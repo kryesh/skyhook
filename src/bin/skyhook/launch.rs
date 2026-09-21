@@ -264,7 +264,7 @@ mod tests {
     use crate::cli::{self, Invocation};
 
     fn history_config(root: Option<PathBuf>) -> RuntimeConfig {
-        let mut config: Config = toml::from_str("[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='http://127.0.0.1:1/v1'\n[models.test]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n").unwrap();
+        let mut config = Config::from_yaml("providers:\n  test:\n    kind: openai\n    api: chat_completions\n    base_url: http://127.0.0.1:1/v1\nmodels:\n  test:\n    provider: test\n    model: fixture\n    max_context: 128000\n    max_output: 4096\n").unwrap();
         config.session_root = root;
         config.into_runtime().unwrap()
     }
@@ -413,7 +413,8 @@ mod tests {
     async fn ceiling_follows_the_host_and_the_permissions() {
         let root = tempfile::tempdir().unwrap();
         let mut config = history_config(None).config().clone();
-        config.modes = toml::from_str("[wide]\ncapabilities = ['read', 'exec']\n[narrow]\ncapabilities = ['read']\n[none]\ncapabilities = []").unwrap();
+        config.modes = Config::from_yaml("modes:\n  wide:\n    capabilities: [read, exec]\n  narrow:\n    capabilities: [read]\n  none:\n    capabilities: []").unwrap().modes;
+        config.modes.shift_remove("general");
         config.default_mode = "wide".into();
         let config = config.into_runtime().unwrap();
         let mut launch = launch(root.path(), &config).await;

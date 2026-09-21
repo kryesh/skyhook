@@ -3,7 +3,7 @@
 ## Approval policy
 
 `--approve-all` or
-`approve_all = true` bypasses approval prompts. Subject to the granted capabilities, the default
+`approve_all: true` bypasses approval prompts. Subject to the granted capabilities, the default
 CLI auto-allows reads and agent operations, as well as writes inside the root workspace.
 Execution, HTTP requests, SSH access, target changes, and writes outside the root workspace
 require approval. When the `interactive` capability is granted, questions and SSH authentication
@@ -58,18 +58,19 @@ target support by including `"targets"` in a mode.
 
 A mode is a named permission preset. The root agent runs in one mode at a time:
 
-```toml
+```yaml
 # The mode a new session starts in; "general" when omitted.
-default_mode = "readonly"
+default_mode: "readonly"
 
-[modes.readonly]
-capabilities = ["read", "network"]
-instructions = "Investigate and report. Do not change anything."
-hint = "Look things up without changing anything"
+modes:
+  readonly:
+    capabilities: ["read", "network"]
+    instructions: "Investigate and report. Do not change anything."
+    hint: "Look things up without changing anything"
 
-# Built in, and listed first. Declare it only to change what it grants.
-[modes.general]
-capabilities = ["read", "write", "exec", "network", "agents", "mcp"]
+  # Built in, and listed first. Declare it only to change what it grants.
+  general:
+    capabilities: ["read", "write", "exec", "network", "agents", "mcp"]
 ```
 
 `capabilities` is required, and `default_mode` must name `general` or a declared mode. Optional `instructions` are added to the system prompt of an agent

@@ -1,7 +1,7 @@
 # Providers and models
 
 Providers and models are separate named profiles. API secrets can be read from environment variables
-or retrieved lazily by a command; no literal API-key field is supported in TOML. `openai` requires
+or retrieved lazily by a command; no literal API-key field is supported in YAML. `openai` requires
 an explicit `base_url` and `api` (`chat_completions` or `responses`); `anthropic` requires an explicit
 `base_url`. Both accept either `api_key_env` or `api_key_command`, or neither for a keyless endpoint.
 URLs name the API root: Skyhook appends
@@ -60,20 +60,22 @@ llama-server \
 
 Then configure Skyhook to match:
 
-```toml
-approve_all = false
+```yaml
+approve_all: false
 
-[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
+providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
 
-[models.local]
-provider = "local"
-model = "qwen3.8-27b"
-max_context = 262144
-max_output = 131072
-supports_images = false
+models:
+  local:
+    provider: "local"
+    model: "qwen3.8-27b"
+    max_context: 262144
+    max_output: 131072
+    supports_images: false
 ```
 
 Here **131,072 is a chosen total-generation cap**, matching `--n-predict`, not a published
@@ -141,18 +143,19 @@ llama.cpp and SGLang, and accepted as an alias by current vLLM. Ordinary Chat re
 reasoning do not acquire an invented reasoning field. Configure a different spelling or disable
 request replay on the **provider**, not individual model profiles:
 
-```toml
-[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
-# Optional; this is the default:
-chat_reasoning_replay = "reasoning_content"
-# Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
+```yaml
+providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
+    # Optional; this is the default:
+    chat_reasoning_replay: "reasoning_content"
+    # Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
 ```
 
 This option belongs only to OpenAI-compatible Chat Completions. Anthropic and Codex reject it as an
-unknown setting; configuring it with `api = "responses"` is also rejected. Their native reasoning
+unknown setting; configuring it with `api: "responses"` is also rejected. Their native reasoning
 replay remains automatic and independent of this option. All models using a provider share its
 Chat convention; use separate provider entries if a proxy routes to incompatible conventions.
 
@@ -168,13 +171,14 @@ OpenAI-compatible and Anthropic providers also accept positive `startup_timeout_
 `read_idle_timeout_secs` settings (both default to 600 seconds). Startup is a deadline for each HTTP
 attempt, while read-idle resets after each response-body chunk. For example:
 
-```toml
-[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:8080/v1"
-api = "chat_completions"
-startup_timeout_secs = 600
-read_idle_timeout_secs = 600
+```yaml
+providers:
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
+    startup_timeout_secs: 600
+    read_idle_timeout_secs: 600
 ```
 
 Each retry gets fresh deadlines, so these settings do not limit the total time spent on a

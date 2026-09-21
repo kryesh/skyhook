@@ -15,6 +15,7 @@ pub mod remote;
 pub mod session;
 pub mod target;
 pub mod tool;
+mod yaml;
 
 pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     media::BlobDigest::of(bytes.as_ref()).to_string()

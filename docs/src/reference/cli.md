@@ -16,7 +16,7 @@ binary's command help. `skyhook` itself requires an interactive terminal; `batch
 
 | Option | Meaning |
 | --- | --- |
-| `-c, --config PATH` | Use only this TOML file; disable user/workspace config searching and merging. |
+| `-c, --config PATH` | Use only this file (YAML regardless of suffix); disable user/workspace config searching and merging. |
 | `-w, --workspace PATH` | Set the workspace base directory (default `.`). |
 | `--resume SESSION_ID` | Reopen a saved session. |
 | `-m, --model PROFILE` | Choose a configured model profile for a new session. Resumed sessions retain their recorded model. |
@@ -59,14 +59,14 @@ Policy capability names are `read`, `write`, `exec`, `network`, `targets`, `ssh_
 | Option | Meaning |
 | --- | --- |
 | `-w, --workspace PATH` | Workspace whose configuration or skills to inspect (default `.`). |
-| `-c, --config PATH` | `config` only: use only this TOML file, with no user/workspace merging. |
+| `-c, --config PATH` | `config` only: use only this file (YAML regardless of suffix), with no user/workspace merging. |
 | `-a, --approve-all` | `config` only: apply the approval override. |
 
 ```sh
-skyhook dump                          # Resolved effective TOML
-skyhook dump config > effective.toml
+skyhook dump                          # Resolved effective YAML
+skyhook dump config > effective.yaml
 skyhook dump config --workspace /path/to/project
-skyhook dump config --config ./standalone.toml --approve-all
+skyhook dump config --config ./standalone.yaml --approve-all
 skyhook dump skills --workspace /path/to/project
 ```
 
@@ -76,11 +76,11 @@ required. `dump skills` rejects `--config` and `--approve-all` as irrelevant.
 
 ### Configuration dump
 
-The config dump writes the resolved effective configuration as TOML to **stdout**. It follows
+The config dump writes the resolved effective configuration as YAML to **stdout**. It follows
 normal [file selection and layering](../configuration/overview.md#file-selection-and-layering),
 including explicit-file-only behavior for `--config`, and includes defaults (such as the
 built-in `general` mode) plus any `--approve-all` override. Source paths and diagnostics go to **stderr**,
-so redirected stdout remains TOML. It exits with status **0** when a valid config can be produced,
+so redirected stdout remains YAML. It exits with status **0** when a valid config can be produced,
 and **nonzero** otherwise; it does not require provider credentials to validate configuration.
 
 The dump includes literal values stored in configuration, such as MCP environment entries;

@@ -30,7 +30,7 @@ termination signals also trigger cleanup and journaled status rather than a term
 
 A batch job never has human interaction. Root `ask` is unavailable (also inside scripts and with `bg:true`). Child agents
 can still ask their owning parent agent. Operations requiring human approval fail immediately;
-ordinary automatically allowed operations still work. `--approve-all` (or config `approve_all = true`)
+ordinary automatically allowed operations still work. `--approve-all` (or config `approve_all: true`)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.
 

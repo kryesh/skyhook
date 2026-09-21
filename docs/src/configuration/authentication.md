@@ -4,13 +4,14 @@
 
 Reference an environment variable with `api_key_env`, or use a command to retrieve the key:
 
-```toml
-[providers.anthropic]
-kind = "anthropic"
-base_url = "https://api.anthropic.com/v1"
-api_key_env = "ANTHROPIC_API_KEY"
-# Alternatively, remove api_key_env and use:
-# api_key_command = "op read 'op://Private/Anthropic/api-key'"
+```yaml
+providers:
+  anthropic:
+    kind: "anthropic"
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    # Alternatively, remove api_key_env and use:
+    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
 ```
 
 `api_key_env` and `api_key_command` are mutually exclusive. Environment-variable keys are resolved

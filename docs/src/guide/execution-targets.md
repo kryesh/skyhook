@@ -5,8 +5,8 @@ Include `"targets"` in a [mode](permissions.md#modes)'s `capabilities` (or a bat
 Without it, agents cannot use target-management tools or select another target, including from
 JavaScript. The `external_agent` example below also requires `ssh_agent`; see [agents](#agents).
 
-Targets are named directly under `[targets.<name>]`, and session tools can add or replace targets without
-modifying TOML. Skyhook never reads SSH configuration files: a target's host, user, port,
+Targets are named entries in the top-level `targets` mapping, and session tools can add or replace
+targets without modifying YAML. Skyhook never reads SSH configuration files: a target's host, user, port,
 authentication, and options come only from its own definition. Aliases, `ProxyJump`, identities,
 and other settings in `~/.ssh/config` or `/etc/ssh/ssh_config` do not apply.
 
@@ -15,38 +15,37 @@ a workspace entry replaces the **whole target with the same name**; it does not 
 authentication, or routing settings. Targets with other names are retained. Repeat any
 required settings in the replacement entry.
 
-```toml
-[targets.bastion]
-type = "ssh"
-host = "bastion.example.com"
+```yaml
+targets:
+  bastion:
+    type: "ssh"
+    host: "bastion.example.com"
+    ssh:
+      user: "gateway"
+      external_agent: true
 
-[targets.bastion.ssh]
-user = "gateway"
-external_agent = true
+  build:
+    type: "ssh"
+    host: "build.internal"
+    workspace: "/srv/project"
+    via: "bastion"
+    ssh:
+      auth:
+        kind: "key"
+        path: "~/.ssh/build_ed25519"
 
-[targets.build]
-type = "ssh"
-host = "build.internal"
-workspace = "/srv/project"
-via = "bastion"
-
-[targets.build.ssh.auth]
-kind = "key"
-path = "~/.ssh/build_ed25519"
-
-[targets.database]
-type = "ssh"
-host = "db.internal"
-origin = "build"
-
-[targets.database.ssh]
-# Reach the host through a gateway using the deploy user's own SSH key on build.
-options = { ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
+  database:
+    type: "ssh"
+    host: "db.internal"
+    origin: "build"
+    ssh:
+      # Reach the host through a gateway using the deploy user's own SSH key on build.
+      options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 ```
 
 Targets have an explicit `type`. The built-in `root` is `local`, meaning the session host—the machine
 running the main Skyhook process. It always identifies that machine, including when an agent's
-current target is remote. Named target configuration and `target_add` accept only `type = "ssh"`.
+current target is remote. Named target configuration and `target_add` accept only `type: "ssh"`.
 
 ## Routing: `origin` and `via`
 
@@ -57,8 +56,8 @@ current target is remote. Named target configuration and `target_add` accept onl
   interpreted on another machine. Omit `via`, rather than naming the origin, to connect directly
   from the origin.
 
-Both may be set: `origin = "build"` with `via = "gateway"` makes `build` run SSH through `gateway`,
-where `gateway` also has `origin = "build"`.
+Both may be set: `origin: "build"` with `via: "gateway"` makes `build` run SSH through `gateway`,
+where `gateway` also has `origin: "build"`.
 
 Registering targets never connects to them; registrations are session-wide.
 
@@ -69,14 +68,15 @@ await tool.target_add({name: "database", type: "ssh", host: "db.internal", origi
 
 ## SSH settings
 
-SSH settings live under `ssh`. Every setting is optional:
+SSH settings live under `ssh`. Every setting is optional. `options` values must be strings;
+quote numeric-looking values, for example `ServerAliveInterval: "15"`.
 
 | Setting | Meaning |
 | --- | --- |
 | `user`, `port` | Remote user (default: the origin's username) and port (1–65535, default 22). |
 | `auth` | `default` offers OpenSSH's default key files (`~/.ssh/id_*`); `agent` offers only keys already in the agent; `key` with `path` offers one private key on the SSH origin. |
 | `external_agent` | Authenticate with, and forward, the agent the origin inherited in `SSH_AUTH_SOCK` instead of a private agent Skyhook runs on the origin. Keys are never added to it. Requires the `ssh_agent` capability; see [agents](#agents). |
-| `options` | Extra `ssh_config` options, written verbatim as in an ssh_config file, e.g. `{ ProxyCommand = "sudo -n -u deploy ssh -W %h:%p gateway.internal" }` to reach the host through a gateway with another user's SSH key (commands run without a terminal, so `sudo` must not prompt). Use `%h` for the target host; `%n` is Skyhook's internal host alias. Skyhook-managed settings cannot be overridden. These are rejected: `Host`, `Match`, `Include`, `HostName`, `User`, `Port`, `IdentityFile`, `IdentityAgent`, `AddKeysToAgent`, `BatchMode`, `ProxyJump`, `ControlMaster`, `ControlPath`, `ControlPersist`, `ForwardAgent`, `RemoteCommand`, `RequestTTY`, `SessionType`, `CanonicalizeHostname`, `SendEnv`, `SetEnv`, `ForwardX11`, and `ForwardX11Trusted`. `ProxyCommand` cannot be combined with `via`. |
+| `options` | Extra `ssh_config` options, written verbatim as in an ssh_config file, e.g. `{ ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }` to reach the host through a gateway with another user's SSH key (commands run without a terminal, so `sudo` must not prompt). Use `%h` for the target host; `%n` is Skyhook's internal host alias. Skyhook-managed settings cannot be overridden. These are rejected: `Host`, `Match`, `Include`, `HostName`, `User`, `Port`, `IdentityFile`, `IdentityAgent`, `AddKeysToAgent`, `BatchMode`, `ProxyJump`, `ControlMaster`, `ControlPath`, `ControlPersist`, `ForwardAgent`, `RemoteCommand`, `RequestTTY`, `SessionType`, `CanonicalizeHostname`, `SendEnv`, `SetEnv`, `ForwardX11`, and `ForwardX11Trusted`. `ProxyCommand` cannot be combined with `via`. |
 
 ## Agents
 

@@ -161,7 +161,7 @@ pub(super) struct ConfigRequest {
     /// Workspace visible to coding tools.
     #[arg(short, long, default_value = ".")]
     pub(super) workspace: PathBuf,
-    /// Use only this TOML config; disable user/workspace config discovery and merging.
+    /// Use only this YAML config, regardless of extension; disable user/workspace discovery and merging.
     #[arg(short, long)]
     pub(super) config: Option<PathBuf>,
     /// Approve every tool invocation without prompting.
@@ -411,13 +411,13 @@ mod tests {
         assert!(parse(&["dump", "unknown"]).is_none());
         assert!(parse(&["help"]).is_none());
         assert!(
-            parse(&["-c", "c.toml", "-a", "-p", "x"])
+            parse(&["-c", "c.yaml", "-a", "-p", "x"])
                 .unwrap()
                 .session
                 .config
                 .approve_all
         );
-        let skills = parse(&["dump", "skills", "--config", "other.toml"]).unwrap();
+        let skills = parse(&["dump", "skills", "--config", "other.yaml"]).unwrap();
         assert!(Invocation::try_from(skills).is_err());
         let id = "00000000000000000000000000000001";
         let stats = |args: &[&str]| match parse_from([&["skyhook", "stats"], args].concat()) {
@@ -446,7 +446,7 @@ mod tests {
             &["stats", "--list", "--format", "json"],
             &["stats", "not-an-id"],
             &["stats", id, "--format", "csv"],
-            &["stats", id, "--config", "c.toml"],
+            &["stats", id, "--config", "c.yaml"],
         ] {
             assert!(parse(args).is_none(), "{args:?}");
         }

@@ -3,7 +3,7 @@
 
 # Local Skyhook configuration, session data, and credentials.
 .skyhook/
-skyhook.toml
+/config.yaml
 codex-oauth.json
 
 # Environment secrets; keep sanitized templates available to commit.

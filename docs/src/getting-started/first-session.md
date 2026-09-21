@@ -8,20 +8,22 @@ config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/skyhook"
 mkdir -p "$config_dir"
 ```
 
-Create `config.toml` in that directory with a provider and model you can access. For example:
+Create `config.yaml` in that directory with a provider and model you can access. For example:
 
-```toml
-[providers.openai]
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-api = "responses"
-api_key_env = "OPENAI_API_KEY"
+```yaml
+providers:
+  openai:
+    kind: "openai"
+    base_url: "https://api.openai.com/v1"
+    api: "responses"
+    api_key_env: "OPENAI_API_KEY"
 
-[models.default]
-provider = "openai"
-model = "gpt-5.6"
-max_context = 1050000
-max_output = 128000
+models:
+  default:
+    provider: "openai"
+    model: "gpt-5.6"
+    max_context: 1050000
+    max_output: 128000
 ```
 
 Use a model identifier supported by your account and set its token limits explicitly; Skyhook
@@ -33,7 +35,7 @@ providers, a keyless local server, or Codex OAuth, see
 From a source checkout, you can instead copy the comprehensive example and edit it before running:
 
 ```sh
-cp config.example.toml "$config_dir/config.toml"
+cp config.example.yaml "$config_dir/config.yaml"
 ```
 
 The [full example](../configuration/overview.md#complete-example) configures several providers;
@@ -54,15 +56,15 @@ with redirected input/output support and automatic exit; see [Headless execution
 
 An unused startup draft creates no saved session. The first sent message or explicitly run
 script creates the session. Use `--workspace PATH` to select another workspace. Normally,
-`<workspace>/.skyhook/config.toml` overlays the selected user configuration. Use
-`--config path.toml` to load **only** that file instead, with no user/workspace config merging.
+`<workspace>/.skyhook/config.yaml` overlays the selected user configuration. Use
+`--config path.yaml` to load **only** that file instead, with no user/workspace config merging.
 See [configuration layering](../configuration/overview.md#file-selection-and-layering), including
 its workspace trust boundary.
 
 To inspect configuration or available skills without a session or API credentials:
 
 ```sh
-skyhook dump config  # Effective TOML on stdout; diagnostics/source paths on stderr.
+skyhook dump config  # Effective YAML on stdout; diagnostics/source paths on stderr.
 skyhook dump skills  # Winning skills, frontmatter, and asset tree.
 ```
 

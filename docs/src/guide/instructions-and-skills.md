@@ -4,7 +4,7 @@
 
 Skyhook loads at most **one user instruction file** and **one file in the exact resolved
 workspace directory**. It does not walk workspace ancestors for instructions. `--workspace PATH`
-selects that workspace; `--config` selects only TOML configuration and does **not** suppress
+selects that workspace; `--config` selects only YAML configuration and does **not** suppress
 instruction discovery.
 
 Within each directory, filenames are checked in this order:
@@ -55,6 +55,12 @@ files, conventionally grouped in `scripts/`, `references/`, and `assets/`:
 └── scripts/
     └── release.py
 ```
+
+Skill YAML frontmatter may contain arbitrary metadata, but its values must be JSON-compatible:
+mappings with string keys, sequences, strings, booleans, finite numbers, and null. Duplicate or
+non-string keys, custom tags, non-finite numbers, and YAML `<<` merge keys are rejected. Anchors
+and aliases are supported with bounded expansion. A `description` must be a string; a skill with
+any other non-null description is skipped with a warning.
 
 ## Loading and copying assets
 

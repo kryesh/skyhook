@@ -31,7 +31,7 @@ pub(super) async fn run(request: Inspection) -> Result<(), Box<dyn std::error::E
                 );
             }
             resolved.config.clone().into_runtime()?;
-            let output = resolved.config.to_toml()?;
+            let output = resolved.config.to_yaml()?;
             io::stdout().lock().write_all(output.as_bytes())?;
         }
         Inspection::Skills(request) => {

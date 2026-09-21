@@ -2,7 +2,7 @@
 
 ## Prerequisites
 
-- Rust 1.88 or newer via rustup, and [just](https://just.systems/) on `PATH`.
+- Rust 1.89 or newer via rustup, and [just](https://just.systems/) on `PATH`.
 - [Zig](https://ziglang.org/download/) on `PATH` (or `CARGO_ZIGBUILD_ZIG_PATH`) **only for
   building the SSH shims**.
 

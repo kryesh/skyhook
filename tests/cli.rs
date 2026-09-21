@@ -41,8 +41,8 @@ impl Fixture {
         self.provider_config(endpoint, top, "");
     }
     fn provider_config(&self, endpoint: &str, top: &str, credential: &str) {
-        self.write("config/skyhook/config.toml", &format!(
-            "{top}\n[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='{endpoint}'\n{credential}\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\nsupports_images=true\n"
+        self.write("config/skyhook/config.yaml", &format!(
+            "{top}\nproviders:\n  test:\n    kind: openai\n    api: chat_completions\n    base_url: '{endpoint}'\n    {credential}\nmodels:\n  first:\n    provider: test\n    model: fixture\n    max_context: 128000\n    max_output: 4096\n    supports_images: true\n"
         ));
     }
     fn bare_command(&self) -> Command {
@@ -68,7 +68,7 @@ impl Fixture {
         let mut cmd = self.bare_command();
         cmd.args(subcommand)
             .arg("--config")
-            .arg(self.path("config/skyhook/config.toml"))
+            .arg(self.path("config/skyhook/config.yaml"))
             .arg("--workspace")
             .arg(self.root.path());
         cmd
@@ -223,7 +223,7 @@ fn parse_early_runtime_and_redirected_terminal_failures_are_reported_correctly()
     let out = run(&["-p", "hello"]);
     assert!(!out.status.success() && out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
-    f.write("config/skyhook/config.toml", "invalid [");
+    f.write("config/skyhook/config.yaml", "invalid [");
     assert_reported_failure(&batch(&["-p", "x"]));
 }
 
@@ -320,8 +320,8 @@ mod dotenv {
     #[test]
     fn dotenv_selects_the_config_directory_and_supplies_provider_credentials() {
         for credential in [
-            format!("api_key_env='{KEY}'"),
-            format!("api_key_command = \"printf '%s' \\\"${KEY}\\\"\""),
+            format!("api_key_env: '{KEY}'"),
+            format!("api_key_command: \"printf '%s' \\\"${KEY}\\\"\""),
         ] {
             let f = fixture();
             let (endpoint, server) = mock_provider();
@@ -359,15 +359,15 @@ mod dotenv {
 mod dump {
     use super::*;
 
-    fn successful_config(output: &Output) -> toml::Value {
+    fn successful_config(output: &Output) -> serde_json::Value {
         assert!(
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
         let text = std::str::from_utf8(&output.stdout).unwrap();
-        let _: skyhook::config::Config = toml::from_str(text).unwrap();
-        toml::from_str(text).unwrap()
+        skyhook::config::Config::from_yaml(text).unwrap();
+        serde_saphyr::from_str(text).unwrap()
     }
 
     fn no_session(f: &Fixture) {
@@ -377,25 +377,50 @@ mod dump {
     }
 
     #[test]
+    fn dump_discovers_only_config_yaml_and_explicit_files_always_use_yaml() {
+        let f = Fixture::new();
+        // Legacy files are ignored even beside a discovered YAML config.
+        let legacy = "[providers.test]\nkind='codex'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n";
+        f.write("config/skyhook/config.toml", legacy);
+        f.write(".skyhook/config.toml", "[models.first]\nmax_output=0\n");
+        let discovered = successful_config(&output(f.bare_command().arg("dump")));
+        assert_eq!(discovered["models"]["first"]["max_output"], 4096);
+
+        let yaml = f.read("config/skyhook/config.yaml");
+        fs::remove_file(f.path("config/skyhook/config.yaml")).unwrap();
+        let missing = output(f.bare_command().arg("dump"));
+        assert!(!missing.status.success() && missing.stdout.is_empty());
+
+        let explicit = f.path("config/skyhook/config.toml");
+        let rejected = output(f.bare_command().args(["dump", "--config"]).arg(&explicit));
+        assert!(!rejected.status.success() && rejected.stdout.is_empty());
+        // --config selects a file, not its parser: YAML works with any extension.
+        fs::write(&explicit, yaml).unwrap();
+        let loaded = output(f.bare_command().args(["dump", "--config"]).arg(explicit));
+        assert_eq!(successful_config(&loaded), discovered);
+        no_session(&f);
+    }
+
+    #[test]
     fn dump_config_merges_selected_workspace_applies_cli_policy_and_fails_whole() {
         let f = Fixture::new();
         f.config(
             "http://127.0.0.1:1/v1",
-            "approve_all=true\ndefault_mode='look'\n[modes.look]\ncapabilities=['read']",
+            "approve_all: false\ndefault_mode: look\nmodes:\n  look:\n    capabilities: [read]",
         );
-        f.write(".skyhook/config.toml", "[models.first]\nmax_output=0\n");
         f.write(
-            "project/.skyhook/config.toml",
-            "[models.first]\nmax_output=8192\n",
+            ".skyhook/config.yaml",
+            "models:\n  first:\n    max_output: 0\n",
+        );
+        f.write(
+            "project/.skyhook/config.yaml",
+            "models:\n  first:\n    max_output: 8192\n",
         );
         let project = f.path("project");
         let merged = output(f.bare_command().args(["dump", "--workspace"]).arg(&project));
         let config = successful_config(&merged);
-        assert_eq!(config["approve_all"].as_bool(), Some(true));
-        assert_eq!(
-            config["models"]["first"]["max_output"].as_integer(),
-            Some(8192)
-        );
+        assert_eq!(config["approve_all"].as_bool(), Some(false));
+        assert_eq!(config["models"]["first"]["max_output"].as_i64(), Some(8192));
         let overridden = output(
             f.bare_command()
                 .args(["dump", "config", "--workspace"])
@@ -403,7 +428,7 @@ mod dump {
                 .arg("--approve-all"),
         );
         let config = successful_config(&overridden);
-        let capabilities = [toml::Value::String("read".into())];
+        let capabilities = [serde_json::Value::String("read".into())];
         let look = &config["modes"]["look"]["capabilities"];
         assert_eq!(look.as_array().unwrap(), &capabilities);
         assert_eq!(config["approve_all"].as_bool(), Some(true));
@@ -420,13 +445,15 @@ mod dump {
         let f = Fixture::new();
         f.write("bin/ssh", "#!/bin/sh\ntouch SSH_WAS_RUN\nexit 1\n");
         fs::set_permissions(f.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
-        f.provider_config("http://127.0.0.1:1/v1", "", "api_key_env='MISSING_API_KEY'");
-        let mut text = f.read("config/skyhook/config.toml");
+        f.provider_config("http://127.0.0.1:1/v1", "", "api_key_env: MISSING_API_KEY");
+        let mut text = f.read("config/skyhook/config.yaml");
         text.push_str(
-            "\n[mcp.trap]\ntransport='stdio'\nstart_command=['/bin/sh','-c','touch MCP_WAS_RUN']\n",
+            "\nmcp:\n  trap:\n    transport: stdio\n    start_command: [/bin/sh, -c, touch MCP_WAS_RUN]\n",
         );
-        text.push_str("\n[targets.remote]\ntype='ssh'\nhost='remote.test'\nvia='defined-later'\n");
-        f.write("config/skyhook/config.toml", &text);
+        text.push_str(
+            "\ntargets:\n  remote:\n    type: ssh\n    host: remote.test\n    via: defined-later\n",
+        );
+        f.write("config/skyhook/config.yaml", &text);
         f.write(".skyhook/state.json", "malformed saved state");
         let path = format!("{}:/usr/bin:/bin", f.path("bin").display());
         let dumped = output(f.bare_command().env("PATH", path).args(["dump", "config"]));
@@ -447,7 +474,7 @@ mod dump {
     #[test]
     fn dump_skills_shows_frontmatter_assets_and_errors_without_model_config() {
         let f = Fixture::new();
-        fs::remove_file(f.path("config/skyhook/config.toml")).unwrap();
+        fs::remove_file(f.path("config/skyhook/config.yaml")).unwrap();
         f.write(
             ".agents/skills/release/SKILL.md",
             "---\nname: declared-release\ndescription: Release helper\nmetadata:\n  owner: maintainers\n  checks: [tests, lint]\n---\n# Release\n",
@@ -505,12 +532,12 @@ mod dump {
         assert!(!skills.stderr.contains(&0x1b));
         assert!(String::from_utf8_lossy(&skills.stderr).contains("evil\\u{1b}[2J"));
 
-        let path = f.path("odd\u{1b}[2J.toml");
-        fs::copy(f.path("config/skyhook/config.toml"), &path).unwrap();
+        let path = f.path("odd\u{1b}[2J.yaml");
+        fs::copy(f.path("config/skyhook/config.yaml"), &path).unwrap();
         let loaded = output(f.bare_command().args(["dump", "--config"]).arg(&path));
         successful_config(&loaded);
         assert!(!loaded.stderr.contains(&0x1b));
-        assert!(String::from_utf8_lossy(&loaded.stderr).contains("odd\\u{1b}[2J.toml"));
+        assert!(String::from_utf8_lossy(&loaded.stderr).contains("odd\\u{1b}[2J.yaml"));
         fs::remove_file(&path).unwrap();
         let missing = output(f.bare_command().args(["dump", "--config"]).arg(path));
         assert!(!missing.status.success() && missing.stdout.is_empty());
@@ -590,7 +617,7 @@ mod headless {
     use std::sync::mpsc;
 
     const READ_CONFIG: &str =
-        "return (await tool.read({path:'config/skyhook/config.toml'})).unwrap();";
+        "return (await tool.read({path:'config/skyhook/config.yaml'})).unwrap();";
 
     /// Leaves a background job running, having recorded its PID in `started`.
     const BACKGROUND: &str = "await tool.exec({argv:['sh','-c','echo $$ > started; sleep 60'],bg:true}); (await tool.exec({argv:['sh','-c','until [ -s started ]; do sleep 0.01; done']})).unwrap();";
@@ -684,7 +711,7 @@ mod headless {
         let f = Fixture::new();
         f.config(
             "http://127.0.0.1:1/v1",
-            "default_mode='none'\n[modes.none]\ncapabilities=[]\n[modes.look]\ncapabilities=['read']",
+            "default_mode: none\nmodes:\n  none:\n    capabilities: []\n  look:\n    capabilities: [read]",
         );
         let empty = f.script("return 7;", &[]);
         assert!(empty.status.success(), "{empty:?}");
@@ -704,7 +731,7 @@ mod headless {
         // It also keeps a mode the configuration has since dropped.
         f.config(
             "http://127.0.0.1:1/v1",
-            "default_mode='none'\n[modes.none]\ncapabilities=[]",
+            "default_mode: none\nmodes:\n  none:\n    capabilities: []",
         );
         for args in [&["--resume", id.trim()][..], &["--resume", id.trim(), "-a"]] {
             let resumed = f.script(READ_CONFIG, args);
@@ -712,7 +739,7 @@ mod headless {
         }
         f.config(
             "http://127.0.0.1:1/v1",
-            "default_mode='none'\n[modes.none]\ncapabilities=[]\n[modes.look]\ncapabilities=['read']",
+            "default_mode: none\nmodes:\n  none:\n    capabilities: []\n  look:\n    capabilities: [read]",
         );
         f.config("http://127.0.0.1:1/v1", "");
         let unapproved =
@@ -774,9 +801,9 @@ mod headless {
     #[test]
     fn model_memory_explicit_selection_resume_and_startup_warnings_are_shared() {
         let f = Fixture::new();
-        let mut config = f.read("config/skyhook/config.toml");
-        config.push_str("\n[models.second]\nprovider='test'\nmodel='second-model'\nmax_context=128000\nmax_output=4096\n");
-        f.write("config/skyhook/config.toml", &config);
+        let mut config = f.read("config/skyhook/config.yaml");
+        config.push_str("  second:\n    provider: test\n    model: second-model\n    max_context: 128000\n    max_output: 4096\n");
+        f.write("config/skyhook/config.yaml", &config);
         f.write(".skyhook/state.json", r#"{"model":"second"}"#);
         let saved = f.script("return 'saved';", &[]);
         assert!(saved.status.success());
@@ -811,7 +838,7 @@ mod headless {
         let missing_id = "00000000000000000000000000000001";
         let args = ["-p", "hello", "--resume", missing_id];
         assert_reported_failure(&output(f.batch().args(args)));
-        f.write("config/skyhook/config.toml", "[providers.test]\nkind='codex'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n");
+        f.write("config/skyhook/config.yaml", "providers:\n  test:\n    kind: codex\nmodels:\n  first:\n    provider: test\n    model: fixture\n    max_context: 128000\n    max_output: 4096\n");
         let out = output(f.batch().args(["--approve-all", "-p", "hello"]));
         assert!(!out.status.success());
         assert!(f.journal(&out).contains("Failed:"));

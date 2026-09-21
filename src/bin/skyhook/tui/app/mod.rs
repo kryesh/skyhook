@@ -319,7 +319,7 @@ pub(super) mod tests {
     pub(super) use tokio::sync::oneshot;
     pub(in super::super) async fn draft_fixture() -> (tempfile::TempDir, App) {
         let root = tempfile::tempdir().unwrap();
-        let config: skyhook::config::Config = toml::from_str("[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='http://127.0.0.1:1'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n").unwrap();
+        let config = crate::interaction::tests::test_config();
         let (interaction, _) = UiInteraction::new();
         let launch = Launch {
             model: config
@@ -567,13 +567,13 @@ pub(super) mod tests {
     async fn startup_warnings_are_ui_only_on_initial_started_and_resumed_sessions() {
         let (_root, mut draft) = draft_fixture().await;
         let missing_command = draft.launch.workspace.join("missing-mcp-server");
-        let server = toml::from_str(&format!(
-            "transport = 'stdio'\nstart_command = [{}]\nstartup_timeout_secs = 1",
+        let mut config = draft.launch.model.config().config().clone();
+        config.mcp = skyhook::config::Config::from_yaml(&format!(
+            "mcp:\n  unavailable:\n    transport: stdio\n    start_command: [{}]\n    startup_timeout_secs: 1",
             serde_json::to_string(&missing_command.to_string_lossy()).unwrap(),
         ))
-        .unwrap();
-        let mut config = draft.launch.model.config().config().clone();
-        config.mcp.insert("unavailable".into(), server);
+        .unwrap()
+        .mcp;
         let runtime = config.into_runtime().unwrap();
         draft.launch.model = runtime.select_model("first").unwrap();
         let session = draft.launch.create(None).await.unwrap();

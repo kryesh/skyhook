@@ -1,6 +1,6 @@
 # Installation
 
-Skyhook is built from a source checkout with [just](https://github.com/casey/just). Rust 1.88 or
+Skyhook is built from a source checkout with [just](https://github.com/casey/just). Rust 1.89 or
 newer is required. SSH support needs static Linux shims, which are cross-compiled with
 [Zig](https://ziglang.org/download/); install Zig yourself and make `zig` available on `PATH` (or
 set `CARGO_ZIGBUILD_ZIG_PATH`). `just setup` installs the remaining Rust-side tooling

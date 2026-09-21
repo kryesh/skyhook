@@ -17,10 +17,10 @@ pub(super) fn user_config_paths() -> Vec<PathBuf> {
 fn candidate_paths(xdg: Option<OsString>, home: Option<OsString>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
     if let Some(root) = xdg.filter(|root| !root.is_empty()) {
-        paths.push(PathBuf::from(root).join("skyhook/config.toml"));
+        paths.push(PathBuf::from(root).join("skyhook/config.yaml"));
     }
     if let Some(home) = home.filter(|home| !home.is_empty()) {
-        let path = PathBuf::from(home).join(".config/skyhook/config.toml");
+        let path = PathBuf::from(home).join(".config/skyhook/config.yaml");
         if !paths.contains(&path) {
             paths.push(path);
         }
@@ -38,17 +38,17 @@ mod tests {
         assert!(candidate_paths(Some("".into()), Some("".into())).is_empty());
         assert_eq!(
             candidate_paths(Some("".into()), Some("/home/me".into())),
-            [PathBuf::from("/home/me/.config/skyhook/config.toml")]
+            [PathBuf::from("/home/me/.config/skyhook/config.yaml")]
         );
         assert_eq!(
             candidate_paths(Some("/home/me/.config".into()), Some("/home/me".into())),
-            [PathBuf::from("/home/me/.config/skyhook/config.toml")]
+            [PathBuf::from("/home/me/.config/skyhook/config.yaml")]
         );
         assert_eq!(
             candidate_paths(Some("/xdg".into()), Some("/home/me".into())),
             [
-                PathBuf::from("/xdg/skyhook/config.toml"),
-                PathBuf::from("/home/me/.config/skyhook/config.toml")
+                PathBuf::from("/xdg/skyhook/config.yaml"),
+                PathBuf::from("/home/me/.config/skyhook/config.yaml")
             ]
         );
     }

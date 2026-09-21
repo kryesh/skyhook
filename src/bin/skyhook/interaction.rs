@@ -213,11 +213,15 @@ pub(crate) mod tests {
     use super::*;
     use Capability::*;
 
+    pub(crate) fn test_config() -> skyhook::config::Config {
+        skyhook::config::Config::from_yaml("providers:\n  test:\n    kind: openai\n    api: chat_completions\n    base_url: http://127.0.0.1:1\nmodels:\n  first:\n    provider: test\n    model: fixture\n    max_context: 128000\n    max_output: 4096\n").unwrap()
+    }
+
     // AuthorizationRequest contains core-private provenance. Capture a real
     // core-produced request rather than introducing a test-only public ctor.
     pub(crate) async fn approval_request() -> AuthorizationRequest {
         let root = tempfile::tempdir().unwrap();
-        let config: skyhook::config::Config = toml::from_str("[providers.test]\nkind='openai'\napi='chat_completions'\nbase_url='http://127.0.0.1:1'\n[models.first]\nprovider='test'\nmodel='fixture'\nmax_context=128000\nmax_output=4096\n").unwrap();
+        let config = test_config();
         let (ui, mut rx) = UiInteraction::new();
         let harness = config
             .into_runtime()

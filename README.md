@@ -24,7 +24,7 @@ workflows, or embed its Rust core in your own application.
 
 ## Install
 
-Requires **Rust 1.88 or newer** and [just](https://github.com/casey/just). SSH support
+Requires **Rust 1.89 or newer** and [just](https://github.com/casey/just). SSH support
 embeds static Linux shims for x86_64 and aarch64, which are cross-compiled with
 [Zig](https://ziglang.org/download/) (install it separately and put it on `PATH`):
 
@@ -36,14 +36,16 @@ just build-release         # produces target/release/skyhook
 ```
 
 Configure a provider and model, then start a session. If you already have a
-configuration, keep it rather than downloading over it:
+configuration, keep it rather than downloading over it. For an old TOML configuration,
+[convert its contents and rename it to `config.yaml`](docs/src/configuration/overview.md#migrating-from-toml)
+first; renaming alone is not enough:
 
 ```sh
 config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/skyhook"
 mkdir -p "$config_dir"
-curl -fsSL https://raw.githubusercontent.com/kryesh/skyhook/main/config.example.toml \
-  -o "$config_dir/config.toml"
-# Edit config.toml: remove unused providers AND their model profiles.
+curl -fsSL https://raw.githubusercontent.com/kryesh/skyhook/main/config.example.yaml \
+  -o "$config_dir/config.yaml"
+# Edit config.yaml: remove unused providers AND their model profiles.
 # Set credentials for every remaining provider; for OpenAI:
 export OPENAI_API_KEY=...
 ./target/release/skyhook --prompt "inspect this repository"

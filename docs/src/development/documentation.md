@@ -23,7 +23,7 @@ claims and examples against the implementation, including defaults, limits, and 
 
 Use relative chapter links such as `../guide/headless.md` inside the book, and
 `https://github.com/kryesh/skyhook/blob/main/...` for repository files. The configuration
-overview includes the root `config.example.toml` at build time instead of maintaining a second copy.
+overview includes the root `config.example.yaml` at build time instead of maintaining a second copy.
 
 Keep secrets out of `docs/src`: mdBook copies every non-Markdown file there into the output,
 ignored or not.

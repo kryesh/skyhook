@@ -1,5 +1,5 @@
 //! Native provider construction. Model names are passed through unchanged.
-//! Raw TOML DTOs are admitted without credential or process effects.
+//! Raw YAML DTOs are admitted without credential or process effects.
 
 use std::{env, sync::Arc, time::Duration};
 
@@ -160,24 +160,26 @@ mod tests {
     use crate::{config::Config, provider::backends::ChatReasoningReplay};
 
     const LOCAL: &str = r#"
-[providers.local]
-kind = "openai"
-base_url = "http://127.0.0.1:11434/v1"
-api = "chat_completions"
-[models.local]
-provider = "local"
-model = "local-model"
-max_context = 4096
-max_output = 512
+providers:
+  local:
+    kind: openai
+    base_url: http://127.0.0.1:11434/v1
+    api: chat_completions
+models:
+  local:
+    provider: local
+    model: local-model
+    max_context: 4096
+    max_output: 512
 "#;
 
     fn with_replay(value: &str) -> String {
-        let replay = format!("chat_reasoning_replay = \"{value}\"\n[models.local]");
-        LOCAL.replace("[models.local]", &replay)
+        let replay = format!("    chat_reasoning_replay: {value}\nmodels:");
+        LOCAL.replace("models:", &replay)
     }
 
     fn builds(text: &str) -> bool {
-        let config: Config = toml::from_str(text).unwrap();
+        let config = Config::from_yaml(text).unwrap();
         config
             .into_runtime()
             .and_then(|runtime| runtime.select_model("local")?.harness_builder("."))
@@ -186,7 +188,7 @@ max_output = 512
 
     fn chat_replay(text: &str) -> Option<ChatReasoningReplay> {
         assert!(builds(text));
-        let config: Config = toml::from_str(text).unwrap();
+        let config = Config::from_yaml(text).unwrap();
         let ProviderConfig::Openai {
             chat_reasoning_replay,
             ..
@@ -212,24 +214,24 @@ max_output = 512
 
     #[test]
     fn replay_is_provider_scoped_and_only_configurable_for_chat() {
-        assert!(toml::from_str::<Config>(&with_replay("guess")).is_err());
-        let on_model = format!("{LOCAL}\nchat_reasoning_replay = \"reasoning\"\n");
+        assert!(Config::from_yaml(&with_replay("guess")).is_err());
+        let on_model = format!("{LOCAL}    chat_reasoning_replay: reasoning\n");
         assert!(
-            toml::from_str::<Config>(&on_model).is_err(),
+            Config::from_yaml(&on_model).is_err(),
             "model-level policy must not be silently ignored"
         );
-        let responses =
-            |text: &str| text.replace("api = \"chat_completions\"", "api = \"responses\"");
+        let responses = |text: &str| text.replace("api: chat_completions", "api: responses");
         assert!(!builds(&responses(&with_replay("reasoning"))));
         assert!(builds(&responses(LOCAL)));
         for provider in [
-            "kind = \"anthropic\"\nbase_url = \"https://api.anthropic.com/v1\"",
-            "kind = \"codex\"",
+            "    kind: anthropic\n    base_url: https://api.anthropic.com/v1",
+            "    kind: codex",
         ] {
-            let text =
-                format!("[providers.native]\n{provider}\nchat_reasoning_replay = \"reasoning\"\n");
+            let text = format!(
+                "providers:\n  native:\n{provider}\n    chat_reasoning_replay: reasoning\n"
+            );
             assert!(
-                toml::from_str::<Config>(&text).is_err(),
+                Config::from_yaml(&text).is_err(),
                 "unrelated provider accepted Chat-specific config"
             );
         }
@@ -237,14 +239,14 @@ max_output = 512
 
     fn native_configs(authentication: &str) -> impl Iterator<Item = ProviderConfig> + '_ {
         [
-            "kind = 'openai'\napi = 'chat_completions'",
-            "kind = 'openai'\napi = 'responses'",
-            "kind = 'anthropic'",
+            "kind: openai\napi: chat_completions",
+            "kind: openai\napi: responses",
+            "kind: anthropic",
         ]
         .into_iter()
         .map(move |kind| {
-            toml::from_str(&format!(
-                "{kind}\nbase_url = 'https://example.com/v1'\n{authentication}"
+            crate::yaml::parse(&format!(
+                "{kind}\nbase_url: https://example.com/v1\n{authentication}"
             ))
             .unwrap()
         })
@@ -256,7 +258,7 @@ max_output = 512
         let marker = directory.path().join("executed");
         let command = format!("printf key > '{}'", marker.display());
         let authentication = format!(
-            "api_key_command = {}",
+            "api_key_command: {}",
             serde_json::to_string(&command).unwrap()
         );
         for config in native_configs(&authentication) {
@@ -272,8 +274,7 @@ max_output = 512
 
     #[test]
     fn credential_sources_are_exclusive_blank_commands_rejected_and_kept_out_of_errors() {
-        let exclusive =
-            "api_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'\napi_key_command = 'secret-marker'";
+        let exclusive = "api_key_env: SKYHOOK_TEST_MISSING_API_KEY\napi_key_command: secret-marker";
         for config in native_configs(exclusive) {
             let admitted = ValidatedProvider::new("vendor", &config).map(|_| ());
             let built = build("test", &config).map(|_| ());
@@ -285,7 +286,7 @@ max_output = 512
                 assert!(!error.contains("secret-marker"));
             }
         }
-        for config in native_configs("api_key_command = '   '") {
+        for config in native_configs("api_key_command: '   '") {
             let error = build("test", &config).err().unwrap().to_string();
             assert!(error.contains("must not be blank"), "{error}");
         }
@@ -297,14 +298,14 @@ max_output = 512
             assert!(build("test", &config).is_ok());
         }
         // No mutation of process-wide environment in concurrent tests.
-        for config in native_configs("api_key_env = 'SKYHOOK_TEST_MISSING_API_KEY'") {
+        for config in native_configs("api_key_env: SKYHOOK_TEST_MISSING_API_KEY") {
             assert!(matches!(
                 build("test", &config),
                 Err(ConfigError::MissingEnvironment(_))
             ));
         }
-        let codex = "kind = 'codex'\napi_key_command = 'echo key'";
-        assert!(toml::from_str::<ProviderConfig>(codex).is_err());
+        let codex = "kind: codex\napi_key_command: echo key";
+        assert!(crate::yaml::parse::<ProviderConfig>(codex).is_err());
     }
 
     #[test]

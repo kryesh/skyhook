@@ -31,7 +31,7 @@ pub(super) enum McpConnection {
     },
 }
 
-/// Strings remain exactly those supplied by TOML: executable/arguments are never
+/// Strings remain exactly those supplied by YAML: executable/arguments are never
 /// split, trimmed, shell-expanded, or normalized. Only executable shape is checked.
 #[derive(Clone, Debug)]
 pub(super) struct CommandSpec {
@@ -195,26 +195,26 @@ mod tests {
     use super::*;
     use std::path::Path;
 
-    const STDIO: &str = "transport = 'stdio'\nstart_command = ['server']";
+    const STDIO: &str = "transport: 'stdio'\nstart_command: ['server']";
 
     #[test]
     fn flat_config_roundtrips_without_changing_defaults_or_endpoint_semantics() {
         for text in [
-            "transport = 'stdio'\nstart_command = [' server name ', 'a b', '$UNEXPANDED']",
-            "transport = 'streamable_http'\nurl = 'HTTPS://Example.COM:443/a%2Fb?q=x#fragment'",
-            "transport = 'streamable_http'\nurl = 'http://user:password@localhost:1234/mcp'",
-            "transport = 'streamable_http'\nurl = 'http://[::1]:1234/mcp'\nstart_command = ['server', '--flag']\ncwd = 'relative/path'\nenv = { KEY = 'value' }\nheaders_env = { Authorization = 'MISSING_MCP_TEST_TOKEN' }\ncapabilities = ['read', 'exec']\nstartup_timeout_secs = 2\ncall_timeout_secs = 9",
+            "transport: 'stdio'\nstart_command: [' server name ', 'a b', '$UNEXPANDED']",
+            "transport: 'streamable_http'\nurl: 'HTTPS://Example.COM:443/a%2Fb?q=x#fragment'",
+            "transport: 'streamable_http'\nurl: 'http://user:password@localhost:1234/mcp'",
+            "transport: 'streamable_http'\nurl: 'http://[::1]:1234/mcp'\nstart_command: ['server', '--flag']\ncwd: 'relative/path'\nenv: { KEY: 'value' }\nheaders_env: { Authorization: 'MISSING_MCP_TEST_TOKEN' }\ncapabilities: ['read', 'exec']\nstartup_timeout_secs: 2\ncall_timeout_secs: 9",
         ] {
-            let raw: RawMcpServerConfig = toml::from_str(text).unwrap();
+            let raw: RawMcpServerConfig = crate::yaml::parse(text).unwrap();
             let expected = serde_json::to_value(&raw).unwrap();
-            let config: McpServerConfig = toml::from_str(text).unwrap();
+            let config: McpServerConfig = crate::yaml::parse(text).unwrap();
             assert_eq!(serde_json::to_value(&config).unwrap(), expected);
-            let encoded = toml::to_string(&config).unwrap();
-            let decoded: McpServerConfig = toml::from_str(&encoded).unwrap();
+            let encoded = serde_saphyr::to_string(&config).unwrap();
+            let decoded: McpServerConfig = crate::yaml::parse(&encoded).unwrap();
             assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
             assert_eq!(config.transport(), raw.transport);
         }
-        let config: McpServerConfig = toml::from_str(STDIO).unwrap();
+        let config: McpServerConfig = crate::yaml::parse(STDIO).unwrap();
         assert_eq!(config.startup_timeout(), Duration::from_secs(30));
         assert_eq!(config.call_timeout(), Duration::from_secs(120));
         assert!(config.capabilities().is_empty());
@@ -223,7 +223,7 @@ mod tests {
     #[test]
     fn admission_is_pure_and_retains_runtime_environment_failures() {
         // Existence/access and secret/header-value validity remain startup concerns.
-        let config: McpServerConfig = toml::from_str("transport = 'streamable_http'\nurl = 'http://localhost:1234/mcp'\nstart_command = ['/nonexistent/mcp-command']\ncwd = '/nonexistent/mcp-directory'\nheaders_env = { 'invalid header name' = 'MISSING_MCP_TEST_TOKEN' }").unwrap();
+        let config: McpServerConfig = crate::yaml::parse("transport: 'streamable_http'\nurl: 'http://localhost:1234/mcp'\nstart_command: ['/nonexistent/mcp-command']\ncwd: '/nonexistent/mcp-directory'\nheaders_env: { 'invalid header name': 'MISSING_MCP_TEST_TOKEN' }").unwrap();
         let mut raw: RawMcpServerConfig = config.into();
         assert_eq!(
             raw.headers_env["invalid header name"],
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn programmatic_timeouts_and_commands_must_pass_the_same_admission() {
-        let raw: RawMcpServerConfig = toml::from_str(STDIO).unwrap();
+        let raw: RawMcpServerConfig = crate::yaml::parse(STDIO).unwrap();
         for seconds in [0, u64::MAX] {
             let mut startup = raw.clone();
             startup.startup_timeout_secs = seconds;
@@ -256,38 +256,41 @@ mod tests {
     #[test]
     fn invalid_connections_unknown_fields_capabilities_and_timeouts_are_rejected() {
         let mut texts: Vec<String> = [
-            "transport = 'stdio'",
-            "transport = 'stdio'\nstart_command = []",
-            "transport = 'stdio'\nstart_command = ['']",
-            "transport = 'stdio'\nstart_command = ['   ']",
-            "transport = 'stdio'\nstart_command = ['server']\nurl = 'https://example.com/mcp'",
-            "transport = 'stdio'\nstart_command = ['server']\nheaders_env = { Authorization = 'TOKEN' }",
-            "transport = 'streamable_http'",
-            "transport = 'streamable_http'\nurl = ''",
-            "transport = 'streamable_http'\nurl = '/mcp'",
-            "transport = 'streamable_http'\nurl = 'ftp://example.com/mcp'",
-            "transport = 'streamable_http'\nurl = 'https://example.com/mcp'\nstart_command = []",
-            "transport = 'streamable_http'\nurl = 'https://example.com/mcp'\ncwd = 'work'",
-            "transport = 'streamable_http'\nurl = 'https://example.com/mcp'\nenv = { MODE = 'test' }",
-            "transport = 'sse'\nurl = 'https://example.com/mcp'",
+            "transport: 'stdio'",
+            "transport: 'stdio'\nstart_command: []",
+            "transport: 'stdio'\nstart_command: ['']",
+            "transport: 'stdio'\nstart_command: ['   ']",
+            "transport: 'stdio'\nstart_command: ['server']\nurl: 'https://example.com/mcp'",
+            "transport: 'stdio'\nstart_command: ['server']\nheaders_env: { Authorization: 'TOKEN' }",
+            "transport: 'streamable_http'",
+            "transport: 'streamable_http'\nurl: ''",
+            "transport: 'streamable_http'\nurl: '/mcp'",
+            "transport: 'streamable_http'\nurl: 'ftp://example.com/mcp'",
+            "transport: 'streamable_http'\nurl: 'https://example.com/mcp'\nstart_command: []",
+            "transport: 'streamable_http'\nurl: 'https://example.com/mcp'\ncwd: 'work'",
+            "transport: 'streamable_http'\nurl: 'https://example.com/mcp'\nenv: { MODE: 'test' }",
+            "transport: 'sse'\nurl: 'https://example.com/mcp'",
         ]
         .map(String::from)
         .into();
         for extra in [
-            "capabilities = ['unknown_capability']",
-            "capabilities = ['Read']",
-            "command = ['other']",
-            "startup_timeout_secs = 0",
-            "call_timeout_secs = 0",
-            "startup_timeout_secs = -1",
-            "call_timeout_secs = -1",
-            "startup_timeout_secs = 1.5",
-            "call_timeout_secs = '120'",
+            "capabilities: ['unknown_capability']",
+            "capabilities: ['Read']",
+            "command: ['other']",
+            "startup_timeout_secs: 0",
+            "call_timeout_secs: 0",
+            "startup_timeout_secs: -1",
+            "call_timeout_secs: -1",
+            "startup_timeout_secs: 1.5",
+            "call_timeout_secs: '120'",
         ] {
             texts.push(format!("{STDIO}\n{extra}"));
         }
         for text in texts {
-            assert!(toml::from_str::<McpServerConfig>(&text).is_err(), "{text}");
+            assert!(
+                crate::yaml::parse::<McpServerConfig>(&text).is_err(),
+                "{text}"
+            );
         }
     }
 }

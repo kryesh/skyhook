@@ -156,22 +156,24 @@ mod tests {
     const VENDOR: &str = "vendor / 任意";
 
     fn config() -> Config {
-        toml::from_str(
+        Config::from_yaml(
             r#"
-[providers."vendor / 任意"]
-kind = 'openai'
-api = 'chat_completions'
-base_url = 'http://127.0.0.1:1/v1'
-[models."z first / 任意"]
-provider = 'vendor / 任意'
-model = 'external:model/version'
-max_context = 8192
-max_output = 512
-[models."a second"]
-provider = 'vendor / 任意'
-model = 'another-external-model'
-max_context = 4096
-max_output = 256
+providers:
+  vendor / 任意:
+    kind: openai
+    api: chat_completions
+    base_url: http://127.0.0.1:1/v1
+models:
+  z first / 任意:
+    provider: vendor / 任意
+    model: external:model/version
+    max_context: 8192
+    max_output: 512
+  a second:
+    provider: vendor / 任意
+    model: another-external-model
+    max_context: 4096
+    max_output: 256
 "#,
         )
         .unwrap()
@@ -258,7 +260,7 @@ max_output = 256
         let (base_url, api_key_env) = vendor(&mut raw);
         *base_url = "http://127.0.0.1:1/v1".into();
         *api_key_env = Some("SKYHOOK_EMPTY_CATALOG_MUST_NOT_LOOK_UP_SECRET".into());
-        raw.targets = toml::from_str("[root]\ntype = 'ssh'\nhost = 'unused'").unwrap();
+        raw.targets = crate::yaml::parse("root:\n  type: ssh\n  host: unused").unwrap();
         assert!(matches!(
             raw.clone().into_runtime(),
             Err(ConfigError::Structure(_))

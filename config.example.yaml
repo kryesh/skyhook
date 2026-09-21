@@ -1,0 +1,174 @@
+# The interface remembers the most recently selected model.
+# With no saved selection, the first declared model below is used.
+# Set to true to skip interactive approval for every tool call.
+approve_all: false
+# The mode a new session starts in: the built-in general, or one declared below.
+# default_mode: "general"
+
+# Modes are named permission presets. A mode's capabilities are an exact allowlist ([] grants
+# none); add "targets" for remote-target tools, arguments, JavaScript APIs, and guidance.
+# Interaction is supplied by the terminal and absent from batch jobs, never listed here.
+# Optional instructions are added to the system prompt of an agent running in the mode.
+# A hint, on a mode or a model, offers it to agents starting a child; others cannot be chosen.
+# The terminal switches modes with Tab/Shift+Tab in the composer; --mode picks the starting one.
+# This built-in mode always exists; declare it to change what it grants:
+# modes:
+#   general:
+#     capabilities: ["read", "write", "exec", "network", "agents", "mcp"]
+#
+#   readonly:
+#     capabilities: ["read", "network"]
+#     instructions: "Investigate and report. Do not change anything."
+#     hint: "Look things up without changing anything"
+
+# The CLI loads .env from its invocation directory (not --workspace or the config directory).
+# Existing process environment variables take precedence; no parent-directory search.
+# Host environment and .env values are not forwarded to remote targets.
+providers:
+  openai:
+    kind: "openai"
+    base_url: "https://api.openai.com/v1"
+    api: "responses"
+    api_key_env: "OPENAI_API_KEY"
+
+  anthropic:
+    kind: "anthropic"
+    base_url: "https://api.anthropic.com/v1"
+    api_key_env: "ANTHROPIC_API_KEY"
+    # Alternatively, remove api_key_env and retrieve a key lazily on the first request:
+    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
+    # Runs via /bin/sh -c on the host; trimmed stdout is cached for this provider.
+    # Also supported by OpenAI-compatible providers; cannot be combined with api_key_env.
+
+  # Run `skyhook auth login` (or `skyhook auth login --headless`) first.
+  # Credentials belong to Skyhook; official Codex client credentials are never accessed.
+  codex:
+    kind: "codex"
+
+  # Keyless local llama.cpp endpoint; the model alias matches --alias below.
+  # Example text-only server (requires enough memory for the configured context):
+  # llama-server --model /path/to/Qwen3.8-27B.gguf --alias qwen3.8-27b \
+  #   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 --n-predict 131072
+  local:
+    kind: "openai"
+    base_url: "http://127.0.0.1:8080/v1"
+    api: "chat_completions"
+    # Chat-only, per-provider. Default "reasoning_content" replays returned reasoning.
+    # Use "reasoning" for that wire convention, or "unsupported" to keep it local only.
+    # Other protocols replay native reasoning automatically and do not accept this option.
+    # chat_reasoning_replay: "reasoning_content"
+    # Defaults allow long local-model prefills. Startup applies to EACH HTTP attempt.
+    # startup_timeout_secs: 600
+    # read_idle_timeout_secs: 600
+
+# Published model limits; smaller budgets can be chosen for cost/latency.
+models:
+  # https://developers.openai.com/api/docs/models/gpt-5.6-sol
+  openai:
+    provider: "openai"
+    model: "gpt-5.6"
+    reasoning: "high"
+    max_context: 1050000
+    max_output: 128000
+    supports_images: true
+
+  # https://platform.claude.com/docs/en/models/sonnet-4-6/overview
+  sonnet:
+    provider: "anthropic"
+    model: "claude-sonnet-4-6"
+    reasoning: "high"
+    max_context: 1000000
+    max_output: 128000
+    supports_images: true
+
+  # Codex's catalog advertises a maximum context of 872000 (default: 272000).
+  # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
+  # max_output is required profile metadata, but is not sent to the Codex endpoint.
+  # It does not control the 80%-of-context compaction threshold.
+  codex:
+    provider: "codex"
+    model: "gpt-5.6-sol"
+    reasoning: "high"
+    max_context: 872000
+    max_output: 128000
+    supports_images: true
+
+  # https://huggingface.co/Qwen/Qwen3.8-27B
+  local:
+    provider: "local"
+    model: "qwen3.8-27b"
+    # Native context; match the llama-server per-slot context, not extended-context claims.
+    max_context: 262144
+    # Chosen total-generation cap matching --n-predict, NOT a published hard model limit.
+    # Reasoning and final text share this allowance and the overall context window.
+    max_output: 131072
+    # The text-only server above has no multimodal projector configured.
+    supports_images: false
+    # Adding a hint makes the model available to be used for delegation by other agents
+    hint: "Local model, good at exploration and logic but not writing"
+
+# Targets are defined only here or by target_add; SSH configuration files are never read.
+
+# targets:
+#   bastion:
+#     type: "ssh"
+#     host: "bastion.example.com"
+#     ssh:
+#       user: "gateway"
+#
+#   build:
+#     type: "ssh"
+#     host: "build.internal"
+#     workspace: "/srv/project"
+#     via: "bastion"
+#     ssh:
+#       user: "builder"
+#       auth:
+#         kind: "key"
+#         path: "~/.ssh/build_ed25519"
+#
+#   # Start SSH on build's shim (using build's key paths and agents), with extra
+#   # ssh_config options. Any via jump must also use origin: "build".
+#   appliance:
+#     type: "ssh"
+#     host: "appliance.internal"
+#     origin: "build"
+#     ssh:
+#       # Reach the host through a gateway using the deploy user's own SSH key (sudo must not prompt).
+#       options:
+#         ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal"
+#         ServerAliveInterval: "15"
+
+# MCP servers are optional; an absent/empty mcp mapping adds no tools or prompt guidance.
+# Commands in this user config are trusted: startup runs without model approval,
+# only on the local root/session host, never on a selected SSH target.
+# Global "mcp" capability is required before any server is launched or contacted.
+# A server's tools additionally require ALL listed capabilities; otherwise hidden.
+# Per-server capabilities defaults to [] (global mcp only, no approval prompt).
+# Valid names: read, write, exec, network, targets, ssh_agent, agents, interactive, mcp.
+# Skyhook imports tools only; discovery is frozen at startup. Failed servers warn
+# and are skipped. Tools are available both directly and inside script. Native
+# input schemas are kept unless open/conflicting, when input uses `arguments`.
+#
+# mcp:
+#   files:
+#     transport: "stdio"
+#     start_command: ["my-mcp-server", "--root", "/srv/project"] # argv, not shell text
+#     capabilities: ["read"]
+#     startup_timeout_secs: 30  # Positive integer seconds; default 30.
+#     call_timeout_secs: 120    # Positive integer seconds; default 120.
+#     cwd: "mcp-work"           # Relative to this config file's directory.
+#     env: { LOG_LEVEL: "warn" } # Startup process environment overrides, not secrets.
+#
+#   service:
+#     transport: "streamable_http"
+#     url: "http://127.0.0.1:8080/mcp" # Full MCP endpoint; legacy HTTP+SSE unsupported.
+#     capabilities: ["read", "write"]
+#     headers_env: { Authorization: "MY_MCP_AUTHORIZATION" } # Env var, not secret.
+#     # The variable must be set to a valid HTTP header value, e.g. Bearer ...
+#     # Missing/non-Unicode variables fail startup; empty values are passed through.
+#     # Connect first. Start this optional local command ONLY if the endpoint is unreachable,
+#     # never for authentication or protocol errors. cwd/env require start_command.
+#     start_command: ["my-http-mcp-server", "--port", "8080"]
+# Stdio requires start_command and rejects url/headers_env; HTTP requires url.
+# Unknown fields/capabilities, invalid combinations, and invalid timeouts are errors.

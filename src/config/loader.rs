@@ -19,7 +19,7 @@ enum LayerError {
     Invalid(String),
 }
 
-/// A rejected candidate or fatal layer error. Never includes TOML source excerpts.
+/// A rejected candidate or fatal layer error. Never includes YAML source excerpts.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ConfigDiagnostic {
     pub path: PathBuf,
@@ -51,8 +51,8 @@ impl fmt::Display for ConfigReport {
 #[derive(Clone, Debug)]
 pub struct ResolvedConfig {
     pub config: Config,
-    /// Snapshot at resolution time. Use `config.to_toml()` after caller overrides.
-    pub normalized_toml: String,
+    /// Snapshot at resolution time. Use `config.to_yaml()` after caller overrides.
+    pub normalized_yaml: String,
     pub report: ConfigReport,
 }
 
@@ -92,7 +92,7 @@ async fn resolve_paths(
         return finish(config, report);
     }
 
-    let mut merged = toml::Value::Table(toml::Table::new());
+    let mut merged = serde_json::Value::Object(serde_json::Map::new());
     let mut seen = Vec::new();
     for path in candidates {
         // Compare absolute paths as well, so relative/absolute identical candidates
@@ -127,7 +127,7 @@ async fn resolve_paths(
             diagnostic(workspace, error.to_string()),
         )
     })?;
-    let workspace_path = workspace.join(".skyhook/config.toml");
+    let workspace_path = workspace.join(".skyhook/config.yaml");
     match read_layer(&workspace_path).await {
         Ok(value) => {
             merge(&mut merged, value, &mut Vec::new());
@@ -160,13 +160,13 @@ async fn resolve_paths(
 }
 
 fn finish(config: Config, report: ConfigReport) -> Result<ResolvedConfig, ConfigError> {
-    let normalized_toml = config.to_toml().map_err(|error| ConfigError::Resolution {
+    let normalized_yaml = config.to_yaml().map_err(|error| ConfigError::Resolution {
         message: error.to_string(),
         report: report.clone(),
     })?;
     Ok(ResolvedConfig {
         config,
-        normalized_toml,
+        normalized_yaml,
         report,
     })
 }
@@ -186,46 +186,39 @@ fn diagnostic(path: &Path, message: impl Into<String>) -> ConfigDiagnostic {
     }
 }
 
-fn deserialize(value: &toml::Value) -> Result<Config, String> {
-    if value.as_table().is_none_or(toml::Table::is_empty) {
+fn deserialize(value: &serde_json::Value) -> Result<Config, String> {
+    if value.as_object().is_none_or(serde_json::Map::is_empty) {
         return Err("configuration is empty".to_owned());
     }
-    let config: Config = value.clone().try_into().map_err(|error: toml::de::Error| {
-        // Display includes source text for parser errors; message() omits it.
-        format!("invalid configuration: {}", error.message())
-    })?;
+    let config: Config = serde_json::from_value(value.clone())
+        .map_err(|error| format!("invalid configuration: {error}"))?;
     config
         .validate_structure()
         .map_err(|error| error.to_string())?;
     Ok(config)
 }
 
-async fn read_layer(path: &Path) -> Result<toml::Value, LayerError> {
+async fn read_layer(path: &Path) -> Result<serde_json::Value, LayerError> {
     let text = fs::read_to_string(path)
         .await
         .map_err(|error| match error.kind() {
             std::io::ErrorKind::NotFound => LayerError::Missing,
             _ => LayerError::Read(error),
         })?;
-    let mut value: toml::Value = toml::from_str(&text).map_err(|error: toml::de::Error| {
-        let location = error
-            .span()
-            .map(|span| {
-                let line = text[..span.start.min(text.len())]
-                    .bytes()
-                    .filter(|b| *b == b'\n')
-                    .count()
-                    + 1;
-                format!(" at line {line}")
-            })
-            .unwrap_or_default();
-        LayerError::Invalid(format!("invalid TOML{location}: {}", error.message()))
-    })?;
+    let mut value: serde_json::Value = crate::yaml::parse(&text).map_err(LayerError::Invalid)?;
+    if !value.is_object() {
+        return Err(LayerError::Invalid(
+            "configuration must be a mapping".into(),
+        ));
+    }
     // Convert only source-file-relative values before merging. Thus an inherited
     // cwd retains its own layer's directory even if sibling fields are overridden.
     // session_root intentionally keeps its historical process-CWD-relative meaning;
     // target workspace and SSH key paths belong to another host, not this file.
-    if let Some(servers) = value.get_mut("mcp").and_then(toml::Value::as_table_mut) {
+    if let Some(servers) = value
+        .get_mut("mcp")
+        .and_then(serde_json::Value::as_object_mut)
+    {
         let absolute =
             std::path::absolute(path).map_err(|error| LayerError::Invalid(error.to_string()))?;
         let directory = absolute
@@ -236,7 +229,7 @@ async fn read_layer(path: &Path) -> Result<toml::Value, LayerError> {
                 && let Some(relative) = cwd.as_str()
                 && Path::new(relative).is_relative()
             {
-                *cwd = toml::Value::String(
+                *cwd = serde_json::Value::String(
                     directory
                         .join(relative)
                         .to_str()
@@ -251,9 +244,9 @@ async fn read_layer(path: &Path) -> Result<toml::Value, LayerError> {
     Ok(value)
 }
 
-fn merge(base: &mut toml::Value, overlay: toml::Value, path: &mut Vec<String>) {
+fn merge(base: &mut serde_json::Value, overlay: serde_json::Value, path: &mut Vec<String>) {
     match (base, overlay) {
-        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
             for (key, value) in overlay {
                 // A target's or mode's omitted fields must never leak in from another layer.
                 if matches!(path.as_slice(), [table] if table == "targets" || table == "modes") {
@@ -278,9 +271,8 @@ mod tests {
     use super::*;
     use crate::target::TargetAuth;
 
-    const MODEL: &str =
-        "[models.main]\nprovider = 'local'\nmodel = 'test'\nmax_context = 4096\nmax_output = 512\n";
-    const PROVIDER: &str = "[providers.local]\nkind = 'openai'\nbase_url = 'https://example.com/v1'\napi = 'chat_completions'\n";
+    const MODEL: &str = "models:\n  main:\n    provider: local\n    model: test\n    max_context: 4096\n    max_output: 512\n";
+    const PROVIDER: &str = "providers:\n  local:\n    kind: openai\n    base_url: https://example.com/v1\n    api: chat_completions\n";
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -294,9 +286,9 @@ mod tests {
         fn new() -> Self {
             let root = tempfile::tempdir().unwrap();
             let workspace = root.path().join("project");
-            let xdg = root.path().join("xdg/skyhook/config.toml");
-            let home = root.path().join("home/.config/skyhook/config.toml");
-            let local = workspace.join(".skyhook/config.toml");
+            let xdg = root.path().join("xdg/skyhook/config.yaml");
+            let home = root.path().join("home/.config/skyhook/config.yaml");
+            let local = workspace.join(".skyhook/config.yaml");
             for path in [&xdg, &home, &local] {
                 std::fs::create_dir_all(path.parent().unwrap()).unwrap();
             }
@@ -326,9 +318,9 @@ mod tests {
     #[tokio::test]
     async fn xdg_wins_without_even_reading_home_and_workspace_merges() {
         let f = Fixture::new();
-        write(&f.xdg, format!("approve_all = true\n{MODEL}{PROVIDER}"));
+        write(&f.xdg, format!("approve_all: true\n{MODEL}{PROVIDER}"));
         std::fs::create_dir(&f.home).unwrap(); // Would be a read error if probed.
-        write(&f.local, "[models.main]\nmodel = 'workspace-model'\n");
+        write(&f.local, "models:\n  main:\n    model: workspace-model\n");
         let resolved = f.resolve().await.unwrap();
         assert_eq!(resolved.report.sources, [f.xdg.clone(), f.local.clone()]);
         assert!(resolved.report.diagnostics.is_empty());
@@ -346,19 +338,20 @@ mod tests {
         None, // missing
         Some(b"DIRECTORY"), // read failure, works even when tests run as root
         Some(b"\xff\xfe"), // invalid UTF-8
-        Some(b"approve_all = true\n[malformed"), // TOML
-        Some(b"approve_all = true\nmax_child_depth = 'bad'"), // serde type
-        Some(b"approve_all = true\nunrecognized = 1"), // serde unknown field
-        Some(b"approve_all = true\n[modes.bad]\ncapabilities = ['interactive']"),
-        Some(b"approve_all = true\n[models.bad]\nprovider = 'local'\nmodel = 'bad'\nmax_context = 10\nmax_output = 10"),
-        Some(b"approve_all = true\n[targets.bad]\ntype = 'ssh'\nhost = 'bad host'"),
-        Some(b"approve_all = true\n[mcp.bad]\ntransport = 'stdio'\nstart_command = []"),
-        Some(b"approve_all = true\n[providers.bad]\nkind = 'anthropic'\nbase_url = 'https://example.com'\napi_key_env = 'KEY'\napi_key_command = 'echo key'"),
-        Some(b"approve_all = true\n[providers.bad]\nkind = 'anthropic'\nbase_url = 'https://example.com'\nstartup_timeout_secs = 0"),
-        Some(b"approve_all = true\n[providers.bad]\nkind = 'anthropic'\nbase_url = 'relative'"),
-        Some(b"approve_all = true\n[providers.bad]\nkind = 'anthropic'\nbase_url = 'https://example.com'\napi_key_command = '  '"),
-        Some(b"approve_all = true\n[providers.bad]\nkind = 'openai'\nbase_url = 'https://example.com'\napi = 'responses'\nchat_reasoning_replay = 'reasoning'"),
-        Some(b"approve_all = true\n[targets.a]\ntype = 'ssh'\nhost = 'a'\nvia = 'b'\n[targets.b]\ntype = 'ssh'\nhost = 'b'\nvia = 'a'"), // route cycle
+        Some(b"approve_all: true\nmalformed: ["), // YAML
+        Some(b"approve_all: true\nmax_child_depth: bad"), // serde type
+        Some(b"approve_all: true\nunrecognized: 1"), // serde unknown field
+        Some(b"approve_all: false\n!!binary YXBwcm92ZV9hbGw=: true"), // coerced key collision
+        Some(b"approve_all: true\nmodes:\n  bad:\n    capabilities: [interactive]"),
+        Some(b"approve_all: true\nmodels:\n  bad:\n    provider: local\n    model: bad\n    max_context: 10\n    max_output: 10"),
+        Some(b"approve_all: true\ntargets:\n  bad:\n    type: ssh\n    host: bad host"),
+        Some(b"approve_all: true\nmcp:\n  bad:\n    transport: stdio\n    start_command: []"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: anthropic\n    base_url: https://example.com\n    api_key_env: 'KEY'\n    api_key_command: 'echo key'"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: anthropic\n    base_url: https://example.com\n    startup_timeout_secs: 0"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: anthropic\n    base_url: relative"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: anthropic\n    base_url: https://example.com\n    api_key_command: '  '"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: openai\n    base_url: https://example.com\n    api: responses\n    chat_reasoning_replay: reasoning"),
+        Some(b"approve_all: true\ntargets:\n  a:\n    type: ssh\n    host: a\n    via: b\n  b:\n    type: ssh\n    host: b\n    via: a"), // route cycle
         Some(b""),
     ];
         for bytes in invalid {
@@ -383,7 +376,7 @@ mod tests {
             assert!(resolved.config.providers.is_empty());
             assert!(resolved.config.targets.entries.is_empty(), "{bytes:?}");
             // The diagnostic names the actual cause, shown here for the route cycle.
-            let cyclic = bytes.is_some_and(|bytes| bytes.ends_with(b"via = 'a'"));
+            let cyclic = bytes.is_some_and(|bytes| bytes.ends_with(b"via: a"));
             let message = &resolved.report.diagnostics[0].message;
             assert_eq!(message.contains(CYCLE), cyclic, "{bytes:?}: {message}");
         }
@@ -392,14 +385,14 @@ mod tests {
     #[tokio::test]
     async fn failed_candidates_are_reported_if_no_usable_config_exists() {
         let f = Fixture::new();
-        write(&f.xdg, "approve_all = 'not-a-bool'");
+        write(&f.xdg, "approve_all: not-a-bool");
         write(&f.home, "[broken");
         let error = f.resolve().await.unwrap_err();
         assert_eq!(error.report().unwrap().diagnostics.len(), 2);
         let message = error.to_string();
         assert!(message.contains(f.xdg.to_str().unwrap()));
         assert!(message.contains(f.home.to_str().unwrap()));
-        assert!(!message.contains("approve_all =") && !message.contains("[broken"));
+        assert!(!message.contains("approve_all:") && !message.contains("[broken"));
     }
 
     #[tokio::test]
@@ -422,9 +415,9 @@ mod tests {
         for bytes in [
             b"[invalid".as_slice(),
             b"\xff",
-            b"max_child_depth = 'wrong'",
-            b"[models.main]\nmax_output = 0",
-            b"[targets.bad]\ntype = 'ssh'", // Atomic/incomplete target.
+            b"max_child_depth: wrong",
+            b"models:\n  main:\n    max_output: 0",
+            b"targets:\n  bad:\n    type: ssh", // Atomic/incomplete target.
         ] {
             let f = Fixture::new();
             write(&f.home, MODEL);
@@ -470,10 +463,13 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "{MODEL}\n[targets.changed]\ntype = 'ssh'\nhost = 'old'\nworkspace = '/old'\nvia = 'retained'\nssh.user = 'old-user'\nssh.port = 2222\nssh.auth = {{ kind = 'key', path = '/old-key' }}\n[targets.retained]\ntype = 'ssh'\nhost = 'other'\n"
+                "{MODEL}\ntargets:\n  changed:\n    type: ssh\n    host: old\n    workspace: /old\n    via: retained\n    ssh:\n      user: old-user\n      port: 2222\n      auth: {{kind: key, path: /old-key}}\n  retained:\n    type: ssh\n    host: other\n"
             ),
         );
-        write(&f.local, "[targets.changed]\ntype = 'ssh'\nhost = 'new'\n");
+        write(
+            &f.local,
+            "targets:\n  changed:\n    type: ssh\n    host: new\n",
+        );
         let targets = f.resolve().await.unwrap().config.targets;
         assert!(targets.entries.contains_key("retained"));
         let changed = &targets.entries["changed"];
@@ -485,7 +481,7 @@ mod tests {
             (&changed.ssh.user, changed.ssh.port, &changed.ssh.auth),
             (&None, None, &TargetAuth::Default)
         );
-        write(&f.local, "[targets.changed]\nhost = 'incomplete'\n");
+        write(&f.local, "targets:\n  changed:\n    host: incomplete\n");
         assert!(
             f.resolve().await.is_err(),
             "target must not inherit required type"
@@ -498,12 +494,12 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "{MODEL}\n[modes.changed]\ncapabilities = ['read', 'exec']\ninstructions = 'old'\n[modes.retained]\ncapabilities = ['read']\n"
+                "{MODEL}\nmodes:\n  changed:\n    capabilities: [read, exec]\n    instructions: old\n  retained:\n    capabilities: [read]\n"
             ),
         );
         write(
             &f.local,
-            "default_mode = 'retained'\n[modes.changed]\ncapabilities = []\n",
+            "default_mode: retained\nmodes:\n  changed:\n    capabilities: []\n",
         );
         let config = f.resolve().await.unwrap().config;
         assert_eq!(
@@ -513,7 +509,7 @@ mod tests {
         assert_eq!(config.default_mode, "retained");
         let changed = &config.modes["changed"];
         assert!(changed.capabilities.is_empty() && changed.instructions.is_none());
-        write(&f.local, "[modes.changed]\ninstructions = 'new'\n");
+        write(&f.local, "modes:\n  changed:\n    instructions: new\n");
         assert!(
             f.resolve().await.is_err(),
             "mode must not inherit capabilities"
@@ -526,12 +522,12 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "max_child_depth = 8\n{MODEL}\n[mcp.test]\ntransport = 'stdio'\nstart_command = ['old', 'arg']\ncapabilities = ['read']\nstartup_timeout_secs = 77\nenv = {{ A = 'a', B = 'b' }}\n"
+                "max_child_depth: 8\n{MODEL}\nmcp:\n  test:\n    transport: stdio\n    start_command: [old, arg]\n    capabilities: [read]\n    startup_timeout_secs: 77\n    env: {{A: a, B: b}}\n"
             ),
         );
         write(
             &f.local,
-            "[mcp.test]\nstart_command = ['new']\ncapabilities = []\nenv = { B = 'changed', C = 'c' }\n",
+            "mcp:\n  test:\n    start_command: [new]\n    capabilities: []\n    env: {B: changed, C: c}\n",
         );
         let resolved = f.resolve().await.unwrap();
         assert_eq!(resolved.config.max_child_depth, 8);
@@ -548,9 +544,10 @@ mod tests {
         );
         let env = raw.env;
         assert_eq!((&*env["A"], &*env["B"], &*env["C"]), ("a", "changed", "c"));
-        let round_trip: Config = toml::from_str(&resolved.normalized_toml).unwrap();
+        let round_trip = Config::from_yaml(&resolved.normalized_yaml).unwrap();
         assert_eq!(round_trip.mcp["test"].startup_timeout().as_secs(), 77);
-        assert!(resolved.normalized_toml.contains("call_timeout_secs = 120"));
+        assert!(resolved.normalized_yaml.contains("call_timeout_secs: 120"));
+        assert!(!resolved.normalized_yaml.contains("null"));
     }
 
     #[tokio::test]
@@ -559,12 +556,12 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "session_root = 'sessions'\n{MODEL}\n[mcp.inherited]\ntransport = 'stdio'\nstart_command = ['old']\ncwd = 'user-work'\n[mcp.changed]\ntransport = 'stdio'\nstart_command = ['old']\ncwd = 'old-work'\n[targets.remote]\ntype = 'ssh'\nhost = 'host'\nworkspace = 'remote-work'\nssh.auth = {{ kind = 'key', path = 'origin-key' }}\n"
+                "session_root: sessions\n{MODEL}\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  changed:\n    transport: stdio\n    start_command: [old]\n    cwd: old-work\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      auth: {{kind: key, path: origin-key}}\n"
             ),
         );
         write(
             &f.local,
-            "[mcp.inherited]\nstart_command = ['new']\n[mcp.changed]\ncwd = 'workspace-work'\n",
+            "mcp:\n  inherited:\n    start_command: [new]\n  changed:\n    cwd: workspace-work\n",
         );
         let config = f.resolve().await.unwrap().config;
         let user_work = f.xdg.parent().unwrap().join("user-work");
@@ -588,19 +585,95 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "{MODEL}{PROVIDER}\napi_key_env = 'SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY'\n[providers.command]\nkind = 'anthropic'\nbase_url = 'https://example.com'\napi_key_command = 'touch {}'\n[providers.subscription]\nkind = 'codex'\n",
+                "{MODEL}{PROVIDER}    api_key_env: SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY\n  command:\n    kind: anthropic\n    base_url: https://example.com\n    api_key_command: 'touch {}'\n  subscription:\n    kind: codex\n",
                 marker.display()
             ),
         );
         let mut resolved = f.resolve().await.unwrap();
         assert!(resolved.report.diagnostics.is_empty());
-        assert!(resolved.normalized_toml.contains("api_key_env"));
+        assert!(resolved.normalized_yaml.contains("api_key_env"));
         resolved.config.approve_all = true;
         resolved.config.modes[0].capabilities.clear();
-        let config: Config = toml::from_str(&resolved.config.to_toml().unwrap()).unwrap();
+        let config = Config::from_yaml(&resolved.config.to_yaml().unwrap()).unwrap();
         assert!(config.approve_all);
         assert!(config.modes[0].capabilities.is_empty());
         assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn model_order_survives_merging_dumping_and_runtime_admission() {
+        let f = Fixture::new();
+        let models = "models:\n  'true': &profile\n    provider: local\n    model: '42'\n    max_context: 4096\n    max_output: 512\n  '42': *profile\n";
+        write(&f.xdg, format!("{PROVIDER}{models}"));
+        write(
+            &f.local,
+            "models:\n  'true':\n    max_output: 256\n  'null':\n    provider: local\n    model: 'true'\n    max_context: 4096\n    max_output: 512\n",
+        );
+        let resolved = f.resolve().await.unwrap();
+        let config = Config::from_yaml(&resolved.normalized_yaml).unwrap();
+        assert_eq!(
+            config.models.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["true", "42", "null"]
+        );
+        assert_eq!(config.models["true"].max_output, 256);
+        assert_eq!(config.models["true"].model, "42");
+        assert_eq!(config.models["null"].model, "true");
+        assert_eq!(config.into_runtime().unwrap().first_model().name(), "true");
+    }
+
+    #[tokio::test]
+    async fn null_clears_optional_values_but_does_not_delete_entries_or_apply_defaults() {
+        let f = Fixture::new();
+        write(
+            &f.xdg,
+            format!("{MODEL}{PROVIDER}    api_key_env: UNUSED_KEY\n"),
+        );
+        write(
+            &f.local,
+            "providers:\n  local:\n    api_key_env: null\n    api_key_command: echo unused\n",
+        );
+        let config = f.resolve().await.unwrap().config;
+        let crate::config::ProviderConfig::Openai {
+            api_key_env,
+            api_key_command,
+            ..
+        } = &config.providers["local"]
+        else {
+            panic!("expected OpenAI provider");
+        };
+        assert!(api_key_env.is_none());
+        assert_eq!(api_key_command.as_deref(), Some("echo unused"));
+
+        for overlay in [
+            "approve_all: null",
+            "models: null",
+            "models: {main: null}",
+            "modes: null",
+            "providers: {local: null}",
+        ] {
+            write(&f.local, overlay);
+            assert!(f.resolve().await.is_err(), "accepted {overlay}");
+        }
+    }
+
+    #[tokio::test]
+    async fn each_layer_requires_a_mapping_and_the_effective_config_must_not_be_empty() {
+        let f = Fixture::new();
+        write(&f.xdg, MODEL);
+        for document in ["", "# comment only", "null", "scalar", "[one, two]"] {
+            write(&f.local, document);
+            assert!(
+                f.resolve().await.is_err(),
+                "accepted workspace {document:?}"
+            );
+            assert!(Config::resolve(&f.workspace, Some(&f.local)).await.is_err());
+        }
+        write(&f.local, "{}");
+        assert!(
+            f.resolve().await.is_ok(),
+            "an empty mapping overlay is a no-op"
+        );
+        assert!(Config::resolve(&f.workspace, Some(&f.local)).await.is_err());
     }
 
     #[tokio::test]
@@ -618,11 +691,15 @@ mod tests {
         assert_eq!(resolved.report.diagnostics.len(), 1);
     }
 
-    fn target(name: &str, via: Option<&str>) -> String {
-        let via = via
-            .map(|name| format!("via = '{name}'\n"))
-            .unwrap_or_default();
-        format!("[targets.{name}]\ntype = 'ssh'\nhost = '{name}'\n{via}")
+    fn targets(entries: &[(&str, Option<&str>)]) -> String {
+        let mut text = String::from("targets:\n");
+        for (name, via) in entries {
+            text.push_str(&format!("  {name}:\n    type: ssh\n    host: {name}\n"));
+            if let Some(via) = via {
+                text.push_str(&format!("    via: {via}\n"));
+            }
+        }
+        text
     }
 
     const CYCLE: &str = "target route contains a cycle";
@@ -631,8 +708,8 @@ mod tests {
     async fn explicit_and_merged_target_cycles_are_rejected() {
         // Explicit files, including self cycles, report only the explicit file.
         for config in [
-            target("a", Some("a")),
-            format!("{}{}", target("a", Some("b")), target("b", Some("a"))),
+            targets(&[("a", Some("a"))]),
+            targets(&[("a", Some("b")), ("b", Some("a"))]),
         ] {
             let f = Fixture::new();
             write(&f.xdg, config);
@@ -648,12 +725,12 @@ mod tests {
         }
         // Merged cycles are fatal, including when a workspace replaces a definition.
         for user in [
-            target("a", Some("b")),
-            format!("{}{}", target("a", Some("b")), target("b", None)),
+            targets(&[("a", Some("b"))]),
+            targets(&[("a", Some("b")), ("b", None)]),
         ] {
             let f = Fixture::new();
             write(&f.xdg, user);
-            write(&f.local, target("b", Some("a")));
+            write(&f.local, targets(&[("b", Some("a"))]));
             let error = f.resolve().await.unwrap_err();
             assert!(error.to_string().contains("effective configuration failed"));
             assert!(error.to_string().contains(CYCLE));
@@ -669,7 +746,7 @@ mod tests {
         use crate::target::{TargetError, TargetRegistry};
 
         let f = Fixture::new();
-        write(&f.xdg, target("a", Some("b")));
+        write(&f.xdg, targets(&[("a", Some("b"))]));
         // Names may be supplied later by workspace config or at runtime.
         let partial = f.resolve().await.unwrap();
         assert_eq!(partial.report.sources, std::slice::from_ref(&f.xdg));
@@ -678,10 +755,7 @@ mod tests {
             TargetRegistry::from_definitions(partial.config.targets.definitions().unwrap()),
             Err(TargetError::UnknownJump(name)) if name == "b"
         ));
-        write(
-            &f.local,
-            format!("{}{}", target("b", Some("c")), target("c", None)),
-        );
+        write(&f.local, targets(&[("b", Some("c")), ("c", None)]));
         let resolved = f.resolve().await.unwrap();
         assert!(resolved.report.diagnostics.is_empty());
         let registry =
@@ -696,14 +770,14 @@ mod tests {
     async fn root_is_implicit_and_local_named_targets_remain_invalid() {
         let f = Fixture::new();
         for config in [
-            target("root", None),
-            target("a", Some("root")),
-            "[targets.a]\ntype = 'local'\nhost = 'localhost'\n".to_owned(),
+            targets(&[("root", None)]),
+            targets(&[("a", Some("root"))]),
+            "targets:\n  a:\n    type: local\n    host: localhost\n".to_owned(),
         ] {
             write(&f.xdg, config);
             assert!(Config::resolve(&f.workspace, Some(&f.xdg)).await.is_err());
         }
-        write(&f.xdg, target("a", None));
+        write(&f.xdg, targets(&[("a", None)]));
         assert!(Config::resolve(&f.workspace, Some(&f.xdg)).await.is_ok());
     }
 }

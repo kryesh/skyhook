@@ -93,7 +93,7 @@ struct SkillEntry {
     description: String,
     root: PathBuf,
     instructions: String,
-    frontmatter: serde_yaml::Value,
+    frontmatter: serde_json::Value,
 }
 
 impl HostSkills {
@@ -139,7 +139,7 @@ impl HostSkills {
         let (mut text, mut errors) = (String::new(), self.warnings.to_vec());
         let mut unreadable = Vec::new();
         for entry in self.entries.values() {
-            let yaml = serde_yaml::to_string(&entry.frontmatter)
+            let yaml = serde_saphyr::to_string(&entry.frontmatter)
                 .unwrap_or_else(|error| format!("[cannot render YAML: {error}]"));
             // The canonical root may have been replaced since discovery; links are not followed.
             let listed = match fs::symlink_metadata(&entry.root).await {
@@ -300,16 +300,13 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, String> {
     })
 }
 
-#[derive(Deserialize)]
-struct Frontmatter {
-    description: Option<String>,
-}
+fn parse_instructions(instructions: &str) -> Result<(String, serde_json::Value), String> {
+    use serde_json::Value;
 
-fn parse_instructions(instructions: &str) -> Result<(String, serde_yaml::Value), String> {
     // Normalize only for parsing: the stored instructions retain their original bytes.
     let normalized = instructions.replace("\r\n", "\n");
     let instructions = normalized.as_str();
-    let mut metadata = serde_yaml::Value::Null;
+    let mut metadata = Value::Null;
     let body = if let Some(rest) = instructions.strip_prefix("---\n") {
         let (frontmatter, body) = rest
             .split_once("\n---\n")
@@ -318,15 +315,21 @@ fn parse_instructions(instructions: &str) -> Result<(String, serde_yaml::Value),
                     .map(|frontmatter| (frontmatter, ""))
             })
             .ok_or_else(|| "unterminated YAML frontmatter".to_owned())?;
-        metadata = serde_yaml::from_str(frontmatter)
+        metadata = crate::yaml::from_str(frontmatter)
             .map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
-        // Keep the original typed YAML validation. Deserializing this from Value
-        // instead changes serde_yaml's scalar-to-string coercion (for example a
-        // numeric description), and can change the existing runtime summary.
-        // Both views are produced here once at discovery, never at inventory time.
-        let parsed: Frontmatter = serde_yaml::from_str(frontmatter)
-            .map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
-        if let Some(description) = parsed.description.filter(|value| !value.trim().is_empty()) {
+        let description = match &metadata {
+            Value::Null => None,
+            Value::Object(fields) => fields.get("description"),
+            _ => return Err("invalid YAML frontmatter: expected a mapping".to_owned()),
+        };
+        let description = match description {
+            None | Some(Value::Null) => String::new(),
+            Some(Value::String(text)) => text.clone(),
+            Some(_) => {
+                return Err("invalid YAML frontmatter: description must be a string".to_owned());
+            }
+        };
+        if !description.trim().is_empty() {
             return Ok((compact_description(description.trim()), metadata));
         }
         body
@@ -667,11 +670,22 @@ mod tests {
     fn summary_comes_from_a_string_description_else_the_first_prose() {
         for (yaml, expected) in [
             ("description: a summary", Some("a summary")),
+            ("description: '  a summary  '", Some("a summary")),
+            (
+                "description: >-\n  a folded\n  summary",
+                Some("a folded summary"),
+            ),
             ("description: null", Some("Fallback prose")),
+            ("description:", Some("Fallback prose")),
             ("description: ''", Some("Fallback prose")),
+            ("description: '  '", Some("Fallback prose")),
             ("other: value", Some("Fallback prose")),
-            ("description: true", Some("true")),
+            ("description: 'true'", Some("true")),
+            ("description: true", None),
+            ("description: 42", None),
+            ("description: 0x10", None),
             ("description: [invalid]", None),
+            ("description: {invalid: value}", None),
             ("scalar", None),
         ] {
             let parsed = parse_instructions(&format!("---\n{yaml}\n---\nFallback prose"));
@@ -684,7 +698,7 @@ mod tests {
         let summary = |text: &str| parse_instructions(text).map(|parsed| parsed.0);
         assert_eq!(
             parse_instructions("# Heading\r\n\r\nProse here").unwrap(),
-            ("Prose here".to_owned(), serde_yaml::Value::Null)
+            ("Prose here".to_owned(), serde_json::Value::Null)
         );
         assert_eq!(
             summary("---\r\ndescription: summary\r\n---\r\nBody").unwrap(),
@@ -693,6 +707,30 @@ mod tests {
         assert!(summary("---\ndescription: unterminated").is_err());
         assert!(summary("# Heading only").is_err());
         assert_eq!(summary(&"é".repeat(600)).unwrap().chars().count(), 512);
+    }
+
+    #[test]
+    fn frontmatter_retains_json_metadata_and_rejects_yaml_only_values() {
+        let (_, metadata) = parse_instructions(
+            "---\ndescription: summary\nextra: [0x10, {two: null}]\nother: yes\n---\nBody",
+        )
+        .unwrap();
+        assert_eq!(
+            metadata,
+            json!({"description": "summary", "extra": [16, {"two": null}], "other": "yes"})
+        );
+        for yaml in [
+            "description: !custom value",
+            "extra: !custom value",
+            "extra: .nan",
+            "extra: {1: value}",
+            "extra: {[a, b]: value}",
+            "extra: {same: 1, same: 2}",
+            "extra: {<<: {merged: value}}",
+        ] {
+            let error = parse_instructions(&format!("---\n{yaml}\n---\nBody")).unwrap_err();
+            assert!(error.starts_with("invalid YAML frontmatter:"), "{error}");
+        }
     }
 
     #[tokio::test]

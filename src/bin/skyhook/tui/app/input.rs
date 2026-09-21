@@ -558,10 +558,11 @@ mod tests {
     async fn tab_steps_modes_in_the_composer_and_rows_in_the_focused_pane() {
         let (_root, mut app) = draft_fixture().await;
         let mut config = app.launch.model.config().config().clone();
-        config.modes = toml::from_str(
-            "[general]\ncapabilities=['read']\n[look]\ncapabilities=[]\n[none]\ncapabilities=[]",
+        config.modes = skyhook::config::Config::from_yaml(
+            "modes:\n  general:\n    capabilities: [read]\n  look:\n    capabilities: []\n  none:\n    capabilities: []",
         )
-        .unwrap();
+        .unwrap()
+        .modes;
         app.launch.model = config.into_runtime().unwrap().first_model();
         // A session offers the modes it was opened with.
         let session = app.launch.create(None).await.unwrap();

@@ -158,7 +158,7 @@ impl HarnessBuilder {
 
     /// Load user instructions, then instructions from the resolved workspace
     /// (the more local scope), then append library-supplied instructions.
-    /// Instruction discovery is independent of the TOML configuration path.
+    /// Instruction discovery is independent of the YAML configuration path.
     pub async fn build(self) -> Result<Harness, HarnessError> {
         let workspace = fs::canonicalize(&self.workspace).await?;
         let default_model_profile = self
@@ -238,7 +238,7 @@ fn validate_model_profiles(
 
 const AGENT_INSTRUCTION_NAMES: [&str; 4] = ["AGENTS.md", "agents.md", "Agents.md", "AGENTS.MD"];
 
-// Instruction discovery deliberately does not depend on the selected TOML config.
+// Instruction discovery deliberately does not depend on the selected YAML config.
 fn user_instruction_directories(
     xdg_config_home: Option<std::ffi::OsString>,
     home: Option<std::ffi::OsString>,
