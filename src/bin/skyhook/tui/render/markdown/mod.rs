@@ -9,9 +9,9 @@ mod tables;
 use ratatui::text::Line;
 
 pub(super) use layout::layout_highlighted;
-pub(super) use parser::options;
 #[cfg(test)]
 pub(super) use parser::tests::{render, render_highlighted};
+pub(super) use parser::{Fence, options};
 
 /// Source and decoration stay separate: wrapping and code padding must not add
 /// bytes/newlines to selection. Prefix boundaries are recorded by the parser,

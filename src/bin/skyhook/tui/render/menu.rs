@@ -61,7 +61,7 @@ pub(super) fn agent_symbol(
         State::Waiting(WaitReason::Permission) | State::Job(JobState::AwaitingApproval) => "◇",
         State::Waiting(WaitReason::Input | WaitReason::ParentInput)
         | State::Job(JobState::WaitingInput) => "?",
-        State::Waiting(WaitReason::Child) => "◷",
+        State::Waiting(WaitReason::Child | WaitReason::Event) => "◷",
         _ if terminal => "✓",
         _ => "·",
     }

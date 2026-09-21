@@ -468,6 +468,7 @@ mod tests {
             name: None,
             tool: "exec".into(),
             role,
+            activity: projection::JobActivity::Work,
             args: serde_json::json!({"argv": ["echo"]}),
             parent: None,
             state,

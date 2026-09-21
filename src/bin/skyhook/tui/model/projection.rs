@@ -23,6 +23,7 @@ pub enum WaitReason {
     Permission,
     Input,
     Child,
+    Event,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -56,6 +57,7 @@ impl AgentDisplayState {
                 WaitReason::Permission => "Waiting for permission",
                 WaitReason::Input => "Waiting for input",
                 WaitReason::Child => "Waiting for child",
+                WaitReason::Event => "Waiting",
             }
             .into(),
             Self::Job(state) => state_name(state).into(),
@@ -117,6 +119,12 @@ impl AgentInfo {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum JobActivity {
+    Work,
+    Wait,
+}
+
 #[derive(Clone)]
 pub struct JobInfo {
     pub id: JobId,
@@ -124,6 +132,7 @@ pub struct JobInfo {
     pub name: Option<String>,
     pub tool: String,
     pub role: JobRole,
+    pub(super) activity: JobActivity,
     pub args: Value,
     pub parent: Option<JobId>,
     pub state: JobState,
@@ -295,6 +304,10 @@ impl Projection {
                             name: name.clone(),
                             tool: tool.clone(),
                             role: *role,
+                            activity: match (role, tool.as_str()) {
+                                (JobRole::Tool, "wait") => JobActivity::Wait,
+                                _ => JobActivity::Work,
+                            },
                             args: arguments.clone(),
                             parent: *parent,
                             state: JobState::Queued,
@@ -531,6 +544,12 @@ impl Projection {
                     .any(|j| j.role == JobRole::Question || j.state == JobState::WaitingInput)
                 {
                     State::Waiting(WaitReason::Input)
+                } else if jobs
+                    .iter()
+                    .any(|j| j.activity == JobActivity::Wait && j.state == JobState::Running)
+                {
+                    // A wait pauses the agent even while its background jobs keep running.
+                    State::Waiting(WaitReason::Event)
                 } else if !jobs.is_empty() && jobs.iter().all(|j| j.role == JobRole::Agent) {
                     State::Waiting(WaitReason::Child)
                 } else if matches!(activity, Some(AgentActivity::Tools)) || !jobs.is_empty() {
@@ -646,6 +665,15 @@ mod tests {
             projection.status(&agent, &snapshot),
             State::Waiting(WaitReason::Child)
         );
+        let wait = JobInfo {
+            activity: JobActivity::Wait,
+            ..job(&agent, 4, JobRole::Tool, JobState::Running)
+        };
+        projection.jobs.insert(wait.id, wait);
+        assert_eq!(
+            projection.status(&agent, &snapshot),
+            State::Waiting(WaitReason::Event)
+        );
         let question = job(&agent, 3, JobRole::Question, JobState::Running);
         projection.jobs.insert(question.id, question);
         assert_eq!(
@@ -666,6 +694,61 @@ mod tests {
             projection.status(&agent, &snapshot),
             State::Waiting(WaitReason::Child)
         );
+    }
+
+    #[test]
+    fn wait_tool_status_tracks_classification_and_settlement() {
+        use AgentDisplayState as State;
+        let agent = agent();
+        let waiting = State::Waiting(WaitReason::Event);
+        assert_eq!(waiting.label(), "Waiting");
+        for (tool, role, running) in [
+            ("wait", JobRole::Tool, waiting),
+            ("exec", JobRole::Tool, State::RunningTools),
+            ("wait_fixture", JobRole::Tool, State::RunningTools),
+            ("wait", JobRole::Script, State::RunningTools),
+        ] {
+            let mut snapshot = ObservationSnapshot::default();
+            let mut projection = Projection::default();
+            // A wait pauses the agent even with other owned work still running.
+            let work = job(&agent, 1, JobRole::Tool, JobState::Running);
+            projection.jobs.insert(work.id, work);
+            let candidate = job(&agent, 2, role, JobState::Queued);
+            record(
+                &mut snapshot,
+                &agent.id,
+                SessionEvent::JobCreated {
+                    job: candidate.id,
+                    parent: None,
+                    origin: None,
+                    tool: tool.into(),
+                    role,
+                    name: None,
+                    arguments: candidate.args,
+                    output_schema: None,
+                    accepts_input: false,
+                    background: false,
+                    authorization_scope: None,
+                    location: candidate.location,
+                },
+            );
+            for (state, expected) in [
+                (JobState::Queued, State::RunningTools),
+                (JobState::Running, running),
+                (JobState::Completed, State::RunningTools),
+            ] {
+                record(
+                    &mut snapshot,
+                    &agent.id,
+                    SessionEvent::JobStateChanged {
+                        job: candidate.id,
+                        state,
+                    },
+                );
+                projection.rebuild(&snapshot);
+                assert_eq!(projection.status(&agent, &snapshot), expected, "{tool}");
+            }
+        }
     }
 
     #[test]

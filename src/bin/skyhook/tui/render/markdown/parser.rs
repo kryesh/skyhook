@@ -7,6 +7,7 @@ use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
 };
+use std::ops::Range;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(super) struct LineInfo {
@@ -39,6 +40,34 @@ pub(in super::super) fn options() -> Options {
     Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS
 }
 
+/// Pulldown emits an end event even for an unfinished fence. Its source range
+/// includes a real closing marker, but text events consume invalid candidates.
+/// Track the un-emitted tail so EOF/container closure cannot enable highlighting.
+pub(in super::super) struct Fence {
+    marker: u8,
+    tail: Range<usize>,
+}
+
+impl Fence {
+    pub(in super::super) fn new(text: &str, range: Range<usize>) -> Self {
+        let body = text[range.clone()]
+            .find('\n')
+            .map_or(range.end, |end| range.start + end + 1);
+        Self {
+            marker: text.as_bytes()[range.start],
+            tail: body..range.end,
+        }
+    }
+
+    pub(in super::super) fn text(&mut self, end: usize) {
+        self.tail.start = end;
+    }
+
+    pub(in super::super) fn closed(self, text: &str) -> bool {
+        text.as_bytes()[self.tail].contains(&self.marker)
+    }
+}
+
 #[derive(Default)]
 struct List {
     next: Option<u64>,
@@ -55,7 +84,11 @@ enum Container {
 
 enum CodeSource {
     Literal,
-    Named { language: String, source: String },
+    Named {
+        language: String,
+        source: String,
+        fence: Fence,
+    },
 }
 
 struct ActiveCodeBlock {
@@ -65,6 +98,7 @@ struct ActiveCodeBlock {
 }
 
 struct Renderer<'a> {
+    input: &'a str,
     palette: Palette,
     width: usize,
     lines: Vec<ParsedLine>,
@@ -232,7 +266,7 @@ impl Renderer<'_> {
         }
     }
 
-    fn event(&mut self, event: Event<'_>) {
+    fn event(&mut self, event: Event<'_>, range: Range<usize>) {
         match event {
             Event::Start(Tag::Strong) => self.bold += 1,
             Event::Start(Tag::Heading { .. }) => {
@@ -262,6 +296,7 @@ impl Renderer<'_> {
                             .map_or(CodeSource::Literal, |language| CodeSource::Named {
                                 language: language.to_owned(),
                                 source: String::new(),
+                                fence: Fence::new(self.input, range),
                             })
                     }
                     CodeBlockKind::Indented => CodeSource::Literal,
@@ -274,8 +309,11 @@ impl Renderer<'_> {
             }
             Event::End(TagEnd::CodeBlock) => {
                 let code = self.code.as_mut().expect("end inside code block");
-                if let CodeSource::Named { language, source } =
-                    std::mem::replace(&mut code.source, CodeSource::Literal)
+                if let CodeSource::Named {
+                    language,
+                    source,
+                    fence,
+                } = std::mem::replace(&mut code.source, CodeSource::Literal)
                     && !source.is_empty()
                 {
                     let trailing_newline = source.ends_with('\n');
@@ -288,7 +326,12 @@ impl Renderer<'_> {
                             role: tool_view::Role::Constant,
                         }],
                     };
-                    let mut lines = document.lines(self.highlights);
+                    let highlights = if fence.closed(self.input) {
+                        self.highlights
+                    } else {
+                        None
+                    };
+                    let mut lines = document.lines(highlights);
                     // Markdown's text() flushes the preceding row at a final
                     // newline; it does not emit split()'s trailing empty row.
                     if trailing_newline {
@@ -397,11 +440,12 @@ impl Renderer<'_> {
                     }
                 }
                 if let Some(ActiveCodeBlock {
-                    source: CodeSource::Named { source, .. },
+                    source: CodeSource::Named { source, fence, .. },
                     ..
                 }) = &mut self.code
                 {
                     source.push_str(&value);
+                    fence.text(range.end);
                 } else {
                     self.text(&value, self.style());
                 }
@@ -474,6 +518,7 @@ pub(super) fn parse(
     cache: Option<&tool_view::HighlightCache>,
 ) -> Parsed {
     let mut renderer = Renderer {
+        input: text,
         palette,
         width,
         lines: Vec::new(),
@@ -492,8 +537,8 @@ pub(super) fn parse(
         links: Vec::new(),
         table: None,
     };
-    for event in Parser::new_ext(text, options()) {
-        renderer.event(event);
+    for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+        renderer.event(event, range);
     }
     renderer.flush(false);
     if placeholder && renderer.lines.is_empty() {
@@ -650,6 +695,20 @@ pub(in super::super) mod tests {
         }
         let lines = rendered("- ```rust\n  let x = 1;  \n\n  ```", 80);
         assert_eq!(strings(&lines), ["• let x = 1;  ", "  "]);
+    }
+
+    #[test]
+    fn open_fences_ignore_cached_highlights_until_closed() {
+        let open = "```rust\nlet answer = 42;\n";
+        let closed = format!("{open}```");
+        let mut fences = crate::tui::render::code::Fences::default();
+        fences.update(&closed);
+        let mut cache = tool_view::HighlightCache::default();
+        cache.wait(&fences.document);
+        let render = |text| render_highlighted(text, Palette::new(), false, 80, Some(&cache));
+        let plain = rendered(open, 80);
+        assert_eq!(render(open), plain);
+        assert_ne!(render(&closed), plain);
     }
 
     #[test]

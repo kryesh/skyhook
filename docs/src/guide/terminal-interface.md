@@ -7,12 +7,15 @@ remote execution target after the tool name, such as `exec @lab-monitoring`; loc
 `@root`. Expand a tool call to inspect its arguments, output, or failure details. Scripts,
 commands, file content, and diffs have syntax highlighting. Click an expanded body to collapse
 it, or drag to select text. Copying code preserves its contents without visual padding or
-newlines added by wrapping.
+newlines added by wrapping. Language-labelled code blocks in messages and reasoning receive
+syntax highlighting once their closing fence arrives; open blocks keep a consistent plain
+code style while streaming.
 
 The agent tree appears above the composer while children are active or a child agent is being
 viewed. Click an agent to inspect its conversation without mixing its output with other agents.
-Each agent retains its reading position and expanded rows. Tree rows show `@target` for remote
-agents and their own token totals and context usage: output · input (uncached) · context.
+Each agent retains its reading position and expanded rows. Agents using the `wait` tool show
+**Waiting** rather than **Running tools**. Tree rows show `@target` for remote agents and their
+own token totals and context usage: output · input (uncached) · context.
 Agent call previews show the child's target even while queued or running; an omitted target
 inherits the caller's target. Completed final replies identify the model that answered in a
 footer below the reply.
