@@ -271,8 +271,8 @@ mod tests {
     use skyhook::identity::SessionId;
     use skyhook::job::{JobRole, JobState};
     use skyhook::provider::protocol::{
-        AssistantItem, BlockKind, ContentDelta, ItemKind, Message, ReplayEnvelope, ResponseEvent,
-        ToolCall, ToolResult, UserContent,
+        AssistantItem, Binding, BlockId, BlockRef, ItemId, ItemKind, Message, Provenance, Replay,
+        ResponseEvent, Scope, ToolCall, ToolResult, UserContent,
     };
     use skyhook::session::{EventRecord, ModelPurpose, SessionEvent};
 
@@ -307,39 +307,8 @@ mod tests {
         sequence
     }
 
-    /// Apply one runtime event; deltas start their native item/block on first use.
+    /// Apply one runtime event as the next revision.
     pub(super) fn update(snapshot: &mut ObservationSnapshot, event: RuntimeEvent) {
-        if let RuntimeEvent::ResponseEvent {
-            agent,
-            request,
-            event: ResponseEvent::BlockDelta { item, block, .. },
-        } = &event
-            && !snapshot
-                .responses
-                .get(&(agent.clone(), *request))
-                .is_some_and(|live| live.snapshot().items.iter().any(|entry| entry.id == *item))
-        {
-            let (position, kind, block_kind) = if item == "reasoning" {
-                (0, ItemKind::Reasoning, BlockKind::Reasoning)
-            } else {
-                (1, ItemKind::Text, BlockKind::Text)
-            };
-            for started in [
-                ResponseEvent::ItemStarted {
-                    id: item.clone(),
-                    position,
-                    kind,
-                },
-                ResponseEvent::BlockStarted {
-                    item: item.clone(),
-                    id: block.clone(),
-                    position: 0,
-                    kind: block_kind,
-                },
-            ] {
-                response(snapshot, agent, *request, started);
-            }
-        }
         snapshot.apply(ObservedEvent {
             revision: snapshot.revision + 1,
             event,
@@ -371,10 +340,18 @@ mod tests {
         item: &str,
         text: &str,
     ) {
-        let event = ResponseEvent::BlockDelta {
-            item: item.into(),
-            block: format!("{item}:0"),
-            delta: ContentDelta::Text(text.into()),
+        let kind = if item == "reasoning" {
+            ItemKind::Reasoning
+        } else {
+            ItemKind::Text
+        };
+        let event = ResponseEvent::Delta {
+            block: BlockRef {
+                item: ItemId::try_from(item.to_owned()).unwrap(),
+                block: BlockId::try_from(format!("{item}:0")).unwrap(),
+            },
+            kind,
+            text: text.into(),
         };
         response(snapshot, agent, request, event);
     }
@@ -450,14 +427,15 @@ mod tests {
         record(snapshot, agent, event)
     }
 
-    pub(super) fn replay() -> ReplayEnvelope {
-        ReplayEnvelope {
-            version: 1,
-            protocol: "fixture".into(),
-            model: "fixture".into(),
-            scope: "reasoning".into(),
+    pub(super) fn replay() -> Replay {
+        Replay {
+            provenance: Provenance {
+                protocol: "fixture".into(),
+                model: "fixture".into(),
+                scope: Scope::try_from("reasoning".to_owned()).unwrap(),
+            },
             payload: serde_json::json!({"signature": "opaque"}),
-            conversation_bound: false,
+            binding: Binding::Free,
         }
     }
 

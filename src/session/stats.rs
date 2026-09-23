@@ -352,7 +352,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                 let Some(stats) = agents.get_mut(agent) else {
                     continue;
                 };
-                for call in items.iter().filter_map(|item| item.tool_call_ref()) {
+                for call in items.iter().filter_map(|item| item.call()) {
                     calling_messages.insert(record.sequence);
                     stats.tools.entry(call.name().to_owned()).or_default().calls += 1;
                     open_calls
@@ -517,7 +517,7 @@ mod tests {
     use crate::{
         execution::ExecutionLocation,
         job::{JobRole, JobState},
-        provider::protocol::{AssistantItem, HistoryLifetime, StopReason, ToolCall, ToolResult},
+        provider::protocol::{AssistantItem, HistoryLifetime, Outcome, ToolCall, ToolResult},
         session::{
             ModelContext, ModelFailureKind, ModelPurpose, SessionEvent, fixture,
             fixture::MemorySession,
@@ -561,7 +561,7 @@ mod tests {
         SessionEvent::ModelAttemptStarted { request, attempt }
     }
 
-    fn call(id: &str, position: usize, name: &str) -> AssistantItem {
+    fn call(id: &str, position: u32, name: &str) -> AssistantItem {
         AssistantItem::tool_call(
             format!("item-{id}"),
             position,
@@ -631,7 +631,7 @@ mod tests {
                 request,
                 attempt: 1,
                 message: Some(message),
-                stop_reason: StopReason::EndTurn,
+                outcome: Outcome::Answer,
             },
         )
         .await;
@@ -652,7 +652,7 @@ mod tests {
                 request: answered,
                 attempt: 1,
                 message: None,
-                stop_reason: StopReason::EndTurn,
+                outcome: Outcome::Answer,
             },
         )
         .await;
@@ -721,7 +721,7 @@ mod tests {
                 request,
                 attempt: 2,
                 message: Some(message),
-                stop_reason: StopReason::ToolUse,
+                outcome: Outcome::ToolUse,
             },
         )
         .await;
@@ -811,7 +811,7 @@ mod tests {
                 request: ended,
                 attempt: 1,
                 message: None,
-                stop_reason: StopReason::EndTurn,
+                outcome: Outcome::Answer,
             },
         )
         .await;

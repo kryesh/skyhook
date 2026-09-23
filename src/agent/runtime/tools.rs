@@ -875,7 +875,7 @@ for line in sys.stdin:
             hint: Some("Hinted".into()),
         };
         let (read, write, agents) = (Capability::Read, Capability::Write, Capability::Agents);
-        let build = |scout: Mode, responses: Vec<Vec<ResponseChunk>>| {
+        let build = |scout: Mode, responses: Vec<Vec<ResponseEvent>>| {
             let provider = scripted_provider(&requests, responses);
             let modes = [
                 ("work", mode(&[read, write, agents], "Work.")),

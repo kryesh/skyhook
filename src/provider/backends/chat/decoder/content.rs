@@ -3,8 +3,8 @@ use super::super::wire;
 use super::{Block, Decoder};
 use crate::provider::{
     ProviderError,
-    backends::common::{self, parse_tool_arguments, reasoning_envelope},
-    protocol::{BlockContent, BlockKind, ContentDelta, ItemKind, ResponseChunk, ToolCall},
+    backends::common::{self, parse_tool_arguments, replay},
+    protocol::{AssistantItem, Binding, ItemKind, ResponseEvent, ToolCall},
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -13,20 +13,20 @@ impl Decoder {
     pub(super) fn delta(
         &mut self,
         delta: &wire::Delta,
-        chunks: &mut Vec<ResponseChunk>,
+        events: &mut Vec<ResponseEvent>,
     ) -> Result<(), ProviderError> {
         if delta.is_noop() {
             return Ok(());
         }
         if let Some(text) = delta.reasoning_text() {
-            self.visible_delta(text, true, chunks)?;
+            self.visible_delta(text, true, events)?;
         }
         for text in [delta.content.as_deref(), delta.refusal.as_deref()]
             .into_iter()
             .flatten()
         {
             if !text.is_empty() {
-                self.visible_delta(text, false, chunks)?;
+                self.visible_delta(text, false, events)?;
             }
         }
         let legacy = delta.legacy_call();
@@ -49,7 +49,6 @@ impl Decoder {
                     arguments: String::new(),
                 });
                 self.tool_ids.insert(index, id);
-                start_item(chunks, id, ItemKind::ToolCall, BlockKind::ToolCallArguments);
                 id
             };
             self.last_tool = Some(index);
@@ -80,11 +79,11 @@ impl Decoder {
             if let Some(fragment) = function.and_then(|function| function.arguments.as_ref()) {
                 arguments.push_str(fragment);
                 if !fragment.is_empty() {
-                    chunks.push(ResponseChunk::BlockDelta {
-                        item: id.to_string(),
-                        block: "0".into(),
-                        delta: ContentDelta::JsonFragment(fragment.clone()),
-                    });
+                    events.push(common::delta(
+                        common::block_ref(id),
+                        ItemKind::ToolCall,
+                        fragment.clone(),
+                    ));
                 }
             }
         }
@@ -200,7 +199,7 @@ impl Decoder {
         &mut self,
         text: &str,
         reasoning: bool,
-        chunks: &mut Vec<ResponseChunk>,
+        events: &mut Vec<ResponseEvent>,
     ) -> Result<(), ProviderError> {
         let same = self.visible_id.filter(|id| {
             matches!(
@@ -211,15 +210,6 @@ impl Decoder {
         let id = if let Some(id) = same {
             id
         } else {
-            if let Some(id) = self.visible_id.take() {
-                let content = match &self.blocks[id] {
-                    Block::Text(text) => BlockContent::Text { text: text.clone() },
-                    Block::Reasoning(text) => BlockContent::Reasoning { text: text.clone() },
-                    _ => unreachable!(),
-                };
-                self.end_item(chunks, id, content);
-                self.ended.insert(id);
-            }
             let id = self.blocks.len();
             self.blocks.push(if reasoning {
                 Block::Reasoning(String::new())
@@ -227,39 +217,24 @@ impl Decoder {
                 Block::Text(String::new())
             });
             self.visible_id = Some(id);
-            start_item(
-                chunks,
-                id,
-                if reasoning {
-                    ItemKind::Reasoning
-                } else {
-                    ItemKind::Text
-                },
-                if reasoning {
-                    BlockKind::Reasoning
-                } else {
-                    BlockKind::Text
-                },
-            );
             id
         };
         match &mut self.blocks[id] {
             Block::Text(full) | Block::Reasoning(full) => full.push_str(text),
             _ => unreachable!(),
         }
-        chunks.push(ResponseChunk::BlockDelta {
-            item: id.to_string(),
-            block: "0".into(),
-            delta: ContentDelta::Text(text.into()),
-        });
+        let kind = if reasoning {
+            ItemKind::Reasoning
+        } else {
+            ItemKind::Text
+        };
+        events.push(common::delta(common::block_ref(id), kind, text));
         Ok(())
     }
 
-    pub(super) fn end_blocks(
-        &self,
-        chunks: &mut Vec<ResponseChunk>,
-        discard_tools: bool,
-    ) -> Result<(), ProviderError> {
+    /// The completed items in block order. Tool calls are dropped when the finish
+    /// does not authorize them, and otherwise must be complete and well formed.
+    pub(super) fn items(&self, discard_tools: bool) -> Result<Vec<AssistantItem>, ProviderError> {
         // Server-supplied IDs are reserved so derived ones never collide with them.
         let origin = self.call_id_origin();
         let reserved: BTreeSet<&str> = self
@@ -271,20 +246,33 @@ impl Decoder {
             })
             .collect();
         let mut call_ids = BTreeSet::new();
+        let mut items = Vec::new();
         for (id, block) in self.blocks.iter().enumerate() {
-            if self.ended.contains(&id) {
-                continue;
-            }
-            let block = match block {
-                Block::Text(text) => BlockContent::Text { text: text.clone() },
-                Block::Reasoning(text) => BlockContent::Reasoning { text: text.clone() },
+            let position = common::position(id)?;
+            let item = match block {
+                Block::Text(text) => AssistantItem::Text {
+                    id: common::item_id(id),
+                    position,
+                    blocks: common::single_block(id, text.clone()),
+                },
+                Block::Reasoning(text) => AssistantItem::Reasoning {
+                    id: common::item_id(id),
+                    position,
+                    blocks: common::single_block(id, text.clone()),
+                    replay: Some(replay(
+                        "chat_completions",
+                        &self.model,
+                        &self.scope,
+                        json!({"text": text}),
+                        Binding::Free,
+                    )),
+                },
                 Block::Tool {
                     call_id,
                     name,
                     arguments,
                 } => {
                     if discard_tools {
-                        chunks.push(ResponseChunk::ItemDiscarded { id: id.to_string() });
                         continue;
                     }
                     if name.trim().is_empty() {
@@ -306,15 +294,18 @@ impl Decoder {
                     let arguments = parse_tool_arguments(arguments).ok_or_else(|| {
                         ProviderError::protocol("Invalid Chat tool arguments JSON")
                     })?;
-                    BlockContent::ToolCall(
-                        ToolCall::new(call_id, name.clone(), Value::Object(arguments))
-                            .map_err(|error| ProviderError::protocol(format!("Chat: {error}")))?,
-                    )
+                    let call = ToolCall::new(call_id, name.clone(), Value::Object(arguments))
+                        .map_err(|error| ProviderError::protocol(format!("Chat: {error}")))?;
+                    AssistantItem::ToolCall {
+                        id: common::item_id(id),
+                        position,
+                        call,
+                    }
                 }
             };
-            self.end_item(chunks, id, block);
+            items.push(item);
         }
-        Ok(())
+        Ok(items)
     }
 
     /// Deterministic origin for missing IDs: a digest of the request and the
@@ -353,42 +344,22 @@ impl Decoder {
     }
 }
 
-fn start_item(chunks: &mut Vec<ResponseChunk>, id: usize, kind: ItemKind, block_kind: BlockKind) {
-    chunks.extend(common::start_item(id, kind, block_kind));
-}
-
-impl Decoder {
-    fn end_item(&self, chunks: &mut Vec<ResponseChunk>, id: usize, content: BlockContent) {
-        // The transport wrapper binds the provider+endpoint scope.
-        let replay = match &content {
-            BlockContent::Reasoning { text } => Some(reasoning_envelope(
-                "chat_completions",
-                &self.model,
-                json!({"text": text}),
-            )),
-            _ => None,
-        };
-        chunks.extend(common::end_item(id, content, replay));
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{Decoder, tests::*};
+    use super::super::tests::*;
     use crate::provider::backends::transport::SseEvent;
     use crate::provider::protocol::{
-        AssistantItem, BlockContent, ContentDelta, ItemKind, ResponseAssembler, ResponseChunk,
-        StopReason, ToolCall, Usage,
+        AssistantItem, CutReason, ItemKind, Outcome, ResponseEvent, ToolCall, Usage,
     };
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
 
-    fn reasoning(text: &str) -> BlockContent {
-        BlockContent::Reasoning { text: text.into() }
+    fn reasoning(text: &str) -> Content {
+        Content::Reasoning(text.into())
     }
 
-    fn tool(id: &str, name: &str, arguments: Value) -> BlockContent {
-        BlockContent::ToolCall(ToolCall::new(id, name, arguments).unwrap())
+    fn tool(id: &str, name: &str, arguments: Value) -> Content {
+        Content::Tool(ToolCall::new(id, name, arguments).unwrap())
     }
 
     const SYNTHETIC: &str = "<synthetic>";
@@ -407,13 +378,7 @@ mod tests {
     }
 
     fn calls_of(items: &[AssistantItem]) -> Vec<(String, String, Value)> {
-        let calls: Vec<_> = items
-            .iter()
-            .filter_map(|item| match &item.blocks[0].content {
-                BlockContent::ToolCall(call) => Some(call),
-                _ => None,
-            })
-            .collect();
+        let calls: Vec<_> = items.iter().filter_map(AssistantItem::call).collect();
         let ids: BTreeSet<_> = calls.iter().map(|call| call.id()).collect();
         assert_eq!(ids.len(), calls.len(), "tool call IDs must be unique");
         calls.into_iter().map(normalize).collect()
@@ -430,8 +395,8 @@ mod tests {
     /// Asserts frames before `failing` decode, and that frame and finish are rejected.
     fn assert_calls(mut frames: Vec<SseEvent>, expected: Vec<(&str, &str, Value)>) {
         frames.push(end("tool_calls"));
-        let (items, _, stop) = decode(frames);
-        assert_eq!(stop, StopReason::ToolUse);
+        let (items, _, outcome) = decode(frames);
+        assert_eq!(outcome, Outcome::ToolUse);
         let expected: Vec<_> = expected
             .into_iter()
             .map(|(id, name, arguments)| (id.to_owned(), name.to_owned(), arguments))
@@ -440,7 +405,7 @@ mod tests {
     }
 
     fn assert_fails_at(frames: Vec<SseEvent>, failing: usize) {
-        let mut decoder = Decoder::new("test-model".into());
+        let mut decoder = decoder();
         for frame in &frames[..failing] {
             decoder.decode(frame).unwrap();
         }
@@ -451,14 +416,14 @@ mod tests {
 
     #[test]
     fn content_refusal_reasoning_and_tools_decode_as_ordered_items() {
-        for (frames, expected_stop, expected) in [
+        for (frames, expected_outcome, expected) in [
             // A singleton choice without an index (llama loading) is reasoning.
             (
                 vec![
                     event(json!({"choices":[{"delta":{"reasoning_content":"loading"}}]})),
                     end("stop"),
                 ],
-                StopReason::EndTurn,
+                Outcome::Answer,
                 vec![reasoning("loading")],
             ),
             // Refusal is visible completed output.
@@ -468,7 +433,7 @@ mod tests {
                     delta(json!({"refusal":"help with that."})),
                     end("stop"),
                 ],
-                StopReason::EndTurn,
+                Outcome::Answer,
                 vec![text("I cannot help with that.")],
             ),
             // Equal reasoning aliases are not duplicated, and null fields are no-ops.
@@ -480,7 +445,7 @@ mod tests {
                     ),
                     end("stop"),
                 ],
-                StopReason::EndTurn,
+                Outcome::Answer,
                 vec![reasoning("same")],
             ),
             // Hermes repeats an index for a header and its sequential arguments.
@@ -494,7 +459,7 @@ mod tests {
                     ])),
                     end("tool_calls"),
                 ],
-                StopReason::ToolUse,
+                Outcome::ToolUse,
                 vec![
                     tool("call-a", "inspect", json!({"path":"file"})),
                     tool("call-b", "other", json!({})),
@@ -511,7 +476,7 @@ mod tests {
                     delta(json!({"content":"世界"})),
                     end("stop"),
                 ],
-                StopReason::EndTurn,
+                Outcome::Answer,
                 vec![
                     reasoning("first thought"),
                     text("hello "),
@@ -520,12 +485,12 @@ mod tests {
                 ],
             ),
         ] {
-            let (items, _, stop) = decode(frames);
-            assert_eq!(stop, expected_stop);
-            assert_eq!(contents(&items), expected.iter().collect::<Vec<_>>());
+            let (items, _, outcome) = decode(frames);
+            assert_eq!(outcome, expected_outcome);
+            assert_eq!(contents(&items), expected);
             for (position, item) in items.iter().enumerate() {
-                assert_eq!(item.position, position);
-                assert_eq!(item.replay.is_some(), item.kind == ItemKind::Reasoning);
+                assert_eq!(item.position().get(), u32::try_from(position).unwrap());
+                assert_eq!(item.replay().is_some(), item.kind() == ItemKind::Reasoning);
             }
         }
     }
@@ -577,8 +542,8 @@ mod tests {
             ),
             done(),
         ];
-        let (items, usage, stop) = decode(frames);
-        assert_eq!(stop, StopReason::ToolUse);
+        let (items, usage, outcome) = decode(frames);
+        assert_eq!(outcome, Outcome::ToolUse);
         assert_eq!((usage.input_tokens, usage.output_tokens), (447, 84));
         let expected = [
             reasoning("Compare."),
@@ -586,7 +551,7 @@ mod tests {
             tool("tooluse_1", "run", json!({"cmd":"ls"})),
             tool("tooluse_2", "list_jobs", json!({})),
         ];
-        assert_eq!(contents(&items), expected.iter().collect::<Vec<_>>());
+        assert_eq!(contents(&items), expected);
     }
 
     #[test]
@@ -608,7 +573,7 @@ mod tests {
                 let mut payload = json!({"content":"answer"});
                 payload[field] = value;
                 let (items, _, _) = decode(vec![delta(payload), end("stop")]);
-                assert_eq!(contents(&items), [&text("answer")]);
+                assert_eq!(contents(&items), [text("answer")]);
             }
         }
     }
@@ -630,20 +595,20 @@ mod tests {
             event(json!({"choices":[{"finish_reason":"tool_calls","delta":null}]})),
             done(),
         ]);
-        let (items, usage, stop) = decode(frames);
-        assert_eq!((stop, usage), (StopReason::ToolUse, USAGE));
+        let (items, usage, outcome) = decode(frames);
+        assert_eq!((outcome, usage), (Outcome::ToolUse, USAGE));
         assert_eq!(
             contents(&items),
-            [&tool("call", "inspect", json!({"path":"file"}))]
+            [tool("call", "inspect", json!({"path":"file"}))]
         );
     }
 
     #[test]
     fn abnormal_finishes_discard_tools_once_regardless_of_argument_completeness() {
-        for (finish, expected_stop) in [
-            ("length", StopReason::MaxTokens),
-            ("abort", StopReason::Aborted),
-            ("content_filter", StopReason::ContentFilter),
+        for (finish, expected) in [
+            ("length", CutReason::MaxTokens),
+            ("abort", CutReason::Aborted),
+            ("content_filter", CutReason::Refusal),
         ] {
             for arguments in ["{", "{}", "not json", "[]"] {
                 for repeated in [false, true] {
@@ -659,10 +624,10 @@ mod tests {
                             done(),
                         ]);
                     }
-                    let (items, usage, stop) = decode(frames);
+                    let (items, usage, outcome) = decode(frames);
                     let expected_usage = if repeated { USAGE } else { Usage::default() };
-                    assert_eq!((stop, usage), (expected_stop.clone(), expected_usage));
-                    assert_eq!(contents(&items), [&text("partial")]);
+                    assert_eq!((outcome, usage), (Outcome::Cut(expected), expected_usage));
+                    assert_eq!(contents(&items), [text("partial")]);
                 }
             }
         }
@@ -735,18 +700,13 @@ mod tests {
             if let Some(response) = response {
                 chunk["id"] = json!(response);
             }
-            let mut decoder = Decoder::new("test-model".into()).for_request(&request);
-            let mut assembler = ResponseAssembler::default();
+            let mut decoder = decoder().for_request(&request);
+            let mut events = Vec::new();
             for frame in [event(chunk), end("tool_calls"), done()] {
-                for chunk in decoder.decode(&frame).unwrap() {
-                    assembler.push(&chunk).unwrap();
-                }
+                events.extend(decoder.decode(&frame).unwrap());
             }
-            let (items, _, _) = assembler.finish().unwrap();
-            match &items[0].blocks[0].content {
-                BlockContent::ToolCall(call) => call.id().to_owned(),
-                _ => unreachable!(),
-            }
+            let reduced = crate::provider::backends::common::tests::reduce(events);
+            reduced.items()[0].call().unwrap().id().to_owned()
         };
         let derived = |response, arguments| derived_for(json!({"turn":1}), response, arguments);
         let id = derived(Some("chatcmpl-x.y:z"), "{}");
@@ -877,13 +837,12 @@ mod tests {
             delta(json!({"reasoning":{}, "content":[{"type":"text","text":"answer"}]})),
             end("stop"),
         ]);
-        assert_eq!(contents(&items), [&reasoning("primary"), &text("answer")]);
+        assert_eq!(contents(&items), [reasoning("primary"), text("answer")]);
     }
 
     #[test]
     fn interleaved_tools_get_first_seen_ids_and_authoritative_arguments() {
-        let mut decoder = Decoder::new("gpt-5".into());
-        let mut assembler = ResponseAssembler::default();
+        let mut decoder = decoder();
         let frames = [
             tool_delta(
                 json!([{"index":7,"id":"call-","function":{"name":"fir","arguments":"{\"a\":"}},{"index":2,"id":"call-b","function":{"name":"second","arguments":"{"}}]),
@@ -895,28 +854,32 @@ mod tests {
             end("tool_calls"),
             done(),
         ];
-        let mut fragments = 0;
+        let mut events = Vec::new();
         for frame in frames {
-            for chunk in decoder.decode(&frame).unwrap() {
-                if matches!(
-                    chunk,
-                    ResponseChunk::BlockDelta {
-                        delta: ContentDelta::JsonFragment(_),
+            events.extend(decoder.decode(&frame).unwrap());
+        }
+        let fragments = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ResponseEvent::Delta {
+                        kind: ItemKind::ToolCall,
                         ..
                     }
-                ) {
-                    fragments += 1;
-                }
-                assembler.push(&chunk).unwrap();
-            }
-        }
-        let (items, _, reason) = assembler.finish().unwrap();
-        assert_eq!((fragments, reason), (4, StopReason::ToolUse));
+                )
+            })
+            .count();
+        let reduced = crate::provider::backends::common::tests::reduce(events);
+        assert_eq!(
+            (fragments, reduced.completion.outcome()),
+            (4, Outcome::ToolUse)
+        );
         let expected = [
             tool("call-a", "first", json!({"a":1})),
             tool("call-b", "second", json!({})),
             text("working"),
         ];
-        assert_eq!(contents(&items), expected.iter().collect::<Vec<_>>());
+        assert_eq!(contents(reduced.items()), expected);
     }
 }

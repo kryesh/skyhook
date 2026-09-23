@@ -33,9 +33,7 @@ pub(super) fn reasoning_text(value: &Value) -> Result<&str, ProviderError> {
     }
 }
 
-pub(super) fn reasoning_parts(
-    item: &Value,
-) -> Result<BTreeMap<usize, BlockContent>, ProviderError> {
+pub(super) fn reasoning_parts(item: &Value) -> Result<BTreeMap<usize, Content>, ProviderError> {
     let mut parts = BTreeMap::new();
     for (field, content) in [("summary", false), ("content", true)] {
         let values = match item.get(field) {
@@ -46,7 +44,7 @@ pub(super) fn reasoning_parts(
         for (position, part) in values.iter().enumerate() {
             parts.insert(
                 reasoning_position(position, content)?,
-                BlockContent::Reasoning {
+                Content::Reasoning {
                     text: readable_reasoning(part, !content)?.into(),
                 },
             );
@@ -86,59 +84,7 @@ pub(super) fn native_enrichment(previous: &Value, terminal: &Value) -> bool {
 }
 
 impl Decoder {
-    /// Some servers finish a reasoning item only when the whole response ends.
-    /// Once a later item starts, earlier reasoning is complete for display, so
-    /// its streamed blocks close now; the item still awaits its snapshot.
-    pub(super) fn close_superseded_reasoning(
-        &mut self,
-        next: usize,
-        chunks: &mut Vec<ResponseChunk>,
-    ) -> Result<(), ProviderError> {
-        let open: Vec<(usize, usize, String)> = self
-            .items
-            .iter()
-            .filter(|(id, item)| **id != next && item.snapshot().is_none())
-            .filter_map(|(id, item)| Some((*id, item.reasoning().ok()?)))
-            .flat_map(|(id, reasoning)| {
-                reasoning
-                    .parts
-                    .iter()
-                    .filter(|(_, part)| part.ended().is_none() && !part.streamed().is_empty())
-                    .map(move |(position, part)| (id, *position, part.streamed().to_owned()))
-            })
-            .collect();
-        for (id, position, text) in open {
-            self.close_part(id, position, BlockContent::Reasoning { text }, chunks)?;
-            self.items
-                .get_mut(&id)
-                .expect("open item")
-                .reasoning_mut()?
-                .shown_early
-                .insert(position);
-        }
-        Ok(())
-    }
-
-    /// Whether a reasoning part (or the part its namespace migrated to) was
-    /// closed for display when a later item started.
-    pub(super) fn shown_early(&self, id: usize, position: usize) -> bool {
-        self.items[&id].reasoning().is_ok_and(|reasoning| {
-            let target = reasoning
-                .aliases
-                .get(&position)
-                .copied()
-                .unwrap_or(position);
-            reasoning.shown_early.contains(&target)
-        })
-    }
-
-    pub(super) fn end_reasoning(
-        &mut self,
-        id: usize,
-        native: &Value,
-        chunks: &mut Vec<ResponseChunk>,
-        terminal: bool,
-    ) -> Result<(), ProviderError> {
+    pub(super) fn end_reasoning(&mut self, id: usize, native: &Value) -> Result<(), ProviderError> {
         let supplied = reasoning_parts(native)?;
         let item = &self.items[&id];
         if let Some(previous) = item.snapshot()
@@ -179,7 +125,7 @@ impl Decoder {
                 // collapse independently supplied summary/content namespaces.
                 if let Some(other) = reasoning.parts.get(&sibling) {
                     let text_matches = match content {
-                        BlockContent::Reasoning { text } => other
+                        Content::Reasoning { text } => other
                             .ended()
                             .map_or(other.streamed() == text, |old| old == content),
                         _ => false,
@@ -195,11 +141,7 @@ impl Decoder {
                     }
                 }
             }
-            // Displayed when a later item started; the snapshot is the replay.
-            if self.shown_early(id, target) {
-                continue;
-            }
-            self.close_part(id, target, content.clone(), chunks)?;
+            self.close_part(id, target, content.clone())?;
         }
         // Missing final plaintext is not evidence that live display was wrong.
         // Close received display locally without adding it to the native replay.
@@ -211,26 +153,19 @@ impl Decoder {
             .map(|(position, part)| (*position, part.streamed().to_owned()))
             .collect();
         for (position, text) in remaining {
-            self.close_part(id, position, BlockContent::Reasoning { text }, chunks)?;
+            self.close_part(id, position, Content::Reasoning { text })?;
         }
+        // The latest snapshot is the replay; the terminal one may enrich it.
         let item = self.items.get_mut(&id).expect("checked item");
         item.reasoning_mut()?.snapshot = Some(native.clone());
-        // Keep the display item open until the terminal snapshot: it may supply
-        // additional readable content absent from output_item.done.
-        if terminal {
-            chunks.push(ResponseChunk::ItemEnded {
-                id: item.native_id.clone(),
-                replay: Some(reasoning_envelope("responses", &self.model, native.clone())),
-            });
-        }
         Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{assemble, decoder, reduce};
     use super::*;
-    use crate::provider::protocol::ResponseAssembler;
 
     fn event(name: &str, index_key: &str, value_key: &str, value: Value) -> Value {
         let mut event = json!({"type":format!("response.{name}"), "output_index":0, "item_id":"r"});
@@ -302,41 +237,39 @@ mod tests {
             .try_for_each(|event| decoder.feed(event).map(drop))
     }
 
+    /// The single reasoning item's (block id, text) display in position order.
+    fn display(item: &AssistantItem) -> Vec<(&str, &str)> {
+        let AssistantItem::Reasoning { blocks, .. } = item else {
+            panic!("expected a reasoning item: {item:?}")
+        };
+        blocks
+            .iter()
+            .map(|block| (block.id.as_str(), block.text.as_str()))
+            .collect()
+    }
+
     /// Asserts the single item's exact replay payload and its (block id, text) display.
     fn assert_display(events: Vec<Value>, native: &Value, expected: &[(&str, &str)]) {
-        let items = super::fixtures::assemble(events).unwrap().0;
-        assert_eq!(items[0].replay.as_ref().unwrap().payload, *native);
-        let display: Vec<_> = items[0]
-            .blocks
-            .iter()
-            .map(|block| {
-                (
-                    block.id.as_str(),
-                    block.content.reasoning_content().unwrap(),
-                )
-            })
-            .collect();
-        assert_eq!(display, expected);
+        let reduced = assemble(events).unwrap();
+        let item = &reduced.items()[0];
+        assert_eq!(item.replay().unwrap().payload, *native);
+        assert_eq!(display(item), expected);
     }
 
     #[test]
     fn native_text_is_live_and_independent_of_summary() {
-        let mut decoder = Decoder::new("model".into());
-        let mut assembler = ResponseAssembler::default();
+        let mut decoder = decoder();
+        let mut events = Vec::new();
         let mut push = |event| {
-            let chunks = decoder.feed(event).unwrap();
-            chunks
-                .iter()
-                .for_each(|chunk| assembler.push(chunk).unwrap());
-            chunks
+            let emitted = decoder.feed(event).unwrap();
+            events.extend(emitted.clone());
+            emitted
         };
         push(snapshot("added", item(json!([]), Value::Null)));
-        let chunks = push(content_delta("raw"));
-        assert!(chunks.iter().any(|chunk| matches!(chunk,
-            ResponseChunk::BlockStarted { id, kind: BlockKind::Reasoning, .. } if id == "content_0")));
-        assert!(chunks.iter().any(|chunk| matches!(chunk,
-            ResponseChunk::BlockDelta { block, delta: ContentDelta::Text(text), .. }
-                if block == "content_0" && text == "raw")));
+        let live = push(content_delta("raw"));
+        assert!(live.iter().any(|event| matches!(event,
+            ResponseEvent::Delta { block, kind: ItemKind::Reasoning, text }
+                if block.block.as_str() == "content_0" && text == "raw")));
         let native = readable(Some("brief"), Some("raw"));
         push(event(
             "reasoning_summary_text.delta",
@@ -353,14 +286,12 @@ mod tests {
         push(snapshot("done", native.clone()));
         push(snapshot("done", native.clone()));
         push(terminal(native.clone()));
-        let items = assembler.finish().unwrap().0;
-        let ids: Vec<_> = items[0]
-            .blocks
-            .iter()
-            .map(|block| block.id.as_str())
-            .collect();
+        let reduced = reduce(events);
+        assert_eq!(reduced.streamed(ItemKind::Reasoning), ["raw", "brief"]);
+        let item = &reduced.items()[0];
+        let ids: Vec<_> = display(item).into_iter().map(|(id, _)| id).collect();
         assert_eq!(ids, ["summary_0", "content_0"]);
-        assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+        assert_eq!(item.replay().unwrap().payload, native);
     }
 
     #[test]
@@ -477,7 +408,7 @@ mod tests {
             ),
             (json!({"type":"reasoning_text", "text":7}), false),
         ] {
-            let mut decoder = Decoder::new("model".into());
+            let mut decoder = decoder();
             feed(
                 &mut decoder,
                 vec![snapshot("added", empty()), content_delta("visible")],
@@ -535,7 +466,7 @@ mod tests {
             } else {
                 ("conflicting", "original")
             };
-            let mut decoder = Decoder::new("model".into());
+            let mut decoder = decoder();
             let events = vec![
                 snapshot("added", empty()),
                 namespace(content),
@@ -560,7 +491,7 @@ mod tests {
             (Some("different"), "native", false),
             (None, "changed", true),
         ] {
-            let mut decoder = Decoder::codex("model".into());
+            let mut decoder = Decoder::codex("model".into(), super::fixtures::scope());
             let result = feed(
                 &mut decoder,
                 vec![
@@ -589,15 +520,14 @@ mod tests {
         for placeholder in [Value::Null, json!("")] {
             let old = json!({"type":"reasoning", "id":"r", "summary":[], "encrypted_content":placeholder});
             let final_item = json!({"type":"reasoning", "id":"r", "summary":[], "encrypted_content":"ciphertext"});
-            let mut decoder = Decoder::new("gpt-5".into());
+            let mut decoder = decoder();
             feed(
                 &mut decoder,
                 vec![snapshot("added", old.clone()), snapshot("done", old)],
             )
             .unwrap();
-            let chunks = decoder.feed(terminal(final_item.clone())).unwrap();
-            assert!(chunks.iter().any(|chunk| matches!(chunk,
-                ResponseChunk::ItemEnded { replay: Some(replay), .. } if replay.payload == final_item)));
+            let reduced = reduce(decoder.feed(terminal(final_item.clone())).unwrap());
+            assert_eq!(reduced.items()[0].replay().unwrap().payload, final_item);
         }
         let mut old = readable(Some("first"), None);
         old["encrypted_content"] = json!("secret");
@@ -609,7 +539,7 @@ mod tests {
         for change in changes {
             let mut final_item = old.clone();
             change(&mut final_item);
-            let mut decoder = Decoder::new("gpt-5".into());
+            let mut decoder = decoder();
             feed(
                 &mut decoder,
                 vec![
@@ -646,96 +576,6 @@ mod tests {
             ],
             &native,
             &[("summary_0", text)],
-        );
-    }
-
-    /// A server that sends reasoning's `output_item.done` only at the end of
-    /// the response: the reasoning display closes when the answer starts.
-    #[test]
-    fn reasoning_display_closes_when_a_later_item_starts() {
-        let reasoning = json!({"id":"rs","type":"reasoning","summary":[],"content":[],
-            "encrypted_content":"","status":"in_progress"});
-        let finished = json!({"id":"rs","type":"reasoning","summary":[],
-            "content":[{"type":"reasoning_text","text":"think"}],"status":"completed"});
-        let message = json!({"id":"msg","type":"message","role":"assistant","content":[]});
-        let answer = json!({"id":"msg","type":"message","role":"assistant",
-            "content":[{"type":"output_text","text":"answer"}]});
-        let mut decoder = Decoder::new("model".into());
-        let mut chunks = Vec::new();
-        for event in [
-            json!({"type":"response.output_item.added","item":reasoning}),
-            json!({"type":"response.reasoning_text.delta","item_id":"rs","delta":"think"}),
-            json!({"type":"response.output_item.added","item":message}),
-            json!({"type":"response.content_part.added","item_id":"msg",
-                "part":{"type":"output_text","text":""}}),
-            json!({"type":"response.output_text.delta","item_id":"msg","delta":"answer"}),
-            json!({"type":"response.output_item.done","item":finished}),
-            json!({"type":"response.output_item.done","item":answer}),
-            json!({"type":"response.completed","response":{"status":"completed",
-                "output":[finished, answer]}}),
-        ] {
-            chunks.extend(decoder.feed(event).unwrap());
-        }
-        let position =
-            |wanted: &dyn Fn(&ResponseChunk) -> bool| chunks.iter().position(wanted).unwrap();
-        let reasoning_closed = position(
-            &|chunk| matches!(chunk, ResponseChunk::BlockEnded { item, .. } if item == "rs"),
-        );
-        let answer_started = position(
-            &|chunk| matches!(chunk, ResponseChunk::ItemStarted { id, .. } if id == "msg"),
-        );
-        assert!(reasoning_closed < answer_started);
-        let mut assembler = ResponseAssembler::default();
-        for chunk in &chunks {
-            assembler.push(chunk).unwrap();
-        }
-        let (items, _, _) = assembler.finish().unwrap();
-        assert_eq!(items[0].blocks.len(), 1);
-        assert_eq!(
-            items[0].blocks[0].content,
-            BlockContent::Reasoning {
-                text: "think".into()
-            }
-        );
-        // The replay is still the item's final snapshot.
-        assert_eq!(items[0].replay.as_ref().unwrap().payload, finished);
-    }
-
-    /// A late final-text event for reasoning already closed for display may
-    /// differ from what streamed (e.g. trimmed); it must not fail the response.
-    #[test]
-    fn late_final_text_for_reasoning_shown_early_is_ignored() {
-        let reasoning = json!({"id":"rs","type":"reasoning","summary":[],"content":[]});
-        let finished = json!({"id":"rs","type":"reasoning","summary":[],
-            "content":[{"type":"reasoning_text","text":"think"}]});
-        let message = json!({"id":"msg","type":"message","role":"assistant","content":[]});
-        let answer = json!({"id":"msg","type":"message","role":"assistant",
-            "content":[{"type":"output_text","text":"answer"}]});
-        let mut decoder = Decoder::new("model".into());
-        let mut assembler = ResponseAssembler::default();
-        for event in [
-            json!({"type":"response.output_item.added","item":reasoning}),
-            json!({"type":"response.reasoning_text.delta","item_id":"rs","delta":"think "}),
-            json!({"type":"response.output_item.added","item":message}),
-            json!({"type":"response.reasoning_text.done","item_id":"rs","text":"think"}),
-            json!({"type":"response.content_part.added","item_id":"msg",
-                "part":{"type":"output_text","text":""}}),
-            json!({"type":"response.output_text.delta","item_id":"msg","delta":"answer"}),
-            json!({"type":"response.output_item.done","item":finished}),
-            json!({"type":"response.output_item.done","item":answer}),
-            json!({"type":"response.completed","response":{"status":"completed",
-                "output":[finished, answer]}}),
-        ] {
-            for chunk in decoder.feed(event).unwrap() {
-                assembler.push(&chunk).unwrap();
-            }
-        }
-        let (items, _, _) = assembler.finish().unwrap();
-        assert_eq!(
-            items[0].blocks[0].content,
-            BlockContent::Reasoning {
-                text: "think ".into()
-            }
         );
     }
 }

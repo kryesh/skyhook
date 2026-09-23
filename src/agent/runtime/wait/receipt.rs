@@ -72,7 +72,7 @@ pub(super) mod tests {
         child: &AgentId,
         text: &str,
     ) -> u64 {
-        let message = Message::Assistant(vec![AssistantContent::text("fixture-reply", 0, text)]);
+        let message = Message::Assistant(vec![AssistantItem::text("fixture-reply", 0, text)]);
         let jobs = &session.runtime.jobs;
         // Fixture progress stands in for a non-terminal child reply: it wakes the owner.
         let committed =

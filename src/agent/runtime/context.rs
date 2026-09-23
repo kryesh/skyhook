@@ -12,7 +12,7 @@ use crate::{
     provider::{
         Provider, ProviderContext,
         profile::{ModelProfile, StateMode},
-        protocol::{HistoryLifetime, Message, ModelRequest, Usage, UserContent},
+        protocol::{ContextId, HistoryLifetime, Message, ModelRequest, Usage, UserContent},
     },
     session::{EventRecord, ModelRequestTemplate, SessionEvent, project_history},
 };
@@ -43,7 +43,7 @@ impl AgentContext {
         restore_meter: bool,
     ) -> Result<Self, HarnessError> {
         let projected = project_history(records, agent)?;
-        let provider = factory.open_context(agent.to_string())?;
+        let provider = factory.open_context(ContextId::from(agent))?;
         let meter = if restore_meter {
             TokenMeter::restore(records, agent)
         } else {
@@ -110,10 +110,8 @@ impl AgentContext {
 
     /// Build the next agent request: projected history, then runtime state as tail unless the
     /// state mode is none.
-    /// Its history is marked as ending once the request itself reaches the
-    /// compaction threshold.
     pub fn request(&self, runtime: UserContent) -> ModelRequest {
-        let mut request = ModelRequest {
+        ModelRequest {
             history: crate::session::merge_tool_results(
                 self.projected.iter().map(|(_, message)| message.clone()),
             ),
@@ -123,11 +121,7 @@ impl AgentContext {
                 StateMode::Dynamic | StateMode::Persist => vec![Message::User(vec![runtime])],
             },
             ..self.template.to_request()
-        };
-        if self.reaches_compaction(self.meter.estimate(&request)) {
-            request.history_lifetime = HistoryLifetime::Ending;
         }
-        request
     }
 
     pub fn needs_compaction(&self, usage: Usage) -> bool {
@@ -265,14 +259,15 @@ mod tests {
 
     use super::super::*;
     use crate::provider::{
-        ProviderContext, ProviderError, ProviderFuture, ResponseStream,
-        protocol::{StopReason, events_for_content},
+        ProviderContext, ProviderError, ResponseStream,
+        protocol::{AssistantItem, Completion, ContextId, ResponseEvent},
     };
+    use futures_util::TryStreamExt;
 
     #[derive(Default)]
     struct Tracking {
         next: AtomicUsize,
-        opened: Mutex<Vec<(usize, String)>>,
+        opened: Mutex<Vec<(usize, ContextId)>>,
         dropped: Mutex<Vec<usize>>,
         fail_all_calls: AtomicBool,
         entered: Notify,
@@ -288,10 +283,10 @@ mod tests {
     impl Provider for Factory {
         fn open_context(
             &self,
-            correlation: String,
+            context: ContextId,
         ) -> Result<Box<dyn ProviderContext>, ProviderError> {
             let id = self.0.next.fetch_add(1, Ordering::SeqCst);
-            self.0.opened.lock().unwrap().push((id, correlation));
+            self.0.opened.lock().unwrap().push((id, context));
             Ok(Box::new(Context {
                 tracking: self.0.clone(),
                 id,
@@ -307,7 +302,7 @@ mod tests {
     }
 
     impl ProviderContext for Context {
-        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
+        fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
             let blocks = request.messages().rev().flat_map(|message| match message {
                 Message::User(blocks) => blocks.as_slice(),
                 _ => &[],
@@ -318,7 +313,7 @@ mod tests {
             });
             let block = texts.next() == Some("block");
             let tracking = self.tracking.clone();
-            Box::pin(async move {
+            let started = async move {
                 if tracking.fail_all_calls.load(Ordering::SeqCst) {
                     return Err(ProviderError::protocol("retry this request"));
                 }
@@ -327,13 +322,12 @@ mod tests {
                     tracking.entered.notify_one();
                     std::future::pending::<()>().await;
                 }
-                let mut events = events_for_content(&[AssistantContent::text("text/0", 0, "done")]);
-                events.push(ResponseChunk::ResponseEnded {
-                    stop_reason: StopReason::EndTurn,
-                });
+                let done = Completion::answer(vec![AssistantItem::text("text/0", 0, "done")]);
+                let events = vec![ResponseEvent::End(done.unwrap())];
                 let events = futures_util::stream::iter(events.into_iter().map(Ok));
                 Ok(Box::pin(events) as ResponseStream)
-            })
+            };
+            Box::pin(futures_util::stream::once(started).try_flatten())
         }
     }
 
@@ -349,7 +343,6 @@ mod tests {
             response_schema: None,
             reasoning: None,
             max_output_tokens: Some(max_output),
-            correlation: None,
             blobs: Default::default(),
         };
         let provider = Box::new(Context {
@@ -367,28 +360,6 @@ mod tests {
             prefix: 0,
             skipped_at: None,
         }
-    }
-
-    #[test]
-    fn history_ends_once_the_request_itself_reaches_compaction() {
-        use crate::provider::protocol::HistoryLifetime::*;
-        let text = |len| {
-            (
-                1,
-                Message::User(vec![UserContent::Text {
-                    text: "x".repeat(len),
-                }]),
-            )
-        };
-        let mut context = test_context(10_000, 1_000);
-        let runtime = || UserContent::Runtime {
-            text: "state".into(),
-        };
-        context.projected = vec![text(100)];
-        assert_eq!(context.request(runtime()).history_lifetime, Continuing);
-        // The input alone reaches 80%: the response will compact this history away.
-        context.projected.push(text(40_000));
-        assert_eq!(context.request(runtime()).history_lifetime, Ending);
     }
 
     #[test]

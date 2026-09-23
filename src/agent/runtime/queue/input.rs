@@ -224,7 +224,7 @@ mod tests {
             assert!(next.messages().any(todo_finished));
         } else {
             assert!(next.messages().any(|message| matches!(message,
-                Message::Assistant(items) if items == &vec![AssistantContent::text("text/0", 0, "answer-0")])));
+                Message::Assistant(items) if items == &vec![AssistantItem::text("text/0", 0, "answer-0")])));
         }
         let state = runtime.jobs.snapshot(job).await.unwrap().state;
         // The child must answer the parent updates first.

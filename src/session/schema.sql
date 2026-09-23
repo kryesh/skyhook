@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 10). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 11). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 
@@ -190,7 +190,7 @@ CREATE TABLE tool_definition (
   digest BLOB NOT NULL UNIQUE CHECK (length(digest) = 32)
 ) STRICT;
 
--- provider/model/reasoning/max_output_tokens derive from profile; correlation from agent.
+-- provider/model/reasoning/max_output_tokens derive from profile.
 -- The agent's first purpose='agent' context is written in its agent_started transaction.
 CREATE TABLE model_context (
   entry INTEGER PRIMARY KEY,
@@ -243,48 +243,56 @@ CREATE TABLE user_part (
   FOREIGN KEY (message, role) REFERENCES message(id, role)
 ) STRICT;
 
+-- Assistant items are text, reasoning (with optional replay), or one tool call each.
+CREATE TABLE item_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO item_kind (name) VALUES ('text'),('reasoning'),('tool_call');
+
 CREATE TABLE assistant_item (
   id INTEGER PRIMARY KEY,
   message INTEGER NOT NULL,
   role TEXT NOT NULL DEFAULT 'assistant' CHECK (role = 'assistant'),
   position INTEGER NOT NULL CHECK (position >= 0),
-  provider_id TEXT NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN ('text','reasoning','tool_call')),
+  provider_id TEXT NOT NULL CHECK (trim(provider_id) <> ''),
+  kind TEXT NOT NULL REFERENCES item_kind(name),
   UNIQUE (message, position),
   UNIQUE (id, kind),
   FOREIGN KEY (message, role) REFERENCES message(id, role)
 ) STRICT;
 
+-- How tightly a replay is bound to the history that produced it.
+CREATE TABLE replay_binding (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO replay_binding (name) VALUES ('free'),('conversation');
+
 CREATE TABLE reasoning_replay (
-  item INTEGER PRIMARY KEY REFERENCES assistant_item(id),
-  version INTEGER NOT NULL,
+  item INTEGER PRIMARY KEY,
+  item_kind TEXT NOT NULL DEFAULT 'reasoning' CHECK (item_kind = 'reasoning'),
   protocol TEXT NOT NULL,
   model TEXT NOT NULL,
-  scope TEXT NOT NULL,
+  scope TEXT NOT NULL CHECK (trim(scope) <> ''),
   payload TEXT NOT NULL CHECK (json_valid(payload)),
-  conversation_bound INTEGER NOT NULL CHECK (conversation_bound IN (0,1))
+  binding TEXT NOT NULL REFERENCES replay_binding(name),
+  FOREIGN KEY (item, item_kind) REFERENCES assistant_item(id, kind)
 ) STRICT;
 
+-- Readable blocks of text and reasoning items.
 CREATE TABLE assistant_block (
   id INTEGER PRIMARY KEY,
   item INTEGER NOT NULL,
-  item_kind TEXT NOT NULL CHECK (item_kind IN ('text','reasoning','tool_call')),
+  item_kind TEXT NOT NULL REFERENCES item_kind(name) CHECK (item_kind IN ('text','reasoning')),
   position INTEGER NOT NULL CHECK (position >= 0),
-  provider_id TEXT NOT NULL,
-  text TEXT,
+  provider_id TEXT NOT NULL CHECK (trim(provider_id) <> ''),
+  text TEXT NOT NULL,
   UNIQUE (item, position),
-  UNIQUE (id, item_kind),
-  CHECK ((item_kind = 'tool_call') = (text IS NULL)),
   FOREIGN KEY (item, item_kind) REFERENCES assistant_item(id, kind)
 ) STRICT;
 
 CREATE TABLE tool_call (
-  block INTEGER PRIMARY KEY,
+  item INTEGER PRIMARY KEY,
   item_kind TEXT NOT NULL DEFAULT 'tool_call' CHECK (item_kind = 'tool_call'),
   call_id TEXT NOT NULL,
   name TEXT NOT NULL,
   arguments TEXT NOT NULL CHECK (json_valid(arguments) AND json_type(arguments) = 'object'),
-  FOREIGN KEY (block, item_kind) REFERENCES assistant_block(id, item_kind)
+  FOREIGN KEY (item, item_kind) REFERENCES assistant_item(id, kind)
 ) STRICT;
 CREATE INDEX tool_call_id ON tool_call(call_id);
 
@@ -293,7 +301,7 @@ CREATE INDEX tool_call_id ON tool_call(call_id);
 CREATE TABLE tool_result (
   message INTEGER PRIMARY KEY,
   role TEXT NOT NULL DEFAULT 'tool' CHECK (role = 'tool'),
-  call INTEGER NOT NULL UNIQUE REFERENCES tool_call(block),
+  call INTEGER NOT NULL UNIQUE REFERENCES tool_call(item),
   result TEXT NOT NULL CHECK (json_valid(result)),
   is_error INTEGER NOT NULL CHECK (is_error IN (0,1)),
   FOREIGN KEY (message, role) REFERENCES message(id, role)
@@ -327,6 +335,10 @@ CREATE TABLE todo_item (
 
 -- ───────────────────────── Model requests, attempts, compaction ─────────────────────────
 
+-- Whether later requests in a context extend a request's history.
+CREATE TABLE history_lifetime (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO history_lifetime (name) VALUES ('extends'),('detached');
+
 CREATE TABLE model_request (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'model_requested' CHECK (kind = 'model_requested'),
@@ -336,7 +348,7 @@ CREATE TABLE model_request (
   -- checkpoint's frontier up to history_through, less model_request_omitted.
   checkpoint INTEGER REFERENCES compaction(entry),
   history_through INTEGER REFERENCES message_commit(entry),
-  history_lifetime TEXT NOT NULL CHECK (history_lifetime IN ('continuing','ending','detached')),
+  history_lifetime TEXT NOT NULL REFERENCES history_lifetime(name),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
   FOREIGN KEY (context, purpose) REFERENCES model_context(entry, purpose)
 ) STRICT;
@@ -390,14 +402,19 @@ CREATE TABLE model_recovery (
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
+-- How a completed response ended; refusals and aborts are model failures instead.
+CREATE TABLE response_outcome (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO response_outcome (name) VALUES ('answer'),('tool_use'),('cut');
+CREATE TABLE cut_reason (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO cut_reason (name) VALUES ('max_tokens'),('incomplete');
+
 CREATE TABLE model_response (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'response_completed' CHECK (kind = 'response_completed'),
   message INTEGER UNIQUE REFERENCES message_commit(message),
-  stop_reason TEXT NOT NULL CHECK (stop_reason IN
-    ('end_turn','tool_use','max_tokens','stop_sequence','content_filter','aborted','other')),
-  stop_other TEXT,
-  CHECK ((stop_reason = 'other') = (stop_other IS NOT NULL)),
+  outcome TEXT NOT NULL REFERENCES response_outcome(name),
+  cut_reason TEXT REFERENCES cut_reason(name),
+  CHECK ((outcome = 'cut') = (cut_reason IS NOT NULL)),
   FOREIGN KEY (entry, kind) REFERENCES attempt_outcome(entry, kind)
 ) STRICT;
 
@@ -451,7 +468,7 @@ CREATE TABLE job (
   created INTEGER NOT NULL UNIQUE,
   kind TEXT NOT NULL DEFAULT 'job_created' CHECK (kind = 'job_created'),
   parent INTEGER REFERENCES job(id),
-  origin_call INTEGER UNIQUE REFERENCES tool_call(block),
+  origin_call INTEGER UNIQUE REFERENCES tool_call(item),
   tool TEXT NOT NULL,
   name TEXT,
   role TEXT NOT NULL CHECK (role IN ('tool','agent','script','question')),
@@ -701,12 +718,11 @@ WHERE NOT EXISTS (SELECT 1 FROM attempt_outcome o WHERE o.attempt = a.entry)
   AND NOT EXISTS (SELECT 1 FROM compaction_outcome c WHERE c.attempt = a.entry);
 
 CREATE VIEW unanswered_call AS
-SELECT c.block AS call, i.message
+SELECT c.item AS call, i.message
 FROM tool_call c
-JOIN assistant_block b ON b.id = c.block
-JOIN assistant_item i ON i.id = b.item
+JOIN assistant_item i ON i.id = c.item
 JOIN message_commit mc ON mc.message = i.message
-WHERE NOT EXISTS (SELECT 1 FROM tool_result r WHERE r.call = c.block);
+WHERE NOT EXISTS (SELECT 1 FROM tool_result r WHERE r.call = c.item);
 
 CREATE VIEW session_summary AS
 SELECT

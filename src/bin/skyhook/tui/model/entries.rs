@@ -11,7 +11,7 @@ use super::requests::{request_entry, request_running};
 use super::{Entry, EntryKey, EntryView, Projection, Surface, Tab, number, pretty};
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
-use skyhook::provider::protocol::{BlockContent, Message, UserContent};
+use skyhook::provider::protocol::{AssistantItem, Message, UserContent};
 use skyhook::session::SessionEvent;
 use std::collections::{HashMap, HashSet};
 
@@ -83,13 +83,11 @@ pub fn entries(
                     } => {
                         pending.clear();
                         turn = Some(record.sequence);
-                        for block in items.iter().flat_map(|item| &item.blocks) {
-                            if let BlockContent::ToolCall(call) = &block.content {
-                                pending.insert(
-                                    (call.id().to_owned(), call.name().to_owned()),
-                                    record.sequence,
-                                );
-                            }
+                        for call in items.iter().filter_map(|item| item.call()) {
+                            pending.insert(
+                                (call.id().to_owned(), call.name().to_owned()),
+                                record.sequence,
+                            );
                         }
                     }
                     SessionEvent::JobCreated {
@@ -212,57 +210,78 @@ pub fn entries(
                                 .get(&record.sequence)
                                 .copied()
                                 .unwrap_or(record.sequence);
-                            let blocks: Vec<_> = items
-                                .iter()
-                                .flat_map(|item| item.blocks.iter().map(move |block| (item, block)))
-                                .collect();
-                            let final_text = if blocks.iter().any(|(_, block)| {
-                                matches!(&block.content, BlockContent::ToolCall(_))
-                            }) {
-                                None
-                            } else {
-                                blocks.iter().rposition(|(_, block)| {
-                                    matches!(&block.content, BlockContent::Text { text } if !text.trim().is_empty())
+                            // The model footer sits under the last visible text of an
+                            // answer; a working turn (one with calls) has none.
+                            let final_text = (!items.iter().any(|item| item.call().is_some()))
+                                .then(|| {
+                                    items.iter().rev().find_map(|item| match item {
+                                        AssistantItem::Text { blocks, .. } => blocks
+                                            .iter()
+                                            .rfind(|block| !block.text.trim().is_empty()),
+                                        _ => None,
+                                    })
                                 })
-                            };
-                            for (i, (item, block)) in blocks.iter().enumerate() {
-                                let block_key = response_block_key(request, &item.id, &block.id);
-                                match &block.content {
-                                    BlockContent::Text { text } if !text.trim().is_empty() => {
-                                        let mut entry = Entry::new(
-                                            block_key.clone(),
-                                            format!("{agent_name}\n{text}"),
-                                            Surface::Agent,
-                                        );
-                                        if Some(i) == final_text {
-                                            entry.footer = projection
-                                                .response_requests
-                                                .get(&record.sequence)
-                                                .and_then(|request| {
-                                                    projection.requests.get(request)
-                                                })
-                                                .and_then(|request| request.start.as_ref())
-                                                .and_then(|start| start.model.clone());
+                                .flatten();
+                            for item in items {
+                                match item {
+                                    AssistantItem::Text { id, blocks, .. } => {
+                                        for block in blocks
+                                            .iter()
+                                            .filter(|block| !block.text.trim().is_empty())
+                                        {
+                                            let mut entry = Entry::new(
+                                                response_block_key(
+                                                    request,
+                                                    id.as_str(),
+                                                    block.id.as_str(),
+                                                ),
+                                                format!("{agent_name}\n{}", block.text),
+                                                Surface::Agent,
+                                            );
+                                            if final_text
+                                                .is_some_and(|last| std::ptr::eq(last, block))
+                                            {
+                                                entry.footer = projection
+                                                    .response_requests
+                                                    .get(&record.sequence)
+                                                    .and_then(|request| {
+                                                        projection.requests.get(request)
+                                                    })
+                                                    .and_then(|request| request.start.as_ref())
+                                                    .and_then(|start| start.model.clone());
+                                            }
+                                            entries.push(entry);
                                         }
-                                        entries.push(entry);
                                     }
-                                    BlockContent::Reasoning { text, .. }
-                                        if !text.trim().is_empty() =>
-                                    {
-                                        entries.push(reasoning_entry(
-                                            reasoning_key(request, &item.id, &block.id),
-                                            text,
-                                            view,
-                                            super::live::ReasoningStatus::Complete,
-                                        ));
+                                    AssistantItem::Reasoning { id, blocks, .. } => {
+                                        for block in blocks
+                                            .iter()
+                                            .filter(|block| !block.text.trim().is_empty())
+                                        {
+                                            entries.push(reasoning_entry(
+                                                reasoning_key(
+                                                    request,
+                                                    id.as_str(),
+                                                    block.id.as_str(),
+                                                ),
+                                                &block.text,
+                                                view,
+                                                super::live::ReasoningStatus::Complete,
+                                            ));
+                                        }
                                     }
-                                    BlockContent::ToolCall(call) => {
+                                    AssistantItem::ToolCall { id, call, .. } => {
                                         let exists = projection.tool_origins.contains(&(
                                             agent.clone(),
                                             record.sequence,
                                             call.id().to_owned(),
                                         ));
                                         if !exists {
+                                            let block_key = response_block_key(
+                                                request,
+                                                id.as_str(),
+                                                id.as_str(),
+                                            );
                                             let e = call_entry(
                                                 block_key.clone(),
                                                 (
@@ -286,7 +305,6 @@ pub fn entries(
                                             entries.push(e);
                                         }
                                     }
-                                    _ => {}
                                 }
                             }
                         }

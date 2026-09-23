@@ -41,7 +41,7 @@ pub(super) fn classify_error(status: Option<u16>, native: &serde_json::Value) ->
         .iter()
         .any(|id| matches!(*id, "rate_limit_error" | "rate_limit_exceeded"))
     {
-        ProviderErrorKind::RateLimited
+        ProviderErrorKind::RateLimited { retry_after: None }
     } else if identifiers
         .iter()
         .any(|id| matches!(*id, "timeout" | "request_timeout"))
@@ -58,10 +58,10 @@ pub(super) fn classify_error(status: Option<u16>, native: &serde_json::Value) ->
         match status {
             Some(401 | 403) => ProviderErrorKind::Authentication,
             Some(408 | 504) => ProviderErrorKind::Timeout,
-            Some(429) => ProviderErrorKind::RateLimited,
-            Some(409 | 425) => ProviderErrorKind::Response,
+            Some(429) => ProviderErrorKind::RateLimited { retry_after: None },
+            Some(409 | 425) => ProviderErrorKind::Unavailable { retry_after: None },
             Some(300..=499) => ProviderErrorKind::InvalidRequest,
-            _ => ProviderErrorKind::Response,
+            _ => ProviderErrorKind::Unavailable { retry_after: None },
         }
     };
     let mut message = match status {
@@ -72,11 +72,7 @@ pub(super) fn classify_error(status: Option<u16>, native: &serde_json::Value) ->
         message.push_str(&format!(" [code={code}]"));
     }
     append_server_message(&mut message, native);
-    ProviderError {
-        kind,
-        message,
-        retry_after: None,
-    }
+    ProviderError { kind, message }
 }
 
 pub(super) fn append_server_message(message: &mut String, native: &serde_json::Value) {
@@ -225,7 +221,7 @@ mod tests {
             ),
             (
                 json!({"type":"rate_limit_error"}),
-                ProviderErrorKind::RateLimited,
+                ProviderErrorKind::RateLimited { retry_after: None },
             ),
             (
                 json!({"type":"invalid_request_error"}),

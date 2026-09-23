@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::Message;
-use crate::media::LoadedBlobs;
+use crate::{identity::AgentId, media::LoadedBlobs};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SystemSegment {
@@ -29,7 +29,6 @@ pub struct ModelRequest {
     pub response_schema: Option<ResponseSchema>,
     pub reasoning: Option<String>,
     pub max_output_tokens: Option<u64>,
-    pub correlation: Option<String>,
     /// Blob contents this request references, loaded by the session store for
     /// provider encoding. Never serialized.
     #[serde(skip)]
@@ -53,13 +52,40 @@ impl ModelRequest {
 pub enum HistoryLifetime {
     /// Later requests in this context extend this history.
     #[default]
-    Continuing,
-    /// This history is replaced after this request (compaction). Providers keep no reusable
-    /// server-side state for it, though reading an already-cached prefix may still pay off.
-    Ending,
+    Extends,
     /// This history is sent once under settings no other request in the context shares
     /// (compaction summaries), so there is no cached prefix to read or extend.
     Detached,
+}
+
+/// Stable identity of one conversation's provider context. Backends may send it as
+/// cache-affinity metadata; it never selects history.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct ContextId(String);
+
+impl ContextId {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&AgentId> for ContextId {
+    fn from(agent: &AgentId) -> Self {
+        Self(agent.to_string())
+    }
+}
+
+impl From<&str> for ContextId {
+    fn from(id: &str) -> Self {
+        Self(id.to_owned())
+    }
+}
+
+impl From<String> for ContextId {
+    fn from(id: String) -> Self {
+        Self(id)
+    }
 }
 
 /// A named JSON Schema that a provider must enforce for the final response text.

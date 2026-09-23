@@ -5,8 +5,8 @@ use std::{env, sync::Arc, time::Duration};
 
 use super::{ConfigError, ProviderConfig};
 use crate::provider::{
-    Provider, ProviderTimeouts,
-    backends::{NativeSettings, OpenAiApi, Protocol, codex::CodexProvider},
+    Provider,
+    backends::{NativeSettings, OpenAiApi, Protocol, ProviderTimeouts, codex::CodexProvider},
 };
 
 /// No public fields or constructors: each value owns exactly one validated auth
@@ -263,8 +263,8 @@ models:
         );
         for config in native_configs(&authentication) {
             let provider = build("test", &config).unwrap();
-            let _first = provider.open_context("first".to_owned()).unwrap();
-            let _second = provider.open_context("second".to_owned()).unwrap();
+            let _first = provider.open_context("first".into()).unwrap();
+            let _second = provider.open_context("second".into()).unwrap();
             assert!(
                 !marker.exists(),
                 "credentials must be resolved only on first request"

@@ -293,7 +293,7 @@ mod tests {
     use super::*;
     use crate::{
         job::{JobRole, JobSpec},
-        provider::protocol::{AssistantContent, Message},
+        provider::protocol::{AssistantItem, Message},
         tool::ToolRegistryBuilder,
     };
     use serde_json::json;
@@ -498,8 +498,7 @@ mod tests {
             let text: String = (0..500)
                 .map(|line| format!("child answer line {line}\n"))
                 .collect();
-            let message =
-                Message::Assistant(vec![AssistantContent::text("answer", 0, text.clone())]);
+            let message = Message::Assistant(vec![AssistantItem::text("answer", 0, text.clone())]);
             let sequence = runtime
                 .jobs
                 .commit_child_message(&child, job, message, text.clone(), true, |_| Vec::new())

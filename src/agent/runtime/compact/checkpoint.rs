@@ -74,12 +74,11 @@ impl SessionRuntime {
             } else {
                 vec![Message::User(vec![runtime])]
             },
-            history_lifetime: HistoryLifetime::Continuing,
+            history_lifetime: HistoryLifetime::Extends,
             tools: input.tools.clone(),
             reasoning: input.reasoning.clone(),
             response_schema: input.response_schema.clone(),
             max_output_tokens: input.max_output_tokens,
-            correlation: input.correlation.clone(),
             blobs: Default::default(),
         };
         let before_tokens = compaction::estimate_request(&input);
@@ -323,7 +322,7 @@ mod tests {
     use crate::{
         agent::TodoStatus,
         job::{JobOutcome, JobSpec},
-        provider::protocol::{AssistantContent, Message, ToolCall, ToolResult, UserContent},
+        provider::protocol::{AssistantItem, Message, ToolCall, ToolResult, UserContent},
         session::{EventRecord, ModelPurpose, SessionEvent},
         tool::ToolOutput,
     };
@@ -362,7 +361,7 @@ mod tests {
         };
         for message in [
             Message::User(vec![UserContent::Attachment { attachment }]),
-            Message::Assistant(vec![AssistantContent::tool_call("image-call", 0, call)]),
+            Message::Assistant(vec![AssistantItem::tool_call("image-call", 0, call)]),
             Message::Tool(vec![result]),
         ] {
             runtime.commit(agent, message).await.unwrap();

@@ -34,7 +34,6 @@ impl ApiKeyCommand {
 fn failure(message: &'static str) -> ProviderError {
     // Never retain the command, output, exit status, or underlying OS error.
     ProviderError {
-        retry_after: None,
         kind: ProviderErrorKind::Authentication,
         message: message.into(),
     }
@@ -92,13 +91,14 @@ async fn execute(command: &str, protocol: Protocol) -> Result<HeaderValue, Provi
 mod tests {
     use super::*;
     use crate::provider::{
-        Provider, ProviderTimeouts,
+        Provider,
         backends::{
-            ChatReasoningReplay, NativeProvider, NativeSettings,
+            ChatReasoningReplay, NativeProvider, NativeSettings, ProviderTimeouts,
             transport::tests::{read_request, reply},
         },
         protocol::ModelRequest,
     };
+    use futures_util::StreamExt;
     use std::{path::Path, time::Duration};
     use tokio::{io::AsyncWriteExt, net::TcpListener};
 
@@ -182,28 +182,27 @@ mod tests {
                     ))
                     .unwrap();
                 let mut contexts: Vec<_> = (0..8)
-                    .map(|i| provider.clone().open_context(i.to_string()).unwrap())
+                    .map(|i| provider.clone().open_context(i.to_string().into()).unwrap())
                     .collect();
                 // Neither unpolled nor invalid invocations run the command.
                 drop(contexts[0].invoke(request()));
                 let mut empty_model = request();
                 empty_model.model.clear();
-                let mut other_context = request();
-                other_context.correlation = Some("different-context".into());
-                for invalid in [empty_model, other_context] {
-                    assert!(contexts[0].invoke(invalid).await.is_err());
-                }
+                let invalid = contexts[0].invoke(empty_model).next().await;
+                assert!(invalid.unwrap().is_err());
                 assert!(!count.exists());
+                // The captured headers prove which credential each request carried; the
+                // empty fixture reply makes every stream's first item irrelevant here.
                 let invoke = async {
-                    let calls = contexts.iter_mut().map(|context| context.invoke(request()));
-                    for result in futures_util::future::join_all(calls).await {
-                        drop(result.unwrap());
-                    }
+                    let calls = contexts
+                        .iter_mut()
+                        .map(|context| context.invoke(request()).into_future());
+                    drop(futures_util::future::join_all(calls).await);
                     // Newly opened contexts reuse cached success.
                     let mut later = provider.open_context("later".into()).unwrap();
-                    drop(later.invoke(request()).await.unwrap());
+                    drop(later.invoke(request()).next().await);
                     let mut direct = direct.open_context("direct".into()).unwrap();
-                    drop(direct.invoke(request()).await.unwrap());
+                    drop(direct.invoke(request()).next().await);
                 };
                 let ((), headers) = tokio::join!(invoke, capture(&listener, 10));
                 for headers in &headers[..9] {
@@ -259,7 +258,7 @@ mod tests {
                     .with_api_key_command(command)
                     .unwrap();
                 let mut context = provider.open_context("test".into()).unwrap();
-                let Err(error) = context.invoke(request()).await else {
+                let Some(Err(error)) = context.invoke(request()).next().await else {
                     panic!("failed command unexpectedly invoked HTTP")
                 };
                 assert_eq!(error.kind, ProviderErrorKind::Authentication);
@@ -302,7 +301,7 @@ mod tests {
             let mut context = provider.open_context("cancelled".into()).unwrap();
             let mut pending = context.invoke(request());
             let pid = tokio::select! {
-                _ = &mut pending => panic!("command should still be running"),
+                _ = pending.next() => panic!("command should still be running"),
                 pid = async {
                     loop {
                         if let Ok(text) = tokio::fs::read_to_string(&marker).await
@@ -333,8 +332,9 @@ mod tests {
                     .is_none()
             );
             let mut retry = provider.clone().open_context("retry".into()).unwrap();
-            let (result, headers) = tokio::join!(retry.invoke(request()), capture(&listener, 1));
-            drop(result.unwrap());
+            let (result, headers) =
+                tokio::join!(retry.invoke(request()).into_future(), capture(&listener, 1));
+            drop(result);
             assert_credential(&headers[0], chat(), "retry-key");
         };
         tokio::time::timeout(Duration::from_secs(10), run)

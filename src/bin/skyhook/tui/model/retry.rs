@@ -2,7 +2,7 @@
 use super::{Entry, EntryKey, Projection, Surface};
 use skyhook::agent::{AgentActivity, ObservationSnapshot};
 use skyhook::identity::AgentId;
-use skyhook::provider::protocol::BlockKind;
+use skyhook::provider::protocol::ItemKind;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum RetryState {
@@ -108,18 +108,10 @@ pub(super) fn retry_entry(
     if info.response.is_none()
         && let Some(response) = snapshot.responses.get(&(agent.clone(), request))
     {
-        for block in response
-            .snapshot()
-            .items
-            .into_iter()
-            .flat_map(|item| item.blocks)
-        {
-            match block.kind {
-                BlockKind::Text if !block.text.trim().is_empty() => {
-                    text.push('\n');
-                    text.push_str(&block.text);
-                }
-                _ => {}
+        for block in response.blocks() {
+            if block.kind == ItemKind::Text && !block.text.trim().is_empty() {
+                text.push('\n');
+                text.push_str(&block.text);
             }
         }
     }

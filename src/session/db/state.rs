@@ -66,8 +66,8 @@ pub(in crate::session) fn interrupted_work(
     )?;
     let calls = db.query(
         "SELECT e.agent, c.call_id, c.name FROM unanswered_call u \
-         JOIN tool_call c ON c.block = u.call \
-         JOIN assistant_block b ON b.id = c.block JOIN assistant_item i ON i.id = b.item \
+         JOIN tool_call c ON c.item = u.call \
+         JOIN assistant_item i ON i.id = c.item \
          JOIN message_commit m ON m.message = u.message JOIN entry e ON e.seq = m.entry \
          ORDER BY m.entry, i.position",
         Vec::new(),

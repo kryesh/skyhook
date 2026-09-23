@@ -4,7 +4,7 @@ use super::super::format::agent_label;
 use super::retry::RetryState;
 use super::state_name;
 use serde_json::Value;
-use skyhook::agent::{AgentActivity, LiveResponse, ObservationSnapshot, TodoItem};
+use skyhook::agent::{AgentActivity, ObservationSnapshot, ObservedResponse, TodoItem};
 use skyhook::execution::ExecutionLocation;
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobRole, JobState};
@@ -237,7 +237,7 @@ impl Projection {
             .is_some_and(|r| r.response.is_some())
     }
 
-    pub(super) fn live_response(&self, request: u64, response: &LiveResponse) -> bool {
+    pub(super) fn live_response(&self, request: u64, response: &ObservedResponse) -> bool {
         // Settlement can announce a journal sequence before its record arrives.
         // Keep that snapshot visible until the projection has consumed the commit.
         (!response.settled || response.message.is_some()) && !self.response_committed(request)
@@ -765,7 +765,7 @@ mod tests {
     #[test]
     fn settlement_keeps_the_live_response_until_its_journal_commit_arrives() {
         let mut projection = Projection::default();
-        let mut live = LiveResponse::default();
+        let mut live = ObservedResponse::default();
         assert!(projection.live_response(4, &live));
         live.settled = true;
         assert!(!projection.live_response(4, &live));

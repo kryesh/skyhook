@@ -4,9 +4,9 @@ use crate::provider::backends::common::{
     attach_runtime_tail, image_url, invalid, opaque_payload, system_text, tool_text, user_parts,
     validate_openai_effort,
 };
-use crate::provider::protocol::{BlockContent, Message, ModelRequest};
+use crate::provider::protocol::{AssistantItem, ContextId, Message, ModelRequest};
 
-pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
+pub(crate) fn encode(request: &ModelRequest, context: &ContextId) -> Result<Value, ProviderError> {
     if request.model.trim().is_empty() {
         return Err(invalid("Responses requires a nonempty model"));
     }
@@ -32,36 +32,36 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
             }
             Message::Assistant(items) => {
                 for item in items {
-                    if item.kind == ItemKind::Reasoning {
+                    match item {
                         // Private replay belongs to the item, never to each display summary.
-                        if let Some(native) =
-                            opaque_payload(&item.replay, "responses", &request.model)
-                        {
-                            if kind(native).map_err(|error| invalid(error.message))?
-                                != ItemKind::Reasoning
+                        AssistantItem::Reasoning { replay, .. } => {
+                            if let Some(native) =
+                                opaque_payload(replay, "responses", &request.model)
                             {
-                                return Err(invalid(
-                                    "Responses reasoning envelope contains a non-reasoning item",
-                                ));
+                                if kind(native).map_err(|error| invalid(error.message))?
+                                    != ItemKind::Reasoning
+                                {
+                                    return Err(invalid(
+                                        "Responses reasoning envelope contains a non-reasoning item",
+                                    ));
+                                }
+                                final_parts(native).map_err(|error| invalid(error.message))?;
+                                input.push(native.clone());
                             }
-                            final_parts(native).map_err(|error| invalid(error.message))?;
-                            input.push(native.clone());
                         }
-                        continue;
-                    }
-                    for part in &item.blocks {
-                        match &part.content {
-                            // `type` is optional in the spec, but some servers
-                            // cannot identify an assistant item without it.
-                            BlockContent::Text { text } => input.push(json!({
-                                "type":"message", "role":"assistant",
-                                "content":[{"type":"output_text", "text":text}]
-                            })),
-                            BlockContent::ToolCall(call) => {
-                                input.push(json!({"type":"function_call", "call_id":call.id(),
-                                    "name":call.name(), "arguments":serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}));
+                        // `type` is optional in the spec, but some servers
+                        // cannot identify an assistant item without it.
+                        AssistantItem::Text { blocks, .. } => {
+                            for block in blocks {
+                                input.push(json!({
+                                    "type":"message", "role":"assistant",
+                                    "content":[{"type":"output_text", "text":block.text}]
+                                }));
                             }
-                            BlockContent::Reasoning { .. } => {}
+                        }
+                        AssistantItem::ToolCall { call, .. } => {
+                            input.push(json!({"type":"function_call", "call_id":call.id(),
+                                "name":call.name(), "arguments":serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}));
                         }
                     }
                 }
@@ -136,9 +136,7 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
         }
         settings.insert("max_output_tokens".into(), json!(max));
     }
-    if let Some(correlation) = &request.correlation {
-        settings.insert("prompt_cache_key".into(), json!(correlation));
-    }
+    settings.insert("prompt_cache_key".into(), json!(context.as_str()));
     // Input is always an explicit array, even for an empty conversation.
     settings.shift_insert(1, "input".into(), Value::Array(input));
     Ok(Value::Object(settings))
@@ -146,26 +144,35 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::fixtures::{call_item, completed, reasoning_item};
+    use super::super::fixtures::{assemble_with, call_item, completed, reasoning_item};
     use super::*;
-    use crate::provider::backends::common::tests::request;
+
+    fn context() -> ContextId {
+        ContextId::from("session")
+    }
+    use crate::provider::backends::common::{
+        replay as scoped_replay,
+        tests::{request, scope},
+    };
     use crate::{
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantItem, ResponseAssembler, ResponseSchema, SystemSegment, ToolDefinition,
-            ToolResult, UserContent,
+            Binding, Outcome, Replay, ResponseSchema, SystemSegment, ToolDefinition, ToolResult,
+            UserContent,
         },
     };
 
+    fn reasoning_envelope(protocol: &str, model: &str, payload: Value) -> Replay {
+        scoped_replay(protocol, model, &scope(), payload, Binding::Free)
+    }
+
     fn assemble(output: Vec<Value>) -> Vec<AssistantItem> {
-        let mut assembler = ResponseAssembler::default();
-        for event in Decoder::new("gpt-5".into())
-            .feed(completed(output))
+        let decoder = Decoder::new("gpt-5".into(), scope());
+        assemble_with(decoder, vec![completed(output)])
             .unwrap()
-        {
-            assembler.push(&event).unwrap();
-        }
-        assembler.finish().unwrap().0
+            .completion
+            .items()
+            .to_vec()
     }
 
     fn text_item(id: &str, text: &str) -> Value {
@@ -208,11 +215,11 @@ mod tests {
         req.history.clear();
         req.max_output_tokens = None;
         assert_eq!(
-            encode(&req).unwrap(),
+            encode(&req, &context()).unwrap(),
             json!({
                 "model":"gpt-5", "input":[], "stream":true, "store":false,
                 "include":["reasoning.encrypted_content"],
-                "reasoning":{"summary":"auto"}
+                "reasoning":{"summary":"auto"}, "prompt_cache_key":"session"
             })
         );
     }
@@ -235,7 +242,6 @@ mod tests {
             schema: schema.clone(),
         });
         req.reasoning = Some("high".into());
-        req.correlation = Some("session".into());
         let attach = |attachment| UserContent::Attachment { attachment };
         let Message::User(mut content) = user("look") else {
             unreachable!()
@@ -248,11 +254,11 @@ mod tests {
             Message::User(content),
             tool_result(json!({"answer":42, "error":null}), vec![image()], true),
         ];
-        assert!(encode(&req).is_err());
+        assert!(encode(&req, &context()).is_err());
         // Load the fixture blobs as the session store would.
         req.blobs.insert(image().blob, b"a".to_vec());
         req.blobs.insert(notes().blob, b"notes".to_vec());
-        let body = encode(&req).unwrap();
+        let body = encode(&req, &context()).unwrap();
         let image_url = "data:image/png;base64,YQ==";
         assert_eq!(body["instructions"], "system");
         assert_eq!(body["tools"][0]["name"], "search");
@@ -286,31 +292,28 @@ mod tests {
             let envelope = reasoning_envelope(provider, model, reasoning_item());
             let reasoning = AssistantItem::reasoning("r", 0, "private", Some(envelope));
             req.history = vec![Message::Assistant(vec![reasoning])];
-            assert_eq!(encode(&req).unwrap()["input"], json!([]));
+            assert_eq!(encode(&req, &context()).unwrap()["input"], json!([]));
         }
     }
 
     #[test]
     fn encrypted_reasoning_and_tools_replay_only_within_their_scope() {
-        use crate::provider::backends::common::{
-            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope,
-        };
+        use crate::provider::backends::common::{filter_reasoning_scope, reasoning_scope};
         let mut req = request("gpt-5");
         let scope = reasoning_scope("openai", "https://api.example/v1/responses");
         // No display summary is required for native reasoning to be replayable.
         let native = json!({"type":"reasoning", "id":"rs_opaque", "summary":[],
             "encrypted_content":"opaque+/=", "future_state":{"signature":"unchanged"},
             "content":[{"type":"reasoning_text", "text":"native reasoning text"}]});
-        let mut assembler = ResponseAssembler::default();
-        let chunks = Decoder::new(req.model.clone())
-            .feed(completed(vec![native.clone(), call_item()]))
-            .unwrap();
-        for mut chunk in chunks {
-            bind_reasoning_scope(&mut chunk, &scope);
-            assembler.push(&chunk).unwrap();
-        }
-        let (items, _, reason) = assembler.finish().unwrap();
-        assert_eq!((reason, items[0].blocks.len()), (StopReason::ToolUse, 1));
+        let decoder = Decoder::new(req.model.clone(), scope.clone());
+        let reduced =
+            assemble_with(decoder, vec![completed(vec![native.clone(), call_item()])]).unwrap();
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+        let items = reduced.items().to_vec();
+        assert_eq!(
+            items[0].reasoning_text().as_deref(),
+            Some("native reasoning text")
+        );
         req.history = vec![
             Message::Assistant(items),
             tool_result(json!({"found":true}), vec![], false),
@@ -318,7 +321,7 @@ mod tests {
         let original = req;
         let mut matching = original.clone();
         filter_reasoning_scope(&mut matching, &scope);
-        let body = encode(&matching).unwrap();
+        let body = encode(&matching, &context()).unwrap();
         let input = &body["input"];
         assert_eq!(input[0], native);
         assert_eq!(
@@ -336,13 +339,17 @@ mod tests {
             let Message::Assistant(items) = &foreign.history[0] else {
                 unreachable!()
             };
-            assert_eq!((items.len(), items[0].blocks.len()), (2, 1));
-            assert!(items[0].replay.is_none());
-            let wire = encode(&foreign).unwrap();
+            assert_eq!(items.len(), 2);
+            assert_eq!(
+                items[0].reasoning_text().as_deref(),
+                Some("native reasoning text")
+            );
+            assert!(items[0].replay().is_none());
+            let wire = encode(&foreign, &context()).unwrap();
             assert_eq!(wire["input"], json!([input[1].clone(), input[2].clone()]));
         }
         // Filtering a call-time clone must never destroy resumable journal state.
-        assert_eq!(encode(&original).unwrap()["input"][0], native);
+        assert_eq!(encode(&original, &context()).unwrap()["input"][0], native);
     }
 
     #[test]
@@ -351,7 +358,7 @@ mod tests {
         let efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
         for effort in std::iter::once(None).chain(efforts.map(Some)) {
             req.reasoning = effort.map(str::to_owned);
-            let body = encode(&req).unwrap();
+            let body = encode(&req, &context()).unwrap();
             assert_eq!(body["reasoning"]["summary"], "auto");
             assert_eq!(
                 body["reasoning"].get("effort"),
@@ -360,7 +367,7 @@ mod tests {
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         }
         req.reasoning = Some("invalid".into());
-        assert!(encode(&req).is_err());
+        assert!(encode(&req, &context()).is_err());
     }
 
     #[test]
@@ -378,7 +385,7 @@ mod tests {
             Message::Assistant(items),
             tool_result(json!({"value":42}), vec![], false),
         ];
-        let encoded = encode(&req).unwrap();
+        let encoded = encode(&req, &context()).unwrap();
         let input = encoded["input"].as_array().unwrap();
         let reasoning = input.iter().filter(|item| item["type"] == "reasoning");
         assert_eq!(reasoning.count(), 1);
@@ -405,7 +412,7 @@ mod tests {
             "answer", "42",
         )])));
         req.history.push(user("thanks"));
-        let replayed = encode(&req).unwrap();
+        let replayed = encode(&req, &context()).unwrap();
         let replayed = replayed["input"].as_array().unwrap();
         assert_eq!(&replayed[..input.len()], input.as_slice());
         assert_eq!(replayed[5]["content"][0]["text"], "42");
@@ -419,14 +426,14 @@ mod tests {
         }]);
         let mut req = request("gpt-5");
         req.history = vec![tool_result(json!(1), vec![], false)];
-        let without_tail = encode(&req).unwrap()["input"].take();
+        let without_tail = encode(&req, &context()).unwrap()["input"].take();
         req.tail = vec![state.clone()];
-        let input = encode(&req).unwrap()["input"].take();
+        let input = encode(&req, &context()).unwrap()["input"].take();
         assert_eq!(input.as_array().unwrap().len(), 1);
         let output = without_tail[0]["output"].as_str().unwrap();
         assert_eq!(input[0]["output"], format!("{output}\n\n<skyhook_state>"));
         req.history = vec![user("hi")];
-        let input = encode(&req).unwrap()["input"].take();
+        let input = encode(&req, &context()).unwrap()["input"].take();
         assert_eq!(
             input,
             json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":"<skyhook_state>"}]}])

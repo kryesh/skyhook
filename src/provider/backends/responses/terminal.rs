@@ -1,6 +1,5 @@
 //! Terminal status, output completeness, usage accounting, and safe tool discard.
 use super::native::NativeItem;
-use super::normalization::TerminalOutcome;
 use super::*;
 
 impl Decoder {
@@ -8,10 +7,10 @@ impl Decoder {
         &mut self,
         output: &[Value],
         usage: Option<Usage>,
-        outcome: TerminalOutcome,
-        chunks: &mut Vec<ResponseChunk>,
+        finish: Finish,
+        events: &mut Vec<ResponseEvent>,
     ) -> Result<(), ProviderError> {
-        let truncated = !matches!(outcome, TerminalOutcome::Completed);
+        let truncated = finish != Finish::Normal;
         let omitted = self.allow_omitted_terminal_output
             && output.is_empty()
             && self.items.values().all(|item| {
@@ -28,9 +27,7 @@ impl Decoder {
                     native
                         .get("id")
                         .and_then(Value::as_str)
-                        .is_some_and(|native_id| {
-                            native_id == item.native_id || item.aliases.contains(native_id)
-                        })
+                        .is_some_and(|native_id| item.is(native_id))
                 });
                 (!retained).then_some(*id)
             })
@@ -43,7 +40,7 @@ impl Decoder {
             let native = NativeItem::parse(native)?;
             // Stable native IDs take precedence over terminal array
             // position. Regenerated IDs require unique semantic evidence.
-            let id = self.snapshot_index(native, None, Some(&alias_candidates), chunks)?;
+            let id = self.snapshot_index(native, None, Some(&alias_candidates))?;
             if !seen.insert(id) {
                 return Err(protocol("duplicate terminal output item"));
             }
@@ -53,7 +50,7 @@ impl Decoder {
                 }
                 continue;
             }
-            self.end(id, native, chunks, true)?;
+            self.end(id, native, true)?;
         }
         if !omitted
             && self.items.iter().any(|(id, item)| {
@@ -62,52 +59,20 @@ impl Decoder {
         {
             return Err(protocol("terminal response omitted a streamed output item"));
         }
-        if truncated {
-            // Even syntactically complete tools are unsafe on an
-            // abnormal stop; never expose them as executable calls.
-            for item in self
-                .items
-                .values()
-                .filter(|item| item.kind() == ItemKind::ToolCall)
-            {
-                chunks.push(ResponseChunk::ItemDiscarded {
-                    id: item.native_id.clone(),
-                });
-            }
-        }
-        // Reasoning display stays open through item.done so the final
-        // snapshot can supply previously absent readable content. Close
-        // it from its actual received snapshot on omitted-output streams.
-        if omitted {
-            let snapshots: Vec<_> = self
-                .items
-                .iter()
-                .filter(|(_, item)| !(truncated && item.kind() == ItemKind::ToolCall))
-                .map(|(id, item)| (*id, item.snapshot().expect("checked ended").clone()))
-                .collect();
-            for (id, native) in snapshots {
-                self.end(id, NativeItem::parse(&native)?, chunks, true)?;
-            }
-        }
+        // Even syntactically complete tools are unsafe on an abnormal stop;
+        // they never become executable calls. Every other item is complete
+        // from its received state, whether the terminal output repeated it or not.
+        let items = self
+            .items
+            .iter()
+            .filter(|(_, item)| !(truncated && item.kind() == ItemKind::ToolCall))
+            .map(|(id, item)| item.build(*id, &self.model, &self.scope))
+            .collect::<Result<Vec<_>, _>>()?;
         if let Some(usage) = usage {
-            chunks.push(ResponseChunk::UsageUpdated { usage });
+            events.push(ResponseEvent::Usage(usage));
         }
         self.completed = true;
-        let stop_reason = match outcome {
-            TerminalOutcome::MaxTokens => StopReason::MaxTokens,
-            TerminalOutcome::ContentFilter => StopReason::ContentFilter,
-            TerminalOutcome::Incomplete => StopReason::Other("incomplete".into()),
-            TerminalOutcome::Completed
-                if self
-                    .items
-                    .values()
-                    .any(|item| item.kind() == ItemKind::ToolCall) =>
-            {
-                StopReason::ToolUse
-            }
-            TerminalOutcome::Completed => StopReason::EndTurn,
-        };
-        chunks.push(ResponseChunk::ResponseEnded { stop_reason });
+        events.push(ResponseEvent::End(finish.complete(items)?));
         Ok(())
     }
 }
@@ -116,7 +81,6 @@ impl Decoder {
 mod tests {
     use super::fixtures::*;
     use super::*;
-    use crate::provider::protocol::ResponseAssembler;
 
     #[test]
     fn abnormal_terminal_discards_tools_but_preserves_reasoning_and_usage() {
@@ -124,14 +88,14 @@ mod tests {
             for codex in [false, true] {
                 for output_done in [false, true] {
                     for (detail, reason) in [
-                        ("max_output_tokens", StopReason::MaxTokens),
-                        ("content_filter", StopReason::ContentFilter),
+                        ("max_output_tokens", CutReason::MaxTokens),
+                        ("content_filter", CutReason::Refusal),
                     ] {
                         for args in ["{\"query\":", "{\"query\":\"rust\"}"] {
-                            let mut decoder = if codex {
-                                Decoder::codex("gpt-5".into())
+                            let decoder = if codex {
+                                Decoder::codex("gpt-5".into(), scope())
                             } else {
-                                Decoder::new("gpt-5".into())
+                                Decoder::new("gpt-5".into(), scope())
                             };
                             let native = reasoning_item();
                             let text = message("text", "partial answer");
@@ -162,22 +126,19 @@ mod tests {
                             "status":"incomplete", "incomplete_details":{"reason":detail},
                             "output":if codex { vec![] } else { vec![native.clone(), call, text] },
                             "usage":usage}}));
-                            let mut assembler = ResponseAssembler::default();
-                            for frame in frames {
-                                for chunk in decoder.feed(frame).unwrap() {
-                                    assembler.push(&chunk).unwrap();
-                                }
-                            }
-                            decoder.finish().unwrap();
-                            let (items, usage, actual_reason) = assembler.finish().unwrap();
-                            assert_eq!(actual_reason, reason);
+                            let reduced = assemble_with(decoder, frames).unwrap();
+                            assert_eq!(reduced.completion.outcome(), Outcome::Cut(reason));
+                            let usage = reduced.usage;
                             assert_eq!(usage.output_tokens, 11);
                             assert_eq!(usage.input_tokens, 20 - cached);
                             assert_eq!(usage.cached_input_tokens, cached);
+                            let items = reduced.items();
                             assert_eq!(items.len(), 2);
-                            assert!(items.iter().all(|item| item.tool_call_ref().is_none()));
+                            assert!(items.iter().all(|item| item.call().is_none()));
                             assert_eq!(items[1].text_content().as_deref(), Some("partial answer"));
-                            assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
+                            assert_eq!(items[0].replay().unwrap().payload, native);
+                            // The call streamed for display before it was cut.
+                            assert_eq!(reduced.streamed(ItemKind::ToolCall), [args]);
                         }
                     }
                 }
@@ -189,9 +150,9 @@ mod tests {
     fn deferred_malformed_tools_still_fail_on_normal_terminal() {
         for codex in [false, true] {
             let mut decoder = if codex {
-                Decoder::codex("gpt-5".into())
+                Decoder::codex("gpt-5".into(), scope())
             } else {
-                Decoder::new("gpt-5".into())
+                Decoder::new("gpt-5".into(), scope())
             };
             let mut call = call_item();
             call["arguments"] = json!("{\"query\":");

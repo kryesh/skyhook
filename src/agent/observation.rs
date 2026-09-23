@@ -2,7 +2,7 @@
 use super::RuntimeEvent;
 use crate::{
     identity::AgentId,
-    provider::protocol::{ResponseAssembler, ResponseSnapshot},
+    provider::protocol::{LiveBlock, LiveResponse, Step},
     session::{EventRecord, SessionEvent},
 };
 use std::{
@@ -29,18 +29,28 @@ pub struct ContextUsage {
     pub capacity: u64,
 }
 
+/// One request's response as observers see it: provisional blocks while it streams,
+/// the final provisional view once it has ended, until its commit replaces it.
 #[derive(Clone, Debug, Default)]
-pub struct LiveResponse {
-    /// The sole source of truth for provider-native response state.
-    assembler: ResponseAssembler,
+pub struct ObservedResponse {
+    live: LiveResponse,
+    ended: Option<Vec<LiveBlock>>,
     pub message: Option<u64>,
     pub settled: bool,
     pub error: Option<String>,
 }
 
-impl LiveResponse {
-    pub fn snapshot(&self) -> ResponseSnapshot {
-        self.assembler.snapshot()
+impl ObservedResponse {
+    /// Blocks in arrival order.
+    #[must_use]
+    pub fn blocks(&self) -> &[LiveBlock] {
+        self.ended.as_deref().unwrap_or_else(|| self.live.blocks())
+    }
+
+    /// Whether `block` is the one still being streamed.
+    #[must_use]
+    pub fn streaming(&self, block: &LiveBlock) -> bool {
+        !self.settled && self.ended.is_none() && self.live.current() == Some(&block.block)
     }
 }
 
@@ -48,7 +58,7 @@ impl LiveResponse {
 pub struct ObservationSnapshot {
     pub revision: u64,
     pub records: BTreeMap<u64, EventRecord>,
-    pub responses: HashMap<(AgentId, u64), LiveResponse>,
+    pub responses: HashMap<(AgentId, u64), ObservedResponse>,
     pub activity: HashMap<AgentId, AgentActivity>,
     pub context: HashMap<AgentId, ContextUsage>,
 }
@@ -83,10 +93,12 @@ impl ObservationSnapshot {
                     }
                     SessionEvent::ModelAttemptStarted { request, .. } => {
                         // One logical request survives retries; native item/block
-                        // IDs may be reused. Clear only the displayed assembler,
+                        // IDs may be reused. Clear only the displayed response,
                         // never the journal's per-attempt audit records.
-                        self.responses
-                            .insert((record.agent.clone(), *request), LiveResponse::default());
+                        self.responses.insert(
+                            (record.agent.clone(), *request),
+                            ObservedResponse::default(),
+                        );
                         let activity = if self.records.get(request).is_some_and(|record| {
                             matches!(
                                 record.event,
@@ -159,8 +171,11 @@ impl ObservationSnapshot {
                 event,
             } => {
                 let response = self.responses.entry((agent, request)).or_default();
-                if let Err(error) = response.assembler.push(&event) {
-                    response.error = Some(error.to_string());
+                if response.ended.is_none() {
+                    match std::mem::take(&mut response.live).push(event) {
+                        Step::Open(live) => response.live = live,
+                        Step::Ended { blocks, .. } => response.ended = Some(blocks),
+                    }
                 }
             }
             RuntimeEvent::ResponseSettled {
@@ -277,7 +292,7 @@ mod tests {
     use super::*;
     use crate::{
         identity::SessionId,
-        provider::protocol::{BlockKind, ContentDelta, ItemKind, Message, ResponseEvent},
+        provider::protocol::{BlockId, BlockRef, ItemId, ItemKind, Message, ResponseEvent},
     };
 
     #[test]
@@ -363,29 +378,18 @@ mod tests {
         });
     }
 
+    /// Streams `text` into request 7's text block.
     fn delta(hub: &RuntimeEvents, agent: &AgentId, text: &str) {
-        let delta = ContentDelta::Text(text.into());
-        let (item, block) = ("text".into(), "text".into());
-        emit(hub, agent, ResponseEvent::BlockDelta { item, block, delta });
+        let block = BlockRef {
+            item: ItemId::try_from("text".to_owned()).unwrap(),
+            block: BlockId::try_from("text".to_owned()).unwrap(),
+        };
+        let kind = ItemKind::Text;
+        let text = text.into();
+        emit(hub, agent, ResponseEvent::Delta { block, kind, text });
     }
 
-    /// Starts request 7's text item and block, then streams `text` into it.
     fn stream_text(hub: &RuntimeEvents, agent: &AgentId, text: &str) {
-        let (id, position) = ("text".to_owned(), 0);
-        let item = ResponseEvent::ItemStarted {
-            id: id.clone(),
-            position,
-            kind: ItemKind::Text,
-        };
-        emit(hub, agent, item);
-        let (item, kind) = (id.clone(), BlockKind::Text);
-        let block = ResponseEvent::BlockStarted {
-            item,
-            id,
-            position,
-            kind,
-        };
-        emit(hub, agent, block);
         delta(hub, agent, text);
     }
 
@@ -415,11 +419,8 @@ mod tests {
         let key = (agent.clone(), 7);
         stream_text(&hub, &agent, "hello");
         let mut observation = hub.observe();
-        let text = |snapshot: &ObservationSnapshot| {
-            snapshot.responses[&key].snapshot().items[0].blocks[0]
-                .text
-                .clone()
-        };
+        let text =
+            |snapshot: &ObservationSnapshot| snapshot.responses[&key].blocks()[0].text.clone();
         assert_eq!(text(&observation.snapshot), "hello");
         delta(&hub, &agent, "!");
         let update = observation.updates.try_recv().unwrap();
@@ -442,7 +443,7 @@ mod tests {
         }
         assert!(observation.snapshot.responses.is_empty());
         assert_eq!(observation.snapshot.records.len(), 1);
-        assert_eq!(observation.snapshot.revision, 6);
+        assert_eq!(observation.snapshot.revision, 4);
     }
 
     #[test]
@@ -476,7 +477,7 @@ mod tests {
         let response = &snapshot.responses[&key];
         assert!(response.settled);
         assert_eq!(response.error.as_deref(), Some("connection lost"));
-        let found = &response.snapshot().items[0].blocks[0].text;
+        let found = &response.blocks()[0].text;
         assert_eq!(*found, "partial answer");
         assert_eq!(replayed(&snapshot).activity[&agent], reconnecting);
         // Duplicate journal delivery cannot roll a newer activity back.
@@ -500,12 +501,12 @@ mod tests {
         let response = &started.responses[&key];
         assert!(!response.settled);
         assert!(response.error.is_none());
-        assert!(response.snapshot().items.is_empty());
+        assert!(response.blocks().is_empty());
         let json =
             |snapshot: &ObservationSnapshot| serde_json::to_value(&snapshot.records[&8]).unwrap();
         assert_eq!(json(&started), json(&snapshot));
         let replayed_response = &replayed(&started).responses[&key];
-        assert!(replayed_response.snapshot().items.is_empty());
+        assert!(replayed_response.blocks().is_empty());
         assert!(replayed_response.error.is_none());
         record(&hub, &agent, 12, SessionEvent::AgentCompleted);
         let completed = hub.observe().snapshot;

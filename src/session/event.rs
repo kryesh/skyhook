@@ -11,7 +11,7 @@ use crate::{
     provider::{
         profile::ModelProfile,
         protocol::{
-            HistoryLifetime, Message, ModelRequest, ResponseSchema, StopReason, SystemSegment,
+            HistoryLifetime, Message, ModelRequest, Outcome, ResponseSchema, SystemSegment,
             ToolDefinition, Usage,
         },
     },
@@ -59,7 +59,7 @@ pub struct ModelCallOrigin {
 
 /// Shared settings of every request in one model context. History and tail are
 /// journaled per request; provider, model, reasoning and output budget come from
-/// the profile and correlation from the agent.
+/// the profile.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct ModelContext {
     pub purpose: ModelPurpose,
@@ -70,9 +70,9 @@ pub struct ModelContext {
 }
 
 impl ModelContext {
-    /// The history-free request these settings describe for `agent`.
+    /// The history-free request these settings describe.
     #[must_use]
-    pub fn template(&self, agent: &AgentId) -> ModelRequest {
+    pub fn template(&self) -> ModelRequest {
         let profile = &self.profile.profile;
         ModelRequest {
             model: profile.model.clone(),
@@ -84,7 +84,6 @@ impl ModelContext {
             response_schema: self.response_schema.clone(),
             reasoning: profile.reasoning.clone(),
             max_output_tokens: Some(profile.max_output),
-            correlation: Some(agent.to_string()),
             blobs: Default::default(),
         }
     }
@@ -179,16 +178,15 @@ pub enum SessionEvent {
         request: u64,
         attempt: u64,
     },
-    /// Terminal stop reason of a response that completed the turn. Refusals and
-    /// aborts fail the turn before this point and are recorded by `ModelFailed`
-    /// instead, so this distinguishes an ordinary end of turn from truncation or
-    /// a stop sequence.
+    /// How a response that completed the turn ended. Refusals and aborts fail the
+    /// turn before this point and are recorded by `ModelFailed` instead, so the
+    /// outcome here is an answer, tool use, or a truncation.
     ResponseCompleted {
         request: u64,
         attempt: u64,
         /// The committed assistant message this response produced.
         message: Option<u64>,
-        stop_reason: StopReason,
+        outcome: Outcome,
     },
     /// A failed model request will be retried after a recovery delay.
     /// This is host-facing status, not model-visible conversation history.

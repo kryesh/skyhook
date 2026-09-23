@@ -154,24 +154,23 @@ mod tests {
     };
     use std::time::Duration;
 
-    use futures_util::{StreamExt, stream};
+    use futures_util::{StreamExt, TryStreamExt, stream};
     use serde_json::json;
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
     pub(super) use crate::agent::runtime::tests::{
-        count, events, summary_json, test_builder, todo, usage,
+        count, delta, events, summary_json, test_builder, todo, usage,
     };
     use crate::agent::runtime::{HarnessError, SessionHandle, TurnContext, compaction, state};
     use crate::{
         agent::TodoStatus,
         execution::ExecutionLocation,
         provider::{
-            Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
-            ResponseStream,
+            Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
             protocol::{
-                AssistantContent, Message, ModelRequest, ResponseChunk, StopReason, ToolCall,
-                Usage, UserContent, events_for_content,
+                AssistantItem, Completion, ContextId, CutReason, ItemKind, Message, ModelRequest,
+                ResponseEvent, ToolCall, Usage, UserContent,
             },
         },
         session::{SessionEvent, project_history},
@@ -198,22 +197,22 @@ mod tests {
     }
 
     impl Provider for Arc<ControlledProvider> {
-        fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+        fn open_context(&self, _: ContextId) -> Result<Box<dyn ProviderContext>, ProviderError> {
             self.opened.fetch_add(1, Ordering::SeqCst);
             Ok(Box::new(self.clone()))
         }
     }
 
-    fn side_effect(id: &str) -> Vec<AssistantContent> {
+    fn side_effect(id: &str) -> Vec<AssistantItem> {
         let arguments = json!({"path":"must-not-exist", "content":"side effect"});
         let call = ToolCall::new(id, "write", arguments).unwrap();
-        vec![AssistantContent::tool_call(id, 0, call)]
+        vec![AssistantItem::tool_call(id, 0, call)]
     }
 
     impl ProviderContext for Arc<ControlledProvider> {
-        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
+        fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
             let provider = self.clone();
-            Box::pin(async move {
+            let started = async move {
                 let summary = request.tail.last() == Some(&compaction::directive());
                 provider.requests.lock().unwrap().push(request);
                 let counters = [
@@ -228,69 +227,75 @@ mod tests {
                 ];
                 let (immediate, streaming) = counters[usize::from(summary)];
                 let error = || ProviderError {
-                    retry_after: None,
                     kind: ProviderErrorKind::Transport,
                     message: "deterministic transient failure".into(),
                 };
                 let usage = *provider.observed_failure_usage.lock().unwrap();
-                let usage = usage.map(|usage| Ok(ResponseChunk::UsageUpdated { usage }));
+                let usage = usage.map(|usage| Ok(ResponseEvent::Usage(usage)));
                 if provider.pause_stream_after_usage.load(Ordering::SeqCst) {
-                    let mut chunks = vec![usage.unwrap()];
-                    let call = events_for_content(&side_effect("interrupted-tool"));
-                    chunks.extend(call.into_iter().map(Ok));
+                    let mut events = vec![usage.unwrap()];
+                    let arguments = json!({"path":"must-not-exist", "content":"side effect"});
+                    let call = "interrupted-tool";
+                    let started = delta(
+                        call,
+                        &format!("{call}:0"),
+                        ItemKind::ToolCall,
+                        &arguments.to_string(),
+                    );
+                    events.push(Ok(started));
                     let tail = stream::once(async move {
                         provider.started.notify_one();
-                        std::future::pending::<Result<ResponseChunk, ProviderError>>().await
+                        std::future::pending::<Result<ResponseEvent, ProviderError>>().await
                     });
-                    return Ok(Box::pin(stream::iter(chunks).chain(tail)) as ResponseStream);
+                    return Ok(Box::pin(stream::iter(events).chain(tail)) as ResponseStream);
                 }
                 if consume_failure(immediate) {
                     return Err(error());
                 }
                 if consume_failure(streaming) {
-                    let chunks = usage.into_iter().chain([Err(error())]);
-                    return Ok(Box::pin(stream::iter(chunks)) as ResponseStream);
+                    let events = usage.into_iter().chain([Err(error())]);
+                    return Ok(Box::pin(stream::iter(events)) as ResponseStream);
                 }
-                let chunks = if summary {
+                let events = if summary {
                     provider.started.notify_one();
                     if provider.block.load(Ordering::SeqCst) {
                         provider.release.notified().await;
                     }
                     if provider.summary_tools.load(Ordering::SeqCst) {
-                        response_chunks(side_effect("never-execute"), StopReason::ToolUse)
+                        response_chunks(Completion::finished(side_effect("never-execute")))
                     } else {
                         let reasoning = "Reasoning before the answer is not JSON and must not enter the continuation.";
                         let text = provider.summary.lock().unwrap().clone();
                         let items = vec![
-                            AssistantContent::reasoning("reasoning/0", 0, reasoning, None),
-                            AssistantContent::text("text/1", 1, text),
+                            AssistantItem::reasoning("reasoning/0", 0, reasoning, None),
+                            AssistantItem::text("text/1", 1, text),
                         ];
-                        let truncate = usize::from(provider.truncate.load(Ordering::SeqCst));
-                        let stop = [StopReason::EndTurn, StopReason::MaxTokens][truncate].clone();
-                        response_chunks(items, stop)
+                        let completion = if provider.truncate.load(Ordering::SeqCst) {
+                            Completion::cut(items, CutReason::MaxTokens)
+                        } else {
+                            Completion::answer(items)
+                        };
+                        response_chunks(completion)
                     }
                 } else if provider.overflow.swap(false, Ordering::SeqCst) {
                     vec![Err(ProviderError {
-                        retry_after: None,
                         kind: ProviderErrorKind::ContextWindowExceeded,
                         message: "prompt is too long".into(),
                     })]
                 } else {
-                    let done = vec![AssistantContent::text("text/0", 0, "done")];
-                    response_chunks(done, StopReason::EndTurn)
+                    let done = vec![AssistantItem::text("text/0", 0, "done")];
+                    response_chunks(Completion::answer(done))
                 };
-                Ok(Box::pin(stream::iter(chunks)) as ResponseStream)
-            })
+                Ok(Box::pin(stream::iter(events)) as ResponseStream)
+            };
+            Box::pin(stream::once(started).try_flatten())
         }
     }
 
     fn response_chunks(
-        items: Vec<AssistantContent>,
-        stop_reason: StopReason,
-    ) -> Vec<Result<ResponseChunk, ProviderError>> {
-        let mut events = events_for_content(&items);
-        events.push(ResponseChunk::ResponseEnded { stop_reason });
-        events.into_iter().map(Ok).collect()
+        completion: Result<Completion, crate::provider::protocol::CompletionError>,
+    ) -> Vec<Result<ResponseEvent, ProviderError>> {
+        vec![Ok(ResponseEvent::End(completion.unwrap()))]
     }
 
     fn consume_failure(counter: &AtomicUsize) -> bool {
@@ -337,7 +342,7 @@ mod tests {
         pub(super) async fn add_history(&self, tokens: usize) {
             let (runtime, root) = (&self.session.runtime, &self.session.root);
             let research = "research ".repeat(tokens * 4 / 9);
-            let research = Message::Assistant(vec![AssistantContent::text("text/0", 0, research)]);
+            let research = Message::Assistant(vec![AssistantItem::text("text/0", 0, research)]);
             runtime.commit(root, research).await.unwrap();
             let text = "Continue the existing task.".into();
             let next = Message::User(vec![UserContent::Text { text }]);
@@ -386,7 +391,7 @@ mod tests {
                 location: &location,
                 capabilities: capabilities.clone(),
             };
-            let mut provider = self.provider.open_context(agent.to_string())?;
+            let mut provider = self.provider.open_context(ContextId::from(agent))?;
             let (provider, meter) = (provider.as_mut(), &mut Default::default());
             let compacted =
                 runtime.compact_history(&turn, provider, meter, sequence, &input, 128_000);

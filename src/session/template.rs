@@ -48,7 +48,7 @@ mod tests {
             }],
             history: Vec::new(),
             tail: Vec::new(),
-            history_lifetime: HistoryLifetime::Continuing,
+            history_lifetime: HistoryLifetime::Extends,
             tools: vec![ToolDefinition {
                 name: "test".into(),
                 description: "description".into(),
@@ -57,7 +57,6 @@ mod tests {
             response_schema: None,
             reasoning: Some("medium".into()),
             max_output_tokens: Some(64),
-            correlation: Some("correlation".into()),
             blobs: Default::default(),
         }
     }
@@ -81,7 +80,7 @@ mod tests {
             ));
         }
         let mut raw = request();
-        raw.history_lifetime = HistoryLifetime::Ending;
+        raw.history_lifetime = HistoryLifetime::Detached;
         let template = ModelRequestTemplate::try_from(raw).unwrap();
         assert_eq!(template.to_request(), request());
     }

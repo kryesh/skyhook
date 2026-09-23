@@ -207,7 +207,7 @@ pub(super) fn pending_messages(
 mod tests {
     use super::*;
     use crate::job::tests::job_events;
-    use crate::provider::protocol::{AssistantContent, BlockContent, Message};
+    use crate::provider::protocol::{AssistantItem, Message};
 
     use crate::job::delivery::LIFECYCLE_BATCH_BYTES;
 
@@ -274,7 +274,7 @@ mod tests {
     }
 
     fn assistant(text: &str) -> Message {
-        Message::Assistant(vec![AssistantContent::text("text", 0, text)])
+        Message::Assistant(vec![AssistantItem::text("text", 0, text)])
     }
 
     async fn commit(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> u64 {
@@ -344,16 +344,12 @@ mod tests {
     #[tokio::test]
     async fn replay_derives_publication_and_ack_from_source_history_only() {
         let (_root, manager, owner, child, job) = child_job(true).await;
-        let mut item = AssistantContent::text("visible", 0, "visible");
-        item.blocks.push(crate::provider::protocol::AssistantBlock {
-            id: "secret".into(),
-            position: 1,
-            content: BlockContent::Reasoning {
-                text: "private reasoning".into(),
-            },
-        });
+        let items = vec![
+            AssistantItem::text("visible", 0, "visible"),
+            AssistantItem::reasoning("secret", 1, "private reasoning", None),
+        ];
         // Simulate a crash after committing history but before in-memory publication.
-        let message = Message::Assistant(vec![item]);
+        let message = Message::Assistant(items);
         let source = manager
             .test_append(child.clone(), SessionEvent::MessageCommitted { message })
             .await;
@@ -724,8 +720,8 @@ mod tests {
             let before = manager.store().records().await.len();
             let mut wakes = manager.subscribe_completions();
             let items = vec![
-                AssistantContent::reasoning("thought", 0, "private reasoning", None),
-                AssistantContent::text("blank", 1, blank),
+                AssistantItem::reasoning("thought", 0, "private reasoning", None),
+                AssistantItem::text("blank", 1, blank),
             ];
             // A turn publishes its normalized projection, which a blank turn empties.
             let projection = crate::provider::protocol::visible_text(&items);

@@ -115,7 +115,7 @@ mod tests {
                 "root",
                 vec![
                     call("delegate", "agent", launch),
-                    AssistantContent::tool_call(
+                    AssistantItem::tool_call(
                         "hold",
                         1,
                         ToolCall::new("hold", "wait", json!({"timeout":1})).unwrap(),
@@ -127,8 +127,8 @@ mod tests {
             (
                 "child",
                 vec![
-                    AssistantContent::text("child-reply", 0, REPLY),
-                    AssistantContent::tool_call(
+                    AssistantItem::text("child-reply", 0, REPLY),
+                    AssistantItem::tool_call(
                         "child-hold",
                         1,
                         ToolCall::new("child-hold", "wait", json!({})).unwrap(),
@@ -185,7 +185,7 @@ mod tests {
                 "root",
                 vec![call("run", "script", json!({"source": source}))],
             ),
-            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("child", vec![AssistantItem::text("final", 0, FINAL)]),
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
@@ -228,17 +228,17 @@ mod tests {
                 "root",
                 vec![
                     call("kid", "agent", delegate),
-                    AssistantContent::tool_call("waiting", 1, waiting),
+                    AssistantItem::tool_call("waiting", 1, waiting),
                 ],
             ),
             (
                 "child",
                 vec![
-                    AssistantContent::text("progress", 0, PROGRESS),
-                    AssistantContent::tool_call("child-hold", 1, hold),
+                    AssistantItem::text("progress", 0, PROGRESS),
+                    AssistantItem::tool_call("child-hold", 1, hold),
                 ],
             ),
-            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("child", vec![AssistantItem::text("final", 0, FINAL)]),
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
@@ -275,7 +275,7 @@ mod tests {
         let launch = json!({"prompt":"report", "model":"child", "name":"merged", "bg":true});
         let tracking = tracking_all(vec![
             ("root", vec![call("launch", "agent", launch)]),
-            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("child", vec![AssistantItem::text("final", 0, FINAL)]),
             ("root", vec![call("waiting", "wait", json!({}))]),
             ("root", vec![answer()]),
         ]);
@@ -329,13 +329,10 @@ mod tests {
         let tracking = tracking_all(vec![
             ("root", vec![call("launch", "agent", launch)]),
             ("child", vec![call("work", "script", work)]),
-            (
-                "child",
-                vec![AssistantContent::text("progress", 0, PROGRESS)],
-            ),
+            ("child", vec![AssistantItem::text("progress", 0, PROGRESS)]),
             ("root", vec![call("waiting", "wait", json!({}))]),
             ("root", vec![call("again", "wait", json!({}))]),
-            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("child", vec![AssistantItem::text("final", 0, FINAL)]),
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
@@ -399,9 +396,9 @@ mod tests {
         let launch = json!({"prompt":"report", "model":"child", "name":"reporter", "bg":true});
         let tracking = tracking(vec![
             ("root", call("launch", "agent", launch)),
-            ("child", AssistantContent::text("report", 0, A)),
+            ("child", AssistantItem::text("report", 0, A)),
             ("root", call("first-report", "wait", json!({}))),
-            ("child", AssistantContent::text("addendum", 0, B)),
+            ("child", AssistantItem::text("addendum", 0, B)),
             ("root", call("no-repeat", "wait", json!({"timeout":1}))),
             ("root", call("last-report", "wait", json!({}))),
             ("root", answer()),
@@ -439,7 +436,7 @@ mod tests {
         let messages = rendered(&addendum);
         assert_eq!(messages.matches("please add an addendum").count(), 1);
         assert!(addendum.messages().any(|message| matches!(message,
-            Message::Assistant(content) if content == &[AssistantContent::text("report", 0, A)])));
+            Message::Assistant(content) if content == &[AssistantItem::text("report", 0, A)])));
         if !parent_already_waiting {
             assert!(!tracking.requested_from(4));
             tracking.release(2);
@@ -493,11 +490,15 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn blank_child_turn_publishes_no_reply_and_never_wakes_the_owner() {
         const FINAL: &str = "child-final-answer-after-blank";
-        let mut child_tool = call("blank-turn-tool", "script", json!({"source":"return 42;"}));
-        child_tool.position = 2;
+        let child_tool = call_at(
+            2,
+            "blank-turn-tool",
+            "script",
+            json!({"source":"return 42;"}),
+        );
         let blank = vec![
-            AssistantContent::reasoning("thought", 0, "private reasoning", None),
-            AssistantContent::text("blank", 1, "\n\n"),
+            AssistantItem::reasoning("thought", 0, "private reasoning", None),
+            AssistantItem::text("blank", 1, "\n\n"),
             child_tool,
         ];
         let launch = json!({"prompt":"child task", "model":"child", "name":"blank", "bg":true});
@@ -505,7 +506,7 @@ mod tests {
             ("root", vec![call("launch", "agent", launch)]),
             ("child", blank.clone()),
             ("root", vec![call("waiting", "wait", json!({}))]),
-            ("child", vec![AssistantContent::text("final", 0, FINAL)]),
+            ("child", vec![AssistantItem::text("final", 0, FINAL)]),
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
@@ -575,12 +576,16 @@ mod tests {
     async fn intermediate_child_reply(parent_already_waiting: bool) {
         const REPLY: &str = "intermediate-child-reply-marker";
         const FINAL: &str = "final-child-output-marker";
-        let mut child_tool = call("continue-child", "script", json!({"source":"return 42;"}));
-        child_tool.position = 1;
-        let reply = vec![AssistantContent::text("child-reply", 0, REPLY), child_tool];
+        let child_tool = call_at(
+            1,
+            "continue-child",
+            "script",
+            json!({"source":"return 42;"}),
+        );
+        let reply = vec![AssistantItem::text("child-reply", 0, REPLY), child_tool];
         let launch =
             json!({"prompt":"child task", "model":"child", "name":"child-replier", "bg":true});
-        let final_reply = vec![AssistantContent::text("child-final", 0, FINAL)];
+        let final_reply = vec![AssistantItem::text("child-final", 0, FINAL)];
         let after_final = vec![call("after-final", "wait", json!({"timeout":1}))];
         let tracking = tracking_all(vec![
             ("root", vec![call("child", "agent", launch)]),
@@ -692,14 +697,18 @@ mod tests {
         ];
         for index in 0..reply_count {
             let text = format!("mailbox-child-reply-{index}");
-            let reply = AssistantContent::text(format!("child-reply-{index}"), 0, text);
+            let reply = AssistantItem::text(format!("child-reply-{index}"), 0, text);
             // Any cheap tool keeps the child working after its reply.
-            let mut tool = call(&format!("child-tool-{index}"), "todo", json!({"items":[]}));
-            tool.position = 1;
+            let tool = call_at(
+                1,
+                &format!("child-tool-{index}"),
+                "todo",
+                json!({"items":[]}),
+            );
             steps.push(("child", vec![reply, tool]));
         }
         let child_final = steps.len();
-        let final_text = AssistantContent::text("child-final", 0, "mailbox-child-final");
+        let final_text = AssistantItem::text("child-final", 0, "mailbox-child-final");
         steps.push(("child", vec![final_text]));
         let parent_reply = steps.len();
         steps.push(("root", vec![call("finish-wait", "wait", json!({}))]));

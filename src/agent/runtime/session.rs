@@ -400,7 +400,7 @@ mod tests {
             .sequence;
         // What a process killed mid-turn leaves behind.
         let call = ToolCall::new("orphan", "read", json!({"path": "file"})).unwrap();
-        let assistant = Message::Assistant(vec![AssistantContent::tool_call("orphan", 0, call)]);
+        let assistant = Message::Assistant(vec![AssistantItem::tool_call("orphan", 0, call)]);
         let root_agent = session.root.clone();
         store
             .append(
@@ -555,15 +555,16 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(session.prompt("delegate").await.unwrap(), "first");
-        let signed = crate::provider::protocol::ReplayEnvelope {
-            version: 1,
-            protocol: "test".into(),
-            model: "test".into(),
-            scope: String::new(),
+        let signed = Replay {
+            provenance: Provenance {
+                protocol: "test".into(),
+                model: "test".into(),
+                scope: Scope::try_from("scope".to_owned()).unwrap(),
+            },
             payload: json!({"signature": "bound to the look conversation"}),
-            conversation_bound: true,
+            binding: Binding::Conversation,
         };
-        let signed = AssistantContent::reasoning("signed", 0, "visible", Some(signed));
+        let signed = AssistantItem::reasoning("signed", 0, "visible", Some(signed));
         let signed = Message::Assistant(vec![signed]);
         session.runtime.commit(&session.root, signed).await.unwrap();
         let prompt = session.prompt_with_options("write", &[], in_mode("work"));
@@ -596,8 +597,8 @@ mod tests {
                 Message::Assistant(items) => Some(items),
                 _ => None,
             });
-            let signed = items.flatten().find(|item| item.id == "signed").cloned();
-            signed.unwrap().replay.is_some()
+            let signed = items.flatten().find(|item| item.id().as_str() == "signed");
+            signed.unwrap().replay().is_some()
         };
         assert!(!replays(working) && !replays(&captured[4]));
 
@@ -629,7 +630,6 @@ mod tests {
         let rejected = crate::provider::ProviderError {
             kind: crate::provider::ProviderErrorKind::InvalidRequest,
             message: "scripted rejection".into(),
-            retry_after: None,
         };
         let steps = [
             Step::new(answer("resumed")),
@@ -676,7 +676,7 @@ mod tests {
         use crate::tool::policy::{Capability, Mode};
         let call = |id: &str, name: &str, arguments: serde_json::Value| {
             let call = ToolCall::new(id, name, arguments).unwrap();
-            response(vec![AssistantContent::tool_call(id, 0, call)])
+            response(vec![AssistantItem::tool_call(id, 0, call)])
         };
         let write = |path: &str| json!({"path": path, "content": "written"});
         let launch = json!({"prompt": "child task", "model": "child", "bg": true});
@@ -913,7 +913,7 @@ mod tests {
         let child = captured
             .iter()
             .rev()
-            .find(|request| request.correlation.as_deref() != Some(&resumed.root.to_string()))
+            .find(|request| request.context != ContextId::from(&resumed.root))
             .expect("the child made a request after the restart");
         let history = serde_json::to_string(&child.history).unwrap();
         assert!(history.contains("work") && history.contains("child done"));
@@ -943,7 +943,7 @@ mod tests {
         let store = &session.runtime.store;
         let root_agent = session.root.clone();
         let call = ToolCall::new("delegate", "agent", json!({"prompt": "work"})).unwrap();
-        let assistant = Message::Assistant(vec![AssistantContent::tool_call("delegate", 0, call)]);
+        let assistant = Message::Assistant(vec![AssistantItem::tool_call("delegate", 0, call)]);
         let launch = store
             .append(
                 root_agent.clone(),
@@ -1099,7 +1099,7 @@ mod tests {
         summary["todos"] = json!(reconciled);
         let mut completed = answer("checkpoint installed");
         let usage = usage(48_000, 2_000, 1_200);
-        completed.insert(completed.len() - 1, ResponseChunk::UsageUpdated { usage });
+        completed.insert(completed.len() - 1, ResponseEvent::Usage(usage));
         let responses = [completed, answer(summary.to_string()), answer("resumed")];
         let provider = scripted_provider(&requests, responses);
         let profile = ModelProfile::new("test", "test", None, 64_000, 4096, false);
@@ -1116,7 +1116,7 @@ mod tests {
         let child_todos = vec![todo("Independent child work", TodoStatus::InProgress)];
         todos.replace(&child, child_todos.clone()).await.unwrap();
         // Exceed the retention tail; only the high-usage response triggers the checkpoint.
-        let history = AssistantContent::text("history", 0, "research ".repeat(40_000));
+        let history = AssistantItem::text("history", 0, "research ".repeat(40_000));
         let history = Message::Assistant(vec![history]);
         session
             .runtime
@@ -1136,7 +1136,7 @@ mod tests {
             assert!(captured[0].response_schema.is_none());
             assert!(captured[1].response_schema.is_some());
             assert!(captured[1].messages().any(|message| matches!(message,
-                Message::Assistant(items) if items == &vec![AssistantContent::text("answer", 0, "checkpoint installed")])));
+                Message::Assistant(items) if items == &vec![AssistantItem::text("answer", 0, "checkpoint installed")])));
             captured[0].clone()
         };
         let id = session.id();
@@ -1212,7 +1212,7 @@ mod tests {
         // The first response reports usage, then hangs mid-stream.
         let mut initial = answer("initial");
         let spent = usage(7, 0, 1);
-        initial.insert(0, ResponseChunk::UsageUpdated { usage: spent });
+        initial.insert(0, ResponseEvent::Usage(spent));
         let steps = [
             Step::new(initial).midstream(),
             Step::new(answer("jobs handled")),

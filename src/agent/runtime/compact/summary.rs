@@ -2,8 +2,8 @@
 
 use super::{HarnessError, SessionRuntime, TurnContext, compaction};
 use crate::provider::{
-    ProviderContext,
-    protocol::{BlockContent, ModelRequest, ResponseChunk, StopReason, Usage},
+    ProviderContext, ProviderError,
+    protocol::{LiveResponse, ModelRequest, Outcome, Step as LiveStep, Usage},
 };
 use futures_util::StreamExt;
 
@@ -65,62 +65,53 @@ impl SessionRuntime {
         request_sequence: u64,
     ) -> Result<(compaction::Continuation, Usage), HarnessError> {
         let agent = turn.agent;
-        let mut stream = tokio::select! {
-            result = provider.invoke(request) => result?,
-            () = turn.cancellation.cancelled() => return Err(HarnessError::Interrupted),
-        };
-        let mut assembler = crate::provider::protocol::ResponseAssembler::default();
-        let mut usage = Usage::default();
-        loop {
-            let chunk = tokio::select! {
-                chunk = stream.next() => chunk,
+        let mut stream = provider.invoke(request);
+        let mut live = LiveResponse::default();
+        let (completion, usage) = loop {
+            let event = tokio::select! {
+                event = stream.next() => event,
                 () = turn.cancellation.cancelled() => {
-                    self.record_model_usage(agent, request_sequence, usage).await?;
+                    self.record_model_usage(agent, request_sequence, live.usage()).await?;
                     return Err(HarnessError::Interrupted);
                 },
             };
-            let Some(chunk) = chunk else {
-                break;
-            };
-            let chunk = match chunk.and_then(|chunk| {
-                assembler.push(&chunk)?;
-                Ok(chunk)
-            }) {
-                Ok(chunk) => chunk,
-                Err(error) => {
-                    if usage != Usage::default() {
-                        self.record_model_usage(agent, request_sequence, usage)
+            let event = match event {
+                Some(Ok(event)) => event,
+                Some(Err(error)) => {
+                    if live.usage() != Usage::default() {
+                        self.record_model_usage(agent, request_sequence, live.usage())
                             .await?;
                     }
                     return Err(error.into());
                 }
+                None => {
+                    return Err(ProviderError::protocol("stream ended without completion").into());
+                }
             };
-            if let ResponseChunk::UsageUpdated { usage: value } = chunk {
-                usage = value;
+            match live.push(event) {
+                LiveStep::Open(open) => live = open,
+                LiveStep::Ended {
+                    completion, usage, ..
+                } => break (completion, usage),
             }
-        }
+        };
 
         self.record_model_usage(agent, request_sequence, usage)
             .await?;
-        let (blocks, _, reason) = assembler.finish()?;
-        if matches!(
-            reason,
-            StopReason::MaxTokens | StopReason::ContentFilter | StopReason::Aborted
-        ) {
-            return Err(HarnessError::Compaction(
-                "summarization was truncated; original history is retained".into(),
-            ));
+        match completion.outcome() {
+            Outcome::Answer => {}
+            Outcome::Cut(_) => {
+                return Err(HarnessError::Compaction(
+                    "summarization was truncated; original history is retained".into(),
+                ));
+            }
+            Outcome::ToolUse => {
+                return Err(HarnessError::Compaction(
+                    "summarizer returned a tool call; no tools were executed".into(),
+                ));
+            }
         }
-        if blocks
-            .iter()
-            .flat_map(|item| &item.blocks)
-            .any(|block| matches!(&block.content, BlockContent::ToolCall(_)))
-        {
-            return Err(HarnessError::Compaction(
-                "summarizer returned a tool call; no tools were executed".into(),
-            ));
-        }
-        let text = crate::provider::protocol::visible_text(&blocks);
+        let text = crate::provider::protocol::visible_text(completion.items());
         let continuation = compaction::continuation(&text).map_err(HarnessError::Compaction)?;
         Ok((continuation, usage))
     }
@@ -278,7 +269,7 @@ mod tests {
             assert_eq!(observed_events, vec![observed]);
             assert_eq!(fixture.session.usage().await, observed);
             let committed = count!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(items) }
-                if items.iter().any(|item| item.id == "interrupted-tool"));
+                if items.iter().any(|item| item.id().as_str() == "interrupted-tool"));
             assert_eq!(committed, 0);
             fixture.assert_no_tool_execution().await;
             fixture.session.shutdown().await.unwrap();

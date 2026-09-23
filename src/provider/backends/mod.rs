@@ -13,12 +13,13 @@ pub(crate) mod transport;
 pub(crate) use chat::validate_schema as validate_chat_schema;
 
 use crate::provider::{
-    Provider, ProviderContext, ProviderError, ProviderFuture, ProviderTimeouts, ResponseStream,
-    protocol::{ModelRequest, ResponseChunk},
+    Provider, ProviderContext, ProviderError, ResponseStream,
+    protocol::{ContextId, ModelRequest, ResponseEvent, Scope},
 };
-use futures_util::{StreamExt, stream};
+use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderValue};
 use std::collections::VecDeque;
+use std::time::Duration;
 
 #[derive(Clone, Copy, Debug, serde::Deserialize, serde::Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -55,8 +56,24 @@ pub struct NativeProvider {
     headers: HeaderMap,
     api_key_command: Option<api_key_command::ApiKeyCommand>,
     protocol: Protocol,
-    scope: String,
+    scope: Scope,
     timeouts: ProviderTimeouts,
+}
+
+/// Startup is a per-attempt deadline; read-idle resets per body chunk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderTimeouts {
+    pub startup: Duration,
+    pub read_idle: Duration,
+}
+
+impl Default for ProviderTimeouts {
+    fn default() -> Self {
+        Self {
+            startup: Duration::from_secs(600),
+            read_idle: Duration::from_secs(600),
+        }
+    }
 }
 
 /// Parsed and validated provider settings; construct through [`NativeSettings::new`].
@@ -164,32 +181,23 @@ impl NativeProvider {
 }
 
 impl Provider for NativeProvider {
-    fn open_context(&self, correlation: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+    fn open_context(&self, context: ContextId) -> Result<Box<dyn ProviderContext>, ProviderError> {
         Ok(Box::new(NativeContext {
             provider: self.clone(),
-            correlation,
+            context,
         }))
     }
 }
 struct NativeContext {
     provider: NativeProvider,
-    correlation: String,
+    context: ContextId,
 }
 
 impl ProviderContext for NativeContext {
-    fn invoke(&mut self, mut request: ModelRequest) -> ProviderFuture {
+    fn invoke(&mut self, mut request: ModelRequest) -> ResponseStream {
         let provider = self.provider.clone();
-        let correlation = self.correlation.clone();
-        Box::pin(async move {
-            if request
-                .correlation
-                .as_ref()
-                .is_some_and(|value| value != &correlation)
-            {
-                return Err(common::invalid(
-                    "request correlation does not match its native context",
-                ));
-            }
+        let context = self.context.clone();
+        let started = async move {
             if request.model.trim().is_empty() {
                 return Err(common::invalid("model must not be empty"));
             }
@@ -197,16 +205,17 @@ impl ProviderContext for NativeContext {
             let (body, decoder) = match provider.protocol {
                 Protocol::Chat { reasoning_replay } => {
                     let body = chat::encode(&request, reasoning_replay)?;
-                    let decoder = chat::Decoder::new(request.model).for_request(&body);
+                    let decoder =
+                        chat::Decoder::new(request.model, provider.scope).for_request(&body);
                     (body, Decoder::Chat(decoder))
                 }
                 Protocol::Responses => (
-                    responses::encode(&request)?,
-                    Decoder::Responses(responses::Decoder::new(request.model)),
+                    responses::encode(&request, &context)?,
+                    Decoder::Responses(responses::Decoder::new(request.model, provider.scope)),
                 ),
                 Protocol::Anthropic => (
                     anthropic::encode(&request)?,
-                    Decoder::Anthropic(anthropic::Decoder::new(request.model)),
+                    Decoder::Anthropic(anthropic::Decoder::new(request.model, provider.scope)),
                 ),
             };
             let mut headers = provider.headers;
@@ -229,8 +238,9 @@ impl ProviderContext for NativeContext {
                 provider.timeouts,
             )
             .await?;
-            Ok(decode_stream(events, decoder, provider.scope))
-        })
+            Ok(decode_stream(events, decoder))
+        };
+        Box::pin(stream::once(started).try_flatten())
     }
 }
 
@@ -241,7 +251,7 @@ enum Decoder {
     Anthropic(anthropic::Decoder),
 }
 impl Decoder {
-    fn decode(&mut self, event: &transport::SseEvent) -> Result<Vec<ResponseChunk>, ProviderError> {
+    fn decode(&mut self, event: &transport::SseEvent) -> Result<Vec<ResponseEvent>, ProviderError> {
         match self {
             Self::Chat(d) => d.decode(event),
             Self::Responses(d) => d.decode(event),
@@ -249,7 +259,7 @@ impl Decoder {
             Self::Anthropic(d) => d.decode(event),
         }
     }
-    fn finish(&mut self) -> Result<Vec<ResponseChunk>, ProviderError> {
+    fn finish(&mut self) -> Result<Vec<ResponseEvent>, ProviderError> {
         match self {
             Self::Chat(d) => d.finish(),
             Self::Responses(d) | Self::Codex(d) => d.finish(),
@@ -257,38 +267,35 @@ impl Decoder {
         }
     }
 }
-fn decode_stream(events: transport::SseStream, decoder: Decoder, scope: String) -> ResponseStream {
+fn decode_stream(frames: transport::SseStream, decoder: Decoder) -> ResponseStream {
     struct State {
-        events: transport::SseStream,
+        frames: transport::SseStream,
         decoder: Decoder,
-        pending: VecDeque<ResponseChunk>,
+        pending: VecDeque<ResponseEvent>,
         done: bool,
-        scope: String,
     }
     Box::pin(stream::unfold(
         State {
-            events,
+            frames,
             decoder,
             pending: VecDeque::new(),
             done: false,
-            scope,
         },
         |mut state| async move {
             loop {
-                if let Some(mut chunk) = state.pending.pop_front() {
-                    common::bind_reasoning_scope(&mut chunk, &state.scope);
+                if let Some(event) = state.pending.pop_front() {
                     // Terminal protocol events close HTTP immediately rather than
                     // waiting for an upstream connection to close or idle timeout.
-                    if matches!(chunk, ResponseChunk::ResponseEnded { .. }) {
+                    if matches!(event, ResponseEvent::End(_)) {
                         state.done = true;
                     }
-                    return Some((Ok(chunk), state));
+                    return Some((Ok(event), state));
                 }
                 if state.done {
                     return None;
                 }
-                let result = match state.events.next().await {
-                    Some(Ok(event)) => state.decoder.decode(&event),
+                let result = match state.frames.next().await {
+                    Some(Ok(frame)) => state.decoder.decode(&frame),
                     Some(Err(error)) => Err(error),
                     None => {
                         state.done = true;
@@ -296,7 +303,7 @@ fn decode_stream(events: transport::SseStream, decoder: Decoder, scope: String) 
                     }
                 };
                 match result {
-                    Ok(chunks) => state.pending.extend(chunks),
+                    Ok(events) => state.pending.extend(events),
                     Err(error) => {
                         state.done = true;
                         return Some((Err(error), state));
@@ -309,10 +316,10 @@ fn decode_stream(events: transport::SseStream, decoder: Decoder, scope: String) 
 
 #[cfg(test)]
 mod tests {
+    use super::common::tests::{Reduced, reduce};
     use super::*;
     use crate::provider::protocol::{
-        AssistantItem, Message, ResponseAssembler, StopReason, ToolDefinition, ToolResult, Usage,
-        UserContent,
+        CutReason, Message, Outcome, ToolDefinition, ToolResult, UserContent,
     };
     use serde_json::{Value, json};
     use std::{sync::Arc, time::Duration};
@@ -371,84 +378,14 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn replay_is_bound_before_public_exposure_on_terminal_enrichment_and_error() {
-        let keep = json!({"keep":[false,null,7]});
-        // Anthropic closes and emits signed reasoning before the message terminal
-        // event, so an ensuing transport error tests real exposed replay.
-        let signed =
-            json!({"type":"thinking", "thinking":"summary", "signature":"opaque", "vendor":keep});
-        // Responses holds reasoning open until the terminal snapshot enriches it.
-        let encrypted = json!({"type":"reasoning", "id":"rs_1", "summary":[],
-            "encrypted_content":"opaque", "vendor":keep});
-        let plain = json!({"type":"reasoning", "id":"rs_1", "summary":[]});
-        for fail_after_item in [false, true] {
-            let (native, frames, decoder) = if fail_after_item {
-                let frames = [
-                    json!({"type":"message_start", "message":{"id":"m", "type":"message", "role":"assistant", "model":"model", "content":[], "usage":{"input_tokens":1,"output_tokens":0}}}),
-                    json!({"type":"content_block_start", "index":0, "content_block":signed}),
-                    json!({"type":"content_block_stop", "index":0}),
-                ];
-                let decoder = Decoder::Anthropic(anthropic::Decoder::new("model".into()));
-                (&signed, frames, decoder)
-            } else {
-                let frames = [
-                    json!({"type":"response.output_item.added", "output_index":0, "item":plain}),
-                    json!({"type":"response.output_item.done", "output_index":0, "item":plain}),
-                    json!({"type":"response.completed", "response":{"id":"r_1", "status":"completed", "output":[encrypted]}}),
-                ];
-                let decoder = Decoder::Responses(responses::Decoder::new("model".into()));
-                (&encrypted, frames, decoder)
-            };
-            let mut events = sse(frames);
-            if fail_after_item {
-                events.push(Err(ProviderError {
-                    retry_after: None,
-                    kind: crate::provider::ProviderErrorKind::Transport,
-                    message: "scripted disconnect".into(),
-                }));
-            }
-            let events = Box::pin(stream::iter(events));
-            let chunks: Vec<_> = decode_stream(events, decoder, "provider-scope".into())
-                .collect()
-                .await;
-            let replays: Vec<_> = chunks
-                .iter()
-                .filter_map(|chunk| match chunk {
-                    Ok(ResponseChunk::ItemEnded {
-                        replay: Some(replay),
-                        ..
-                    }) => Some((replay.scope.as_str(), &replay.payload)),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(replays, [("provider-scope", native)], "{chunks:?}");
-            match chunks.last() {
-                Some(Err(_)) => assert!(fail_after_item),
-                last => assert!(matches!(
-                    last,
-                    Some(Ok(ResponseChunk::ResponseEnded { .. }))
-                )),
-            }
-        }
-    }
-
-    /// Assemble a response whose transport never reaches EOF.
-    async fn assemble_without_eof(
-        events: Events,
-        decoder: Decoder,
-    ) -> (Vec<AssistantItem>, Usage, StopReason) {
+    /// Reduce a response whose transport never reaches EOF.
+    async fn reduce_without_eof(events: Events, decoder: Decoder) -> Reduced {
         let events = Box::pin(stream::iter(events).chain(stream::pending()));
-        let mut decoded = decode_stream(events, decoder, "scope".into());
-        let mut assembler = ResponseAssembler::default();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while let Some(chunk) = decoded.next().await {
-                assembler.push(&chunk.unwrap()).unwrap();
-            }
-        })
-        .await
-        .expect("terminal response must not wait for HTTP EOF");
-        assembler.finish().unwrap()
+        let decoded = decode_stream(events, decoder);
+        let events: Vec<_> = tokio::time::timeout(Duration::from_secs(1), decoded.collect())
+            .await
+            .expect("terminal response must not wait for HTTP EOF");
+        reduce(events.into_iter().map(Result::unwrap))
     }
 
     #[tokio::test]
@@ -459,9 +396,12 @@ mod tests {
             event: None,
             data: "[DONE]".into(),
         }));
-        let decoder = Decoder::Chat(chat::Decoder::new("model".into()));
-        let (items, _, reason) = assemble_without_eof(events, decoder).await;
-        assert_eq!((items.len(), reason), (1, StopReason::EndTurn));
+        let decoder = Decoder::Chat(chat::Decoder::new("model".into(), common::tests::scope()));
+        let reduced = reduce_without_eof(events, decoder).await;
+        assert_eq!(
+            (reduced.items().len(), reduced.completion.outcome()),
+            (1, Outcome::Answer)
+        );
     }
 
     /// Codex reports truncation with an empty terminal `output`: the partial call is
@@ -481,14 +421,24 @@ mod tests {
                 "incomplete_details":{"reason":"max_output_tokens"}, "output":[],
                 "usage":{"input_tokens":8,"output_tokens":13}}}),
         ]);
-        let decoder = Decoder::Codex(responses::Decoder::codex("gpt-5".into()));
-        let (items, usage, reason) = assemble_without_eof(events, decoder).await;
+        let decoder = Decoder::Codex(responses::Decoder::codex(
+            "gpt-5".into(),
+            common::tests::scope(),
+        ));
+        let reduced = reduce_without_eof(events, decoder).await;
         assert_eq!(
-            (reason, usage.output_tokens, items.len()),
-            (StopReason::MaxTokens, 13, 1)
+            (
+                reduced.completion.outcome(),
+                reduced.usage.output_tokens,
+                reduced.items().len()
+            ),
+            (Outcome::Cut(CutReason::MaxTokens), 13, 1)
         );
-        let replay = items[0].replay.as_ref().unwrap();
-        assert_eq!((replay.scope.as_str(), &replay.payload), ("scope", &native));
+        let replay = reduced.items()[0].replay().unwrap();
+        assert_eq!(
+            (replay.provenance.scope.as_str(), &replay.payload),
+            ("scope", &native)
+        );
     }
 
     // Synthetic llama-swap/vLLM acceptance exercises the configured provider and
@@ -527,16 +477,9 @@ mod tests {
         }
     }
 
-    async fn complete(
-        context: &mut dyn ProviderContext,
-        request: ModelRequest,
-    ) -> ResponseAssembler {
-        let mut stream = context.invoke(request).await.unwrap();
-        let mut assembler = ResponseAssembler::default();
-        while let Some(event) = stream.next().await {
-            assembler.push(&event.unwrap()).unwrap();
-        }
-        assembler
+    async fn complete(context: &mut dyn ProviderContext, request: ModelRequest) -> Reduced {
+        let events: Vec<_> = context.invoke(request).collect().await;
+        reduce(events.into_iter().map(Result::unwrap))
     }
 
     #[tokio::test]
@@ -575,14 +518,12 @@ mod tests {
                     let user = Message::User(vec![UserContent::Text {
                         text: "find x".into(),
                     }]);
-                    let (items, usage, stop) = complete(&mut *context, request(model, vec![user.clone()]))
-                        .await
-                        .finish()
-                        .unwrap();
-                    assert_eq!(stop, StopReason::ToolUse);
+                    let reduced = complete(&mut *context, request(model, vec![user.clone()])).await;
+                    assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+                    let usage = reduced.usage;
                     let tokens = (usage.input_tokens, usage.cached_input_tokens, usage.output_tokens);
                     assert_eq!(tokens, (20, 80, 6));
-                    assert!(items.iter().filter_map(|item| item.replay.as_ref()).all(|replay| !replay.scope.is_empty()));
+                    let items = reduced.completion.items().to_vec();
                     // Persist/restore canonical history without any backend-specific request fields.
                     let serialized = serde_json::to_vec(&Message::Assistant(items)).unwrap();
                     let assistant: Message = serde_json::from_slice(&serialized).unwrap();
@@ -599,11 +540,11 @@ mod tests {
                     ];
                     drop(context);
                     let mut resumed = provider.open_context("resumed".into()).unwrap();
-                    complete(&mut *resumed, request(model, history.clone())).await.finish().unwrap();
+                    complete(&mut *resumed, request(model, history.clone())).await;
                     // Same URL/model, different configured provider identity: no private replay crossing.
                     let foreign: Arc<dyn Provider> = Arc::new(configured("other-provider"));
                     let mut foreign_context = foreign.open_context("foreign".into()).unwrap();
-                    complete(&mut *foreign_context, request(model, history)).await.finish().unwrap();
+                    complete(&mut *foreign_context, request(model, history)).await;
                     assert_eq!(serde_json::to_vec(&assistant).unwrap(), serialized);
                     let requests: Vec<Value> = server
                         .finish()

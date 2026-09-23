@@ -198,7 +198,8 @@ mod tests {
 
     use super::super::*;
     pub(super) use crate::agent::runtime::tests::{
-        Script, Step, bounded, enqueue_prompts, ephemeral_session, events, quiet_root, response,
+        AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, events,
+        quiet_root, response,
     };
 
     pub(super) fn count(script: &Script) -> usize {
@@ -212,14 +213,14 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         // Only the first two responses are gated; request `n` is answered `answer-n`.
         let answer = |index| {
-            response(vec![AssistantContent::text(
+            response(vec![AssistantItem::text(
                 "text/0",
                 0,
                 format!("answer-{index}"),
             )])
         };
         let todo = ToolCall::new("queue-todo", "todo", json!({"items": []})).unwrap();
-        let todo = response(vec![AssistantContent::tool_call("queue-todo", 0, todo)]);
+        let todo = response(vec![AssistantItem::tool_call("queue-todo", 0, todo)]);
         let first = if first_calls_tool { todo } else { answer(0) };
         let steps = [Step::new(first).gated(), Step::new(answer(1)).gated()];
         let steps = steps

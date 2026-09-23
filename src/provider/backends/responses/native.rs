@@ -64,16 +64,16 @@ impl<'a> NativeItem<'a> {
         })
     }
 
-    pub(super) fn final_parts(self) -> Result<Vec<BlockContent>, ProviderError> {
+    pub(super) fn final_parts(self) -> Result<Vec<Content>, ProviderError> {
         parts_for_kind(self.raw, self.kind)
     }
 }
 
-pub(super) fn final_parts(item: &Value) -> Result<Vec<BlockContent>, ProviderError> {
+pub(super) fn final_parts(item: &Value) -> Result<Vec<Content>, ProviderError> {
     parts_for_kind(item, kind(item)?)
 }
 
-fn parts_for_kind(item: &Value, kind: ItemKind) -> Result<Vec<BlockContent>, ProviderError> {
+fn parts_for_kind(item: &Value, kind: ItemKind) -> Result<Vec<Content>, ProviderError> {
     match kind {
         ItemKind::Text if item.get("role").is_some_and(|role| role != "assistant") => {
             Err(protocol("output message role is not assistant"))
@@ -87,11 +87,11 @@ fn parts_for_kind(item: &Value, kind: ItemKind) -> Result<Vec<BlockContent>, Pro
                     "refusal" => string(part, "refusal"),
                     _ => return None,
                 };
-                Some(text.map(|text| BlockContent::Text { text: text.into() }))
+                Some(text.map(|text| Content::Text { text: text.into() }))
             })
             .collect(),
         ItemKind::Reasoning => Ok(reasoning_parts(item)?.into_values().collect()),
-        ItemKind::ToolCall => Ok(vec![BlockContent::ToolCall(function_call(item)?)]),
+        ItemKind::ToolCall => Ok(vec![Content::ToolCall(function_call(item)?)]),
     }
 }
 
@@ -117,13 +117,6 @@ pub(super) fn arguments(text: &str) -> Result<serde_json::Map<String, Value>, Pr
 }
 
 impl ItemKind {
-    pub(super) fn block_kind(self) -> BlockKind {
-        match self {
-            Self::Text => BlockKind::Text,
-            Self::Reasoning => BlockKind::Reasoning,
-            Self::ToolCall => BlockKind::ToolCallArguments,
-        }
-    }
     pub(super) fn part_id(self, position: usize) -> String {
         match self {
             Self::Text => format!("content_{position}"),
@@ -167,7 +160,7 @@ mod tests {
             item["arguments"] = args;
             assert_eq!(
                 final_parts(&item).unwrap(),
-                vec![BlockContent::ToolCall(
+                vec![Content::ToolCall(
                     ToolCall::new("call", "lookup", json!({})).unwrap()
                 )]
             );
@@ -175,7 +168,7 @@ mod tests {
         item["arguments"] = json!(r#"{"query":"rust"}"#);
         assert_eq!(
             final_parts(&item).unwrap(),
-            vec![BlockContent::ToolCall(
+            vec![Content::ToolCall(
                 ToolCall::new("call", "lookup", json!({"query":"rust"})).unwrap()
             )]
         );

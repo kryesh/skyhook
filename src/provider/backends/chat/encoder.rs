@@ -9,7 +9,7 @@ use crate::provider::{
             user_parts, validate_openai_effort,
         },
     },
-    protocol::{BlockContent, Message, ModelRequest},
+    protocol::{AssistantItem, Message, ModelRequest},
 };
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
@@ -50,26 +50,27 @@ pub(crate) fn encode(
                 let mut calls = Vec::new();
                 let mut reasoning = String::new();
                 for item in parts {
-                    if replay != ChatReasoningReplay::Unsupported
-                        && let Some(payload) =
-                            opaque_payload(&item.replay, "chat_completions", &request.model)
-                        && let Some(text) = payload.get("text").and_then(Value::as_str)
-                    {
-                        reasoning.push_str(text);
-                    }
-                    for part in &item.blocks {
-                        match &part.content {
-                            BlockContent::Text { text: fragment } => text.push_str(fragment),
-                            // Only the originating envelope is replayable. Visible
-                            // reasoning (including foreign summaries) is not provenance.
-                            BlockContent::Reasoning { .. } => {}
-                            BlockContent::ToolCall(call) => {
-                                // Results pair by call ID, so sanitizing an invalid name is safe.
-                                calls.push(json!({
-                                    "id": call.id(), "type": "function",
-                                    "function": {"name": wire_name(call.name()), "arguments": serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}
-                                }));
+                    match item {
+                        AssistantItem::Text { blocks, .. } => {
+                            blocks.iter().for_each(|block| text.push_str(&block.text));
+                        }
+                        // Only the originating replay is sent. Visible reasoning
+                        // (including foreign summaries) is not provenance.
+                        AssistantItem::Reasoning { replay: state, .. } => {
+                            if replay != ChatReasoningReplay::Unsupported
+                                && let Some(payload) =
+                                    opaque_payload(state, "chat_completions", &request.model)
+                                && let Some(text) = payload.get("text").and_then(Value::as_str)
+                            {
+                                reasoning.push_str(text);
                             }
+                        }
+                        AssistantItem::ToolCall { call, .. } => {
+                            // Results pair by call ID, so sanitizing an invalid name is safe.
+                            calls.push(json!({
+                                "id": call.id(), "type": "function",
+                                "function": {"name": wire_name(call.name()), "arguments": serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}
+                            }));
                         }
                     }
                 }
@@ -225,14 +226,21 @@ mod tests {
         decoder::tests::{delta, end},
     };
     use super::*;
-    use crate::provider::backends::common::{reasoning_envelope, tests::request};
+    use crate::provider::backends::common::{
+        replay as scoped_replay,
+        tests::{request, scope},
+    };
     use crate::{
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantItem, ItemKind, ReplayEnvelope, ResponseAssembler, SystemSegment, ToolCall,
-            ToolDefinition, ToolResult, UserContent,
+            AssistantItem, Binding, ItemId, Replay, Scope, SystemSegment, ToolCall, ToolDefinition,
+            ToolResult, UserContent,
         },
     };
+
+    fn reasoning_envelope(protocol: &str, model: &str, payload: serde_json::Value) -> Replay {
+        scoped_replay(protocol, model, &scope(), payload, Binding::Free)
+    }
 
     fn image() -> ImageRef {
         ImageRef {
@@ -348,37 +356,31 @@ mod tests {
     }
 
     #[test]
-    fn reasoning_envelope_roundtrip_is_scoped_and_policy_selected() {
-        use crate::provider::backends::common::{
-            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope,
-        };
+    fn reasoning_replay_roundtrip_is_scoped_and_policy_selected() {
+        use crate::provider::backends::common::{filter_reasoning_scope, reasoning_scope};
         let scope = reasoning_scope("local", "http://localhost/v1/chat/completions");
-        let mut decoder = Decoder::new("test-model".into());
-        let mut assembler = ResponseAssembler::default();
+        let mut decoder = Decoder::new("test-model".into(), scope.clone());
         let frames = [
             delta(json!({"reasoning_content":"first "})),
             delta(json!({"reasoning":"second"})),
             end("stop"),
         ];
+        let mut events = Vec::new();
         for frame in frames {
-            for mut chunk in decoder.decode(&frame).unwrap() {
-                bind_reasoning_scope(&mut chunk, &scope);
-                assembler.push(&chunk).unwrap();
-            }
+            events.extend(decoder.decode(&frame).unwrap());
         }
-        for chunk in decoder.finish().unwrap() {
-            assembler.push(&chunk).unwrap();
-        }
-        let (items, _, _) = assembler.finish().unwrap();
-        let envelope = items[0].replay.as_ref().unwrap();
+        events.extend(decoder.finish().unwrap());
+        let items = crate::provider::backends::common::tests::reduce(events)
+            .items()
+            .to_vec();
+        let envelope = items[0].replay().unwrap();
         assert_eq!(
             (
-                envelope.version,
-                &*envelope.protocol,
-                &*envelope.model,
-                &envelope.scope
+                &*envelope.provenance.protocol,
+                &*envelope.provenance.model,
+                &envelope.provenance.scope
             ),
-            (1, "chat_completions", "test-model", &scope)
+            ("chat_completions", "test-model", &scope)
         );
         assert_eq!(envelope.payload, json!({"text":"first second"}));
         let original = history(items);
@@ -406,11 +408,12 @@ mod tests {
         }
         let unsupported = encode(&original, ChatReasoningReplay::Unsupported).unwrap();
         assert_eq!(unsupported["messages"], json!([]));
-        let mutations: [fn(&mut ReplayEnvelope); 5] = [
-            |envelope| envelope.scope = "elsewhere".into(),
-            |envelope| envelope.model = "different-model".into(),
-            |envelope| envelope.protocol = "responses".into(),
-            |envelope| envelope.version += 1,
+        let mutations: [fn(&mut Replay); 4] = [
+            |envelope| {
+                envelope.provenance.scope = Scope::try_from("elsewhere".to_owned()).unwrap();
+            },
+            |envelope| envelope.provenance.model = "different-model".into(),
+            |envelope| envelope.provenance.protocol = "responses".into(),
             |envelope| envelope.payload = json!({"text":42}),
         ];
         for mutation in mutations.map(Some).into_iter().chain([None]) {
@@ -418,9 +421,12 @@ mod tests {
             let Message::Assistant(items) = &mut request.history[0] else {
                 unreachable!()
             };
+            let AssistantItem::Reasoning { replay, .. } = &mut items[0] else {
+                unreachable!()
+            };
             match mutation {
-                Some(mutate) => mutate(items[0].replay.as_mut().unwrap()),
-                None => items[0].replay = None,
+                Some(mutate) => mutate(replay.as_mut().unwrap()),
+                None => *replay = None,
             }
             filter_reasoning_scope(&mut request, &scope);
             let body = encode(&request, ChatReasoningReplay::ReasoningContent).unwrap();
@@ -451,10 +457,9 @@ mod tests {
         // Empty reasoning items are omitted; replay-only items keep their payload.
         for replay in [None, Some(envelope("private"))] {
             let has_replay = replay.is_some();
-            let item = AssistantItem {
-                id: "r".into(),
-                position: 0,
-                kind: ItemKind::Reasoning,
+            let item = AssistantItem::Reasoning {
+                id: ItemId::try_from("r".to_owned()).unwrap(),
+                position: 0.into(),
                 blocks: vec![],
                 replay,
             };

@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     agent::todo::TodoItem,
-    provider::protocol::{BlockContent, Message, ModelRequest, UserContent},
+    provider::protocol::{AssistantItem, Message, ModelRequest, UserContent},
 };
 
 /// Required continuation sections, shared by the response schema and strict parser.
@@ -161,23 +161,23 @@ pub(crate) fn estimate_message(message: &Message, model: &str) -> u64 {
             .sum::<u64>(),
         Message::Assistant(items) => items
             .iter()
-            .map(|item| {
-                item.blocks
+            .map(|item| match item {
+                AssistantItem::Text { blocks, .. } => blocks
                     .iter()
-                    .map(|block| match &block.content {
-                        BlockContent::Text { text } => 4 + estimate_text(text),
-                        BlockContent::Reasoning { .. } => 0,
-                        BlockContent::ToolCall(call) => {
-                            12 + estimate_text(call.id())
-                                + estimate_text(call.name())
-                                + estimate_text(&serde_json::Value::Object(call.arguments().clone()).to_string())
-                        }
-                    })
-                    .sum::<u64>()
-                    // Opaque replay belongs to the item, not each visible block.
-                    + item.replay.as_ref().filter(|replay| replay.model == model).map_or(0, |replay| {
-                        estimate_text(&replay.payload.to_string())
-                    })
+                    .map(|block| 4 + estimate_text(&block.text))
+                    .sum::<u64>(),
+                // Visible reasoning is never sent; only replay for this model is.
+                AssistantItem::Reasoning { replay, .. } => replay
+                    .as_ref()
+                    .filter(|replay| replay.provenance.model == model)
+                    .map_or(0, |replay| estimate_text(&replay.payload.to_string())),
+                AssistantItem::ToolCall { call, .. } => {
+                    12 + estimate_text(call.id())
+                        + estimate_text(call.name())
+                        + estimate_text(
+                            &serde_json::Value::Object(call.arguments().clone()).to_string(),
+                        )
+                }
             })
             .sum::<u64>(),
         Message::Tool(results) => results
@@ -343,33 +343,31 @@ mod tests {
     #[test]
     fn estimate_counts_sent_blocks_and_replay_for_its_own_model_once_per_item() {
         use crate::provider::protocol::{
-            AssistantBlock, AssistantItem, ItemKind, ReplayEnvelope, ToolCall,
+            AssistantItem, Binding, BlockId, ItemId, Provenance, Replay, Scope, TextBlock, ToolCall,
         };
         let payload = json!({"encrypted_content": "opaque".repeat(100)});
         // The final reasoning item has replay but no visible blocks.
         let blocks = [3, 3, 2, 0];
         let mut items: Vec<_> = (0..)
             .zip(blocks)
-            .map(|(position, count)| AssistantItem {
-                id: format!("item-{position}"),
-                position,
-                kind: ItemKind::Reasoning,
+            .map(|(position, count): (u32, u32)| AssistantItem::Reasoning {
+                id: ItemId::try_from(format!("item-{position}")).unwrap(),
+                position: position.into(),
                 blocks: (0..count)
-                    .map(|part| AssistantBlock {
-                        id: format!("block-{position}-{part}"),
-                        position: part,
-                        content: BlockContent::Reasoning {
-                            text: "visible summary".into(),
-                        },
+                    .map(|part| TextBlock {
+                        id: BlockId::try_from(format!("block-{position}-{part}")).unwrap(),
+                        position: part.into(),
+                        text: "visible summary".into(),
                     })
                     .collect(),
-                replay: Some(ReplayEnvelope {
-                    version: 1,
-                    protocol: "responses".into(),
-                    model: "model".into(),
-                    scope: "reasoning".into(),
+                replay: Some(Replay {
+                    provenance: Provenance {
+                        protocol: "responses".into(),
+                        model: "model".into(),
+                        scope: Scope::try_from("reasoning".to_owned()).unwrap(),
+                    },
                     payload: payload.clone(),
-                    conversation_bound: false,
+                    binding: Binding::Free,
                 }),
             })
             .collect();
@@ -406,7 +404,6 @@ mod tests {
             response_schema: None,
             reasoning: None,
             max_output_tokens: None,
-            correlation: None,
             blobs: Default::default(),
         };
         let without_schema = estimate_request(&request);

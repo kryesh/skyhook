@@ -7,9 +7,10 @@ use super::{
     responses, transport,
 };
 use crate::provider::{
-    Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
-    protocol::{Message, ModelRequest, UserContent},
+    Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
+    protocol::{ContextId, Message, ModelRequest, Scope, UserContent},
 };
+use futures_util::{TryStreamExt, stream};
 use reqwest::header::{HeaderMap, HeaderValue};
 use serde_json::{Value, json};
 
@@ -40,15 +41,15 @@ impl CodexProvider {
         self
     }
 
-    fn replay_scope(&self) -> String {
+    fn replay_scope(&self) -> Scope {
         reasoning_scope(&self.name, &self.endpoint)
     }
 }
 impl Provider for CodexProvider {
-    fn open_context(&self, correlation: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+    fn open_context(&self, context: ContextId) -> Result<Box<dyn ProviderContext>, ProviderError> {
         Ok(Box::new(Context {
             provider: self.clone(),
-            correlation,
+            context,
             routing: Default::default(),
         }))
     }
@@ -56,7 +57,7 @@ impl Provider for CodexProvider {
 
 struct Context {
     provider: CodexProvider,
-    correlation: String,
+    context: ContextId,
     /// The service's sticky-routing token: received on a turn's first response and
     /// replayed on that turn's later requests, never on another turn's.
     routing: std::sync::Arc<std::sync::Mutex<Option<HeaderValue>>>,
@@ -76,31 +77,18 @@ fn continues_turn(request: &ModelRequest) -> bool {
 }
 
 impl ProviderContext for Context {
-    fn invoke(&mut self, mut request: ModelRequest) -> ProviderFuture {
+    fn invoke(&mut self, mut request: ModelRequest) -> ResponseStream {
         let provider = self.provider.clone();
-        let correlation = self.correlation.clone();
+        let context = self.context.clone();
         let routing = self.routing.clone();
-        Box::pin(async move {
+        let started = async move {
             let scope = provider.replay_scope();
             filter_reasoning_scope(&mut request, &scope);
-            let mut body = responses::encode(&request)?;
+            let mut body = responses::encode(&request, &context)?;
             adapt_subscription_request(&mut body);
-            if request
-                .correlation
-                .as_ref()
-                .is_some_and(|value| value != &correlation)
-            {
-                return Err(error(
-                    ProviderErrorKind::InvalidRequest,
-                    "request correlation does not match its Codex context",
-                ));
-            }
             let credentials = provider.auth.credentials().await.map_err(auth_error)?;
-            let mut headers = auth_headers(
-                &credentials.access_token,
-                &credentials.account_id,
-                &correlation,
-            )?;
+            let mut headers =
+                auth_headers(&credentials.access_token, &credentials.account_id, &context)?;
             {
                 let mut token = routing.lock().expect("routing lock");
                 if !continues_turn(&request) {
@@ -116,16 +104,20 @@ impl ProviderContext for Context {
                 let mut token = routing.lock().expect("routing lock");
                 token.get_or_insert_with(|| received.clone());
             }
-            Ok(super::decode_stream(
+            Ok::<_, ProviderError>(super::decode_stream(
                 events,
-                super::Decoder::Codex(responses::Decoder::codex(request.model)),
-                scope,
+                super::Decoder::Codex(responses::Decoder::codex(request.model, scope)),
             ))
-        })
+        };
+        Box::pin(stream::once(started).try_flatten())
     }
 }
 
-fn auth_headers(token: &str, account: &str, correlation: &str) -> Result<HeaderMap, ProviderError> {
+fn auth_headers(
+    token: &str,
+    account: &str,
+    context: &ContextId,
+) -> Result<HeaderMap, ProviderError> {
     let sensitive = |value: &str, message| {
         let mut value = HeaderValue::from_str(value)
             .map_err(|_| error(ProviderErrorKind::Authentication, message))?;
@@ -145,10 +137,10 @@ fn auth_headers(token: &str, account: &str, correlation: &str) -> Result<HeaderM
     // The service derives cache affinity from this header.
     headers.insert(
         "session-id",
-        HeaderValue::from_str(correlation).map_err(|_| {
+        HeaderValue::from_str(context.as_str()).map_err(|_| {
             error(
                 ProviderErrorKind::InvalidRequest,
-                "invalid context correlation header",
+                "invalid context identity header",
             )
         })?,
     );
@@ -177,7 +169,6 @@ pub(super) fn is_transport_metadata(event: &Value) -> bool {
 
 fn error(kind: ProviderErrorKind, message: &str) -> ProviderError {
     ProviderError {
-        retry_after: None,
         kind,
         message: message.into(),
     }
@@ -191,8 +182,9 @@ mod tests {
     use super::super::common::tests::request as base_request;
     use super::super::transport::tests::{Plan, Server, reply};
     use super::*;
-    use crate::provider::protocol::{
-        AssistantItem, BlockContent, Message, ResponseChunk, StopReason, ToolCall, ToolResult,
+    use crate::provider::{
+        backends::common::tests::reduce,
+        protocol::{AssistantItem, Message, Outcome, ToolCall, ToolResult},
     };
     use futures_util::StreamExt;
 
@@ -201,12 +193,28 @@ mod tests {
             "encrypted_content":"opaque+/=", "future_native":{"state":"keep"}})
     }
 
-    fn reasoning_tool_request(scope: &str) -> ModelRequest {
-        let mut replay =
-            super::super::common::reasoning_envelope("responses", "gpt-5", reasoning_item());
-        replay.scope = scope.into();
-        let mut reasoning = AssistantItem::reasoning("rs_private", 0, "", Some(replay));
-        reasoning.blocks.clear();
+    fn reasoning_tool_request(scope: &Scope) -> ModelRequest {
+        let replay = super::super::common::replay(
+            "responses",
+            "gpt-5",
+            scope,
+            reasoning_item(),
+            crate::provider::protocol::Binding::Free,
+        );
+        let AssistantItem::Reasoning {
+            replay: Some(replay),
+            ..
+        } = AssistantItem::reasoning("rs_private", 0, "", Some(replay))
+        else {
+            unreachable!()
+        };
+        // Native reasoning without a readable summary replays from its envelope alone.
+        let reasoning = AssistantItem::Reasoning {
+            id: crate::provider::protocol::ItemId::try_from("rs_private".to_owned()).unwrap(),
+            position: 0.into(),
+            blocks: Vec::new(),
+            replay: Some(replay),
+        };
         ModelRequest {
             history: vec![
                 Message::Assistant(vec![
@@ -225,7 +233,6 @@ mod tests {
                     is_error: false,
                 }]),
             ],
-            correlation: Some("context".into()),
             max_output_tokens: Some(100),
             ..base_request("gpt-5")
         }
@@ -253,10 +260,11 @@ mod tests {
 
     #[test]
     fn credentials_are_sensitive_headers() {
-        let headers = auth_headers("secret", "account", "session").unwrap();
+        let session = ContextId::from("session");
+        let headers = auth_headers("secret", "account", &session).unwrap();
         assert!(headers["authorization"].is_sensitive());
         assert!(headers["chatgpt-account-id"].is_sensitive());
-        assert!(auth_headers("bad\ntoken", "account", "session").is_err());
+        assert!(auth_headers("bad\ntoken", "account", &session).is_err());
     }
 
     #[tokio::test]
@@ -285,26 +293,12 @@ mod tests {
             endpoint: server.url.clone(),
         };
         let mut context = provider.open_context("context".into()).unwrap();
-        let mut mismatched = reasoning_tool_request(&provider.replay_scope());
-        mismatched.correlation = Some("other".into());
-        let Err(error) = context.invoke(mismatched).await else {
-            panic!("expected correlation mismatch")
-        };
-        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-
         let request = reasoning_tool_request(&provider.replay_scope());
-        let chunks: Vec<_> = context.invoke(request).await.unwrap().collect().await;
-        assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
-        let any = |test: &dyn Fn(&ResponseChunk) -> bool| chunks.iter().flatten().any(test);
-        assert!(any(
-            &|c| matches!(c, ResponseChunk::BlockEnded { content: BlockContent::Text { text }, .. } if text == "OK")
-        ));
-        assert!(any(&|c| matches!(
-            c,
-            ResponseChunk::ResponseEnded {
-                stop_reason: StopReason::EndTurn
-            }
-        )));
+        let events: Vec<_> = context.invoke(request).collect().await;
+        assert!(events.iter().all(Result::is_ok), "{events:?}");
+        let reduced = reduce(events.into_iter().map(Result::unwrap));
+        assert_eq!(reduced.completion.outcome(), Outcome::Answer);
+        assert_eq!(reduced.items()[0].text_content().as_deref(), Some("OK"));
 
         let requests = server.finish().await;
         assert!(requests[0].starts_with("POST "));
@@ -363,13 +357,8 @@ mod tests {
         request.history.clear();
         for step in steps {
             request.history.extend(step);
-            let chunks: Vec<_> = context
-                .invoke(request.clone())
-                .await
-                .unwrap()
-                .collect()
-                .await;
-            assert!(chunks.iter().all(Result::is_ok), "{chunks:?}");
+            let events: Vec<_> = context.invoke(request.clone()).collect().await;
+            assert!(events.iter().all(Result::is_ok), "{events:?}");
         }
         let requests = server.finish().await;
         let sent = |request: &String| {
@@ -400,13 +389,14 @@ mod tests {
         let original = reasoning_tool_request(&a.replay_scope());
         let mut same = original.clone();
         filter_reasoning_scope(&mut same, &a.replay_scope());
+        let context = ContextId::from("context");
         assert_eq!(
-            responses::encode(&same).unwrap()["input"][0],
+            responses::encode(&same, &context).unwrap()["input"][0],
             reasoning_item()
         );
         let mut foreign = original;
         filter_reasoning_scope(&mut foreign, &b.replay_scope());
-        let wire = responses::encode(&foreign).unwrap();
+        let wire = responses::encode(&foreign, &context).unwrap();
         assert_eq!(wire["input"].as_array().unwrap().len(), 2);
         assert_eq!(wire["input"][0]["type"], "function_call");
     }

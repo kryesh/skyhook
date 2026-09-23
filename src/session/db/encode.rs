@@ -9,9 +9,7 @@ use super::{Db, DbResult, corrupt, diagnostic::Slot, params, rejected};
 use crate::{
     identity::AgentId,
     media::{AttachmentRef, BlobRef, ImageRef},
-    provider::protocol::{
-        AssistantItem, BlockContent, Message, StopReason, ToolResult, UserContent,
-    },
+    provider::protocol::{AssistantItem, CutReason, Message, Outcome, ToolResult, UserContent},
     session::{CompactionCheckpoint, EventRecord, ModelContext, ProfileSnapshot, SessionEvent},
     target::TargetDefinition,
 };
@@ -281,7 +279,7 @@ impl Encoder {
                 request,
                 attempt,
                 message,
-                stop_reason,
+                outcome: ended,
             } => {
                 outcome(db, seq, kind, *request, *attempt)?;
                 let message = message
@@ -296,14 +294,20 @@ impl Encoder {
                         .ok_or_else(|| rejected("response message is not a committed message"))
                     })
                     .transpose()?;
-                let (reason, other) = match stop_reason {
-                    StopReason::Other(other) => ("other".to_owned(), Some(other.clone())),
-                    reason => (variant(reason)?, None),
+                let (outcome, cut) = match ended {
+                    Outcome::Answer => ("answer", None),
+                    Outcome::ToolUse => ("tool_use", None),
+                    Outcome::Cut(reason @ (CutReason::MaxTokens | CutReason::Incomplete)) => {
+                        ("cut", Some(variant(reason)?))
+                    }
+                    Outcome::Cut(_) => {
+                        return Err(rejected("refused and aborted responses are failures"));
+                    }
                 };
                 db.execute(
-                    "INSERT INTO model_response (entry, message, stop_reason, stop_other) \
+                    "INSERT INTO model_response (entry, message, outcome, cut_reason) \
                      VALUES (?1, ?2, ?3, ?4)",
-                    params![seq, message, reason, other],
+                    params![seq, message, outcome, cut],
                 )?;
             }
             SessionEvent::ModelRecoveryScheduled {
@@ -378,9 +382,8 @@ impl Encoder {
                     .as_ref()
                     .map(|origin| {
                         db.query_row(
-                            "SELECT c.block FROM tool_call c \
-                             JOIN assistant_block b ON b.id = c.block \
-                             JOIN assistant_item i ON i.id = b.item \
+                            "SELECT c.item FROM tool_call c \
+                             JOIN assistant_item i ON i.id = c.item \
                              JOIN message_commit m ON m.message = i.message \
                              WHERE m.entry = ?1 AND c.call_id = ?2",
                             params![origin.message, &origin.call_id],
@@ -732,13 +735,12 @@ impl Encoder {
         };
         let (call, name) = db
             .query_row(
-                "SELECT c.block, c.name FROM tool_call c \
-                 JOIN assistant_block b ON b.id = c.block \
-                 JOIN assistant_item i ON i.id = b.item \
+                "SELECT c.item, c.name FROM tool_call c \
+                 JOIN assistant_item i ON i.id = c.item \
                  JOIN message_commit m ON m.message = i.message \
                  JOIN entry e ON e.seq = m.entry \
                  WHERE e.agent = ?1 AND c.call_id = ?2 \
-                 AND NOT EXISTS (SELECT 1 FROM tool_result r WHERE r.call = c.block) \
+                 AND NOT EXISTS (SELECT 1 FROM tool_result r WHERE r.call = c.item) \
                  ORDER BY m.entry DESC LIMIT 1",
                 params![agent, &result.call_id],
                 |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)),
@@ -804,41 +806,51 @@ impl Encoder {
 }
 
 fn assistant_item(db: &Db, message: i64, item: &AssistantItem) -> DbResult<()> {
-    let kind = variant(&item.kind)?;
+    let kind = variant(&item.kind())?;
     let id = db.insert(
         "INSERT INTO assistant_item (message, position, provider_id, kind) \
          VALUES (?1, ?2, ?3, ?4)",
-        params![message, item.position, &item.id, kind.clone()],
+        params![
+            message,
+            item.position().get(),
+            item.id().as_str(),
+            kind.clone()
+        ],
     )?;
-    if let Some(replay) = &item.replay {
+    if let Some(replay) = item.replay() {
         db.execute(
-            "INSERT INTO reasoning_replay (item, version, protocol, model, scope, payload, \
-             conversation_bound) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO reasoning_replay (item, protocol, model, scope, payload, binding) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
-                replay.version,
-                &replay.protocol,
-                &replay.model,
-                &replay.scope,
+                &replay.provenance.protocol,
+                &replay.provenance.model,
+                replay.provenance.scope.as_str(),
                 json(&replay.payload)?,
-                replay.conversation_bound
+                variant(&replay.binding)?
             ],
         )?;
     }
-    for block in &item.blocks {
-        let text = match &block.content {
-            BlockContent::Text { text } | BlockContent::Reasoning { text } => Some(text.clone()),
-            BlockContent::ToolCall(_) => None,
-        };
-        let block_id = db.insert(
-            "INSERT INTO assistant_block (item, item_kind, position, provider_id, text) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![id, kind.clone(), block.position, &block.id, text],
-        )?;
-        if let BlockContent::ToolCall(call) = &block.content {
+    match item {
+        AssistantItem::Text { blocks, .. } | AssistantItem::Reasoning { blocks, .. } => {
+            for block in blocks {
+                db.execute(
+                    "INSERT INTO assistant_block (item, item_kind, position, provider_id, text) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        id,
+                        kind.clone(),
+                        block.position.get(),
+                        block.id.as_str(),
+                        block.text.clone()
+                    ],
+                )?;
+            }
+        }
+        AssistantItem::ToolCall { call, .. } => {
             db.execute(
-                "INSERT INTO tool_call (block, call_id, name, arguments) VALUES (?1, ?2, ?3, ?4)",
-                params![block_id, call.id(), call.name(), json(call.arguments())?],
+                "INSERT INTO tool_call (item, call_id, name, arguments) VALUES (?1, ?2, ?3, ?4)",
+                params![id, call.id(), call.name(), json(call.arguments())?],
             )?;
         }
     }
@@ -1062,8 +1074,9 @@ mod tests {
         job::{JobRole, JobState},
         media::{AttachmentRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantItem, HistoryLifetime, Message, ReplayEnvelope, ResponseSchema, StopReason,
-            SystemSegment, ToolCall, ToolDefinition, Usage, UserContent,
+            AssistantItem, Binding, CutReason, HistoryLifetime, Message, Outcome, Provenance,
+            Replay, ResponseSchema, Scope, SystemSegment, ToolCall, ToolDefinition, Usage,
+            UserContent,
         },
         session::{
             CompactionCheckpoint, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose,
@@ -1101,7 +1114,7 @@ mod tests {
                     context,
                     history,
                     tail: Vec::new(),
-                    history_lifetime: HistoryLifetime::Ending,
+                    history_lifetime: HistoryLifetime::Detached,
                     purpose: ModelPurpose::Agent,
                 },
             );
@@ -1192,7 +1205,7 @@ mod tests {
                 context,
                 history: vec![context],
                 tail: Vec::new(),
-                history_lifetime: HistoryLifetime::Ending,
+                history_lifetime: HistoryLifetime::Detached,
                 purpose: ModelPurpose::Agent,
             },
         );
@@ -1200,7 +1213,7 @@ mod tests {
             context,
             history: vec![prompt],
             tail: vec![user("tail")],
-            history_lifetime: HistoryLifetime::Ending,
+            history_lifetime: HistoryLifetime::Detached,
             purpose: ModelPurpose::Agent,
         });
         one!(SessionEvent::ModelAttemptStarted {
@@ -1229,13 +1242,14 @@ mod tests {
             request,
             attempt: 2
         });
-        let replay = ReplayEnvelope {
-            version: 1,
-            protocol: "responses".into(),
-            model: "model".into(),
-            scope: "reasoning".into(),
+        let replay = Replay {
+            provenance: Provenance {
+                protocol: "responses".into(),
+                model: "model".into(),
+                scope: Scope::try_from("reasoning".to_owned()).unwrap(),
+            },
             payload: json!({"encrypted": "opaque"}),
-            conversation_bound: true,
+            binding: Binding::Conversation,
         };
         let assistant = one!(SessionEvent::MessageCommitted {
             message: Message::Assistant(vec![
@@ -1265,7 +1279,7 @@ mod tests {
             request,
             attempt: 2,
             message: Some(assistant),
-            stop_reason: StopReason::Other("custom".into()),
+            outcome: Outcome::Cut(CutReason::MaxTokens),
         });
         let job = JobId::new(1).unwrap();
         one!(SessionEvent::JobCreated {
@@ -1374,7 +1388,7 @@ mod tests {
             context,
             history: vec![checkpoint, prompt],
             tail: Vec::new(),
-            history_lifetime: HistoryLifetime::Continuing,
+            history_lifetime: HistoryLifetime::Extends,
             purpose: ModelPurpose::Agent,
         });
         one!(SessionEvent::CompactionFailed {

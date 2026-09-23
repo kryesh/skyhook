@@ -12,14 +12,6 @@ struct ResolvedReference {
     part: usize,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(super) enum TerminalOutcome {
-    Completed,
-    MaxTokens,
-    ContentFilter,
-    Incomplete,
-}
-
 /// Only consumed fields are interpreted here. Native snapshots stay borrowed
 /// whole, including unknown vendor extensions used by replay and reconciliation.
 #[derive(Debug)]
@@ -53,12 +45,12 @@ pub(super) enum NormalizedEvent<'a> {
     },
     PartEnded {
         part: (usize, usize),
-        content: BlockContent,
+        content: Content,
     },
     Terminal {
         output: &'a [Value],
         usage: Option<Usage>,
-        outcome: TerminalOutcome,
+        finish: Finish,
     },
 }
 
@@ -89,9 +81,9 @@ impl Decoder {
     }
 
     fn item_by_id(&self, native_id: &str) -> Option<usize> {
-        self.items.iter().find_map(|(id, item)| {
-            (item.native_id == native_id || item.aliases.contains(native_id)).then_some(*id)
-        })
+        self.items
+            .iter()
+            .find_map(|(id, item)| item.is(native_id).then_some(*id))
     }
 
     fn bind_wire_index(&mut self, id: usize, wire: Option<usize>) -> Result<(), ProviderError> {
@@ -154,7 +146,7 @@ impl Decoder {
         if let ItemBody::Function(state) = &item.body
             && let FunctionPhase::Completed { call, .. } = &state.phase
         {
-            return parts.as_slice() == [BlockContent::ToolCall(call.clone())];
+            return parts.as_slice() == [Content::ToolCall(call.clone())];
         }
         if let Some(old) = item.snapshot() {
             return final_parts(old).ok().as_ref() == Some(&parts);
@@ -182,11 +174,11 @@ impl Decoder {
             .map(|part| {
                 part.ended().cloned().unwrap_or_else(|| {
                     if item.kind() == ItemKind::Reasoning {
-                        BlockContent::Reasoning {
+                        Content::Reasoning {
                             text: part.streamed().to_owned(),
                         }
                     } else {
-                        BlockContent::Text {
+                        Content::Text {
                             text: part.streamed().to_owned(),
                         }
                     }
@@ -201,7 +193,6 @@ impl Decoder {
         native: NativeItem<'_>,
         wire_index: Option<usize>,
         alias_candidates: Option<&BTreeSet<usize>>,
-        chunks: &mut Vec<ResponseChunk>,
     ) -> Result<usize, ProviderError> {
         let native_id = native.id;
         if let Some(id) = self.item_by_id(native_id) {
@@ -232,7 +223,7 @@ impl Decoder {
             return Ok(id);
         }
         let id = self.vacant_index(wire_index)?;
-        self.start(id, native, chunks)?;
+        self.start(id, native)?;
         self.items.get_mut(&id).expect("started item").wire_index = wire_index;
         Ok(id)
     }
@@ -242,7 +233,6 @@ impl Decoder {
     pub(super) fn normalize_event<'a>(
         &mut self,
         event: &'a Value,
-        chunks: &mut Vec<ResponseChunk>,
     ) -> Result<NormalizedEvent<'a>, ProviderError> {
         let wire = optional_index(event, "output_index")?;
         let name = string(event, "type")?;
@@ -266,10 +256,10 @@ impl Decoder {
         if name == "response.output_item.done" {
             let native =
                 NativeItem::parse(event.get("item").ok_or_else(|| protocol("missing item"))?)?;
-            let index = self.snapshot_index(native, wire, None, chunks)?;
+            let index = self.snapshot_index(native, wire, None)?;
             return Ok(NormalizedEvent::ItemDone { index, native });
         }
-        let reference = self.resolve_reference(event, name, wire, chunks)?;
+        let reference = self.resolve_reference(event, name, wire)?;
         // The resolver checks identities and wire/local-index contradictions.
         // This final state check is shared by every consumed live-item event.
         let active = |expected| -> Result<(usize, usize), ProviderError> {
@@ -285,9 +275,9 @@ impl Decoder {
         };
         let text_content = |kind, text: &str| {
             if kind == ItemKind::Reasoning {
-                BlockContent::Reasoning { text: text.into() }
+                Content::Reasoning { text: text.into() }
             } else {
-                BlockContent::Text { text: text.into() }
+                Content::Text { text: text.into() }
             }
         };
         match name {
@@ -419,17 +409,17 @@ impl Decoder {
         let response = event
             .get("response")
             .ok_or_else(|| protocol("missing final response"))?;
-        let outcome = match string(response, "status")? {
+        let finish = match string(response, "status")? {
             "incomplete" => match response
                 .get("incomplete_details")
                 .and_then(|details| details.get("reason"))
                 .and_then(Value::as_str)
             {
-                Some("max_output_tokens") => TerminalOutcome::MaxTokens,
-                Some("content_filter") => TerminalOutcome::ContentFilter,
-                _ => TerminalOutcome::Incomplete,
+                Some("max_output_tokens") => Finish::Cut(CutReason::MaxTokens),
+                Some("content_filter") => Finish::Cut(CutReason::Refusal),
+                _ => Finish::Cut(CutReason::Incomplete),
             },
-            "completed" if name == "response.completed" => TerminalOutcome::Completed,
+            "completed" if name == "response.completed" => Finish::Normal,
             _ => return Err(protocol("terminal response status disagrees with event")),
         };
         let output = if self.allow_omitted_terminal_output && response.get("output").is_none() {
@@ -457,7 +447,7 @@ impl Decoder {
                 let input = count("input_tokens")?
                     .checked_sub(cached)
                     .ok_or_else(|| protocol("cached tokens exceed input tokens"))?;
-                Ok(Usage {
+                Ok::<_, ProviderError>(Usage {
                     input_tokens: input,
                     cached_input_tokens: cached,
                     output_tokens: count("output_tokens")?,
@@ -467,7 +457,7 @@ impl Decoder {
         Ok(NormalizedEvent::Terminal {
             output,
             usage,
-            outcome,
+            finish,
         })
     }
 
@@ -478,7 +468,6 @@ impl Decoder {
         event: &Value,
         name: &str,
         wire: Option<usize>,
-        chunks: &mut Vec<ResponseChunk>,
     ) -> Result<Option<ResolvedReference>, ProviderError> {
         let wire_owner = wire.and_then(|wire| {
             self.items
@@ -522,7 +511,7 @@ impl Decoder {
             id
         } else if let Some(native_id) = native_id {
             let id = self.vacant_index(wire)?;
-            self.start_item(id, native_id, expected, (None, None), chunks)?;
+            self.start_item(id, native_id, expected, (None, None))?;
             self.items.get_mut(&id).expect("started item").wire_index = wire;
             id
         } else if let Some(id) = wire_owner {
@@ -599,23 +588,24 @@ impl Decoder {
 mod tests {
     use super::fixtures::*;
     use super::*;
+    use crate::provider::protocol::Position;
 
     #[test]
     fn lifecycle_events_require_a_response_and_failed_events_are_errors() {
         for tag in ["response.queued", "response.in_progress"] {
-            let mut decoder = Decoder::new("model".into());
+            let mut decoder = decoder();
             let event = json!({"type":tag, "response":{"x-vendor":true}});
             assert!(decoder.feed(event).unwrap().is_empty());
             assert!(decoder.feed(json!({"type":tag})).is_err());
         }
         let failed = json!({"type":"response.failed", "response":{"error":{"code":"invalid_request_error"}}});
-        assert!(Decoder::new("model".into()).feed(failed).is_err());
+        assert!(decoder().feed(failed).is_err());
     }
 
     #[test]
     fn unknown_events_and_output_item_types_are_ignored() {
         let hosted = json!({"type":"web_search_call", "id":"ws_1", "status":"completed"});
-        let mut decoder = Decoder::new("model".into());
+        let mut decoder = decoder();
         for event in [
             json!({"type":"response.future_unknown"}),
             json!({"type":"response.output_item.added", "output_index":0, "item":hosted}),
@@ -626,15 +616,15 @@ mod tests {
         }
         let output = json!([hosted, {"type":"message", "id":"msg", "role":"assistant",
             "content":[{"type":"output_text", "text":"answer"}, {"type":"output_audio"}]}]);
-        let chunks = decoder
-            .feed(json!({"type":"response.completed",
+        let reduced = reduce(
+            decoder
+                .feed(json!({"type":"response.completed",
                 "response":{"status":"completed", "output":output}}))
-            .unwrap();
-        assert!(chunks.contains(&ResponseChunk::ResponseEnded {
-            stop_reason: StopReason::EndTurn
-        }));
+                .unwrap(),
+        );
+        assert_eq!(reduced.completion.outcome(), Outcome::Answer);
         // Incomplete for an unnamed reason ends without executable tools.
-        let (items, _, stop) = assemble(vec![
+        let reduced = assemble(vec![
             added(0, function("fc_1", "call_1", "")),
             done(0, function("fc_1", "call_1", "{}")),
             json!({"type":"response.incomplete",
@@ -642,41 +632,27 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(
-            (stop, items.len()),
-            (StopReason::Other("incomplete".into()), 0)
+            (reduced.completion.outcome(), reduced.items().len()),
+            (Outcome::Cut(CutReason::Incomplete), 0)
         );
     }
 
     #[test]
     fn untyped_items_and_abnormal_top_level_events_fail() {
         let untyped = json!({"id":"fc_1", "call_id":"call_1", "name":"lookup", "arguments":"{}"});
+        assert!(decoder().feed(added(0, untyped.clone())).is_err());
         assert!(
-            Decoder::new("model".into())
-                .feed(added(0, untyped.clone()))
-                .is_err()
-        );
-        assert!(
-            Decoder::new("model".into())
+            decoder()
                 .feed(json!({"type":"response.completed",
                     "response":{"status":"completed", "output":[untyped]}}))
                 .is_err()
         );
         for name in ["response.aborted", "response.cancelled", "response.error"] {
-            assert!(
-                Decoder::new("model".into())
-                    .feed(json!({"type":name}))
-                    .is_err(),
-                "{name}"
-            );
+            assert!(decoder().feed(json!({"type":name})).is_err(), "{name}");
         }
         // Sub-events of hosted tools are not the response ending.
         let hosted = json!({"type":"response.web_search_call.failed", "item_id":"ws_1"});
-        assert!(
-            Decoder::new("model".into())
-                .feed(hosted)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(decoder().feed(hosted).unwrap().is_empty());
     }
 
     #[test]
@@ -699,12 +675,10 @@ mod tests {
                     "output_index":0, "item_id":"fc_1", "arguments":"{\"path\":\"/etc\"}"}));
             }
             events.extend([done(0, final_item.clone()), completed(vec![final_item])]);
-            let (items, _, stop) = assemble(events).unwrap();
-            assert_eq!(stop, StopReason::ToolUse);
-            match &items[0].blocks[0].content {
-                BlockContent::ToolCall(call) => Value::Object(call.arguments().clone()),
-                other => panic!("expected a tool call: {other:?}"),
-            }
+            let reduced = assemble(events).unwrap();
+            assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+            let call = reduced.items()[0].call().expect("expected a tool call");
+            Value::Object(call.arguments().clone())
         };
         // Missing, blank, and placeholder values that decode to `{}`.
         for final_arguments in [
@@ -739,16 +713,12 @@ mod tests {
                 "name":"lookup", "arguments":arguments, "status":"completed"})
         };
         // Terminal-only output with object arguments.
-        let (items, _, _) = assemble(vec![completed(vec![item(json!({"path":"/etc"}))])]).unwrap();
-        match &items[0].blocks[0].content {
-            BlockContent::ToolCall(call) => {
-                assert_eq!(
-                    Value::Object(call.arguments().clone()),
-                    json!({"path":"/etc"})
-                )
-            }
-            other => panic!("expected a tool call: {other:?}"),
-        }
+        let reduced = assemble(vec![completed(vec![item(json!({"path":"/etc"}))])]).unwrap();
+        let call = reduced.items()[0].call().expect("expected a tool call");
+        assert_eq!(
+            Value::Object(call.arguments().clone()),
+            json!({"path":"/etc"})
+        );
         // Other non-string types are not arguments.
         for arguments in [json!([1]), json!(5), json!(true)] {
             assert!(
@@ -785,13 +755,9 @@ mod tests {
             let mut all = vec![added(0, function("fc_1", "call_1", ""))];
             all.extend(events);
             all.extend([done(0, real.clone()), completed(vec![real.clone()])]);
-            let (items, _, _) = assemble(all).unwrap();
-            match &items[0].blocks[0].content {
-                BlockContent::ToolCall(call) => {
-                    assert_eq!(Value::Object(call.arguments().clone()), json!({"p":1}))
-                }
-                other => panic!("expected a tool call: {other:?}"),
-            }
+            let reduced = assemble(all).unwrap();
+            let call = reduced.items()[0].call().expect("expected a tool call");
+            assert_eq!(Value::Object(call.arguments().clone()), json!({"p":1}));
         }
     }
 
@@ -821,8 +787,11 @@ mod tests {
             json!({"type":"response.incomplete", "response":{"status":"incomplete",
             "incomplete_details":{"reason":"max_output_tokens"}, "output":[final_item.clone()]}}),
         );
-        let (items, _, stop) = assemble(events).unwrap();
-        assert_eq!((stop, items.len()), (StopReason::MaxTokens, 0));
+        let reduced = assemble(events).unwrap();
+        assert_eq!(
+            (reduced.completion.outcome(), reduced.items().len()),
+            (Outcome::Cut(CutReason::MaxTokens), 0)
+        );
         // A normal stop cannot execute a call whose input never completed.
         let mut events = prefix();
         events.push(completed(vec![final_item.clone()]));
@@ -831,7 +800,7 @@ mod tests {
 
     #[test]
     fn normalized_references_distinguish_local_wire_and_reasoning_positions() {
-        let mut decoder = Decoder::new("model".into());
+        let mut decoder = decoder();
         decoder
             .feed(unindexed_added(json!({"id":"first","type":"message"})))
             .unwrap();
@@ -844,7 +813,7 @@ mod tests {
         ] {
             let mut event = json!({"type":tag,"item_id":"second","output_index":0,"delta":"text"});
             event[key] = json!(3);
-            match decoder.normalize_event(&event, &mut vec![]).unwrap() {
+            match decoder.normalize_event(&event).unwrap() {
                 NormalizedEvent::Delta { part, .. } => assert_eq!(part, (1, position)),
                 other => panic!("unexpected semantic event: {other:?}"),
             }
@@ -973,14 +942,15 @@ mod tests {
             ),
         ];
         for (index, (events, expected)) in cases.into_iter().enumerate() {
-            let (items, _, reason) = assemble(events).unwrap();
-            assert_eq!(reason, StopReason::EndTurn);
+            let reduced = assemble(events).unwrap();
+            assert_eq!(reduced.completion.outcome(), Outcome::Answer);
+            let items = reduced.items();
             assert_eq!(items.len(), expected.len(), "case {index}");
             for (item, (id, position, text)) in items.iter().zip(expected) {
-                assert_eq!(item.id, id, "case {index}");
+                assert_eq!(item.id().as_str(), id, "case {index}");
                 assert_eq!(item.text_content().as_deref(), Some(text), "case {index}");
                 if let Some(position) = position {
-                    assert_eq!(item.position, position, "case {index}");
+                    assert_eq!(item.position(), Position::from(position), "case {index}");
                 }
             }
         }
@@ -1002,7 +972,7 @@ mod tests {
                 json!({"type":"summary_text", "text":"visible"}),
             ),
         ] {
-            let (items, _, _) = assemble(vec![
+            let reduced = assemble(vec![
                 added(0, native.clone()),
                 json!({"type":format!("response.{part_family}.added"), "item_id":"item",
                     "part":{"type":part["type"], "text":""}}),
@@ -1013,12 +983,13 @@ mod tests {
                 completed(vec![native]),
             ])
             .unwrap();
-            assert_eq!((items.len(), items[0].blocks.len()), (1, 1));
-            let content = &items[0].blocks[0].content;
-            let text = content
+            let items = reduced.items();
+            assert_eq!(items.len(), 1);
+            let text = items[0]
                 .text_content()
-                .or_else(|| content.reasoning_content());
-            assert_eq!(text, Some("visible"));
+                .or_else(|| items[0].reasoning_text());
+            assert_eq!(text.as_deref(), Some("visible"));
+            assert_eq!(reduced.streamed(items[0].kind()), ["visible"]);
         }
     }
 
@@ -1029,7 +1000,7 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!({"type":"output_text", "text":"second"}));
-        let (items, _, _) = assemble(vec![
+        let reduced = assemble(vec![
             added(0, message("message", "")),
             json!({"type":"response.output_text.delta", "output_index":0, "item_id":"message",
                 "content_index":1, "delta":"sec"}),
@@ -1037,12 +1008,12 @@ mod tests {
             completed(vec![native]),
         ])
         .unwrap();
-        let texts: Vec<_> = items[0]
-            .blocks
-            .iter()
-            .map(|block| block.content.text_content())
-            .collect();
-        assert_eq!(texts, [Some("first"), Some("second")]);
+        let AssistantItem::Text { blocks, .. } = &reduced.items()[0] else {
+            panic!("expected a text item")
+        };
+        let texts: Vec<_> = blocks.iter().map(|block| block.text.as_str()).collect();
+        assert_eq!(texts, ["first", "second"]);
+        assert_eq!(reduced.streamed(ItemKind::Text), ["second"]);
     }
 
     #[test]
@@ -1054,19 +1025,20 @@ mod tests {
         ];
         let mut events: Vec<_> = output.iter().cloned().map(unindexed_done).collect();
         events.push(completed(output));
-        let (items, _, reason) = assemble(events).unwrap();
-        assert_eq!(reason, StopReason::ToolUse);
+        let reduced = assemble(events).unwrap();
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+        let items = reduced.items();
         assert_eq!(items.len(), 3);
-        assert_eq!(items[0].reasoning_content().as_deref(), Some("plan"));
+        assert_eq!(items[0].reasoning_text().as_deref(), Some("plan"));
         assert_eq!(items[1].text_content().as_deref(), Some("checking"));
-        assert_eq!(items[2].tool_call_ref().unwrap().id(), "call-stable");
+        assert_eq!(items[2].call().unwrap().id(), "call-stable");
     }
 
     #[test]
     fn tool_argument_events_resolve_by_native_item_id() {
         let call = function("function", "call-stable", r#"{"key":"value"}"#);
         let arguments = |kind: &str, field: &str, value: Value| json!({"type":format!("response.function_call_arguments.{kind}"), "item_id":"function", field:value});
-        let (items, _, reason) = assemble(vec![
+        let reduced = assemble(vec![
             added(0, function("function", "call-stable", "")),
             arguments("delta", "delta", json!("{\"key\":")),
             arguments("delta", "delta", json!("\"value\"}")),
@@ -1075,8 +1047,12 @@ mod tests {
             completed(vec![call]),
         ])
         .unwrap();
-        assert_eq!(reason, StopReason::ToolUse);
-        let call = items[0].tool_call_ref().unwrap();
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+        assert_eq!(
+            reduced.streamed(ItemKind::ToolCall),
+            ["{\"key\":\"value\"}"]
+        );
+        let call = reduced.items()[0].call().unwrap();
         assert_eq!(call.id(), "call-stable");
         assert_eq!(
             Value::Object(call.arguments().clone()),
@@ -1104,11 +1080,12 @@ mod tests {
             events.push(done(position, item.clone()));
         }
         events.push(completed(terminal));
-        let (items, _, reason) = assemble(events).unwrap();
-        assert_eq!(reason, StopReason::ToolUse);
-        let ids: Vec<_> = items.iter().map(|item| item.id.as_str()).collect();
+        let reduced = assemble(events).unwrap();
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+        let items = reduced.items();
+        let ids: Vec<_> = items.iter().map(|item| item.id().as_str()).collect();
         assert_eq!(ids, ["reason-stream", "text-stream", "function-stream"]);
-        let call = items[2].tool_call_ref().unwrap();
+        let call = items[2].call().unwrap();
         assert_eq!(call.id(), "call-stable");
         assert_eq!(
             Value::Object(call.arguments().clone()),
@@ -1119,7 +1096,7 @@ mod tests {
     /// Feeds events without calling finish: an unrelated missing-terminal error could
     /// mask accidental acceptance of the invalid reference under test.
     fn fails_while_feeding(events: Vec<Value>) -> bool {
-        let mut decoder = Decoder::new("test-model".into());
+        let mut decoder = decoder();
         events.into_iter().any(|event| match decoder.feed(event) {
             Err(error) => {
                 assert_eq!(error.kind, ProviderErrorKind::Protocol, "{error:?}");
@@ -1274,7 +1251,7 @@ mod tests {
             json!({"type":format!("response.content_part.{kind}"),"output_index":0,"content_index":0,
                 "part":{"type":"output_text","text":"thinking"}})
         };
-        let (items, _, _) = assemble(vec![
+        let reduced = assemble(vec![
             added(0, json!({"type":"reasoning","id":"r"})),
             part("added"),
             part("done"),
@@ -1282,7 +1259,8 @@ mod tests {
             completed(vec![output.clone()]),
         ])
         .unwrap();
-        assert_eq!(items[0].reasoning_content().as_deref(), Some("thinking"));
-        assert_eq!(items[0].replay.as_ref().unwrap().payload, output);
+        let item = &reduced.items()[0];
+        assert_eq!(item.reasoning_text().as_deref(), Some("thinking"));
+        assert_eq!(item.replay().unwrap().payload, output);
     }
 }

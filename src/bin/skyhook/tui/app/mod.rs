@@ -359,25 +359,27 @@ pub(super) mod tests {
     /// A deterministic terminal failure, unlike a refused connection, which is
     /// transient and now retries until cancellation.
     pub(super) async fn permanent_failure_fixture() -> (tempfile::TempDir, App) {
-        use skyhook::provider::protocol::ModelRequest;
+        use skyhook::provider::protocol::{ContextId, ModelRequest};
         use skyhook::provider::{
-            Provider, ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
+            Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
         };
         struct Rejected;
         impl Provider for Rejected {
-            fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+            fn open_context(
+                &self,
+                _: ContextId,
+            ) -> Result<Box<dyn ProviderContext>, ProviderError> {
                 Ok(Box::new(Self))
             }
         }
         impl ProviderContext for Rejected {
-            fn invoke(&mut self, _: ModelRequest) -> ProviderFuture {
-                Box::pin(async {
+            fn invoke(&mut self, _: ModelRequest) -> ResponseStream {
+                Box::pin(futures_util::stream::once(async {
                     Err(ProviderError {
                         kind: ProviderErrorKind::Authentication,
                         message: "fixture credentials rejected".into(),
-                        retry_after: None,
                     })
-                })
+                }))
             }
         }
         let (root, mut app) = draft_fixture().await;

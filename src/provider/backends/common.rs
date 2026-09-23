@@ -4,8 +4,9 @@ use crate::{
     provider::{
         ProviderError, ProviderErrorKind,
         protocol::{
-            BlockContent, BlockKind, ItemKind, Message, ModelRequest, ReplayEnvelope,
-            ResponseChunk, ToolResult, UserContent,
+            AssistantItem, Binding, BlockId, BlockRef, Completion, CompletionError, CutReason,
+            ItemId, ItemKind, Message, ModelRequest, Position, Provenance, Replay, ResponseEvent,
+            Scope, TextBlock, ToolResult, UserContent,
         },
     },
 };
@@ -13,7 +14,6 @@ use serde_json::{Map, Value, json};
 
 pub(crate) fn invalid(message: impl Into<String>) -> ProviderError {
     ProviderError {
-        retry_after: None,
         kind: ProviderErrorKind::InvalidRequest,
         message: message.into(),
     }
@@ -177,92 +177,104 @@ pub(crate) fn attach_runtime_tail(
     false
 }
 
-/// Start events of a single-block item identified by its index.
-pub(crate) fn start_item(id: usize, kind: ItemKind, block_kind: BlockKind) -> [ResponseChunk; 2] {
-    [
-        ResponseChunk::ItemStarted {
-            id: id.to_string(),
-            position: id,
-            kind,
-        },
-        ResponseChunk::BlockStarted {
-            item: id.to_string(),
-            id: "0".into(),
-            position: 0,
-            kind: block_kind,
-        },
-    ]
+/// The wire identity of an index-addressed item.
+pub(crate) fn item_id(index: usize) -> ItemId {
+    ItemId::try_from(index.to_string()).expect("digits are nonblank")
 }
 
-/// End events matching [`start_item`].
-pub(crate) fn end_item(
-    id: usize,
-    content: BlockContent,
-    replay: Option<ReplayEnvelope>,
-) -> [ResponseChunk; 2] {
-    [
-        ResponseChunk::BlockEnded {
-            item: id.to_string(),
-            block: "0".into(),
-            content,
-        },
-        ResponseChunk::ItemEnded {
-            id: id.to_string(),
-            replay,
-        },
-    ]
+/// The single block of an index-addressed item.
+pub(crate) fn block_ref(index: usize) -> BlockRef {
+    BlockRef {
+        item: item_id(index),
+        block: BlockId::try_from("0".to_owned()).expect("literal is nonblank"),
+    }
+}
+
+pub(crate) fn position(index: usize) -> Result<Position, ProviderError> {
+    Position::try_from(index).map_err(|error| ProviderError::protocol(error.to_string()))
+}
+
+/// The one text block of an index-addressed item, keyed like its deltas.
+pub(crate) fn single_block(index: usize, text: String) -> Vec<TextBlock> {
+    vec![TextBlock {
+        id: block_ref(index).block,
+        position: 0.into(),
+        text,
+    }]
+}
+
+pub(crate) fn delta(block: BlockRef, kind: ItemKind, text: impl Into<String>) -> ResponseEvent {
+    ResponseEvent::Delta {
+        block,
+        kind,
+        text: text.into(),
+    }
+}
+
+/// How a response's finish settled: normally, with its tool calls executable, or
+/// cut, after which the decoder keeps text and reasoning but no calls.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Finish {
+    Normal,
+    Cut(CutReason),
+}
+
+impl Finish {
+    pub(crate) fn complete(self, items: Vec<AssistantItem>) -> Result<Completion, CompletionError> {
+        match self {
+            Self::Normal => Completion::finished(items),
+            Self::Cut(reason) => Completion::cut(items, reason),
+        }
+    }
 }
 
 pub(crate) fn opaque_payload<'a>(
-    replay: &'a Option<ReplayEnvelope>,
+    replay: &'a Option<Replay>,
     protocol: &str,
     model: &str,
 ) -> Option<&'a Value> {
-    let envelope = replay.as_ref()?;
-    (envelope.version == 1 && envelope.protocol == protocol && envelope.model == model)
-        .then_some(&envelope.payload)
+    let replay = replay.as_ref()?;
+    (replay.provenance.protocol == protocol && replay.provenance.model == model)
+        .then_some(&replay.payload)
 }
 
-pub(crate) fn reasoning_envelope(protocol: &str, model: &str, payload: Value) -> ReplayEnvelope {
-    ReplayEnvelope {
-        version: 1,
-        protocol: protocol.into(),
-        model: model.into(),
-        scope: String::new(),
+pub(crate) fn replay(
+    protocol: &str,
+    model: &str,
+    scope: &Scope,
+    payload: Value,
+    binding: Binding,
+) -> Replay {
+    Replay {
+        provenance: Provenance {
+            protocol: protocol.into(),
+            model: model.into(),
+            scope: scope.clone(),
+        },
         payload,
-        conversation_bound: false,
+        binding,
     }
 }
 
 /// Provider-bound provenance prevents replaying private reasoning to a different
 /// endpoint even when protocol and model names happen to match.
-pub(crate) fn reasoning_scope(name: &str, endpoint: &str) -> String {
-    crate::sha256_hex(format!("{name}\0{endpoint}"))
+pub(crate) fn reasoning_scope(name: &str, endpoint: &str) -> Scope {
+    Scope::try_from(crate::sha256_hex(format!("{name}\0{endpoint}"))).expect("digest is nonblank")
 }
 
-pub(crate) fn filter_reasoning_scope(request: &mut ModelRequest, scope: &str) {
+pub(crate) fn filter_reasoning_scope(request: &mut ModelRequest, scope: &Scope) {
     for message in request.messages_mut() {
         if let Message::Assistant(items) = message {
             for item in items {
-                if item
-                    .replay
-                    .as_ref()
-                    .is_some_and(|replay| replay.scope != scope)
+                if let AssistantItem::Reasoning { replay, .. } = item
+                    && replay
+                        .as_ref()
+                        .is_some_and(|replay| replay.provenance.scope != *scope)
                 {
-                    item.replay = None;
+                    *replay = None;
                 }
             }
         }
-    }
-}
-
-pub(crate) fn bind_reasoning_scope(chunk: &mut ResponseChunk, scope: &str) {
-    if let ResponseChunk::ItemEnded {
-        replay: Some(replay),
-        ..
-    } = chunk
-    {
-        replay.scope = scope.into();
     }
 }
 
@@ -271,8 +283,60 @@ pub(super) mod tests {
     use super::*;
     use crate::media::{BlobRef, ImageFormat};
     use crate::provider::protocol::{
-        AssistantBlock, AssistantItem, BlockContent, Message, ModelRequest, ResponseChunk,
+        AssistantItem, Completion, LiveBlock, LiveResponse, Message, ModelRequest, Step, TextBlock,
+        Usage,
     };
+
+    /// The scope test decoders issue replay under.
+    pub(crate) fn scope() -> Scope {
+        Scope::try_from("scope".to_owned()).unwrap()
+    }
+
+    /// What a consumer sees of a decoded event sequence that reached its end.
+    pub(crate) struct Reduced {
+        pub(crate) blocks: Vec<LiveBlock>,
+        pub(crate) usage: Usage,
+        pub(crate) completion: Completion,
+    }
+
+    impl Reduced {
+        pub(crate) fn items(&self) -> &[AssistantItem] {
+            self.completion.items()
+        }
+
+        /// Provisional text per block, in arrival order.
+        pub(crate) fn streamed(&self, kind: ItemKind) -> Vec<&str> {
+            self.blocks
+                .iter()
+                .filter(|block| block.kind == kind)
+                .map(|block| block.text.as_str())
+                .collect()
+        }
+    }
+
+    /// Reduce events as the runtime does; a missing or non-final `End` is a decoder bug.
+    pub(crate) fn reduce(events: impl IntoIterator<Item = ResponseEvent>) -> Reduced {
+        let mut live = LiveResponse::default();
+        let mut ended = None;
+        for event in events {
+            assert!(ended.is_none(), "event after End: {event:?}");
+            // Keep what streamed, not the authoritative view the end supplies.
+            let streamed = live.blocks().to_vec();
+            match std::mem::take(&mut live).push(event) {
+                Step::Open(open) => live = open,
+                Step::Ended {
+                    completion, usage, ..
+                } => {
+                    ended = Some(Reduced {
+                        blocks: streamed,
+                        usage,
+                        completion,
+                    });
+                }
+            }
+        }
+        ended.expect("response ended")
+    }
 
     #[test]
     fn tool_arguments_tolerate_empty_null_and_double_encoded_objects() {
@@ -327,7 +391,6 @@ pub(super) mod tests {
             response_schema: None,
             reasoning: None,
             max_output_tokens: Some(8192),
-            correlation: None,
             blobs: Default::default(),
         }
     }
@@ -338,25 +401,17 @@ pub(super) mod tests {
         let b = reasoning_scope("api", "https://b.example/v1/responses");
         assert_ne!(a, b);
         let native = json!({"type":"reasoning","encrypted_content":"private"});
-        let replay = Some(reasoning_envelope("responses", "same-model", native));
-        let mut chunk = ResponseChunk::ItemEnded {
-            id: "reasoning-0".into(),
-            replay,
-        };
-        bind_reasoning_scope(&mut chunk, &a);
-        let ResponseChunk::ItemEnded { replay, .. } = chunk else {
+        let replay = replay("responses", "same-model", &a, native, Binding::Free);
+        let mut item = AssistantItem::reasoning("reasoning-0", 0, "summary", Some(replay));
+        let AssistantItem::Reasoning { blocks, .. } = &mut item else {
             unreachable!()
         };
-        let mut item = AssistantItem::reasoning("reasoning-0", 0, "summary", replay);
-        let content = BlockContent::Reasoning {
+        blocks.push(TextBlock {
+            id: BlockId::try_from("summary-1".to_owned()).unwrap(),
+            position: 1.into(),
             text: "second summary".into(),
-        };
-        item.blocks.push(AssistantBlock {
-            id: "summary-1".into(),
-            position: 1,
-            content,
         });
-        let expected_blocks = item.blocks.clone();
+        let expected_text = item.reasoning_text();
         let messages = vec![Message::Assistant(vec![item])];
         let request = ModelRequest {
             history: messages,
@@ -370,8 +425,8 @@ pub(super) mod tests {
         let Message::Assistant(parts) = &foreign.history[0] else {
             unreachable!()
         };
-        assert!(parts[0].replay.is_none());
-        assert_eq!(parts[0].blocks, expected_blocks);
+        assert!(parts[0].replay().is_none());
+        assert_eq!(parts[0].reasoning_text(), expected_text);
     }
 
     #[test]

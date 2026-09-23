@@ -393,7 +393,6 @@ mod tests {
                 response_schema: None,
                 reasoning: None,
                 max_output_tokens: None,
-                correlation: None,
                 blobs: LoadedBlobs::default(),
             };
             assert!(matches!(

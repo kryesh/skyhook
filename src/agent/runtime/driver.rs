@@ -537,7 +537,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn session_resume_restarts_all_interrupted_children_without_restarting_waiting_parent() {
-        let child = |index: usize| {
+        let child = |index: u32| {
             let arguments = json!({"prompt":format!("child task {index}"), "depth":0});
             tool_call(index, &format!("agent-{index}"), "agent", arguments)
         };
@@ -765,13 +765,10 @@ mod tests {
             let wait = response(vec![tool_call(0, "wait", "wait_fixture", json!({}))]);
             // The child's first invocation fails outright, or aborts after partial text.
             let failed = if aborted {
-                let mut chunks = answer("partial child answer");
-                let stop_reason = StopReason::Aborted;
-                *chunks.last_mut().unwrap() = ResponseChunk::ResponseEnded { stop_reason };
-                Step::new(chunks)
+                let partial = AssistantItem::text("answer", 0, "partial child answer");
+                Step::new(cut(vec![partial], CutReason::Aborted))
             } else {
                 Step::fail(ProviderError {
-                    retry_after: None,
                     kind: crate::provider::ProviderErrorKind::Authentication,
                     message: "fixture permanent failure".into(),
                 })
@@ -890,12 +887,8 @@ mod tests {
         {
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
-            let child_id = Some(child.to_string());
-            assert!(
-                requests
-                    .iter()
-                    .all(|request| request.correlation == child_id)
-            );
+            let child_id = ContextId::from(&child);
+            assert!(requests.iter().all(|request| request.context == child_id));
             let history = &requests[2].history;
             let text = serde_json::to_string(history).unwrap();
             let expected = ["remember the initial task", "first answer", "follow-up one"];

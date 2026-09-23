@@ -1,3 +1,5 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -35,9 +37,7 @@ impl Message {
     #[must_use]
     pub fn is_content_free(&self) -> bool {
         match self {
-            Self::Assistant(items) => items
-                .iter()
-                .all(|item| item.blocks.is_empty() && item.replay.is_none()),
+            Self::Assistant(items) => items.iter().all(AssistantItem::is_content_free),
             Self::User(_) | Self::Tool(_) => false,
         }
     }
@@ -48,15 +48,7 @@ impl Message {
     #[must_use]
     pub fn without_bound_reasoning(mut self) -> Option<Self> {
         if let Self::Assistant(items) = &mut self {
-            for item in items {
-                if item
-                    .replay
-                    .as_ref()
-                    .is_some_and(|replay| replay.conversation_bound)
-                {
-                    item.replay = None;
-                }
-            }
+            items.iter_mut().for_each(AssistantItem::unbind);
         }
         (!self.is_content_free()).then_some(self)
     }
@@ -74,18 +66,120 @@ impl UserContent {
     }
 }
 
-/// A provider-native item. Its blocks and replay state must remain grouped.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct AssistantItem {
-    pub id: String,
-    pub position: usize,
-    pub kind: ItemKind,
-    pub blocks: Vec<AssistantBlock>,
-    pub replay: Option<ReplayEnvelope>,
+/// Nonblank provider item identity, unique within one response.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(try_from = "String", into = "String")]
+pub struct ItemId(String);
+
+/// Nonblank block identity, scoped to its item.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[serde(try_from = "String", into = "String")]
+pub struct BlockId(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("identity must not be blank")]
+pub struct BlankId;
+
+macro_rules! nonblank_id {
+    ($($id:ident),+) => {$(
+        impl TryFrom<String> for $id {
+            type Error = BlankId;
+            fn try_from(id: String) -> Result<Self, BlankId> {
+                if id.trim().is_empty() {
+                    return Err(BlankId);
+                }
+                Ok(Self(id))
+            }
+        }
+
+        impl From<$id> for String {
+            fn from(id: $id) -> Self {
+                id.0
+            }
+        }
+
+        impl $id {
+            #[must_use]
+            pub fn as_str(&self) -> &str {
+                &self.0
+            }
+        }
+
+        impl fmt::Display for $id {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(&self.0)
+            }
+        }
+    )+};
+}
+nonblank_id!(ItemId, BlockId);
+
+/// Provider ordering key. Not an index into anything.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct Position(u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("position does not fit the journal")]
+pub struct PositionOverflow;
+
+impl Position {
+    #[must_use]
+    pub fn get(self) -> u32 {
+        self.0
+    }
 }
 
-/// Migration alias; assistant content is now an item, never a flat block.
-pub type AssistantContent = AssistantItem;
+impl From<u32> for Position {
+    fn from(position: u32) -> Self {
+        Self(position)
+    }
+}
+
+impl TryFrom<usize> for Position {
+    type Error = PositionOverflow;
+    fn try_from(position: usize) -> Result<Self, PositionOverflow> {
+        u32::try_from(position)
+            .map(Self)
+            .map_err(|_| PositionOverflow)
+    }
+}
+
+/// A provider-native item. Its blocks and replay state must remain grouped.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AssistantItem {
+    Text {
+        id: ItemId,
+        position: Position,
+        blocks: Vec<TextBlock>,
+    },
+    Reasoning {
+        id: ItemId,
+        position: Position,
+        blocks: Vec<TextBlock>,
+        replay: Option<Replay>,
+    },
+    ToolCall {
+        id: ItemId,
+        position: Position,
+        call: ToolCall,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub struct TextBlock {
+    pub id: BlockId,
+    pub position: Position,
+    pub text: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ItemKind {
+    Text,
+    Reasoning,
+    ToolCall,
+}
 
 /// The visible reply an assistant response projects: its text blocks concatenated,
 /// with a whitespace-only projection normalized to none.
@@ -102,8 +196,7 @@ pub type AssistantContent = AssistantItem;
 pub fn visible_text(items: &[AssistantItem]) -> String {
     let text: String = items
         .iter()
-        .flat_map(|item| &item.blocks)
-        .filter_map(|block| block.content.text_content())
+        .filter_map(AssistantItem::text_content)
         .collect();
     if text.trim().is_empty() {
         String::new()
@@ -112,179 +205,202 @@ pub fn visible_text(items: &[AssistantItem]) -> String {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct AssistantBlock {
-    pub id: String,
-    pub position: usize,
-    pub content: BlockContent,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ItemKind {
-    Text,
-    Reasoning,
-    ToolCall,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum BlockKind {
-    Text,
-    Reasoning,
-    ToolCallArguments,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-#[serde(tag = "type", rename_all = "snake_case")]
-pub enum BlockContent {
-    Text { text: String },
-    Reasoning { text: String },
-    ToolCall(ToolCall),
-}
-
 /// Opaque native replay state, attached exactly once to its owning item.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
-pub struct ReplayEnvelope {
-    pub version: u32,
-    pub protocol: String,
-    pub model: String,
-    pub scope: String,
+pub struct Replay {
+    pub provenance: Provenance,
     pub payload: Value,
-    /// Signed state bound to the exact conversation before it; changing that history, as
-    /// compaction or a mode switch does, invalidates it.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub conversation_bound: bool,
+    pub binding: Binding,
 }
 
-fn is_false(value: &bool) -> bool {
-    !*value
+/// Where a replay came from. Encoders compare it for equality and never interpret it.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Provenance {
+    pub protocol: String,
+    pub model: String,
+    pub scope: Scope,
+}
+
+/// The configured provider identity a replay is valid under, assigned by the backend
+/// that issued it. Private state never crosses to another endpoint or provider name.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(try_from = "String", into = "String")]
+pub struct Scope(String);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("replay scope must not be blank")]
+pub struct BlankScope;
+
+impl TryFrom<String> for Scope {
+    type Error = BlankScope;
+    fn try_from(scope: String) -> Result<Self, BlankScope> {
+        if scope.trim().is_empty() {
+            return Err(BlankScope);
+        }
+        Ok(Self(scope))
+    }
+}
+
+impl From<Scope> for String {
+    fn from(scope: Scope) -> Self {
+        scope.0
+    }
+}
+
+impl Scope {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// How tightly a replay is bound to the history that produced it.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Binding {
+    /// Replays under any history with matching provenance.
+    Free,
+    /// Signed against the exact preceding conversation; compaction or a mode switch
+    /// invalidates it.
+    Conversation,
 }
 
 impl AssistantItem {
-    pub fn text(id: impl Into<String>, position: usize, text: impl Into<String>) -> Self {
-        Self::single(
-            id.into(),
-            position,
-            ItemKind::Text,
-            BlockContent::Text { text: text.into() },
-            None,
-        )
+    /// Single-block items with known-good identities, for fixtures and hosts.
+    /// Decoders parse wire identities at their boundary instead.
+    pub fn text(
+        id: impl Into<String>,
+        position: impl Into<Position>,
+        text: impl Into<String>,
+    ) -> Self {
+        let (id, block) = Self::single_ids(id.into());
+        Self::Text {
+            id,
+            position: position.into(),
+            blocks: vec![TextBlock {
+                id: block,
+                position: Position(0),
+                text: text.into(),
+            }],
+        }
     }
 
     pub fn reasoning(
         id: impl Into<String>,
-        position: usize,
+        position: impl Into<Position>,
         text: impl Into<String>,
-        replay: Option<ReplayEnvelope>,
+        replay: Option<Replay>,
     ) -> Self {
-        Self::single(
-            id.into(),
-            position,
-            ItemKind::Reasoning,
-            BlockContent::Reasoning { text: text.into() },
-            replay,
-        )
-    }
-
-    pub fn tool_call(id: impl Into<String>, position: usize, call: ToolCall) -> Self {
-        Self::single(
-            id.into(),
-            position,
-            ItemKind::ToolCall,
-            BlockContent::ToolCall(call),
-            None,
-        )
-    }
-
-    fn single(
-        id: String,
-        position: usize,
-        kind: ItemKind,
-        content: BlockContent,
-        replay: Option<ReplayEnvelope>,
-    ) -> Self {
-        let block = AssistantBlock {
-            id: format!("{id}:0"),
-            position: 0,
-            content,
-        };
-        Self {
+        let (id, block) = Self::single_ids(id.into());
+        Self::Reasoning {
             id,
-            position,
-            kind,
-            blocks: vec![block],
+            position: position.into(),
+            blocks: vec![TextBlock {
+                id: block,
+                position: Position(0),
+                text: text.into(),
+            }],
             replay,
         }
     }
 
-    /// Concatenates visible text without flattening stored item boundaries.
-    /// Kind-mismatched blocks yield `None` rather than a partial projection.
+    pub fn tool_call(id: impl Into<String>, position: impl Into<Position>, call: ToolCall) -> Self {
+        let (id, _) = Self::single_ids(id.into());
+        Self::ToolCall {
+            id,
+            position: position.into(),
+            call,
+        }
+    }
+
+    fn single_ids(id: String) -> (ItemId, BlockId) {
+        let block = BlockId::try_from(format!("{id}:0")).expect("suffixed id is nonblank");
+        let id = ItemId::try_from(id).expect("item ids are nonblank");
+        (id, block)
+    }
+
+    #[must_use]
+    pub fn id(&self) -> &ItemId {
+        match self {
+            Self::Text { id, .. } | Self::Reasoning { id, .. } | Self::ToolCall { id, .. } => id,
+        }
+    }
+
+    #[must_use]
+    pub fn position(&self) -> Position {
+        match self {
+            Self::Text { position, .. }
+            | Self::Reasoning { position, .. }
+            | Self::ToolCall { position, .. } => *position,
+        }
+    }
+
+    #[must_use]
+    pub fn kind(&self) -> ItemKind {
+        match self {
+            Self::Text { .. } => ItemKind::Text,
+            Self::Reasoning { .. } => ItemKind::Reasoning,
+            Self::ToolCall { .. } => ItemKind::ToolCall,
+        }
+    }
+
+    #[must_use]
+    pub fn replay(&self) -> Option<&Replay> {
+        match self {
+            Self::Reasoning { replay, .. } => replay.as_ref(),
+            Self::Text { .. } | Self::ToolCall { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn call(&self) -> Option<&ToolCall> {
+        match self {
+            Self::ToolCall { call, .. } => Some(call),
+            Self::Text { .. } | Self::Reasoning { .. } => None,
+        }
+    }
+
+    /// Concatenates a text item's blocks; other kinds project no text.
+    #[must_use]
     pub fn text_content(&self) -> Option<String> {
-        (self.kind == ItemKind::Text)
-            .then(|| {
-                self.blocks
-                    .iter()
-                    .map(|b| b.content.text_content())
-                    .collect()
-            })
-            .flatten()
-    }
-
-    pub fn reasoning_content(&self) -> Option<String> {
-        (self.kind == ItemKind::Reasoning)
-            .then(|| {
-                self.blocks
-                    .iter()
-                    .map(|b| b.content.reasoning_content())
-                    .collect()
-            })
-            .flatten()
-    }
-
-    pub fn tool_call_ref(&self) -> Option<&ToolCall> {
-        match (self.kind, self.blocks.as_slice()) {
-            (
-                ItemKind::ToolCall,
-                [
-                    AssistantBlock {
-                        content: BlockContent::ToolCall(call),
-                        ..
-                    },
-                ],
-            ) => Some(call),
-            _ => None,
-        }
-    }
-}
-
-impl BlockContent {
-    pub fn kind(&self) -> BlockKind {
         match self {
-            Self::Text { .. } => BlockKind::Text,
-            Self::Reasoning { .. } => BlockKind::Reasoning,
-            Self::ToolCall(_) => BlockKind::ToolCallArguments,
+            Self::Text { blocks, .. } => {
+                Some(blocks.iter().map(|block| block.text.as_str()).collect())
+            }
+            Self::Reasoning { .. } | Self::ToolCall { .. } => None,
         }
     }
 
-    pub fn text_content(&self) -> Option<&str> {
+    /// Concatenates a reasoning item's readable blocks; other kinds project none.
+    #[cfg(test)]
+    pub fn reasoning_text(&self) -> Option<String> {
         match self {
-            Self::Text { text } => Some(text),
-            _ => None,
+            Self::Reasoning { blocks, .. } => {
+                Some(blocks.iter().map(|block| block.text.as_str()).collect())
+            }
+            Self::Text { .. } | Self::ToolCall { .. } => None,
         }
     }
 
-    pub fn reasoning_content(&self) -> Option<&str> {
+    /// Whether nothing of this item can be encoded: no blocks and no replay. A blank
+    /// text block is content; a tool call always is.
+    #[must_use]
+    pub fn is_content_free(&self) -> bool {
         match self {
-            Self::Reasoning { text } => Some(text),
-            _ => None,
+            Self::Text { blocks, .. } => blocks.is_empty(),
+            Self::Reasoning { blocks, replay, .. } => blocks.is_empty() && replay.is_none(),
+            Self::ToolCall { .. } => false,
         }
     }
 
-    pub fn tool_call_ref(&self) -> Option<&ToolCall> {
-        match self {
-            Self::ToolCall(call) => Some(call),
-            _ => None,
+    /// Drop replay bound to the conversation that produced it, keeping readable text.
+    pub fn unbind(&mut self) {
+        if let Self::Reasoning { replay, .. } = self
+            && replay
+                .as_ref()
+                .is_some_and(|replay| replay.binding == Binding::Conversation)
+        {
+            *replay = None;
         }
     }
 }
@@ -378,23 +494,35 @@ mod content_free_tests {
     use super::*;
     use serde_json::json;
 
-    fn envelope() -> ReplayEnvelope {
-        ReplayEnvelope {
-            version: 1,
-            protocol: "anthropic".into(),
-            model: "model".into(),
-            scope: "scope".into(),
+    fn envelope() -> Replay {
+        Replay {
+            provenance: Provenance {
+                protocol: "anthropic".into(),
+                model: "model".into(),
+                scope: Scope::try_from("scope".to_owned()).unwrap(),
+            },
             payload: json!({"type":"thinking","thinking":"private","signature":"signed"}),
-            conversation_bound: true,
+            binding: Binding::Conversation,
         }
     }
 
-    /// An item whose blocks were all dropped, as a malformed decode would leave it.
-    fn blockless(kind: ItemKind, replay: Option<ReplayEnvelope>) -> AssistantItem {
-        AssistantItem {
-            id: "item".into(),
-            position: 0,
-            kind,
+    fn id(id: &str) -> ItemId {
+        ItemId::try_from(id.to_owned()).unwrap()
+    }
+
+    /// Items whose blocks were all dropped, as a malformed decode would leave them.
+    fn blockless_text() -> AssistantItem {
+        AssistantItem::Text {
+            id: id("text"),
+            position: Position(0),
+            blocks: Vec::new(),
+        }
+    }
+
+    fn blockless_reasoning(replay: Option<Replay>) -> AssistantItem {
+        AssistantItem::Reasoning {
+            id: id("reasoning"),
+            position: Position(0),
             blocks: Vec::new(),
             replay,
         }
@@ -403,11 +531,10 @@ mod content_free_tests {
     #[test]
     fn content_free_means_no_blocks_at_all_not_empty_text() {
         // The only unencodable shapes: no items, or items carrying no blocks and
-        // no replay state.
+        // no replay state. A tool call is always content.
         assert!(Message::Assistant(Vec::new()).is_content_free());
-        for kind in [ItemKind::Text, ItemKind::Reasoning, ItemKind::ToolCall] {
-            assert!(Message::Assistant(vec![blockless(kind, None)]).is_content_free());
-        }
+        assert!(Message::Assistant(vec![blockless_text()]).is_content_free());
+        assert!(Message::Assistant(vec![blockless_reasoning(None)]).is_content_free());
         // Only assistant messages can be content-free.
         assert!(!Message::User(Vec::new()).is_content_free());
         assert!(!Message::Tool(Vec::new()).is_content_free());
@@ -430,10 +557,46 @@ mod content_free_tests {
         // Reasoning is content through a rendered block or through replay state.
         let blank_prose = AssistantItem::reasoning("thought", 0, "   ", None);
         assert!(!Message::Assistant(vec![blank_prose]).is_content_free());
-        let signed = blockless(ItemKind::Reasoning, Some(envelope()));
+        let signed = blockless_reasoning(Some(envelope()));
         assert!(!Message::Assistant(vec![signed]).is_content_free());
         let visible = AssistantItem::text("answer", 0, "hello");
         assert!(!Message::Assistant(vec![visible]).is_content_free());
+    }
+
+    #[test]
+    fn unbinding_drops_only_conversation_bound_replay_and_empties_fall_away() {
+        let free = Replay {
+            binding: Binding::Free,
+            ..envelope()
+        };
+        let message = Message::Assistant(vec![
+            AssistantItem::reasoning("bound", 0, "visible", Some(envelope())),
+            AssistantItem::reasoning("free", 1, "kept", Some(free.clone())),
+        ]);
+        let Some(Message::Assistant(items)) = message.without_bound_reasoning() else {
+            panic!("readable text keeps the message")
+        };
+        assert_eq!(items[0].replay(), None);
+        assert_eq!(items[1].replay(), Some(&free));
+        let signed_only = Message::Assistant(vec![blockless_reasoning(Some(envelope()))]);
+        assert_eq!(signed_only.without_bound_reasoning(), None);
+    }
+
+    #[test]
+    fn identities_and_positions_are_parsed_at_the_boundary() {
+        assert_eq!(ItemId::try_from(" ".to_owned()), Err(BlankId));
+        assert_eq!(BlockId::try_from(String::new()), Err(BlankId));
+        assert_eq!(Position::try_from(usize::MAX), Err(PositionOverflow));
+        let item: AssistantItem =
+            serde_json::from_value(json!({"kind":"text", "id":"t", "position":3,
+                "blocks":[{"id":"t:0", "position":0, "text":"hi"}]}))
+            .unwrap();
+        assert_eq!(item, AssistantItem::text("t", 3, "hi"));
+        assert!(
+            serde_json::from_value::<AssistantItem>(json!({"kind":"text", "id":"",
+            "position":0, "blocks":[]}))
+            .is_err()
+        );
     }
 }
 
@@ -466,50 +629,28 @@ mod visible_text_tests {
         }
     }
 
-    /// Real text is projected byte for byte, including surrounding whitespace, so a
-    /// child reply keeps matching the assistant text committed to history.
+    /// Real text is projected byte for byte, including surrounding whitespace and
+    /// block boundaries, so a child reply keeps matching the committed assistant text.
     #[test]
     fn substantive_text_is_projected_verbatim_across_blocks() {
+        let block = |id: &str, position, text: &str| TextBlock {
+            id: BlockId::try_from(id.to_owned()).unwrap(),
+            position: Position(position),
+            text: text.into(),
+        };
         let items = vec![
             AssistantItem::reasoning("thought", 0, "private", None),
-            AssistantItem::text("first", 1, "\n\nanswer\n"),
-            AssistantItem::text("second", 2, " continued\n\n"),
+            AssistantItem::Text {
+                id: ItemId::try_from("answer".to_owned()).unwrap(),
+                position: Position(1),
+                blocks: vec![block("a", 0, " first"), block("b", 1, "\nsecond ")],
+            },
             tool_call(),
+            AssistantItem::text("more", 3, "third"),
         ];
-        assert_eq!(visible_text(&items), "\n\nanswer\n continued\n\n");
-    }
-
-    #[test]
-    fn reasoning_and_calls_alone_project_nothing() {
-        let items = vec![
-            AssistantItem::reasoning("thought", 0, "private reasoning", None),
-            tool_call(),
-        ];
-        assert_eq!(visible_text(&items), "");
-        assert_eq!(visible_text(&[]), "");
-    }
-}
-
-#[cfg(test)]
-mod completed_call_tests {
-    use super::*;
-    use serde_json::json;
-
-    #[test]
-    fn completed_call_rejects_blank_identity_and_nonobject_arguments() {
-        for (id, name, error) in [
-            ("", "tool", ToolCallError::EmptyId),
-            (" ", "tool", ToolCallError::EmptyId),
-            ("call", "", ToolCallError::EmptyName),
-            ("call", "\t", ToolCallError::EmptyName),
-        ] {
-            assert_eq!(ToolCall::new(id, name, json!({})), Err(error));
-        }
-        for arguments in [Value::Null, json!(false), json!(1), json!("{}"), json!([])] {
-            assert_eq!(
-                ToolCall::new("call", "tool", arguments),
-                Err(ToolCallError::ArgumentsNotObject),
-            );
-        }
+        assert_eq!(visible_text(&items), " first\nsecond third");
+        assert_eq!(items[1].text_content().as_deref(), Some(" first\nsecond "));
+        assert_eq!(items[0].reasoning_text().as_deref(), Some("private"));
+        assert_eq!(items[0].text_content(), None);
     }
 }

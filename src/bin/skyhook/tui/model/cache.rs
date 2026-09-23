@@ -314,7 +314,7 @@ mod tests {
     use skyhook::agent::{AgentActivity, RuntimeEvent};
     use skyhook::job::{JobRole, JobState};
     use skyhook::provider::protocol::{
-        AssistantItem, BlockContent, Message, ResponseEvent, UserContent,
+        AssistantItem, Completion, Message, ResponseEvent, UserContent,
     };
     use skyhook::session::SessionEvent;
 
@@ -471,30 +471,19 @@ mod tests {
         }
         delta(&mut snapshot, &agent, request, "text", "answer");
         sync(&mut cache, &snapshot, &projection);
-        // Equal-length authoritative replacement and block-only closure must invalidate entries.
-        let provisional = snapshot.responses[&(agent.clone(), request)]
-            .snapshot()
-            .items[0]
-            .blocks[0]
+        // An equal-length authoritative replacement at the end must invalidate entries.
+        let provisional = snapshot.responses[&(agent.clone(), request)].blocks()[0]
             .text
             .clone();
         let replacement = provisional.replace("first", "FIRST");
         assert_eq!(replacement.len(), provisional.len());
         let (item, block) = (String::from("reasoning"), String::from("reasoning:0"));
-        let text = replacement.clone();
-        for event in [
-            ResponseEvent::BlockEnded {
-                item: item.clone(),
-                block: block.clone(),
-                content: BlockContent::Reasoning { text },
-            },
-            ResponseEvent::ItemEnded {
-                id: item.clone(),
-                replay: Some(replay()),
-            },
-        ] {
-            response(&mut snapshot, &agent, request, event);
-        }
+        let ended = Completion::answer(vec![
+            AssistantItem::reasoning("reasoning", 0, replacement.clone(), Some(replay())),
+            AssistantItem::text("text", 1, "answer"),
+        ])
+        .unwrap();
+        response(&mut snapshot, &agent, request, ResponseEvent::End(ended));
         sync(&mut cache, &snapshot, &projection);
         assert!(!cache.entries()[0].running);
         assert!(cache.entries()[0].text().starts_with("▸ Reasoning"));

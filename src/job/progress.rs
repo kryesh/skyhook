@@ -127,7 +127,7 @@ pub(super) fn active_job(
 #[cfg(test)]
 mod tests {
     use crate::job::*;
-    use crate::provider::protocol::{AssistantContent, Message};
+    use crate::provider::protocol::{AssistantItem, Message};
 
     async fn started(jobs: &JobManager, agent: &AgentId, owner: JobId, target: &str) {
         let location = ExecutionLocation::named(target, format!("/{target}/work").into());
@@ -138,7 +138,7 @@ mod tests {
     }
 
     async fn committed(jobs: &JobManager, agent: &AgentId) {
-        let message = Message::Assistant(vec![AssistantContent::text("answer", 0, "done")]);
+        let message = Message::Assistant(vec![AssistantItem::text("answer", 0, "done")]);
         jobs.test_append(agent.clone(), SessionEvent::MessageCommitted { message })
             .await;
     }

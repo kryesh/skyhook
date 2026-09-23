@@ -315,7 +315,8 @@ mod tests {
     use super::super::*;
     use super::{COALESCE_MAX_WINDOW, COALESCE_QUIET_WINDOW};
     pub(super) use crate::agent::runtime::tests::{
-        Script, Step, bounded, enqueue_prompts, ephemeral_session, poll, rendered, response,
+        AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, poll, rendered,
+        response,
     };
     use crate::{
         job::{JobOutcome, JobSpec, JobState},
@@ -323,23 +324,27 @@ mod tests {
     };
 
     /// Gated steps, each served to the named model profile's next request.
-    pub(super) fn tracking_all(steps: Vec<(&'static str, Vec<AssistantContent>)>) -> Arc<Script> {
+    pub(super) fn tracking_all(steps: Vec<(&'static str, Vec<AssistantItem>)>) -> Arc<Script> {
         let steps = steps
             .into_iter()
             .map(|(model, content)| Step::new(response(content)).model(model).gated());
         Script::new(steps, &Default::default())
     }
 
-    pub(super) fn tracking(steps: Vec<(&'static str, AssistantContent)>) -> Arc<Script> {
+    pub(super) fn tracking(steps: Vec<(&'static str, AssistantItem)>) -> Arc<Script> {
         tracking_all(steps.into_iter().map(|(m, c)| (m, vec![c])).collect())
     }
 
-    pub(super) fn call(id: &str, name: &str, arguments: Value) -> AssistantContent {
-        AssistantContent::tool_call(id, 0, ToolCall::new(id, name, arguments).unwrap())
+    pub(super) fn call(id: &str, name: &str, arguments: Value) -> AssistantItem {
+        call_at(0, id, name, arguments)
     }
 
-    pub(super) fn answer() -> AssistantContent {
-        AssistantContent::text("answer", 0, "done".to_owned())
+    pub(super) fn call_at(position: u32, id: &str, name: &str, arguments: Value) -> AssistantItem {
+        AssistantItem::tool_call(id, position, ToolCall::new(id, name, arguments).unwrap())
+    }
+
+    pub(super) fn answer() -> AssistantItem {
+        AssistantItem::text("answer", 0, "done".to_owned())
     }
 
     /// A session whose "root" and "child" profiles are answered by `tracking`.
@@ -682,7 +687,7 @@ mod tests {
                 "root",
                 vec![
                     call("first", "script", first),
-                    AssistantContent::tool_call(
+                    AssistantItem::tool_call(
                         "second",
                         1,
                         ToolCall::new("second", "script", second).unwrap(),
@@ -790,7 +795,7 @@ mod tests {
                 "root",
                 vec![
                     call("first", "wait", json!({"timeout":null})),
-                    AssistantContent::tool_call("second", 1, second),
+                    AssistantItem::tool_call("second", 1, second),
                 ],
             ),
             ("root", vec![answer()]),
@@ -1004,7 +1009,7 @@ mod tests {
                 "root",
                 vec![
                     call("kid", "agent", delegate),
-                    AssistantContent::tool_call(
+                    AssistantItem::tool_call(
                         "blocked",
                         1,
                         ToolCall::new("blocked", "script", blocked).unwrap(),

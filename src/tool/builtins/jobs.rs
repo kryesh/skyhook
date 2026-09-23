@@ -369,7 +369,6 @@ mod tests {
             response_schema: None,
             reasoning: None,
             max_output_tokens: None,
-            correlation: None,
             blobs: Default::default(),
             tail: Vec::new(),
             history_lifetime: Default::default(),

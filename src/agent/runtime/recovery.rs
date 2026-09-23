@@ -6,7 +6,7 @@ use super::*;
 /// longer than its 30-second cap. `attempt` counts transient failures of the
 /// frozen request, independently of context/validation attempts.
 fn recovery_delay(error: &crate::provider::ProviderError, attempt: u64) -> std::time::Duration {
-    error.retry_after.unwrap_or_else(|| {
+    error.retry_after().unwrap_or_else(|| {
         std::time::Duration::from_secs(1u64 << attempt.saturating_sub(1).min(5))
             .min(std::time::Duration::from_secs(30))
     })
@@ -125,19 +125,19 @@ mod tests {
 
     use super::*;
     use crate::agent::runtime::tests::{
-        Requests, Script, Step, bounded, child_launch, cloned_provider, count, enqueue_prompts,
-        events, owner, poll, shutdown_session, summary_json, test_builder, test_harness, tool_call,
-        usage,
+        Requests, Script, Served, Step, bounded, child_launch, count, delta, enqueue_prompts,
+        events, owner, poll, response, shutdown_session, stream, summary_json, test_builder,
+        test_harness, tool_call, usage,
     };
     use crate::provider::{
-        ProviderContext, ProviderError, ProviderErrorKind, ProviderFuture,
-        protocol::{StopReason, events_for_content},
+        Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
+        protocol::{AssistantItem, ContextId, ResponseEvent},
     };
     use crate::session::{ModelPurpose, project_history};
+    use futures_util::TryStreamExt;
 
     fn error(kind: ProviderErrorKind, message: &str) -> ProviderError {
         ProviderError {
-            retry_after: None,
             kind,
             message: message.into(),
         }
@@ -159,22 +159,38 @@ mod tests {
         }
     }
 
-    fn success(items: Vec<AssistantContent>, stop_reason: StopReason) -> Step {
-        let mut chunks = events_for_content(&items);
-        chunks.push(ResponseChunk::ResponseEnded { stop_reason });
-        Step::stream(chunks.into_iter().map(Ok).collect())
+    fn success(items: Vec<AssistantItem>) -> Step {
+        Step::stream(response(items).into_iter().map(Ok).collect())
     }
 
     fn answer(text: &str) -> Step {
-        let items = vec![AssistantContent::text("answer", 0, text)];
-        success(items, StopReason::EndTurn)
+        success(vec![AssistantItem::text("answer", 0, text)])
     }
-    fn write_call(id: &str, path: &str) -> AssistantContent {
+
+    fn write_call(id: &str, path: &str) -> AssistantItem {
         tool_call(0, id, "write", json!({"path":path, "content":id}))
     }
 
     fn write_step(id: &str, path: &str) -> Step {
-        success(vec![write_call(id, path)], StopReason::ToolUse)
+        success(vec![write_call(id, path)])
+    }
+
+    /// Provisional deltas for `items`, as a stream that fails before its end shows.
+    fn partial(items: &[AssistantItem]) -> Vec<Result<ResponseEvent, ProviderError>> {
+        items
+            .iter()
+            .map(|item| {
+                let text = match item {
+                    AssistantItem::Text { .. } => item.text_content().unwrap(),
+                    AssistantItem::Reasoning { .. } => item.reasoning_text().unwrap(),
+                    AssistantItem::ToolCall { call, .. } => {
+                        serde_json::Value::Object(call.arguments().clone()).to_string()
+                    }
+                };
+                let block = format!("{}:0", item.id());
+                Ok(delta(item.id().as_str(), &block, item.kind(), &text))
+            })
+            .collect()
     }
 
     struct Fixture {
@@ -202,7 +218,7 @@ mod tests {
         async fn records(&self) -> Vec<EventRecord> {
             self.session.runtime.store.records().await
         }
-        fn requests(&self) -> Vec<ModelRequest> {
+        fn requests(&self) -> Vec<Served> {
             self.script.requests.lock().unwrap().clone()
         }
 
@@ -281,7 +297,9 @@ mod tests {
             assert_eq!(recovery_delay(&error, attempt), expected);
         }
         for hint in [0, 1234, 90_000].map(Duration::from_millis) {
-            error.retry_after = Some(hint);
+            error.kind = ProviderErrorKind::Unavailable {
+                retry_after: Some(hint),
+            };
             assert_eq!(recovery_delay(&error, 1), hint);
             assert_eq!(recovery_delay(&error, u64::MAX), hint);
         }
@@ -289,9 +307,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn startup_failure_retries_the_frozen_request_and_honors_server_retry_after() {
-        let mut error = recoverable();
-        error.retry_after = Some(Duration::from_secs(90));
-        let fixture = Fixture::new([Step::fail(error), answer("recovered")]).await;
+        let error = error(
+            ProviderErrorKind::RateLimited {
+                retry_after: Some(Duration::from_secs(90)),
+            },
+            "scripted throttle",
+        );
+        let fixture = Fixture::new([Step::fail(error.clone()), answer("recovered")]).await;
         let image = crate::media::Attachment::Image {
             file: Some(fixture.workspace.path().join("evidence.png")),
             image: crate::tests::png(b"request image fixture"),
@@ -307,7 +329,7 @@ mod tests {
         let records = fixture.records().await;
         let scheduled = recoveries(&records).into_iter();
         let scheduled = scheduled.map(|(_, attempt, delay, error)| (attempt, delay, error));
-        let expected = (2, 90_000, recoverable().to_string());
+        let expected = (2, 90_000, error.to_string());
         assert_eq!(scheduled.collect::<Vec<_>>(), [expected]);
         let requests = fixture.requests();
         assert_eq!(requests.len(), 2);
@@ -320,22 +342,20 @@ mod tests {
         assert_eq!(fixture.script.opened.load(Ordering::SeqCst), 1);
         let (history, assistants) = fixture.history(&records);
         assert_eq!(assistants, 1);
-        assert!(!history.contains("connection lost"));
+        assert!(!history.contains("scripted throttle"));
         fixture.session.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn failed_partial_text_and_complete_tool_block_are_discarded_before_retry() {
         let observed_usage = usage(71, 13, 5);
-        let mut partial = vec![Ok(ResponseChunk::UsageUpdated {
-            usage: observed_usage,
-        })];
+        let mut partial = vec![Ok(ResponseEvent::Usage(observed_usage))];
         let discarded = json!({"path":"must-not-exist", "content":"bad"});
         let items = [
-            AssistantContent::text("partial", 0, "DO NOT COMMIT"),
+            AssistantItem::text("partial", 0, "DO NOT COMMIT"),
             tool_call(1, "discarded", "write", discarded),
         ];
-        partial.extend(events_for_content(&items).into_iter().map(Ok));
+        partial.extend(self::partial(&items));
         partial.push(Err(recoverable()));
         let committed = write_step("committed", "successful-tool");
         let fixture = Fixture::new([Step::stream(partial), committed, answer("done")]).await;
@@ -448,8 +468,13 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn all_transient_categories_retry_past_three_startup_or_stream_failures() {
-        use ProviderErrorKind::{RateLimited, Response, Timeout, Transport};
-        for kind in [Response, Transport, Timeout, RateLimited] {
+        use ProviderErrorKind::{RateLimited, Timeout, Transport, Unavailable};
+        for kind in [
+            Unavailable { retry_after: None },
+            Transport,
+            Timeout,
+            RateLimited { retry_after: None },
+        ] {
             for streaming in [false, true] {
                 let failures = 4;
                 let failure = || {
@@ -458,13 +483,12 @@ mod tests {
                         return Step::fail(error);
                     }
                     let items = [
-                        AssistantContent::text("partial", 1, "discard failed partial answer"),
+                        AssistantItem::text("partial", 1, "discard failed partial answer"),
                         write_call("failed", "must-not-exist"),
                     ];
-                    let mut chunks: Vec<_> =
-                        events_for_content(&items).into_iter().map(Ok).collect();
-                    chunks.push(Err(error));
-                    Step::stream(chunks)
+                    let mut events = partial(&items);
+                    events.push(Err(error));
+                    Step::stream(events)
                 };
                 let steps = (0..failures)
                     .map(|_| failure())
@@ -552,7 +576,7 @@ mod tests {
         let requests = fixture.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
-        assert_eq!(requests[0].correlation, Some(child.to_string()));
+        assert_eq!(requests[0].context, ContextId::from(&child));
         let records = fixture.records().await;
         assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 1);
         let child_records = records.iter().filter(|record| record.agent == child);
@@ -599,7 +623,7 @@ mod tests {
         let requests = fixture.requests();
         assert_eq!(requests.len(), 3);
         assert_eq!(requests[0], requests[1]);
-        let queued = |index: usize| serde_json::to_string(&requests[index]).unwrap();
+        let queued = |index: usize| serde_json::to_string(&requests[index].request).unwrap();
         assert!(queued(2).contains("queued input") && !queued(1).contains("queued input"));
         fixture.session.shutdown().await.unwrap();
     }
@@ -617,7 +641,7 @@ mod tests {
         .await;
         // Exceed the 8,000-token verbatim tail so old work is summarized, not retained.
         let history = "original context ".repeat(5000);
-        let history = Message::Assistant(vec![AssistantContent::text("history", 0, history)]);
+        let history = Message::Assistant(vec![AssistantItem::text("history", 0, history)]);
         let root = &fixture.session.root;
         fixture.session.runtime.commit(root, history).await.unwrap();
         let answer = fixture.prompt("continue").await;
@@ -666,17 +690,30 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn failed_provider_call_is_journaled_before_invocation() {
-        #[derive(Clone)]
         struct FailingProvider {
             session_root: PathBuf,
         }
-        cloned_provider!(FailingProvider);
-        impl ProviderContext for FailingProvider {
-            fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
-                let correlation = request.correlation.as_ref().unwrap();
-                let session = correlation.split(':').next().unwrap().parse().unwrap();
+        struct FailingContext {
+            session_root: PathBuf,
+            context: ContextId,
+        }
+        impl Provider for FailingProvider {
+            fn open_context(
+                &self,
+                context: ContextId,
+            ) -> Result<Box<dyn ProviderContext>, ProviderError> {
+                Ok(Box::new(FailingContext {
+                    session_root: self.session_root.clone(),
+                    context,
+                }))
+            }
+        }
+        impl ProviderContext for FailingContext {
+            fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
+                let session = self.context.as_str().split(':').next().unwrap();
+                let session = session.parse().unwrap();
                 let root = self.session_root.clone();
-                Box::pin(async move {
+                let started = async move {
                     // A separate reader sees only committed transactions.
                     let records = SessionStore::read_records(&root, session).await.unwrap();
                     let SessionEvent::ModelAttemptStarted {
@@ -689,8 +726,11 @@ mod tests {
                     let reconstructed =
                         crate::session::reconstruct_model_request(&records, sequence);
                     assert_eq!(reconstructed.unwrap(), ("test".into(), request));
-                    Err(ProviderError::protocol("intentional provider failure"))
-                })
+                    Err::<ResponseStream, _>(ProviderError::protocol(
+                        "intentional provider failure",
+                    ))
+                };
+                Box::pin(stream::once(started).try_flatten())
             }
         }
         let workspace = tempfile::tempdir().unwrap();

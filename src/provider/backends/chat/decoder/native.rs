@@ -53,25 +53,24 @@ pub(super) fn decode(event: &SseEvent) -> Result<Option<wire::Chunk>, ProviderEr
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Decoder, tests::*};
-    use crate::provider::protocol::StopReason;
+    use super::super::tests::*;
+    use crate::provider::protocol::{Outcome, ResponseEvent};
     use serde_json::{Value, json};
 
     /// Decodes `packet` before content, after content, and after a normal
     /// finish without producing output or failing the stream.
     fn assert_ignored_at_every_stage(packet: Value) {
         for stage in 0..3 {
-            let mut decoder = Decoder::new("test-model".into());
+            let mut decoder = decoder();
             let prefix = [delta(json!({"content":"answer"})), end("stop")];
             for frame in prefix.into_iter().take(stage) {
                 decoder.decode(&frame).unwrap();
             }
-            let chunks = decoder.decode(&event(packet.clone())).unwrap();
+            let events = decoder.decode(&event(packet.clone())).unwrap();
             assert!(
-                chunks.iter().all(|chunk| matches!(
-                    chunk,
-                    crate::provider::protocol::ResponseChunk::UsageUpdated { .. }
-                )),
+                events
+                    .iter()
+                    .all(|event| matches!(event, ResponseEvent::Usage(_))),
                 "{stage}: {packet}"
             );
         }
@@ -88,7 +87,7 @@ mod tests {
             json!([null, {"index":0,"delta":{"content":"answer"}}]),
         ] {
             let (items, _, _) = decode(vec![event(json!({"choices":choices})), end("stop")]);
-            assert_eq!(contents(&items), [&text("answer")], "{choices}");
+            assert_eq!(contents(&items), [text("answer")], "{choices}");
         }
         for index in [json!(1), json!(-1), json!(0.5), json!(true)] {
             assert_ignored_at_every_stage(
@@ -135,11 +134,11 @@ mod tests {
             if let Some(choices) = &choices {
                 packet["choices"] = choices.clone();
             }
-            let mut decoder = Decoder::new("test-model".into());
+            let mut decoder = decoder();
             assert!(decoder.decode(&event(packet)).is_err());
             assert!(decoder.finish().is_err());
         }
-        let mut decoder = Decoder::new("test-model".into());
+        let mut decoder = decoder();
         let invalid = crate::provider::backends::transport::SseEvent {
             event: None,
             data: "{not json".into(),
@@ -156,9 +155,9 @@ mod tests {
         ] {
             let mut choice = choice;
             choice["finish_reason"] = json!("stop");
-            let (items, _, stop) = decode(vec![event(json!({ "choices": [choice] }))]);
-            assert_eq!(stop, StopReason::EndTurn);
-            assert_eq!(contents(&items), [&text("answer")]);
+            let (items, _, outcome) = decode(vec![event(json!({ "choices": [choice] }))]);
+            assert_eq!(outcome, Outcome::Answer);
+            assert_eq!(contents(&items), [text("answer")]);
         }
         let (items, _, _) = decode(vec![event(
             json!({"choices":[{"finish_reason":"tool_calls",
@@ -190,9 +189,9 @@ mod tests {
                 frame
             })
             .collect();
-        let (items, _, stop) = decode(frames);
-        assert_eq!(stop, StopReason::EndTurn);
-        assert_eq!(contents(&items), [&text("answer")]);
+        let (items, _, outcome) = decode(frames);
+        assert_eq!(outcome, Outcome::Answer);
+        assert_eq!(contents(&items), [text("answer")]);
     }
 
     #[test]
@@ -203,7 +202,7 @@ mod tests {
         let mut named = event(error.clone());
         named.event = Some("error".into());
         for frame in [event(json!({ "error": error })), named] {
-            let mut decoder = Decoder::new("test-model".into());
+            let mut decoder = decoder();
             let error = decoder.decode(&frame).unwrap_err();
             assert_eq!(error.kind, ProviderErrorKind::ContextWindowExceeded);
             assert!(error.message.ends_with(": prompt too long"));
@@ -213,24 +212,24 @@ mod tests {
 
     #[test]
     fn full_message_beside_streamed_deltas_is_not_duplicated() {
-        let (items, _, stop) = decode(vec![
+        let (items, _, outcome) = decode(vec![
             delta(json!({"content":"hello"})),
             event(
                 json!({"choices":[{"delta":{},"message":{"content":"hello"},"finish_reason":"stop"}]}),
             ),
         ]);
         assert_eq!(
-            (stop, contents(&items)),
-            (StopReason::EndTurn, vec![&text("hello")])
+            (outcome, contents(&items)),
+            (Outcome::Answer, vec![text("hello")])
         );
         let call = json!([{"index":0,"id":"c","function":{"name":"run","arguments":"{\"a\":1}"}}]);
-        let (items, _, stop) = decode(vec![
+        let (items, _, outcome) = decode(vec![
             delta(json!({"tool_calls":call})),
             event(
                 json!({"choices":[{"delta":{},"message":{"tool_calls":call},"finish_reason":"tool_calls"}]}),
             ),
         ]);
-        assert_eq!((stop, items.len()), (StopReason::ToolUse, 1));
+        assert_eq!((outcome, items.len()), (Outcome::ToolUse, 1));
     }
 
     #[test]
@@ -241,26 +240,26 @@ mod tests {
             event(json!({"choices":[{"delta":{},"message":message,"finish_reason":finish}]}))
         };
         // Only reasoning streamed: the answer and tool call come from the message.
-        let (items, _, stop) = decode(vec![
+        let (items, _, outcome) = decode(vec![
             delta(json!({"reasoning_content":"thinking"})),
             full(json!({"content":"answer","tool_calls":call}), "tool_calls"),
         ]);
-        assert_eq!(stop, StopReason::ToolUse);
+        assert_eq!(outcome, Outcome::ToolUse);
         assert_eq!(items.len(), 3);
-        assert_eq!(items[1].blocks[0].content, text("answer"));
+        assert_eq!(contents(&items)[1], text("answer"));
         // A repeat that adds a tool call adds just the call.
         let (items, _, _) = decode(vec![
             delta(json!({"content":"answer"})),
             full(json!({"content":"answer","tool_calls":call}), "tool_calls"),
         ]);
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].blocks[0].content, text("answer"));
+        assert_eq!(contents(&items)[0], text("answer"));
         // Text the stream did not finish is completed.
         let (items, _, _) = decode(vec![
             delta(json!({"content":"hel"})),
             full(json!({"content":"hello"}), "stop"),
         ]);
-        assert_eq!(contents(&items), [&text("hello")]);
+        assert_eq!(contents(&items), [text("hello")]);
         // A message that differs from the stream (trimmed, reformatted, or
         // with different calls) leaves the streamed content as it is.
         for (streamed, message, expected) in [
@@ -276,16 +275,12 @@ mod tests {
             ),
         ] {
             let (items, _, _) = decode(vec![delta(streamed), full(message, "stop")]);
-            assert_eq!(contents(&items), [&expected]);
+            assert_eq!(contents(&items), [expected]);
         }
         let streamed_call = json!({"tool_calls":[{"index":0,"id":"c","function":{"name":"run","arguments":"{\"a\":1}"}}]});
         let message = json!({"tool_calls":[{"id":"c","type":"function","function":{"name":"run","arguments":"{\"a\":2}"}}]});
         let (items, _, _) = decode(vec![delta(streamed_call), full(message, "tool_calls")]);
-        match &items[0].blocks[0].content {
-            crate::provider::protocol::BlockContent::ToolCall(call) => {
-                assert_eq!(Value::Object(call.arguments().clone()), json!({"a":1}))
-            }
-            other => panic!("expected a tool call: {other:?}"),
-        }
+        let call = items[0].call().expect("a tool call");
+        assert_eq!(Value::Object(call.arguments().clone()), json!({"a":1}));
     }
 }

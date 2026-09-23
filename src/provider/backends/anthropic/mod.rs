@@ -5,13 +5,13 @@ use serde_json::Value;
 
 use crate::provider::{
     ProviderError, ProviderErrorKind,
-    protocol::{
-        BlockContent, BlockKind, ContentDelta, ItemKind, ReplayEnvelope, ResponseChunk, StopReason,
-        Usage,
-    },
+    protocol::{AssistantItem, Binding, CutReason, ItemKind, Replay, ResponseEvent, Scope, Usage},
 };
 
-use super::{common::reasoning_envelope, transport::SseEvent};
+use super::{
+    common::{Finish, block_ref, delta, item_id, position, replay, single_block},
+    transport::SseEvent,
+};
 
 mod encoder;
 mod native;
@@ -38,7 +38,7 @@ enum CompletedBlock {
     Reasoning {
         text: String,
         // None when the signature was stripped: displayed, never replayed.
-        replay: Option<ReplayEnvelope>,
+        replay: Option<Replay>,
     },
     Tool(crate::provider::protocol::ToolCall),
 }
@@ -50,16 +50,17 @@ enum Block {
     // discard it, ordinary stops surface the original error.
     PendingToolError(ProviderError),
     Skipped,
-    EmittedTool,
-    EmittedOther,
 }
 
 /// Signed thinking is bound to the exact conversation before it, so compaction and mode switches drop it.
-fn bound_envelope(model: &str, native: &Value) -> ReplayEnvelope {
-    ReplayEnvelope {
-        conversation_bound: true,
-        ..reasoning_envelope("anthropic", model, native.clone())
-    }
+fn bound_replay(model: &str, scope: &Scope, native: &Value) -> Replay {
+    replay(
+        "anthropic",
+        model,
+        scope,
+        native.clone(),
+        Binding::Conversation,
+    )
 }
 
 fn stream_error(value: &Value) -> ProviderError {
@@ -72,14 +73,14 @@ fn stream_error(value: &Value) -> ProviderError {
         .to_ascii_lowercase();
     let kind = match error_type {
         "authentication_error" | "permission_error" => ProviderErrorKind::Authentication,
-        "rate_limit_error" => ProviderErrorKind::RateLimited,
+        "rate_limit_error" => ProviderErrorKind::RateLimited { retry_after: None },
         "invalid_request_error" if text.contains("prompt is too long") => {
             ProviderErrorKind::ContextWindowExceeded
         }
         "invalid_request_error" | "not_found_error" | "request_too_large" => {
             ProviderErrorKind::InvalidRequest
         }
-        _ => ProviderErrorKind::Response,
+        _ => ProviderErrorKind::Unavailable { retry_after: None },
     };
     let known = matches!(
         error_type,
@@ -98,31 +99,17 @@ fn stream_error(value: &Value) -> ProviderError {
         "Anthropic server error".to_owned()
     };
     super::errors::append_server_message(&mut message, value);
-    ProviderError {
-        retry_after: None,
-        kind,
-        message,
-    }
+    ProviderError { kind, message }
 }
 
-fn classify_stop(reason: &str) -> StopReason {
+/// Unknown reasons, including `pause_turn` (its calls are not final), end the turn
+/// without executing tools.
+fn classify_stop(reason: &str) -> Finish {
     match reason.to_ascii_lowercase().as_str() {
-        "tool_use" => StopReason::ToolUse,
-        "end_turn" => StopReason::EndTurn,
-        "stop_sequence" => StopReason::StopSequence,
-        "max_tokens" | "model_context_window_exceeded" => StopReason::MaxTokens,
-        "refusal" => StopReason::ContentFilter,
-        // Includes `pause_turn`: its calls are not final, so the turn ends
-        // without executing them.
-        _ => StopReason::Other(reason.into()),
-    }
-}
-
-fn block_delta(item: usize, delta: ContentDelta) -> ResponseChunk {
-    ResponseChunk::BlockDelta {
-        item: item.to_string(),
-        block: "0".into(),
-        delta,
+        "tool_use" | "end_turn" | "stop_sequence" => Finish::Normal,
+        "max_tokens" | "model_context_window_exceeded" => Finish::Cut(CutReason::MaxTokens),
+        "refusal" => Finish::Cut(CutReason::Refusal),
+        _ => Finish::Cut(CutReason::Incomplete),
     }
 }
 
@@ -133,7 +120,6 @@ impl Block {
             Self::Streaming(StreamingBlock::Tool { .. })
                 | Self::Completed(CompletedBlock::Tool(_))
                 | Self::PendingToolError(_)
-                | Self::EmittedTool
         )
     }
 }
@@ -150,22 +136,17 @@ fn ensure_string(native: &mut Value, field: &str) -> String {
 }
 
 impl StreamingBlock {
-    fn start(mut native: Value, id: usize) -> Result<(Self, Vec<ResponseChunk>), ProviderError> {
+    fn start(mut native: Value, id: usize) -> Result<(Self, Vec<ResponseEvent>), ProviderError> {
         let kind = native.get("type").and_then(Value::as_str).unwrap_or("");
-        let (block, kind, block_kind, text) = match kind {
+        let (block, kind, text) = match kind {
             "text" => {
                 let text = ensure_string(&mut native, "text");
-                (Self::Text(native), ItemKind::Text, BlockKind::Text, text)
+                (Self::Text(native), ItemKind::Text, text)
             }
             "thinking" => {
                 let text = ensure_string(&mut native, "thinking");
                 ensure_string(&mut native, "signature");
-                (
-                    Self::Thinking(native),
-                    ItemKind::Reasoning,
-                    BlockKind::Reasoning,
-                    text,
-                )
+                (Self::Thinking(native), ItemKind::Reasoning, text)
             }
             "redacted_thinking"
                 if native
@@ -176,7 +157,6 @@ impl StreamingBlock {
                 (
                     Self::RedactedThinking(native),
                     ItemKind::Reasoning,
-                    BlockKind::Reasoning,
                     String::new(),
                 )
             }
@@ -192,26 +172,25 @@ impl StreamingBlock {
                         unreadable: false,
                     },
                     ItemKind::ToolCall,
-                    BlockKind::ToolCallArguments,
                     String::new(),
                 )
             }
             _ => return Ok((Self::Ignored, Vec::new())),
         };
-        let mut chunks = super::common::start_item(id, kind, block_kind).to_vec();
+        let mut events = Vec::new();
         if !text.is_empty() {
-            chunks.push(block_delta(id, ContentDelta::Text(text)));
+            events.push(delta(block_ref(id), kind, text));
         }
-        Ok((block, chunks))
+        Ok((block, events))
     }
 
-    fn complete(&self, model: &str) -> Result<Block, ProviderError> {
+    fn complete(&self, model: &str, scope: &Scope) -> Result<Block, ProviderError> {
         let content = match self {
             Self::Text(native) => CompletedBlock::Text(string(native, "text")?.into()),
             Self::Thinking(native) => CompletedBlock::Reasoning {
                 text: string(native, "thinking")?.into(),
                 replay: (!string(native, "signature")?.is_empty())
-                    .then(|| bound_envelope(model, native)),
+                    .then(|| bound_replay(model, scope, native)),
             },
             Self::RedactedThinking(native) => CompletedBlock::Reasoning {
                 // Preserve optional display text from the original raw block.
@@ -220,7 +199,7 @@ impl StreamingBlock {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .into(),
-                replay: Some(bound_envelope(model, native)),
+                replay: Some(bound_replay(model, scope, native)),
             },
             Self::Tool {
                 unreadable: true, ..
@@ -252,35 +231,33 @@ struct NativeUsage {
 }
 
 /// One decoder owns exactly one Messages response. Native indices identify blocks;
-/// completed blocks are emitted in index order even if the SSE blocks interleave.
+/// the completion lists them in index order even if the SSE blocks interleave.
 pub(crate) struct Decoder {
     model: String,
+    scope: Scope,
     started: bool,
     message_delta: bool,
-    tools_discarded: bool,
     stopped: bool,
-    stop_reason: Option<StopReason>,
+    finish: Option<Finish>,
     blocks: BTreeMap<usize, Block>,
-    next_end: usize,
     usage: NativeUsage,
 }
 
 impl Decoder {
-    pub(crate) fn new(model: String) -> Self {
+    pub(crate) fn new(model: String, scope: Scope) -> Self {
         Self {
             model,
+            scope,
             started: false,
             message_delta: false,
-            tools_discarded: false,
             stopped: false,
-            stop_reason: None,
+            finish: None,
             blocks: BTreeMap::new(),
-            next_end: 0,
             usage: NativeUsage::default(),
         }
     }
 
-    pub(crate) fn decode(&mut self, event: &SseEvent) -> Result<Vec<ResponseChunk>, ProviderError> {
+    pub(crate) fn decode(&mut self, event: &SseEvent) -> Result<Vec<ResponseEvent>, ProviderError> {
         if self.stopped {
             return Err(protocol("event after message_stop"));
         }
@@ -298,7 +275,7 @@ impl Decoder {
         if kind == "ping" {
             return Ok(Vec::new());
         }
-        let mut chunks = Vec::new();
+        let mut events = Vec::new();
         if kind == "message_start" {
             if self.started {
                 return Err(protocol("duplicate message_start"));
@@ -307,8 +284,8 @@ impl Decoder {
             let usage = value
                 .get("message")
                 .and_then(|message| message.get("usage"));
-            self.push_usage(usage, &mut chunks)?;
-            return Ok(chunks);
+            self.push_usage(usage, &mut events)?;
+            return Ok(events);
         }
         // A stream without message_start is still decoded.
         self.started = true;
@@ -325,7 +302,7 @@ impl Decoder {
                     .clone();
                 let (block, started) = StreamingBlock::start(native, id)?;
                 self.blocks.insert(id, Block::Streaming(block));
-                chunks.extend(started);
+                events.extend(started);
             }
             "content_block_delta" => {
                 self.require_content_phase()?;
@@ -338,31 +315,35 @@ impl Decoder {
                         _ => None,
                     })
                     .ok_or_else(|| protocol(format!("delta for unopened or ended block {id}")))?;
-                let delta = value
+                let value = value
                     .get("delta")
                     .ok_or_else(|| protocol("missing content delta"))?;
-                let kind = delta.get("type").and_then(Value::as_str).unwrap_or("");
+                let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
                 match (block, kind) {
                     (StreamingBlock::Text(native), "text_delta")
                     | (StreamingBlock::Thinking(native), "thinking_delta") => {
                         let field = kind.trim_end_matches("_delta");
-                        let text = string(delta, field)?;
+                        let text = string(value, field)?;
                         append(native, field, text)?;
+                        let kind = if field == "text" {
+                            ItemKind::Text
+                        } else {
+                            ItemKind::Reasoning
+                        };
                         if !text.is_empty() {
-                            chunks.push(block_delta(id, ContentDelta::Text(text.into())));
+                            events.push(delta(block_ref(id), kind, text));
                         }
                     }
                     (StreamingBlock::Thinking(native), "signature_delta") => {
-                        append(native, "signature", string(delta, "signature")?)?;
+                        append(native, "signature", string(value, "signature")?)?;
                     }
                     (StreamingBlock::Tool { partial_json, .. }, "input_json_delta") => {
-                        let fragment = string(delta, "partial_json")?;
+                        let fragment = string(value, "partial_json")?;
                         partial_json
                             .get_or_insert_with(String::new)
                             .push_str(fragment);
                         if !fragment.is_empty() {
-                            chunks
-                                .push(block_delta(id, ContentDelta::JsonFragment(fragment.into())));
+                            events.push(delta(block_ref(id), ItemKind::ToolCall, fragment));
                         }
                     }
                     (StreamingBlock::Tool { unreadable, .. }, _) => *unreadable = true,
@@ -379,8 +360,7 @@ impl Decoder {
                 let Block::Streaming(streaming) = block else {
                     return Err(protocol(format!("stop for unopened or ended block {id}")));
                 };
-                *block = streaming.complete(&self.model)?;
-                chunks.extend(self.emit_completed_blocks(false)?);
+                *block = streaming.complete(&self.model, &self.scope)?;
             }
             "message_delta" => {
                 let reason = value
@@ -389,129 +369,94 @@ impl Decoder {
                     .and_then(Value::as_str);
                 // A reasonless delta only carries usage.
                 if let Some(reason) = reason {
-                    chunks = if self.message_delta {
-                        self.revise(reason)
+                    if self.message_delta {
+                        self.revise(reason);
                     } else {
-                        self.terminate(Some(reason))?
-                    };
+                        self.terminate(Some(reason))?;
+                    }
                 }
-                self.push_usage(value.get("usage"), &mut chunks)?;
+                self.push_usage(value.get("usage"), &mut events)?;
             }
             "message_stop" => {
                 if !self.message_delta {
-                    chunks.extend(self.terminate(None)?);
+                    self.terminate(None)?;
                 }
-                self.push_usage(value.get("usage"), &mut chunks)?;
-                chunks.push(self.end());
+                self.push_usage(value.get("usage"), &mut events)?;
+                events.push(self.end()?);
             }
             _ => {}
         }
-        Ok(chunks)
+        Ok(events)
     }
 
-    /// Settle the stop reason. Unknown or missing reasons discard tool calls.
-    fn terminate(&mut self, reason: Option<&str>) -> Result<Vec<ResponseChunk>, ProviderError> {
+    /// Settle the finish. Unknown or missing reasons cut tool calls; a normal finish
+    /// surfaces a tool input that never became a call.
+    fn terminate(&mut self, reason: Option<&str>) -> Result<(), ProviderError> {
         self.require_all_blocks_ended()?;
-        let stop_reason = match reason {
+        let finish = match reason {
             Some(reason) => classify_stop(reason),
-            None if self.blocks.values().any(Block::is_tool) => {
-                StopReason::Other("missing_stop_reason".into())
-            }
-            None => StopReason::EndTurn,
+            None if self.blocks.values().any(Block::is_tool) => Finish::Cut(CutReason::Incomplete),
+            None => Finish::Normal,
         };
-        let discard_tools = !stop_reason.authorizes_tools();
-        let mut chunks = Vec::new();
-        if discard_tools {
-            // Even syntactically complete inputs are unsafe on abnormal
-            // stops. Retract tools already emitted, as well as pending
-            // ones, before the response can be promoted for execution.
-            chunks = self.discard_tools();
-        } else {
+        if finish == Finish::Normal {
             for block in self.blocks.values() {
                 if let Block::PendingToolError(error) = block {
                     return Err(error.clone());
                 }
             }
         }
-        chunks.extend(self.emit_completed_blocks(discard_tools)?);
-        self.stop_reason = Some(stop_reason);
-        self.tools_discarded = discard_tools;
+        self.finish = Some(finish);
         self.message_delta = true;
-        Ok(chunks)
+        Ok(())
     }
 
-    /// A later abnormal reason retracts tool calls; nothing revives them.
-    fn revise(&mut self, reason: &str) -> Vec<ResponseChunk> {
-        let stop_reason = classify_stop(reason);
-        // Without tool calls the model already finished; the first reason stands.
-        if stop_reason.authorizes_tools()
-            || self.tools_discarded
-            || !self.blocks.values().any(Block::is_tool)
+    /// A later abnormal reason retracts tool calls; nothing revives them. Without
+    /// tool calls the model already finished, so the first reason stands.
+    fn revise(&mut self, reason: &str) {
+        if let (Some(Finish::Normal), cut @ Finish::Cut(_)) = (self.finish, classify_stop(reason))
+            && self.blocks.values().any(Block::is_tool)
         {
-            return Vec::new();
+            self.finish = Some(cut);
         }
-        self.tools_discarded = true;
-        self.stop_reason = Some(stop_reason);
-        self.discard_tools()
     }
 
-    fn discard_tools(&self) -> Vec<ResponseChunk> {
-        self.blocks
-            .iter()
-            .filter(|(_, block)| block.is_tool())
-            .map(|(id, _)| ResponseChunk::ItemDiscarded { id: id.to_string() })
-            .collect()
-    }
-
-    /// Only reached once `terminate` has settled the stop reason.
-    fn end(&mut self) -> ResponseChunk {
+    /// The completion in native index order. Only reached once `terminate` settled
+    /// the finish; a cut leaves out every tool call, complete or not.
+    fn end(&mut self) -> Result<ResponseEvent, ProviderError> {
         self.stopped = true;
-        ResponseChunk::ResponseEnded {
-            stop_reason: self.stop_reason.clone().expect("settled by terminate"),
-        }
-    }
-
-    fn emit_completed_blocks(
-        &mut self,
-        discard_tools: bool,
-    ) -> Result<Vec<ResponseChunk>, ProviderError> {
-        let mut chunks = Vec::new();
-        while let Some(block) = self
-            .blocks
-            .get_mut(&self.next_end)
-            .filter(|block| !matches!(block, Block::Streaming(_)))
-        {
-            if matches!(block, Block::Skipped) {
-                *block = Block::EmittedOther;
-            } else if discard_tools && block.is_tool() {
-                *block = Block::EmittedTool;
-            } else {
-                if matches!(block, Block::PendingToolError(_)) {
-                    // Keep index ordering while awaiting the terminal reason.
-                    break;
+        let finish = self.finish.expect("settled by terminate");
+        let mut items = Vec::new();
+        for (index, block) in std::mem::take(&mut self.blocks) {
+            let (id, position) = (item_id(index), position(index)?);
+            let item = match block {
+                Block::Completed(CompletedBlock::Text(text)) => AssistantItem::Text {
+                    id,
+                    position,
+                    blocks: single_block(index, text),
+                },
+                Block::Completed(CompletedBlock::Reasoning { text, replay }) => {
+                    AssistantItem::Reasoning {
+                        id,
+                        position,
+                        blocks: single_block(index, text),
+                        replay,
+                    }
                 }
-                let completed = std::mem::replace(block, Block::EmittedOther);
-                let (content, replay) = match completed {
-                    Block::Completed(CompletedBlock::Text(text)) => {
-                        (BlockContent::Text { text }, None)
-                    }
-                    Block::Completed(CompletedBlock::Reasoning { text, replay }) => {
-                        (BlockContent::Reasoning { text }, replay)
-                    }
-                    Block::Completed(CompletedBlock::Tool(call)) => {
-                        *block = Block::EmittedTool;
-                        (BlockContent::ToolCall(call), None)
-                    }
-                    _ => return Err(protocol("block was already emitted")),
-                };
-                chunks.extend(super::common::end_item(self.next_end, content, replay));
-            }
-            self.next_end = self
-                .next_end
-                .checked_add(1)
-                .ok_or_else(|| protocol("block index overflow"))?;
+                Block::Completed(CompletedBlock::Tool(call)) if finish == Finish::Normal => {
+                    AssistantItem::ToolCall { id, position, call }
+                }
+                // A pending tool error survives only into a cut: `terminate` raised it
+                // for a normal finish.
+                Block::Completed(CompletedBlock::Tool(_))
+                | Block::PendingToolError(_)
+                | Block::Skipped => continue,
+                Block::Streaming(_) => {
+                    return Err(protocol("message ended with open content blocks"));
+                }
+            };
+            items.push(item);
         }
-        Ok(chunks)
+        Ok(ResponseEvent::End(finish.complete(items)?))
     }
 
     fn require_content_phase(&self) -> Result<(), ProviderError> {
@@ -542,11 +487,11 @@ impl Decoder {
     fn push_usage(
         &mut self,
         value: Option<&Value>,
-        chunks: &mut Vec<ResponseChunk>,
+        events: &mut Vec<ResponseEvent>,
     ) -> Result<(), ProviderError> {
         if let Some(value) = value.filter(|value| value.is_object()) {
             let usage = self.update_usage(value)?;
-            chunks.push(ResponseChunk::UsageUpdated { usage });
+            events.push(ResponseEvent::Usage(usage));
         }
         Ok(())
     }
@@ -569,13 +514,13 @@ impl Decoder {
         })
     }
 
-    pub(crate) fn finish(&mut self) -> Result<Vec<ResponseChunk>, ProviderError> {
+    pub(crate) fn finish(&mut self) -> Result<Vec<ResponseEvent>, ProviderError> {
         if self.stopped {
             return Ok(Vec::new());
         }
         // Some proxies close the stream after the terminal message_delta.
         if self.message_delta {
-            return Ok(vec![self.end()]);
+            return Ok(vec![self.end()?]);
         }
         Err(protocol("unexpected EOF before message_stop"))
     }
@@ -584,7 +529,8 @@ impl Decoder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::protocol::{Message, ModelRequest, ResponseAssembler, ToolResult};
+    use crate::provider::backends::common::tests::{Reduced, reduce, scope};
+    use crate::provider::protocol::{Completion, Message, ModelRequest, Outcome, ToolResult};
     use serde_json::json;
 
     fn event(value: Value) -> SseEvent {
@@ -612,10 +558,10 @@ mod tests {
     }
 
     fn started() -> Decoder {
-        let mut decoder = Decoder::new("claude-test".into());
+        let mut decoder = Decoder::new("claude-test".into(), scope());
         let usage = usage(1);
-        let chunks = decoder.decode(&event(start())).unwrap();
-        assert_eq!(chunks, [ResponseChunk::UsageUpdated { usage }]);
+        let events = decoder.decode(&event(start())).unwrap();
+        assert_eq!(events, [ResponseEvent::Usage(usage)]);
         decoder
     }
 
@@ -651,20 +597,34 @@ mod tests {
         json!({"type":"tool_use", "id":id, "name":"inspect", "input":{}})
     }
 
-    fn decode(decoder: &mut Decoder, frames: Vec<Value>) -> Vec<ResponseChunk> {
-        let mut chunks = Vec::new();
+    fn decode(decoder: &mut Decoder, frames: Vec<Value>) -> Vec<ResponseEvent> {
+        let mut events = Vec::new();
         for frame in frames {
-            chunks.extend(decoder.decode(&event(frame)).unwrap());
+            events.extend(decoder.decode(&event(frame)).unwrap());
         }
-        chunks
+        events
     }
 
-    fn assembled(chunks: &[ResponseChunk]) -> ResponseAssembler {
-        let mut assembler = ResponseAssembler::default();
-        for chunk in chunks {
-            assembler.push(chunk).unwrap();
-        }
-        assembler
+    /// Decode a whole message and reduce it as the runtime would.
+    fn reduced(model: &str, frames: Vec<Value>) -> Reduced {
+        let mut decoder = Decoder::new(model.into(), scope());
+        let events = decode(&mut decoder, frames);
+        decoder.finish().unwrap();
+        reduce(events)
+    }
+
+    fn calls(reduced: &Reduced) -> Vec<(String, Value)> {
+        reduced
+            .items()
+            .iter()
+            .filter_map(AssistantItem::call)
+            .map(|call| {
+                (
+                    call.name().to_owned(),
+                    Value::Object(call.arguments().clone()),
+                )
+            })
+            .collect()
     }
 
     #[test]
@@ -708,7 +668,7 @@ mod tests {
         let native = json!({"type":"thinking", "thinking":"reason", "signature":"signed", "x-vendor":{"nested":[1,null,"opaque"]}});
         let (streaming, _) = StreamingBlock::start(native.clone(), 0).unwrap();
         let Block::Completed(CompletedBlock::Reasoning { text, replay }) =
-            streaming.complete("vendor-model").unwrap()
+            streaming.complete("vendor-model", &scope()).unwrap()
         else {
             panic!("reasoning completion required");
         };
@@ -722,7 +682,7 @@ mod tests {
         ] {
             let (streaming, _) = StreamingBlock::start(unsigned, 0).unwrap();
             let Block::Completed(CompletedBlock::Reasoning { text, replay }) =
-                streaming.complete("vendor-model").unwrap()
+                streaming.complete("vendor-model", &scope()).unwrap()
             else {
                 panic!("reasoning completion required");
             };
@@ -732,8 +692,8 @@ mod tests {
 
     #[test]
     fn text_lifecycle_preserves_initial_and_streamed_text_and_usage() {
-        let chunks = decode(
-            &mut Decoder::new("claude".into()),
+        let reduced = reduced(
+            "claude",
             vec![
                 start(),
                 block_start(0, json!({"type":"text","text":"hel"})),
@@ -743,17 +703,20 @@ mod tests {
                 message_stop(),
             ],
         );
-        let (items, usage, reason) = assembled(&chunks).finish().unwrap();
-        assert_eq!(items[0].id, "0");
-        assert_eq!(items[0].blocks[0].content.text_content(), Some("hello"));
-        assert_eq!((usage.output_tokens, reason), (7, StopReason::EndTurn));
+        // The initial text streams as a delta like any later fragment.
+        assert_eq!(reduced.streamed(ItemKind::Text), ["hello"]);
+        let item = &reduced.items()[0];
+        assert_eq!(item.id().as_str(), "0");
+        assert_eq!(item.text_content().as_deref(), Some("hello"));
+        assert_eq!(
+            (reduced.usage.output_tokens, reduced.completion.outcome()),
+            (7, Outcome::Answer)
+        );
     }
 
     #[test]
     fn signed_and_redacted_reasoning_tool_roundtrip_is_scoped() {
-        use crate::provider::backends::common::{
-            bind_reasoning_scope, filter_reasoning_scope, reasoning_scope,
-        };
+        use crate::provider::backends::common::{filter_reasoning_scope, reasoning_scope};
         let mut request = crate::provider::backends::common::tests::request("claude-test");
         let scope = reasoning_scope("anthropic", "https://api.example/v1/messages");
         let native = json!({"type":"thinking", "thinking":"original private text", "signature":"sig+/=",
@@ -762,8 +725,8 @@ mod tests {
             json!({"type":"redacted_thinking", "data":"encrypted+/=", "future_field":42});
         let tool =
             json!({"type":"tool_use", "id":"call_1", "name":"inspect", "input":{"path":"test"}});
-        let mut chunks = decode(
-            &mut Decoder::new(request.model.clone()),
+        let events = decode(
+            &mut Decoder::new(request.model.clone(), scope.clone()),
             vec![
                 start(),
                 block_start(
@@ -786,34 +749,25 @@ mod tests {
                 message_stop(),
             ],
         );
-        let streamed_thinking: String = chunks
-            .iter()
-            .filter_map(|chunk| match chunk {
-                ResponseChunk::BlockDelta {
-                    item,
-                    delta: ContentDelta::Text(text),
-                    ..
-                } if item == "0" => Some(text.as_str()),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(streamed_thinking, "original private text");
-        chunks
-            .iter_mut()
-            .for_each(|chunk| bind_reasoning_scope(chunk, &scope));
-        let (mut items, _, reason) = assembled(&chunks).finish().unwrap();
-        assert_eq!(reason, StopReason::ToolUse);
+        let reduced = reduce(events);
         assert_eq!(
-            items[0].blocks[0].content.reasoning_content(),
+            reduced.streamed(ItemKind::Reasoning),
+            ["original private text"]
+        );
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+        let mut items = reduced.items().to_vec();
+        assert_eq!(
+            items[0].reasoning_text().as_deref(),
             Some("original private text")
         );
-        assert_eq!(items[0].replay.as_ref().unwrap().payload, native);
-        assert_eq!(items[1].replay.as_ref().unwrap().payload, redacted);
+        assert_eq!(items[0].replay().unwrap().payload, native);
+        assert_eq!(items[1].replay().unwrap().payload, redacted);
         // UI summaries are not authoritative signed thinking and must never be
         // used to reconstruct the native payload, even after persistence.
-        items[0].blocks[0].content = BlockContent::Reasoning {
-            text: "display summary only".into(),
+        let AssistantItem::Reasoning { blocks, .. } = &mut items[0] else {
+            panic!("signed thinking is a reasoning item")
         };
+        blocks[0].text = "display summary only".into();
         request.history.push(Message::Assistant(items));
         request.history.push(Message::Tool(vec![ToolResult {
             call_id: "call_1".into(),
@@ -845,10 +799,10 @@ mod tests {
             };
             assert_eq!(items.len(), 3);
             assert_eq!(
-                items[0].blocks[0].content.reasoning_content(),
+                items[0].reasoning_text().as_deref(),
                 Some("display summary only")
             );
-            assert!(items[0].replay.is_none());
+            assert!(items[0].replay().is_none());
             assert_eq!(assistant(&foreign), json!([tool]));
         }
         let mut foreign = original.clone();
@@ -858,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_tools_are_finalized_in_native_index_order() {
+    fn interleaved_tools_are_completed_in_native_index_order() {
         let mut decoder = started();
         decode(
             &mut decoder,
@@ -867,22 +821,27 @@ mod tests {
                 block_start(0, tool_use("call-0")),
             ],
         );
-        let chunks = decode(&mut decoder, vec![json_delta(1, "{\"x\":1}")]);
+        let events = decode(&mut decoder, vec![json_delta(1, "{\"x\":1}")]);
         assert_eq!(
-            chunks,
-            [ResponseChunk::BlockDelta {
-                item: "1".into(),
-                block: "0".into(),
-                delta: ContentDelta::JsonFragment("{\"x\":1}".into())
-            }]
+            events,
+            [crate::provider::backends::common::delta(
+                block_ref(1),
+                ItemKind::ToolCall,
+                "{\"x\":1}"
+            )]
         );
-        assert!(decode(&mut decoder, vec![stop(1)]).is_empty());
-        let chunks = decode(&mut decoder, vec![stop(0)]);
-        assert_eq!(chunks.len(), 4);
-        assert!(matches!(&chunks[0],ResponseChunk::BlockEnded { item, .. } if item == "0"));
-        assert!(
-            matches!(&chunks[2],ResponseChunk::BlockEnded { item, content:BlockContent::ToolCall(call), .. } if item == "1" && Value::Object(call.arguments().clone()) == json!({"x":1}))
-        );
+        // Block ends emit nothing: the completion carries the calls.
+        assert!(decode(&mut decoder, vec![stop(1), stop(0)]).is_empty());
+        let events = decode(&mut decoder, vec![terminal("tool_use", 3), message_stop()]);
+        decoder.finish().unwrap();
+        let reduced = reduce(events);
+        let ids: Vec<_> = reduced
+            .items()
+            .iter()
+            .map(|item| (item.id().as_str(), item.call().unwrap().id()))
+            .collect();
+        assert_eq!(ids, [("0", "call-0"), ("1", "call-1")]);
+        assert_eq!(calls(&reduced)[1].1, json!({"x":1}));
     }
 
     #[test]
@@ -896,17 +855,17 @@ mod tests {
         for (reason, expected, input, tool_first) in [
             (
                 "max_tokens",
-                StopReason::MaxTokens,
+                CutReason::MaxTokens,
                 r#"{"path":"part"#,
                 false,
             ),
             (
                 "model_context_window_exceeded",
-                StopReason::MaxTokens,
+                CutReason::MaxTokens,
                 r#"{"path":"complete"}"#,
                 true,
             ),
-            ("refusal", StopReason::ContentFilter, "[]", false),
+            ("refusal", CutReason::Refusal, "[]", false),
         ] {
             let (tool, reasoning) = if tool_first { (0, [1, 2]) } else { (2, [0, 1]) };
             let mut frames = vec![start()];
@@ -927,17 +886,17 @@ mod tests {
                 frames.push(stop(index));
             }
             frames.extend([terminal(reason, 19), message_stop()]);
-            let mut decoder = Decoder::new("claude-test".into());
-            let chunks = decode(&mut decoder, frames);
-            decoder.finish().unwrap();
-            assert!(chunks.contains(&ResponseChunk::ItemDiscarded {
-                id: tool.to_string()
-            }));
-            let (items, actual_usage, stop_reason) = assembled(&chunks).finish().unwrap();
-            assert_eq!((stop_reason, actual_usage), (expected.clone(), usage(19)));
-            let payloads: Vec<_> = items
+            let reduced = reduced("claude-test", frames);
+            assert_eq!(
+                (reduced.completion.outcome(), reduced.usage),
+                (Outcome::Cut(expected), usage(19))
+            );
+            // The tool streamed its input but never became a call.
+            assert!(!reduced.streamed(ItemKind::ToolCall).is_empty());
+            let payloads: Vec<_> = reduced
+                .items()
                 .iter()
-                .map(|item| (item.kind, &item.replay.as_ref().unwrap().payload))
+                .map(|item| (item.kind(), &item.replay().unwrap().payload))
                 .collect();
             assert_eq!(
                 payloads,
@@ -967,7 +926,7 @@ mod tests {
 
     #[test]
     fn truncated_streams_fail_eof_after_a_terminal_delta_ends_and_ping_is_a_noop() {
-        let mut absent = Decoder::new("model".into());
+        let mut absent = Decoder::new("model".into(), scope());
         assert!(decode(&mut absent, vec![json!({"type":"ping"})]).is_empty());
         assert!(absent.finish().is_err());
         for frames in [
@@ -982,9 +941,7 @@ mod tests {
         decode(&mut closed, vec![terminal("end_turn", 1)]);
         assert_eq!(
             closed.finish().unwrap(),
-            [ResponseChunk::ResponseEnded {
-                stop_reason: StopReason::EndTurn
-            }]
+            [ResponseEvent::End(Completion::answer(Vec::new()).unwrap())]
         );
         let mut complete = started();
         decode(&mut complete, vec![terminal("end_turn", 1), message_stop()]);
@@ -1006,24 +963,10 @@ mod tests {
             terminal("tool_use", 79),
             message_stop(),
         ];
-        let mut decoder = Decoder::new("model-a".into());
-        let chunks = decode(&mut decoder, frames);
-        decoder.finish().unwrap();
-        let (items, _, stop_reason) = assembled(&chunks).finish().unwrap();
-        assert_eq!(stop_reason, StopReason::ToolUse);
-        let calls: Vec<_> = items
-            .iter()
-            .flat_map(|item| &item.blocks)
-            .filter_map(|block| match &block.content {
-                BlockContent::ToolCall(call) => Some((
-                    call.name().to_owned(),
-                    Value::Object(call.arguments().clone()),
-                )),
-                _ => None,
-            })
-            .collect();
+        let reduced = reduced("model-a", frames);
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
         assert_eq!(
-            calls,
+            calls(&reduced),
             [
                 ("inspect".to_owned(), json!({"cmd":"ls -la /tmp"})),
                 ("inspect".to_owned(), json!({}))
@@ -1057,25 +1000,26 @@ mod tests {
             json!({"type":"message_delta", "delta":{}, "usage":{"output_tokens":4}}),
             message_stop(),
         ];
-        let mut decoder = Decoder::new("model-a".into());
-        let chunks = decode(&mut decoder, frames);
-        decoder.finish().unwrap();
-        let (items, usage, stop_reason) = assembled(&chunks).finish().unwrap();
-        assert_eq!(stop_reason, StopReason::Other("pause_for_vendor".into()));
-        assert_eq!((usage.input_tokens, usage.output_tokens), (3, 5));
-        assert_eq!(items.len(), 1);
+        let reduced = reduced("model-a", frames);
         assert_eq!(
-            items[0].blocks[0].content,
-            BlockContent::Text { text: "hi".into() }
+            reduced.completion.outcome(),
+            Outcome::Cut(CutReason::Incomplete)
         );
+        assert_eq!(
+            (reduced.usage.input_tokens, reduced.usage.output_tokens),
+            (3, 5)
+        );
+        let items = reduced.items();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].text_content().as_deref(), Some("hi"));
     }
 
     #[test]
     fn only_a_normal_final_stop_reason_keeps_tools() {
         let usage_only = json!({"type":"message_delta", "delta":{"stop_reason":null},
             "usage":{"output_tokens":2}});
-        let max_tokens = Some(StopReason::MaxTokens);
-        for (tail, stop_reason, discarded) in [
+        let max_tokens = Some(Outcome::Cut(CutReason::MaxTokens));
+        for (tail, outcome, discarded) in [
             (vec![], None, true),
             (
                 vec![json!({"type":"message_delta", "delta":{}})],
@@ -1095,7 +1039,7 @@ mod tests {
                     usage_only,
                     terminal("max_tokens", 9),
                 ],
-                max_tokens.clone(),
+                max_tokens,
                 true,
             ),
             // A later abnormal reason retracts tools.
@@ -1116,16 +1060,13 @@ mod tests {
             ];
             frames.extend(tail.clone());
             frames.push(message_stop());
-            let mut decoder = Decoder::new("model-a".into());
-            let chunks = decode(&mut decoder, frames);
-            decoder.finish().unwrap();
-            let discard = ResponseChunk::ItemDiscarded { id: "0".into() };
-            assert_eq!(chunks.contains(&discard), discarded, "{tail:?}");
-            if stop_reason.is_some() {
-                assert_eq!(decoder.stop_reason, stop_reason, "{tail:?}");
+            let reduced = reduced("model-a", frames);
+            let actual = reduced.completion.outcome();
+            assert_eq!(matches!(actual, Outcome::Cut(_)), discarded, "{tail:?}");
+            if let Some(outcome) = outcome {
+                assert_eq!(actual, outcome, "{tail:?}");
             }
-            let tools = assembled(&chunks).finish().unwrap().0;
-            let tools = tools.iter().filter(|item| item.kind == ItemKind::ToolCall);
+            let tools = reduced.items().iter().filter(|item| item.call().is_some());
             assert_eq!(tools.count(), usize::from(!discarded), "{tail:?}");
         }
     }
@@ -1139,7 +1080,10 @@ mod tests {
                 "message":"Overloaded, retry with Bearer abc.def"}}),
             ))
             .unwrap_err();
-        assert_eq!(error.kind, ProviderErrorKind::Response);
+        assert_eq!(
+            error.kind,
+            ProviderErrorKind::Unavailable { retry_after: None }
+        );
         assert_eq!(
             error.message,
             "Anthropic overloaded_error: Overloaded, retry with Bearer abc.def"
@@ -1161,22 +1105,24 @@ mod tests {
                 message_stop(),
             ]
         };
-        let mut decoder = Decoder::new("model-a".into());
+        let mut decoder = Decoder::new("model-a".into(), scope());
         let result: Result<Vec<_>, _> = frames("tool_use")
             .into_iter()
             .map(|frame| decoder.decode(&event(frame)))
             .collect();
         assert!(result.is_err());
-        let mut decoder = Decoder::new("model-a".into());
-        let chunks = decode(&mut decoder, frames("max_tokens"));
-        assert!(chunks.contains(&ResponseChunk::ItemDiscarded { id: "0".into() }));
+        let reduced = reduced("model-a", frames("max_tokens"));
+        assert_eq!(
+            reduced.completion.outcome(),
+            Outcome::Cut(CutReason::MaxTokens)
+        );
+        assert!(reduced.items().is_empty());
     }
 
     #[test]
     fn a_later_abnormal_reason_does_not_revise_a_text_response() {
-        let mut decoder = Decoder::new("model-a".into());
-        decode(
-            &mut decoder,
+        let reduced = reduced(
+            "model-a",
             vec![
                 start(),
                 block_start(0, json!({"type":"text","text":"partial"})),
@@ -1186,6 +1132,10 @@ mod tests {
                 message_stop(),
             ],
         );
-        assert_eq!(decoder.stop_reason, Some(StopReason::EndTurn));
+        assert_eq!(reduced.completion.outcome(), Outcome::Answer);
+        assert_eq!(
+            reduced.items()[0].text_content().as_deref(),
+            Some("partial")
+        );
     }
 }

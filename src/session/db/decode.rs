@@ -14,8 +14,9 @@ use crate::{
     provider::{
         profile::ModelProfile,
         protocol::{
-            AssistantBlock, AssistantItem, BlockContent, Message, ReplayEnvelope, ResponseSchema,
-            StopReason, SystemSegment, ToolCall, ToolDefinition, ToolResult, Usage, UserContent,
+            AssistantItem, CutReason, ItemId, ItemKind, Message, Outcome, Position, Provenance,
+            Replay, ResponseSchema, SystemSegment, TextBlock, ToolCall, ToolDefinition, ToolResult,
+            Usage, UserContent,
         },
     },
     session::{
@@ -33,6 +34,15 @@ pub(in crate::session) fn parse_variant<T: DeserializeOwned>(text: String) -> Db
 
 fn parse_json<T: DeserializeOwned>(text: &str) -> DbResult<T> {
     serde_json::from_str(text).map_err(|error| corrupt(error.to_string()))
+}
+
+/// A nonblank identity newtype (`ItemId`, `BlockId`, `Scope`) from its column.
+fn parsed<T>(text: String) -> DbResult<T>
+where
+    T: TryFrom<String>,
+    T::Error: std::fmt::Display,
+{
+    T::try_from(text).map_err(|error| corrupt(error.to_string()))
 }
 
 #[cfg(unix)]
@@ -94,20 +104,17 @@ type UserPart = (
     Option<String>,
     Option<String>,
 );
-/// position, provider id, text, tool call (id, name, arguments)
-type Block = (
-    i64,
-    String,
-    Option<String>,
-    Option<(String, String, String)>,
-);
+/// position, provider id, text
+type Block = (i64, String, String);
 
 struct Messages {
     roles: HashMap<i64, String>,
     parts: HashMap<i64, Vec<UserPart>>,
     items: HashMap<i64, Vec<(i64, i64, String, String)>>,
-    replays: HashMap<i64, ReplayEnvelope>,
+    replays: HashMap<i64, Replay>,
     blocks: HashMap<i64, Vec<Block>>,
+    /// call id, name, arguments
+    calls: HashMap<i64, (String, String, String)>,
     /// call id, name, result, is_error
     results: HashMap<i64, (String, String, String, bool)>,
     images: HashMap<i64, Vec<ImageRef>>,
@@ -129,11 +136,10 @@ fn image(row: &Row, at: i32) -> DbResult<ImageRef> {
     })
 }
 
-fn call(row: &Row, at: i32) -> DbResult<Option<(String, String, String)>> {
-    Ok(match row.get::<Option<String>>(at)? {
-        Some(id) => Some((id, row.get(at + 1)?, row.get(at + 2)?)),
-        None => None,
-    })
+fn position(value: i64) -> DbResult<Position> {
+    u32::try_from(value)
+        .map(Position::from)
+        .map_err(|_| corrupt("position does not fit"))
 }
 
 impl Messages {
@@ -161,30 +167,34 @@ impl Messages {
             )?,
             replays: keyed(
                 db,
-                "SELECT item, version, protocol, model, scope, payload, conversation_bound \
-                 FROM reasoning_replay",
+                "SELECT item, protocol, model, scope, payload, binding FROM reasoning_replay",
                 |row| {
-                    Ok(ReplayEnvelope {
-                        version: row.get(1)?,
-                        protocol: row.get(2)?,
-                        model: row.get(3)?,
-                        scope: row.get(4)?,
-                        payload: parse_json(&row.get::<String>(5)?)?,
-                        conversation_bound: row.get(6)?,
+                    Ok(Replay {
+                        provenance: Provenance {
+                            protocol: row.get(1)?,
+                            model: row.get(2)?,
+                            scope: parsed(row.get(3)?)?,
+                        },
+                        payload: parse_json(&row.get::<String>(4)?)?,
+                        binding: parse_variant(row.get(5)?)?,
                     })
                 },
             )?,
             blocks: grouped(
                 db,
-                "SELECT b.item, b.position, b.provider_id, b.text, c.call_id, c.name, c.arguments \
-                 FROM assistant_block b LEFT JOIN tool_call c ON c.block = b.id \
-                 ORDER BY b.item, b.position",
-                |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, call(row, 4)?)),
+                "SELECT item, position, provider_id, text FROM assistant_block \
+                 ORDER BY item, position",
+                |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?)),
+            )?,
+            calls: keyed(
+                db,
+                "SELECT item, call_id, name, arguments FROM tool_call",
+                |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?)),
             )?,
             results: keyed(
                 db,
                 "SELECT r.message, c.call_id, c.name, r.result, r.is_error FROM tool_result r \
-                 JOIN tool_call c ON c.block = r.call",
+                 JOIN tool_call c ON c.item = r.call",
                 |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
             )?,
             images: grouped(
@@ -234,41 +244,51 @@ impl Messages {
             }
             "assistant" => {
                 let mut items = Vec::new();
-                for (item, position, provider_id, kind) in self.items.get(&id).into_iter().flatten()
+                for (item, item_position, provider_id, kind) in
+                    self.items.get(&id).into_iter().flatten()
                 {
-                    let mut blocks = Vec::new();
-                    for (block_position, block_id, text, call) in
-                        self.blocks.get(item).into_iter().flatten()
-                    {
-                        let content = match (kind.as_str(), text, call) {
-                            ("text", Some(text), None) => BlockContent::Text { text: text.clone() },
-                            ("reasoning", Some(text), None) => {
-                                BlockContent::Reasoning { text: text.clone() }
-                            }
-                            ("tool_call", None, Some((call_id, name, arguments))) => {
-                                BlockContent::ToolCall(
-                                    ToolCall::new(
-                                        call_id.clone(),
-                                        name.clone(),
-                                        parse_json(arguments)?,
-                                    )
-                                    .map_err(|error| corrupt(error.to_string()))?,
+                    let id: ItemId = parsed(provider_id.clone())?;
+                    let position = position(*item_position)?;
+                    let blocks = || {
+                        self.blocks
+                            .get(item)
+                            .into_iter()
+                            .flatten()
+                            .map(|(block_position, block_id, text)| {
+                                Ok(TextBlock {
+                                    id: parsed(block_id.clone())?,
+                                    position: self::position(*block_position)?,
+                                    text: text.clone(),
+                                })
+                            })
+                            .collect::<DbResult<Vec<_>>>()
+                    };
+                    let kind: ItemKind = parse_variant(kind.clone())?;
+                    items.push(match (kind, self.calls.get(item)) {
+                        (ItemKind::Text, None) => AssistantItem::Text {
+                            id,
+                            position,
+                            blocks: blocks()?,
+                        },
+                        (ItemKind::Reasoning, None) => AssistantItem::Reasoning {
+                            id,
+                            position,
+                            blocks: blocks()?,
+                            replay: self.replays.get(item).cloned(),
+                        },
+                        (ItemKind::ToolCall, Some((call_id, name, arguments))) => {
+                            AssistantItem::ToolCall {
+                                id,
+                                position,
+                                call: ToolCall::new(
+                                    call_id.clone(),
+                                    name.clone(),
+                                    parse_json(arguments)?,
                                 )
+                                .map_err(|error| corrupt(error.to_string()))?,
                             }
-                            _ => return Err(corrupt("assistant block does not match its item")),
-                        };
-                        blocks.push(AssistantBlock {
-                            id: block_id.clone(),
-                            position: usize::try_from(*block_position).unwrap_or_default(),
-                            content,
-                        });
-                    }
-                    items.push(AssistantItem {
-                        id: provider_id.clone(),
-                        position: usize::try_from(*position).unwrap_or_default(),
-                        kind: parse_variant(kind.clone())?,
-                        blocks,
-                        replay: self.replays.get(item).cloned(),
+                        }
+                        _ => return Err(corrupt("assistant item does not match its rows")),
                     });
                 }
                 Message::Assistant(items)
@@ -684,7 +704,7 @@ pub(in crate::session) fn decode_records(
         }
     );
     load!(
-        "SELECT r.entry, a.request, a.attempt, m.entry, r.stop_reason, r.stop_other \
+        "SELECT r.entry, a.request, a.attempt, m.entry, r.outcome, r.cut_reason \
          FROM model_response r JOIN attempt_outcome o ON o.entry = r.entry \
          JOIN model_attempt a ON a.entry = o.attempt \
          LEFT JOIN message_commit m ON m.message = r.message",
@@ -692,9 +712,14 @@ pub(in crate::session) fn decode_records(
             request: row.get(1)?,
             attempt: row.get(2)?,
             message: row.get(3)?,
-            stop_reason: match (row.get::<String>(4)?, row.get(5)?) {
-                (reason, Some(other)) if reason == "other" => StopReason::Other(other),
-                (reason, _) => parse_variant(reason)?,
+            outcome: match (
+                row.get::<String>(4)?.as_str(),
+                row.get::<Option<String>>(5)?
+            ) {
+                ("answer", None) => Outcome::Answer,
+                ("tool_use", None) => Outcome::ToolUse,
+                ("cut", Some(reason)) => Outcome::Cut(parse_variant::<CutReason>(reason)?),
+                _ => return Err(corrupt("response outcome does not match its cut reason")),
             },
         }
     );
@@ -748,9 +773,8 @@ pub(in crate::session) fn decode_records(
          j.role, j.arguments, j.output_schema, j.accepts_input, j.background, t.name, \
          j.location_workspace, j.authorization_scope FROM job j \
          JOIN target t ON t.id = j.location_target \
-         LEFT JOIN tool_call c ON c.block = j.origin_call \
-         LEFT JOIN assistant_block b ON b.id = c.block \
-         LEFT JOIN assistant_item i ON i.id = b.item \
+         LEFT JOIN tool_call c ON c.item = j.origin_call \
+         LEFT JOIN assistant_item i ON i.id = c.item \
          LEFT JOIN message_commit m ON m.message = i.message",
         |row| {
             let origin = match (row.get::<Option<i64>>(3)?, row.get(4)?, row.get(5)?) {

@@ -5,13 +5,14 @@ mod request;
 mod response;
 
 pub use message::{
-    AssistantBlock, AssistantContent, AssistantItem, BlockContent, BlockKind, ItemKind, Message,
-    ReplayEnvelope, ToolCall, ToolCallError, ToolResult, UserContent, visible_text,
+    AssistantItem, Binding, BlankId, BlankScope, BlockId, ItemId, ItemKind, Message, Position,
+    PositionOverflow, Provenance, Replay, Scope, TextBlock, ToolCall, ToolCallError, ToolResult,
+    UserContent, visible_text,
 };
-pub use request::{HistoryLifetime, ModelRequest, ResponseSchema, SystemSegment, ToolDefinition};
-#[cfg(test)]
-pub use response::events_for_content;
+pub use request::{
+    ContextId, HistoryLifetime, ModelRequest, ResponseSchema, SystemSegment, ToolDefinition,
+};
 pub use response::{
-    BlockSnapshot, ContentDelta, ItemSnapshot, ResponseAssembler, ResponseChunk, ResponseEvent,
-    ResponseSnapshot, StopReason, Usage,
+    BlockRef, Completion, CompletionError, CutReason, LiveBlock, LiveResponse, Outcome,
+    ResponseEvent, Step, Usage,
 };

@@ -1,9 +1,9 @@
 //! Live response cards, reasoning expansion, and stable native block identities.
 
 use super::{AgentDisplayState, Entry, EntryKey, Projection, Surface, View};
-use skyhook::agent::{AgentActivity, LiveResponse, ObservationSnapshot};
+use skyhook::agent::{AgentActivity, ObservationSnapshot, ObservedResponse};
 use skyhook::identity::AgentId;
-use skyhook::provider::protocol::BlockKind;
+use skyhook::provider::protocol::ItemKind;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReasoningStatus {
@@ -112,7 +112,7 @@ pub(super) fn live_tail_response<'a>(
     projection: &Projection,
     agent: &AgentId,
     request: u64,
-) -> Option<&'a LiveResponse> {
+) -> Option<&'a ObservedResponse> {
     snapshot
         .responses
         .get(&(agent.clone(), request))
@@ -125,7 +125,7 @@ pub(super) fn live_tail_responses<'a>(
     snapshot: &'a ObservationSnapshot,
     projection: &Projection,
     agent: &AgentId,
-) -> Vec<(u64, &'a LiveResponse)> {
+) -> Vec<(u64, &'a ObservedResponse)> {
     let mut responses: Vec<_> = snapshot
         .responses
         .keys()
@@ -141,52 +141,51 @@ pub(super) fn live_tail_responses<'a>(
 
 pub(super) fn response_entries(
     request: u64,
-    response: &LiveResponse,
+    response: &ObservedResponse,
     view: &View,
     agent_name: &str,
 ) -> Vec<Entry> {
     let mut entries = Vec::new();
-    for item in response.snapshot().items {
-        for block in item.blocks {
-            match block.kind {
-                BlockKind::Reasoning if !block.text.trim().is_empty() => {
-                    // A block ends independently of its item and of answer text.
-                    let running = !response.settled && !block.ended;
-                    let entry = reasoning_entry(
-                        reasoning_key(request, &item.id, &block.id),
-                        &block.text,
-                        view,
-                        if running {
-                            ReasoningStatus::Running
-                        } else if response.error.is_some() {
-                            ReasoningStatus::Incomplete
-                        } else {
-                            ReasoningStatus::Complete
-                        },
-                    );
-                    entries.push(entry);
-                }
-                BlockKind::Text if !block.text.trim().is_empty() => {
-                    entries.push(Entry::new(
-                        response_block_key(request, &item.id, &block.id),
-                        format!(
-                            "{}\n{}",
-                            if response.error.is_some() {
-                                "Incomplete response"
-                            } else {
-                                agent_name
-                            },
-                            block.text,
-                        ),
-                        if response.error.is_some() {
-                            Surface::Error
-                        } else {
-                            Surface::Agent
-                        },
-                    ));
-                }
-                _ => {}
+    for block in response.blocks() {
+        let (item, id) = (block.block.item.as_str(), block.block.block.as_str());
+        match block.kind {
+            ItemKind::Reasoning if !block.text.trim().is_empty() => {
+                // Reasoning keeps streaming until a later block takes over or the
+                // response ends.
+                let entry = reasoning_entry(
+                    reasoning_key(request, item, id),
+                    &block.text,
+                    view,
+                    if response.streaming(block) {
+                        ReasoningStatus::Running
+                    } else if response.error.is_some() {
+                        ReasoningStatus::Incomplete
+                    } else {
+                        ReasoningStatus::Complete
+                    },
+                );
+                entries.push(entry);
             }
+            ItemKind::Text if !block.text.trim().is_empty() => {
+                entries.push(Entry::new(
+                    response_block_key(request, item, id),
+                    format!(
+                        "{}\n{}",
+                        if response.error.is_some() {
+                            "Incomplete response"
+                        } else {
+                            agent_name
+                        },
+                        block.text,
+                    ),
+                    if response.error.is_some() {
+                        Surface::Error
+                    } else {
+                        Surface::Agent
+                    },
+                ));
+            }
+            _ => {}
         }
     }
     entries
@@ -196,32 +195,13 @@ pub(super) fn response_entries(
 mod tests {
     use super::super::tests::{response as apply, root};
     use super::*;
-    use skyhook::provider::protocol::{BlockContent, ItemKind, ResponseEvent};
+    use skyhook::provider::protocol::{AssistantItem, Completion, ResponseEvent};
 
-    fn response(text: &str) -> LiveResponse {
+    fn response(text: &str) -> ObservedResponse {
         let agent = root(1);
         let mut snapshot = ObservationSnapshot::default();
-        let (item, block) = (String::from("text"), String::from("block"));
-        for event in [
-            ResponseEvent::ItemStarted {
-                id: item.clone(),
-                position: 0,
-                kind: ItemKind::Text,
-            },
-            ResponseEvent::BlockStarted {
-                item: item.clone(),
-                id: block.clone(),
-                position: 0,
-                kind: BlockKind::Text,
-            },
-            ResponseEvent::BlockEnded {
-                item,
-                block,
-                content: BlockContent::Text { text: text.into() },
-            },
-        ] {
-            apply(&mut snapshot, &agent, 4, event);
-        }
+        let ended = Completion::answer(vec![AssistantItem::text("text", 0, text)]).unwrap();
+        apply(&mut snapshot, &agent, 4, ResponseEvent::End(ended));
         snapshot.responses.remove(&(agent, 4)).unwrap()
     }
 
@@ -256,7 +236,7 @@ mod tests {
 
     #[test]
     fn text_visibility_preserves_whitespace_and_failed_response_attribution() {
-        let rows = |live: &LiveResponse| response_entries(4, live, &View::default(), "Agent");
+        let rows = |live: &ObservedResponse| response_entries(4, live, &View::default(), "Agent");
         for text in ["", "\n\n", "  "] {
             assert!(rows(&response(text)).is_empty());
         }

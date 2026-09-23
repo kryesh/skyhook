@@ -3,7 +3,7 @@
 use super::{HarnessError, compaction};
 use crate::{
     identity::{AgentId, JobId},
-    provider::protocol::{BlockContent, Message},
+    provider::protocol::Message,
     session::{EventRecord, ModelCallOrigin, SessionEvent},
 };
 use std::collections::BTreeSet;
@@ -86,9 +86,11 @@ pub(super) fn retained_sources<'a>(
                 "active job creator is not an assistant message".into(),
             ));
         };
-        if !blocks.iter().flat_map(|item| &item.blocks).any(
-            |block| matches!(&block.content, BlockContent::ToolCall(call) if call.id() == origin.call_id),
-        ) {
+        if !blocks
+            .iter()
+            .filter_map(|item| item.call())
+            .any(|call| call.id() == origin.call_id)
+        {
             return Err(HarnessError::Compaction(
                 "active job creator call is missing".into(),
             ));
@@ -109,14 +111,7 @@ pub(super) fn retained_sources<'a>(
                 _ => &[],
             })
             .collect();
-        for call in blocks
-            .iter()
-            .flat_map(|item| &item.blocks)
-            .filter_map(|block| match &block.content {
-                BlockContent::ToolCall(call) => Some(call),
-                _ => None,
-            })
-        {
+        for call in blocks.iter().filter_map(|item| item.call()) {
             if !results.iter().any(|result| result.call_id == call.id()) {
                 return Err(HarnessError::Compaction(
                     "active job exchange has an unmatched tool call".into(),
@@ -196,7 +191,7 @@ pub(super) fn included_message_jobs(message: &Message, jobs: &mut BTreeSet<JobId
 mod tests {
     use super::*;
     use crate::provider::protocol::{
-        AssistantContent, ReplayEnvelope, ToolCall, ToolResult, UserContent,
+        AssistantItem, Binding, Provenance, Replay, Scope, ToolCall, ToolResult, UserContent,
     };
     use serde_json::json;
 
@@ -222,21 +217,20 @@ mod tests {
     fn active_exchange_retains_complete_reasoning_bundle_outside_visible_tail() {
         let agent = AgentId::root(crate::identity::SessionId::from_bytes([0; 16]));
         for protocol in ["chat_completions", "responses", "anthropic"] {
-            let replay = ReplayEnvelope {
-                version: 1,
-                protocol: protocol.into(),
-                model: "model".into(),
-                scope: "scope".into(),
+            let replay = Replay {
+                provenance: Provenance {
+                    protocol: protocol.into(),
+                    model: "model".into(),
+                    scope: Scope::try_from("scope".to_owned()).unwrap(),
+                },
                 payload: json!({"opaque":"must survive", "signature":"signed"}),
-                conversation_bound: false,
+                binding: Binding::Free,
             };
             let reasoning =
-                AssistantContent::reasoning("reason", 0, "visible reasoning", Some(replay));
+                AssistantItem::reasoning("reason", 0, "visible reasoning", Some(replay));
             let call = ToolCall::new("call", "agent", json!({"prompt":"continue"})).unwrap();
-            let exchange = Message::Assistant(vec![
-                reasoning,
-                AssistantContent::tool_call("tool", 1, call),
-            ]);
+            let exchange =
+                Message::Assistant(vec![reasoning, AssistantItem::tool_call("tool", 1, call)]);
             let results = Message::Tool(vec![ToolResult {
                 call_id: "call".into(),
                 name: "agent".into(),

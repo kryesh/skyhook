@@ -49,7 +49,8 @@ boundary. Apply updates to the snapshot in revision order with `ObservationSnaps
 It contains:
 
 - Durable records keyed by their original journal sequence.
-- Request-scoped live responses keyed by agent and logical request, with assembler snapshots.
+- Request-scoped live responses keyed by agent and logical request: their streamed blocks in
+  arrival order, then the authoritative blocks once the response has ended.
 - Current agent activity and context-usage estimates.
 
 Live response deltas are provisional, not additional committed messages. A new attempt of the
@@ -121,9 +122,9 @@ or authentication headers:
 
 - `model_context` stores a `ModelContext`: the purpose, named model-profile snapshot, assembled
   system segments (including harness instructions and location), tool descriptions and schemas,
-  and optional response schema. Its `template(agent)` derives the history-free `ModelRequest`,
-  including the model ID, reasoning setting, output limit, and agent correlation identity. Context
-  records describe request settings, not the lifetime of a `ProviderContext` resource.
+  and optional response schema. Its `template()` derives the history-free `ModelRequest`,
+  including the model ID, reasoning setting, and output limit. Context records describe request
+  settings, not the lifetime of a `ProviderContext` resource.
 - `model_requested` identifies one frozen logical request before its first invocation. It references
   the context record and stores `history` as ordered source-event sequences, `tail` as exact inline
   messages, `history_lifetime`, and purpose. Retries refer back to this request using

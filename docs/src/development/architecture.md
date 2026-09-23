@@ -25,12 +25,13 @@ select machines and workspaces; tools still operate on those machines' files.
 
 ## Provider boundary and lifetime
 
-`provider::Provider` is a shared factory. `open_context(correlation)` creates an independently
-owned `ProviderContext` without making a model request; `invoke(&mut self, request)` returns
-owned startup work and then an owned asynchronous response stream. Neither borrows the context.
-The request's correlation must match the context's identity. Custom providers implement both
-traits; native adapters and codecs live under `provider::backends`, while shared request,
-message, and response types live under `provider::protocol`.
+`provider::Provider` is a shared factory. `open_context(id)` creates an independently owned
+`ProviderContext` for one conversation without making a model request; `invoke(&mut self,
+request)` returns an owned asynchronous response stream that does not borrow the context. A
+startup failure is the stream's first and only item. Backends may send the context identity as
+cache-affinity metadata. Custom providers implement both traits; native adapters and codecs
+live under `provider::backends`, while shared request, message, and response types live under
+`provider::protocol`.
 
 The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context
@@ -38,7 +39,7 @@ for later input; resources are released when that loop exits. A model-profile ch
 its replacement before committing the selection, preserves journal history, and resets token
 calibration. Equivalent profiles keep the current context. A mode change also replaces the
 prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
-context under the same agent correlation identity.
+context under the same context identity.
 
 Providers receive complete provider-neutral requests; they do not privately replay failed
 submissions. A `response_schema` must be transmitted as a structured-output constraint or
@@ -58,16 +59,12 @@ conversation, which matters for reasoning bound to that conversation.
 
 `history_lifetime` communicates cache reuse without prescribing a backend implementation:
 
-- `continuing` is the default: later requests extend this history.
-- `ending` marks history expected to be replaced after the request; the runtime sets it when
-  the request estimate reaches the compaction threshold. It is a cache hint, not the decision
-  to compact.
+- `extends` is the default: later requests extend this history.
 - `detached` marks one-off settings, such as a compaction summary request, with no reusable
   history prefix under those settings.
 
 Anthropic marks the last history block as a cache breakpoint except for detached requests.
-Ending history still needs that breakpoint to read an existing cache entry. OpenAI protocols
-use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
+OpenAI protocols use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
 to the final tool output or user message instead of introducing a separate user turn, which
 would look like the user speaking again after every tool call.
 
@@ -77,10 +74,11 @@ would look like the user speaking again after every tool call.
    history from the journal, and builds the request. Shared settings are recorded in
    `model_context`; `model_requested` freezes the exact history references and inline tail.
 2. Each provider invocation gets a `model_attempt_started` record for that logical request.
-   `ResponseEvent`s describe ordered items and blocks: start, typed deltas, authoritative final
-   block content, item completion or discard, usage snapshots, and a terminal stop reason.
-   `ResponseAssembler` validates this lifecycle and supplies the same snapshot semantics to
-   the runtime and observers. Usage snapshots replace earlier values; they are not increments.
+   The stream carries display-only `Delta`s for blocks, cumulative `Usage` snapshots, and one
+   terminal `End` holding the `Completion`: the complete items in position order and how the
+   response ended (an answer, tool use, or a cut). Only a completion built for tool use carries
+   tool calls, so nothing else can authorize execution. `LiveResponse` gives the runtime and
+   observers the same provisional view of the deltas until the end arrives.
 3. Only an accepted response becomes model-visible history. Its message, usage, and outcome
    commit together before tool dispatch. Each tool result commits as its call finishes; request
    projection merges results back into the original call order. This preserves completed work
@@ -90,17 +88,18 @@ would look like the user speaking again after every tool call.
 
 Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized `ProviderErrorKind` values rather than error-message text: rate limits, timeouts,
-transport failures, and retryable response failures repeat the frozen logical request. Input
+transport failures, and unavailable servers repeat the frozen logical request. Input
 and selection changes wait for the next request boundary. The failed stream is dropped before
 backoff; server retry hints take precedence over capped exponential delays. Recovery remains
 cancellable and continues until success or interruption.
 
-A retry starts a fresh live assembler while retaining the attempt audit records and any reported
-usage. Partial failed responses never authorize tool execution, and transient recovery does
-not rerun completed tools. Authentication, invalid requests, and protocol errors do not enter
-this retry loop. Context-window recovery and invalid compaction summaries have their own bounded
-recovery path. Refusals fail without committing the refused message; a provider abort can retain
-completed safe content but still fails the turn and never executes its tool calls.
+A retry starts a fresh live response while retaining the attempt audit records and any reported
+usage. A stream that fails or closes before its end never authorizes tool execution, and
+transient recovery does not rerun completed tools. Authentication, invalid requests, and protocol
+errors do not enter this retry loop. Context-window recovery and invalid compaction summaries
+have their own bounded recovery path. A refusal cut fails without committing the refused message;
+an abort cut can retain completed safe content but still fails the turn; a truncated or
+incomplete cut commits its retained content as a completed response with that outcome.
 
 ## Compaction and context accounting
 

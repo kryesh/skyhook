@@ -1,12 +1,12 @@
 //! Merge cumulative counters without erasing late cached-token refinements.
 use super::super::wire;
 use super::Decoder;
-use crate::provider::protocol::{ResponseChunk, Usage};
+use crate::provider::protocol::{ResponseEvent, Usage};
 
 impl Decoder {
     /// Cumulative counters: missing or smaller late values keep the previous
     /// total, and cached tokens are clamped to the prompt.
-    pub(super) fn update_usage(&mut self, usage: wire::Usage, chunks: &mut Vec<ResponseChunk>) {
+    pub(super) fn update_usage(&mut self, usage: wire::Usage, events: &mut Vec<ResponseEvent>) {
         let prompt = usage
             .prompt_tokens
             .unwrap_or(self.raw_prompt_tokens)
@@ -26,14 +26,14 @@ impl Decoder {
             cached_input_tokens,
             output_tokens,
         };
-        chunks.push(ResponseChunk::UsageUpdated { usage: self.usage });
+        events.push(ResponseEvent::Usage(self.usage));
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::{Decoder, tests::*};
-    use crate::provider::protocol::{StopReason, Usage};
+    use super::super::tests::*;
+    use crate::provider::protocol::Usage;
     use serde_json::{Value, json};
 
     #[test]
@@ -72,7 +72,7 @@ mod tests {
             json!({"completion_tokens":-1, "prompt_tokens":100}),
         ] {
             for stage in 0..3 {
-                let mut decoder = Decoder::new("test-model".into());
+                let mut decoder = decoder();
                 let mut packet = phantom_usage_chunk();
                 packet["choices"] = json!([]);
                 decoder.decode(&event(packet.clone())).unwrap();
@@ -90,7 +90,7 @@ mod tests {
             }
         }
         // Cached tokens never exceed the prompt.
-        let mut decoder = Decoder::new("test-model".into());
+        let mut decoder = decoder();
         let packet = json!({"usage":{"prompt_tokens":10,"completion_tokens":1,
             "prompt_tokens_details":{"cached_tokens":50}}});
         decoder.decode(&event(packet)).unwrap();
@@ -107,13 +107,13 @@ mod tests {
                     "prompt_tokens_details":{"cached_tokens":cached}}
             }))
         };
-        let (_, usage, stop) = decode(vec![
+        let (_, usage, outcome) = decode(vec![
             delta(json!({"content":"partial"})),
             end("length"),
             packet(9, Value::Null),
             packet(10, json!(80)),
             event(json!({"choices":[{"finish_reason":"length","delta":null}]})),
         ]);
-        assert_eq!((stop, usage), (StopReason::MaxTokens, USAGE));
+        assert_eq!((outcome, usage), (MAX_TOKENS, USAGE));
     }
 }

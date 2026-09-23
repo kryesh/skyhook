@@ -2,7 +2,7 @@
 
 use crate::{
     identity::AgentId,
-    provider::protocol::{BlockContent, HistoryLifetime, Message, ModelRequest},
+    provider::protocol::{HistoryLifetime, Message, ModelRequest},
 };
 
 use super::{EventRecord, ModelPurpose, SessionError, SessionEvent};
@@ -34,11 +34,8 @@ pub fn merge_tool_results(messages: impl IntoIterator<Item = Message>) -> Vec<Me
                 if let Message::Assistant(items) = &message {
                     calls = items
                         .iter()
-                        .flat_map(|item| &item.blocks)
-                        .filter_map(|block| match &block.content {
-                            BlockContent::ToolCall(call) => Some(call.id().to_owned()),
-                            _ => None,
-                        })
+                        .filter_map(|item| item.call())
+                        .map(|call| call.id().to_owned())
                         .collect();
                 }
                 merged.push(message);
@@ -234,12 +231,7 @@ pub(super) fn validate_compaction(
                 };
                 assistant
             }
-            Message::Assistant(content)
-                if content
-                    .iter()
-                    .flat_map(|item| &item.blocks)
-                    .any(|block| matches!(&block.content, BlockContent::ToolCall(_))) =>
-            {
+            Message::Assistant(content) if content.iter().any(|item| item.call().is_some()) => {
                 index
             }
             _ => continue,
@@ -264,11 +256,8 @@ fn valid_tool_pair(assistant: &Message, tools: &[&Message]) -> bool {
     };
     let calls: Vec<_> = content
         .iter()
-        .flat_map(|item| &item.blocks)
-        .filter_map(|block| match &block.content {
-            BlockContent::ToolCall(call) => Some((call.id(), call.name())),
-            _ => None,
-        })
+        .filter_map(|item| item.call())
+        .map(|call| (call.id(), call.name()))
         .collect();
     let results: Vec<_> = tools
         .iter()
@@ -394,7 +383,7 @@ fn visit_request<'a>(
     }
     Ok((
         context.profile.profile.provider.clone(),
-        context.template(&call.agent),
+        context.template(),
         tail,
         *history_lifetime,
     ))
@@ -406,7 +395,8 @@ mod tests {
     use crate::{
         identity::AgentId,
         provider::protocol::{
-            AssistantItem, ReplayEnvelope, SystemSegment, ToolDefinition, ToolResult, UserContent,
+            AssistantItem, Binding, Provenance, Replay, Scope, SystemSegment, ToolDefinition,
+            ToolResult, UserContent,
         },
         session::SessionStore,
     };
@@ -490,14 +480,15 @@ mod tests {
                 attachment: notes.clone(),
             },
         ]);
-        let envelope = ReplayEnvelope {
-            version: 1,
-            protocol: "test".into(),
-            model: "original-model".into(),
-            scope: "reasoning".into(),
+        let envelope = Replay {
+            provenance: Provenance {
+                protocol: "test".into(),
+                model: "original-model".into(),
+                scope: Scope::try_from("reasoning".to_owned()).unwrap(),
+            },
             // Opaque to the journal: nesting, key order, numbers and escapes must survive.
             payload: json!({"signature":"pre\"serve\u{e9}","a":[1.5,{"z":null,"b":-0.0}],"n":1e300}),
-            conversation_bound: false,
+            binding: Binding::Free,
         };
         let reasoning = AssistantItem::reasoning("reasoning-item", 0, "reasoning", Some(envelope));
         let read = crate::provider::protocol::ToolCall::new("read-1", "read", json!({})).unwrap();
@@ -526,11 +517,11 @@ mod tests {
         let SessionEvent::ModelContext { context: template } = &original else {
             unreachable!()
         };
-        let template = template.template(&agent);
+        let template = template.template();
         let context = append(&agent, original.clone()).await;
         let child_context = append(&child, original).await;
         append(&child, committed(text_message("child only"))).await;
-        let history_lifetime = HistoryLifetime::Ending;
+        let history_lifetime = HistoryLifetime::Detached;
         let request = requested(
             context.sequence,
             ModelPurpose::Agent,
@@ -609,7 +600,7 @@ mod tests {
                 ModelPurpose::Compaction,
                 history,
                 tail,
-                HistoryLifetime::Ending,
+                HistoryLifetime::Detached,
             )
         };
         let events = vec![
@@ -735,7 +726,7 @@ mod tests {
     fn checkpoint_cannot_cut_or_mismatch_parallel_tool_exchanges() {
         let (agent, records) = projection_fixture();
         let calls = ["a", "b"];
-        let call = |(position, id): (usize, &&str)| {
+        let call = |(position, id): (u32, &&str)| {
             let call = crate::provider::protocol::ToolCall::new(*id, "shell", json!({})).unwrap();
             AssistantItem::tool_call(format!("item-{id}"), position, call)
         };
@@ -748,9 +739,7 @@ mod tests {
         };
         let mut records =
             with_checkpoint(&records, 5, |checkpoint| checkpoint.retained = vec![1, 2]);
-        records[0].event = committed(Message::Assistant(
-            calls.iter().enumerate().map(call).collect(),
-        ));
+        records[0].event = committed(Message::Assistant((0..).zip(&calls).map(call).collect()));
         records[1].event = committed(Message::Tool(calls.iter().rev().map(result).collect()));
         let records = &records[..6];
         assert!(project_history(records, &agent).is_ok());
@@ -785,16 +774,17 @@ mod tests {
     #[test]
     fn bound_reasoning_does_not_survive_compaction() {
         let (agent, mut records) = projection_fixture();
-        let portable = ReplayEnvelope {
-            version: 1,
-            protocol: "test".into(),
-            model: "model".into(),
-            scope: "scope".into(),
+        let portable = Replay {
+            provenance: Provenance {
+                protocol: "test".into(),
+                model: "model".into(),
+                scope: Scope::try_from("scope".to_owned()).unwrap(),
+            },
             payload: json!({"signature":"opaque"}),
-            conversation_bound: false,
+            binding: Binding::Free,
         };
-        let bound = ReplayEnvelope {
-            conversation_bound: true,
+        let bound = Replay {
+            binding: Binding::Conversation,
             ..portable.clone()
         };
         let message = |replay| {
@@ -818,7 +808,7 @@ mod tests {
             records.push(record);
         };
         append(&mut records, 10, committed(signed.clone()));
-        let lifetime = HistoryLifetime::Continuing;
+        let lifetime = HistoryLifetime::Extends;
         append(
             &mut records,
             11,

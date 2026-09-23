@@ -21,12 +21,12 @@ use crate::{
     job::{CancellationToken, JobManager},
     mcp::{McpServerConfig, manager::McpManager},
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
-    provider::Provider,
     provider::profile::ModelProfile,
     provider::protocol::{
-        AssistantContent, BlockContent, Message, ModelRequest, ResponseAssembler, ResponseChunk,
-        SystemSegment, ToolCall, ToolResult, Usage, UserContent,
+        CutReason, LiveResponse, Message, ModelRequest, Outcome, Step as LiveStep, SystemSegment,
+        ToolCall, ToolResult, Usage, UserContent, visible_text,
     },
+    provider::{Provider, ProviderError},
     remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
     session::{EventRecord, SessionError, SessionEvent, SessionStore},
     target::{TargetDefinition, TargetRegistry, TargetsConfig},
@@ -426,16 +426,33 @@ mod tests {
         time::Duration,
     };
 
-    pub(super) use futures_util::stream;
+    pub(super) use futures_util::{TryStreamExt, stream};
 
     pub(super) use super::*;
     pub(super) use crate::{
         agent::Question,
-        provider::protocol::{ItemKind, ReplayEnvelope, StopReason, ToolCall, events_for_content},
-        provider::{ProviderContext, ProviderError, ProviderFuture, ResponseStream},
+        provider::protocol::{
+            AssistantItem, Binding, BlockId, BlockRef, ContextId, ItemId, ItemKind, Provenance,
+            Replay, ResponseEvent, Scope, ToolCall,
+        },
+        provider::{ProviderContext, ResponseStream},
     };
 
-    pub(super) type Requests = Arc<StdMutex<Vec<ModelRequest>>>;
+    /// A request as the scripted context that received it saw it.
+    #[derive(Clone, Debug, PartialEq)]
+    pub(super) struct Served {
+        pub(super) context: ContextId,
+        pub(super) request: ModelRequest,
+    }
+
+    impl std::ops::Deref for Served {
+        type Target = ModelRequest;
+        fn deref(&self) -> &ModelRequest {
+            &self.request
+        }
+    }
+
+    pub(super) type Requests = Arc<StdMutex<Vec<Served>>>;
 
     /// Counts records (or record references) whose event matches a pattern.
     macro_rules! count {
@@ -462,37 +479,37 @@ mod tests {
             impl crate::provider::Provider for $provider {
                 fn open_context(
                     &self,
-                    _: String,
+                    _: crate::provider::protocol::ContextId,
                 ) -> Result<Box<dyn crate::provider::ProviderContext>, crate::provider::ProviderError> {
                     Ok(Box::new(self.clone()))
                 }
             }
         )+};
     }
-    pub(crate) use {cloned_provider, count, events};
+    pub(crate) use {count, events};
 
-    type Chunks = Vec<Result<ResponseChunk, ProviderError>>;
+    type Events = Vec<Result<ResponseEvent, ProviderError>>;
 
     /// One scripted response, served to the first unserved request it matches.
     pub(super) struct Step {
         model: Option<&'static str>,
-        response: StdMutex<Option<Result<Chunks, ProviderError>>>,
+        response: StdMutex<Option<Result<Events, ProviderError>>>,
         gate: tokio::sync::Semaphore,
         midstream: bool,
     }
 
     impl Step {
-        pub(super) fn stream(chunks: Chunks) -> Self {
+        pub(super) fn stream(events: Events) -> Self {
             Self {
                 model: None,
-                response: StdMutex::new(Some(Ok(chunks))),
+                response: StdMutex::new(Some(Ok(events))),
                 gate: tokio::sync::Semaphore::new(1),
                 midstream: false,
             }
         }
 
-        pub(super) fn new(chunks: Vec<ResponseChunk>) -> Self {
-            Self::stream(chunks.into_iter().map(Ok).collect())
+        pub(super) fn new(events: Vec<ResponseEvent>) -> Self {
+            Self::stream(events.into_iter().map(Ok).collect())
         }
 
         /// The invocation itself fails, before any stream exists.
@@ -514,7 +531,7 @@ mod tests {
             self
         }
 
-        /// Stream the first chunk, then hold the rest until `Script::release`.
+        /// Stream every event but the terminal one, then hold it until `Script::release`.
         pub(super) fn midstream(mut self) -> Self {
             self.midstream = true;
             self.gated()
@@ -585,16 +602,22 @@ mod tests {
     }
 
     impl Provider for Script {
-        fn open_context(&self, _: String) -> Result<Box<dyn ProviderContext>, ProviderError> {
+        fn open_context(
+            &self,
+            context: ContextId,
+        ) -> Result<Box<dyn ProviderContext>, ProviderError> {
             self.opened.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(ScriptContext(self.this.upgrade().unwrap())))
+            Ok(Box::new(ScriptContext(
+                self.this.upgrade().unwrap(),
+                context,
+            )))
         }
     }
 
-    struct ScriptContext(Arc<Script>);
+    struct ScriptContext(Arc<Script>, ContextId);
 
     impl ProviderContext for ScriptContext {
-        fn invoke(&mut self, request: ModelRequest) -> ProviderFuture {
+        fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
             let script = self.0.clone();
             let step = {
                 let mut served = script.served.lock().unwrap();
@@ -608,12 +631,15 @@ mod tests {
                     .enumerate()
                     .find(free)
                     .expect("scripted response");
-                script.requests.lock().unwrap().push(request.clone());
+                script.requests.lock().unwrap().push(Served {
+                    context: self.1.clone(),
+                    request: request.clone(),
+                });
                 served.push((step, request));
                 step
             };
             script.changed.notify_waiters();
-            Box::pin(async move {
+            let started = async move {
                 let gate = async move |script: Arc<Script>| {
                     script.steps[step].gate.acquire().await.unwrap().forget();
                 };
@@ -621,34 +647,42 @@ mod tests {
                 if !midstream {
                     gate(script.clone()).await;
                 }
-                let mut chunks = script.steps[step]
+                let mut events = script.steps[step]
                     .response
                     .lock()
                     .unwrap()
                     .take()
                     .unwrap()?;
-                let rest = chunks.split_off(usize::from(midstream).min(chunks.len()));
+                let split = if midstream {
+                    events.len().saturating_sub(1)
+                } else {
+                    0
+                };
+                let rest = events.split_off(split);
                 let held = stream::once(async move {
                     if midstream {
                         gate(script).await;
                     }
                     stream::iter(rest)
                 });
-                Ok(Box::pin(stream::iter(chunks).chain(held.flatten())) as ResponseStream)
-            })
+                Ok::<_, ProviderError>(
+                    Box::pin(stream::iter(events).chain(held.flatten())) as ResponseStream
+                )
+            };
+            Box::pin(stream::once(started).try_flatten())
         }
     }
 
     pub(super) fn scripted_provider(
         requests: &Requests,
-        responses: impl IntoIterator<Item = Vec<ResponseChunk>>,
+        responses: impl IntoIterator<Item = Vec<ResponseEvent>>,
     ) -> Arc<Script> {
         Script::new(responses.into_iter().map(Step::new), requests)
     }
 
     /// A session over `root` (sessions in `root/sessions`) answering from a script.
     pub(super) async fn scripted_session(
-        responses: impl IntoIterator<Item = Vec<ResponseChunk>>,
+        responses: impl IntoIterator<Item = Vec<ResponseEvent>>,
     ) -> (tempfile::TempDir, Requests, SessionHandle) {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
@@ -680,8 +714,8 @@ mod tests {
     cloned_provider!(HangingProvider);
 
     impl ProviderContext for HangingProvider {
-        fn invoke(&mut self, _request: ModelRequest) -> ProviderFuture {
-            Box::pin(async { Ok(Box::pin(stream::pending()) as ResponseStream) })
+        fn invoke(&mut self, _request: ModelRequest) -> ResponseStream {
+            Box::pin(stream::pending())
         }
     }
 
@@ -882,30 +916,45 @@ mod tests {
         }
     }
 
-    pub(super) fn response(items: Vec<AssistantContent>) -> Vec<ResponseChunk> {
-        let stop_reason = if items.iter().any(|item| item.kind == ItemKind::ToolCall) {
-            StopReason::ToolUse
-        } else {
-            StopReason::EndTurn
-        };
-        let mut events = events_for_content(&items);
-        events.push(ResponseChunk::ResponseEnded { stop_reason });
-        events
+    /// A normal finish: tool use when any item is a call, otherwise an answer.
+    pub(super) fn response(items: Vec<AssistantItem>) -> Vec<ResponseEvent> {
+        vec![ResponseEvent::End(
+            crate::provider::protocol::Completion::finished(items).unwrap(),
+        )]
     }
 
-    pub(super) fn answer(text: impl Into<String>) -> Vec<ResponseChunk> {
-        response(vec![AssistantContent::text("answer", 0, text)])
+    /// An abnormal end keeping `items`, which must not include calls.
+    pub(super) fn cut(items: Vec<AssistantItem>, reason: CutReason) -> Vec<ResponseEvent> {
+        vec![ResponseEvent::End(
+            crate::provider::protocol::Completion::cut(items, reason).unwrap(),
+        )]
+    }
+
+    pub(super) fn answer(text: impl Into<String>) -> Vec<ResponseEvent> {
+        response(vec![AssistantItem::text("answer", 0, text)])
+    }
+
+    /// A provisional text delta for block `block` of item `item`.
+    pub(super) fn delta(item: &str, block: &str, kind: ItemKind, text: &str) -> ResponseEvent {
+        ResponseEvent::Delta {
+            block: BlockRef {
+                item: ItemId::try_from(item.to_owned()).unwrap(),
+                block: BlockId::try_from(block.to_owned()).unwrap(),
+            },
+            kind,
+            text: text.into(),
+        }
     }
 
     /// A tool call item `tool-{position}` invoking `name` with call id `id`.
     pub(super) fn tool_call(
-        position: usize,
+        position: u32,
         id: &str,
         name: &str,
         arguments: serde_json::Value,
-    ) -> AssistantContent {
+    ) -> AssistantItem {
         let call = ToolCall::new(id, name, arguments).unwrap();
-        AssistantContent::tool_call(format!("tool-{position}"), position, call)
+        AssistantItem::tool_call(format!("tool-{position}"), position, call)
     }
 
     pub(super) fn todo(text: &str, status: crate::agent::TodoStatus) -> TodoItem {

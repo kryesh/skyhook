@@ -363,7 +363,6 @@ impl SessionRuntime {
             reasoning: profile.reasoning.clone(),
             response_schema: None,
             max_output_tokens: Some(profile.max_output),
-            correlation: Some(agent.to_string()),
             blobs: Default::default(),
         };
         let mut context = AgentContext::open(

@@ -683,7 +683,7 @@ mod tests {
         super::PendingQuestion::new(entries.collect()).unwrap()
     }
 
-    fn ask(id: &str, index: usize) -> AssistantContent {
+    fn ask(id: &str, index: u32) -> AssistantItem {
         tool_call(index, id, "ask", json!({"id":id, "prompt":"Question?"}))
     }
 
@@ -1023,7 +1023,7 @@ mod tests {
             {
                 let requests = requests.lock().unwrap();
                 let offers_ask = |r: &ModelRequest| r.tools.iter().any(|tool| tool.name == "ask");
-                assert!(requests.iter().all(offers_ask));
+                assert!(requests.iter().all(|r| offers_ask(r)));
                 let messages = rendered(&requests[1]);
                 assert!(messages.contains("parent-answer"));
             }

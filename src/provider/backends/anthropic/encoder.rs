@@ -3,7 +3,7 @@ use super::super::common::{anthropic_image, invalid, opaque_payload, tool_text, 
 use super::native::validate_thinking;
 use crate::provider::{
     ProviderError,
-    protocol::{BlockContent, HistoryLifetime, Message, ModelRequest},
+    protocol::{AssistantItem, HistoryLifetime, Message, ModelRequest},
 };
 use serde_json::{Value, json};
 
@@ -103,7 +103,6 @@ pub(crate) fn encode(request: &ModelRequest) -> Result<Value, ProviderError> {
     if !output_config.is_empty() {
         body["output_config"] = Value::Object(output_config);
     }
-    // correlation is local tracing information, not Anthropic user metadata.
     Ok(body)
 }
 
@@ -120,26 +119,25 @@ fn push_message(
         Message::Assistant(items) => {
             let mut blocks = Vec::new();
             for item in items {
-                // Replay belongs to the native item, not to each display block.
-                if let Some(payload) = opaque_payload(&item.replay, "anthropic", &request.model) {
-                    validate_thinking(payload).map_err(|error| invalid(error.message))?;
-                    blocks.push(payload.clone());
-                    continue;
-                }
-                for block in &item.blocks {
-                    match &block.content {
-                        // A blank block carries nothing and is not universally
-                        // accepted (a trailing one is a prefill error), so it is
-                        // dropped rather than replayed.
-                        BlockContent::Text { text } if text.trim().is_empty() => {}
-                        BlockContent::Text { text } => {
-                            blocks.push(json!({"type":"text", "text":text}))
+                match item {
+                    // Replay belongs to the native item, not to each display block.
+                    // Unsigned/foreign private reasoning is display-only.
+                    AssistantItem::Reasoning { replay, .. } => {
+                        if let Some(payload) = opaque_payload(replay, "anthropic", &request.model) {
+                            validate_thinking(payload).map_err(|error| invalid(error.message))?;
+                            blocks.push(payload.clone());
                         }
-                        // Unsigned/foreign private reasoning is display-only.
-                        BlockContent::Reasoning { .. } => {}
-                        BlockContent::ToolCall(call) => {
-                            blocks.push(json!({"type":"tool_use", "id":call.id(), "name":call.name(), "input":call.arguments()}));
-                        }
+                    }
+                    // A blank block carries nothing and is not universally
+                    // accepted (a trailing one is a prefill error), so it is
+                    // dropped rather than replayed.
+                    AssistantItem::Text { blocks: text, .. } => blocks.extend(
+                        text.iter()
+                            .filter(|block| !block.text.trim().is_empty())
+                            .map(|block| json!({"type":"text", "text":block.text})),
+                    ),
+                    AssistantItem::ToolCall { call, .. } => {
+                        blocks.push(json!({"type":"tool_use", "id":call.id(), "name":call.name(), "input":call.arguments()}));
                     }
                 }
             }
@@ -210,18 +208,21 @@ fn mark_last_cacheable(messages: &mut [Value]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::backends::common::reasoning_envelope;
+    use crate::provider::backends::common::{replay as scoped_replay, tests::scope};
     use crate::{
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantBlock, AssistantItem, BlockContent, HistoryLifetime, ItemKind, ReplayEnvelope,
-            ResponseSchema, SystemSegment, ToolCall, ToolDefinition, ToolResult, UserContent,
+            AssistantItem, Binding, BlockId, HistoryLifetime, ItemId, Replay, ResponseSchema,
+            SystemSegment, TextBlock, ToolCall, ToolDefinition, ToolResult, UserContent,
         },
     };
 
+    fn reasoning_envelope(protocol: &str, model: &str, payload: serde_json::Value) -> Replay {
+        scoped_replay(protocol, model, &scope(), payload, Binding::Conversation)
+    }
+
     fn request() -> ModelRequest {
         ModelRequest {
-            correlation: Some("local-trace".into()),
             ..crate::provider::backends::common::tests::request("claude-test")
         }
     }
@@ -349,8 +350,6 @@ mod tests {
         let reasoning = AssistantItem::reasoning("r", 0, "", Some(envelope));
         request.history.push(Message::Assistant(vec![reasoning]));
         request.tail = vec![Message::User(vec![text("state")])];
-        // Ending history is still marked so the request reads the cached prefix.
-        request.history_lifetime = HistoryLifetime::Ending;
         let body = encode(&request).unwrap();
         let messages = &body["messages"];
         assert_eq!(
@@ -369,7 +368,7 @@ mod tests {
         // Detached history shares no cached prefix with any other request.
         request.history_lifetime = HistoryLifetime::Detached;
         assert!(unmarked(&request));
-        request.history_lifetime = HistoryLifetime::Ending;
+        request.history_lifetime = HistoryLifetime::Extends;
         // A tail-only request has no history to cache.
         request.history.clear();
         assert!(unmarked(&request));
@@ -403,14 +402,13 @@ mod tests {
     }
 
     #[test]
-    fn opaque_reasoning_replays_only_matching_version_protocol_and_model() {
+    fn opaque_reasoning_replays_only_matching_protocol_and_model() {
         let native = json!({"type":"thinking", "thinking":"private", "signature":"signature", "future_field":42});
         let mut request = request();
         let envelope = reasoning_envelope("anthropic", &request.model, native.clone());
-        let mutations: [fn(&mut ReplayEnvelope); 3] = [
-            |envelope| envelope.version = 2,
-            |envelope| envelope.protocol = "responses".into(),
-            |envelope| envelope.model = "another-model".into(),
+        let mutations: [fn(&mut Replay); 2] = [
+            |envelope| envelope.provenance.protocol = "responses".into(),
+            |envelope| envelope.provenance.model = "another-model".into(),
         ];
         let mut envelopes = vec![(Some(envelope.clone()), true), (None, false)];
         envelopes.extend(mutations.map(|mutate| {
@@ -420,12 +418,13 @@ mod tests {
         }));
         for (replay, matches) in envelopes {
             let mut item = AssistantItem::reasoning("r", 0, "visible", replay);
-            item.blocks.push(AssistantBlock {
-                id: "second".into(),
-                position: 1,
-                content: BlockContent::Reasoning {
-                    text: "second summary".into(),
-                },
+            let AssistantItem::Reasoning { blocks, .. } = &mut item else {
+                unreachable!()
+            };
+            blocks.push(TextBlock {
+                id: BlockId::try_from("second".to_owned()).unwrap(),
+                position: 1.into(),
+                text: "second summary".into(),
             });
             request.history = continue_after(item);
             let body = encode(&request).unwrap();
@@ -472,10 +471,9 @@ mod tests {
         let envelope = reasoning_envelope("anthropic", &request.model, native.clone());
         for replay in [None, Some(envelope)] {
             let has_replay = replay.is_some();
-            request.history = continue_after(AssistantItem {
-                id: "r".into(),
-                position: 0,
-                kind: ItemKind::Reasoning,
+            request.history = continue_after(AssistantItem::Reasoning {
+                id: ItemId::try_from("r".to_owned()).unwrap(),
+                position: 0.into(),
                 blocks: vec![],
                 replay,
             });

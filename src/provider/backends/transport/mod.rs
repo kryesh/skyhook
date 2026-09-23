@@ -1,6 +1,7 @@
 //! Shared, cancellation-safe HTTP/SSE transport. A dropped stream drops its HTTP body.
+use super::ProviderTimeouts;
 use super::errors::classify_error;
-use crate::provider::{ProviderError, ProviderErrorKind, ProviderTimeouts};
+use crate::provider::{ProviderError, ProviderErrorKind};
 use reqwest::{
     Client, Response,
     header::{ACCEPT, CONTENT_TYPE, HeaderMap, RETRY_AFTER},
@@ -26,7 +27,6 @@ pub(crate) fn client() -> Result<Client, ProviderError> {
 
 pub(crate) fn http_error(error: reqwest::Error) -> ProviderError {
     ProviderError {
-        retry_after: None,
         kind: if error.is_builder() {
             ProviderErrorKind::InvalidRequest
         } else if error.is_timeout() {
@@ -41,7 +41,6 @@ pub(crate) fn http_error(error: reqwest::Error) -> ProviderError {
 
 fn timeout_error(phase: &str) -> ProviderError {
     ProviderError {
-        retry_after: None,
         kind: ProviderErrorKind::Timeout,
         message: format!("provider HTTP {phase} timeout"),
     }
@@ -146,7 +145,11 @@ async fn status_error(
     let native = serde_json::from_slice(&body)
         .unwrap_or_else(|_| Value::String(String::from_utf8_lossy(&body).into_owned()));
     let mut error = classify_error(Some(status), &native);
-    error.retry_after = retry_after;
+    if let ProviderErrorKind::RateLimited { retry_after: slot }
+    | ProviderErrorKind::Unavailable { retry_after: slot } = &mut error.kind
+    {
+        *slot = retry_after;
+    }
     error
 }
 
@@ -417,7 +420,9 @@ pub(crate) mod tests {
                 "429 Too Many Requests",
                 "Retry-After: 120\r\n",
                 throttle,
-                RateLimited,
+                RateLimited {
+                    retry_after: Some(Duration::from_secs(120)),
+                },
                 ": slow down",
             ),
             // Non-JSON bodies (proxy text) still carry the explanation.
@@ -425,14 +430,14 @@ pub(crate) mod tests {
                 "503 Service Unavailable",
                 "",
                 "upstream unavailable",
-                Response,
+                Unavailable { retry_after: None },
                 ": upstream unavailable",
             ),
             (
                 "500 Internal Server Error",
                 "",
                 refused,
-                Response,
+                Unavailable { retry_after: None },
                 ": upstream rejected the request",
             ),
             (
@@ -462,9 +467,7 @@ pub(crate) mod tests {
                 "{status}: {}",
                 error.message
             );
-            let throttled = (kind == RateLimited).then_some(Duration::from_secs(120));
-            assert_eq!(error.retry_after, throttled, "{status}");
-            assert_eq!(error.message.contains("429"), kind == RateLimited);
+            assert_eq!(error.message.contains("429"), error.retry_after().is_some());
         }
         // An empty response closes the socket after consuming the full POST.
         let closed = rejected(Plan::reply(String::new()), timeouts(100, 100)).await;

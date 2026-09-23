@@ -11,7 +11,7 @@ pub use interaction::{
     Question, QuestionError, QuestionFuture, QuestionHandler, QuestionOption, RuntimeEvent,
 };
 pub use observation::{
-    AgentActivity, ContextUsage, LiveResponse, Observation, ObservationSnapshot, ObservedEvent,
+    AgentActivity, ContextUsage, Observation, ObservationSnapshot, ObservedEvent, ObservedResponse,
 };
 pub use runtime::{
     ContinueOptions, ContinueOutcome, Harness, HarnessBuilder, PromptOptions, QueuedPrompt,
