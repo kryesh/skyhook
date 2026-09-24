@@ -84,7 +84,11 @@ impl SessionRuntime {
             .set(executor.clone())
             .map_err(|_| HarnessError::Initialization("executor already set".to_owned()))?;
         let records = store.records().await;
-        let caught_up_sequence = Mutex::new(records.last().map_or(0, |record| record.sequence));
+        let caught_up_sequence = Mutex::new(
+            records
+                .last()
+                .map_or(RecordSeq::default(), |record| record.sequence),
+        );
         let events = RuntimeEvents::new(&records);
         let mut usage = Usage::default();
         for record in &prior_records {
@@ -94,13 +98,11 @@ impl SessionRuntime {
         }
         let mut child_counters = HashMap::new();
         for record in &prior_records {
-            if let SessionEvent::AgentStarted {
-                parent: Some(parent),
-                ..
-            } = &record.event
+            if let SessionEvent::AgentStarted { .. } = &record.event
+                && let Some(parent) = record.agent.parent()
                 && let Some(segment) = record.agent.path().last()
             {
-                let counter = child_counters.entry(parent.clone()).or_insert(0_u32);
+                let counter = child_counters.entry(parent).or_insert(0_u32);
                 *counter = (*counter).max(*segment);
             }
         }
@@ -109,6 +111,7 @@ impl SessionRuntime {
             harness.questions.clone(),
         ));
         let runtime = Arc::new(Self {
+            instance: RuntimeInstance::next(),
             shutting_down: std::sync::atomic::AtomicBool::new(false),
             todos: TodoStore::restore(store.clone(), &prior_records),
             harness,
@@ -140,30 +143,54 @@ impl SessionRuntime {
     }
 
     /// Close what a stopped process left open, in one transaction, before any agent
-    /// resumes: attempts without an outcome, and committed calls without a result.
-    /// Their agents' turns end interrupted; returns those agents. A settled call to
-    /// a retained child releases it: nothing waits on it any more.
+    /// resumes: attempts without an outcome, requests still waiting for an attempt
+    /// (their first, or the retry after a failure), and committed calls without a
+    /// result. Their agents' turns end interrupted; returns those agents. A
+    /// settled call to a retained child releases it: nothing waits on it any more.
     pub(super) async fn settle_interrupted_work(&self) -> Result<Vec<AgentId>, HarnessError> {
         let work = self.store.interrupted_work().await?;
-        if work.attempts.is_empty() && work.calls.is_empty() {
+        let mut ledger = crate::session::RequestLedger::default();
+        for record in self.store.records().await {
+            ledger.observe(&record);
+        }
+        let waiting: Vec<AgentId> = ledger
+            .iter()
+            .filter(|(_, request)| {
+                matches!(
+                    request.phase,
+                    crate::session::RequestPhase::Requested
+                        | crate::session::RequestPhase::Retrying { .. }
+                )
+            })
+            .map(|(_, request)| request.agent.clone())
+            .collect();
+        if work.attempts.is_empty() && work.calls.is_empty() && waiting.is_empty() {
             return Ok(Vec::new());
         }
         let attempts = work.attempts.into_iter().map(|(agent, request, attempt)| {
-            (
-                agent,
-                SessionEvent::ModelAttemptInterrupted { request, attempt },
-            )
+            let attempt = crate::session::AttemptRef { request, attempt };
+            (agent, SessionEvent::ModelAttemptInterrupted(attempt))
         });
         let mut events: Vec<_> = attempts.collect();
         let mut agents: Vec<_> = events.iter().map(|(agent, _)| agent.clone()).collect();
         agents.extend(work.calls.iter().map(|(agent, ..)| agent.clone()));
+        agents.extend(waiting);
         agents.sort();
         agents.dedup();
         events.extend(work.calls.into_iter().map(|(agent, call_id, name)| {
+            let failure = crate::job::JobView::failure(
+                "interrupted while the session was not running".into(),
+                None,
+                false,
+                crate::job::JobMetadata {
+                    tool: Some(name.clone()),
+                    ..Default::default()
+                },
+            );
             let result = ToolResult {
                 call_id,
                 name,
-                result: json!({"error": "interrupted while the session was not running"}),
+                result: failure.into_value(),
                 images: Vec::new(),
                 is_error: true,
             };
@@ -245,11 +272,8 @@ impl SessionRuntime {
                     }
                     continue;
                 }
-                None
-                | Some(
-                    AgentActivity::Idle | AgentActivity::Failed(_) | AgentActivity::Interrupted,
-                ) => continue,
-                _ => {}
+                Some(activity) if activity.is_busy() => {}
+                _ => continue,
             }
             // Read the turn's token only now: the agent may have begun a new turn
             // while the awaits above ran, and a stale token would leave that turn
@@ -271,7 +295,7 @@ impl SessionRuntime {
                 // Commits an error result, which `continue` then resumes from.
                 let _ = self.jobs.cancel(job).await;
             }
-            self.activity(agent, AgentActivity::Interrupted);
+            self.activity(agent, AgentActivity::Stopped(TurnFailure::Interrupted));
             cancelled.push(agent.clone());
         }
         // A held child is retained too; its holder shows interrupted meanwhile.
@@ -281,7 +305,7 @@ impl SessionRuntime {
                 .iter()
                 .any(|agent| agent != &holder && agent.path().starts_with(holder.path()));
             if descendant_cancelled {
-                self.activity(&holder, AgentActivity::Interrupted);
+                self.activity(&holder, AgentActivity::Stopped(TurnFailure::Interrupted));
                 interrupted += 1;
             }
         }
@@ -331,7 +355,7 @@ impl SessionRuntime {
         let mut cancelled = 0;
         for (agent, cancellation) in targets {
             cancellation.cancel();
-            self.activity(&agent, AgentActivity::Interrupted);
+            self.activity(&agent, AgentActivity::Stopped(TurnFailure::Interrupted));
             cancelled += self.jobs.cancel_all(&agent).await;
         }
         cancelled

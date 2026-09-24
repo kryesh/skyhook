@@ -62,3 +62,43 @@ pub enum HarnessError {
     #[error("harness initialization failed: {0}")]
     Initialization(String),
 }
+
+/// Why an agent turn ended without an answer. Carried by agent activity so an
+/// owner can recognise an interrupt or refusal without reading rendered messages.
+#[derive(Clone, Debug, PartialEq, Eq, Error)]
+pub enum TurnFailure {
+    #[error("agent turn was interrupted")]
+    Interrupted,
+    #[error("the model declined to respond: {0}")]
+    Refused(String),
+    #[error("provider aborted response")]
+    Aborted,
+    #[error("provider returned no assistant content")]
+    Empty,
+    #[error("{0}")]
+    Other(String),
+}
+
+impl From<&HarnessError> for TurnFailure {
+    fn from(error: &HarnessError) -> Self {
+        match error {
+            HarnessError::Interrupted => Self::Interrupted,
+            HarnessError::Refused(detail) => Self::Refused(detail.clone()),
+            HarnessError::ProviderAborted => Self::Aborted,
+            HarnessError::EmptyResponse => Self::Empty,
+            error => Self::Other(error.to_string()),
+        }
+    }
+}
+
+impl From<TurnFailure> for HarnessError {
+    fn from(failure: TurnFailure) -> Self {
+        match failure {
+            TurnFailure::Interrupted => Self::Interrupted,
+            TurnFailure::Refused(detail) => Self::Refused(detail),
+            TurnFailure::Aborted => Self::ProviderAborted,
+            TurnFailure::Empty => Self::EmptyResponse,
+            TurnFailure::Other(message) => Self::Agent(message),
+        }
+    }
+}

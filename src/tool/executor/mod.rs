@@ -15,15 +15,16 @@ use crate::{
     identity::{AgentId, JobId},
     job::{JobError, JobManager, JobOutcome, JobSpec, JobState},
     remote::RemoteError,
-    target::{ROOT_TARGET, ResolvedRoute, TargetRouter},
+    target::{ResolvedRoute, TargetRef, TargetRouter},
     tool::{
         ToolPlacement,
         authorization::{AuthorizationCoordinator, AuthorizationError, AuthorizationSubject},
         diagnostic::{
-            Cause, Diagnostic, DiagnosticContext, Effects, FailureSite, Operation, PathFact,
+            Cause, Effects, FailureSite, Operation, PartialContext, PartialDiagnostic, PathFact,
             Subject,
         },
         policy::{Capability, CapabilitySet, PermissionUse, Policy, ResourceId},
+        registry::{ExecutionEnvelope, JobLaunch, JobName},
     },
 };
 
@@ -40,9 +41,7 @@ struct PreparedInvocation {
     tool: Arc<crate::tool::RegisteredTool>,
     original_arguments: Value,
     handler_arguments: Value,
-    background: bool,
-    job_name: Option<String>,
-    authorization_scope: Option<u64>,
+    envelope: ExecutionEnvelope,
 }
 
 struct InvocationPlan {
@@ -56,9 +55,7 @@ struct InvocationPlan {
     permissions: Vec<PermissionUse>,
     path_facts: Vec<PathFact>,
     parent: Option<JobId>,
-    authorization_scope: Option<u64>,
-    background: bool,
-    job_name: Option<String>,
+    launch: JobLaunch,
     dispatch: InvocationDispatch<PlannedRemote>,
 }
 
@@ -77,6 +74,21 @@ enum InvocationDispatch<R> {
 struct PlannedRemote {
     route: ResolvedRoute,
     router: TargetRouter,
+}
+
+/// A planned invocation whose job is published: the caller's outstanding work
+/// from here on, before anything runs. Dropping it cancels the job.
+pub(crate) struct CreatedInvocation {
+    kind: InvocationKind,
+    plan: InvocationPlan,
+    lease: crate::job::JobLease,
+}
+
+impl CreatedInvocation {
+    /// The name the job was published under.
+    pub(crate) fn job_name(&self) -> Option<&JobName> {
+        self.plan.launch.name.as_ref()
+    }
 }
 
 #[derive(Clone)]
@@ -196,6 +208,7 @@ impl ToolExecutor {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_model(
         &self,
         agent: AgentId,
@@ -207,6 +220,7 @@ impl ToolExecutor {
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute_script(
         &self,
         agent: AgentId,
@@ -226,28 +240,80 @@ impl ToolExecutor {
         arguments: Value,
         parent: Option<JobId>,
     ) -> Result<ExecutionResult, ExecutionError> {
-        let host = self
-            .shared
-            .registry
-            .get(name)
-            .is_none_or(|tool| tool.placement() == ToolPlacement::Host);
-        let stage = |operation, location: &ExecutionLocation| {
-            DiagnosticContext::new(operation, Subject::Tool(name.to_owned()))
-                .at(FailureSite::bound(location, host))
-        };
+        let created = self.create(kind, agent, name, arguments, parent).await?;
+        self.run(created).await
+    }
+
+    /// Plan a model call and publish its job without running it, so the calls of
+    /// one response can all be outstanding before any of them runs.
+    pub(crate) async fn create_model(
+        &self,
+        agent: AgentId,
+        name: &str,
+        arguments: Value,
+        parent: Option<JobId>,
+    ) -> Result<CreatedInvocation, ExecutionError> {
+        self.create(InvocationKind::Model, agent, name, arguments, parent)
+            .await
+    }
+
+    /// Plan a script call and publish its job without running it.
+    pub(crate) async fn create_script(
+        &self,
+        agent: AgentId,
+        name: &str,
+        arguments: Value,
+        parent: Option<JobId>,
+    ) -> Result<CreatedInvocation, ExecutionError> {
+        self.create(InvocationKind::Script, agent, name, arguments, parent)
+            .await
+    }
+
+    async fn create(
+        &self,
+        kind: InvocationKind,
+        agent: AgentId,
+        name: &str,
+        arguments: Value,
+        parent: Option<JobId>,
+    ) -> Result<CreatedInvocation, ExecutionError> {
         let plan = self
             .plan_registered(kind, agent, name, arguments, parent)
             .await
             .map_err(|error| {
-                let fallback = stage(Operation::Validate, &self.caller_location);
-                error.contextualize(fallback, &self.capabilities)
+                let host = self
+                    .shared
+                    .registry
+                    .get(name)
+                    .is_none_or(|tool| tool.placement() == ToolPlacement::Host);
+                let fallback =
+                    PartialContext::new(Operation::Validate, Subject::Tool(name.to_owned()))
+                        .at(FailureSite::bound(&self.caller_location, host));
+                error.or(fallback, &self.capabilities)
             })?;
-        let result_policy = plan.tool.result_policy();
-        let fallback = stage(Operation::Prepare, &plan.execution_location);
-        let started = self
-            .start(plan)
+        // The plan's borrow ends before the append: admitted handlers are not `Sync`.
+        let (spec, fallback) = (self.job_spec(&plan), prepare_fallback(&plan));
+        let lease = self
+            .shared
+            .jobs
+            .create(spec)
             .await
-            .map_err(|error| error.contextualize(fallback, &self.capabilities))?;
+            .map_err(|error| ExecutionError::from(error).or(fallback, &self.capabilities))?;
+        Ok(CreatedInvocation { kind, plan, lease })
+    }
+
+    /// Authorize, launch and collect a created invocation.
+    pub(crate) async fn run(
+        &self,
+        created: CreatedInvocation,
+    ) -> Result<ExecutionResult, ExecutionError> {
+        let CreatedInvocation { kind, plan, lease } = created;
+        let result_policy = plan.tool.result_policy();
+        let fallback = prepare_fallback(&plan);
+        let started = self
+            .start(plan, lease)
+            .await
+            .map_err(|error| error.or(fallback, &self.capabilities))?;
         match kind {
             InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
                 self.collect_model_started(started).await
@@ -258,4 +324,15 @@ impl ToolExecutor {
             InvocationKind::Host => self.collect_started(started).await,
         }
     }
+}
+
+fn prepare_fallback(plan: &InvocationPlan) -> PartialContext {
+    PartialContext::new(
+        Operation::Prepare,
+        Subject::Tool(plan.tool.name().to_owned()),
+    )
+    .at(FailureSite::bound(
+        &plan.execution_location,
+        plan.tool.placement() == ToolPlacement::Host,
+    ))
 }

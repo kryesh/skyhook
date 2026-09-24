@@ -3,9 +3,10 @@ use std::num::NonZeroU64;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::{
-    tool::output::{CaptureEvent, CaptureId, ProducedOutput},
-    tool::policy::{Capability, PermissionUse},
+use crate::tool::{
+    authorization::AuthorizationError,
+    output::{CaptureEvent, CaptureId, ProducedOutput},
+    policy::{Capability, PermissionUse},
 };
 use serde_json::Value;
 
@@ -86,9 +87,46 @@ pub(crate) enum Request {
     AuthorizationDecision {
         request_id: RequestId,
         authorization_id: AuthorizationId,
-        allowed: bool,
-        reason: Option<String>,
+        decision: AuthorizationDecision,
     },
+}
+
+/// The host's answer to a shim's authorization request.
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum AuthorizationDecision {
+    Allowed,
+    Denied(String),
+    InvalidGrant(String),
+    Cancelled,
+    Unavailable,
+    /// The host policy stopped before deciding.
+    Failed,
+}
+
+impl From<Result<(), AuthorizationError>> for AuthorizationDecision {
+    fn from(decision: Result<(), AuthorizationError>) -> Self {
+        match decision {
+            Ok(()) => Self::Allowed,
+            Err(AuthorizationError::Denied(reason)) => Self::Denied(reason),
+            Err(AuthorizationError::InvalidGrant(reason)) => Self::InvalidGrant(reason),
+            Err(AuthorizationError::Cancelled) => Self::Cancelled,
+            Err(AuthorizationError::Unavailable) => Self::Unavailable,
+            Err(AuthorizationError::PolicyFailed) => Self::Failed,
+        }
+    }
+}
+
+impl AuthorizationDecision {
+    pub(crate) fn into_result(self) -> Result<(), AuthorizationError> {
+        match self {
+            Self::Allowed => Ok(()),
+            Self::Denied(reason) => Err(AuthorizationError::Denied(reason)),
+            Self::InvalidGrant(reason) => Err(AuthorizationError::InvalidGrant(reason)),
+            Self::Cancelled => Err(AuthorizationError::Cancelled),
+            Self::Unavailable => Err(AuthorizationError::Unavailable),
+            Self::Failed => Err(AuthorizationError::PolicyFailed),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -175,7 +213,9 @@ impl From<ProducedOutput> for RemoteToolOutput {
                 .map(|capture| capture.id())
                 .collect(),
             streams: output.streams,
-            diagnostic: output.diagnostic,
+            diagnostic: output
+                .diagnostic
+                .map(crate::tool::diagnostic::PartialDiagnostic::resolve),
         }
     }
 }
@@ -245,4 +285,47 @@ where
     serde_json::from_slice(&bytes)
         .map(Some)
         .map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tool::{AdmissionError, diagnostic::Cause};
+
+    /// Every path that reports an authorization failure to a tool reads it the
+    /// same way, including after a wire round trip; a cancellation is never
+    /// relayed as a denial.
+    #[test]
+    fn authorization_failures_read_the_same_on_every_path() {
+        let cases = [
+            (
+                AuthorizationError::Denied("no".into()),
+                Cause::Denied("no".into()),
+            ),
+            (AuthorizationError::Cancelled, Cause::Cancelled),
+            (
+                AuthorizationError::InvalidGrant("unproposed".into()),
+                Cause::Message("unproposed".into()),
+            ),
+            (
+                AuthorizationError::Unavailable,
+                Cause::Denied("required capability is unavailable".into()),
+            ),
+            (
+                AuthorizationError::PolicyFailed,
+                Cause::Message("authorization could not be decided".into()),
+            ),
+        ];
+        for (error, cause) in cases {
+            let direct = AdmissionError::from(error.clone()).diagnostic().cause;
+            let relayed = AuthorizationDecision::from(Err(error))
+                .into_result()
+                .map_err(AdmissionError::from)
+                .unwrap_err()
+                .diagnostic()
+                .cause;
+            assert_eq!(direct, cause);
+            assert_eq!(relayed, cause);
+        }
+    }
 }

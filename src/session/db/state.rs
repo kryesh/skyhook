@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use super::{Db, DbResult, corrupt};
 use crate::identity::{AgentId, SessionId};
+use crate::session::RequestSeq;
 
 /// A session list row, read without decoding the session.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -41,7 +42,7 @@ pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InterruptedWork {
     /// Agent, request sequence and attempt number of attempts without an outcome.
-    pub attempts: Vec<(AgentId, u64, u64)>,
+    pub attempts: Vec<(AgentId, RequestSeq, u64)>,
     /// Agent, call id and tool name of committed calls without a result.
     pub calls: Vec<(AgentId, String, String)>,
 }
@@ -62,7 +63,13 @@ pub(in crate::session) fn interrupted_work(
          JOIN model_attempt a ON a.entry = o.attempt JOIN entry e ON e.seq = a.entry \
          ORDER BY a.entry",
         Vec::new(),
-        |row| Ok((agent(row.get(0)?)?, row.get(1)?, row.get(2)?)),
+        |row| {
+            Ok((
+                agent(row.get(0)?)?,
+                super::decode::sequence(row.get(1)?).request(),
+                row.get(2)?,
+            ))
+        },
     )?;
     let calls = db.query(
         "SELECT e.agent, c.call_id, c.name FROM unanswered_call u \

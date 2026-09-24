@@ -5,9 +5,7 @@ use super::*;
 pub struct HarnessBuilder {
     workspace: PathBuf,
     session_root: Option<PathBuf>,
-    providers: BTreeMap<String, Arc<dyn Provider>>,
-    model_profiles: BTreeMap<String, ModelProfile>,
-    default_model_profile: Option<String>,
+    catalog: CatalogSource,
     policy: Arc<dyn Policy>,
     questions: Option<Arc<dyn QuestionHandler>>,
     extra_tools: ToolRegistry,
@@ -15,22 +13,125 @@ pub struct HarnessBuilder {
     instructions: Vec<String>,
     max_child_depth: usize,
     capabilities: CapabilitySet,
-    modes: indexmap::IndexMap<String, Mode>,
-    mode: Option<String>,
     targets: TargetsConfig,
     shim_catalog: EmbeddedShimCatalog,
     sensitive_prompts: Arc<dyn SensitivePromptHandler>,
 }
 
+/// The providers, model profiles and modes a harness serves, with what a new
+/// session starts from. Every profile names a provider and the defaults are members.
+pub(crate) struct Catalog {
+    pub(crate) providers: BTreeMap<String, Arc<dyn Provider>>,
+    pub(crate) model_profiles: BTreeMap<String, ModelProfile>,
+    pub(crate) default_model_profile: String,
+    pub(crate) modes: indexmap::IndexMap<String, Mode>,
+    /// The mode a new session starts in; none without modes.
+    pub(crate) mode: Option<String>,
+}
+
+/// A catalog admitted with the configuration is proven; one assembled through
+/// the setters is checked by `build`. Any catalog setter makes it the latter.
+enum CatalogSource {
+    Admitted(Catalog),
+    Assembled(Assembled),
+}
+
+impl Default for CatalogSource {
+    fn default() -> Self {
+        Self::Assembled(Assembled::default())
+    }
+}
+
+impl CatalogSource {
+    fn assembled(self) -> Assembled {
+        match self {
+            Self::Admitted(catalog) => Assembled {
+                providers: catalog.providers,
+                model_profiles: catalog.model_profiles,
+                default_model_profile: Some(catalog.default_model_profile),
+                modes: catalog.modes,
+                mode: catalog.mode,
+            },
+            Self::Assembled(assembled) => assembled,
+        }
+    }
+}
+
+#[derive(Default)]
+struct Assembled {
+    providers: BTreeMap<String, Arc<dyn Provider>>,
+    model_profiles: BTreeMap<String, ModelProfile>,
+    default_model_profile: Option<String>,
+    modes: indexmap::IndexMap<String, Mode>,
+    mode: Option<String>,
+}
+
+impl Assembled {
+    fn check(self) -> Result<Catalog, HarnessError> {
+        let default_model_profile = self
+            .default_model_profile
+            .ok_or(HarnessError::MissingDefaultModelProfile)?;
+        if !self.model_profiles.contains_key(&default_model_profile) {
+            return Err(HarnessError::UnknownModelProfile(default_model_profile));
+        }
+        for (name, profile) in &self.model_profiles {
+            profile.validate_limits().map_err(|error| {
+                HarnessError::InvalidProfile(format!("model profile `{name}`: {error}"))
+            })?;
+            if !self.providers.contains_key(&profile.provider) {
+                return Err(HarnessError::InvalidProfile(format!(
+                    "model profile `{name}` uses unknown provider `{}`",
+                    profile.provider
+                )));
+            }
+        }
+        // Without modes the root agent holds the ceiling itself and no mode applies.
+        let mode = match self.mode {
+            _ if self.modes.is_empty() => None,
+            Some(mode) if !self.modes.contains_key(&mode) => {
+                return Err(HarnessError::UnknownMode(mode));
+            }
+            Some(mode) => Some(mode),
+            None => self.modes.keys().next().cloned(),
+        };
+        Ok(Catalog {
+            providers: self.providers,
+            model_profiles: self.model_profiles,
+            default_model_profile,
+            modes: self.modes,
+            mode,
+        })
+    }
+}
+
+/// A mode is a set: the journal pins it sorted and without repeats. Interaction
+/// follows the host, so a mode never lists it.
+fn normalize_modes(modes: &mut indexmap::IndexMap<String, Mode>) {
+    for mode in modes.values_mut() {
+        (mode.capabilities).retain(|capability| *capability != Capability::Interactive);
+        mode.capabilities.sort();
+        mode.capabilities.dedup();
+    }
+}
+
 impl HarnessBuilder {
     #[must_use]
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
+        Self::with_catalog(workspace, CatalogSource::default())
+    }
+
+    /// A builder over a catalog that configuration admission has already proven.
+    #[must_use]
+    pub(crate) fn admitted(workspace: impl Into<PathBuf>, mut catalog: Catalog) -> Self {
+        normalize_modes(&mut catalog.modes);
+        Self::with_catalog(workspace, CatalogSource::Admitted(catalog))
+    }
+
+    fn with_catalog(workspace: impl Into<PathBuf>, catalog: CatalogSource) -> Self {
         Self {
             workspace: workspace.into(),
             session_root: None,
-            providers: BTreeMap::new(),
-            model_profiles: BTreeMap::new(),
-            default_model_profile: None,
+            catalog,
             policy: Arc::new(AllowAll),
             questions: None,
             extra_tools: ToolRegistry::default(),
@@ -38,12 +139,17 @@ impl HarnessBuilder {
             instructions: Vec::new(),
             max_child_depth: 4,
             capabilities: CapabilitySet::default(),
-            modes: indexmap::IndexMap::new(),
-            mode: None,
             targets: TargetsConfig::default(),
             shim_catalog: EmbeddedShimCatalog::default(),
             sensitive_prompts: Arc::new(RejectSensitivePrompts),
         }
+    }
+
+    fn assemble(mut self, edit: impl FnOnce(&mut Assembled)) -> Self {
+        let mut assembled = std::mem::take(&mut self.catalog).assembled();
+        edit(&mut assembled);
+        self.catalog = CatalogSource::Assembled(assembled);
+        self
     }
 
     #[must_use]
@@ -53,21 +159,22 @@ impl HarnessBuilder {
     }
 
     #[must_use]
-    pub fn provider(mut self, name: impl Into<String>, provider: Arc<dyn Provider>) -> Self {
-        self.providers.insert(name.into(), provider);
-        self
+    pub fn provider(self, name: impl Into<String>, provider: Arc<dyn Provider>) -> Self {
+        self.assemble(|catalog| {
+            catalog.providers.insert(name.into(), provider);
+        })
     }
 
     #[must_use]
-    pub fn model_profile(mut self, name: impl Into<String>, profile: ModelProfile) -> Self {
-        self.model_profiles.insert(name.into(), profile);
-        self
+    pub fn model_profile(self, name: impl Into<String>, profile: ModelProfile) -> Self {
+        self.assemble(|catalog| {
+            catalog.model_profiles.insert(name.into(), profile);
+        })
     }
 
     #[must_use]
-    pub fn default_model_profile(mut self, name: impl Into<String>) -> Self {
-        self.default_model_profile = Some(name.into());
-        self
+    pub fn default_model_profile(self, name: impl Into<String>) -> Self {
+        self.assemble(|catalog| catalog.default_model_profile = Some(name.into()))
     }
 
     #[must_use]
@@ -115,26 +222,17 @@ impl HarnessBuilder {
 
     /// The modes the root agent can run in, and with a hint its descendants; each is
     /// limited by `capabilities`. With none, the root agent holds `capabilities` itself.
-    /// Clears the selected mode.
     #[must_use]
-    pub fn modes(mut self, mut modes: indexmap::IndexMap<String, Mode>) -> Self {
-        // A mode is a set: the journal pins it sorted and without repeats. Interaction
-        // follows the host, so a mode never lists it.
-        for mode in modes.values_mut() {
-            (mode.capabilities).retain(|capability| *capability != Capability::Interactive);
-            mode.capabilities.sort();
-            mode.capabilities.dedup();
-        }
-        self.modes = modes;
-        self.mode = None;
-        self
+    pub fn modes(self, mut modes: indexmap::IndexMap<String, Mode>) -> Self {
+        normalize_modes(&mut modes);
+        self.assemble(|catalog| catalog.modes = modes)
     }
 
-    /// The mode a new session starts in; by default the first.
+    /// The mode a new session starts in; by default the first. `build` rejects one
+    /// the modes do not declare.
     #[must_use]
-    pub fn mode(mut self, mode: impl Into<String>) -> Self {
-        self.mode = Some(mode.into());
-        self
+    pub fn mode(self, mode: impl Into<String>) -> Self {
+        self.assemble(|catalog| catalog.mode = Some(mode.into()))
     }
 
     #[must_use]
@@ -161,23 +259,13 @@ impl HarnessBuilder {
     /// Instruction discovery is independent of the YAML configuration path.
     pub async fn build(self) -> Result<Harness, HarnessError> {
         let workspace = fs::canonicalize(&self.workspace).await?;
-        let default_model_profile = self
-            .default_model_profile
-            .ok_or(HarnessError::MissingDefaultModelProfile)?;
-        validate_model_profiles(
-            &self.providers,
-            &self.model_profiles,
-            &default_model_profile,
-        )?;
+        let catalog = match self.catalog {
+            CatalogSource::Admitted(catalog) => catalog,
+            CatalogSource::Assembled(assembled) => assembled.check()?,
+        };
         let session_root = self
             .session_root
             .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
-        let mode = self.mode.or_else(|| self.modes.keys().next().cloned());
-        if let Some(mode) = &mode
-            && !self.modes.contains_key(mode)
-        {
-            return Err(HarnessError::UnknownMode(mode.clone()));
-        }
         let mut instructions = load_agent_instructions(&workspace).await?;
         let skills = HostSkills::discover(&workspace).await;
         let target_definitions = self.targets.definitions()?;
@@ -194,9 +282,9 @@ impl HarnessBuilder {
             inner: Arc::new(HarnessInner {
                 workspace,
                 session_root,
-                providers: self.providers,
-                model_profiles: self.model_profiles,
-                default_model_profile,
+                providers: catalog.providers,
+                model_profiles: catalog.model_profiles,
+                default_model_profile: catalog.default_model_profile,
                 policy: self.policy,
                 questions: self.questions,
                 extra_tools: self.extra_tools,
@@ -205,8 +293,8 @@ impl HarnessBuilder {
                 skills,
                 max_child_depth: self.max_child_depth,
                 capabilities: self.capabilities,
-                modes: self.modes,
-                mode,
+                modes: catalog.modes,
+                mode: catalog.mode,
                 target_definitions,
                 shim_catalog: self.shim_catalog,
                 sensitive_prompts,
@@ -214,28 +302,6 @@ impl HarnessBuilder {
         })
     }
 }
-fn validate_model_profiles(
-    providers: &BTreeMap<String, Arc<dyn Provider>>,
-    models: &BTreeMap<String, ModelProfile>,
-    default_model: &str,
-) -> Result<(), HarnessError> {
-    if !models.contains_key(default_model) {
-        return Err(HarnessError::UnknownModelProfile(default_model.to_owned()));
-    }
-    for (name, profile) in models {
-        profile.validate_limits().map_err(|error| {
-            HarnessError::InvalidProfile(format!("model profile `{name}`: {error}"))
-        })?;
-        if !providers.contains_key(&profile.provider) {
-            return Err(HarnessError::InvalidProfile(format!(
-                "model profile `{name}` uses unknown provider `{}`",
-                profile.provider
-            )));
-        }
-    }
-    Ok(())
-}
-
 const AGENT_INSTRUCTION_NAMES: [&str; 4] = ["AGENTS.md", "agents.md", "Agents.md", "AGENTS.MD"];
 
 // Instruction discovery deliberately does not depend on the selected YAML config.
@@ -427,6 +493,45 @@ mod tests {
             assert_eq!(message, expected, "{case}");
         }
         assert!(base().build().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn starting_mode_is_checked_at_build_whichever_setter_came_first() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let base = || test_builder(root.path(), &sessions, Arc::new(HangingProvider), false);
+        let mode = |capabilities: &[Capability]| Mode {
+            capabilities: capabilities.to_vec(),
+            instructions: None,
+            hint: None,
+        };
+        let modes = || {
+            [
+                ("look".to_owned(), mode(&[Capability::Read])),
+                (
+                    "work".to_owned(),
+                    mode(&[Capability::Read, Capability::Write]),
+                ),
+            ]
+            .into()
+        };
+        let starting = |harness: Harness| harness.inner.mode.clone();
+        let built = base().mode("work").modes(modes()).build().await.unwrap();
+        assert_eq!(starting(built).as_deref(), Some("work"));
+        let built = base().modes(modes()).mode("work").build().await.unwrap();
+        assert_eq!(starting(built).as_deref(), Some("work"));
+        let built = base().modes(modes()).build().await.unwrap();
+        assert_eq!(starting(built).as_deref(), Some("look"));
+        for builder in [
+            base().mode("missing").modes(modes()),
+            base().modes(modes()).mode("missing"),
+        ] {
+            let error = builder.build().await.err().unwrap();
+            assert!(matches!(error, HarnessError::UnknownMode(mode) if mode == "missing"));
+        }
+        // Without modes the root holds the ceiling itself; a selection does not apply.
+        let built = base().mode("work").build().await.unwrap();
+        assert!(starting(built).is_none());
     }
 
     #[test]
@@ -640,14 +745,14 @@ mod tests {
     #[tokio::test]
     async fn revoked_interactive_rejects_supplied_sensitive_handler() {
         use crate::remote::{
-            SecretValue, SensitivePrompt, SensitivePromptFuture, SensitivePromptKind,
+            PromptAnswer, SensitivePrompt, SensitivePromptFuture, SensitivePromptKind,
         };
 
         struct RecordingSensitive(Arc<AtomicUsize>);
         impl SensitivePromptHandler for RecordingSensitive {
             fn prompt(&self, _prompt: SensitivePrompt) -> SensitivePromptFuture {
                 self.0.fetch_add(1, Ordering::SeqCst);
-                Box::pin(async { Ok(SecretValue::new("answer".to_owned())) })
+                Box::pin(async { Ok(PromptAnswer::Confirmed) })
             }
         }
 

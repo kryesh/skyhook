@@ -1,6 +1,6 @@
 //! Job presentation and live metadata queries.
-
 use super::*;
+use crate::session::StateJob;
 use crate::tool::diagnostic::DiagnosticViewer;
 
 /// An agent's live work, as an interrupt and a `wait` each need to see it.
@@ -22,12 +22,16 @@ pub(crate) struct WaitState {
     pub(crate) holding: Option<JobId>,
     /// Something is pending that this caller has not been shown yet.
     pub(crate) unseen: bool,
-    /// The input revision this caller was last shown, if it is a script.
-    pub(crate) seen_input: Option<u64>,
-    /// The caller is a script's wait, not one the model called.
-    pub(crate) hosted: bool,
+    pub(crate) caller: WaitCaller,
     /// What to record as the caller's floor if it reports now.
     pub(crate) stamp: u64,
+}
+
+/// Who called `wait`: the model, whose request boundary consumes what it is
+/// shown, or a script, which is shown each event once.
+pub(crate) enum WaitCaller {
+    Model,
+    Script { floor: Option<WaitFloor> },
 }
 
 fn classify(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> LiveWork {
@@ -56,7 +60,7 @@ fn classify(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> LiveWork {
         if effectively_background(jobs, *id) {
             continue;
         }
-        if entry.role != JobRole::Agent {
+        if entry.child().is_none() {
             work.blocking.push(*id);
         }
         if !parked.contains(id) && !entry.suspended() {
@@ -89,9 +93,15 @@ fn pending(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> bool {
 }
 
 /// The script hosting a `wait`: what persists across its successive waits.
-fn script_host(jobs: &HashMap<JobId, JobEntry>, caller: JobId) -> Option<JobId> {
+fn script_host(
+    jobs: &mut HashMap<JobId, JobEntry>,
+    caller: JobId,
+) -> Option<&mut Option<WaitFloor>> {
     let host = jobs.get(&caller)?.parent?;
-    (jobs.get(&host)?.role == JobRole::Script).then_some(host)
+    match &mut jobs.get_mut(&host)?.role {
+        RoleState::Script { wait_floor } => Some(wait_floor),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq)]
@@ -105,9 +115,11 @@ pub struct JobEnvelope {
     pub name: Option<String>,
     pub state: JobState,
     pub output: Option<Value>,
-    /// Host projection derived from diagnostic facts, never persisted as authority.
-    /// Capability-aware views re-render the facts rather than using this cache.
-    pub error: Option<String>,
+    /// The question a waiting job asks, until its owner has seen it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) question: Option<QuestionOutput>,
+    /// Failure facts; every viewer renders them under its own capabilities.
     #[serde(skip)]
     #[schemars(skip)]
     pub(crate) diagnostic: Option<Diagnostic>,
@@ -119,8 +131,8 @@ pub struct JobEnvelope {
 
 /// The single public wire contract for both model and JavaScript job responses.
 /// Payload JSON is opaque; only these owned presentation groups are constructed.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub(crate) struct JobView {
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct JobView {
     pub(crate) id: Option<JobId>,
     pub(crate) state: JobState,
     pub(crate) has_result: bool,
@@ -130,8 +142,8 @@ pub(crate) struct JobView {
     pub(crate) presentation: Option<Presentation>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
-pub(crate) struct JobMetadata {
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct JobMetadata {
     pub(crate) parent: Option<JobId>,
     pub(crate) tool: Option<String>,
     pub(crate) name: Option<String>,
@@ -139,19 +151,18 @@ pub(crate) struct JobMetadata {
     /// Display metadata; execution keeps its native PathBuf in JobEnvelope.
     pub(crate) workspace: Option<String>,
     /// Source sequence of the last visible child reply.
-    pub(crate) last_message: Option<u64>,
+    pub(crate) last_message: Option<MessageSeq>,
     pub(crate) code: Option<crate::tool::DenialCode>,
     pub(crate) executed: Option<bool>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, JsonSchema)]
-pub(crate) struct Presentation {
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct Presentation {
     pub(crate) preview: Option<output::OutputPreview>,
     pub(crate) truncated: Vec<output::OutputTruncation>,
     pub(crate) captures: Vec<output::CaptureDescriptor>,
     /// A waiting child agent returns a question batch rather than a result.
-    #[schemars(schema_with = "question_schema")]
-    pub(crate) question: Option<Value>,
+    pub(crate) question: Option<QuestionOutput>,
     pub(crate) notice: Option<String>,
 }
 
@@ -177,6 +188,19 @@ impl JobMetadata {
 }
 
 impl JobView {
+    /// None when the call settled before a job was published.
+    pub fn id(&self) -> Option<JobId> {
+        self.id
+    }
+
+    pub fn state(&self) -> JobState {
+        self.state
+    }
+
+    pub fn tool(&self) -> Option<&str> {
+        self.meta.as_ref().and_then(|meta| meta.tool.as_deref())
+    }
+
     pub(crate) fn failure(
         message: String,
         output: Option<Value>,
@@ -200,45 +224,11 @@ impl JobView {
     }
 }
 
-// Keep question fields discoverable without classifying extensible tool names.
-fn question_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
-    schemars::json_schema!({
-        "anyOf": [generator.subschema_for::<crate::agent::QuestionOutput>(), true]
-    })
-}
-
-/// Minimal job information included in the model's current runtime snapshot.
-#[derive(Serialize)]
-pub(crate) struct ActiveJob {
-    pub(crate) job: JobId,
-    pub(crate) tool: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) name: Option<String>,
-    pub(crate) state: JobState,
-    pub(crate) location: ActiveJobLocation,
-    pub(crate) age_seconds: u64,
-    #[serde(flatten, skip_serializing_if = "Option::is_none")]
-    pub(crate) progress: Option<progress::AgentProgress>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub(crate) children: Vec<ActiveJob>,
-}
-
-#[derive(Serialize)]
-pub(crate) struct ActiveJobLocation {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) target: Option<String>,
-    pub(crate) workspace: std::path::PathBuf,
-}
-
 impl JobEnvelope {
-    pub(crate) fn render_diagnostics<'a>(&mut self, viewer: impl Into<DiagnosticViewer<'a>>) {
-        let viewer = viewer.into();
-        self.error = self
-            .diagnostic
-            .as_ref()
-            .map(|diagnostic| diagnostic.render_for(viewer));
+    /// Render the producer-registered error slot of the output for `viewer`.
+    pub(crate) fn render_output_diagnostic<'a>(&mut self, viewer: impl Into<DiagnosticViewer<'a>>) {
         if let (Some(output), Some(diagnostic)) = (&mut self.output, &self.output_diagnostic) {
-            render_output_diagnostic(output, diagnostic, viewer);
+            render_output_diagnostic(output, diagnostic, viewer.into());
         }
     }
 
@@ -250,13 +240,12 @@ impl JobEnvelope {
         self.diagnostic
             .as_ref()
             .map(|diagnostic| diagnostic.render_for(viewer))
-            .or_else(|| self.error.clone())
     }
 
     /// Ordinary foreground responses omit redundant launch metadata on success.
     pub(crate) fn response_view<'a>(&self, viewer: impl Into<DiagnosticViewer<'a>>) -> JobView {
-        let failed =
-            self.error.is_some() || (self.state.is_terminal() && self.state != JobState::Completed);
+        let failed = self.diagnostic.is_some()
+            || (self.state.is_terminal() && self.state != JobState::Completed);
         self.view(viewer.into(), failed)
     }
 
@@ -267,14 +256,11 @@ impl JobEnvelope {
 
     fn view(&self, viewer: DiagnosticViewer<'_>, metadata: bool) -> JobView {
         let capabilities = viewer.capabilities;
-        let waiting = self.state == JobState::WaitingInput;
         JobView {
             id: Some(self.id),
             state: self.state.presented(),
-            has_result: !waiting && self.output.is_some(),
-            result: if waiting {
-                Value::Null
-            } else {
+            has_result: self.output.is_some(),
+            result: {
                 let mut result = self.output.clone().unwrap_or(Value::Null);
                 if let Some(diagnostic) = &self.output_diagnostic {
                     render_output_diagnostic(&mut result, diagnostic, viewer);
@@ -286,10 +272,10 @@ impl JobEnvelope {
                 let mut metadata = JobMetadata {
                     parent: self.parent,
                     tool: Some(self.tool.clone()),
-                    name: self.name.clone().filter(|name| !name.is_empty()),
+                    name: self.name.clone(),
                     target: capabilities
                         .contains(Capability::Targets)
-                        .then(|| self.location.target.clone()),
+                        .then(|| self.location.target.to_string()),
                     workspace: Some(self.location.workspace.to_string_lossy().into_owned()),
                     last_message: None,
                     code: None,
@@ -299,7 +285,7 @@ impl JobEnvelope {
                 metadata
             }),
             presentation: Presentation {
-                question: waiting.then(|| self.output.clone()).flatten(),
+                question: self.question.clone(),
                 ..Presentation::default()
             }
             .into_option(),
@@ -341,7 +327,7 @@ impl JobManager {
         let mut launches = Vec::new();
         for (id, entry) in jobs
             .iter()
-            .filter(|(_, entry)| &entry.agent == agent && !entry.state.is_terminal())
+            .filter(|(_, entry)| &entry.agent == agent && entry.end().is_none())
         {
             let mut current = entry;
             let origin = loop {
@@ -389,10 +375,6 @@ impl JobManager {
         self.entry(id, |entry| entry.cancellation.clone()).await
     }
 
-    pub(crate) async fn authorization_scope(&self, id: JobId) -> Result<Option<u64>, JobError> {
-        self.entry(id, |entry| entry.authorization_scope).await
-    }
-
     pub async fn list(&self, owner: &AgentId) -> Vec<JobEnvelope> {
         let jobs = self.inner.jobs.lock().await;
         let mut output = jobs
@@ -410,7 +392,7 @@ impl JobManager {
         owner: &AgentId,
         capabilities: &CapabilitySet,
         now_millis: i64,
-    ) -> Vec<ActiveJob> {
+    ) -> Vec<StateJob> {
         let mut progress = self.inner.progress.lock().await;
         self.inner
             .store
@@ -419,7 +401,7 @@ impl JobManager {
         let jobs = self.inner.jobs.lock().await;
         let mut states = jobs
             .iter()
-            .filter(|(_, entry)| &entry.agent == owner && !entry.state.is_terminal())
+            .filter(|(_, entry)| &entry.agent == owner && entry.end().is_none())
             .map(|(id, _)| {
                 progress::active_job(
                     *id,
@@ -494,9 +476,7 @@ impl JobManager {
 
     /// Whether the job ended, other than by a retained interruption.
     pub(crate) async fn settled(&self, id: JobId) -> bool {
-        self.entry(id, |entry| entry.state.is_terminal() && !entry.suspended())
-            .await
-            .unwrap_or(true)
+        self.entry(id, JobEntry::settled).await.unwrap_or(true)
     }
 
     /// Mark `caller` parked and resolve its decision under one lock, so concurrent
@@ -508,16 +488,20 @@ impl JobManager {
         {
             self.parked_signal(owner).notify_waiters();
         }
-        let host = script_host(&jobs, caller);
-        let floor = host.and_then(|host| jobs.get(&host)?.wait_floor);
-        let since = floor.map_or(0, |(stamp, _)| stamp);
+        let caller = match script_host(&mut jobs, caller) {
+            Some(floor) => WaitCaller::Script { floor: *floor },
+            None => WaitCaller::Model,
+        };
+        let since = match caller {
+            WaitCaller::Script { floor } => floor.map_or(0, |floor| floor.stamp),
+            WaitCaller::Model => 0,
+        };
         WaitState {
-            hosted: host.is_some(),
             holding: classify(&jobs, owner).holding,
             unseen: jobs
                 .values()
                 .any(|entry| &entry.agent == owner && entry.pending_since(since)),
-            seen_input: floor.map(|(_, input)| input),
+            caller,
             stamp: current_pending_stamp(),
         }
     }
@@ -538,10 +522,10 @@ impl JobManager {
             .clone()
     }
 
-    pub(crate) async fn set_wait_floor(&self, caller: JobId, floor: (u64, u64)) {
+    pub(crate) async fn set_wait_floor(&self, caller: JobId, floor: WaitFloor) {
         let mut jobs = self.inner.jobs.lock().await;
-        if let Some(host) = script_host(&jobs, caller).and_then(|host| jobs.get_mut(&host)) {
-            host.wait_floor = Some(floor);
+        if let Some(host) = script_host(&mut jobs, caller) {
+            *host = Some(floor);
         }
     }
 
@@ -558,7 +542,12 @@ impl JobManager {
     }
 
     pub async fn images(&self, id: JobId) -> Result<Vec<ImageRef>, JobError> {
-        self.entry(id, |entry| entry.images.clone()).await
+        self.entry(id, |entry| {
+            entry
+                .finished()
+                .map_or_else(Vec::new, |finished| finished.images.clone())
+        })
+        .await
     }
 }
 
@@ -575,7 +564,7 @@ mod tests {
             name: None,
             state: JobState::Completed,
             output,
-            error: None,
+            question: None,
             diagnostic: None,
             output_diagnostic: None,
             location: ExecutionLocation::root(std::path::PathBuf::from("/work")),
@@ -674,7 +663,7 @@ mod tests {
     fn failures_include_metadata_with_or_without_admission() {
         let mut job = envelope(Some(Value::Null));
         job.state = JobState::Failed;
-        job.diagnostic = Some(crate::tool::ToolError::Denied("failed".into()).diagnostic());
+        job.diagnostic = Some(crate::tool::ToolError::denied("failed").diagnostic());
         let view = job.response_view(&CapabilitySet::default()).into_value();
         assert_eq!(view["meta"]["code"], "permission_denied");
         assert_eq!(view["meta"]["executed"], false);
@@ -691,7 +680,7 @@ mod tests {
     }
 
     #[test]
-    fn question_schema_documents_batches_without_classifying_tool_names() {
+    fn a_waiting_job_presents_its_question_batch_in_place_of_a_result() {
         for many in [false, true] {
             let schema = presented_job_schema(many);
             assert!(
@@ -699,22 +688,17 @@ mod tests {
                     .get("questions")
                     .is_some()
             );
-            for (tool, output) in [
-                (
-                    "delegate",
-                    serde_json::json!({"questions":[{"id":"choice", "prompt":"Choose"}]}),
-                ),
-                ("agent", serde_json::json!("custom prompt")),
-            ] {
-                let mut job = envelope(Some(output.clone()));
-                job.state = JobState::WaitingInput;
-                job.tool = tool.into();
-                let job = job.metadata_view(&CapabilitySet::default()).into_value();
-                assert_eq!(job["presentation"]["question"], output);
-                assert_eq!(job["has_result"], false);
-                let value = if many { serde_json::json!([job]) } else { job };
-                assert!(jsonschema::is_valid(&schema, &value));
-            }
+            let mut job = envelope(None);
+            job.state = JobState::WaitingInput;
+            job.question = Some(crate::job::tests::question("choice"));
+            let job = job.metadata_view(&CapabilitySet::default()).into_value();
+            assert_eq!(
+                job["presentation"]["question"]["questions"][0]["id"],
+                "choice"
+            );
+            assert_eq!(job["has_result"], false);
+            let value = if many { serde_json::json!([job]) } else { job };
+            assert!(jsonschema::is_valid(&schema, &value));
         }
     }
 
@@ -725,12 +709,12 @@ mod tests {
         let call = async |agent: &AgentId, id: &str| {
             let call = crate::provider::protocol::ToolCall::new(id, "agent", serde_json::json!({}))
                 .unwrap();
-            let message = crate::provider::protocol::Message::Assistant(vec![
+            let message = crate::session::Message::Assistant(vec![
                 crate::provider::protocol::AssistantItem::tool_call(id, 0, call),
             ]);
             let event = crate::session::SessionEvent::MessageCommitted { message };
             crate::session::ModelCallOrigin {
-                message: jobs.test_append(agent.clone(), event).await,
+                message: jobs.test_append(agent.clone(), event).await.message(),
                 call_id: id.into(),
             }
         };

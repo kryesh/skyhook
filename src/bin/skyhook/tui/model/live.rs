@@ -1,9 +1,10 @@
 //! Live response cards, reasoning expansion, and stable native block identities.
 
-use super::{AgentDisplayState, Entry, EntryKey, Projection, Surface, View};
+use super::{AgentDisplayState, Entry, EntryKey, Projection, ResponseRef, Surface, Title, View};
 use skyhook::agent::{AgentActivity, ObservationSnapshot, ObservedResponse};
 use skyhook::identity::AgentId;
-use skyhook::provider::protocol::ItemKind;
+use skyhook::provider::protocol::{BlockRef, ItemKind};
+use skyhook::session::{RequestPhase, RequestSeq};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReasoningStatus {
@@ -21,18 +22,36 @@ pub(super) fn working_entry(
     if running {
         return None;
     }
-    // Attempt-aware requests carry status in their original journal position,
-    // including the short transition between failure and scheduled recovery.
-    let active = projection.active_request.get(agent);
-    if active.is_some_and(|request| projection.retry_failed(*request)) {
+    // A request's own status card carries failure and recovery at its journal
+    // position, including the short transition between the two.
+    let latest = projection
+        .ledger
+        .latest(agent)
+        .and_then(|request| projection.ledger.get(request))
+        .map(|record| &record.phase);
+    if matches!(
+        latest,
+        Some(
+            RequestPhase::Failed { .. }
+                | RequestPhase::Refused { .. }
+                | RequestPhase::Retrying { .. }
+        )
+    ) {
         return None;
     }
     let state = match snapshot.activity.get(agent) {
+        // A committed answer needs no indicator under it while activity catches up.
         Some(AgentActivity::Working)
-            if !projection
-                .active_request
-                .get(agent)
-                .is_some_and(|request| projection.response_committed(*request)) =>
+            if !matches!(
+                latest,
+                Some(
+                    RequestPhase::Completed { .. }
+                        | RequestPhase::Open {
+                            message: Some(_),
+                            ..
+                        }
+                )
+            ) =>
         {
             AgentDisplayState::Working
         }
@@ -45,7 +64,7 @@ pub(super) fn working_entry(
 
     let mut entry = Entry::new(
         EntryKey::Working(agent.clone()),
-        format!("  {}", state.label()),
+        state.label(),
         Surface::Muted,
     );
     entry.running = true;
@@ -58,9 +77,8 @@ pub(super) fn reasoning_entry(
     view: &View,
     status: ReasoningStatus,
 ) -> Entry {
-    let title = match status {
-        ReasoningStatus::Running => "  Reasoning",
-        ReasoningStatus::Complete => "Reasoning",
+    let label = match status {
+        ReasoningStatus::Running | ReasoningStatus::Complete => "Reasoning",
         ReasoningStatus::Incomplete => "Reasoning · incomplete",
     };
     let running = status == ReasoningStatus::Running;
@@ -74,65 +92,52 @@ pub(super) fn reasoning_entry(
         return entry;
     }
     let open = view.is_expanded(&key, default_open);
-    let mut entry = Entry::expandable_text(
-        key,
-        if open {
-            format!("▾ {title}\n{text}")
-        } else {
-            format!("▸ {title}")
-        },
-        Surface::Reasoning,
-    );
+    let body = if open { text.to_owned() } else { String::new() };
+    let mut entry = Entry::titled(key, Title::disclosed(label, open), body, Surface::Reasoning);
     entry.default_open = default_open;
     entry.running = running;
     entry
 }
 
 /// Native block identity remains stable from live response through journal commit.
-pub(super) fn response_block_key(request: u64, item: &str, block: &str) -> EntryKey {
-    EntryKey::ResponseBlock {
-        request,
-        item: item.to_owned(),
-        block: block.to_owned(),
+pub(super) fn block_key(response: ResponseRef, block: &BlockRef) -> EntryKey {
+    EntryKey::Block {
+        response,
+        block: block.clone(),
     }
 }
 
-pub(super) fn reasoning_key(request: u64, item: &str, block: &str) -> EntryKey {
-    EntryKey::ReasoningBlock {
-        request,
-        item: item.to_owned(),
-        block: block.to_owned(),
-    }
-}
-
-/// Complete live-tail eligibility shared by fresh, reset, and dirty-tail paths.
-/// This deliberately does not broaden Projection::live_response's narrower API.
+/// A response streams at the tail until its commit is observed; failures and
+/// interruptions move it into the request's status card at its journal position.
 pub(super) fn live_tail_response<'a>(
     snapshot: &'a ObservationSnapshot,
     projection: &Projection,
     agent: &AgentId,
-    request: u64,
+    request: RequestSeq,
 ) -> Option<&'a ObservedResponse> {
-    snapshot
-        .responses
-        .get(&(agent.clone(), request))
-        .filter(|response| {
-            projection.live_response(request, response) && !projection.retry_failed(request)
-        })
+    let live = projection.ledger.get(request).is_some_and(|record| {
+        matches!(
+            record.phase,
+            RequestPhase::Requested | RequestPhase::Open { message: None, .. }
+        )
+    });
+    live.then(|| snapshot.responses.get(&(agent.clone(), request)))
+        .flatten()
 }
 
 pub(super) fn live_tail_responses<'a>(
     snapshot: &'a ObservationSnapshot,
     projection: &Projection,
     agent: &AgentId,
-) -> Vec<(u64, &'a ObservedResponse)> {
+) -> Vec<(RequestSeq, &'a ObservedResponse)> {
     let mut responses: Vec<_> = snapshot
         .responses
         .keys()
         .filter(|(owner, _)| owner == agent)
         .filter_map(|(_, request)| {
-            live_tail_response(snapshot, projection, agent, *request)
-                .map(|response| (*request, response))
+            let request = *request;
+            live_tail_response(snapshot, projection, agent, request)
+                .map(|response| (request, response))
         })
         .collect();
     responses.sort_by_key(|(request, _)| *request);
@@ -140,25 +145,25 @@ pub(super) fn live_tail_responses<'a>(
 }
 
 pub(super) fn response_entries(
-    request: u64,
+    request: RequestSeq,
     response: &ObservedResponse,
     view: &View,
     agent_name: &str,
 ) -> Vec<Entry> {
     let mut entries = Vec::new();
     for block in response.blocks() {
-        let (item, id) = (block.block.item.as_str(), block.block.block.as_str());
+        let key = block_key(ResponseRef::Request(request), &block.block);
         match block.kind {
             ItemKind::Reasoning if !block.text.trim().is_empty() => {
                 // Reasoning keeps streaming until a later block takes over or the
                 // response ends.
                 let entry = reasoning_entry(
-                    reasoning_key(request, item, id),
+                    key,
                     &block.text,
                     view,
                     if response.streaming(block) {
                         ReasoningStatus::Running
-                    } else if response.error.is_some() {
+                    } else if response.incomplete() {
                         ReasoningStatus::Incomplete
                     } else {
                         ReasoningStatus::Complete
@@ -167,22 +172,16 @@ pub(super) fn response_entries(
                 entries.push(entry);
             }
             ItemKind::Text if !block.text.trim().is_empty() => {
-                entries.push(Entry::new(
-                    response_block_key(request, item, id),
-                    format!(
-                        "{}\n{}",
-                        if response.error.is_some() {
-                            "Incomplete response"
-                        } else {
-                            agent_name
-                        },
-                        block.text,
-                    ),
-                    if response.error.is_some() {
-                        Surface::Error
-                    } else {
-                        Surface::Agent
-                    },
+                let (title, surface) = if response.incomplete() {
+                    ("Incomplete response", Surface::Error)
+                } else {
+                    (agent_name, Surface::Agent)
+                };
+                entries.push(Entry::titled(
+                    key,
+                    Title::plain(title),
+                    block.text.clone(),
+                    surface,
                 ));
             }
             _ => {}
@@ -193,61 +192,103 @@ pub(super) fn response_entries(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{response as apply, root};
+    use super::super::tests::{root, update};
     use super::*;
-    use skyhook::provider::protocol::{AssistantItem, Completion, ResponseEvent};
+    use skyhook::agent::{RuntimeEvent, Settlement, TurnFailure};
+    use skyhook::provider::protocol::{AssistantItem, BlockId, Completion, ItemId, ResponseEvent};
+    use skyhook::session::{MessageSeq, RequestSeq};
 
+    /// A settled answer of `text`, observed for a request that is never journaled.
     fn response(text: &str) -> ObservedResponse {
         let agent = root(1);
         let mut snapshot = ObservationSnapshot::default();
         let ended = Completion::answer(vec![AssistantItem::text("text", 0, text)]).unwrap();
-        apply(&mut snapshot, &agent, 4, ResponseEvent::End(ended));
-        snapshot.responses.remove(&(agent, 4)).unwrap()
+        let event = RuntimeEvent::ResponseEvent {
+            agent: agent.clone(),
+            request: RequestSeq::default(),
+            event: ResponseEvent::End(ended),
+        };
+        update(&mut snapshot, event);
+        snapshot
+            .responses
+            .remove(&(agent, RequestSeq::default()))
+            .unwrap()
     }
 
     #[test]
     fn reasoning_expansion_respects_defaults_and_explicit_overrides() {
         use ReasoningStatus::{Complete, Running};
         let mut view = View::default();
-        let key = reasoning_key(4, "item", "block");
+        let block = BlockRef {
+            item: ItemId::try_from("item".to_owned()).unwrap(),
+            block: BlockId::try_from("block".to_owned()).unwrap(),
+        };
+        let key = block_key(ResponseRef::Request(RequestSeq::default()), &block);
         let entry =
             |view: &View, text: &str, status| reasoning_entry(key.clone(), text, view, status);
         let active = entry(&view, "\nFirst\nSecond\r\n", Running);
-        assert_eq!(active.text(), "▾   Reasoning\nFirst\nSecond");
-        assert!(active.expandable() && active.default_open);
+        assert_eq!(active.title(), Some(&Title::disclosed("Reasoning", true)));
+        assert_eq!(active.body(), "First\nSecond");
+        assert_eq!(active.text(), "▾ Reasoning\nFirst\nSecond");
+        assert!(active.expandable() && active.default_open && active.running);
         view.set_expanded(key.clone(), false);
+        let collapsed = entry(&view, "First\nSecond", Running);
         assert_eq!(
-            entry(&view, "First\nSecond", Running).text(),
-            "▸   Reasoning"
+            collapsed.title(),
+            Some(&Title::disclosed("Reasoning", false))
         );
+        assert_eq!((collapsed.body(), collapsed.text()), ("", "▸ Reasoning"));
         view.clear_collapsed();
+        let complete = entry(&view, "First\nSecond", Complete);
         assert_eq!(
-            entry(&view, "First\nSecond", Complete).text(),
-            "▸ Reasoning"
+            complete.title(),
+            Some(&Title::disclosed("Reasoning", false))
         );
+        assert!(!complete.running && !complete.default_open);
         view.set_expanded(key.clone(), true);
-        assert!(
-            entry(&view, "First\nSecond", Complete)
-                .text()
-                .contains("Second")
+        assert_eq!(
+            entry(&view, "First\nSecond", Complete).body(),
+            "First\nSecond"
         );
-        assert!(!entry(&view, "single line", Complete).expandable());
+        let single = entry(&view, "single line", Complete);
+        assert!(!single.expandable() && single.title().is_none());
+        assert_eq!(single.text(), "single line");
     }
 
     #[test]
     fn text_visibility_preserves_whitespace_and_failed_response_attribution() {
-        let rows = |live: &ObservedResponse| response_entries(4, live, &View::default(), "Agent");
+        let rows = |live: &ObservedResponse| {
+            response_entries(RequestSeq::default(), live, &View::default(), "Agent")
+        };
         for text in ["", "\n\n", "  "] {
             assert!(rows(&response(text)).is_empty());
         }
-        let mut live = response("\n\n  Actual answer.\n");
-        for (error, label, surface) in [
-            (None, "Agent", Surface::Agent),
-            (Some("disconnected"), "Incomplete response", Surface::Error),
+        let blocks = response("\n\n  Actual answer.\n").blocks().to_vec();
+        let disconnected = TurnFailure::Other("disconnected".into());
+        for (how, label, surface) in [
+            (
+                Settlement::Committed(MessageSeq::default()),
+                "Agent",
+                Surface::Agent,
+            ),
+            (
+                Settlement::Aborted(MessageSeq::default()),
+                "Incomplete response",
+                Surface::Error,
+            ),
+            (
+                Settlement::Failed(disconnected),
+                "Incomplete response",
+                Surface::Error,
+            ),
         ] {
-            live.error = error.map(Into::into);
+            let live = ObservedResponse::Settled {
+                blocks: blocks.clone(),
+                how,
+            };
             let rows = rows(&live);
-            assert_eq!(rows[0].text(), format!("{label}\n\n\n  Actual answer.\n"));
+            assert_eq!(rows[0].title(), Some(&Title::plain(label)));
+            assert_eq!(rows[0].body(), "\n\n  Actual answer.\n");
             assert_eq!(rows[0].surface, surface);
         }
     }

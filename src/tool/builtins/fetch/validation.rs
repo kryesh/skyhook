@@ -16,7 +16,8 @@ use super::{Auth, FetchArgs, HeaderValues, MAX_BYTES, ResponseFormat};
 pub(in crate::tool::builtins) struct HttpRequestUrl(Url);
 impl HttpRequestUrl {
     pub(in crate::tool::builtins) fn parse(value: &str) -> Result<Self, AdmissionError> {
-        let url = Url::parse(value).map_err(|_| AdmissionError::invalid("invalid absolute URL"))?;
+        let url = Url::parse(value)
+            .map_err(|_| AdmissionError::invalid_arguments("invalid absolute URL"))?;
         Self::admit(url)
     }
     fn admit(mut url: Url) -> Result<Self, AdmissionError> {
@@ -70,12 +71,12 @@ impl SanitizedOrigin {
 
 fn check_url(url: &Url) -> Result<(), AdmissionError> {
     if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
-        return Err(AdmissionError::invalid(
+        return Err(AdmissionError::invalid_arguments(
             "URL must use HTTP or HTTPS and have a host",
         ));
     }
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(AdmissionError::invalid(
+        return Err(AdmissionError::invalid_arguments(
             "embedded URL credentials are not supported; use auth",
         ));
     }
@@ -87,25 +88,29 @@ fn validate_options(args: &FetchArgs) -> Result<(), AdmissionError> {
         || args.connect_timeout == 0
         || args.connect_timeout > 3600
     {
-        return Err(AdmissionError::invalid(
+        return Err(AdmissionError::invalid_arguments(
             "timeouts must be between 1 and 3600 seconds",
         ));
     }
     if args.max_bytes == 0 || args.max_bytes > MAX_BYTES {
-        return Err(AdmissionError::invalid(
+        return Err(AdmissionError::invalid_arguments(
             "max_bytes must be between 1 and 104857600",
         ));
     }
     if args.max_redirects > 20 {
-        return Err(AdmissionError::invalid("max_redirects must not exceed 20"));
+        return Err(AdmissionError::invalid_arguments(
+            "max_redirects must not exceed 20",
+        ));
     }
     if args.text && (args.save_to.is_some() || args.response_format == ResponseFormat::Base64) {
-        return Err(AdmissionError::invalid(
+        return Err(AdmissionError::invalid_arguments(
             "text conflicts with save_to and response_format base64",
         ));
     }
     if args.overwrite && args.save_to.is_none() {
-        return Err(AdmissionError::invalid("overwrite requires save_to"));
+        return Err(AdmissionError::invalid_arguments(
+            "overwrite requires save_to",
+        ));
     }
     Ok(())
 }
@@ -113,10 +118,11 @@ fn validate_options(args: &FetchArgs) -> Result<(), AdmissionError> {
 fn request_headers(args: &FetchArgs) -> Result<HeaderMap, AdmissionError> {
     let mut headers = HeaderMap::new();
     for (key, values) in &args.headers {
-        let name = HeaderName::from_bytes(key.as_bytes()).map_err(AdmissionError::invalid)?;
+        let name =
+            HeaderName::from_bytes(key.as_bytes()).map_err(AdmissionError::invalid_arguments)?;
         // Let the HTTP implementation compute framing; conflicting framing is unsafe.
         if matches!(name.as_str(), "content-length" | "transfer-encoding") {
-            return Err(AdmissionError::invalid(
+            return Err(AdmissionError::invalid_arguments(
                 "content-length and transfer-encoding are managed by fetch",
             ));
         }
@@ -127,20 +133,20 @@ fn request_headers(args: &FetchArgs) -> Result<HeaderMap, AdmissionError> {
         for value in values {
             headers.append(
                 name.clone(),
-                HeaderValue::from_str(value).map_err(AdmissionError::invalid)?,
+                HeaderValue::from_str(value).map_err(AdmissionError::invalid_arguments)?,
             );
         }
     }
     if let Some(auth) = &args.auth {
         if headers.contains_key("authorization") {
-            return Err(AdmissionError::invalid(
+            return Err(AdmissionError::invalid_arguments(
                 "auth conflicts with the authorization header",
             ));
         }
         let value = match auth {
             Auth::Basic { username, password } => {
                 if username.contains(':') {
-                    return Err(AdmissionError::invalid(
+                    return Err(AdmissionError::invalid_arguments(
                         "basic auth username must not contain ':'",
                     ));
                 }
@@ -151,7 +157,7 @@ fn request_headers(args: &FetchArgs) -> Result<HeaderMap, AdmissionError> {
             }
             Auth::Bearer { token } => format!("Bearer {token}"),
         };
-        let mut value = HeaderValue::from_str(&value).map_err(AdmissionError::invalid)?;
+        let mut value = HeaderValue::from_str(&value).map_err(AdmissionError::invalid_arguments)?;
         value.set_sensitive(true);
         headers.insert("authorization", value);
     }
@@ -242,7 +248,8 @@ impl TryFrom<FetchArgs> for FetchPlan {
     fn try_from(args: FetchArgs) -> Result<Self, AdmissionError> {
         // Preserve the admission error ordering of URL, method, options and headers.
         let mut url = HttpRequestUrl::parse(&args.url)?;
-        let method = Method::from_bytes(args.method.as_bytes()).map_err(AdmissionError::invalid)?;
+        let method = Method::from_bytes(args.method.as_bytes())
+            .map_err(AdmissionError::invalid_arguments)?;
         validate_options(&args)?;
         let headers = request_headers(&args)?;
         url.append_query(&args.query);

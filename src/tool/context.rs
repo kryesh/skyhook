@@ -133,8 +133,8 @@ impl ToolContext {
                 tool,
                 arguments,
             } => Ok((coordinator, tool, arguments)),
-            Authority::UnavailableForResume => Err(AdmissionError::Denied(
-                "runtime authorization is unavailable".to_owned(),
+            Authority::UnavailableForResume => Err(AdmissionError::denied(
+                "runtime authorization is unavailable",
             )),
         }
     }
@@ -149,17 +149,7 @@ impl ToolContext {
         coordinator
             .authorize(&self.subject, tool.to_owned(), permissions, arguments)
             .await
-            .map_err(|error| {
-                use super::authorization::AuthorizationError;
-                match error {
-                    AuthorizationError::Cancelled => AdmissionError::Cancelled,
-                    AuthorizationError::Denied(reason)
-                    | AuthorizationError::InvalidGrant(reason) => AdmissionError::Denied(reason),
-                    AuthorizationError::Unavailable => {
-                        AdmissionError::Denied("required capability is unavailable".to_owned())
-                    }
-                }
-            })
+            .map_err(AdmissionError::from)
     }
 
     /// Approve a redirect destination before connecting to it. Callers must pass
@@ -220,8 +210,8 @@ impl ToolContext {
     pub async fn receive(&self) -> Result<Value, ToolError> {
         let mut input = self.input.lock().await;
         tokio::select! {
-            received = input.recv() => received.ok_or(ToolError::InputClosed),
-            () = self.cancelled() => Err(ToolError::Cancelled),
+            received = input.recv() => received.ok_or(ToolError::input_closed()),
+            () = self.cancelled() => Err(ToolError::cancelled()),
         }
     }
 
@@ -261,7 +251,7 @@ pub struct ToolOutput {
     #[serde(skip)]
     pub(crate) streams: StreamEnd,
     #[serde(skip)]
-    pub(crate) diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
+    pub(crate) diagnostic: Option<crate::tool::diagnostic::PartialDiagnostic>,
 }
 
 impl ToolOutput {
@@ -279,7 +269,7 @@ impl ToolOutput {
     /// Register the builtin read result's error-message slot for presentation.
     pub(crate) fn with_diagnostic(
         mut self,
-        diagnostic: crate::tool::diagnostic::Diagnostic,
+        diagnostic: crate::tool::diagnostic::PartialDiagnostic,
     ) -> Self {
         self.diagnostic = Some(diagnostic);
         self
@@ -304,12 +294,13 @@ impl ToolOutput {
     }
 }
 
-#[derive(
-    Clone, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum DenialCode {
-    PermissionDenied,
+crate::named_enum::named_enum! {
+    #[derive(
+        Clone, Copy, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
+    )]
+    pub enum DenialCode {
+        PermissionDenied = "permission_denied",
+    }
 }
 
 pub type ToolError = crate::tool::invocation::OperationError<ToolOutput>;

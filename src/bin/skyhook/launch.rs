@@ -4,14 +4,14 @@ use super::{
     interaction::{HostApprovalPolicy, UiInteraction},
 };
 use skyhook::{
-    agent::SessionHandle,
+    agent::{HarnessError, SessionHandle},
     bounded_io::BoundedReadError,
-    config::{Config, ConfiguredModel, RuntimeConfig},
+    config::{Config, ConfigError, ConfiguredModel, RuntimeConfig},
     identity::SessionId,
     media::{Attachment, Image, ImageFormat, MAX_IMAGE_BYTES},
     remote::EmbeddedShimCatalog,
-    session::SessionStore,
-    tool::policy::{AllowAll, Capability, CapabilitySet},
+    session::{SessionError, SessionStore},
+    tool::policy::{AllowAll, Capability, CapabilitySet, Policy},
 };
 use std::{
     path::{Path, PathBuf},
@@ -83,6 +83,41 @@ pub(crate) enum Permissions {
     Exact(CapabilitySet),
 }
 
+impl Permissions {
+    /// A batch job's permissions. A resumed session knows modes the configuration
+    /// may no longer have; it admits the name when a message selects it.
+    pub(crate) fn for_batch(
+        args: &cli::PermissionArgs,
+        resumed: bool,
+        config: &RuntimeConfig,
+    ) -> Result<Self, ConfigError> {
+        Ok(match args {
+            cli::PermissionArgs::Mode(Some(mode)) if resumed => Self::Mode(mode.clone()),
+            cli::PermissionArgs::Mode(mode) => {
+                Self::Mode(config.select_mode(mode.as_deref())?.to_owned())
+            }
+            cli::PermissionArgs::Exact(capabilities) => {
+                Self::Exact(capabilities.iter().copied().collect())
+            }
+        })
+    }
+}
+
+/// Why a session could not be created or resumed.
+#[derive(Debug, thiserror::Error)]
+pub enum LaunchError {
+    #[error(transparent)]
+    Session(#[from] SessionError),
+    #[error("Model profile {0} is missing. Restore it in the configuration before resuming.")]
+    MissingProfile(String),
+    #[error("Unknown model profile: {0}")]
+    UnknownProfile(String),
+    #[error(transparent)]
+    Config(#[from] ConfigError),
+    #[error(transparent)]
+    Harness(#[from] HarnessError),
+}
+
 #[derive(Clone)]
 pub struct Launch {
     pub model: ConfiguredModel,
@@ -94,24 +129,20 @@ pub struct Launch {
     pub(crate) approve_all: bool,
 }
 impl Launch {
-    pub async fn create(&self, resume: Option<SessionId>) -> Result<SessionHandle, String> {
+    pub async fn create(&self, resume: Option<SessionId>) -> Result<SessionHandle, LaunchError> {
         let mut model = self.model.clone();
         if let Some(id) = resume {
-            let summary = SessionStore::summary(&self.sessions, id)
-                .await
-                .map_err(|e| e.to_string())?;
-            if let Some(m) = summary.model {
-                model = self.model.config().select_model(&m).map_err(|_| {
-                    format!(
-                        "Model profile {m} is missing. Restore it in the configuration before resuming."
-                    )
-                })?;
+            let summary = SessionStore::summary(&self.sessions, id).await?;
+            if let Some(name) = summary.model {
+                model = self
+                    .model
+                    .config()
+                    .select_model(&name)
+                    .map_err(|_| LaunchError::MissingProfile(name))?;
             }
         }
         let capabilities = self.ceiling(model.config().config(), resume.is_some());
-        let builder = model
-            .harness_builder(&self.workspace)
-            .map_err(|e| e.to_string())?;
+        let builder = model.harness_builder(&self.workspace)?;
         let builder = match &self.permissions {
             // A resumed session continues in its own mode, which may not be configured.
             Permissions::Mode(_) if resume.is_some() => builder,
@@ -124,14 +155,15 @@ impl Launch {
             .session_root(self.sessions.clone())
             .shim_catalog(self.catalog.clone())
             .capabilities(capabilities.clone());
-        let builder = if self.approve_all {
-            builder.policy(Arc::new(AllowAll))
-        } else {
-            builder.policy(Arc::new(HostApprovalPolicy::new(
+        let policy: Arc<dyn Policy> = match (&self.interaction, self.approve_all) {
+            (_, true) => Arc::new(AllowAll),
+            (None, false) => Arc::new(HostApprovalPolicy::Unattended),
+            (Some(ui), false) => Arc::new(HostApprovalPolicy::Attended {
                 capabilities,
-                self.interaction.as_deref().cloned(),
-            )))
+                ui: (**ui).clone(),
+            }),
         };
+        let builder = builder.policy(policy);
         let builder = if let Some(interaction) = &self.interaction {
             builder
                 .question_handler(interaction.clone())
@@ -139,23 +171,15 @@ impl Launch {
         } else {
             builder
         };
-        let harness = builder.build().await.map_err(|e| e.to_string())?;
-        match resume {
-            Some(id) => harness.resume_session(id).await,
-            None => harness.new_session().await,
-        }
-        .map_err(|e| e.to_string())
+        let harness = builder.build().await?;
+        Ok(match resume {
+            Some(id) => harness.resume_session(id).await?,
+            None => harness.new_session().await?,
+        })
     }
 }
 
 impl Launch {
-    pub(crate) fn mode(&self) -> Option<&str> {
-        match &self.permissions {
-            Permissions::Mode(mode) => Some(mode),
-            Permissions::Exact(_) => None,
-        }
-    }
-
     /// The most the session can hold. The terminal can switch between every mode; a
     /// new batch job keeps its own, and a resumed session is held to what it started
     /// with. Human interaction is a runtime fact, never configured.
@@ -210,11 +234,11 @@ pub fn select_model(
     config: &RuntimeConfig,
     explicit: Option<&str>,
     saved: Option<&str>,
-) -> Result<ConfiguredModel, String> {
+) -> Result<ConfiguredModel, LaunchError> {
     if let Some(name) = explicit {
         return config
             .select_model(name)
-            .map_err(|_| format!("Unknown model profile: {name}"));
+            .map_err(|_| LaunchError::UnknownProfile(name.to_owned()));
     }
     Ok(saved
         .and_then(|name| config.select_model(name).ok())
@@ -225,21 +249,9 @@ impl Launch {
     pub async fn from_request(
         request: &cli::ExecutionRequest,
         model: ConfiguredModel,
+        permissions: Permissions,
         interaction: Option<Arc<UiInteraction>>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let permissions = match &request.permissions {
-            // A resumed session knows modes the configuration may no longer have; it
-            // admits the name when a message selects it.
-            cli::PermissionArgs::Mode(Some(mode)) if request.resume.is_some() => {
-                Permissions::Mode(mode.clone())
-            }
-            cli::PermissionArgs::Mode(mode) => {
-                Permissions::Mode(model.config().select_mode(mode.as_deref())?.to_owned())
-            }
-            cli::PermissionArgs::Exact(capabilities) => {
-                Permissions::Exact(capabilities.iter().copied().collect())
-            }
-        };
         let request = &request.config;
         let workspace = tokio::fs::canonicalize(&request.workspace).await?;
         // CLI history belongs only to the selected workspace, never to an
@@ -275,7 +287,8 @@ mod tests {
         let Invocation::Interactive(request, _) = cli::parse_from(args).unwrap() else {
             panic!("interactive request")
         };
-        Launch::from_request(&request, config.first_model(), None)
+        let mode = Permissions::Mode(config.default_mode().to_owned());
+        Launch::from_request(&request.execution, config.first_model(), mode, None)
             .await
             .unwrap()
     }
@@ -302,8 +315,11 @@ mod tests {
                 &config.config().models[expected]
             ));
         }
-        let unknown = select_model(&config, Some("removed"), Some("another")).err();
-        assert_eq!(unknown.unwrap(), "Unknown model profile: removed");
+        let Err(unknown) = select_model(&config, Some("removed"), Some("another")) else {
+            panic!("an explicit unknown profile is rejected");
+        };
+        assert!(matches!(&unknown, LaunchError::UnknownProfile(name) if name == "removed"));
+        assert_eq!(unknown.to_string(), "Unknown model profile: removed");
 
         // Persist names, not handles: the same name after reload belongs to the
         // newly admitted generation, even while an earlier selection is alive.
@@ -337,8 +353,12 @@ mod tests {
         let profile = reloaded.models.shift_remove("test").unwrap();
         reloaded.models.insert("replacement".into(), profile);
         let launch = launch(root.path(), &reloaded.into_runtime().unwrap()).await;
+        let Err(missing) = launch.create(Some(id)).await else {
+            panic!("a missing recorded profile is reported");
+        };
+        assert!(matches!(&missing, LaunchError::MissingProfile(name) if name == "test"));
         assert_eq!(
-            launch.create(Some(id)).await.err().unwrap(),
+            missing.to_string(),
             "Model profile test is missing. Restore it in the configuration before resuming."
         );
         // A valid new selection remains usable; stale history is not silently

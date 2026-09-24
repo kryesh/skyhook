@@ -10,14 +10,14 @@ use tokio::sync::Mutex;
 use crate::{
     execution::ExecutionLocation,
     job::CancellationToken,
-    remote::{EmbeddedShimCatalog, SensitivePromptHandler},
-    target::{ResolvedRoute, RouteIdentity},
+    remote::{EmbeddedShimCatalog, ProtocolError, SensitivePromptHandler},
+    target::{ResolvedRoute, RouteIdentity, TargetName},
     tool::{ToolContext, ToolOutput, authorization::AuthorizationCoordinator},
 };
 
 pub(crate) use super::client::PooledConnection;
 pub(super) use super::client::Session;
-pub use super::error::RemoteError;
+pub(crate) use super::error::RemoteError;
 
 #[derive(Clone)]
 pub(crate) struct RemoteManager {
@@ -58,8 +58,10 @@ impl PreparedConnection {
         arguments: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolOutput, RemoteError> {
-        let destination =
-            ExecutionLocation::named(self.key.route.destination(), self.key.workspace.clone());
+        let destination = ExecutionLocation::named(
+            self.key.route.destination().clone(),
+            self.key.workspace.clone(),
+        );
         let result = self
             .connection
             .execute(name, arguments, context, destination)
@@ -201,12 +203,12 @@ impl RemoteManager {
         }
     }
 
-    pub(crate) async fn invalidate(&self, names: &[String]) {
+    pub(crate) async fn invalidate(&self, names: &[TargetName]) {
         self.inner
             .pool
             .lock()
             .await
-            .retain(|key, _| !names.iter().any(|name| name == key.route.destination()));
+            .retain(|key, _| !names.contains(key.route.destination()));
     }
 
     async fn connect(
@@ -214,17 +216,16 @@ impl RemoteManager {
         resolved_route: &ResolvedRoute,
         workspace: &Path,
     ) -> Result<Session, RemoteError> {
-        let target = resolved_route.destination().name.as_str();
+        let target = &resolved_route.destination().name;
         let route = resolved_route.definitions();
         // The destination's origin starts this connection's SSH process on its shim;
         // the hops after it are native jumps of that process.
         let (origin, hops) = match &resolved_route.destination().origin {
             None => (None, route),
             Some(origin) => {
-                let index = route
-                    .iter()
-                    .position(|hop| &hop.name == origin)
-                    .ok_or_else(|| RemoteError::Protocol("origin missing from route".into()))?;
+                let index = route.iter().position(|hop| &hop.name == origin).ok_or(
+                    RemoteError::Protocol(ProtocolError::Violation("origin missing from route")),
+                )?;
                 let prefix = ResolvedRoute::from_definitions(route[..=index].to_vec())
                     .expect("inclusive route prefix is nonempty");
                 let cancellation = CancellationToken::new();
@@ -312,8 +313,12 @@ pub(crate) mod tests {
                 self.origins.lock().unwrap().push(Arc::downgrade(origin));
             }
             self.requests.lock().unwrap().push(RecordedRequest {
-                target: request.route.last().unwrap().name.clone(),
-                route: request.route.iter().map(|hop| hop.name.clone()).collect(),
+                target: request.route.last().unwrap().name.to_string(),
+                route: request
+                    .route
+                    .iter()
+                    .map(|hop| hop.name.to_string())
+                    .collect(),
                 has_origin: request.origin.is_some(),
                 workspace: request.workspace,
             });
@@ -513,7 +518,7 @@ pub(crate) mod tests {
                 for event in [
                     CaptureEvent::Open {
                         id: CaptureId::FIRST,
-                        field: "/result/content".into(),
+                        field: "/result/content".parse().unwrap(),
                         kind: crate::job::output::CaptureKind::Text,
                     },
                     CaptureEvent::Write {
@@ -701,13 +706,13 @@ pub(crate) mod tests {
         let manager = manager(factory.clone());
         let origin = TargetDefinition::test("origin", "/origin", None);
         let mut via = TargetDefinition::test("via", "/via", None);
-        via.origin = Some("origin".into());
+        via.origin = Some("origin".parse().unwrap());
         // The jump belongs to the SSH process the destination's origin starts.
         let mut destination = TargetDefinition::test("build", "/build", Some("via"));
-        destination.origin = Some("origin".into());
+        destination.origin = Some("origin".parse().unwrap());
         // Origins nest: deep's SSH process runs on build's shim.
         let mut deep = TargetDefinition::test("deep", "/deep", None);
-        deep.origin = Some("build".into());
+        deep.origin = Some("build".parse().unwrap());
         let route = route(vec![origin, via, destination, deep]);
         let cancellation = CancellationToken::new();
         let prepared = manager.connection(route, Path::new("/override"), &cancellation);
@@ -725,7 +730,7 @@ pub(crate) mod tests {
         });
         assert_eq!(*factory.requests.lock().unwrap(), expected);
         let origin = factory.origins.lock().unwrap()[0].clone();
-        manager.invalidate(&["origin".into()]).await;
+        manager.invalidate(&["origin".parse().unwrap()]).await;
         assert!(
             origin.upgrade().is_some(),
             "child stream must retain its origin"

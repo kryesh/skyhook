@@ -25,6 +25,15 @@ enum ChildPhase {
     Parked,
 }
 
+/// Who took a child's answer when its invocation completed.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Handoff {
+    /// The waiter has it, so the owning job finishes and wakes the owner itself.
+    Waiter,
+    /// Consumed callback-free; the owner still needs a wake.
+    Consumed,
+}
+
 /// Replace a child's phase, yielding the waiter the old phase held.
 fn take_completion(phase: &mut ChildPhase, next: ChildPhase) -> Option<Completion> {
     match std::mem::replace(phase, next) {
@@ -34,6 +43,10 @@ fn take_completion(phase: &mut ChildPhase, next: ChildPhase) -> Option<Completio
 }
 
 impl DriverPhase {
+    fn is_child(&self) -> bool {
+        matches!(self, Self::Child(_))
+    }
+
     fn parked(&self) -> bool {
         matches!(
             self,
@@ -67,7 +80,7 @@ impl DriverPhase {
 
     // Parking is unconditional; the returned flag is only whether the failure
     // reached this invocation's waiter, which is what finishes the owning job.
-    fn fail(&mut self, error: RequestFailure) -> bool {
+    fn fail(&mut self, error: TurnFailure) -> bool {
         let phase = match self {
             Self::Root { parked } => {
                 *parked = true;
@@ -83,10 +96,8 @@ impl DriverPhase {
 
     // Consume the answer even without a waiter. Empty mailbox wakeups after
     // completion must not publish AgentCompleted again for this invocation.
-    // `None` means there was no answer to consume; `Some(true)` handed it to the
-    // waiter, so the owning job finishes and its own completion wakes the owner;
-    // `Some(false)` consumed it callback-free, leaving the owner to be woken here.
-    fn complete(&mut self) -> Option<bool> {
+    // `None` means there was no answer to consume.
+    fn complete(&mut self) -> Option<Handoff> {
         let Self::Child(phase @ ChildPhase::Answered { .. }) = self else {
             return None;
         };
@@ -96,9 +107,11 @@ impl DriverPhase {
             // The guard above matched Answered.
             return None;
         };
-        Some(match completion {
-            Some(completion) => completion.send(Ok(answer)).is_ok(),
-            None => false,
+        let handed = completion.is_some_and(|completion| completion.send(Ok(answer)).is_ok());
+        Some(if handed {
+            Handoff::Waiter
+        } else {
+            Handoff::Consumed
         })
     }
 }
@@ -137,12 +150,12 @@ impl SessionRuntime {
         owner_job: Option<JobId>,
         phase: &mut DriverPhase,
     ) {
-        if let Some(handed) = phase.complete() {
+        if let Some(handoff) = phase.complete() {
             let _ = self
                 .store
                 .append(id.clone(), SessionEvent::AgentCompleted)
                 .await;
-            if !handed {
+            if handoff == Handoff::Consumed {
                 self.wake_owner(owner_job).await;
             }
         }
@@ -167,7 +180,7 @@ impl SessionRuntime {
         } else {
             DriverPhase::Root { parked: false }
         };
-        let child = matches!(phase, DriverPhase::Child(_));
+        let child = phase.is_child();
         let owner_cancellation = match owner_job {
             Some(job) => match self.jobs.cancellation_token(job).await {
                 Ok(token) => token,
@@ -189,7 +202,7 @@ impl SessionRuntime {
                         // The cancelled owning job finishes and wakes the owner for
                         // whatever is still pending; with no waiter nothing finishes
                         // it, so a retained reply needs the explicit wake.
-                        let failure = RequestFailure::Failed("child agent cancelled".to_owned());
+                        let failure = TurnFailure::Other("child agent cancelled".to_owned());
                         if !phase.fail(failure) {
                             self.wake_owner(owner_job).await;
                         }
@@ -233,16 +246,16 @@ impl SessionRuntime {
             };
             let (content, done, options) = match command {
                 AgentCommand::QueuedInputs(inputs) => {
-                    let (consumed, failed) = self
+                    let batch = self
                         .consume_queued_batch(&mut turn, &mut context, &mut settings, inputs)
                         .await;
-                    if failed {
+                    if batch.failed {
                         queue::reject_pending(&mut rx, &mut deferred);
                     }
-                    if !consumed {
+                    if !batch.consumed {
                         continue;
                     }
-                    (Vec::new(), None, PromptOptions::default())
+                    (Vec::new(), None, Selection::default())
                 }
                 AgentCommand::Shutdown => {
                     let _ = self
@@ -261,11 +274,11 @@ impl SessionRuntime {
                         .pending_event_content(&id, turn.diagnostic_viewer())
                         .await
                     {
-                        Ok((content, messages)) if !content.is_empty() => {
-                            pending_events = Some(messages);
+                        Ok(Some((content, pending))) => {
+                            pending_events = Some(pending);
                             content
                         }
-                        Ok(_)
+                        Ok(None)
                             if matches!(phase, DriverPhase::Child(ChildPhase::Answered { .. }))
                                 && !self.jobs.has_running(&id).await =>
                         {
@@ -280,7 +293,7 @@ impl SessionRuntime {
                         }
                         _ => continue,
                     };
-                    (content, None, PromptOptions::default())
+                    (content, None, Selection::default())
                 }
             };
             let selected = self.select(&mut turn, &mut context, &mut settings, options, false);
@@ -297,7 +310,10 @@ impl SessionRuntime {
             if !content.is_empty() {
                 let message = Message::User(content);
                 let committed = match pending_events {
-                    Some(messages) => messages.commit().await,
+                    Some(pending) => pending
+                        .commit(message.clone())
+                        .await
+                        .map_err(HarnessError::from),
                     None => self
                         .commit(&id, message.clone())
                         .await
@@ -319,7 +335,8 @@ impl SessionRuntime {
                 }
                 context
                     .projected
-                    .push((committed.expect("commit succeeded"), message));
+                    .messages
+                    .push((committed.expect("commit succeeded").into(), message));
             }
             let result = tokio::select! {
                 biased;
@@ -372,8 +389,7 @@ impl SessionRuntime {
             self.activity(
                 &id,
                 match &result {
-                    Err(HarnessError::Interrupted) => AgentActivity::Interrupted,
-                    Err(error) => AgentActivity::Failed(error.to_string()),
+                    Err(error) => AgentActivity::Stopped(error.into()),
                     Ok(_) if child && self.jobs.has_running(&id).await => {
                         AgentActivity::WaitingChildren
                     }
@@ -381,12 +397,7 @@ impl SessionRuntime {
                 },
             );
             if let Some(done) = done {
-                let _ = done.send(
-                    result
-                        .as_ref()
-                        .map(Clone::clone)
-                        .map_err(RequestFailure::from),
-                );
+                let _ = done.send(result.as_ref().map(Clone::clone).map_err(TurnFailure::from));
             }
             if !child && let Err(error) = &result {
                 phase.fail(error.into());
@@ -402,7 +413,7 @@ impl SessionRuntime {
                     // An interrupted turn can still have published visible text
                     // (a shielded commit outlives the cancelled turn), so the owner
                     // is woken unless the waiter finishes the job for us.
-                    if !phase.fail(RequestFailure::Interrupted) {
+                    if !phase.fail(TurnFailure::Interrupted) {
                         self.wake_owner(owner_job).await;
                     }
                     let _ = self
@@ -459,7 +470,7 @@ impl SessionRuntime {
 mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
-    use crate::job::{JobOutcome, JobSpec, JobState};
+    use crate::job::{JobEnd, JobOutcome, JobSpec, JobState};
     use crate::tool::{ToolOptions, ToolOutput, ToolRegistryBuilder};
 
     #[tokio::test(start_paused = true)]
@@ -500,7 +511,8 @@ mod tests {
         let output = jobs.snapshot(agent_job.id).await.unwrap().output;
         assert_eq!(output, Some(json!(final_answer)));
         let requests = requests.lock().unwrap();
-        let mut lines = request_runtime_state(&requests[2]).lines().skip(1);
+        let state = request_runtime_state(&requests[2]);
+        let mut lines = state.lines().skip(1);
         let header = "jobs: job parent tool name state age_s turns tool_calls";
         assert_eq!(lines.next(), Some(header));
         let fields = lines.next().unwrap().split(' ').collect::<Vec<_>>();
@@ -513,7 +525,7 @@ mod tests {
         assert!(lines.next().is_none(), "empty todos are omitted");
         let last = requests.last().unwrap();
         let mut results = last.history.iter().flat_map(|message| match message {
-            Message::Tool(results) => results.as_slice(),
+            Sent::Tool(results) => results.as_slice(),
             _ => &[],
         });
         let result = results.find(|result| result.name == "agent").unwrap();
@@ -594,7 +606,7 @@ mod tests {
             Some(&crate::agent::AgentActivity::WaitingChildren)
         );
         let records = session.runtime.store.records().await;
-        let interrupted = count!(&records, SessionEvent::JobFinished { state, .. } if *state == JobState::Interrupted);
+        let interrupted = count!(&records, SessionEvent::JobFinished { state, .. } if *state == JobEnd::Interrupted);
         assert_eq!(interrupted, 2);
         // Only an interrupted stream, never an interrupted startup, journals usage.
         let children = records.iter().filter(|record| record.agent != session.root);
@@ -609,9 +621,9 @@ mod tests {
         let resumed = resumed_jobs.iter().map(|job| job.id);
         assert!(resumed.eq(original_jobs.iter().map(|job| job.id)));
         assert!(resumed_jobs.iter().all(|j| j.state == JobState::Running));
-        let parent_input = |message: &Message| {
-            matches!(message, Message::User(content)
-            if content.iter().any(|part| matches!(part, UserContent::ParentInput { .. })))
+        let parent_input = |message: &Sent| {
+            matches!(message, Sent::User(content)
+            if content.iter().any(|part| matches!(part, SentPart::Text { text } if text.starts_with("Owner input:"))))
         };
         for request in &requests.lock().unwrap()[3..5] {
             let history = &request.history;
@@ -818,11 +830,11 @@ mod tests {
             if aborted {
                 assert!(matches!(&failed.diagnostic.as_ref().unwrap().cause,
                     crate::tool::diagnostic::Cause::Message(message) if message == "provider aborted response"));
-                // A rejected model selection neither replays nor unparks the child.
+                // A rejected selection neither replays nor unparks the child.
                 let sender = session.runtime.agents.read().unwrap()[&child]
                     .sender
                     .clone();
-                mailbox_barrier(&sender).await;
+                mailbox_barrier(&session, &sender).await;
                 assert_eq!(requests.lock().unwrap().len(), 2);
             }
             let retry = format!("return tool.job({job}).send({{value:'try again'}});");
@@ -899,7 +911,7 @@ mod tests {
                 assert!(text.contains(expected), "missing {expected}: {text}");
             }
             assert!(
-                matches!(history.last(), Some(Message::User(content)) if matches!(&content[0], UserContent::ParentInput {text} if text.contains("follow-up two")))
+                matches!(history.last(), Some(Sent::User(content)) if matches!(&content[0], SentPart::Text {text} if text.contains("follow-up two")))
             );
         }
         let records = session.runtime.store.records().await;
@@ -952,27 +964,34 @@ mod tests {
         session.runtime.jobs.claim(job).await.unwrap();
     }
 
-    fn input(model: Option<&str>, done: Option<Completion>) -> AgentCommand {
-        let model = model.map(str::to_owned);
-        let text = if model.is_some() { "" } else { "task" };
-        let content = vec![UserContent::Text { text: text.into() }];
+    fn input(text: &str, options: Selection, done: Option<Completion>) -> AgentCommand {
+        let content = vec![UserPart::Text { text: text.into() }];
         AgentCommand::Input {
-            options: PromptOptions { model, mode: None },
+            options,
             content,
             done,
         }
     }
 
     async fn child_input(sender: &AgentSender, done: Option<Completion>) {
-        sender.send(input(None, done)).await.unwrap();
+        let input = input("task", Selection::default(), done);
+        sender.send(input).await.unwrap();
     }
 
-    // A rejected selection acknowledges all earlier mailbox commands without
-    // invoking a provider, replacing a child waiter or starting another turn.
-    async fn mailbox_barrier(sender: &AgentSender) {
+    // A rejected selection (a mode, which only the root can enter) acknowledges all
+    // earlier mailbox commands without invoking a provider, replacing a child
+    // waiter or starting another turn.
+    async fn mailbox_barrier(session: &SessionHandle, sender: &AgentSender) {
         let (done, received) = oneshot::channel();
-        let rejected = input(Some("missing-driver-test-profile"), Some(done));
-        sender.send(rejected).await.unwrap();
+        let mode = SessionMode {
+            runtime: session.runtime.instance,
+            name: "driver-test-mode".into(),
+        };
+        let selection = Selection {
+            mode: Some(mode),
+            ..Default::default()
+        };
+        sender.send(input("", selection, Some(done))).await.unwrap();
         assert!(bounded(received).await.unwrap().is_err());
     }
 
@@ -1010,7 +1029,7 @@ mod tests {
         let mut events = session.runtime.events.observe().updates;
         child_input(&sender, Some(done)).await;
         wait_for_child_answer(&mut events, &child).await;
-        mailbox_barrier(&sender).await;
+        mailbox_barrier(&session, &sender).await;
         assert_eq!(completion_count(&session, &child).await, 0);
 
         let gate = completion_gate(&session, &child);
@@ -1023,7 +1042,7 @@ mod tests {
         let (committed, rejected) = oneshot::channel();
         let text = "cancelled update".to_owned();
         let queued = queue::QueuedInput {
-            content: vec![UserContent::Text { text }],
+            content: vec![UserPart::Text { text }],
             options: Default::default(),
             cancellation,
             committed,
@@ -1035,7 +1054,7 @@ mod tests {
         drop(completing);
         assert!(bounded(rejected).await.unwrap().is_err());
         assert_eq!(bounded(received).await.unwrap().unwrap(), "latest answer");
-        mailbox_barrier(&sender).await;
+        mailbox_barrier(&session, &sender).await;
         assert_eq!(completion_count(&session, &child).await, 1);
         // Rejected input must not run another model turn.
         assert_eq!(requests.lock().unwrap().len(), 2);
@@ -1052,7 +1071,7 @@ mod tests {
         let mut events = session.runtime.events.observe().updates;
         child_input(&sender, None).await;
         wait_for_child_answer(&mut events, &child).await;
-        mailbox_barrier(&sender).await;
+        mailbox_barrier(&session, &sender).await;
         let gate = completion_gate(&session, &child);
         let completing = gate.lock().await;
         claim_completed(&session, background).await;
@@ -1060,16 +1079,16 @@ mod tests {
             sender.send(AgentCommand::JobsReady).await.unwrap();
         }
         drop(completing);
-        mailbox_barrier(&sender).await;
+        mailbox_barrier(&session, &sender).await;
         assert_eq!(completion_count(&session, &child).await, 1);
         assert_eq!(requests.lock().unwrap().len(), 1);
 
         // Idle stays resumable, with one fresh completion rather than the consumed one.
         child_input(&sender, None).await;
         wait_for_child_answer(&mut events, &child).await;
-        mailbox_barrier(&sender).await;
+        mailbox_barrier(&session, &sender).await;
         sender.send(AgentCommand::JobsReady).await.unwrap();
-        mailbox_barrier(&sender).await;
+        mailbox_barrier(&session, &sender).await;
         assert_eq!(completion_count(&session, &child).await, 2);
         assert_eq!(requests.lock().unwrap().len(), 2);
         drop(root_inbox);

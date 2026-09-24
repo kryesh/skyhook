@@ -2,7 +2,8 @@
 use super::config::{SshConfig, shell_quote, ssh_command};
 use crate::{
     remote::{
-        RemoteError, SensitivePromptHandler, backend::ProcessEnvironment, transport::Transport,
+        DeploymentError, Platform, RemoteError, SensitivePromptHandler, ShimProtocol,
+        backend::ProcessEnvironment, transport::Transport,
     },
     target::TargetDefinition,
 };
@@ -25,7 +26,7 @@ pub(crate) async fn open(
     let target = route.last().ok_or(RemoteError::EmptyRoute)?;
     let prompts = Arc::new(ContextPrompts {
         inner: prompts,
-        target: target.name.clone(),
+        target: target.name.to_string(),
     });
     let external_agent = std::env::var("SSH_AUTH_SOCK").ok();
     let config = SshConfig::create(route, environment, external_agent.as_deref(), prompts)?;
@@ -113,21 +114,22 @@ impl SshLauncher {
         let probe = self.output("uname -s; uname -m", &[]).await?;
         let mut lines = probe.lines();
         let (Some(os), Some(arch)) = (lines.next(), lines.next()) else {
-            return Err(RemoteError::Deployment(
-                "platform probe returned invalid output".into(),
-            ));
+            return Err(DeploymentError::Probe.into());
         };
-        let shim = catalog.find("ssh", arch, os).ok_or_else(|| {
-            RemoteError::Deployment(if catalog.is_empty() {
-                "this Skyhook build contains no remote shims (SSH targets are unavailable)".into()
+        let (os, arch) = (os.trim(), arch.trim());
+        let platform = Platform::parse(&os.to_ascii_lowercase(), &arch.to_ascii_lowercase())
+            .ok_or_else(|| DeploymentError::UnsupportedPlatform {
+                os: os.to_owned(),
+                arch: arch.to_owned(),
+            })?;
+        let protocol = ShimProtocol::Ssh;
+        let shim = catalog
+            .find(protocol, platform)
+            .ok_or(if catalog.is_empty() {
+                DeploymentError::NoShims
             } else {
-                format!(
-                    "no ssh shim is embedded for remote platform {}-{}",
-                    os.trim(),
-                    arch.trim()
-                )
-            })
-        })?;
+                DeploymentError::NoShim { protocol, platform }
+            })?;
         let hash = shim.sha256();
         let path = format!(".cache/skyhook/shims/{hash}/{}", shim.installed_name());
         let check = format!(
@@ -139,7 +141,7 @@ impl SshLauncher {
             .is_ok_and(|s| s.trim() == "skyhook-valid")
         {
             let mut random = [0; 8];
-            getrandom::fill(&mut random).map_err(|e| RemoteError::Deployment(e.to_string()))?;
+            getrandom::fill(&mut random).map_err(DeploymentError::Random)?;
             let temporary = format!(
                 ".cache/skyhook/shims/{hash}/.upload-{:016x}",
                 u64::from_ne_bytes(random)
@@ -148,7 +150,7 @@ impl SshLauncher {
                 "umask 077; d=\"$HOME/.cache/skyhook/shims/{hash}\"; t=\"$HOME/{temporary}\"; mkdir -p \"$d\" && trap 'rm -f \"$t\"' EXIT HUP INT TERM && cat > \"$t\" && chmod 700 \"$t\" && \"$t\" --self-check {hash} && mv -f \"$t\" \"$HOME/{path}\" && echo skyhook-installed"
             );
             if self.output(&command, &shim.bytes).await?.trim() != "skyhook-installed" {
-                return Err(RemoteError::Deployment("shim installation failed".into()));
+                return Err(DeploymentError::Install.into());
             }
         }
         let command = format!(

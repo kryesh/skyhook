@@ -41,6 +41,12 @@ calibration. Equivalent profiles keep the current context. A mode change also re
 prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
 context under the same context identity.
 
+The session owns the durable conversation (`session::Message`): user text and attachments, the
+agent's state (date, live jobs, todos), job events (child replies and presented job views),
+parent input and compaction summaries. Providers receive it rendered: state and job events
+become runtime text that joins the final turn, so the provider layer knows nothing about jobs
+or todos, and those renderers are part of the session format.
+
 Providers receive complete provider-neutral requests; they do not privately replay failed
 submissions. A `response_schema` must be transmitted as a structured-output constraint or
 rejected with `InvalidRequest`, not silently ignored or replaced with prompting. Input images
@@ -78,13 +84,19 @@ would look like the user speaking again after every tool call.
    terminal `End` holding the `Completion`: the complete items in position order and how the
    response ended (an answer, tool use, or a cut). Only a completion built for tool use carries
    tool calls, so nothing else can authorize execution. `LiveResponse` gives the runtime and
-   observers the same provisional view of the deltas until the end arrives.
+   observers the same provisional view of the deltas until the end arrives. Observers then see
+   each response settle as committed, committed-but-aborted, or failed, keyed by the journal
+   sequence it produced.
 3. Only an accepted response becomes model-visible history. Its message, usage, and outcome
    commit together before tool dispatch. Each tool result commits as its call finishes; request
    projection merges results back into the original call order. This preserves completed work
    after a crash without making completion order part of the next model request.
 4. Once a tool exchange is closed, the runtime can compact history or build the next request.
    An agent with no further work returns to its idle loop rather than discarding its context.
+
+Hosts fold these records into one `RequestPhase` per request in `session::RequestLedger`;
+session statistics and the terminal interface read request outcomes, retry state, and
+message attribution from that fold rather than deriving them from live activity.
 
 Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized `ProviderErrorKind` values rather than error-message text: rate limits, timeouts,
@@ -124,8 +136,11 @@ input and output schemas; registry metadata also supplies compact result documen
 model and JavaScript runtime. Both call paths use the same executor, capability checks,
 authorization coordinator, and job supervision rather than separate tool implementations.
 
-The executor coordinates host-owned jobs and persistence. The local invocation layer admits typed
-arguments and runs operations without requiring a session database. The SSH shim reuses that layer
+The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
+(queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
+are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
+its startup stage carries a job from creation to its running worker. The local invocation layer
+admits typed arguments and runs operations without requiring a session database. The SSH shim reuses that layer
 for remote built-ins while the host retains job ownership, policy decisions, and saved output.
 This separation keeps remote workers from becoming second agent runtimes.
 
@@ -138,8 +153,9 @@ cleanup. See [connection and request lifecycle](remote-transport-and-shims.md#co
 Tool failures are structured diagnostics: a typed cause plus the operation, subject, site, and
 known effects. Tools annotate facts; `tool::diagnostic` owns the one renderer. Facts chosen nearest
 the failure win, and each boundary (planning, dispatch, remote result ingestion) only fills what is
-missing. A worker's reported site is always rebound to the destination of the connection it arrived
-on.
+still unset: a failure carries a partial context in process and is resolved once, when it is
+persisted, sent over the wire, or rendered. A worker's reported site is always rebound to the
+destination of the connection it arrived on.
 
 Diagnostics are persisted with the job and rendered per viewer. Target aliases in structured job
 diagnostics and result slots registered by their producer, such as an expected `read` failure, are
@@ -176,8 +192,11 @@ management is enabled. SSH's host-mediated prompt channel is described under
 ## Durability and resume
 
 Each durable session uses one SQLite database, `session.db`. The event ledger is append-only and
-normalized; blobs, job output documents, and line-addressable captures share the database rather
-than separate transcript or output files. Related state transitions are appended transactionally
+normalized; blobs, job results, and line-addressable captures share the database rather than
+separate transcript or output files. Only shapes that a model, a tool's own schema or a provider
+defines are stored as JSON text: tool-call arguments and results, job arguments and output
+schemas, tool and response schemas, reasoning replay payloads, saved job results and the
+results and pages a job event presented. Related state transitions are appended transactionally
 before their in-memory projections are published. Accepted writer work is owned independently
 of the caller, so dropping an await does not cancel a commit already in progress.
 

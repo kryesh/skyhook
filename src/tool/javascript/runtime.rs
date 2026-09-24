@@ -16,7 +16,8 @@ use super::{bridge::HostResponse, console::ConsoleOutput};
 use crate::{
     media::ImageRef,
     tool::diagnostic::{Effects, FailureSite, Operation, Subject},
-    tool::executor::ToolExecutor,
+    tool::executor::{ExecutionError, ToolExecutor},
+    tool::registry::JobName,
     tool::{ToolContext, ToolError, ToolOutput},
 };
 
@@ -76,7 +77,7 @@ fn finish_evaluation(
             Ok(output)
         }
         (Err(error), Ok(console)) => {
-            let (diagnostic, mut output) = error.into_parts();
+            let (diagnostic, mut output) = error.into_facts();
             if let (Some(output), Some(console)) = (&mut output, console) {
                 output
                     .value
@@ -85,7 +86,7 @@ fn finish_evaluation(
                     .remove("console");
                 output.captures.push(console);
             }
-            Err(ToolError::from_diagnostic(diagnostic, output.map(Box::new)))
+            Err(ToolError::from_facts(diagnostic, output))
         }
         (Ok(output), Err(error)) => Err(console_failure(
             error.into(),
@@ -103,8 +104,8 @@ fn finish_evaluation(
                 Operation::FinishCapture,
                 Effects::OutputIncomplete,
             );
-            let (mut diagnostic, mut output) = error.into_parts();
-            diagnostic.context.effects = Effects::OutputIncomplete;
+            let (mut diagnostic, mut output) = error.into_facts();
+            diagnostic.context = diagnostic.context.effects(Effects::OutputIncomplete);
             if let Some(Value::String(stack)) = output
                 .as_mut()
                 .and_then(|output| output.value.pointer_mut("/failure/stack"))
@@ -112,7 +113,7 @@ fn finish_evaluation(
                 stack.push('\n');
                 stack.push_str(&secondary.to_string());
             }
-            Err(ToolError::from_diagnostic(diagnostic, output.map(Box::new)))
+            Err(ToolError::from_facts(diagnostic, output))
         }
     }
 }
@@ -148,7 +149,7 @@ fn javascript_error(error: JsError) -> ToolError {
         ),
     };
     let error = match error {
-        JsError::Cancelled => ToolError::Cancelled,
+        JsError::Cancelled => ToolError::cancelled(),
         JsError::Failure { message, details } => ToolError::with_output(
             message,
             super::result::script_output(Value::Null, Some(details), None),
@@ -264,25 +265,35 @@ async fn evaluate_inner(
                                     .then_some(tool.result_schema.as_ref())
                                     .flatten()
                             });
-                            let requested_name = arguments.get("name").and_then(Value::as_str).map(str::to_owned);
+                            let parent = Some(host_context.job());
+                            let requested = arguments.as_object().and_then(JobName::requested);
+                            // Failures before and after the job exists are ordinary
+                            // tool responses rather than JS exceptions.
+                            let failed = |error: ExecutionError, job_name| {
+                                error.into_response(
+                                    &name,
+                                    parent,
+                                    job_name,
+                                    host_context.diagnostic_viewer(),
+                                )
+                            };
                             let output = match host_executor
-                                .execute_script(
+                                .create_script(
                                     host_context.agent().clone(),
                                     &name,
                                     arguments,
-                                    Some(host_context.job()),
+                                    parent,
                                 )
                                 .await
                             {
-                                Ok(result) => result.output,
-                                // Preadmission failures have no job to collect, but are
-                                // still ordinary tool responses rather than JS exceptions.
-                                Err(error) => error.into_response(
-                                    &name,
-                                    Some(host_context.job()),
-                                    requested_name.as_deref(),
-                                    host_context.diagnostic_viewer(),
-                                ),
+                                Ok(created) => {
+                                    let job_name = created.job_name().cloned();
+                                    match host_executor.run(created).await {
+                                        Ok(result) => result.output,
+                                        Err(error) => failed(error, job_name),
+                                    }
+                                }
+                                Err(error) => failed(error, requested),
                             };
                             let annotations = schema
                                 .and_then(|schema| output.value.get("result").map(|value| (schema, value)))
@@ -342,24 +353,28 @@ async fn evaluate_inner(
     })?;
     let envelope: super::outcome::Envelope = serde_json::from_str(&encoded)
         .map_err(|error| javascript_error(JsError::InvalidOutput(error.to_string())))?;
-    if !envelope.ok {
-        let mut details = envelope.error;
-        map_failure_stack_lines(&mut details, user_start_line, user_line_count);
-        let message = details.get("message").and_then(Value::as_str).map_or_else(
-            || details.to_string(),
-            |message| {
-                format!(
-                    "{message}\n{}",
-                    details.get("stack").and_then(Value::as_str).unwrap_or("")
-                )
-            },
-        );
-        return Err(javascript_error(JsError::Failure {
-            message: map_script_lines(&message, user_start_line, user_line_count),
-            details,
-        }));
-    }
-    let (value, presentation) = (envelope.value, envelope.presentation);
+    let (value, presentation) = match envelope {
+        super::outcome::Envelope::Ok {
+            value,
+            presentation,
+        } => (value, presentation),
+        super::outcome::Envelope::Failed { error: mut details } => {
+            map_failure_stack_lines(&mut details, user_start_line, user_line_count);
+            let message = details.get("message").and_then(Value::as_str).map_or_else(
+                || details.to_string(),
+                |message| {
+                    format!(
+                        "{message}\n{}",
+                        details.get("stack").and_then(Value::as_str).unwrap_or("")
+                    )
+                },
+            );
+            return Err(javascript_error(JsError::Failure {
+                message: map_script_lines(&message, user_start_line, user_line_count),
+                details,
+            }));
+        }
+    };
     let mut images = std::mem::take(&mut *returned_images.lock().await);
     images.sort();
     images.dedup();
@@ -441,8 +456,8 @@ pub(super) fn wrapper_script(source: &str, builders: &str) -> String {
          }})();\n\
          const presentation = {{fields:[]}};\n\
          const resolved = await __resolve(value, \"$\", new Set(), \"/result/value\", presentation);\n\
-         return __stringify({{ok:true, value:resolved, presentation}});\n\
-         }} catch (error) {{ return __stringify({{ok:false, error:__describeError(error)}}); }}\n\
+         return __stringify({{outcome:\"ok\", value:resolved, presentation}});\n\
+         }} catch (error) {{ return __stringify({{outcome:\"failed\", error:__describeError(error)}}); }}\n\
          }})()\n"
     )
 }
@@ -488,20 +503,20 @@ mod tests {
     }
 
     struct TestScope {
-        // Keep startup alive while the test drives evaluation directly.
-        _lease: crate::job::JobLease,
+        // Keep the job alive while the test drives evaluation directly.
+        _worker: crate::job::JobWorker,
         _root: tempfile::TempDir,
     }
 
     async fn test_runtime(builder: ToolRegistryBuilder) -> (TestScope, ToolExecutor, ToolContext) {
         let runtime = TestRuntime::new().await;
         let spec = crate::job::JobSpec::test(runtime.agent.clone(), "script");
-        let mut lease = runtime.jobs.create(spec).await.unwrap();
+        let lease = runtime.jobs.create(spec).await.unwrap().test_run().await;
         let executor = runtime.executor(builder);
-        let context = runtime.tool_context(&mut lease);
+        let (context, worker) = runtime.tool_context(lease);
         (
             TestScope {
-                _lease: lease,
+                _worker: worker,
                 _root: runtime.root,
             },
             executor,
@@ -619,7 +634,7 @@ mod tests {
                 "deny",
                 "test denial",
                 ToolOptions::default(),
-                |_, _| async { Err(crate::tool::ToolError::Denied("user reason".to_owned())) },
+                |_, _| async { Err(crate::tool::ToolError::denied("user reason")) },
             )
             .unwrap();
         let (_scope, executor, context) = test_runtime(builder).await;
@@ -827,8 +842,7 @@ return {first, second, started};
         ] {
             let (expected, expected_output) = error.into_parts();
             // Check both successful and failed console finalization against the same primary.
-            let primary =
-                ToolError::from_diagnostic(expected.clone(), expected_output.clone().map(Box::new));
+            let primary = ToolError::from_diagnostic(expected.clone(), expected_output.clone());
             let (diagnostic, mut output) = finish_evaluation(
                 Err(primary),
                 Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
@@ -854,8 +868,7 @@ return {first, second, started};
                 output.map(|output| output.value),
                 expected_output.as_ref().map(|output| output.value.clone())
             );
-            let primary =
-                ToolError::from_diagnostic(expected.clone(), expected_output.clone().map(Box::new));
+            let primary = ToolError::from_diagnostic(expected.clone(), expected_output.clone());
             let (diagnostic, output) = finish_evaluation(Err(primary), Ok(None))
                 .unwrap_err()
                 .into_parts();
@@ -941,8 +954,8 @@ return {first, second, started};
             );
             let output = error
                 .into_tool_error()
-                .into_failure()
-                .output
+                .into_parts()
+                .1
                 .expect("script failure retains captured output");
             assert_eq!(output.value["console"], "before error\n");
         }
@@ -999,7 +1012,7 @@ function __skyhookConsoleLog(message) {
                 .catch(&ctx)
                 .expect("finish wrapper before watchdog deadline without pending host work");
             let result: Value = serde_json::from_str(&encoded).expect("wrapper JSON result");
-            assert_eq!(result["ok"], true, "wrapper failed: {result:#}");
+            assert_eq!(result["outcome"], "ok", "wrapper failed: {result:#}");
             result
         })
     }

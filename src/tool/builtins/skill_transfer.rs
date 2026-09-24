@@ -5,10 +5,10 @@ use serde::{Deserialize, Serialize};
 
 use super::workspace::{atomic_write, resolve_for_authorization};
 use crate::{
-    target::TargetRouter,
+    target::{TargetRef, TargetRouter},
     tool::{
         PathKind, RegistryError, ToolContext, ToolError, ToolOptions, ToolPlacement,
-        diagnostic::{DiagnosticContext, Effects, FailureSite, Operation, Subject},
+        diagnostic::{Effects, FailureSite, Operation, PartialContext, Subject},
         invocation::{AdmissionError, LocalCatalogBuilder, LocalError},
         policy::{Capability, PathAccess, PermissionUse, ResourceId},
     },
@@ -42,7 +42,7 @@ pub(crate) fn register_worker(builder: &mut LocalCatalogBuilder) -> Result<(), R
         |_context, args| async move {
             let bytes = crate::media::decode_base64_bounded(&args.data_base64, MAX_COPY_BYTES)
                 .map_err(|error| {
-                    LocalError::invalid(match error {
+                    LocalError::invalid_arguments(match error {
                         crate::media::MediaError::TooLarge => "skill asset is too large",
                         _ => "skill asset has invalid base64",
                     })
@@ -59,11 +59,11 @@ async fn write(path: &std::path::Path, bytes: &[u8]) -> Result<String, Admission
         .await
         .is_ok_and(|metadata| metadata.is_dir())
     {
-        return Err(AdmissionError::InvalidArguments(
-            "to must name a file, not a directory".into(),
-        )
-        .operation(Operation::Validate, Subject::path(path))
-        .effects(Effects::Unchanged));
+        return Err(
+            AdmissionError::invalid_arguments("to must name a file, not a directory")
+                .operation(Operation::Validate, Subject::path(path))
+                .effects(Effects::Unchanged),
+        );
     }
     atomic_write(path, bytes).await?;
     Ok(path.to_string_lossy().into_owned())
@@ -76,7 +76,7 @@ pub(super) async fn copy(
     bytes: &[u8],
 ) -> Result<String, ToolError> {
     let caller = context.caller_location();
-    if caller.is_root() {
+    let TargetRef::Named(target) = &caller.target else {
         let resolved = resolve_for_authorization(&caller.workspace, to, PathKind::Writable)
             .await
             .map_err(|error| {
@@ -112,7 +112,7 @@ pub(super) async fn copy(
         return write(&resolved.path, bytes)
             .await
             .map_err(|error| ToolError::from(error).at(FailureSite::Execution(caller.clone())));
-    }
+    };
     router
         .authorize_transfer(
             context,
@@ -131,7 +131,7 @@ pub(super) async fn copy(
                 .effects(Effects::Unchanged)
         })?;
     let route = router
-        .resolve(&caller.target, context.capabilities())
+        .resolve(target, context.capabilities())
         .await
         .map_err(|error| {
             ToolError::from(error.into_admission_error())
@@ -163,14 +163,12 @@ pub(super) async fn copy(
         .prepare(route, &caller.workspace, context.invocation_subject()?)
         .await
         .map_err(|error| {
-            error.into_tool_error().fallback_context(
-                DiagnosticContext::new(
-                    Operation::Connect,
-                    Subject::working_directory(&caller.workspace),
-                )
-                .at(FailureSite::Execution(caller.clone()))
-                .effects(Effects::Unchanged),
+            error.into_tool_error().or(PartialContext::new(
+                Operation::Connect,
+                Subject::working_directory(&caller.workspace),
             )
+            .at(FailureSite::Execution(caller.clone()))
+            .effects(Effects::Unchanged))
         })?;
     // The worker resolves `to` and requests path permissions on its own filesystem.
     // Base64 keeps the maximum 8 MiB asset safely below the protocol's 16 MiB frame limit.
@@ -185,10 +183,10 @@ pub(super) async fn copy(
         )
         .await
         .map_err(|error| {
-            error.into_tool_error().fallback_context(
-                DiagnosticContext::new(Operation::Copy, Subject::path(to))
-                    .at(FailureSite::Execution(caller.clone())),
-            )
+            error
+                .into_tool_error()
+                .or(PartialContext::new(Operation::Copy, Subject::path(to))
+                    .at(FailureSite::Execution(caller.clone())))
         })?;
     Ok(serde_json::from_value::<CopyOutput>(result.value)
         .map_err(|error| {
@@ -205,7 +203,7 @@ pub(super) async fn copy(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::ToolRegistryBuilder;
+    use crate::tool::{ToolRegistryBuilder, authorization::AuthorizationError};
     use crate::{
         execution::ExecutionLocation,
         remote::{
@@ -245,7 +243,9 @@ mod tests {
 
     impl Default for TransportReply {
         fn default() -> Self {
-            Self::ConnectionFailure(RemoteError::Protocol("fixture transport reached".into()))
+            Self::ConnectionFailure(RemoteError::Protocol(
+                crate::remote::ProtocolError::Violation("fixture transport reached"),
+            ))
         }
     }
 
@@ -346,7 +346,10 @@ mod tests {
     }
 
     fn remote_caller(_: &std::path::Path) -> ExecutionLocation {
-        ExecutionLocation::named("remote", "/remote-only/agent-override".into())
+        ExecutionLocation::named(
+            "remote".parse().unwrap(),
+            "/remote-only/agent-override".into(),
+        )
     }
 
     #[tokio::test]
@@ -395,7 +398,7 @@ mod tests {
         assert_eq!(writes.len(), 1);
         assert_eq!(
             writes[0].resource,
-            ResourceId::workspace("remote", &caller.workspace)
+            ResourceId::workspace(&"remote".parse().unwrap(), &caller.workspace)
         );
         assert!(!fixture.runtime.root.path().join("copied.bin").exists());
         fixture.manager.shutdown().await;
@@ -426,14 +429,14 @@ mod tests {
     async fn remote_copy_connection_and_worker_denials_retain_classification() {
         for (reply, operation) in [
             (
-                TransportReply::ConnectionFailure(RemoteError::ApprovalDenied(
-                    "connection denied".into(),
+                TransportReply::ConnectionFailure(RemoteError::Authorization(
+                    AuthorizationError::Denied("connection denied".into()),
                 )),
                 Operation::Connect,
             ),
             (
                 TransportReply::Worker(
-                    LocalError::Denied("worker denied".into())
+                    LocalError::denied("worker denied")
                         .operation(Operation::Authorize, Subject::path("copied.bin"))
                         .effects(Effects::Unchanged),
                 ),

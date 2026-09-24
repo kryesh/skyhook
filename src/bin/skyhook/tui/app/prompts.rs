@@ -1,5 +1,5 @@
 use super::*;
-use skyhook::agent::Question;
+use skyhook::{agent::Question, remote::PromptAnswer};
 use std::ops::Deref;
 
 /// Editor and view travel with their prompt (and with each question page).
@@ -222,6 +222,13 @@ fn approval_items(
     }
     items
 }
+/// Host-key and agent-key confirmations are answered by choice, not by text.
+fn confirmation_items() -> Vec<Item<PromptAnswer>> {
+    vec![
+        Item::new(PromptAnswer::Confirmed, "Confirm", ""),
+        Item::new(PromptAnswer::Rejected, "Decline", ""),
+    ]
+}
 #[derive(Clone, Copy)]
 enum QuestionAction {
     Choice(usize),
@@ -409,6 +416,12 @@ impl App {
                     })
                     .collect()
             }
+            PromptKind::Authentication { prompt, .. } if prompt.kind.is_confirmation() => {
+                confirmation_items()
+                    .into_iter()
+                    .map(|item| item.label)
+                    .collect()
+            }
             PromptKind::Authentication { .. } => vec![],
         }
     }
@@ -592,8 +605,13 @@ impl App {
                 };
                 let _ = reply.send(Ok(value));
             }
-            (PromptKind::Authentication { reply, .. }, PromptState::Authentication(input)) => {
-                let _ = reply.send(Ok(input.editor.take_sensitive()));
+            (PromptKind::Authentication { prompt, reply }, PromptState::Authentication(input)) => {
+                let answer = if prompt.kind.is_confirmation() {
+                    confirmation_items().swap_remove(input.choice).value
+                } else {
+                    PromptAnswer::Secret(input.editor.take_sensitive())
+                };
+                let _ = reply.send(Ok(answer));
             }
             _ => unreachable!("request and draft are constructed together"),
         }
@@ -605,7 +623,8 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
-    use KeyCode::{Down, Enter, Esc, Left, Right, Tab, Up};
+    use KeyCode::{Char, Down, Enter, Esc, Left, Right, Tab, Up};
+    use skyhook::remote::SensitivePromptKind;
 
     fn confirmed_answers(app: &App) -> HashMap<String, Answer> {
         let Some(prompt) = app.prompts.front() else {
@@ -637,11 +656,12 @@ mod tests {
     fn authentication(
         app: &mut App,
         id: u64,
-    ) -> oneshot::Receiver<Result<skyhook::remote::SecretValue, String>> {
+        kind: skyhook::remote::SensitivePromptKind,
+    ) -> oneshot::Receiver<Result<PromptAnswer, String>> {
         let (reply, response) = oneshot::channel();
         let prompt = skyhook::remote::SensitivePrompt {
-            kind: skyhook::remote::SensitivePromptKind::Password,
-            message: format!("SSH password {id}"),
+            kind,
+            message: format!("SSH prompt {id}"),
         };
         let kind = PromptKind::Authentication { prompt, reply };
         app.prompt(Prompt { id, kind });
@@ -799,14 +819,43 @@ mod tests {
         assert_eq!(app.prompt_input_mut().editor.cursor(), 2);
         key(&mut app, Enter, M::NONE);
         assert_eq!(response.await.unwrap().unwrap(), "abc");
-        let ssh = authentication(&mut app, 100);
+        let ssh = authentication(&mut app, 100, SensitivePromptKind::Password);
+        assert!(app.prompt_options().is_empty());
         app.prompt_input_mut().editor.insert("sec");
         paste(&mut app, "ret");
         key(&mut app, Left, M::NONE);
         assert_eq!(app.prompt_input_mut().editor.cursor(), 5);
         assert!(!draw(&mut app).contains("secret"));
         key(&mut app, Enter, M::NONE);
-        assert_eq!(ssh.await.unwrap().unwrap().expose(), "secret");
+        let PromptAnswer::Secret(secret) = ssh.await.unwrap().unwrap() else {
+            panic!("expected a secret")
+        };
+        assert_eq!(secret.expose(), "secret");
+        assert!(app.prompts.is_empty());
+        // Confirmations offer a choice instead of an editor: typed or pasted text
+        // has nowhere to go, so it can never pass for an answer.
+        for (kind, presses, expected) in [
+            (
+                SensitivePromptKind::AgentConfirmation,
+                &[Enter][..],
+                "Confirmed",
+            ),
+            (
+                SensitivePromptKind::HostConfirmation,
+                &[Down, Enter][..],
+                "Rejected",
+            ),
+        ] {
+            let confirmation = authentication(&mut app, 101, kind);
+            assert_eq!(app.prompt_options(), ["Confirm", "Decline"]);
+            assert!(draw(&mut app).contains("SSH prompt 101"));
+            press(&mut app, &[Char('n'), Char('o')]);
+            paste(&mut app, "no");
+            assert!(app.prompt_input().editor.text().is_empty());
+            press(&mut app, presses);
+            let answer = format!("{:?}", confirmation.await.unwrap().unwrap());
+            assert_eq!(answer, expected);
+        }
         assert!(app.prompts.is_empty());
     }
 
@@ -822,7 +871,7 @@ mod tests {
         key(&mut app, Down, M::NONE);
         paste(&mut app, "my comment");
         // An authentication prompt pre-empts the question and restores its draft.
-        let ssh = authentication(&mut app, 100);
+        let ssh = authentication(&mut app, 100, SensitivePromptKind::Password);
         key(&mut app, Esc, M::NONE);
         assert!(ssh.await.unwrap().is_err());
         let input = app.prompt_input_mut();
@@ -880,7 +929,7 @@ mod tests {
             ) = (3, 2, true);
             app.info("Details", "An open menu".into());
             app.search_editor = Some(Editor::default());
-            let response = authentication(&mut app, 100);
+            let response = authentication(&mut app, 100, SensitivePromptKind::Password);
             assert!(matches!(app.input_target(), InputTarget::Prompt));
             assert!(app.menu.is_none() && app.search_editor.is_none());
             assert_eq!(app.prompts.front().unwrap().id, 100);
@@ -888,11 +937,14 @@ mod tests {
             assert!(confirmed_answers(&app).is_empty());
             paste(&mut app, "ssh secret");
             let screen = draw(&mut app);
-            assert!(screen.contains("SSH password 100") && !screen.contains("ssh secret"));
+            assert!(screen.contains("SSH prompt 100") && !screen.contains("ssh secret"));
             match finish {
                 0 => {
                     key(&mut app, Enter, M::NONE);
-                    assert_eq!(response.await.unwrap().unwrap().expose(), "ssh secret");
+                    let PromptAnswer::Secret(secret) = response.await.unwrap().unwrap() else {
+                        panic!("expected a secret")
+                    };
+                    assert_eq!(secret.expose(), "ssh secret");
                 }
                 1 => {
                     key(&mut app, Esc, M::NONE);
@@ -934,9 +986,9 @@ mod tests {
         let answer = question(&mut app, "Question".into(), vec![]);
         paste(&mut app, "saved answer");
         key(&mut app, Esc, M::NONE);
-        let first = authentication(&mut app, 100);
+        let first = authentication(&mut app, 100, SensitivePromptKind::Password);
         paste(&mut app, "first secret");
-        let second = authentication(&mut app, 101);
+        let second = authentication(&mut app, 101, SensitivePromptKind::Password);
         assert!(app.prompt_active);
         assert_eq!(
             app.prompts.iter().map(|p| p.id).collect::<Vec<_>>(),
@@ -962,7 +1014,7 @@ mod tests {
         let (_root, mut app) = fixture().await;
         let answer = question(&mut app, "Question".into(), vec![]);
         paste(&mut app, "abandoned answer");
-        let response = authentication(&mut app, 100);
+        let response = authentication(&mut app, 100, SensitivePromptKind::Password);
         drop(answer);
         app.tick();
         key(&mut app, Esc, M::NONE);

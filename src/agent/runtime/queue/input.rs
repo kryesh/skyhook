@@ -13,21 +13,20 @@ impl SessionRuntime {
         turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
         settings: &mut AgentSettings,
-        options: PromptOptions,
+        options: Selection,
         images: bool,
     ) -> Result<(), HarnessError> {
         let agent = turn.agent;
-        let model = options.model.filter(|name| name != &settings.model_profile);
+        let model = options
+            .model
+            .map(|model| model.name)
+            .filter(|name| name != &settings.model_profile);
         let mode = options
             .mode
+            .map(|mode| mode.name)
             .filter(|name| settings.mode.as_ref() != Some(name));
         let profile = match &model {
-            Some(name) => self
-                .harness
-                .model_profiles
-                .get(name)
-                .cloned()
-                .ok_or_else(|| HarnessError::UnknownModelProfile(name.clone()))?,
+            Some(name) => self.harness.model_profiles[name].clone(),
             None => context.profile.clone(),
         };
         if images && !profile.supports_images {
@@ -37,7 +36,7 @@ impl SessionRuntime {
             Some(name) if agent.depth() != 0 => return Err(HarnessError::UnknownMode(name)),
             Some(name) => {
                 let depth = self.available_depth(agent);
-                let capabilities = self.mode_capabilities(&name)?.for_agent(depth);
+                let capabilities = self.granted_by(&self.modes[&name]).for_agent(depth);
                 Some((name, depth, capabilities))
             }
             None => None,
@@ -129,7 +128,7 @@ impl SessionRuntime {
             committed,
             ..
         } = input;
-        let images = content.iter().any(UserContent::is_image);
+        let images = content.iter().any(UserPart::is_image);
         // ModelChanged and ModeChanged precede the MessageCommitted they apply to.
         let result = async {
             self.select(turn, context, settings, options, images)
@@ -139,7 +138,7 @@ impl SessionRuntime {
                 message: message.clone(),
             };
             let record = self.store.append(agent.clone(), event).await?;
-            context.projected.push((record.sequence, message));
+            context.projected.messages.push((record.sequence, message));
             Ok(())
         }
         .await;
@@ -224,7 +223,7 @@ mod tests {
             assert!(next.messages().any(todo_finished));
         } else {
             assert!(next.messages().any(|message| matches!(message,
-                Message::Assistant(items) if items == &vec![AssistantItem::text("text/0", 0, "answer-0")])));
+                Sent::Assistant(items) if items == &vec![AssistantItem::text("text/0", 0, "answer-0")])));
         }
         let state = runtime.jobs.snapshot(job).await.unwrap().state;
         // The child must answer the parent updates first.
@@ -381,11 +380,11 @@ mod tests {
         let expected = ["test:initial", "test:queued-one", "test:queued-two"];
         assert_eq!(texts(next.messages()), expected);
         let blocks = next.messages().flat_map(|message| match message {
-            Message::User(blocks) => blocks.as_slice(),
+            Sent::User(blocks) => blocks.as_slice(),
             _ => &[],
         });
         let images = blocks.filter_map(|block| match block {
-            UserContent::Attachment {
+            SentPart::Attachment {
                 attachment: crate::media::AttachmentRef::Image(image),
             } => Some(next.blobs.get(&image.blob).unwrap()),
             _ => None,
@@ -470,9 +469,12 @@ mod tests {
 
     #[tokio::test]
     async fn queued_validation_errors_do_not_claim_or_commit() {
-        use HarnessError::{ImageLimit, UnknownModelProfile};
         let (_root, tracking, session) = start(false).await;
         let runtime = &session.runtime;
+        let unknown = session.selection(Some("missing-model"), None).unwrap_err();
+        assert!(
+            matches!(unknown, HarnessError::UnknownModelProfile(name) if name == "missing-model")
+        );
         // One byte over the per-image limit, and one image over the count limit.
         let image = |bytes: &[u8]| crate::media::Attachment::Image {
             file: None,
@@ -481,28 +483,20 @@ mod tests {
         let (oversized, small) = (image(&vec![0; MAX_IMAGE_BYTES as usize - 7]), image(b""));
         let before = runtime.store.records().await.len();
         let cases = [
-            (Some("missing-model"), vec![], "model"),
-            (None, vec![oversized], "size"),
-            (None, vec![small; MAX_IMAGES_PER_SUBMISSION + 1], "count"),
+            (vec![oversized], "size"),
+            (vec![small; MAX_IMAGES_PER_SUBMISSION + 1], "count"),
         ];
-        for (model, attachments, case) in cases {
+        for (attachments, case) in cases {
             let prompt = QueuedPrompt {
                 text: "test:invalid".into(),
                 attachments,
-                options: PromptOptions {
-                    model: model.map(str::to_owned),
-                    mode: None,
-                },
+                options: Selection::default(),
                 cancellation: QueuedPromptCancellation::default(),
             };
             let token_cancel = prompt.cancellation.clone();
             let enqueued = enqueue_prompts(&session, vec![prompt]);
             let error = bounded(enqueued).await.pop().unwrap().unwrap_err();
-            if case == "model" {
-                assert!(matches!(error, UnknownModelProfile(_)), "{case}");
-            } else {
-                assert!(matches!(error, ImageLimit), "{case}");
-            }
+            assert!(matches!(error, HarnessError::ImageLimit), "{case}");
             assert!(!token_cancel.is_claimed(), "{case}");
             assert!(token_cancel.cancel(), "{case}");
             assert_eq!(runtime.store.records().await.len(), before, "{case}");

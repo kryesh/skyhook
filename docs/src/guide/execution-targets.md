@@ -43,9 +43,9 @@ targets:
       options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 ```
 
-Targets have an explicit `type`. The built-in `root` is `local`, meaning the session host—the machine
-running the main Skyhook process. It always identifies that machine, including when an agent's
-current target is remote. Named target configuration and `target_add` accept only `type: "ssh"`.
+The built-in `root` is the session host—the machine running the main Skyhook process. It is not
+configured as a target and always identifies that machine, including when an agent's current
+target is remote. Named targets declare their transport with `type`; `"ssh"` is the only transport.
 
 ## Routing: `origin` and `via`
 

@@ -4,6 +4,7 @@ use super::{
     app::{App, HostRequest, PreparedObservation, Work},
 };
 use crate::interaction::{Prompt, UiInteraction};
+use crate::launch::LaunchError;
 use skyhook::{
     agent::{ObservedEvent, SessionHandle},
     identity::SessionId,
@@ -42,7 +43,7 @@ pub struct Opened {
     from: (u64, String),
     launch: Launch,
     prompts: mpsc::UnboundedReceiver<Prompt>,
-    result: Result<SessionHandle, String>,
+    result: Result<SessionHandle, LaunchError>,
 }
 pub enum HostEvent {
     Slot(usize, SlotEvent),
@@ -220,7 +221,7 @@ impl Host {
                     self.app().toast("Session opened");
                 }
             }
-            Err(error) => self.app().local_notice(error),
+            Err(error) => self.app().local_notice(error.to_string()),
         }
     }
     /// Apply what the last event asked for. Returns false once nothing is left open.

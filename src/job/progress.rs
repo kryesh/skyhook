@@ -3,26 +3,25 @@
 //! Count committed assistant messages, not requests/usage (which include retries and
 //! compaction), and owned job creations, not assistant tool-call blocks (which miss
 //! calls launched inside scripts). Retained resumes keep the same agent identity.
-
 use std::collections::HashMap;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     identity::{AgentId, JobId},
-    provider::protocol::Message,
-    session::{EventRecord, SessionEvent},
+    session::{EventRecord, Message, RecordSeq, SessionEvent, StateJob, StateJobKind},
 };
 
-#[derive(Clone, Copy, Default, Serialize)]
-pub(crate) struct AgentProgress {
-    pub(crate) turns: u64,
-    pub(crate) tool_calls: u64,
+/// A child agent's durable progress: committed turns and jobs it created.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct AgentProgress {
+    pub turns: u64,
+    pub tool_calls: u64,
 }
 
 #[derive(Default)]
 pub(super) struct Progress {
-    pub sequence: u64,
+    pub sequence: RecordSeq,
     pub agents: HashMap<JobId, AgentId>,
     counts: HashMap<AgentId, AgentProgress>,
 }
@@ -75,11 +74,11 @@ pub(super) fn active_job(
     capabilities: &crate::tool::policy::CapabilitySet,
     now_millis: i64,
     path: &mut std::collections::HashSet<JobId>,
-) -> super::ActiveJob {
+) -> StateJob {
     use crate::tool::policy::Capability;
 
     let entry = &jobs[&id];
-    let is_agent = entry.role == super::JobRole::Agent;
+    let is_agent = entry.child().is_some();
     let mut children = Vec::new();
     path.insert(id);
     if is_agent && let Some(agent) = progress.agents.get(&id) {
@@ -87,8 +86,8 @@ pub(super) fn active_job(
             .iter()
             .filter(|(job, child)| {
                 &child.agent == agent
-                    && !child.state.is_terminal()
-                    && child.role == super::JobRole::Agent
+                    && child.end().is_none()
+                    && child.child().is_some()
                     && !path.contains(job)
             })
             .map(|(job, _)| *job)
@@ -106,20 +105,25 @@ pub(super) fn active_job(
         }
     }
     path.remove(&id);
-    super::ActiveJob {
+    StateJob {
         job: id,
-        tool: entry.tool.clone(),
-        name: entry.name.clone(),
-        state: entry.state.presented(),
-        location: super::ActiveJobLocation {
-            target: capabilities
-                .contains(Capability::Targets)
-                .then(|| entry.location.target.clone()),
-            workspace: entry.location.workspace.clone(),
+        kind: if is_agent {
+            StateJobKind::Agent {
+                progress: progress.for_job(id),
+            }
+        } else {
+            StateJobKind::Tool {
+                tool: entry.tool.clone(),
+            }
         },
+        name: entry.name.clone().map(String::from),
+        state: entry.state().presented(),
+        target: capabilities
+            .contains(Capability::Targets)
+            .then(|| entry.location.target.clone()),
+        workspace: entry.location.workspace.clone(),
         age_seconds: u64::try_from(now_millis.saturating_sub(entry.created_at_millis)).unwrap_or(0)
             / 1_000,
-        progress: is_agent.then(|| progress.for_job(id)),
         children,
     }
 }
@@ -127,12 +131,20 @@ pub(super) fn active_job(
 #[cfg(test)]
 mod tests {
     use crate::job::*;
-    use crate::provider::protocol::{AssistantItem, Message};
+    use crate::provider::protocol::AssistantItem;
+    use crate::session::{Message, StateJob, StateJobKind};
+
+    fn progress_of(job: &StateJob) -> Option<AgentProgress> {
+        match job.kind {
+            StateJobKind::Agent { progress } => Some(progress),
+            StateJobKind::Tool { .. } => None,
+        }
+    }
 
     async fn started(jobs: &JobManager, agent: &AgentId, owner: JobId, target: &str) {
-        let location = ExecutionLocation::named(target, format!("/{target}/work").into());
-        let event =
-            crate::session::fixture::child_started(agent.parent(), Some(owner), location.clone());
+        let location =
+            ExecutionLocation::named(target.parse().unwrap(), format!("/{target}/work").into());
+        let event = crate::session::fixture::child_started(Some(owner), location.clone());
         jobs.test_append(agent.clone(), event).await;
         jobs.set_agent_location(owner, location).await.unwrap();
     }
@@ -143,12 +155,12 @@ mod tests {
             .await;
     }
 
-    async fn snapshot(jobs: &JobManager, owner: &AgentId, targets: bool) -> Value {
+    async fn snapshot(jobs: &JobManager, owner: &AgentId, targets: bool) -> Vec<StateJob> {
         let mut capabilities = CapabilitySet::default();
         if targets {
             capabilities.insert(Capability::Targets);
         }
-        serde_json::to_value(jobs.active_states(owner, &capabilities, i64::MAX).await).unwrap()
+        jobs.active_states(owner, &capabilities, i64::MAX).await
     }
 
     fn agent_spec(agent: &AgentId, parent: Option<JobId>) -> JobSpec {
@@ -159,8 +171,8 @@ mod tests {
         }
     }
 
-    fn progress(value: &Value) -> (Value, Value) {
-        (value["turns"].clone(), value["tool_calls"].clone())
+    fn progress(turns: u64, tool_calls: u64) -> Option<AgentProgress> {
+        Some(AgentProgress { turns, tool_calls })
     }
 
     #[tokio::test]
@@ -175,9 +187,9 @@ mod tests {
         let ordinary = jobs.test_lease(JobSpec::test(root.clone(), "agent")).await;
         // Even queued agents without AgentStarted have zero counters; tools do not.
         let initial = snapshot(&jobs, &root, false).await;
-        assert_eq!(progress(&initial[0]), (0.into(), 0.into()));
-        assert!(initial[0].get("children").is_none());
-        assert_eq!(progress(&initial[1]), (Value::Null, Value::Null));
+        assert_eq!(progress_of(&initial[0]), progress(0, 0));
+        assert!(initial[0].children.is_empty());
+        assert_eq!(progress_of(&initial[1]), None);
         started(&jobs, &child, delegated.id(), "child").await;
         committed(&jobs, &child).await;
         committed(&jobs, &child).await;
@@ -191,11 +203,10 @@ mod tests {
         };
         let nested = jobs.test_lease(spec).await;
         jobs.test_finish(nested.id(), Value::Null).await;
-        let delegated_again = jobs.test_lease(agent_spec(&child, Some(script.id()))).await;
+        let delegated_again = jobs
+            .test_approving(agent_spec(&child, Some(script.id())))
+            .await;
         started(&jobs, &grandchild, delegated_again.id(), "grandchild").await;
-        jobs.transition(delegated_again.id(), JobState::AwaitingApproval)
-            .await
-            .unwrap();
         committed(&jobs, &grandchild).await;
         let deepest = jobs.test_lease(agent_spec(&grandchild, None)).await;
         started(&jobs, &great_grandchild, deepest.id(), "deepest").await;
@@ -207,44 +218,48 @@ mod tests {
         jobs.test_finish(terminal.id(), Value::Null).await;
 
         let state = snapshot(&jobs, &root, false).await;
-        assert_eq!(state.as_array().unwrap().len(), 2);
+        assert_eq!(state.len(), 2);
         assert_eq!(
-            (&state[0]["job"], &state[1]["job"]),
-            (&delegated.id().get().into(), &ordinary.id().get().into())
+            (state[0].job, state[1].job),
+            (delegated.id(), ordinary.id())
         );
         // Script, nested exec, and two agent jobs.
-        assert_eq!(progress(&state[0]), (2.into(), 4.into()));
-        assert_eq!(state[0]["children"].as_array().unwrap().len(), 1);
-        let grand = &state[0]["children"][0];
-        assert_eq!(grand["job"], delegated_again.id().get());
-        assert_eq!(grand["state"], "queued"); // Approval stays host-only.
-        assert_eq!(progress(grand), (1.into(), 1.into()));
-        assert_eq!(grand["location"]["workspace"], "/grandchild/work");
-        let deepest_state = &grand["children"][0];
-        assert_eq!(deepest_state["job"], deepest.id().get());
-        assert_eq!(progress(deepest_state), (1.into(), 1.into()));
-        assert!(deepest_state.get("children").is_none());
+        assert_eq!(progress_of(&state[0]), progress(2, 4));
+        assert_eq!(state[0].children.len(), 1);
+        let grand = &state[0].children[0];
+        assert_eq!(grand.job, delegated_again.id());
+        assert_eq!(grand.state, JobState::Queued); // Approval stays host-only.
+        assert_eq!(progress_of(grand), progress(1, 1));
+        assert_eq!(grand.workspace, std::path::Path::new("/grandchild/work"));
+        let deepest_state = &grand.children[0];
+        assert_eq!(deepest_state.job, deepest.id());
+        assert_eq!(progress_of(deepest_state), progress(1, 1));
+        assert!(deepest_state.children.is_empty());
         let visible = snapshot(&jobs, &root, true).await;
-        let mut visible = &visible[0];
+        let mut visible = visible.first();
         for (entry, target) in [
             (&state[0], "child"),
             (grand, "grandchild"),
             (deepest_state, "deepest"),
         ] {
-            assert!(entry["location"].get("target").is_none());
-            assert_eq!(visible["location"]["target"], target);
-            visible = &visible["children"][0];
+            assert!(entry.target.is_none());
+            let shown = visible.expect("a visible job at every depth");
+            assert_eq!(
+                shown.target.as_ref().map(crate::target::TargetRef::as_str),
+                Some(target)
+            );
+            visible = shown.children.first();
         }
         // Polling and a different viewer cannot double count the same journal suffix.
         assert_eq!(snapshot(&jobs, &root, false).await, state);
         assert_eq!(
-            progress(&snapshot(&jobs, &child, false).await[1]),
-            progress(grand)
+            progress_of(&snapshot(&jobs, &child, false).await[1]),
+            progress_of(grand)
         );
         let future = jobs
             .active_states(&root, &CapabilitySet::default(), 0)
             .await;
-        assert_eq!(serde_json::to_value(future).unwrap()[0]["age_seconds"], 0);
+        assert_eq!(future[0].age_seconds, 0);
     }
 
     #[tokio::test]
@@ -280,18 +295,22 @@ mod tests {
         jobs.set_resume_handler(delegated.id(), handler)
             .await
             .unwrap();
-        assert_eq!(snapshot(&jobs, &root, false).await[0]["turns"], 1);
+        let turns = |jobs: &[StateJob]| progress_of(&jobs[0]).map(|progress| progress.turns);
+        assert_eq!(turns(&snapshot(&jobs, &root, false).await), Some(1));
         jobs.test_finish(delegated.id(), Value::Null).await;
-        assert_eq!(snapshot(&jobs, &root, false).await, serde_json::json!([]));
+        assert!(snapshot(&jobs, &root, false).await.is_empty());
         jobs.send(delegated.id(), Value::Null).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while snapshot(&jobs, &root, false).await[0]["tool_calls"] != 2 {
+            while progress_of(&snapshot(&jobs, &root, false).await[0])
+                .map(|progress| progress.tool_calls)
+                != Some(2)
+            {
                 tokio::task::yield_now().await;
             }
         })
         .await
         .unwrap();
-        assert_eq!(snapshot(&jobs, &root, false).await[0]["turns"], 2);
+        assert_eq!(turns(&snapshot(&jobs, &root, false).await), Some(2));
         release.add_permits(1);
         jobs.wait(delegated.id(), Some(Duration::from_secs(5)), true)
             .await
@@ -300,22 +319,13 @@ mod tests {
 
         let records = store.records().await;
         let restored = JobManager::restore(store, &records).await.unwrap();
-        let retained = async || {
-            let progress = restored.inner.progress.lock().await.for_job(delegated.id());
-            serde_json::to_value(progress).unwrap()
-        };
+        let retained = async || restored.inner.progress.lock().await.for_job(delegated.id());
         // Completed agents remain omitted after replay, but retain progress for resumption.
-        assert_eq!(
-            snapshot(&restored, &root, false).await,
-            serde_json::json!([])
-        );
-        assert_eq!(
-            retained().await,
-            serde_json::json!({"turns": 2, "tool_calls": 2})
-        );
+        assert!(snapshot(&restored, &root, false).await.is_empty());
+        assert_eq!(retained().await, progress(2, 2).unwrap());
         // Exercise the same projection after replay without resetting the retained identity.
         committed(&restored, &child).await;
         snapshot(&restored, &root, false).await;
-        assert_eq!(retained().await["turns"], 3);
+        assert_eq!(retained().await.turns, 3);
     }
 }

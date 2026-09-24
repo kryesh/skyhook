@@ -64,7 +64,7 @@ mod tests {
             width,
             surface: Surface::Tool,
             entry,
-            entry_key: std::sync::Arc::new(model::EntryKey::Record(entry as u64)),
+            entry_key: std::sync::Arc::new(model::EntryKey::UnsavedStatus(entry)),
             selectable: true,
             layout,
             inset: 0,
@@ -72,10 +72,10 @@ mod tests {
     }
 
     pub(super) fn expandable_entry() -> model::Entry {
-        model::Entry::expandable_text(
-            model::EntryKey::Record(1),
-            "first header with many wrapped fragments\nbody with many wrapped fragments\n  \n"
-                .into(),
+        model::Entry::titled(
+            model::EntryKey::UnsavedStatus(1),
+            model::Title::disclosed("first header with many wrapped fragments", true),
+            "body with many wrapped fragments\n  \n".into(),
             Surface::Tool,
         )
     }

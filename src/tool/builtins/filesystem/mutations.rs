@@ -1,8 +1,6 @@
 //! Atomic writes, exact replacements, and removals.
 use crate::tool::ToolOptions;
-use crate::tool::diagnostic::{
-    DiagnosticContext, Effects, Operation, Subject, deserialize_arguments,
-};
+use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject, deserialize_arguments};
 use crate::tool::invocation::{AdmissionError, LocalCatalogBuilder, LocalError};
 
 use schemars::JsonSchema;
@@ -40,9 +38,9 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
             if args.create_parents {
                 let parent = path
                     .parent()
-                    .ok_or_else(|| AdmissionError::Failed("path has no parent".to_owned()).context(unchanged(Operation::CreateDirectories, &path)))?;
+                    .ok_or_else(|| AdmissionError::failed("path has no parent").context(unchanged(Operation::CreateDirectories, &path)))?;
                 fs::create_dir_all(parent).await.map_err(LocalError::annotated(
-                    DiagnosticContext::new(Operation::CreateDirectories, Subject::ParentDirectory(parent.to_owned()))
+                    PartialContext::new(Operation::CreateDirectories, Subject::ParentDirectory(parent.to_owned()))
                         .effects(Effects::PartialChange),
                 ))?;
             }
@@ -76,7 +74,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 } else {
                     return Ok(());
                 };
-                Err(AdmissionError::InvalidArguments(invalid)
+                Err(AdmissionError::invalid_arguments(invalid)
                     .context(unchanged(Operation::Validate, &args.path)))
             }),
         |context, args| async move {
@@ -86,7 +84,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 .map_err(AdmissionError::annotated(unchanged(Operation::Read, &path)))?;
             let replacements = text.matches(&args.old).count();
             if replacements != args.count {
-                return Err(LocalError::Failed(format!(
+                return Err(LocalError::failed(format!(
                     "expected {} matches, found {replacements}{}",
                     args.count,
                     match_lines(&text, &args.old)
@@ -129,13 +127,11 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
             } else if metadata.is_dir() {
                 RemoveKind::Directory
             } else {
-                return Err(
-                    LocalError::Failed("unsupported filesystem entry".to_owned())
-                        .context(unchanged(Operation::Remove, &path)),
-                );
+                return Err(LocalError::failed("unsupported filesystem entry")
+                    .context(unchanged(Operation::Remove, &path)));
             };
             let failed =
-                |error| LocalError::Io(error).operation(Operation::Remove, Subject::path(&path));
+                |error| LocalError::io(error).operation(Operation::Remove, Subject::path(&path));
             match kind {
                 RemoveKind::Directory if args.recursive => fs::remove_dir_all(&path)
                     .await
@@ -179,7 +175,7 @@ fn replacement_size(text: usize, old: usize, new: usize, count: usize) -> usize 
 
 fn check_write_size(bytes: usize, path: impl AsRef<Path>) -> Result<(), AdmissionError> {
     if bytes > MAX_WRITE_BYTES {
-        Err(AdmissionError::Failed(format!(
+        Err(AdmissionError::failed(format!(
             "write is {bytes} bytes, exceeding the {MAX_WRITE_BYTES}-byte limit"
         ))
         .context(unchanged(Operation::Validate, path)))
@@ -188,8 +184,8 @@ fn check_write_size(bytes: usize, path: impl AsRef<Path>) -> Result<(), Admissio
     }
 }
 
-fn unchanged(operation: Operation, path: impl AsRef<Path>) -> DiagnosticContext {
-    DiagnosticContext::new(operation, Subject::path(path)).effects(Effects::Unchanged)
+fn unchanged(operation: Operation, path: impl AsRef<Path>) -> PartialContext {
+    PartialContext::new(operation, Subject::path(path)).effects(Effects::Unchanged)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -571,7 +567,10 @@ mod tests {
             matches!(error.diagnostic().cause, Cause::Denied(_)),
             "{error:?}"
         );
-        let resource = ResourceId::path("root", &outside.join("nested/file.txt"));
+        let resource = ResourceId::path(
+            &crate::target::TargetRef::Root,
+            &outside.join("nested/file.txt"),
+        );
         let requests = policy.requests.lock().unwrap().clone();
         assert!(
             requests

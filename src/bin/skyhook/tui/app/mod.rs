@@ -39,11 +39,12 @@ use serde_json::Value;
 use serde_json::json;
 use skyhook::media::Attachment;
 use skyhook::{
-    agent::{AgentActivity, ObservationSnapshot, ObservedEvent, RuntimeEvent, SessionHandle},
+    agent::{
+        AgentActivity, ObservationSnapshot, ObservedEvent, RuntimeEvent, SessionHandle, TurnFailure,
+    },
     identity::{AgentId, JobId, SessionId},
-    job::JobOutputQuery,
-    provider::protocol::Message,
-    session::{EventRecord, SessionEvent, SessionStore},
+    job::{FieldPointer, JobOutputQuery},
+    session::{EventRecord, Message, RecordSeq, SessionEvent, SessionStore},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -61,7 +62,7 @@ pub enum Focus {
 /// A root submission blocks queue dispatch until a later root user record is
 /// observed, either live or through a replacement snapshot after lag. The gate
 /// is `Some((root, last sequence))` while waiting.
-fn observe_initial_input(gate: &mut Option<(AgentId, u64)>, record: &EventRecord) -> bool {
+fn observe_initial_input(gate: &mut Option<(AgentId, RecordSeq)>, record: &EventRecord) -> bool {
     let Some((root, after)) = gate else {
         return false;
     };
@@ -105,8 +106,20 @@ struct HistoryBrowse {
     draft: Composer,
 }
 
+/// A draft becomes a session with its first submission or script; the draft's
+/// root identity then names what was noticed before the session existed.
+enum Phase {
+    Draft {
+        root: AgentId,
+    },
+    Open {
+        observation: ActiveObservation,
+        attached_draft: Option<AgentId>,
+    },
+}
+
 pub struct App {
-    observation: Option<ActiveObservation>,
+    phase: Phase,
     pub launch: Launch,
     /// UI-only choice, captured by each submitted user message.
     pub model: String,
@@ -132,9 +145,8 @@ pub struct App {
     queue_sender: Option<mpsc::UnboundedSender<Vec<QueueDelivery>>>,
     queue_activity_revision: u64,
     /// `Some((root, sequence))` while a root submission blocks queue dispatch.
-    initial_input: Option<(AgentId, u64)>,
+    initial_input: Option<(AgentId, RecordSeq)>,
     start: StartState,
-    attached_draft: Option<AgentId>,
     pub paused: bool,
     pub operation: bool,
     pub prompts: VecDeque<UiPrompt>,
@@ -217,25 +229,41 @@ impl App {
         self.history_browse = None;
     }
 
+    /// `mode` is what a new session starts in; an opened session's root supplies
+    /// its own where the session still has it.
     pub fn new(
         observation: Option<PreparedObservation>,
         launch: Launch,
+        mode: String,
         saved: state::SavedState,
         tx: mpsc::UnboundedSender<Work>,
     ) -> Self {
-        let selected = observation
-            .as_ref()
-            .map(|prepared| prepared.active.session.root_agent().clone())
-            .unwrap_or_else(draft_root);
+        let (phase, snapshot) = match observation {
+            Some(PreparedObservation { active, snapshot }) => (
+                Phase::Open {
+                    observation: active,
+                    attached_draft: None,
+                },
+                snapshot,
+            ),
+            None => (
+                Phase::Draft { root: draft_root() },
+                ObservationSnapshot::default(),
+            ),
+        };
+        let selected = match &phase {
+            Phase::Draft { root } => root.clone(),
+            Phase::Open { observation, .. } => observation.session.root_agent().clone(),
+        };
         let mut app = Self {
             model: launch.model.name().to_owned(),
-            mode: launch.mode().unwrap_or_default().to_owned(),
+            mode,
             remembered_model: saved.model,
             remembered_mode: saved.mode,
             sidebar: saved.sidebar,
-            observation: None,
+            phase,
             launch,
-            snapshot: ObservationSnapshot::default(),
+            snapshot,
             projection: Projection::default(),
             selected: selected.clone(),
             tab: Tab::default(),
@@ -252,7 +280,6 @@ impl App {
             queue_activity_revision: 0,
             initial_input: None,
             start: StartState::Idle,
-            attached_draft: None,
             paused: false,
             operation: false,
             prompts: VecDeque::new(),
@@ -295,10 +322,11 @@ impl App {
             hover: None,
             render: super::render::RenderState::new(selected, tx),
         };
-        app.install_observation(observation);
         app.refresh();
         if let Some(root) = app.projection.agents.iter().find(|a| a.id == app.selected) {
-            app.model.clone_from(&root.model);
+            if let Some(model) = &root.model {
+                app.model.clone_from(model);
+            }
             // A recorded mode that is no longer configured cannot be sent again.
             if let Some(mode) = root
                 .mode
@@ -319,6 +347,7 @@ pub(super) mod tests {
     use crate::interaction::UiInteraction;
     pub(super) use skyhook::agent::{Question, QuestionOption};
     use skyhook::remote::EmbeddedShimCatalog;
+    use skyhook::session::{RecordSeq, SessionEvent};
     use std::sync::Arc;
     pub(super) use tokio::sync::oneshot;
     pub(in super::super) async fn draft_fixture() -> (tempfile::TempDir, App) {
@@ -339,7 +368,7 @@ pub(super) mod tests {
             approve_all: false,
         };
         let (tx, _) = mpsc::unbounded_channel();
-        let mut app = App::new(None, launch, Default::default(), tx);
+        let mut app = App::new(None, launch, "general".into(), Default::default(), tx);
         // Unit fixtures must not change the user's global model preference.
         app.remembered_model = Some("first".into());
         app.remembered_mode = Some("general".into());
@@ -350,6 +379,14 @@ pub(super) mod tests {
         let session = app.launch.create(None).await.unwrap();
         attach(&mut app, session).await;
         (root, app)
+    }
+    /// Journal `event` for the selected agent and mirror it into the snapshot.
+    pub(in crate::tui) async fn push_record(app: &mut App, event: SessionEvent) -> RecordSeq {
+        let store = app.session().unwrap().store();
+        let record = store.append(app.selected.clone(), event).await.unwrap();
+        let sequence = record.sequence;
+        app.snapshot.records.insert(sequence, record);
+        sequence
     }
     /// Replace a draft fixture with one opened on `session`.
     pub(super) async fn attach(app: &mut App, session: SessionHandle) {
@@ -532,7 +569,11 @@ pub(super) mod tests {
             loop {
                 match app.launch.create(Some(id)).await {
                     Ok(session) => break session,
-                    Err(error) if error.contains("already open") => {
+                    Err(crate::launch::LaunchError::Harness(
+                        skyhook::agent::HarnessError::Session(
+                            skyhook::session::SessionError::AlreadyOpen(_),
+                        ),
+                    )) => {
                         tokio::time::sleep(Duration::from_millis(1)).await;
                     }
                     Err(error) => panic!("could not reopen session: {error}"),
@@ -589,6 +630,7 @@ pub(super) mod tests {
         let mut initial = App::new(
             Some(observation),
             draft.launch.clone(),
+            "general".into(),
             Default::default(),
             tx,
         );

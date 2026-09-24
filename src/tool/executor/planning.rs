@@ -1,15 +1,18 @@
 //! Validate and authorize arguments, then select where an invocation runs.
 
 use super::*;
-use crate::tool::invocation::{
-    PathOutcome, PathPreflight, path_text, preflight_path_arguments, scope_capabilities,
+use crate::tool::{
+    invocation::{
+        PathOutcome, PathPreflight, path_text, preflight_path_arguments, scope_capabilities,
+    },
+    registry::split_envelope,
 };
 
 impl ToolExecutor {
     async fn resolve_workspace_invocation(
         &self,
         tool: &crate::tool::RegisteredTool,
-        arguments: &Value,
+        explicit: Option<TargetRef>,
     ) -> Result<SelectedLocation, ExecutionError> {
         if tool.placement() == ToolPlacement::Host {
             return Ok(SelectedLocation {
@@ -17,34 +20,14 @@ impl ToolExecutor {
                 route: None,
             });
         }
-        let explicit = if tool.placement() == ToolPlacement::TargetedWorkspace {
-            if arguments.get("target").is_some() && !self.capabilities.contains(Capability::Targets)
-            {
-                return Err(ToolError::InvalidArguments(
-                    "target selection requires the targets capability".to_owned(),
-                )
-                .into());
-            }
-            match arguments.get("target") {
-                Some(Value::String(target)) => Some(target.as_str()),
-                Some(Value::Null) | None => None,
-                Some(_) => {
-                    return Err(
-                        ToolError::InvalidArguments("target must be a string".to_owned()).into(),
-                    );
-                }
-            }
-        } else if arguments.get("target").is_some() {
-            return Err(ToolError::InvalidArguments(format!(
-                "tool `{}` does not accept a target",
-                tool.name()
-            ))
+        if explicit.is_some() && !self.capabilities.contains(Capability::Targets) {
+            return Err(ToolError::invalid_arguments(
+                "target selection requires the targets capability",
+            )
             .into());
-        } else {
-            None
-        };
-        let selected = explicit.unwrap_or(&self.caller_location.target);
-        if selected == ROOT_TARGET {
+        }
+        let selected = explicit.as_ref().unwrap_or(&self.caller_location.target);
+        let TargetRef::Named(selected) = selected else {
             return Ok(SelectedLocation {
                 location: ExecutionLocation::select(
                     &self.caller_location,
@@ -57,11 +40,9 @@ impl ToolExecutor {
                 ),
                 route: None,
             });
-        }
+        };
         let router = self.shared.router.as_ref().ok_or_else(|| {
-            ToolError::InvalidArguments(
-                "remote targets are unavailable in this tool runtime".to_owned(),
-            )
+            ToolError::invalid_arguments("remote targets are unavailable in this tool runtime")
         })?;
         let route = router
             .resolve(selected, &self.capabilities)
@@ -85,13 +66,12 @@ impl ToolExecutor {
         })
     }
 
-    async fn prepare_invocation(
+    fn prepare_invocation(
         &self,
         kind: InvocationKind,
         agent: &AgentId,
         name: &str,
         mut arguments: Value,
-        parent: Option<JobId>,
     ) -> Result<PreparedInvocation, ExecutionError> {
         let tool = self
             .shared
@@ -100,7 +80,7 @@ impl ToolExecutor {
             .ok_or_else(|| ExecutionError::UnknownTool(name.to_owned()))?;
         let spec = tool
             .spec(&self.capabilities, agent)
-            .ok_or_else(|| ToolError::InvalidArguments(format!("tool `{name}` is unavailable")))?;
+            .ok_or_else(|| ToolError::invalid_arguments(format!("tool `{name}` is unavailable")))?;
         // Only model output is repaired; host and script callers must match exactly.
         if matches!(kind, InvocationKind::Model) {
             crate::tool::coerce::coerce_arguments(&spec.input_schema, &mut arguments);
@@ -108,16 +88,12 @@ impl ToolExecutor {
         spec.validate_arguments(&arguments)?;
         validate_invocation(&spec, kind)?;
         let original_arguments = arguments.clone();
-        let (mut handler_arguments, background) =
-            self.shared.registry.split_execution(&spec, arguments)?;
-        let job_name = tool.take_job_name(&mut handler_arguments)?;
+        let (handler_arguments, envelope) = split_envelope(&spec, &tool, arguments)?;
         Ok(PreparedInvocation {
             tool,
             original_arguments,
             handler_arguments,
-            background,
-            job_name,
-            authorization_scope: self.authorization_scope(parent).await?,
+            envelope,
         })
     }
 
@@ -133,32 +109,22 @@ impl ToolExecutor {
             tool,
             original_arguments,
             handler_arguments: mut arguments,
-            background,
-            job_name,
-            authorization_scope,
-        } = self
-            .prepare_invocation(kind, &agent, name, arguments, parent)
-            .await?;
+            envelope: ExecutionEnvelope { launch, target },
+        } = self.prepare_invocation(kind, &agent, name, arguments)?;
         let selected = self
-            .resolve_workspace_invocation(&tool, &original_arguments)
+            .resolve_workspace_invocation(&tool, target)
             .await
             .map_err(|error| {
-                error.contextualize(
-                    DiagnosticContext::new(Operation::Lookup, Subject::argument(["target"]))
+                error.or(
+                    PartialContext::new(Operation::Lookup, Subject::argument(["target"]))
                         .at(FailureSite::Host),
                     &self.capabilities,
                 )
             })?;
-        if tool.placement() == ToolPlacement::TargetedWorkspace {
-            arguments
-                .as_object_mut()
-                .ok_or(ToolError::ArgumentsMustBeObject)?
-                .remove("target");
-        }
         // Validation failures belong to the selected location, not the caller's.
         let invalid = |error: ExecutionError| {
-            error.contextualize(
-                DiagnosticContext::new(Operation::Validate, Subject::Tool(name.to_owned())).at(
+            error.or(
+                PartialContext::new(Operation::Validate, Subject::Tool(name.to_owned())).at(
                     FailureSite::bound(&selected.location, tool.placement() == ToolPlacement::Host),
                 ),
                 &self.capabilities,
@@ -255,17 +221,8 @@ impl ToolExecutor {
             permissions,
             path_facts,
             parent,
-            authorization_scope,
-            background,
-            job_name,
+            launch,
             dispatch,
-        })
-    }
-
-    async fn authorization_scope(&self, parent: Option<JobId>) -> Result<Option<u64>, JobError> {
-        Ok(match parent {
-            Some(parent) => self.shared.jobs.authorization_scope(parent).await?,
-            None => None,
         })
     }
 }
@@ -363,8 +320,8 @@ pub(super) mod tests {
                     .named()
                     .argument_validator(|arguments| {
                         if arguments["url"] != "https://initial.test" {
-                            return Err(crate::tool::AdmissionError::InvalidArguments(
-                                "invalid test URL".to_owned(),
+                            return Err(crate::tool::AdmissionError::invalid_arguments(
+                                "invalid test URL",
                             ));
                         }
                         Ok(())
@@ -417,7 +374,10 @@ pub(super) mod tests {
     }
 
     fn network_use(origin: &str) -> PermissionUse {
-        PermissionUse::new(Capability::Network, ResourceId::network("root", origin))
+        PermissionUse::new(
+            Capability::Network,
+            ResourceId::network(&crate::target::TargetRef::Root, origin),
+        )
     }
 
     #[tokio::test]
@@ -491,7 +451,7 @@ pub(super) mod tests {
             runtime.root.path().join("download"),
         );
         for (capability, path) in [(Capability::Read, &upload), (Capability::Write, &download)] {
-            let resource = ResourceId::path("root", path);
+            let resource = ResourceId::path(&crate::target::TargetRef::Root, path);
             assert!(
                 plan.permissions
                     .iter()
@@ -665,7 +625,7 @@ pub(super) mod tests {
                     crate::tool::PathKind::Existing,
                 ),
                 |_context, _arguments| async {
-                    Err(ToolError::Io(std::io::ErrorKind::PermissionDenied.into()))
+                    Err(ToolError::io(std::io::ErrorKind::PermissionDenied.into()))
                 },
             )
             .unwrap();

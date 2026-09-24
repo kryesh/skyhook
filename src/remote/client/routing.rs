@@ -1,14 +1,14 @@
 //! Dispatch shim responses without blocking frame reads on host callbacks.
 use super::permissions::rebase_remote_permissions;
 use super::*;
-use crate::tool::authorization::AuthorizationError;
+use crate::{remote::SshError, target::TargetName, tool::authorization::AuthorizationError};
 use tokio::io::AsyncRead;
 
 pub(super) async fn route_responses<R>(
     output: R,
     state: &Mutex<ConnectionState>,
     host: (&Arc<Mutex<RequestWriter>>, &AuthorizationCoordinator),
-    target: String,
+    target: TargetName,
     prompts: Arc<dyn SensitivePromptHandler>,
     shutdown: CancellationToken,
     owner: Box<dyn Send>,
@@ -37,7 +37,7 @@ async fn route<R>(
     mut output: R,
     state: &Mutex<ConnectionState>,
     host: (&Arc<Mutex<RequestWriter>>, &AuthorizationCoordinator),
-    target: String,
+    target: TargetName,
     prompts: Arc<dyn SensitivePromptHandler>,
     results: &mut super::results::Results,
 ) -> Result<std::convert::Infallible, RemoteError>
@@ -73,7 +73,9 @@ where
         };
         let response = response
             .map_err(|error| transport_error(error, Operation::Receive))?
-            .ok_or_else(|| RemoteError::Protocol("shim closed before replying".to_owned()))?;
+            .ok_or(RemoteError::Protocol(ProtocolError::Violation(
+                "shim closed before replying",
+            )))?;
         match response {
             Response::Payload { request_id, event } => {
                 results.payload(state, host.0, request_id, event).await?;
@@ -92,16 +94,17 @@ where
                     })
                 };
                 if invalid || overflow {
-                    return Err(RemoteError::Protocol(
-                        "invalid stream output or flow-control overflow".into(),
-                    ));
+                    return Err(ProtocolError::Violation(
+                        "invalid stream output or flow-control overflow",
+                    )
+                    .into());
                 }
             }
             Response::StreamClosed { channel, error } => {
                 if let Some(sender) = state.lock().await.streams.remove(&channel)
                     && let Some(error) = error
                 {
-                    let _ = sender.output.try_send(Err(RemoteError::Ssh(error)));
+                    let _ = sender.output.try_send(Err(SshError::Stream(error).into()));
                 }
             }
             Response::StreamAck { channel } => {
@@ -113,7 +116,7 @@ where
                         .is_some_and(|stream| stream.credit.acknowledge().is_err())
                 };
                 if invalid {
-                    return Err(RemoteError::Protocol("invalid stream credit".into()));
+                    return Err(ProtocolError::Violation("invalid stream credit").into());
                 }
             }
             Response::SensitivePrompt {
@@ -121,7 +124,7 @@ where
                 mut prompt,
             } => {
                 if prompt_tasks.contains_key(&prompt_id) {
-                    return Err(RemoteError::Protocol("duplicate prompt".into()));
+                    return Err(ProtocolError::Violation("duplicate prompt").into());
                 }
                 prompt.message = format!("[origin={target}] {}", prompt.message);
                 let writer = host.0.clone();
@@ -136,10 +139,7 @@ where
                         answer = prompts.prompt(prompt) => answer,
                         () = cancelled.cancelled() => return Ok(Some(prompt_id)),
                     };
-                    let answer = match answer {
-                        Ok(value) => crate::remote::prompt::PromptAnswer::Accepted(value),
-                        Err(_) => crate::remote::prompt::PromptAnswer::Rejected,
-                    };
+                    let answer = answer.unwrap_or(crate::remote::PromptAnswer::Rejected);
                     write_frame(
                         &mut writer.lock().await.input,
                         &Request::SensitiveAnswer { prompt_id, answer },
@@ -179,30 +179,14 @@ where
                             Err(error) => Err(AuthorizationError::Denied(error.to_string())),
                         }
                     } else {
-                        Err(AuthorizationError::Denied(
-                            "remote authorization requires a host tool context".into(),
-                        ))
-                    };
-                    let (allowed, reason) = match decision {
-                        Ok(()) => (true, None),
-                        Err(
-                            AuthorizationError::Denied(reason)
-                            | AuthorizationError::InvalidGrant(reason),
-                        ) => (false, Some(reason)),
-                        Err(AuthorizationError::Cancelled) => {
-                            (false, Some("tool was cancelled".into()))
-                        }
-                        Err(AuthorizationError::Unavailable) => {
-                            (false, Some("capability is unavailable".into()))
-                        }
+                        Err(AuthorizationError::PolicyFailed)
                     };
                     write_frame(
                         &mut writer.lock().await.input,
                         &Request::AuthorizationDecision {
                             request_id,
                             authorization_id,
-                            allowed,
-                            reason,
+                            decision: decision.into(),
                         },
                     )
                     .await
@@ -211,9 +195,9 @@ where
                 });
             }
             Response::Ready => {
-                return Err(RemoteError::Protocol(
-                    "received a second remote ready response".to_owned(),
-                ));
+                return Err(
+                    ProtocolError::Violation("received a second remote ready response").into(),
+                );
             }
         }
     }
@@ -225,7 +209,7 @@ mod tests {
         fixture_context, output, route_fixture, test_connection, write_result,
     };
     use super::*;
-    use crate::remote::protocol::AuthorizationId;
+    use crate::remote::protocol::{AuthorizationDecision, AuthorizationId};
     use crate::tool::policy::{Capability, PermissionUse, ResourceId};
     use std::time::Duration;
 
@@ -297,7 +281,7 @@ mod tests {
                 responses,
                 &state,
                 callbacks,
-                "build".into(),
+                "build".parse().unwrap(),
                 prompts,
                 CancellationToken::new(),
                 Box::new(()),
@@ -312,7 +296,10 @@ mod tests {
             },
         };
         tokio::time::timeout(Duration::from_secs(3), async {
-            let outside = ResourceId::path("root", std::path::Path::new("/outside"));
+            let outside = ResourceId::path(
+                &crate::target::TargetRef::Root,
+                std::path::Path::new("/outside"),
+            );
             let request = Response::Authorization {
                 request_id: RequestId::FIRST,
                 authorization_id: AUTHORIZATION,
@@ -330,7 +317,7 @@ mod tests {
                 control(&mut replies).await,
                 Some(Request::SensitiveAnswer {
                     prompt_id: PROMPT,
-                    answer: crate::remote::prompt::PromptAnswer::Rejected
+                    answer: crate::remote::PromptAnswer::Rejected
                 })
             ));
             release.notify_one();
@@ -338,7 +325,7 @@ mod tests {
                 control(&mut replies).await,
                 Some(Request::AuthorizationDecision {
                     authorization_id: AUTHORIZATION,
-                    allowed: true,
+                    decision: AuthorizationDecision::Allowed,
                     ..
                 })
             ));

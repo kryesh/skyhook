@@ -1,6 +1,7 @@
 //! Child-agent launch, tool dispatch, and model context selection.
 
 use super::*;
+use crate::tool::registry::JobName;
 
 // One owner binds the resolved provider context, admitted capabilities, loop
 // controls and initial journal publication to the same launch identity. There
@@ -132,7 +133,6 @@ impl PreparedAgentLaunch {
         } = self;
         if !resumed {
             let started = SessionEvent::AgentStarted {
-                parent: agent_loop.id.parent(),
                 owner_job: agent_loop.owner_job,
                 profile: Some(crate::session::ProfileSnapshot {
                     name: agent_loop.settings.model_profile.clone(),
@@ -202,17 +202,19 @@ impl SessionRuntime {
             .await
     }
 
-    pub(super) fn execute_call(
+    /// Plan a model call and publish its job. A response's calls are created in
+    /// order before any runs, so a `wait` among them sees its siblings as
+    /// outstanding work from the start.
+    pub(super) async fn create_call(
         &self,
         agent: &AgentId,
         parent: Option<JobId>,
         call: &ToolCall,
-        origin: u64,
+        origin: MessageSeq,
         location: &crate::execution::ExecutionLocation,
         capabilities: &CapabilitySet,
-    ) -> futures_util::future::BoxFuture<'static, ToolResult> {
+    ) -> CreatedCall {
         let call = call.clone();
-        let agent = agent.clone();
         let executor = self
             .executor
             .clone()
@@ -222,18 +224,57 @@ impl SessionRuntime {
                 message: origin,
                 call_id: call.id().to_owned(),
             });
-        // Tool dispatch owns its execution inputs. Erasing this future separates
-        // the driver's Send proof from the nested supervised executor graph.
+        let created = executor
+            .create_model(
+                agent.clone(),
+                call.name(),
+                serde_json::Value::Object(call.arguments().clone()),
+                parent,
+            )
+            .await;
+        match created {
+            Ok(created) => CreatedCall::Created {
+                executor,
+                call,
+                parent,
+                created: Box::new(created),
+            },
+            Err(error) => {
+                let requested = JobName::requested(call.arguments());
+                CreatedCall::Settled(failed_result(&call, parent, &executor, error, requested))
+            }
+        }
+    }
+}
+
+/// A model call between its job's publication and its result.
+pub(super) enum CreatedCall {
+    Created {
+        executor: ToolExecutor,
+        call: ToolCall,
+        parent: Option<JobId>,
+        created: Box<crate::tool::executor::CreatedInvocation>,
+    },
+    /// Settled without a job: planning failed or the tool is unavailable.
+    Settled(ToolResult),
+}
+
+impl CreatedCall {
+    /// Tool dispatch owns its execution inputs. Erasing this future separates
+    /// the driver's Send proof from the nested supervised executor graph.
+    pub(super) fn run(self) -> futures_util::future::BoxFuture<'static, ToolResult> {
         Box::pin(async move {
-            let result = executor
-                .execute_model(
-                    agent,
-                    call.name(),
-                    serde_json::Value::Object(call.arguments().clone()),
+            let (executor, call, parent, created) = match self {
+                Self::Settled(result) => return result,
+                Self::Created {
+                    executor,
+                    call,
                     parent,
-                )
-                .await;
-            match result {
+                    created,
+                } => (executor, call, parent, created),
+            };
+            let job_name = created.job_name().cloned();
+            match executor.run(*created).await {
                 Ok(result) => ToolResult {
                     call_id: call.id().to_owned(),
                     name: call.name().to_owned(),
@@ -241,27 +282,32 @@ impl SessionRuntime {
                     images: result.output.images,
                     is_error: result.is_error,
                 },
-                Err(error) => {
-                    let output = error.into_response(
-                        call.name(),
-                        parent,
-                        call.arguments()
-                            .get("name")
-                            .and_then(serde_json::Value::as_str),
-                        executor.diagnostic_viewer(),
-                    );
-                    ToolResult {
-                        call_id: call.id().to_owned(),
-                        name: call.name().to_owned(),
-                        result: output.value,
-                        images: output.images,
-                        is_error: true,
-                    }
-                }
+                Err(error) => failed_result(&call, parent, &executor, error, job_name),
             }
         })
     }
+}
 
+/// `name` is the published job's name, or the requested one when no job was
+/// published.
+fn failed_result(
+    call: &ToolCall,
+    parent: Option<JobId>,
+    executor: &ToolExecutor,
+    error: crate::tool::executor::ExecutionError,
+    name: Option<JobName>,
+) -> ToolResult {
+    let output = error.into_response(call.name(), parent, name, executor.diagnostic_viewer());
+    ToolResult {
+        call_id: call.id().to_owned(),
+        name: call.name().to_owned(),
+        result: output.value,
+        images: output.images,
+        is_error: true,
+    }
+}
+
+impl SessionRuntime {
     pub(super) async fn resolve_agent(
         &self,
         model_profile: &str,
@@ -300,10 +346,9 @@ impl SessionRuntime {
         mode: Option<&str>,
         capabilities: &CapabilitySet,
     ) -> Result<Vec<SystemSegment>, HarnessError> {
-        let target = if location.is_root() {
-            None
-        } else {
-            Some(self.router.targets().get(&location.target).await?)
+        let target = match &location.target {
+            crate::target::TargetRef::Root => None,
+            crate::target::TargetRef::Named(name) => Some(self.router.targets().get(name).await?),
         };
         let system = vec![prompt::system_segment(&prompt::PromptInputs {
             instructions: &self.harness.instructions,
@@ -532,7 +577,7 @@ mod tests {
     use crate::agent::runtime::tests::*;
 
     fn last_tool_results(request: &ModelRequest) -> &[ToolResult] {
-        let Some(Message::Tool(results)) = request.history.last() else {
+        let Some(Sent::Tool(results)) = request.history.last() else {
             panic!("expected tool results at the end of the history");
         };
         results

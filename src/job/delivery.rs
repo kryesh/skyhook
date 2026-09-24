@@ -1,6 +1,7 @@
 //! Serialized lifecycle delivery, claims, and wait semantics.
 
 use super::*;
+use crate::session::Message;
 
 /// Aggregate child-reply bytes one notification batches; a single oversized
 /// reply is still admitted.
@@ -32,7 +33,7 @@ impl PendingDelivery {
     /// Commit the parent notification with an acknowledgement row for each delivered
     /// job outcome and child reply, in one transaction, then acknowledge them live.
     /// Shielded from caller cancellation once admitted.
-    pub(crate) async fn commit(self, message: Message) -> Result<u64, JobError> {
+    pub(crate) async fn commit(self, message: Message) -> Result<MessageSeq, JobError> {
         let Self {
             manager,
             owner,
@@ -54,7 +55,7 @@ impl PendingDelivery {
                                 jobs.get(&envelope.id).is_some_and(|entry| {
                                     entry.agent == owner
                                         && entry.background
-                                        && entry.state == envelope.state
+                                        && entry.state() == envelope.state
                                         && entry.deliverable()
                                         && entry.delivery == DeliveryState::Pending
                                 })
@@ -70,7 +71,8 @@ impl PendingDelivery {
                         .append_then(
                             owner.clone(),
                             SessionEvent::MessageCommitted { message },
-                            move |notification| {
+                            move |notification: RecordSeq| {
+                                let notification = notification.message();
                                 let injected = acknowledged
                                     .into_iter()
                                     .map(|job| SessionEvent::JobInjected { job });
@@ -92,9 +94,7 @@ impl PendingDelivery {
                     let mut jobs = manager.inner.jobs.lock().await;
                     for reply in &messages {
                         if let Some(entry) = jobs.get_mut(&reply.id) {
-                            entry
-                                .messages
-                                .retain(|message| message.message != reply.message);
+                            entry.deliver_message(reply.message);
                         }
                     }
                     for job in delivered {
@@ -112,7 +112,7 @@ impl PendingDelivery {
                             break;
                         }
                     }
-                    Ok(record.sequence)
+                    Ok(record.sequence.message())
                 },
             )
             .await
@@ -157,18 +157,16 @@ impl JobManager {
                 let mut jobs = self.inner.jobs.lock().await;
                 let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
                 let notified = entry.notify.clone().notified_owned();
-                let pending_question = entry.state == JobState::WaitingInput
-                    && entry.delivery == DeliveryState::Pending;
+                let pending_question = entry.waiting() && entry.delivery == DeliveryState::Pending;
                 let (ready, claim) = match mode {
-                    WaitMode::Foreground => (
-                        entry.deliverable() || entry.background,
-                        entry.state == JobState::WaitingInput,
-                    ),
+                    WaitMode::Foreground => {
+                        (entry.deliverable() || entry.background, entry.waiting())
+                    }
                     WaitMode::Explicit { claim } => (
-                        !entry.suspended() && (entry.state.is_terminal() || pending_question),
+                        !entry.suspended() && (entry.end().is_some() || pending_question),
                         claim,
                     ),
-                    WaitMode::Terminal => (entry.state.is_terminal() && !entry.suspended(), false),
+                    WaitMode::Terminal => (entry.settled(), false),
                 };
                 let claimed_agent = if ready && claim {
                     (entry.delivery == DeliveryState::Pending).then(|| entry.agent.clone())
@@ -176,8 +174,8 @@ impl JobManager {
                     None
                 };
                 let mut snapshot = entry.envelope(id);
-                if entry.state == JobState::WaitingInput && !ready {
-                    snapshot.output = None;
+                if !ready {
+                    snapshot.question = None;
                 }
                 (snapshot, notified, ready, claimed_agent)
             };
@@ -265,7 +263,9 @@ impl JobManager {
         owner: &AgentId,
         messages: &[AgentMessage],
     ) -> Vec<JobId> {
-        let messages_through = messages.last().map_or(0, |message| message.message);
+        let messages_through = messages
+            .last()
+            .map_or(MessageSeq::default(), |message| message.message);
         let mut remaining = LIFECYCLE_BATCH_BYTES;
         let mut ids = jobs
             .iter()
@@ -276,7 +276,9 @@ impl JobManager {
                     && entry.delivery == DeliveryState::Pending
                     // Filter before budgeting: a blocked low-ID child must not
                     // consume the lifecycle budget of an unrelated completion.
-                    && entry.messages.iter().all(|message| message.message <= messages_through)
+                    && entry.child().is_none_or(|child| {
+                        child.messages.iter().all(|message| message.message <= messages_through)
+                    })
             })
             .map(|(id, _)| *id)
             .collect::<Vec<_>>();
@@ -287,9 +289,10 @@ impl JobManager {
             let metadata = serde_json::to_vec(&entry.metadata(id))
                 .map_or(output::PAGE_BYTES, |bytes| bytes.len());
             // A completed child agent presents its result by reference to its reply.
-            let referenced = entry.role == JobRole::Agent
-                && entry.state == JobState::Completed
-                && entry.last_agent_message.is_some();
+            let referenced = entry.end() == Some(JobEnd::Completed)
+                && entry
+                    .child()
+                    .is_some_and(|child| child.last_message.is_some());
             let cost = if referenced {
                 metadata.saturating_add(128)
             } else {
@@ -313,7 +316,7 @@ impl JobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::protocol::{Message, UserContent};
+    use crate::session::UserPart;
 
     async fn completed_job() -> (tempfile::TempDir, JobManager, AgentId, JobId) {
         let (root, manager, owner) = crate::job::tests::runtime().await;
@@ -321,29 +324,27 @@ mod tests {
             background: true,
             ..JobSpec::test(owner.clone(), "test")
         };
-        let lease = manager.test_lease(spec).await;
-        manager
-            .test_finish(lease.id(), serde_json::json!("answer"))
-            .await;
-        (root, manager, owner, lease.id())
+        let job = manager.test_create(spec).await;
+        manager.test_finish(job, serde_json::json!("answer")).await;
+        (root, manager, owner, job)
     }
 
     async fn question_job() -> (tempfile::TempDir, JobManager, AgentId, JobId) {
         let (root, manager, owner) = crate::job::tests::runtime().await;
         let job = manager
-            .test_create(JobSpec::test(owner.clone(), "agent"))
-            .await;
-        manager.transition(job, JobState::Running).await.unwrap();
-        let question = serde_json::json!({"question":"choose"});
+            .test_running(JobSpec::test(owner.clone(), "agent"))
+            .await
+            .into_test_id();
+        let question = crate::job::tests::question("choose");
         manager.request_input(job, question).await.unwrap();
         (root, manager, owner, job)
     }
 
     fn notification(job: JobId, state: JobState) -> Message {
-        crate::job::tests::job_events(serde_json::json!([{"id":job,"state":state}]))
+        crate::job::tests::job_events(vec![crate::job::tests::job_view(job, state)])
     }
 
-    async fn commit_pending(manager: &JobManager, owner: &AgentId, message: Message) -> u64 {
+    async fn commit_pending(manager: &JobManager, owner: &AgentId, message: Message) -> MessageSeq {
         let receipt = manager.pending_delivery(owner).await.unwrap();
         receipt.commit(message).await.unwrap()
     }
@@ -452,12 +453,12 @@ mod tests {
         commit_pending(&manager, &owner, notification(job, JobState::Completed)).await;
         let running = SessionEvent::JobStateChanged {
             job,
-            state: JobState::Running,
+            state: JobTransition::Running,
         };
         manager.test_append(owner.clone(), running).await;
         let finished = SessionEvent::JobFinished {
             job,
-            state: JobState::Completed,
+            state: JobEnd::Completed,
             diagnostic: None,
             output_diagnostic: None,
             images: Vec::new(),
@@ -474,7 +475,7 @@ mod tests {
             commit_pending(&manager, &owner, notification(job, JobState::WaitingInput)).await;
             if cancelled {
                 manager
-                    .finish(job, ToolError::Cancelled.into())
+                    .finish(job, ToolError::cancelled().into())
                     .await
                     .unwrap();
             } else {
@@ -503,9 +504,8 @@ mod tests {
         manager.claim(job).await.unwrap();
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         assert!(receipt.envelopes().is_empty());
-        let text = "<skyhook_child_messages>\n[]\n</skyhook_child_messages>".into();
         receipt
-            .commit(Message::User(vec![UserContent::Runtime { text }]))
+            .commit(Message::User(vec![UserPart::JobEvents { events: vec![] }]))
             .await
             .unwrap();
         assert!(
@@ -559,26 +559,22 @@ mod tests {
             accepts_input: true,
             ..JobSpec::test(agent.clone(), "agent")
         };
-        let lease = manager.test_lease(spec).await;
-        manager
-            .transition(lease.id(), JobState::Running)
-            .await
-            .unwrap();
-        let question = |id: &str| serde_json::json!({"kind":"questions","question_id":id});
+        let lease = manager.test_running(spec).await;
+        let question = crate::job::tests::question;
         manager
             .request_input(lease.id(), question("q-2"))
             .await
             .unwrap();
         let question_view = manager.wait(lease.id(), None, true).await.unwrap();
         assert_eq!(question_view.state, JobState::WaitingInput);
-        assert_eq!(question_view.output.unwrap()["question_id"], "q-2");
+        assert_eq!(question_view.question, Some(question("q-2")));
         assert!(!manager.has_pending(&agent).await);
         let repeated = manager
             .wait(lease.id(), Some(Duration::from_millis(1)), true)
             .await
             .unwrap();
         assert_eq!(
-            (repeated.state, repeated.output),
+            (repeated.state, repeated.question),
             (JobState::WaitingInput, None)
         );
         manager.resume_input(lease.id()).await.unwrap();
@@ -588,8 +584,7 @@ mod tests {
             .unwrap();
         let receipt = manager.pending_delivery(&agent).await.unwrap();
         assert_eq!(receipt.envelopes().len(), 1);
-        let output = receipt.envelopes()[0].output.as_ref().unwrap();
-        assert_eq!(output["question_id"], "q-3");
+        assert_eq!(receipt.envelopes()[0].question, Some(question("q-3")));
         let message = notification(lease.id(), JobState::WaitingInput);
         receipt.commit(message).await.unwrap();
         assert!(!manager.has_pending(&agent).await);

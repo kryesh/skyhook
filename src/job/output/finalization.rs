@@ -17,7 +17,8 @@ fn invalid(message: impl Into<String>) -> io::Error {
 /// stays unreferenced and is reported incomplete. Only persistence failures are errors.
 pub(crate) fn save_completed(
     output: &Output,
-    document: &Value,
+    result: Option<Value>,
+    captures_complete: bool,
     completed: Vec<CompletedCapture>,
 ) -> Result<(), ToolError> {
     // An unreadable inventory leaves every receipt unbound (and so incomplete).
@@ -29,7 +30,7 @@ pub(crate) fn save_completed(
                 .captures
                 .values()
                 .map(|capture| {
-                    let kind = CaptureKind::parse(&capture.kind);
+                    let kind = capture.kind;
                     (capture.pointer.clone(), (capture.id, kind))
                 })
                 .collect::<BTreeMap<_, _>>()
@@ -52,14 +53,15 @@ pub(crate) fn save_completed(
                 && fields.iter().enumerate().all(|(other, candidate)| {
                     other == index
                         || (*candidate != field
-                            && !nested(candidate, field)
-                            && !nested(field, candidate))
+                            && !field.contains(candidate)
+                            && !candidate.contains(field))
                 }))
             .then_some((id, capture))
         })
         .collect::<Vec<_>>();
 
-    let mut document = document.clone();
+    let has_result = result.is_some();
+    let mut document = json!({"result": result});
     let mut references = BTreeSet::new();
     let mut kinds = Vec::new();
     for (id, capture) in bound {
@@ -72,24 +74,16 @@ pub(crate) fn save_completed(
             continue;
         }
         if kind == CaptureKind::Text || value.is_array() || value.is_object() {
-            references.insert(field.to_owned());
+            references.insert(field.clone());
         }
         kinds.push((id, kind));
     }
     // Unknown registrations resolve only for admitted receipts.
     for (id, kind) in kinds {
-        output
-            .db
-            .resolve_capture_kind(id, kind.as_str())
-            .map_err(database)?;
+        output.db.resolve_capture_kind(id, kind).map_err(database)?;
     }
-    save_document(output, &document, &references)
-}
-
-fn nested(field: &str, ancestor: &str) -> bool {
-    field
-        .strip_prefix(ancestor)
-        .is_some_and(|suffix| suffix.starts_with('/'))
+    let result = has_result.then(|| document["result"].take());
+    save_document(output, result, captures_complete, &references)
 }
 
 /// Interpret one bound receipt against the terminal document. `Ok(None)` is a
@@ -106,22 +100,24 @@ fn admitted_value(
             .capture(field)
             .ok_or_else(|| invalid("completed capture is missing"))
     };
-    Ok(Some(match (capture.kind(), document.pointer(field)) {
-        // A terminal primitive historically abandons the raw capture, even
-        // when the sender completed its bytes. Do not parse or replace it.
-        (_, Some(Value::Null | Value::Bool(_) | Value::Number(_))) => return Ok(None),
-        (CaptureKind::Text, _) | (CaptureKind::Unknown, Some(Value::String(_))) => {
-            validate_utf8(source()?, &mut [0; 64 * 1024])?;
-            (CaptureKind::Text, Value::String(String::new()))
-        }
-        (CaptureKind::Json, _)
-        | (CaptureKind::Unknown, Some(Value::Object(_) | Value::Array(_))) => {
-            (CaptureKind::Json, validated_json_reference(source()?)?)
-        }
-        // Historical Unknown is only a hint. Scalars and missing
-        // fields never referenced its bytes; retain that distinction.
-        (CaptureKind::Unknown, _) => return Ok(None),
-    }))
+    Ok(Some(
+        match (capture.kind(), document.pointer(field.as_str())) {
+            // A terminal primitive historically abandons the raw capture, even
+            // when the sender completed its bytes. Do not parse or replace it.
+            (_, Some(Value::Null | Value::Bool(_) | Value::Number(_))) => return Ok(None),
+            (CaptureKind::Text, _) | (CaptureKind::Unknown, Some(Value::String(_))) => {
+                validate_utf8(source()?, &mut [0; 64 * 1024])?;
+                (CaptureKind::Text, Value::String(String::new()))
+            }
+            (CaptureKind::Json, _)
+            | (CaptureKind::Unknown, Some(Value::Object(_) | Value::Array(_))) => {
+                (CaptureKind::Json, validated_json_reference(source()?)?)
+            }
+            // Historical Unknown is only a hint. Scalars and missing
+            // fields never referenced its bytes; retain that distinction.
+            (CaptureKind::Unknown, _) => return Ok(None),
+        },
+    ))
 }
 
 /// Validate JSON without constructing its container tree. Scalars are then
@@ -193,15 +189,12 @@ fn validate_utf8(mut source: impl io::Read, buffer: &mut [u8]) -> io::Result<()>
 /// a JSON Pointer alone is not evidence that a numeric member denotes an array.
 /// The whole path is checked before mutation, so a rejected field leaves the
 /// document unchanged.
-fn install(document: &mut Value, field: &str, value: Value) -> io::Result<()> {
-    if field.is_empty() {
+fn install(document: &mut Value, field: &FieldPointer, value: Value) -> io::Result<()> {
+    if field.is_root() {
         *document = value;
         return Ok(());
     }
-    let Some(pointer) = field.strip_prefix('/') else {
-        return Err(invalid("completed capture field must be a JSON Pointer"));
-    };
-    let keys = pointer
+    let keys = field.as_str()[1..]
         .split('/')
         .map(|key| key.replace("~1", "/").replace("~0", "~"))
         .collect::<Vec<_>>();
@@ -261,10 +254,9 @@ mod tests {
         let mut outputs = Vec::new();
         for name in ["first", "second"] {
             let id = manager
-                .test_lease(JobSpec::test(agent.clone(), name))
+                .test_running(JobSpec::test(agent.clone(), name))
                 .await
-                .id();
-            manager.transition(id, JobState::Running).await.unwrap();
+                .into_test_id();
             outputs.push(manager.output(id));
         }
         let second = outputs.pop().unwrap();
@@ -278,9 +270,15 @@ mod tests {
         kind: CaptureKind,
         bytes: &[u8],
     ) -> CompletedCapture {
-        let mut writer = PendingCapture::create(output, field, kind).unwrap().open();
+        let mut writer = PendingCapture::create(output, &pointer(field), kind)
+            .unwrap()
+            .open();
         writer.write_all(bytes).unwrap();
         writer.finish().unwrap()
+    }
+
+    fn pointer(field: &str) -> FieldPointer {
+        field.parse().unwrap()
     }
 
     fn document(output: &Output) -> Value {
@@ -289,10 +287,6 @@ mod tests {
 
     fn saved(output: &Output) -> Saved {
         Saved::load(output).unwrap()
-    }
-
-    fn complete_document() -> Value {
-        json!({"result":{},"capture_complete":true})
     }
 
     #[tokio::test]
@@ -304,7 +298,7 @@ mod tests {
             ("/result/a~1b/~0key", CaptureKind::Json, br#"[null,"x"]"#),
         ]
         .map(|(field, kind, bytes)| completed(&output, field, kind, bytes));
-        save_completed(&output, &complete_document(), captures.into()).unwrap();
+        save_completed(&output, Some(json!({})), true, captures.into()).unwrap();
         let document = document(&output);
         assert_eq!(
             document["result"],
@@ -312,7 +306,10 @@ mod tests {
         );
         let referenced = output.test_fields();
         assert_eq!(
-            referenced,
+            referenced
+                .iter()
+                .map(FieldPointer::as_str)
+                .collect::<Vec<_>>(),
             ["/result/a~1b/~0key", "/result/matches", "/result/text"]
         );
         let hydrated = hydrate(&saved(&output), document).unwrap();
@@ -341,8 +338,7 @@ mod tests {
             ("ancestor", &b"valid"[..]),
         ] {
             let (_root, _manager, output, other) = outputs().await;
-            let prior = json!({"result":{"prior":true},"capture_complete":false});
-            save_completed(&output, &prior, Vec::new()).unwrap();
+            save_completed(&output, Some(json!({"prior":true})), false, Vec::new()).unwrap();
             let kind = if failure == "json" {
                 CaptureKind::Json
             } else {
@@ -358,9 +354,12 @@ mod tests {
             proofs.push(completed(&output, "/result/ok", CaptureKind::Text, b"fine"));
             match failure {
                 "registration" => {
-                    let raw = saved(&output).captures[field].id;
+                    let raw = saved(&output).captures[&pointer(field)].id;
                     output.db.delete_capture(raw).unwrap();
-                    drop(PendingCapture::create(&output, field, CaptureKind::Json).unwrap());
+                    drop(
+                        PendingCapture::create(&output, &pointer(field), CaptureKind::Json)
+                            .unwrap(),
+                    );
                 }
                 "overlap" => proofs.push(completed(
                     &output,
@@ -370,14 +369,14 @@ mod tests {
                 )),
                 "duplicate" => proofs.push(proofs[0].clone()),
                 "missing" => {
-                    let raw = saved(&output).captures[field].id;
+                    let raw = saved(&output).captures[&pointer(field)].id;
                     output.db.delete_capture(raw).unwrap();
                 }
                 _ => {}
             }
             let target = if failure == "job" { &other } else { &output };
-            let product = json!({"result":{"scalar":"text"},"capture_complete":true});
-            save_completed(target, &product, proofs).expect(failure);
+            let product = Some(json!({"scalar":"text"}));
+            save_completed(target, product, true, proofs).expect(failure);
             let document = document(target);
             assert_eq!(document["result"]["scalar"], "text", "{failure}");
             assert!(document.pointer(field).is_none(), "{failure}");
@@ -387,9 +386,18 @@ mod tests {
             } else {
                 &["/result/ok"]
             };
-            assert_eq!(referenced, expected, "{failure}");
+            assert_eq!(
+                referenced
+                    .iter()
+                    .map(FieldPointer::as_str)
+                    .collect::<Vec<_>>(),
+                expected,
+                "{failure}"
+            );
             let captures = captures::available_captures(&saved(&output), true);
-            let raw = captures.iter().find(|capture| capture.field == field);
+            let raw = captures
+                .iter()
+                .find(|capture| capture.field.as_str() == field);
             match failure {
                 "missing" => assert!(raw.is_none()),
                 _ => assert!(raw.is_some_and(|capture| !capture.complete), "{failure}"),
@@ -432,7 +440,8 @@ mod tests {
         for kind in [CaptureKind::Unknown, CaptureKind::Text, CaptureKind::Json] {
             let (_root, _manager, output, _) = outputs().await;
             let unknown = kind == CaptureKind::Unknown;
-            let initial = json!({"result":{"text":"", "object":{}, "array":[], "null":null, "bool":true,"number":4},"capture_complete":true});
+            let initial =
+                json!({"text":"", "object":{}, "array":[], "null":null, "bool":true,"number":4});
             let shaped: &[(&str, &[u8])] = if unknown {
                 &[
                     ("text", br#"{"looks":"json"}"#),
@@ -451,7 +460,7 @@ mod tests {
                 .chain(scalars)
                 .map(|(field, bytes)| completed(&output, &format!("/result/{field}"), kind, bytes))
                 .collect();
-            save_completed(&output, &initial, captures).unwrap();
+            save_completed(&output, Some(initial.clone()), true, captures).unwrap();
             let hydrated = hydrate(&saved(&output), document(&output)).unwrap();
             if unknown {
                 assert_eq!(hydrated["result"]["text"], r#"{"looks":"json"}"#);
@@ -459,10 +468,10 @@ mod tests {
                 assert_eq!(hydrated["result"]["array"], json!([1, 2]));
                 assert!(hydrated.pointer("/result/missing").is_none());
             } else {
-                assert_eq!(document(&output), initial);
+                assert_eq!(document(&output)["result"], initial);
             }
             for (field, _) in scalars {
-                assert_eq!(hydrated["result"][field], initial["result"][field]);
+                assert_eq!(hydrated["result"][field], initial[field]);
             }
             assert_eq!(output.test_fields().len(), if unknown { 3 } else { 0 });
             for descriptor in captures::available_captures(&saved(&output), true) {
@@ -484,10 +493,9 @@ mod tests {
             CaptureKind::Text,
             b"abandoned raw bytes",
         );
-        let result =
-            json!({"result":{"raw":"ordinary value".repeat(1000)},"capture_complete":true});
-        save_completed(&output, &result, vec![]).unwrap();
-        assert_eq!(document(&output), result);
+        let result = json!({"raw":"ordinary value".repeat(1000)});
+        save_completed(&output, Some(result.clone()), true, vec![]).unwrap();
+        assert_eq!(document(&output)["result"], result);
         assert!(output.test_fields().is_empty());
         assert_eq!(
             output.test_bytes("/result/raw").unwrap(),
@@ -506,7 +514,7 @@ mod tests {
             CaptureKind::Text,
             &vec![b's'; 6 * PAGE_BYTES],
         );
-        save_completed(&output, &complete_document(), vec![capture]).unwrap();
+        save_completed(&output, Some(json!({})), true, vec![capture]).unwrap();
         let estimate = presentation_size(&output);
         assert!(
             estimate <= 2 * PAGE_BYTES,

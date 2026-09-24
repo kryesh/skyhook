@@ -10,22 +10,100 @@ use serde_json::Value;
 
 use crate::{
     media::{BlobRef, Image, ImageRef, MAX_IMAGE_BYTES},
+    named_enum::named_enum,
+    newtype::string_newtype,
     tool::StreamEnd,
 };
 
-#[derive(
-    Clone, Copy, Debug, Default, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq,
-)]
-#[serde(rename_all = "snake_case")]
-pub enum CaptureKind {
-    Text,
-    Json,
-    /// Transports may stream a capture before its final JSON type is known.
-    #[default]
-    Unknown,
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+    pub enum CaptureKind {
+        Text = "text",
+        Json = "json",
+        /// Transports may stream a capture before its final JSON type is known.
+        Unknown = "unknown",
+    }
 }
 
 pub(crate) const OUTPUT_CHUNK_BYTES: usize = 32 * 1024;
+
+string_newtype! {
+    /// A JSON Pointer into a job's saved output: the whole output (`""`) or `/`-led
+    /// segments with `~0`/`~1` escapes. Ordered and compared by spelling.
+    #[derive(Default, PartialOrd, Ord)]
+    pub struct FieldPointer(InvalidFieldPointer) = |field| {
+        let mut characters = field.chars();
+        let valid_root = field.is_empty() || field.starts_with('/');
+        let mut valid_escapes = true;
+        while let Some(character) = characters.next() {
+            if character == '~' && !matches!(characters.next(), Some('0' | '1')) {
+                valid_escapes = false;
+                break;
+            }
+        }
+        (valid_root && valid_escapes)
+            .then_some(())
+            .ok_or(InvalidFieldPointer)
+    };
+}
+
+/// Spelled as a plain string wherever a schema names it.
+impl schemars::JsonSchema for FieldPointer {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        String::schema_name()
+    }
+    fn schema_id() -> std::borrow::Cow<'static, str> {
+        String::schema_id()
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        String::json_schema(generator)
+    }
+    fn inline_schema() -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("field must be a JSON Pointer")]
+pub struct InvalidFieldPointer;
+
+impl From<InvalidFieldPointer> for io::Error {
+    fn from(error: InvalidFieldPointer) -> Self {
+        Self::new(io::ErrorKind::InvalidInput, error)
+    }
+}
+
+impl FieldPointer {
+    pub const fn root() -> Self {
+        Self(String::new())
+    }
+    /// The product's result, where every tool payload lives.
+    pub fn result() -> Self {
+        Self::root().property("result")
+    }
+    pub fn is_root(&self) -> bool {
+        self.0.is_empty()
+    }
+    /// The pointer of object member `key` under this one.
+    pub fn property(&self, key: &str) -> Self {
+        Self(format!(
+            "{}/{}",
+            self.0,
+            key.replace('~', "~0").replace('/', "~1")
+        ))
+    }
+    /// The pointer of array element `index` under this one.
+    pub fn index(&self, index: usize) -> Self {
+        Self(format!("{}/{index}", self.0))
+    }
+    /// Whether `other` addresses a strict descendant of this pointer.
+    pub fn contains(&self, other: &Self) -> bool {
+        other
+            .0
+            .strip_prefix(self.0.as_str())
+            .is_some_and(|rest| rest.starts_with('/'))
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TextCaptureField {
@@ -36,16 +114,13 @@ pub(crate) enum TextCaptureField {
 }
 
 impl TextCaptureField {
-    pub(crate) fn pointer(self) -> String {
-        format!(
-            "/result/{}",
-            match self {
-                Self::Stdout => "stdout",
-                Self::Stderr => "stderr",
-                Self::Content => "content",
-                Self::Console => "console",
-            }
-        )
+    pub(crate) fn pointer(self) -> FieldPointer {
+        FieldPointer::result().property(match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+            Self::Content => "content",
+            Self::Console => "console",
+        })
     }
 }
 
@@ -82,7 +157,7 @@ impl CaptureId {
 pub(crate) enum CaptureEvent {
     Open {
         id: CaptureId,
-        field: String,
+        field: FieldPointer,
         kind: CaptureKind,
     },
     Write {
@@ -160,24 +235,23 @@ impl OutputContext {
 
     pub(crate) async fn pending_stream_capture(
         &self,
-        field: &str,
+        field: FieldPointer,
         kind: CaptureKind,
     ) -> io::Result<PendingOutput> {
         self.pending_capture(field, kind, Abandon::Retain).await
     }
 
     pub(crate) async fn text_capture(&self, field: TextCaptureField) -> io::Result<PendingOutput> {
-        self.pending_capture(&field.pointer(), CaptureKind::Text, Abandon::Discard)
+        self.pending_capture(field.pointer(), CaptureKind::Text, Abandon::Discard)
             .await
     }
 
     pub(crate) async fn pending_capture(
         &self,
-        field: &str,
+        field: FieldPointer,
         kind: CaptureKind,
         abandon: Abandon,
     ) -> io::Result<PendingOutput> {
-        validate_field(field)?;
         let inner = self.inner.clone();
         let id = {
             let mut state = inner.state.lock().unwrap_or_else(PoisonError::into_inner);
@@ -192,7 +266,6 @@ impl OutputContext {
             activity: Activity { inner },
             id,
         };
-        let field = field.to_owned();
         tokio::task::spawn_blocking(move || {
             target
                 .activity
@@ -275,25 +348,6 @@ impl OutputContext {
     }
 }
 
-pub(crate) fn validate_field(field: &str) -> io::Result<()> {
-    let mut characters = field.chars();
-    let valid_root = field.is_empty() || field.starts_with('/');
-    let mut valid_escapes = true;
-    while let Some(character) = characters.next() {
-        if character == '~' && !matches!(characters.next(), Some('0' | '1')) {
-            valid_escapes = false;
-            break;
-        }
-    }
-    if !valid_root || !valid_escapes {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "capture field must be a JSON Pointer",
-        ));
-    }
-    Ok(())
-}
-
 /// Producer completion selects an output; it is not a persistence receipt.
 #[derive(Clone, Debug)]
 pub(crate) struct FinishedOutput {
@@ -313,7 +367,7 @@ pub(crate) struct ProducedOutput {
     pub(crate) images: Vec<ImageRef>,
     pub(crate) captures: Vec<FinishedOutput>,
     pub(crate) streams: StreamEnd,
-    pub(crate) diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
+    pub(crate) diagnostic: Option<crate::tool::diagnostic::PartialDiagnostic>,
 }
 
 impl ProducedOutput {
@@ -330,7 +384,7 @@ impl ProducedOutput {
     /// Register the builtin read result's error-message slot for presentation.
     pub(crate) fn with_diagnostic(
         mut self,
-        diagnostic: crate::tool::diagnostic::Diagnostic,
+        diagnostic: crate::tool::diagnostic::PartialDiagnostic,
     ) -> Self {
         self.diagnostic = Some(diagnostic);
         self
@@ -771,6 +825,22 @@ pub(crate) mod tests {
             Poll::Ready(())
         })
         .await;
+    }
+
+    #[test]
+    fn field_pointers_parse_at_the_boundary_and_know_their_descendants() {
+        for invalid in ["not-a-pointer", "/result/~", "/result/~2", "result"] {
+            assert_eq!(invalid.parse::<FieldPointer>(), Err(InvalidFieldPointer));
+        }
+        let result = FieldPointer::result();
+        let escaped = result.property("a/b").property("~key").index(2);
+        assert_eq!(escaped.as_str(), "/result/a~1b/~0key/2");
+        assert_eq!(escaped.as_str().parse::<FieldPointer>().unwrap(), escaped);
+        assert!(FieldPointer::root().contains(&result));
+        assert!(result.contains(&escaped));
+        assert!(!result.contains(&result));
+        assert!(!result.contains(&FieldPointer::root().property("results")));
+        assert!(!escaped.contains(&result));
     }
 
     #[tokio::test]

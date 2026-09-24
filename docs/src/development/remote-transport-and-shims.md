@@ -79,9 +79,11 @@ started by a remote worker receive OpenSSH's forwarded `SSH_AUTH_SOCK`; no secon
 listener is needed.
 
 SSH authentication prompts use `SensitivePromptHandler`, separate from model questions and tool
-output. Remote prompts and answers travel as private control messages, not session events or
-saved results. OpenSSH is given an explicit askpass helper so the host can handle passwords,
-passphrases, and confirmations without exposing them to the agent transcript.
+output. Remote prompts and their typed answers (a secret, a confirmation or a rejection) travel as
+private control messages, not session events or saved results. OpenSSH is given an explicit askpass
+helper so the host can handle passwords, passphrases, and confirmations without exposing them to
+the agent transcript; the helper prints a secret, answers `yes` to a confirmed host key, and exits
+nonzero for a rejection.
 
 Each askpass server keeps its helper and socket in a private temporary directory and accepts
 only peers running as its own user. This prevents other local users from injecting
@@ -109,8 +111,9 @@ CLI rebuild. Release builds (`just build-release`) include bytes at compile time
 self-contained. That recipe touches the embedding module first because `rust-embed` cannot detect
 newly added files. Debug shim artifacts are substantially larger than release artifacts.
 
-A missing or empty staging directory yields an empty catalog; SSH then reports an explicit
-missing-shim error. Library hosts inject their own [embedded catalog](embedding.md#embedded-shim-catalog)
+Artifact names outside this table are rejected when the catalog is built. A missing or empty
+staging directory yields an empty catalog; SSH then reports an explicit missing-shim error, distinct
+from an unsupported remote platform. Library hosts inject their own [embedded catalog](embedding.md#embedded-shim-catalog)
 rather than inheriting the CLI catalog.
 
 Git contains source only, not prebuilt shim binaries. To build a native Linux SSH shim without

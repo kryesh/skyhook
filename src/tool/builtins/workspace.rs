@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
-use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, PathRole, Subject};
+use crate::tool::diagnostic::{Effects, Operation, PartialContext, PathRole, Subject};
 use crate::tool::invocation::AdmissionError;
 use crate::tool::policy::{ApprovalGrant, Capability, PermissionUse, ResourceId};
 use crate::tool::registry::PathKind;
@@ -16,7 +16,11 @@ pub(crate) struct ResolvedWorkspacePath {
 impl ResolvedWorkspacePath {
     /// The permission for this path, proposing a grant over a directory's
     /// descendants or the exact file.
-    pub(crate) fn permission(&self, capability: Capability, target: &str) -> PermissionUse {
+    pub(crate) fn permission(
+        &self,
+        capability: Capability,
+        target: &crate::target::TargetRef,
+    ) -> PermissionUse {
         let resource = ResourceId::path(target, &self.path);
         let grant = if self.directory {
             ApprovalGrant::descendants(capability, resource.clone())
@@ -61,7 +65,7 @@ pub(crate) async fn resolve_existing(
     let joined = lexical_path(workspace, relative)?;
     fs::canonicalize(&joined)
         .await
-        .map_err(AdmissionError::annotated(DiagnosticContext::new(
+        .map_err(AdmissionError::annotated(PartialContext::new(
             Operation::Canonicalize,
             Subject::path(&joined),
         )))
@@ -74,7 +78,7 @@ pub(crate) async fn resolve_writable(
     let joined = lexical_path(workspace, relative)?;
     if fs::try_exists(&joined)
         .await
-        .map_err(AdmissionError::annotated(DiagnosticContext::new(
+        .map_err(AdmissionError::annotated(PartialContext::new(
             Operation::Inspect,
             Subject::path(&joined),
         )))?
@@ -87,13 +91,13 @@ pub(crate) async fn resolve_writable(
 /// Resolve the parent's symlinks while keeping the final entry's own name.
 async fn within_canonical_parent(joined: &Path) -> Result<PathBuf, AdmissionError> {
     let missing = |part: &str| {
-        AdmissionError::Failed(format!("path has no {part}"))
+        AdmissionError::failed(format!("path has no {part}"))
             .operation(Operation::Canonicalize, Subject::path(joined))
     };
     let parent = joined.parent().ok_or_else(|| missing("parent"))?;
     let parent = fs::canonicalize(parent)
         .await
-        .map_err(AdmissionError::annotated(DiagnosticContext::new(
+        .map_err(AdmissionError::annotated(PartialContext::new(
             Operation::Canonicalize,
             Subject::ParentDirectory(parent.to_owned()),
         )))?;
@@ -126,12 +130,12 @@ pub(crate) async fn resolve_writable_with_parents(
                     Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => {}
                     Ok(_) => {
                         return Err(
-                            AdmissionError::Io(error).operation(Operation::Canonicalize, subject)
+                            AdmissionError::io(error).operation(Operation::Canonicalize, subject)
                         );
                     }
                     Err(error) => {
                         return Err(
-                            AdmissionError::Io(error).operation(Operation::Inspect, subject)
+                            AdmissionError::io(error).operation(Operation::Inspect, subject)
                         );
                     }
                 }
@@ -141,7 +145,7 @@ pub(crate) async fn resolve_writable_with_parents(
                 }
             }
             Err(error) => {
-                return Err(AdmissionError::Io(error).operation(Operation::Canonicalize, subject));
+                return Err(AdmissionError::io(error).operation(Operation::Canonicalize, subject));
             }
         }
     }
@@ -151,7 +155,7 @@ pub(crate) async fn resolve_writable_with_parents(
 pub(crate) fn lexical_path(workspace: &Path, relative: &str) -> Result<PathBuf, AdmissionError> {
     let path = Path::new(relative);
     if path.as_os_str().is_empty() {
-        return Err(AdmissionError::Failed("path cannot be empty".to_owned())
+        return Err(AdmissionError::failed("path cannot be empty")
             .operation(Operation::Validate, Subject::argument(["path"])));
     }
     if path.is_absolute() {
@@ -169,7 +173,7 @@ pub(crate) async fn resolve_removable(
     let joined = if joined.file_name().is_none() {
         fs::canonicalize(&joined)
             .await
-            .map_err(AdmissionError::annotated(DiagnosticContext::new(
+            .map_err(AdmissionError::annotated(PartialContext::new(
                 Operation::Canonicalize,
                 Subject::path(&joined),
             )))?
@@ -180,16 +184,14 @@ pub(crate) async fn resolve_removable(
     if resolved
         == fs::canonicalize(workspace)
             .await
-            .map_err(AdmissionError::annotated(DiagnosticContext::new(
+            .map_err(AdmissionError::annotated(PartialContext::new(
                 Operation::Canonicalize,
                 Subject::working_directory(workspace),
             )))?
     {
-        return Err(
-            AdmissionError::Failed("cannot remove the workspace root".to_owned())
-                .operation(Operation::Remove, Subject::path(&resolved))
-                .effects(Effects::Unchanged),
-        );
+        return Err(AdmissionError::failed("cannot remove the workspace root")
+            .operation(Operation::Remove, Subject::path(&resolved))
+            .effects(Effects::Unchanged));
     }
     fs::symlink_metadata(&resolved)
         .await
@@ -197,8 +199,8 @@ pub(crate) async fn resolve_removable(
     Ok(resolved)
 }
 
-fn inspect_resolved(path: &Path) -> DiagnosticContext {
-    DiagnosticContext::new(Operation::Inspect, Subject::path(path)).path(PathRole::Resolved, path)
+fn inspect_resolved(path: &Path) -> PartialContext {
+    PartialContext::new(Operation::Inspect, Subject::path(path)).path(PathRole::Resolved, path)
 }
 
 pub(crate) fn relative_path(workspace: &Path, path: &Path) -> String {
@@ -228,30 +230,37 @@ fn atomic_write_error(path: &Path, error: crate::fs::AtomicWriteError) -> Admiss
     let parent = || Subject::ParentDirectory(path.parent().unwrap_or(path).to_owned());
     // Only a completed rename proves replacement; commit and wait prove nothing.
     let (operation, subject, effects) = match error.stage {
-        Stage::Prepare => (Operation::Prepare, target(), Effects::Unchanged),
-        Stage::InspectDestination => (Operation::Inspect, target(), Effects::Unchanged),
-        Stage::CreateStaging => (Operation::Create, staging(), Effects::Unchanged),
-        Stage::WriteStaging => (Operation::Write, staging(), Effects::Unchanged),
-        Stage::SetPermissions => (Operation::SetPermissions, staging(), Effects::Unchanged),
-        Stage::SyncStaging => (Operation::SyncFile, staging(), Effects::Unchanged),
-        Stage::Commit => (Operation::Rename, target(), Effects::Unknown),
-        Stage::Wait => (Operation::Wait, target(), Effects::Unknown),
+        Stage::Prepare => (Operation::Prepare, target(), Some(Effects::Unchanged)),
+        Stage::InspectDestination => (Operation::Inspect, target(), Some(Effects::Unchanged)),
+        Stage::CreateStaging => (Operation::Create, staging(), Some(Effects::Unchanged)),
+        Stage::WriteStaging => (Operation::Write, staging(), Some(Effects::Unchanged)),
+        Stage::SetPermissions => (
+            Operation::SetPermissions,
+            staging(),
+            Some(Effects::Unchanged),
+        ),
+        Stage::SyncStaging => (Operation::SyncFile, staging(), Some(Effects::Unchanged)),
+        Stage::Commit => (Operation::Rename, target(), None),
+        Stage::Wait => (Operation::Wait, target(), None),
         Stage::OpenDirectory => (
             Operation::OpenDirectory,
             parent(),
-            Effects::DestinationReplaced,
+            Some(Effects::DestinationReplaced),
         ),
         Stage::SyncDirectory => (
             Operation::SyncDirectory,
             parent(),
-            Effects::DestinationReplaced,
+            Some(Effects::DestinationReplaced),
         ),
     };
-    let mut context = DiagnosticContext::new(operation, subject).effects(effects);
-    if effects == Effects::DestinationReplaced {
+    let mut context = PartialContext::new(operation, subject);
+    if let Some(effects) = effects {
+        context = context.effects(effects);
+    }
+    if effects == Some(Effects::DestinationReplaced) {
         context = context.path(PathRole::Resolved, path);
     }
-    AdmissionError::Io(error.source).context(context)
+    AdmissionError::io(error.source).context(context)
 }
 
 #[cfg(test)]
@@ -299,9 +308,10 @@ mod tests {
             assert_eq!(diagnostic.context.operation, operation);
             assert_eq!(diagnostic.context.subject, subject);
             assert_eq!(diagnostic.context.effects, effects);
-            assert!(
-                matches!(error.unannotated(), AdmissionError::Io(error) if error.raw_os_error() == Some(13))
-            );
+            assert!(matches!(
+                diagnostic.cause,
+                crate::tool::diagnostic::Cause::Io { code: Some(13), .. }
+            ));
             if stage == Stage::SyncDirectory {
                 assert!(
                     diagnostic
@@ -326,9 +336,13 @@ mod tests {
             diagnostic.context.subject,
             Subject::ParentDirectory(root.path().join("missing"))
         );
-        assert!(
-            matches!(error.unannotated(), AdmissionError::Io(error) if error.kind() == std::io::ErrorKind::NotFound)
-        );
+        assert!(matches!(
+            diagnostic.cause,
+            crate::tool::diagnostic::Cause::Io {
+                kind: crate::tool::diagnostic::IoKind::NotFound,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

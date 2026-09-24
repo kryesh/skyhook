@@ -1,5 +1,7 @@
 //! OpenSSH configuration generated only from target definitions.
-use crate::remote::{RemoteError, SensitivePromptHandler, backend::ProcessEnvironment};
+use crate::remote::{
+    ProtocolError, RemoteError, SensitivePromptHandler, SshError, backend::ProcessEnvironment,
+};
 use crate::target::{TargetAuth, TargetDefinition, TargetError};
 use std::{io::Write as _, path::Path, sync::Arc};
 use tokio::process::Command;
@@ -37,7 +39,7 @@ impl SshConfig {
         }
         // A route deserialized from the wire has not passed through the registry.
         if route.iter().any(|hop| hop.validate().is_err()) {
-            return Err(RemoteError::Protocol("unsupported transport route".into()));
+            return Err(ProtocolError::Violation("unsupported transport route").into());
         }
         let directory = tempfile::Builder::new().prefix("skyhook-ssh-").tempdir()?;
         let path = directory.path().join("config");
@@ -152,11 +154,8 @@ fn write_auth(
     // Name sockets explicitly: OpenSSH replaces its own SSH_AUTH_SOCK before
     // starting jump hops, so an inherited variable is not stable across hops.
     let agent = if target.ssh.external_agent {
-        let socket = external_agent.ok_or_else(|| {
-            RemoteError::Ssh(format!(
-                "target `{}` uses external_agent, but SSH_AUTH_SOCK is not set where its SSH connection starts",
-                target.name
-            ))
+        let socket = external_agent.ok_or_else(|| SshError::ExternalAgentUnavailable {
+            target: target.name.to_string(),
         })?;
         // Never add keys to an agent Skyhook does not own.
         format!("{}\n  AddKeysToAgent no", ssh_token(socket)?)
@@ -201,9 +200,7 @@ pub(crate) fn ssh_command(config: &SshConfig, destination: &str) -> Command {
 
 fn ssh_token(value: &str) -> Result<String, RemoteError> {
     if value.is_empty() || value.chars().any(char::is_control) {
-        return Err(RemoteError::Ssh(
-            "SSH values cannot be empty or contain control characters".into(),
-        ));
+        return Err(SshError::InvalidValue.into());
     }
     Ok(format!(
         "\"{}\"",
@@ -218,12 +215,12 @@ pub(crate) fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{remote::prompt::RejectSensitivePrompts, target::TargetSource};
+    use crate::remote::prompt::RejectSensitivePrompts;
     use serde_json::json;
 
     fn target(name: &str, config: serde_json::Value) -> Result<TargetDefinition, TargetError> {
         let config = serde_json::from_value(config).unwrap();
-        TargetDefinition::from_config(name.into(), config, TargetSource::Config)
+        TargetDefinition::from_config(name.into(), config)
     }
 
     fn managed() -> ProcessEnvironment {
@@ -278,10 +275,15 @@ mod tests {
             [std::ffi::OsStr::new("-F"), config.path.as_os_str()]
         );
         assert!(args.contains(&std::ffi::OsStr::new("-A")));
-        let mut local = route[0].clone();
-        local.r#type = crate::target::TargetType::Local;
-        let rejected =
-            SshConfig::create(&[local], &managed(), None, Arc::new(RejectSensitivePrompts));
+        // A route from the wire has not passed the registry; unvalidated hops are refused.
+        let mut unvalidated = route[0].clone();
+        unvalidated.host = "jump host".into();
+        let rejected = SshConfig::create(
+            &[unvalidated],
+            &managed(),
+            None,
+            Arc::new(RejectSensitivePrompts),
+        );
         assert!(matches!(rejected, Err(RemoteError::Protocol(_))));
 
         let proxy = json!({"type": "ssh", "host": "x", "via": "jump", "ssh": {"options": {"ProxyCommand": "nc %h %p"}}});

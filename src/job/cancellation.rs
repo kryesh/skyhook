@@ -33,9 +33,7 @@ impl JobManager {
             for job in descendants {
                 let entry = jobs.get_mut(&job).expect("known descendant");
                 entry.cancellation.cancel();
-                if (!entry.state.is_terminal() || entry.state == JobState::Interrupted)
-                    && !entry.cancellation_watchdog_started
-                {
+                if entry.cancellable() && !entry.cancellation_watchdog_started {
                     entry.cancellation_watchdog_started = true;
                     watchdogs.push(job);
                 }
@@ -60,11 +58,7 @@ impl JobManager {
             .lock()
             .await
             .iter()
-            .filter_map(|(id, entry)| {
-                (&entry.agent == owner
-                    && (!entry.state.is_terminal() || entry.state == JobState::Interrupted))
-                    .then_some(*id)
-            })
+            .filter_map(|(id, entry)| (&entry.agent == owner && entry.cancellable()).then_some(*id))
             .collect::<Vec<_>>();
         for id in &ids {
             let _ = self.cancel(*id).await;
@@ -83,10 +77,7 @@ impl JobManager {
                 .lock()
                 .await
                 .iter()
-                .filter_map(|(id, entry)| {
-                    (!entry.state.is_terminal() || entry.state == JobState::Interrupted)
-                        .then_some(*id)
-                })
+                .filter_map(|(id, entry)| entry.cancellable().then_some(*id))
                 .collect::<Vec<_>>();
             if ids.is_empty() {
                 // Terminal publication may precede supervisor cleanup.
@@ -108,7 +99,7 @@ impl JobManager {
             let Some(entry) = jobs.get(&id) else {
                 return;
             };
-            if entry.state.is_terminal() && entry.state != JobState::Interrupted {
+            if !entry.cancellable() {
                 return;
             }
             entry.task_abort.clone()
@@ -116,7 +107,7 @@ impl JobManager {
         if let Some(task_abort) = task_abort {
             task_abort.abort();
         }
-        if let Err(error) = self.finish(id, ToolError::Cancelled.into()).await
+        if let Err(error) = self.finish(id, ToolError::cancelled().into()).await
             && !matches!(error, JobError::AlreadyTerminal(_))
         {
             self.fail_volatile(
@@ -171,20 +162,23 @@ mod tests {
             media::ImageFormat,
             tool::{
                 StreamEnd,
-                diagnostic::{Cause, DiagnosticContext, Effects, FailureSite, Operation, Subject},
+                diagnostic::{
+                    Cause, Effects, FailureSite, Operation, PartialContext, PartialDiagnostic,
+                    Subject,
+                },
             },
         };
         use std::io::Write as _;
 
         let (_root, jobs, agent) = crate::job::tests::runtime().await;
-        let context = DiagnosticContext::new(Operation::Wait, Subject::Process)
+        let context = PartialContext::new(Operation::Wait, Subject::Process)
             .at(FailureSite::Execution(ExecutionLocation::named(
-                "worker",
+                "worker".parse().unwrap(),
                 "/workspace".into(),
             )))
             .effects(Effects::MayHaveExecuted);
-        let output_diagnostic = Diagnostic::new(
-            DiagnosticContext::new(Operation::ReadCapture, Subject::Process)
+        let output_diagnostic = PartialDiagnostic::new(
+            PartialContext::new(Operation::ReadCapture, Subject::Process)
                 .effects(Effects::OutputIncomplete),
             Cause::Message("partial output".into()),
         );
@@ -197,20 +191,19 @@ mod tests {
         for (error, streams) in [
             (None, StreamEnd::Finished),
             (
-                Some(ToolError::Denied(
-                    "permission denied after partial work".into(),
-                )),
+                Some(ToolError::denied("permission denied after partial work")),
                 StreamEnd::Finished,
             ),
-            (Some(ToolError::Cancelled), StreamEnd::Finished),
-            (Some(ToolError::Interrupted), StreamEnd::Finished),
-            (Some(ToolError::Interrupted), StreamEnd::Cut),
+            (Some(ToolError::cancelled()), StreamEnd::Finished),
+            (Some(ToolError::interrupted()), StreamEnd::Finished),
+            (Some(ToolError::interrupted()), StreamEnd::Cut),
         ] {
             let id = jobs
                 .test_create(JobSpec::test(agent.clone(), "finished"))
                 .await;
             let saved = jobs.output(id);
-            let mut writer = PendingCapture::create(&saved, "/result/stdout", CaptureKind::Text)
+            let stdout = "/result/stdout".parse().unwrap();
+            let mut writer = PendingCapture::create(&saved, &stdout, CaptureKind::Text)
                 .unwrap()
                 .open();
             writer.write_all(text.as_bytes()).unwrap();
@@ -239,9 +232,7 @@ mod tests {
             // terminal cause changes; prior context and output remain authoritative.
             if expected.state == JobState::Interrupted {
                 expected.state = JobState::Cancelled;
-                let diagnostic = expected.diagnostic.as_mut().unwrap();
-                diagnostic.cause = Cause::Cancelled;
-                expected.error = Some(diagnostic.render(&CapabilitySet::default()));
+                expected.diagnostic.as_mut().unwrap().cause = Cause::Cancelled;
             }
             // Even a late watchdog must not overwrite output or denial metadata.
             jobs.force_cancel(id).await;
@@ -268,21 +259,15 @@ mod tests {
     async fn cancellation_drain_waits_for_terminal_questions_and_descendants() {
         let (_root, jobs, agent) = crate::job::tests::runtime().await;
         let parent = jobs
-            .test_lease(JobSpec::test(agent.clone(), "script"))
+            .test_running(JobSpec::test(agent.clone(), "script"))
             .await;
-        jobs.transition(parent.id(), JobState::Running)
-            .await
-            .unwrap();
         let spec = JobSpec {
             accepts_input: true,
             background: true,
             ..child(parent.id(), agent, "ask")
         };
-        let question = jobs.test_lease(spec).await;
-        jobs.transition(question.id(), JobState::Running)
-            .await
-            .unwrap();
-        let prompt = serde_json::json!({"prompt": "pending"});
+        let question = jobs.test_running(spec).await;
+        let prompt = crate::job::tests::question("pending");
         jobs.request_input(question.id(), prompt).await.unwrap();
         assert_eq!(
             jobs.snapshot(question.id()).await.unwrap().state,
@@ -352,7 +337,7 @@ mod tests {
                         started.notify_one();
                         context.cancelled().await;
                         observed.store(true, Ordering::Relaxed);
-                        Err(ToolError::Cancelled)
+                        Err(ToolError::cancelled())
                     }
                 }
             })

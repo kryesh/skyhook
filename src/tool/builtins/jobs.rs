@@ -7,7 +7,7 @@ use crate::{
     job::{JobError, JobManager, presented_job_schema},
     tool::{
         RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
-        diagnostic::{DiagnosticContext, Effects, Operation, Subject},
+        diagnostic::{Effects, Operation, PartialContext, Subject},
     },
 };
 
@@ -63,19 +63,19 @@ pub(crate) fn register(
         "job_output",
         "Read or search saved job output and status on job completion. Whole-output reads attach saved images; filtered or paginated reads return text in preview.lines without images.",
         ToolOptions::default().job_method("output", "job"),
-        move |context, mut args| {
+        move |context, args| {
             let jobs = output.clone();
             async move {
-                args.cancellation = Some(context.cancellation_token());
                 let job = args.job;
                 jobs.present_output_with(
                     args,
+                    context.cancellation_token(),
                     context.diagnostic_viewer(),
                     crate::job::output::OutputOptions::Model { presentation: crate::job::OutputPresentation::Full },
                 )
                 .await
                 .map_err(|error| {
-                    error.fallback_context(DiagnosticContext::new(Operation::Read, Subject::Job(job)))
+                    error.or(PartialContext::new(Operation::Read, Subject::Job(job)))
                 })
             }
         },
@@ -121,16 +121,19 @@ pub(crate) fn register(
 /// Convert at the host job boundary, before opaque persistence failures can
 /// expose stored input or be mistaken for a rejected, unstarted mutation.
 fn job_failure(error: JobError, operation: Operation, job: JobId) -> ToolError {
-    let effects = match &error {
+    let not_started = matches!(
+        &error,
         JobError::Unknown(_)
-        | JobError::InputUnavailable { .. }
-        | JobError::InputUnsupported(_)
-        | JobError::InputClosed(_) => Effects::NotStarted,
-        _ => Effects::Unknown,
-    };
-    ToolError::from(error)
-        .operation(operation, Subject::Job(job))
-        .effects(effects)
+            | JobError::InputUnavailable { .. }
+            | JobError::InputUnsupported(_)
+            | JobError::InputClosed(_)
+    );
+    let error = ToolError::from(error).operation(operation, Subject::Job(job));
+    if not_started {
+        error.effects(Effects::NotStarted)
+    } else {
+        error
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -203,9 +206,11 @@ mod tests {
                 Effects::Unknown,
             ),
             (
-                JobError::Internal("private lifecycle details".into()),
-                Cause::Message("job lifecycle operation failed".into()),
-                Effects::Unknown,
+                JobError::Output(Box::new(
+                    ToolError::failed("capture write failed").effects(Effects::OutputIncomplete),
+                )),
+                Cause::Message("capture write failed".into()),
+                Effects::OutputIncomplete,
             ),
             (
                 JobError::Unknown(job),
@@ -263,10 +268,8 @@ mod tests {
             .create(JobSpec::test(agent.clone(), "pending"))
             .await
             .unwrap();
+        let pending_lease = pending_lease.await_approval().await.unwrap();
         let pending = pending_lease.id();
-        jobs.transition(pending, JobState::AwaitingApproval)
-            .await
-            .unwrap();
         let completed_lease = jobs.create(spec("completed")).await.unwrap();
         let completed = completed_lease.id();
         let finished = JobOutcome::Completed(ToolOutput::new(Value::Null));
@@ -363,15 +366,6 @@ mod tests {
         assert_eq!(images[0].format, crate::media::ImageFormat::Png);
         let blob = images[0].blob;
         let mut request = ModelRequest {
-            model: "image-test".into(),
-            system: vec![],
-            tools: vec![],
-            response_schema: None,
-            reasoning: None,
-            max_output_tokens: None,
-            blobs: Default::default(),
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
             history: vec![Message::Tool(vec![ToolResult {
                 call_id: "output".into(),
                 name: "job_output".into(),
@@ -379,6 +373,7 @@ mod tests {
                 images,
                 is_error: false,
             }])],
+            ..ModelRequest::test("image-test")
         };
         assert!(request.blobs.get(&blob).is_err());
         store.load_blobs(&mut request).await.unwrap();
@@ -520,7 +515,7 @@ mod tests {
         let output = ToolOutput::new(json!({"image":image})).with_images(vec![image]);
         lease
             .fail(
-                ToolError::Failed("failed after producing an image".into())
+                ToolError::failed("failed after producing an image")
                     .with_result(output)
                     .into(),
             )

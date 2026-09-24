@@ -8,16 +8,43 @@ use crate::{
     job::CancellationToken,
 };
 
-use super::policy::{
-    ApprovalGrant, AuthorizationRequest, CapabilitySet, PermissionUse, Policy, PolicyDecision,
+use super::{
+    AdmissionError,
+    policy::{
+        ApprovalGrant, AuthorizationRequest, CapabilitySet, PermissionUse, Policy, PolicyDecision,
+    },
 };
+use crate::session::RecordSeq;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
 pub(crate) enum AuthorizationError {
+    #[error("{0}")]
     Denied(String),
+    #[error("cancelled")]
     Cancelled,
+    #[error("{0}")]
     InvalidGrant(String),
+    #[error("required capability is unavailable")]
     Unavailable,
+    /// The policy stopped before deciding; nothing was denied or allowed.
+    #[error("authorization could not be decided")]
+    PolicyFailed,
+}
+
+/// The one tool-facing reading of an authorization failure, whichever path
+/// (local, remote worker, or route) authorized. What the failure left behind is
+/// the call site's to say: only admission knows nothing had started.
+impl From<AuthorizationError> for AdmissionError {
+    fn from(error: AuthorizationError) -> Self {
+        match error {
+            AuthorizationError::Denied(reason) => Self::denied(reason),
+            AuthorizationError::Cancelled => Self::cancelled(),
+            AuthorizationError::Unavailable => Self::denied(error.to_string()),
+            AuthorizationError::InvalidGrant(_) | AuthorizationError::PolicyFailed => {
+                Self::failed(error)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -48,7 +75,7 @@ pub(crate) struct AuthorizationCoordinator {
 #[derive(Default)]
 struct ApprovalState {
     /// Each grant with the sequence that journaled it, if any.
-    grants: Vec<(Option<u64>, ApprovalGrant)>,
+    grants: Vec<(Option<RecordSeq>, ApprovalGrant)>,
     pending: HashMap<ApprovalGrant, PendingApproval>,
     next_pending: u64,
 }
@@ -170,23 +197,15 @@ impl AuthorizationCoordinator {
             let agent = subject.agent.clone();
             // Finalization belongs to the decision, not to any individual waiter.
             let task = tokio::spawn(async move {
-                let result = tokio::spawn(decision).await.unwrap_or_else(|error| {
-                    Err(AuthorizationError::Denied(format!(
-                        "authorization policy failed: {error}"
-                    )))
-                });
+                let result = tokio::spawn(decision)
+                    .await
+                    .unwrap_or(Err(AuthorizationError::PolicyFailed));
                 coordinator.finish_pending(id, agent, &result).await;
                 result
             });
-            let future = async move {
-                task.await.unwrap_or_else(|error| {
-                    Err(AuthorizationError::Denied(format!(
-                        "authorization task failed: {error}"
-                    )))
-                })
-            }
-            .boxed()
-            .shared();
+            let future = async move { task.await.unwrap_or(Err(AuthorizationError::PolicyFailed)) }
+                .boxed()
+                .shared();
             for proposal in proposals {
                 state.pending.insert(
                     proposal,

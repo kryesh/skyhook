@@ -7,7 +7,6 @@ use std::{
 
 use crate::{
     mcp::config::McpServerConfig,
-    provider::backends::OpenAiApi,
     provider::profile::ModelProfile,
     target::TargetsConfig,
     tool::policy::{Capability, CapabilitySet, Mode},
@@ -20,6 +19,7 @@ mod paths;
 mod providers;
 mod runtime;
 
+pub use providers::{ProviderConfig, RawProviderConfig};
 pub use runtime::{ConfiguredModel, RuntimeConfig};
 
 pub use loader::{ConfigDiagnostic, ConfigReport, ResolvedConfig};
@@ -88,39 +88,6 @@ fn default_modes() -> indexmap::IndexMap<String, Mode> {
     [(default_mode(), general)].into()
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum ProviderConfig {
-    /// Standard OpenAI wire protocols, without endpoint or model presets.
-    Openai {
-        base_url: String,
-        api: OpenAiApi,
-        /// Chat-only request field; absence uses the shared reasoning_content default.
-        chat_reasoning_replay: Option<crate::provider::backends::ChatReasoningReplay>,
-        api_key_env: Option<String>,
-        /// Shell command run on first provider request; trimmed stdout is cached as the key.
-        /// Mutually exclusive with api_key_env.
-        api_key_command: Option<String>,
-        /// Time to receive HTTP response headers per attempt (default: 600 seconds).
-        startup_timeout_secs: Option<u64>,
-        /// Maximum interval between HTTP response body reads (default: 600 seconds).
-        read_idle_timeout_secs: Option<u64>,
-    },
-    Anthropic {
-        base_url: String,
-        api_key_env: Option<String>,
-        /// Shell command run on first provider request; trimmed stdout is cached as the key.
-        /// Mutually exclusive with api_key_env.
-        api_key_command: Option<String>,
-        /// Time to receive HTTP response headers per attempt (default: 600 seconds).
-        startup_timeout_secs: Option<u64>,
-        /// Maximum interval between HTTP response body reads (default: 600 seconds).
-        read_idle_timeout_secs: Option<u64>,
-    },
-    /// ChatGPT subscription using Skyhook-owned OAuth credentials.
-    Codex {},
-}
-
 impl Config {
     /// Loads an explicit config, or resolves user and current-workspace layers.
     pub async fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
@@ -158,27 +125,29 @@ impl Config {
 
     /// Parse a single YAML document without discovery, merging, or admission.
     pub fn from_yaml(text: &str) -> Result<Self, ConfigError> {
-        crate::yaml::parse(text).map_err(ConfigError::Structure)
+        let value = crate::yaml::from_str(text)
+            .map_err(|error| ConfigError::Structure(format!("invalid YAML: {error}")))?;
+        Self::from_value(&value).map_err(ConfigError::Structure)
     }
 
-    /// Admit provider settings, then targets, then model limits, without model
-    /// selection or external resources. Loading discards the admitted providers.
-    fn validate_structure(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, providers::ValidatedProvider>, ConfigError> {
-        let providers = self
-            .providers
-            .iter()
-            .map(|(name, config)| {
-                Ok((
-                    name.clone(),
-                    providers::ValidatedProvider::new(name, config)?,
-                ))
-            })
-            .collect::<Result<_, ConfigError>>()?;
-        self.targets
-            .validate_structure()
-            .map_err(|error| ConfigError::Structure(error.to_string()))?;
+    /// Typed extraction naming the offending entry, so a rejected provider or
+    /// server reads `` `providers.local`: ... ``.
+    fn from_value(value: &serde_json::Value) -> Result<Self, String> {
+        serde_path_to_error::deserialize(value).map_err(|error| {
+            let path = error.path().to_string();
+            let inner = error.into_inner();
+            if path == "." {
+                inner.to_string()
+            } else {
+                format!("`{path}`: {inner}")
+            }
+        })
+    }
+
+    /// Check targets, then model limits and mode text, without model selection or
+    /// external resources. Providers were admitted when they were deserialized.
+    fn validate_structure(&self) -> Result<(), ConfigError> {
+        self.targets.validate_structure()?;
         for (name, profile) in &self.models {
             profile
                 .validate_limits()
@@ -204,7 +173,7 @@ impl Config {
                 }
             }
         }
-        Ok(providers)
+        Ok(())
     }
 }
 
@@ -219,6 +188,8 @@ pub enum ConfigError {
     Serialize(String),
     #[error("invalid configuration: {0}")]
     Structure(String),
+    #[error("invalid configuration: {0}")]
+    Targets(#[from] crate::target::TargetError),
     #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.yaml")]
     Missing,
     #[error("environment variable `{0}` is required and must not be empty")]
@@ -507,6 +478,7 @@ models:
         let two = "modes:\n  first:\n    capabilities: []\n  second:\n    capabilities: [read]\n";
         let config = runtime("default_mode: second", two).unwrap();
         assert_eq!(config.select_mode(None).unwrap(), "second");
+        assert_eq!(config.default_mode(), "second");
         assert_eq!(config.select_mode(Some("first")).unwrap(), "first");
         assert!(config.select_mode(Some("missing")).is_err());
         // `general` stays the default, and declared, until the config says otherwise.

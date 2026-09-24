@@ -8,7 +8,8 @@ use crate::{
         protocol::{ImageId, PayloadEvent, PayloadId, PayloadOpen, RemoteToolOutput},
     },
     tool::{
-        diagnostic::{DiagnosticContext, FailureSite, Operation, Subject},
+        diagnostic::{FailureSite, Operation, PartialContext, Subject},
+        output::FieldPointer,
         output::{CaptureEvent, OutputEvent, OutputSink},
     },
 };
@@ -50,7 +51,7 @@ impl Results {
         let bytes = match &event {
             PayloadEvent::Data { data, .. }
             | PayloadEvent::Capture(CaptureEvent::Write { data, .. }) => data.len(),
-            PayloadEvent::Capture(CaptureEvent::Open { field, .. }) => field.len(),
+            PayloadEvent::Capture(CaptureEvent::Open { field, .. }) => field.as_str().len(),
             PayloadEvent::Open(PayloadOpen::Image { file, .. }) => {
                 file.as_ref().map_or(0, String::len)
             }
@@ -136,14 +137,14 @@ impl Results {
 }
 
 fn host_output_error(error: impl Into<RemoteError>, operation: Operation) -> RemoteError {
-    error.into().fallback_context(
-        DiagnosticContext::new(operation, Subject::Label("remote output".into()))
+    error.into().or(
+        PartialContext::new(operation, Subject::Label("remote output".into()))
             .at(FailureSite::Host),
     )
 }
 
-fn protocol(message: &str) -> RemoteError {
-    RemoteError::Protocol(message.into())
+fn protocol(message: &'static str) -> RemoteError {
+    ProtocolError::Violation(message).into()
 }
 
 async fn temporary_file() -> Result<tokio::fs::File, RemoteError> {
@@ -233,8 +234,10 @@ impl Ingestion {
     ) -> Result<(), RemoteError> {
         match event {
             PayloadEvent::Capture(event) => {
+                let result = FieldPointer::result();
                 if let CaptureEvent::Open { field, .. } = &event
-                    && !(field == "/error" || field == "/result" || field.starts_with("/result/"))
+                    && *field != result
+                    && !result.contains(field)
                 {
                     return Err(protocol("invalid capture field"));
                 }
@@ -328,7 +331,7 @@ impl Ingestion {
                 })?
                 .map_err(|error| {
                     host_output_error(
-                        RemoteError::Protocol(error.to_string()),
+                        ProtocolError::Decode(error.to_string()),
                         Operation::Deserialize,
                     )
                 })?;
@@ -360,7 +363,7 @@ impl Ingestion {
             .with_images(images)
             .with_captures(captures);
         local.streams = output.streams;
-        local.diagnostic = output.diagnostic;
+        local.diagnostic = output.diagnostic.map(Into::into);
         Ok(local)
     }
 
@@ -389,7 +392,7 @@ impl Ingestion {
                 // to this routed invocation, not evidence of a host-side location.
                 error.diagnostic.bind_worker(location);
                 ReceivedResult(Err(RemoteError::Remote {
-                    diagnostic: error.diagnostic,
+                    diagnostic: Box::new((*error.diagnostic).into()),
                     output: error_output.map(Box::new),
                 }))
             }
@@ -417,7 +420,7 @@ mod tests {
     fn open(id: u64, field: &str) -> PayloadEvent {
         PayloadEvent::Capture(CaptureEvent::Open {
             id: CaptureId::new(id).unwrap(),
-            field: field.into(),
+            field: field.parse().unwrap(),
             kind: CaptureKind::Text,
         })
     }
@@ -444,18 +447,23 @@ mod tests {
 
         let runtime = crate::tests::TestRuntime::new().await;
         let context = fixture_context(&runtime);
-        let trusted = ExecutionLocation::named("bastion", "/trusted/workspace".into());
+        let trusted =
+            ExecutionLocation::named("bastion".parse().unwrap(), "/trusted/workspace".into());
         for claimed in [
             FailureSite::Invocation,
             FailureSite::Host,
             FailureSite::Execution(ExecutionLocation::root("/worker/root".into())),
-            FailureSite::Execution(ExecutionLocation::named("forged", "/forged".into())),
+            FailureSite::Execution(ExecutionLocation::named(
+                "forged".parse().unwrap(),
+                "/forged".into(),
+            )),
         ] {
             for failed in [false, true] {
                 let diagnostic = Diagnostic::new(
-                    DiagnosticContext::new(Operation::Read, Subject::path("missing"))
+                    PartialContext::new(Operation::Read, Subject::path("missing"))
                         .at(claimed.clone())
-                        .effects(Effects::Unchanged),
+                        .effects(Effects::Unchanged)
+                        .resolve(),
                     Cause::Io {
                         kind: IoKind::NotFound,
                         code: Some(2),
@@ -496,7 +504,7 @@ mod tests {
                     }
                 };
                 assert_eq!(output.streams, StreamEnd::Cut);
-                let diagnostic = output.diagnostic.unwrap();
+                let diagnostic = output.diagnostic.unwrap().resolve();
                 assert_eq!(diagnostic.context.operation, Operation::Read);
                 assert_eq!(diagnostic.context.subject, Subject::path("missing"));
                 assert_eq!(diagnostic.context.effects, Effects::Unchanged);
@@ -619,7 +627,7 @@ mod tests {
             let result = if failed {
                 Err(RemoteToolError {
                     diagnostic: Box::new(
-                        crate::tool::ToolError::Failed("failure with output".into()).diagnostic(),
+                        crate::tool::ToolError::failed("failure with output").diagnostic(),
                     ),
                     output: Some(Box::new(output)),
                 })

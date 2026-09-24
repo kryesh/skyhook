@@ -8,19 +8,23 @@ use tokio::sync::Mutex;
 
 use crate::{
     identity::{AgentId, JobId},
-    session::{CompactionCheckpoint, EventRecord, SessionError, SessionEvent, SessionStore},
+    named_enum::named_enum,
+    session::{
+        CompactionCheckpoint, EventRecord, RecordSeq, SessionError, SessionEvent, SessionStore,
+    },
     tool::{
         ToolError,
         diagnostic::{Effects, Operation, Subject},
     },
 };
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TodoStatus {
-    Pending,
-    InProgress,
-    Completed,
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum TodoStatus {
+        Pending = "pending",
+        InProgress = "in_progress",
+        Completed = "completed",
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -41,7 +45,7 @@ pub struct TodoSnapshot {
 struct AgentTodos {
     owner_job: Option<JobId>,
     items: Vec<TodoItem>,
-    revision: u64,
+    revision: RecordSeq,
 }
 
 pub(super) struct TodoStore {
@@ -111,14 +115,12 @@ impl TodoStore {
 
     pub fn validate(items: &[TodoItem]) -> Result<(), ToolError> {
         if let Some(index) = items.iter().position(|item| item.text.trim().is_empty()) {
-            return Err(
-                ToolError::InvalidArguments("todo text cannot be blank".to_owned())
-                    .operation(
-                        Operation::Validate,
-                        Subject::Label(format!("todo item at index {index}")),
-                    )
-                    .effects(Effects::NotStarted),
-            );
+            return Err(ToolError::invalid_arguments("todo text cannot be blank")
+                .operation(
+                    Operation::Validate,
+                    Subject::Label(format!("todo item at index {index}")),
+                )
+                .effects(Effects::NotStarted));
         }
         Ok(())
     }
@@ -181,18 +183,16 @@ impl TodoStore {
                 .iter()
                 .find_map(|(agent, state)| (state.owner_job == Some(job)).then_some(agent))
                 .ok_or_else(|| {
-                    ToolError::InvalidArguments(
-                        "job does not identify an initialized child agent".to_owned(),
-                    )
-                    .operation(Operation::Lookup, Subject::Job(job))
-                    .effects(Effects::Unchanged)
+                    ToolError::invalid_arguments("job does not identify an initialized child agent")
+                        .operation(Operation::Lookup, Subject::Job(job))
+                        .effects(Effects::Unchanged)
                 })?;
             if agent.session() != caller.session()
                 || agent.depth() <= caller.depth()
                 || !agent.path().starts_with(caller.path())
             {
-                return Err(ToolError::InvalidArguments(
-                    "todo inspection is limited to descendants".to_owned(),
+                return Err(ToolError::invalid_arguments(
+                    "todo inspection is limited to descendants",
                 )
                 .operation(Operation::Inspect, Subject::Job(job))
                 .effects(Effects::Unchanged));

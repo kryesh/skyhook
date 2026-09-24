@@ -3,11 +3,8 @@ use serde_json::Value;
 use skyhook::{
     agent::{Question, QuestionError, QuestionHandler},
     identity::AgentId,
-    remote::{
-        SecretValue, SensitivePrompt, SensitivePromptFuture, SensitivePromptHandler,
-        SensitivePromptKind,
-    },
-    target::ROOT_TARGET,
+    remote::{PromptAnswer, SensitivePrompt, SensitivePromptFuture, SensitivePromptHandler},
+    target::TargetRef,
     tool::policy::{
         AuthorizationRequest, Capability, CapabilitySet, PermissionUse, Policy, PolicyDecision,
         PolicyFuture, ResourceId,
@@ -36,7 +33,7 @@ pub enum PromptKind {
     },
     Authentication {
         prompt: SensitivePrompt,
-        reply: Reply<SecretValue>,
+        reply: Reply<PromptAnswer>,
     },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -47,7 +44,7 @@ pub enum ApprovalReply {
 }
 
 /// A category-specific, consuming reply capability. Not cloneable:
-/// authentication answers must remain `SecretValue` throughout this bridge.
+/// authentication answers stay typed `PromptAnswer`s throughout this bridge.
 pub type Reply<T> = oneshot::Sender<Result<T, String>>;
 
 pub struct Prompt {
@@ -56,7 +53,13 @@ pub struct Prompt {
 }
 impl Prompt {
     pub fn secret(&self) -> bool {
-        matches!(&self.kind, PromptKind::Authentication { prompt, .. } if !matches!(prompt.kind, SensitivePromptKind::HostConfirmation | SensitivePromptKind::AgentConfirmation))
+        matches!(&self.kind, PromptKind::Authentication { prompt, .. } if !prompt.kind.is_confirmation())
+    }
+
+    /// Whether typed text is part of the answer: a question's answer or comment,
+    /// or a secret. Approvals and confirmations are answered by choice alone.
+    pub fn takes_text(&self) -> bool {
+        matches!(&self.kind, PromptKind::Questions { .. }) || self.secret()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -113,7 +116,7 @@ fn requires_prompt(permission: &PermissionUse) -> bool {
         Capability::Exec | Capability::Targets | Capability::SshAgent | Capability::Network => true,
         Capability::Write => !matches!(
             &permission.resource,
-            ResourceId::Workspace { target, .. } if target == ROOT_TARGET
+            ResourceId::Workspace { target, .. } if target == TargetRef::Root.as_str()
         ),
     }
 }
@@ -123,46 +126,55 @@ fn requires_prompt(permission: &PermissionUse) -> bool {
 /// requires Interactive before asking for approval; it never turns a missing
 /// capability into an approval dialog. --approve-all selects AllowAll instead
 /// of this policy and does not enable questions or authentication.
-pub struct HostApprovalPolicy {
-    capabilities: CapabilitySet,
-    ui: Option<UiInteraction>,
+pub enum HostApprovalPolicy {
+    /// No interface: operations needing approval are denied.
+    Unattended,
+    /// Asks `ui` while the session holds the interactive capability.
+    Attended {
+        capabilities: CapabilitySet,
+        ui: UiInteraction,
+    },
+}
+
+/// Settled by the policy itself, or handed to the interface.
+enum Approval<'a> {
+    Decided(PolicyDecision),
+    Ask(&'a UiInteraction),
 }
 
 impl HostApprovalPolicy {
-    pub fn new(capabilities: CapabilitySet, ui: Option<UiInteraction>) -> Self {
-        Self { capabilities, ui }
-    }
-
-    fn decision_without_prompt(&self, permissions: &[PermissionUse]) -> Option<PolicyDecision> {
+    fn approval(&self, permissions: &[PermissionUse]) -> Approval<'_> {
         if !permissions.iter().any(requires_prompt) {
-            return Some(PolicyDecision::allow());
+            return Approval::Decided(PolicyDecision::allow());
         }
-        if !self.capabilities.contains(Capability::Interactive) {
-            return Some(PolicyDecision::Deny {
-                reason: "approval requires the interactive capability".into(),
-            });
-        }
-        if self.ui.is_none() {
-            return Some(PolicyDecision::Deny {
+        match self {
+            Self::Unattended => Approval::Decided(PolicyDecision::Deny {
                 reason: "approval requires an interactive interface".into(),
-            });
+            }),
+            Self::Attended { capabilities, .. }
+                if !capabilities.contains(Capability::Interactive) =>
+            {
+                Approval::Decided(PolicyDecision::Deny {
+                    reason: "approval requires the interactive capability".into(),
+                })
+            }
+            Self::Attended { ui, .. } => Approval::Ask(ui),
         }
-        None
     }
 }
 
 impl Policy for HostApprovalPolicy {
     fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
         Box::pin(async move {
-            if let Some(decision) = self.decision_without_prompt(&request.permissions) {
-                return decision;
-            }
+            let ui = match self.approval(&request.permissions) {
+                Approval::Decided(decision) => return decision,
+                Approval::Ask(ui) => ui,
+            };
             let grants = request
                 .permissions
                 .iter()
                 .filter_map(|p| p.proposed_grant.clone())
                 .collect();
-            let ui = self.ui.as_ref().expect("approval interface checked above");
             match ui
                 .request(|reply| PromptKind::Approval { request, reply })
                 .await
@@ -231,7 +243,7 @@ pub(crate) mod tests {
             .harness_builder(root.path())
             .unwrap()
             .session_root(root.path().join("sessions"))
-            .policy(Arc::new(policy(true, Some(ui))))
+            .policy(Arc::new(attended(true, ui)))
             .build()
             .await
             .unwrap();
@@ -257,26 +269,37 @@ pub(crate) mod tests {
     }
 
     fn workspace(target: &str) -> ResourceId {
-        ResourceId::workspace(target, std::path::Path::new("item"))
+        ResourceId::workspace(&target.parse().unwrap(), std::path::Path::new("item"))
     }
 
     fn mcp_item(target: &str) -> ResourceId {
         ResourceId::mcp(target, "item")
     }
 
-    fn policy(interactive: bool, ui: Option<UiInteraction>) -> HostApprovalPolicy {
+    fn attended(interactive: bool, ui: UiInteraction) -> HostApprovalPolicy {
         let mut capabilities = CapabilitySet::default();
         if interactive {
             capabilities.insert(Capability::Interactive);
         } else {
             capabilities.remove(Capability::Interactive);
         }
-        HostApprovalPolicy::new(capabilities, ui)
+        HostApprovalPolicy::Attended { capabilities, ui }
+    }
+
+    /// What the policy settles by itself; `None` when it would ask the interface.
+    fn decided(
+        policy: &HostApprovalPolicy,
+        permissions: &[PermissionUse],
+    ) -> Option<PolicyDecision> {
+        match policy.approval(permissions) {
+            Approval::Decided(decision) => Some(decision),
+            Approval::Ask(_) => None,
+        }
     }
 
     fn password_prompt() -> SensitivePrompt {
         SensitivePrompt {
-            kind: SensitivePromptKind::Password,
+            kind: skyhook::remote::SensitivePromptKind::Password,
             message: "password".into(),
         }
     }
@@ -294,26 +317,28 @@ pub(crate) mod tests {
         let approvals = [
             PermissionUse::new(Exec, workspace("root")),
             PermissionUse::new(Targets, mcp_item("root")),
-            PermissionUse::new(Network, ResourceId::network("root", "https://example.com")),
-            PermissionUse::new(Network, ResourceId::network("build", "https://example.com")),
+            PermissionUse::new(
+                Network,
+                ResourceId::network(&skyhook::target::TargetRef::Root, "https://example.com"),
+            ),
+            PermissionUse::new(
+                Network,
+                ResourceId::network(&"build".parse().unwrap(), "https://example.com"),
+            ),
             PermissionUse::new(Write, workspace("build")),
             PermissionUse::new(Write, mcp_item("root")),
         ];
-        for interactive in [false, true] {
-            let policy = policy(interactive, None);
-            assert_eq!(
-                policy.decision_without_prompt(&[]),
-                Some(PolicyDecision::allow())
-            );
-            let decision = policy.decision_without_prompt(&automatic);
-            assert_eq!(decision, Some(PolicyDecision::allow()));
+        let (ui, _rx) = UiInteraction::new();
+        for policy in [HostApprovalPolicy::Unattended, attended(false, ui)] {
+            assert_eq!(decided(&policy, &[]), Some(PolicyDecision::allow()));
+            assert_eq!(decided(&policy, &automatic), Some(PolicyDecision::allow()));
             for approval in &approvals {
                 // An auto-allowed permission cannot mask another's need for approval.
                 let permissions = [
                     PermissionUse::new(Read, workspace("root")),
                     approval.clone(),
                 ];
-                let decision = policy.decision_without_prompt(&permissions);
+                let decision = decided(&policy, &permissions);
                 assert!(
                     matches!(decision, Some(PolicyDecision::Deny { reason }) if reason.contains("interactive"))
                 );
@@ -325,23 +350,19 @@ pub(crate) mod tests {
     fn a_live_ui_is_prompted_only_with_interactive() {
         let exec = [PermissionUse::new(Exec, workspace("root"))];
         let (ui, mut rx) = UiInteraction::new();
-        let policy = policy(false, Some(ui));
-        let decision = policy.decision_without_prompt(&exec);
-        assert!(matches!(decision, Some(PolicyDecision::Deny { .. })));
+        let policy = attended(false, ui);
+        assert!(matches!(
+            decided(&policy, &exec),
+            Some(PolicyDecision::Deny { .. })
+        ));
         let write = [PermissionUse::new(Write, workspace("root"))];
-        assert_eq!(
-            policy.decision_without_prompt(&write),
-            Some(PolicyDecision::allow())
-        );
+        assert_eq!(decided(&policy, &write), Some(PolicyDecision::allow()));
         assert!(matches!(
             rx.try_recv(),
             Err(mpsc::error::TryRecvError::Empty)
         ));
         let (ui, _rx) = UiInteraction::new();
-        assert_eq!(
-            super::tests::policy(true, Some(ui)).decision_without_prompt(&exec),
-            None
-        );
+        assert_eq!(decided(&attended(true, ui), &exec), None);
     }
 
     #[tokio::test]
@@ -353,9 +374,13 @@ pub(crate) mod tests {
         let PromptKind::Authentication { reply, .. } = prompt.kind else {
             panic!("expected authentication request");
         };
-        // This reply only accepts SecretValue, so no cross-category answer exists.
-        assert!(reply.send(Ok(SecretValue::new("secret".into()))).is_ok());
-        assert_eq!(task.await.unwrap().unwrap().expose(), "secret");
+        // This reply only accepts PromptAnswer, so no cross-category answer exists.
+        let secret = skyhook::remote::SecretValue::new("secret".into());
+        assert!(reply.send(Ok(PromptAnswer::Secret(secret))).is_ok());
+        let PromptAnswer::Secret(answer) = task.await.unwrap().unwrap() else {
+            panic!("expected a secret answer")
+        };
+        assert_eq!(answer.expose(), "secret");
 
         let task = tokio::spawn(handler.prompt(password_prompt()));
         rx.recv()
@@ -409,7 +434,7 @@ pub(crate) mod tests {
         ] {
             let (ui, mut rx) = UiInteraction::new();
             let request = request.clone();
-            let policy = policy(true, Some(ui));
+            let policy = attended(true, ui);
             let task = tokio::spawn(async move { policy.authorize(request).await });
             let PromptKind::Approval { reply, .. } = rx.recv().await.unwrap().kind else {
                 panic!("approval");

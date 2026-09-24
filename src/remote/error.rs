@@ -1,18 +1,18 @@
 //! Remote transport and authorization errors, with tool-facing conversion.
 use crate::{
-    remote::ArtifactError,
+    remote::{ArtifactError, Platform, ShimProtocol},
     target::TargetError,
     tool::{
-        ToolError, ToolOutput,
+        AdmissionError, ToolError, ToolOutput,
         authorization::AuthorizationError,
-        diagnostic::{Cause, Diagnostic, DiagnosticContext},
+        diagnostic::{Cause, Effects, Operation, PartialContext, PartialDiagnostic, Subject},
     },
 };
 use std::{io, sync::Arc};
 use thiserror::Error;
 
 #[derive(Clone, Debug, Error)]
-pub enum RemoteError {
+pub(crate) enum RemoteError {
     #[error(transparent)]
     Target(#[from] TargetError),
     #[error(transparent)]
@@ -21,55 +21,81 @@ pub enum RemoteError {
     Session(std::sync::Arc<crate::session::SessionError>),
     #[error("could not start transport process: {source}")]
     Start { source: Arc<io::Error> },
-    #[error("target connection was denied: {0}")]
-    ApprovalDenied(String),
-    #[error("target connection returned an invalid approval grant: {0}")]
-    ApprovalInvalidGrant(String),
-    #[error("target connection requires an unavailable capability")]
-    ApprovalUnavailable,
+    #[error("target connection authorization failed: {0}")]
+    Authorization(AuthorizationError),
     #[error("target connection was cancelled")]
     Cancelled,
     #[error("remote connection startup task failed: {0}")]
     ConnectionTask(String),
     #[error("SSH failed: {0}")]
-    Ssh(String),
+    Ssh(#[from] SshError),
     #[error("remote shim deployment failed: {0}")]
-    Deployment(String),
+    Deployment(#[from] DeploymentError),
     #[error("remote protocol failed: {0}")]
-    Protocol(String),
-    #[error("{}", diagnostic.render(&Default::default()))]
+    Protocol(#[from] ProtocolError),
+    #[error("{}", diagnostic.clone().resolve().render(&Default::default()))]
     Remote {
-        diagnostic: Box<Diagnostic>,
+        diagnostic: Box<PartialDiagnostic>,
         output: Option<Box<ToolOutput>>,
     },
     #[error("target route is empty")]
     EmptyRoute,
     #[error("{source}")]
     Io { source: Arc<io::Error> },
+}
+
+/// Why no shim could be installed on the remote host.
+#[derive(Clone, Debug, Error)]
+pub(crate) enum DeploymentError {
+    #[error("platform probe returned invalid output")]
+    Probe,
+    #[error("unsupported remote platform `{os}-{arch}`")]
+    UnsupportedPlatform { os: String, arch: String },
+    #[error("this Skyhook build contains no remote shims (SSH targets are unavailable)")]
+    NoShims,
+    #[error("no {protocol} shim is embedded for remote platform {platform}")]
+    NoShim {
+        protocol: ShimProtocol,
+        platform: Platform,
+    },
+    #[error("shim installation failed")]
+    Install,
+    #[error("upload name generation failed: {0}")]
+    Random(getrandom::Error),
+}
+
+/// An SSH connection could not be configured or its stream failed.
+#[derive(Clone, Debug, Error)]
+pub(crate) enum SshError {
+    #[error(
+        "target `{target}` uses external_agent, but SSH_AUTH_SOCK is not set where its SSH connection starts"
+    )]
+    ExternalAgentUnavailable { target: String },
+    #[error("SSH values cannot be empty or contain control characters")]
+    InvalidValue,
     #[error("{0}")]
-    Json(String),
+    Stream(String),
+}
+
+/// The peer broke the frame contract; the connection is unusable.
+#[derive(Clone, Debug, Error)]
+pub(crate) enum ProtocolError {
+    #[error("{0}")]
+    Violation(&'static str),
+    #[error("remote scoped permission used unexpected execution target `{0}`")]
+    UnexpectedPermissionTarget(String),
+    #[error("remote result could not be decoded: {0}")]
+    Decode(String),
 }
 
 impl RemoteError {
-    /// Fill missing boundary facts without replacing those the source selected.
+    /// Fill the facts still unset without replacing those the source selected.
     #[must_use]
-    pub(crate) fn fallback_context(self, context: DiagnosticContext) -> Self {
-        let (diagnostic, output) = self
-            .into_tool_error()
-            .fallback_context(context)
-            .into_parts();
+    pub(crate) fn or(self, context: PartialContext) -> Self {
+        let (diagnostic, output) = self.into_tool_error().or(context).into_facts();
         Self::Remote {
             diagnostic: Box::new(diagnostic),
             output: output.map(Box::new),
-        }
-    }
-
-    pub(crate) fn authorization(error: AuthorizationError) -> Self {
-        match error {
-            AuthorizationError::Denied(reason) => Self::ApprovalDenied(reason),
-            AuthorizationError::Cancelled => Self::Cancelled,
-            AuthorizationError::InvalidGrant(reason) => Self::ApprovalInvalidGrant(reason),
-            AuthorizationError::Unavailable => Self::ApprovalUnavailable,
         }
     }
 
@@ -86,18 +112,26 @@ impl RemoteError {
     }
 
     #[must_use]
-    pub fn into_tool_error(self) -> ToolError {
+    pub(crate) fn into_tool_error(self) -> ToolError {
         match self {
             Self::Target(error) => error.into_admission_error().into(),
-            Self::ApprovalDenied(reason) => ToolError::Denied(reason),
-            Self::Cancelled => ToolError::Cancelled,
+            Self::Authorization(error) => AdmissionError::from(error).into(),
+            Self::Cancelled => ToolError::cancelled(),
             Self::Session(source) => ToolError::from(source),
-            Self::Remote { diagnostic, output } => ToolError::from_diagnostic(*diagnostic, output),
-            Self::Start { source } | Self::Io { source } => ToolError::from_diagnostic(
-                Diagnostic::new(DiagnosticContext::default(), Cause::io(&source)),
-                None,
-            ),
-            error => ToolError::Failed(error.to_string()),
+            Self::Remote { diagnostic, output } => {
+                ToolError::from_facts(*diagnostic, output.map(|output| *output))
+            }
+            Self::Start { source } | Self::Io { source } => ToolError::cause(Cause::io(&source)),
+            Self::Deployment(error) => ToolError::failed(error)
+                .operation(Operation::Connect, Subject::Label("remote shim".into()))
+                .effects(Effects::NotStarted),
+            Self::Ssh(error) => {
+                ToolError::failed(error).operation(Operation::Connect, Subject::Label("ssh".into()))
+            }
+            error @ (Self::Artifact(_)
+            | Self::ConnectionTask(_)
+            | Self::Protocol(_)
+            | Self::EmptyRoute) => ToolError::failed(error),
         }
     }
 }
@@ -108,9 +142,12 @@ impl From<io::Error> for RemoteError {
     }
 }
 
-impl From<serde_json::Error> for RemoteError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Json(error.to_string())
+impl From<AuthorizationError> for RemoteError {
+    fn from(error: AuthorizationError) -> Self {
+        match error {
+            AuthorizationError::Cancelled => Self::Cancelled,
+            error => Self::Authorization(error),
+        }
     }
 }
 

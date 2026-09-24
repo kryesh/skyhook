@@ -3,12 +3,13 @@
 use super::{AgentCommand, SessionRuntime};
 
 mod delivery;
-mod receipt;
-use crate::tool::{
-    ToolContext, ToolError,
-    diagnostic::{Effects, Operation, Subject},
+use crate::{
+    job::{WaitCaller, WaitFloor},
+    tool::{
+        ToolContext, ToolError,
+        diagnostic::{Effects, Operation, Subject},
+    },
 };
-pub(super) use receipt::PendingEventBatch;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::sync::{
@@ -191,8 +192,7 @@ impl AgentSender {
 #[serde(deny_unknown_fields)]
 pub(super) struct WaitArgs {
     /// Maximum seconds to wait, as a positive integer. Omitted/null waits indefinitely.
-    #[schemars(range(min = 1))]
-    pub(super) timeout: Option<u64>,
+    pub(super) timeout: Option<std::num::NonZeroU64>,
 }
 
 #[derive(Serialize, JsonSchema, Debug, PartialEq)]
@@ -216,21 +216,17 @@ impl SessionRuntime {
         let deadline = args
             .timeout
             .map(|seconds| {
-                let invalid = |message: &str| {
-                    ToolError::InvalidArguments(message.into())
-                        .operation(Operation::Validate, Subject::argument(["timeout"]))
-                        .effects(Effects::NotStarted)
-                };
-                if seconds == 0 {
-                    return Err(invalid("timeout must be a positive integer"));
-                }
                 tokio::time::Instant::now()
-                    .checked_add(std::time::Duration::from_secs(seconds))
-                    .ok_or_else(|| invalid("timeout is too large"))
+                    .checked_add(std::time::Duration::from_secs(seconds.get()))
+                    .ok_or_else(|| {
+                        ToolError::invalid_arguments("timeout is too large")
+                            .operation(Operation::Validate, Subject::argument(["timeout"]))
+                            .effects(Effects::NotStarted)
+                    })
             })
             .transpose()?;
         let sender = self.agent_sender(context.agent()).ok_or_else(|| {
-            ToolError::Failed("calling agent is not active".into())
+            ToolError::failed("calling agent is not active")
                 .operation(
                     Operation::Lookup,
                     Subject::Label(format!("calling agent {}", context.agent())),
@@ -243,7 +239,7 @@ impl SessionRuntime {
             None => std::future::pending().await,
         };
         let cancelled = || {
-            ToolError::Cancelled
+            ToolError::cancelled()
                 .operation(Operation::Wait, Subject::Job(context.job()))
                 .effects(Effects::Unchanged)
         };
@@ -263,7 +259,7 @@ impl SessionRuntime {
                     // Completed foreground work is something the agent acts on: its
                     // result returns with this wait's. A script's wait cannot.
                     _ = self.jobs.wait_settled(holding) => {
-                        if !state.hosted && self.jobs.settled(holding).await {
+                        if matches!(state.caller, WaitCaller::Model) && self.jobs.settled(holding).await {
                             return Ok(WaitOutput { reason: WakeReason::Event });
                         }
                         continue;
@@ -281,13 +277,19 @@ impl SessionRuntime {
             // any open batch to release first keeps a burst in one report.
             let released = *revision.borrow_and_update();
             let ready_input = sender.wake.ready_input_revision.load(Ordering::Acquire);
+            let seen_input = match state.caller {
+                WaitCaller::Script { floor } => floor.map(|floor| floor.input),
+                WaitCaller::Model => None,
+            };
             let input = ready_input != sender.wake.observed_input.load(Ordering::Acquire)
-                && state.seen_input != Some(ready_input);
+                && seen_input != Some(ready_input);
             let settled = released == sender.wake.scheduled();
             if (state.unseen || input) && settled {
-                self.jobs
-                    .set_wait_floor(context.job(), (state.stamp, ready_input))
-                    .await;
+                let floor = WaitFloor {
+                    stamp: state.stamp,
+                    input: ready_input,
+                };
+                self.jobs.set_wait_floor(context.job(), floor).await;
                 return Ok(WaitOutput {
                     reason: WakeReason::Event,
                 });
@@ -318,6 +320,7 @@ mod tests {
         AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, poll, rendered,
         response,
     };
+    pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
     use crate::{
         job::{JobOutcome, JobSpec, JobState},
         tool::ToolOutput,
@@ -404,12 +407,10 @@ mod tests {
             background: true,
             ..JobSpec::test(owner.clone(), "wait-fixture")
         };
-        let lease = jobs.create(spec).await.unwrap();
-        let id = lease.id();
-        jobs.transition(id, JobState::Running).await.unwrap();
+        let id = jobs.test_running(spec).await.into_test_id();
         let outcome = JobOutcome::Completed(ToolOutput::new(json!({"value":value})));
         jobs.finish(id, outcome).await.unwrap();
-        lease.into_test_id()
+        id
     }
 
     pub(super) fn events(request: &ModelRequest) -> Vec<Value> {
@@ -420,17 +421,20 @@ mod tests {
         job_entries(request, true)
     }
 
+    /// Job events across the request's envelopes, as their presented JSON.
     fn job_entries(request: &ModelRequest, messages: bool) -> Vec<Value> {
-        let (prefix, suffix) = ("<skyhook_job_events>\n", "\n</skyhook_job_events>");
         let blocks = request.messages().flat_map(|message| match message {
-            Message::User(content) => content.as_slice(),
+            Sent::User(content) => content.as_slice(),
             _ => &[],
         });
-        let entries = blocks.filter_map(|block| match block {
-            UserContent::Runtime { text } => text.strip_prefix(prefix)?.strip_suffix(suffix),
-            _ => None,
+        let entries = blocks.flat_map(|block| match block {
+            SentPart::Runtime { text } => text
+                .strip_prefix("<skyhook_job_events>\n")
+                .and_then(|json| json.strip_suffix("\n</skyhook_job_events>"))
+                .map(|json| serde_json::from_str::<Vec<Value>>(json).unwrap())
+                .unwrap_or_default(),
+            _ => Vec::new(),
         });
-        let entries = entries.flat_map(|text| serde_json::from_str::<Vec<Value>>(text).unwrap());
         entries
             .filter(|entry| (entry["kind"] == "message") == messages)
             .collect()
@@ -452,7 +456,7 @@ mod tests {
 
     pub(super) fn assert_reason(request: &ModelRequest, id: &str, reason: &str) {
         let results = request.messages().flat_map(|message| match message {
-            Message::Tool(results) => results.as_slice(),
+            Sent::Tool(results) => results.as_slice(),
             _ => &[],
         });
         let results = results
@@ -775,7 +779,11 @@ mod tests {
         let first = jobs.test_create(hosted()).await;
         let state = jobs.wait_state(root, first).await;
         assert!(state.unseen);
-        jobs.set_wait_floor(first, (state.stamp, 0)).await;
+        let floor = crate::job::WaitFloor {
+            stamp: state.stamp,
+            input: 0,
+        };
+        jobs.set_wait_floor(first, floor).await;
         let second = jobs.test_create(hosted()).await;
         assert!(!jobs.wait_state(root, second).await.unseen);
         complete_background(&session, root, "second").await;

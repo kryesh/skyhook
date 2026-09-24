@@ -1,13 +1,63 @@
-use std::{borrow::Cow, sync::Arc};
+//! Embedded remote shims, named `<os>-<protocol>-<arch>` such as `linux-ssh-x86_64`.
+use std::{borrow::Cow, fmt, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// A remote shim named `<os>-<protocol>-<arch>`, such as `linux-ssh-x86_64`.
+use crate::named_enum::named_enum;
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub enum Os {
+        Linux = "linux",
+    }
+}
+
+named_enum! {
+    /// `uname -m` aliases parse to the canonical spelling.
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub enum Arch {
+        X86_64 = "x86_64" | "amd64",
+        Aarch64 = "aarch64" | "arm64",
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub enum ShimProtocol {
+        Ssh = "ssh",
+    }
+}
+
+/// A remote host's operating system and architecture.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Platform {
+    pub os: Os,
+    pub arch: Arch,
+}
+
+impl Platform {
+    /// Parses an operating system and architecture spelling, such as trimmed
+    /// lowercase `uname -s` and `uname -m` output.
+    #[must_use]
+    pub fn parse(os: &str, arch: &str) -> Option<Self> {
+        Some(Self {
+            os: os.parse().ok()?,
+            arch: arch.parse().ok()?,
+        })
+    }
+}
+
+impl fmt::Display for Platform {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "{}-{}", self.os, self.arch)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct EmbeddedShim {
-    pub arch: String,
-    pub os: String,
-    pub protocol: String,
+    pub platform: Platform,
+    pub protocol: ShimProtocol,
     pub bytes: Cow<'static, [u8]>,
 }
 
@@ -29,23 +79,13 @@ impl EmbeddedShimCatalog {
             .filter(|(name, _)| std::path::Path::new(name.as_ref()).extension().is_none())
             .map(|(name, bytes)| {
                 let name = name.as_ref();
-                let parts = name.split('-').collect::<Vec<_>>();
-                let valid = |part: &&str| {
-                    !part.is_empty()
-                        && part
-                            .bytes()
-                            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+                let invalid = || ArtifactError::InvalidName(name.to_owned());
+                let [os, protocol, arch] = name.split('-').collect::<Vec<_>>()[..] else {
+                    return Err(invalid());
                 };
-                let [os, protocol, arch] = parts[..] else {
-                    return Err(ArtifactError::InvalidName(name.to_owned()));
-                };
-                if !parts.iter().all(valid) {
-                    return Err(ArtifactError::InvalidName(name.to_owned()));
-                }
                 Ok(EmbeddedShim {
-                    arch: normalize_arch(arch),
-                    os: os.to_owned(),
-                    protocol: protocol.to_owned(),
+                    platform: Platform::parse(os, arch).ok_or_else(invalid)?,
+                    protocol: protocol.parse().map_err(|_| invalid())?,
                     bytes,
                 })
             })
@@ -61,14 +101,11 @@ impl EmbeddedShimCatalog {
         self.shims.is_empty()
     }
 
-    /// Finds the shim for a protocol and the `uname -m` / `uname -s` values of a host.
-    pub fn find(&self, protocol: &str, arch: &str, os: &str) -> Option<EmbeddedShim> {
-        let arch = normalize_arch(arch);
-        let os = os.trim().to_ascii_lowercase();
+    #[must_use]
+    pub fn find(&self, protocol: ShimProtocol, platform: Platform) -> Option<&EmbeddedShim> {
         self.shims
             .iter()
-            .find(|shim| shim.protocol == protocol && shim.arch == arch && shim.os == os)
-            .cloned()
+            .find(|shim| shim.protocol == protocol && shim.platform == platform)
     }
 }
 
@@ -80,15 +117,7 @@ impl EmbeddedShim {
 
     #[must_use]
     pub fn installed_name(&self) -> String {
-        format!("{}-{}", self.os, self.protocol)
-    }
-}
-
-fn normalize_arch(value: &str) -> String {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "amd64" => "x86_64".to_owned(),
-        "arm64" => "aarch64".to_owned(),
-        other => other.to_owned(),
+        format!("{}-{}", self.platform.os, self.protocol)
     }
 }
 
@@ -109,28 +138,30 @@ mod tests {
     }
 
     #[test]
-    fn finds_shims_by_uname_values_and_arch_aliases() {
-        let catalog = catalog(&[
+    fn finds_shims_by_platform_and_arch_aliases() {
+        let shims = catalog(&[
             "linux-ssh-x86_64",
             "linux-ssh-aarch64",
             "linux-ssh-x86_64.d",
         ])
         .unwrap();
-        let shim = catalog.find("ssh", "x86_64\n", "Linux").unwrap();
-        assert_eq!((shim.arch.as_str(), &*shim.bytes), ("x86_64", &b"abc"[..]));
+        let platform = Platform::parse("linux", "x86_64").unwrap();
+        let shim = shims.find(ShimProtocol::Ssh, platform).unwrap();
+        assert_eq!(
+            (shim.platform.arch, &*shim.bytes),
+            (Arch::X86_64, &b"abc"[..])
+        );
         assert_eq!(shim.installed_name(), "linux-ssh");
         let sha = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
         assert_eq!(shim.sha256(), sha);
-        assert_eq!(
-            catalog.find("ssh", "arm64", "linux").unwrap().arch,
-            "aarch64"
-        );
-        assert_eq!(
-            catalog.find("ssh", "amd64", "linux").unwrap().arch,
-            "x86_64"
-        );
-        assert!(catalog.find("ssh", "riscv64", "linux").is_none());
-        assert!(catalog.find("ssh", "x86_64", "darwin").is_none());
+        assert_eq!(platform.to_string(), "linux-x86_64");
+        assert_eq!("arm64".parse::<Arch>().unwrap(), Arch::Aarch64);
+        assert_eq!("amd64".parse::<Arch>().unwrap(), Arch::X86_64);
+        assert!(Platform::parse("linux", "riscv64").is_none());
+        assert!(Platform::parse("darwin", "x86_64").is_none());
+        // An alias-named artifact serves the canonical platform.
+        let aliased = catalog(&["linux-ssh-amd64"]).unwrap();
+        assert!(aliased.find(ShimProtocol::Ssh, platform).is_some());
     }
 
     #[test]
@@ -142,6 +173,9 @@ mod tests {
             "Linux-ssh-x86_64",
             "../linux-ssh-x86_64",
             "linux-ssh-$(uname)",
+            "linux-ssh-riscv64",
+            "linux-scp-x86_64",
+            "darwin-ssh-x86_64",
         ] {
             assert!(
                 matches!(catalog(&[name]), Err(ArtifactError::InvalidName(value)) if value == name),

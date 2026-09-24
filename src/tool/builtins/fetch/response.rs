@@ -1,7 +1,7 @@
 //! Bounded response streaming, atomic downloads, and response decoding.
 use std::{collections::BTreeMap, path::PathBuf};
 
-use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, Subject};
+use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use futures_util::StreamExt;
@@ -70,7 +70,7 @@ impl PendingDownload {
         self.writer.sync_all().await.map_err(local_io)?;
         if context.is_cancelled() {
             return Err(FetchError::from_tool_error(
-                LocalError::Cancelled,
+                LocalError::cancelled(),
                 FetchPhase::LocalIo,
             ));
         }
@@ -249,7 +249,7 @@ pub(super) async fn read_body(
             BodySink::Memory { .. } => progress.phase(FetchPhase::ResponseBody),
             BodySink::Download(download) => progress.operation(
                 FetchPhase::ResponseBody,
-                DiagnosticContext::new(Operation::Receive, Subject::path(&download.destination))
+                PartialContext::new(Operation::Receive, Subject::path(&download.destination))
                     .effects(Effects::Unchanged),
             ),
         }
@@ -382,7 +382,7 @@ mod tests {
             .await
             .unwrap_err();
         task.await.unwrap();
-        let output = error.into_tool_error().into_failure().output.unwrap().value;
+        let output = error.into_tool_error().into_parts().1.unwrap().value;
         assert_eq!(output["status"], 201);
         assert_eq!(output["received_bytes"], html.len());
         assert_eq!(output["diagnostic"]["phase"], "extraction");
@@ -454,8 +454,7 @@ mod tests {
                 .to_string()
                 .contains("server-side effects are unknown")
         );
-        let failure = error.into_tool_error().into_failure();
-        let output = failure.output.unwrap().value;
+        let output = error.into_tool_error().into_parts().1.unwrap().value;
         assert_eq!(output["status"], 200);
         assert_eq!(output["received_bytes"], 11);
         assert_eq!(output["diagnostic"]["phase"], "local_io");

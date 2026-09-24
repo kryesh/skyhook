@@ -4,6 +4,7 @@ use crate::{
     execution::ExecutionLocation,
     identity::AgentId,
     provider::protocol::SystemSegment,
+    target::{TargetDefinition, TargetName, TargetRef},
     tool::policy::{Capability, CapabilitySet, Mode},
 };
 
@@ -25,7 +26,7 @@ pub(super) const CHILD_PROMPT: &str = concat!(
 );
 pub(super) const TARGET_PROMPT: &str = r#"Tools default to the target and workspace in skyhook_context. A tool's target selects the execution machine; write commands as if already on that machine. If the task's machine is unclear, use targets to discover available machines. Findings apply only to the target inspected.
 
-"root" selects the session host running Skyhook and its configured workspace; "local" identifies that host's target type. Selecting another target uses its configured workspace; selecting the current remote target preserves your workspace override.
+"root" selects the session host running Skyhook and its configured workspace. Selecting another target uses its configured workspace; selecting the current remote target preserves your workspace override.
 
 Remote commands receive the SSH agent their target's connection forwards in SSH_AUTH_SOCK; Skyhook handles SSH authentication prompts."#;
 
@@ -44,11 +45,10 @@ struct SkyhookContext<'a> {
 
 #[derive(Serialize)]
 struct TargetContext<'a> {
-    name: &'a str,
-    r#type: crate::target::TargetType,
+    name: &'a TargetRef,
     host: &'a str,
-    via: Option<&'a str>,
-    origin: Option<&'a str>,
+    via: Option<&'a TargetName>,
+    origin: Option<&'a TargetName>,
 }
 
 /// Everything an agent's system prompt is derived from.
@@ -57,7 +57,7 @@ pub(super) struct PromptInputs<'a> {
     pub agent: &'a AgentId,
     pub location: &'a ExecutionLocation,
     /// None on the session host.
-    pub target: Option<&'a crate::target::TargetDefinition>,
+    pub target: Option<&'a TargetDefinition>,
     pub available_depth: usize,
     /// The agent's mode and its name.
     pub mode: Option<(&'a str, &'a Mode)>,
@@ -81,10 +81,9 @@ pub(super) fn system_segment(inputs: &PromptInputs<'_>) -> SystemSegment {
             .contains(Capability::Targets)
             .then(|| TargetContext {
                 name: &location.target,
-                r#type: target.map_or(crate::target::TargetType::Local, |target| target.r#type),
                 host: target.map_or("localhost", |target| &target.host),
-                via: target.and_then(|target| target.via.as_deref()),
-                origin: target.and_then(|target| target.origin.as_deref()),
+                via: target.and_then(|target| target.via.as_ref()),
+                origin: target.and_then(|target| target.origin.as_ref()),
             }),
     };
     let role = if agent.depth() == 0 {

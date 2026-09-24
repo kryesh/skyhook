@@ -362,7 +362,7 @@ impl Document {
         preview: &PreviewView,
         whole: Option<&Value>,
     ) {
-        let field = preview.field();
+        let field = preview.field().as_str();
         self.line(
             if field.is_empty() {
                 "Complete result"
@@ -377,7 +377,7 @@ impl Document {
             omit_null_fields(&mut value);
             Some(pretty(&value))
         } else if field != "/result/content" && (language.is_empty() || language == "json") {
-            pretty_json_preview(preview.source(), preview.pagination(), preview.field())
+            pretty_json_preview(preview.source(), preview.pagination(), field)
         } else {
             None
         };

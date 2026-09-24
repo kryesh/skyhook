@@ -1,5 +1,4 @@
 //! Session persistence in one normalized SQLite database per session.
-
 use chrono::Utc;
 use fs2::FileExt;
 use std::{
@@ -12,24 +11,33 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::{
     identity::{AgentId, EventId, SessionId},
-    provider::protocol::{Message, ModelRequest, UserContent},
+    provider::protocol::ModelRequest,
 };
 
+mod content;
 mod db;
 mod event;
+mod ledger;
 mod request;
 pub mod stats;
 mod template;
 
 pub(crate) use template::ModelRequestTemplate;
 
+pub use content::{JobEvent, Message, RuntimeState, StateJob, StateJobKind, UserPart};
 pub(crate) use db::{CaptureExtent, CaptureRow, Presentation, SharedDb};
 pub use db::{DbError, SessionSummary};
+pub(crate) use event::EntryKind;
 pub use event::{
-    CompactionCheckpoint, EventRecord, ModeSelection, ModelCallOrigin, ModelContext,
-    ModelFailureKind, ModelPurpose, ProfileSnapshot, SessionEvent,
+    AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, EventRecord, MessageSeq,
+    ModeSelection, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose, ProfileSnapshot,
+    RecordSeq, RequestSeq, SessionEvent, Truncation,
 };
-pub use request::{merge_tool_results, project_history, reconstruct_model_request};
+pub use ledger::{RequestLedger, RequestPhase, RequestRecord};
+pub use request::{
+    Projection, project_history, reconstruct_model_request, record_at, render_history,
+    request_context,
+};
 
 /// The database schema version; earlier formats are intentionally unsupported.
 pub const SESSION_FORMAT_VERSION: i64 = db::USER_VERSION;
@@ -114,7 +122,7 @@ enum WriterHealth {
 pub struct AppendIdentity {
     pub event: EventId,
     pub session: SessionId,
-    pub sequence: u64,
+    pub sequence: RecordSeq,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -202,7 +210,7 @@ impl AppendBoundary {
 type Acceptance = oneshot::Sender<Result<Vec<AppendIdentity>, SessionError>>;
 
 /// Builds events that reference the first entry's sequence, in the same transaction.
-type Follow = Box<dyn FnOnce(u64) -> Vec<(AgentId, SessionEvent)> + Send>;
+type Follow = Box<dyn FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send>;
 
 struct State {
     records: Vec<EventRecord>,
@@ -350,7 +358,7 @@ impl Writer {
         let first = state
             .records
             .last()
-            .map_or(1, |record| record.sequence.saturating_add(1));
+            .map_or(RecordSeq::new(1), |record| record.sequence.next());
         let timestamp_millis = Utc::now().timestamp_millis();
         if let Some(follow) = follow {
             entries.extend(follow(first));
@@ -377,7 +385,7 @@ impl Writer {
             }
             records.push(EventRecord {
                 id: EventId::generate()?,
-                sequence: first.saturating_add(offset as u64),
+                sequence: RecordSeq::new(first.get().saturating_add(offset as u64)),
                 timestamp_millis,
                 agent,
                 event,
@@ -486,7 +494,9 @@ impl SessionStore {
         root: &Path,
         id: SessionId,
     ) -> Result<Vec<EventRecord>, SessionError> {
-        Self::read_only(root, id, move |db| db::decode_records(db, id)).await
+        Self::read_only(root, id, move |db| db::decode_records(db, id))
+            .await
+            .and_then(request::admit_records)
     }
 
     /// A session list row, without decoding the session or taking its lock.
@@ -583,7 +593,7 @@ impl SessionStore {
                 }
             };
             let db = db::Db::open(&path, mode)?;
-            let records = db::decode_records(&db, id)?;
+            let records = request::admit_records(db::decode_records(&db, id)?)?;
             Ok::<_, SessionError>((db, lock, records))
         })
         .await??;
@@ -674,7 +684,7 @@ impl SessionStore {
     /// Visit a consistent committed suffix without cloning event payloads.
     pub(crate) async fn visit_records_after(
         &self,
-        sequence: u64,
+        sequence: RecordSeq,
         visit: impl FnOnce(&[EventRecord]),
     ) {
         let state = self.inner.shared.read();
@@ -707,7 +717,7 @@ impl SessionStore {
         &self,
         agent: AgentId,
         event: SessionEvent,
-        follow: impl FnOnce(u64) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
+        follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
     ) -> Result<Vec<EventRecord>, SessionError> {
         self.commit_batch(vec![(agent, event)], Some(Box::new(follow)))
             .await
@@ -879,6 +889,7 @@ impl SessionStore {
         use crate::media::{AttachmentRef, ImageFormat, MAX_IMAGE_BYTES, MediaError};
         // Image blobs carry the format they must sniff as; text blobs carry none.
         let mut blobs = Vec::new();
+        use crate::provider::protocol::{Message, UserContent};
         for message in request.messages() {
             match message {
                 Message::User(content) => {
@@ -1039,10 +1050,7 @@ pub(crate) mod fixture {
         let child = parent.child(index);
         let location = ExecutionLocation::root(workspace.to_path_buf());
         store
-            .append(
-                child.clone(),
-                child_started(Some(parent.clone()), owner_job, location),
-            )
+            .append(child.clone(), child_started(owner_job, location))
             .await
             .unwrap();
         child
@@ -1057,7 +1065,7 @@ pub(crate) mod fixture {
                     capabilities: Capability::ALL.to_vec(),
                 },
             ),
-            (agent.clone(), agent_started(None, workspace)),
+            (agent.clone(), agent_started(workspace)),
         ]
     }
 
@@ -1071,22 +1079,16 @@ pub(crate) mod fixture {
         }
     }
 
-    pub(crate) fn agent_started(parent: Option<AgentId>, workspace: &Path) -> SessionEvent {
-        child_started(
-            parent,
-            None,
-            ExecutionLocation::root(workspace.to_path_buf()),
-        )
+    pub(crate) fn agent_started(workspace: &Path) -> SessionEvent {
+        child_started(None, ExecutionLocation::root(workspace.to_path_buf()))
     }
 
     /// An agent start owned by `owner_job` at `location`, for fixtures that script children.
     pub(crate) fn child_started(
-        parent: Option<AgentId>,
         owner_job: Option<JobId>,
         location: ExecutionLocation,
     ) -> SessionEvent {
         SessionEvent::AgentStarted {
-            parent,
             owner_job,
             profile: Some(profile()),
             available_depth: 0,
@@ -1248,7 +1250,7 @@ mod tests {
                 .append(agent, SessionEvent::AgentCompleted)
                 .await
                 .unwrap();
-            assert_eq!(next.sequence, replay.len() as u64 + 1);
+            assert_eq!(next.sequence.get(), replay.len() as u64 + 1);
             assert_ne!(next.id, identity.event);
         }
     }
@@ -1271,7 +1273,7 @@ mod tests {
             .append(agent, SessionEvent::AgentCompleted)
             .await
             .unwrap();
-        assert_eq!(next.sequence, before.len() as u64 + 1);
+        assert_eq!(next.sequence.get(), before.len() as u64 + 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1383,7 +1385,11 @@ mod tests {
         let (root, store, id, _agent) = fresh().await;
         drop(store);
         let path = root.path().join(id.to_string()).join(DATABASE_FILE);
-        for pragma in ["user_version = 3", "application_id = 1"] {
+        for pragma in [
+            "user_version = 11",
+            "user_version = 3",
+            "application_id = 1",
+        ] {
             {
                 let raw = libsql::Builder::new_local(&path).build();
                 let raw = futures_util::FutureExt::now_or_never(raw).unwrap().unwrap();

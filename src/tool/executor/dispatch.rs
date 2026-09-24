@@ -3,34 +3,33 @@
 use super::*;
 
 impl ToolExecutor {
-    /// Authorize, prepare and launch one owned invocation. Nothing here is
-    /// Clone: reusable transport connections do not make authority reusable.
-    pub(super) async fn start(
-        &self,
-        plan: InvocationPlan,
-    ) -> Result<StartedExecution, ExecutionError> {
-        let spec = JobSpec {
+    pub(super) fn job_spec(&self, plan: &InvocationPlan) -> JobSpec {
+        JobSpec {
             role: plan.tool.job_role(),
             origin: plan.origin.clone(),
             agent: plan.agent.clone(),
             parent: plan.parent,
             tool: plan.tool.name().to_owned(),
-            name: plan.job_name.clone(),
+            name: plan.launch.name.clone(),
             arguments: plan.original_arguments.clone(),
             output_schema: plan.tool.output_schema(&self.capabilities),
             accepts_input: plan.tool.accepts_input(),
-            background: plan.background,
-            authorization_scope: plan.authorization_scope,
+            background: plan.launch.background,
             location: plan.execution_location.clone(),
-        };
-        let mut lease = self.shared.jobs.create(spec).await?;
+        }
+    }
+
+    /// Authorize, prepare and launch one owned invocation. Nothing here is
+    /// Clone: reusable transport connections do not make authority reusable.
+    pub(super) async fn start(
+        &self,
+        plan: InvocationPlan,
+        lease: crate::job::JobLease,
+    ) -> Result<StartedExecution, ExecutionError> {
         if lease.cancellation_token().is_cancelled() {
             return Err(self.cancelled(lease).await);
         }
-        self.shared
-            .jobs
-            .transition(lease.id(), JobState::AwaitingApproval)
-            .await?;
+        let lease = lease.await_approval().await?;
         let subject = AuthorizationSubject {
             agent: plan.agent.clone(),
             job: lease.id(),
@@ -53,16 +52,13 @@ impl ToolExecutor {
         {
             let error = match error {
                 AuthorizationError::Cancelled => return Err(self.cancelled(lease).await),
-                AuthorizationError::Denied(reason) => ExecutionError::Denied(reason),
-                AuthorizationError::InvalidGrant(_) => {
-                    ToolError::Failed("operation could not be started".to_owned()).into()
-                }
                 AuthorizationError::Unavailable => {
                     ExecutionError::UnavailableTool(plan.tool.name().to_owned())
                 }
+                error => crate::tool::AdmissionError::from(error).into(),
             }
-            .contextualize(
-                DiagnosticContext::new(
+            .or(
+                PartialContext::new(
                     Operation::Authorize,
                     Subject::Tool(plan.tool.name().to_owned()),
                 )
@@ -75,10 +71,7 @@ impl ToolExecutor {
         // Route preparation may reauthorize a changed route, and seals its own
         // admission snapshot under the router mutation gate. No gate is held
         // across physical tool IO or promises execution-time freshness.
-        self.shared
-            .jobs
-            .transition(lease.id(), JobState::Running)
-            .await?;
+        let lease = lease.run().await?;
         let dispatch = match plan.dispatch {
             InvocationDispatch::Local(admitted) => InvocationDispatch::Local(admitted),
             InvocationDispatch::ReadError(output) => InvocationDispatch::ReadError(output),
@@ -94,8 +87,8 @@ impl ToolExecutor {
                     },
                     Err(RemoteError::Cancelled) => return Err(self.cancelled(lease).await),
                     Err(error) => {
-                        let error = ExecutionError::Tool(error.into_tool_error()).contextualize(
-                            DiagnosticContext::new(
+                        let error = ExecutionError::Tool(error.into_tool_error()).or(
+                            PartialContext::new(
                                 Operation::Connect,
                                 Subject::Tool(plan.tool.name().to_owned()),
                             )
@@ -111,11 +104,12 @@ impl ToolExecutor {
             return Err(self.cancelled(lease).await);
         }
         let tool = plan.tool;
+        let (input, worker) = lease.split();
         let mut context = ToolContext::new(
             subject,
             plan.execution_location,
             plan.caller_location,
-            lease.take_input(),
+            input,
             self.shared.jobs.clone(),
         )
         .with_invocation_authority(
@@ -132,18 +126,16 @@ impl ToolExecutor {
             None
         };
         let job = context.job();
-        lease
+        worker
             .start_supervised(async move {
                 let cancellation = context.cancellation_token();
-                let mut fallback = DiagnosticContext::new(
-                    Operation::Execute,
-                    Subject::Tool(tool.name().to_owned()),
-                )
-                .at(FailureSite::bound(
-                    context.execution_location(),
-                    tool.placement() == ToolPlacement::Host,
-                ));
-                fallback.paths = plan.path_facts;
+                let fallback =
+                    PartialContext::new(Operation::Execute, Subject::Tool(tool.name().to_owned()))
+                        .at(FailureSite::bound(
+                            context.execution_location(),
+                            tool.placement() == ToolPlacement::Host,
+                        ))
+                        .paths(plan.path_facts);
                 let result = async {
                     if let Some(router) = authentication {
                         context.process_environment.extend(
@@ -154,7 +146,7 @@ impl ToolExecutor {
                         );
                     }
                     if context.is_cancelled() {
-                        return Err(ToolError::Cancelled.effects(Effects::NotStarted));
+                        return Err(ToolError::cancelled().effects(Effects::NotStarted));
                     }
                     match dispatch {
                         InvocationDispatch::Local(admitted) => match admitted {
@@ -173,33 +165,32 @@ impl ToolExecutor {
                 }
                 .await;
                 let result = result.map(|mut output| {
-                    if let Some(diagnostic) = &mut output.diagnostic {
-                        diagnostic.context.fallback(fallback.clone());
-                    }
+                    output.diagnostic = output.diagnostic.map(|d| d.or(fallback.clone()));
                     output
                 });
                 cancellation_result(result, cancellation.is_cancelled())
-                    .map_err(|error| error.fallback_context(fallback))
+                    .map_err(|error| error.or(fallback))
             })
             .await?;
         Ok(StartedExecution {
             job,
-            background: plan.background,
+            background: plan.launch.background,
         })
     }
 
-    async fn cancelled(&self, lease: crate::job::JobLease) -> ExecutionError {
-        lease.fail(ToolError::Cancelled.into()).await;
-        ExecutionError::Tool(ToolError::Cancelled)
+    async fn cancelled<S>(&self, lease: crate::job::JobLease<S>) -> ExecutionError {
+        lease.fail(ToolError::cancelled().into()).await;
+        ExecutionError::Tool(ToolError::cancelled())
     }
 
-    async fn fail_start(
+    async fn fail_start<S>(
         &self,
-        lease: crate::job::JobLease,
+        lease: crate::job::JobLease<S>,
         error: ExecutionError,
     ) -> ExecutionError {
-        let outcome = ToolError::from_diagnostic(error.diagnostic(), None).into();
-        lease.fail(outcome).await;
+        lease
+            .fail(ToolError::from_facts(error.facts(), None).into())
+            .await;
         error
     }
 }
@@ -214,24 +205,25 @@ fn cancellation_result(
         return result;
     }
     let (mut diagnostic, output) = match result {
-        Err(error) => error.into_parts(),
+        Err(error) => error.into_facts(),
         Ok(output) => {
             // A completed read error remains data within the cancelled outcome.
             // Its marker renders that payload; the outer cause describes cancellation.
             let context = output
                 .diagnostic
                 .as_ref()
-                .map_or_else(DiagnosticContext::default, |diagnostic| {
+                .map_or_else(PartialContext::default, |diagnostic| {
                     diagnostic.context.clone()
                 });
-            (Diagnostic::new(context, Cause::Cancelled), Some(output))
+            (
+                PartialDiagnostic::new(context, Cause::Cancelled),
+                Some(output),
+            )
         }
     };
     diagnostic.cause = Cause::Cancelled;
-    if diagnostic.context.effects == Effects::Unknown {
-        diagnostic.context.effects = Effects::MayHaveExecuted;
-    }
-    Err(ToolError::from_diagnostic(diagnostic, output.map(Box::new)))
+    let diagnostic = diagnostic.or(PartialContext::default().effects(Effects::MayHaveExecuted));
+    Err(ToolError::from_facts(diagnostic, output))
 }
 
 #[cfg(test)]
@@ -312,8 +304,8 @@ mod tests {
         use crate::tool::diagnostic::{Cause, Effects, Operation, Subject};
 
         for error in [
-            ToolError::Cancelled,
-            ToolError::Failed("transport closed".into()),
+            ToolError::cancelled(),
+            ToolError::failed("transport closed"),
         ] {
             let error = error
                 .operation(Operation::Receive, Subject::Process)
@@ -336,15 +328,15 @@ mod tests {
 
         let runtime = crate::tests::TestRuntime::new().await;
         let (entered, mut started) = tokio::sync::mpsc::unbounded_channel();
-        let mut read_diagnostic =
-            ToolError::source_filesystem_io(std::io::ErrorKind::NotFound.into())
-                .operation(Operation::Read, Subject::path("missing"))
-                .effects(Effects::Unchanged)
-                .diagnostic();
+        let read_facts = ToolError::source_filesystem_io(std::io::ErrorKind::NotFound.into())
+            .operation(Operation::Read, Subject::path("missing"))
+            .effects(Effects::Unchanged)
+            .into_facts()
+            .0;
         let output = ToolOutput::new(serde_json::json!({
             "kind":"error", "path":"missing", "error":{"code":"not_found", "message":""}
         }))
-        .with_diagnostic(read_diagnostic.clone());
+        .with_diagnostic(read_facts.clone());
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register_dynamic(
@@ -381,8 +373,14 @@ mod tests {
             .unwrap()
             .unwrap_err();
         let (diagnostic, output) = error.into_tool_error().into_parts();
-        read_diagnostic.context.site =
-            FailureSite::Execution(ExecutionLocation::root(runtime.root.path().to_owned()));
+        // The dispatch boundary binds the site the read left unset.
+        let read_diagnostic = read_facts
+            .or(
+                PartialContext::default().at(FailureSite::Execution(ExecutionLocation::root(
+                    runtime.root.path().to_owned(),
+                ))),
+            )
+            .resolve();
         assert_eq!(diagnostic.cause, Cause::Cancelled);
         assert_eq!(diagnostic.context, read_diagnostic.context);
 

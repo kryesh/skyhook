@@ -7,15 +7,16 @@ use crate::{
     execution::ExecutionLocation,
     job::CancellationToken,
     remote::SensitivePromptHandler,
-    target::TargetDefinition,
+    target::{TargetDefinition, TargetName},
     tool::{
         ToolContext, ToolOutput,
         authorization::AuthorizationCoordinator,
-        diagnostic::{DiagnosticContext, Effects, FailureSite, Operation, Subject},
+        diagnostic::{Effects, FailureSite, Operation, PartialContext, Subject},
     },
 };
 
 use crate::remote::{
+    ProtocolError,
     manager::RemoteError,
     protocol::{
         PromptId, RemoteToolResult, Request, RequestId, Response, read_frame, spawn_owned_write,
@@ -83,7 +84,7 @@ impl PooledConnection {
             drop(state);
             drop(writer);
             let failure = transport_error(
-                RemoteError::Protocol("request ID space exhausted".into()),
+                ProtocolError::Violation("request ID space exhausted"),
                 Operation::Send,
             );
             fail_connection(&self.state, failure.clone()).await;
@@ -107,15 +108,14 @@ impl PooledConnection {
         if let Err(error) = spawn_owned_write(writer, request).await {
             let failure = transport_error(error, Operation::Send);
             fail_connection(&self.state, failure.clone()).await;
-            return Err(failure
-                .fallback_context(DiagnosticContext::default().effects(Effects::MayHaveExecuted)));
+            return Err(failure.or(PartialContext::default().effects(Effects::MayHaveExecuted)));
         }
         Ok(())
     }
 
     pub(in crate::remote) async fn from_transport(
         transport: crate::remote::transport::Transport,
-        target: &str,
+        target: &TargetName,
         authorization: AuthorizationCoordinator,
         prompts: Arc<dyn SensitivePromptHandler>,
         tasks: &tokio_util::task::TaskTracker,
@@ -138,7 +138,7 @@ impl PooledConnection {
             Some(Response::Ready)
         ) {
             return Err(not_started(transport_error(
-                RemoteError::Protocol("invalid shim handshake".into()),
+                ProtocolError::Violation("invalid shim handshake"),
                 Operation::Receive,
             )));
         }
@@ -149,7 +149,7 @@ impl PooledConnection {
         }));
         let reader_state = state.clone();
         let reader_writer = writer.clone();
-        let reader_target = target.to_owned();
+        let reader_target = target.clone();
         let reader_shutdown = shutdown.clone();
         tasks.spawn(async move {
             route_responses(
@@ -206,10 +206,10 @@ async fn call_tool(
     let received = async {
         receiver.await.map_err(|_| {
             transport_error(
-                RemoteError::Protocol("remote response dispatcher stopped unexpectedly".to_owned()),
+                ProtocolError::Violation("remote response dispatcher stopped unexpectedly"),
                 Operation::Receive,
             )
-            .fallback_context(DiagnosticContext::default().effects(Effects::MayHaveExecuted))
+            .or(PartialContext::default().effects(Effects::MayHaveExecuted))
         })?
     };
     tokio::pin!(received);
@@ -234,8 +234,10 @@ async fn send_cancel(
 }
 
 fn not_started(error: RemoteError) -> RemoteError {
-    let (mut diagnostic, output) = error.into_tool_error().into_parts();
-    diagnostic.context.effects = Effects::NotStarted;
+    let (diagnostic, output) = error
+        .into_tool_error()
+        .effects(Effects::NotStarted)
+        .into_facts();
     RemoteError::Remote {
         diagnostic: Box::new(diagnostic),
         output: output.map(Box::new),
@@ -243,8 +245,8 @@ fn not_started(error: RemoteError) -> RemoteError {
 }
 
 fn transport_error(error: impl Into<RemoteError>, operation: Operation) -> RemoteError {
-    error.into().fallback_context(
-        DiagnosticContext::new(operation, Subject::Label("remote transport".into()))
+    error.into().or(
+        PartialContext::new(operation, Subject::Label("remote transport".into()))
             .at(FailureSite::Host),
     )
 }
@@ -259,7 +261,7 @@ async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
     for pending in pending.into_values() {
         let _ = pending.sender.send(Err(failure
             .clone()
-            .fallback_context(DiagnosticContext::default().effects(Effects::MayHaveExecuted))));
+            .or(PartialContext::default().effects(Effects::MayHaveExecuted))));
     }
 }
 
@@ -293,7 +295,10 @@ impl PooledConnection {
 pub(in crate::remote) mod tests {
     use super::*;
     use crate::job::CancellationToken;
-    use crate::tool::policy::{AllowAll, Capability};
+    use crate::tool::{
+        authorization::AuthorizationError,
+        policy::{AllowAll, Capability},
+    };
 
     /// A live fake shim transport for manager/router tests, including the real handshake.
     pub(crate) fn test_transport(
@@ -477,7 +482,7 @@ pub(in crate::remote) mod tests {
             output,
             state,
             (&writer, &allow_all()),
-            target.into(),
+            target.parse().unwrap(),
             prompts,
             CancellationToken::new(),
             Box::new(()),
@@ -501,34 +506,35 @@ pub(in crate::remote) mod tests {
             &context,
             context.execution_location().clone(),
         );
-        let inspect = async {
-            let Request::Tool {
-                request_id,
-                capabilities,
-                ..
-            } = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap()
-            else {
-                panic!("expected tool request")
+        let inspect =
+            async {
+                let Request::Tool {
+                    request_id,
+                    capabilities,
+                    ..
+                } = read_frame::<_, Request>(&mut peer).await.unwrap().unwrap()
+                else {
+                    panic!("expected tool request")
+                };
+                assert_eq!(
+                    capabilities,
+                    context.capabilities().iter().collect::<Vec<_>>()
+                );
+                assert!(!capabilities.contains(&Capability::Interactive));
+                assert!(!capabilities.contains(&Capability::Read));
+                let pending = connection
+                    .state
+                    .lock()
+                    .await
+                    .pending
+                    .remove(&request_id)
+                    .unwrap();
+                let _ = pending.sender.send(Err(RemoteError::Authorization(
+                    AuthorizationError::Denied("fixture".into()),
+                )));
             };
-            assert_eq!(
-                capabilities,
-                context.capabilities().iter().collect::<Vec<_>>()
-            );
-            assert!(!capabilities.contains(&Capability::Interactive));
-            assert!(!capabilities.contains(&Capability::Read));
-            let pending = connection
-                .state
-                .lock()
-                .await
-                .pending
-                .remove(&request_id)
-                .unwrap();
-            let _ = pending
-                .sender
-                .send(Err(RemoteError::ApprovalDenied("fixture".into())));
-        };
         let (result, ()) = tokio::join!(call, inspect);
-        assert!(matches!(result, Err(RemoteError::ApprovalDenied(_))));
+        assert!(matches!(result, Err(RemoteError::Authorization(_))));
     }
 
     #[tokio::test]

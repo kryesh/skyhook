@@ -148,7 +148,7 @@ mod tests {
     use super::*;
 
     fn context() -> ContextId {
-        ContextId::from("session")
+        "session".parse::<ContextId>().unwrap()
     }
     use crate::provider::backends::common::{
         replay as scoped_replay,
@@ -421,9 +421,8 @@ mod tests {
 
     #[test]
     fn runtime_tail_joins_the_final_tool_output_or_user_turn() {
-        let state = Message::User(vec![UserContent::Runtime {
-            text: "<skyhook_state>".into(),
-        }]);
+        let text = "<skyhook_state>";
+        let state = Message::User(vec![UserContent::Runtime { text: text.into() }]);
         let mut req = request("gpt-5");
         req.history = vec![tool_result(json!(1), vec![], false)];
         let without_tail = encode(&req, &context()).unwrap()["input"].take();
@@ -431,12 +430,12 @@ mod tests {
         let input = encode(&req, &context()).unwrap()["input"].take();
         assert_eq!(input.as_array().unwrap().len(), 1);
         let output = without_tail[0]["output"].as_str().unwrap();
-        assert_eq!(input[0]["output"], format!("{output}\n\n<skyhook_state>"));
+        assert_eq!(input[0]["output"], format!("{output}\n\n{text}"));
         req.history = vec![user("hi")];
         let input = encode(&req, &context()).unwrap()["input"].take();
         assert_eq!(
             input,
-            json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":"<skyhook_state>"}]}])
+            json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":text}]}])
         );
     }
 }

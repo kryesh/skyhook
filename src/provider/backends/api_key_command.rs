@@ -182,7 +182,12 @@ mod tests {
                     ))
                     .unwrap();
                 let mut contexts: Vec<_> = (0..8)
-                    .map(|i| provider.clone().open_context(i.to_string().into()).unwrap())
+                    .map(|i| {
+                        provider
+                            .clone()
+                            .open_context(i.to_string().parse().unwrap())
+                            .unwrap()
+                    })
                     .collect();
                 // Neither unpolled nor invalid invocations run the command.
                 drop(contexts[0].invoke(request()));
@@ -199,9 +204,9 @@ mod tests {
                         .map(|context| context.invoke(request()).into_future());
                     drop(futures_util::future::join_all(calls).await);
                     // Newly opened contexts reuse cached success.
-                    let mut later = provider.open_context("later".into()).unwrap();
+                    let mut later = provider.open_context("later".parse().unwrap()).unwrap();
                     drop(later.invoke(request()).next().await);
-                    let mut direct = direct.open_context("direct".into()).unwrap();
+                    let mut direct = direct.open_context("direct".parse().unwrap()).unwrap();
                     drop(direct.invoke(request()).next().await);
                 };
                 let ((), headers) = tokio::join!(invoke, capture(&listener, 10));
@@ -257,7 +262,7 @@ mod tests {
                 let provider = provider(protocol, "http://127.0.0.1:1/v1", None)
                     .with_api_key_command(command)
                     .unwrap();
-                let mut context = provider.open_context("test".into()).unwrap();
+                let mut context = provider.open_context("test".parse().unwrap()).unwrap();
                 let Some(Err(error)) = context.invoke(request()).next().await else {
                     panic!("failed command unexpectedly invoked HTTP")
                 };
@@ -298,7 +303,7 @@ mod tests {
             ))
             .unwrap();
         let run = async {
-            let mut context = provider.open_context("cancelled".into()).unwrap();
+            let mut context = provider.open_context("cancelled".parse().unwrap()).unwrap();
             let mut pending = context.invoke(request());
             let pid = tokio::select! {
                 _ = pending.next() => panic!("command should still be running"),
@@ -331,7 +336,10 @@ mod tests {
                     .get()
                     .is_none()
             );
-            let mut retry = provider.clone().open_context("retry".into()).unwrap();
+            let mut retry = provider
+                .clone()
+                .open_context("retry".parse().unwrap())
+                .unwrap();
             let (result, headers) =
                 tokio::join!(retry.invoke(request()).into_future(), capture(&listener, 1));
             drop(result);

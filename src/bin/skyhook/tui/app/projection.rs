@@ -100,10 +100,10 @@ impl App {
     }
     /// The root's turn ended, or is held, interrupted: nothing more to interrupt.
     pub(super) fn root_interrupted(&self) -> bool {
-        matches!(
-            self.snapshot.activity.get(self.root_agent()),
-            Some(AgentActivity::Interrupted | AgentActivity::Failed(_))
-        )
+        self.snapshot
+            .activity
+            .get(self.root_agent())
+            .is_some_and(AgentActivity::is_retryable)
     }
 
     pub fn busy(&self) -> bool {
@@ -112,16 +112,11 @@ impl App {
             || self.operation
             || self.snapshot.revision < self.queue_activity_revision
             || self.queue.iter().any(|input| input.in_flight.is_some())
-            || matches!(
-                self.snapshot.activity.get(self.root_agent()),
-                Some(
-                    AgentActivity::Working
-                        | AgentActivity::Reconnecting { .. }
-                        | AgentActivity::Tools
-                        | AgentActivity::Compacting
-                        | AgentActivity::WaitingChildren
-                )
-            )
+            || self
+                .snapshot
+                .activity
+                .get(self.root_agent())
+                .is_some_and(AgentActivity::is_busy)
     }
     pub(super) fn active_work(&self) -> bool {
         self.busy()

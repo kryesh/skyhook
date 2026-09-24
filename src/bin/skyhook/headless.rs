@@ -1,28 +1,33 @@
 //! A single root operation with journaled diagnostics and deterministic cleanup.
 use super::{
-    cli::{ExecutionRequest, InitialInput},
-    launch::{self, Launch},
+    cli::{BatchRequest, InitialInput, PermissionArgs},
+    launch::{self, Launch, Permissions},
 };
 use skyhook::agent::SessionHandle;
 use std::io::{self, Write};
 
 pub async fn run(
-    request: ExecutionRequest,
+    request: BatchRequest,
     input: InitialInput,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let BatchRequest {
+        execution: request,
+        permissions,
+    } = request;
     let config = launch::load_config(&request.config, false).await?;
     // Model memory is shared with terminal launches, but UI settings are never read.
     let (saved, state_warning) = super::tui::state::load(&request.config.workspace);
     let model = launch::select_model(&config, request.model.as_deref(), saved.model.as_deref())?;
-    let launch = Launch::from_request(&request, model, None).await?;
+    // A named mode also applies to a resumed session, from this prompt on.
+    let mode = match &permissions {
+        PermissionArgs::Mode(Some(mode)) => Some(mode.clone()),
+        _ => None,
+    };
+    let permissions = Permissions::for_batch(&permissions, request.resume.is_some(), &config)?;
+    let launch = Launch::from_request(&request, model, permissions, None).await?;
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    // A named mode also applies to a resumed session, from this prompt on.
-    let mode = match &request.permissions {
-        super::cli::PermissionArgs::Mode(Some(_)) => launch.mode().map(str::to_owned),
-        _ => None,
-    };
     if request.resume.is_some() && mode.is_some() && matches!(input, InitialInput::Script(_)) {
         return Err(
             "--mode changes a resumed session with its next prompt; a script has none".into(),
@@ -112,15 +117,11 @@ async fn run_input(
         }
         InitialInput::Prompt { text, images } => {
             let attachments = launch::read_images(workspace, &images).await?;
+            let selection = session
+                .selection(None, mode.as_deref())
+                .map_err(|error| error.to_string())?;
             session
-                .prompt_with_options(
-                    text,
-                    &attachments,
-                    skyhook::agent::PromptOptions {
-                        mode,
-                        ..Default::default()
-                    },
-                )
+                .prompt_with_options(text, &attachments, selection)
                 .await
                 .map_err(|error| error.to_string())?;
         }

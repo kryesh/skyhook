@@ -12,21 +12,24 @@ use crate::{
     provider::{
         Provider, ProviderContext,
         profile::{ModelProfile, StateMode},
-        protocol::{ContextId, HistoryLifetime, Message, ModelRequest, Usage, UserContent},
+        protocol::{ContextId, HistoryLifetime, ModelRequest, Usage},
     },
-    session::{EventRecord, ModelRequestTemplate, SessionEvent, project_history},
+    session::{
+        EventRecord, Message, ModelRequestTemplate, Projection, RecordSeq, SessionEvent, UserPart,
+        project_history,
+    },
 };
 
 pub(super) struct AgentContext {
     pub profile: ModelProfile,
     pub template: ModelRequestTemplate,
-    pub projected: Vec<(u64, Message)>,
+    pub projected: Projection,
     pub meter: TokenMeter,
     pub provider: Box<dyn ProviderContext>,
     /// Pinned tools the live registry no longer provides as journaled.
     pub unavailable_tools: std::sync::Arc<std::collections::HashSet<String>>,
     /// The last journal sequence reflected in `projected`.
-    through: u64,
+    through: RecordSeq,
     /// Checkpoint and retained messages, which precede later commits in `projected`.
     prefix: usize,
     /// Occupancy at which a summary last failed to shrink the context.
@@ -42,7 +45,7 @@ impl AgentContext {
         records: &[EventRecord],
         restore_meter: bool,
     ) -> Result<Self, HarnessError> {
-        let projected = project_history(records, agent)?;
+        let projected = project_history(records, agent);
         let provider = factory.open_context(ContextId::from(agent))?;
         let meter = if restore_meter {
             TokenMeter::restore(records, agent)
@@ -52,12 +55,14 @@ impl AgentContext {
         Ok(Self {
             profile,
             template,
-            prefix: history_prefix(&projected, records, agent),
+            prefix: history_prefix(&projected.messages, records, agent),
             projected,
             meter,
             provider,
             unavailable_tools: Default::default(),
-            through: records.last().map_or(0, |record| record.sequence),
+            through: records
+                .last()
+                .map_or(RecordSeq::default(), |record| record.sequence),
             skipped_at: None,
         })
     }
@@ -87,39 +92,43 @@ impl AgentContext {
             .await;
         if compacted {
             let records = store.records().await;
-            self.projected = project_history(&records, agent)?;
-            self.prefix = history_prefix(&self.projected, &records, agent);
+            self.projected = project_history(&records, agent);
+            self.prefix = history_prefix(&self.projected.messages, &records, agent);
             self.skipped_at = None;
-            self.through = records.last().map_or(0, |record| record.sequence);
+            self.through = records
+                .last()
+                .map_or(RecordSeq::default(), |record| record.sequence);
             return Ok(());
         }
         // The turn pushes its own commits as it makes them; other producers'
         // commits interleave, so later history is kept in journal order.
-        let suffix = &self.projected[self.prefix..];
+        let suffix = &self.projected.messages[self.prefix..];
         let known: std::collections::HashSet<_> =
             suffix.iter().map(|(sequence, _)| *sequence).collect();
         for (sequence, message) in committed {
             if !known.contains(&sequence) && !message.is_content_free() {
-                self.projected.push((sequence, message));
+                self.projected.messages.push((sequence, message));
             }
         }
-        self.projected[self.prefix..].sort_by_key(|(sequence, _)| *sequence);
+        self.projected.messages[self.prefix..].sort_by_key(|(sequence, _)| *sequence);
         self.through = through;
         Ok(())
     }
 
-    /// Build the next agent request: projected history, then runtime state as tail unless the
-    /// state mode is none.
-    pub fn request(&self, runtime: UserContent) -> ModelRequest {
+    /// The request's tail: the runtime state, unless the profile's state mode omits
+    /// it. A persisting profile commits it to history instead, before the request.
+    pub fn tail(&self, runtime: UserPart) -> Option<Message> {
+        match self.profile.state_mode {
+            StateMode::None => None,
+            StateMode::Dynamic | StateMode::Persist => Some(Message::User(vec![runtime])),
+        }
+    }
+
+    /// The next request as the provider receives it: projected history, then the tail.
+    pub fn request(&self, tail: Option<&Message>) -> ModelRequest {
         ModelRequest {
-            history: crate::session::merge_tool_results(
-                self.projected.iter().map(|(_, message)| message.clone()),
-            ),
-            // The caller commits persisted state to history before sending.
-            tail: match self.profile.state_mode {
-                StateMode::None => Vec::new(),
-                StateMode::Dynamic | StateMode::Persist => vec![Message::User(vec![runtime])],
-            },
+            history: crate::session::render_history(self.projected.history()),
+            tail: tail.map(Message::render).into_iter().collect(),
             ..self.template.to_request()
         }
     }
@@ -143,11 +152,11 @@ impl AgentContext {
 
     /// A mode switch invalidates bound reasoning in the history before it.
     pub fn strip_bound_reasoning(&mut self) {
-        let later = self.projected.split_off(self.prefix);
+        let later = self.projected.messages.split_off(self.prefix);
         let kept = later
             .into_iter()
             .filter_map(|(sequence, message)| Some((sequence, message.without_bound_reasoning()?)));
-        self.projected.extend(kept);
+        self.projected.messages.extend(kept);
     }
 
     fn reaches_compaction(&self, tokens: u64) -> bool {
@@ -156,6 +165,7 @@ impl AgentContext {
 
     pub fn contains_images(&self) -> bool {
         self.projected
+            .messages
             .iter()
             .any(|(_, message)| super::contains_images(std::slice::from_ref(message)))
     }
@@ -167,7 +177,11 @@ fn occupancy(usage: Usage) -> u64 {
 }
 
 /// The projected checkpoint and the retained messages at or before its frontier.
-fn history_prefix(projected: &[(u64, Message)], records: &[EventRecord], agent: &AgentId) -> usize {
+fn history_prefix(
+    projected: &[(RecordSeq, Message)],
+    records: &[EventRecord],
+    agent: &AgentId,
+) -> usize {
     let frontier = records.iter().rev().find_map(|record| match &record.event {
         SessionEvent::Compaction { checkpoint } if &record.agent == agent => {
             Some(checkpoint.frontier)
@@ -204,15 +218,12 @@ pub(in crate::agent) fn recorded_context(
     for (agent, capacity) in capacities {
         let Some(mut request) = records.iter().rev().find_map(|record| {
             if &record.agent == agent
-                && matches!(
-                    record.event,
-                    SessionEvent::ModelRequested {
-                        purpose: crate::session::ModelPurpose::Agent,
-                        ..
-                    }
-                )
+                && crate::session::request_context(record, |sequence| {
+                    crate::session::record_at(records, sequence)
+                })
+                .is_some_and(|context| context.purpose == crate::session::ModelPurpose::Agent)
             {
-                crate::session::reconstruct_model_request(records, record.sequence)
+                crate::session::reconstruct_model_request(records, record.sequence.request())
                     .ok()
                     .map(|(_, request)| request)
             } else {
@@ -226,12 +237,9 @@ pub(in crate::agent) fn recorded_context(
         request.history.clear();
         request.history_lifetime = HistoryLifetime::default();
         let meter = TokenMeter::restore(records, agent);
-        let Ok(history) = crate::session::project_history(records, agent) else {
-            continue;
-        };
         let current = ModelRequest {
-            history: crate::session::merge_tool_results(
-                history.into_iter().map(|(_, message)| message),
+            history: crate::session::render_history(
+                crate::session::project_history(records, agent).history(),
             ),
             tail,
             ..request
@@ -304,11 +312,11 @@ mod tests {
     impl ProviderContext for Context {
         fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
             let blocks = request.messages().rev().flat_map(|message| match message {
-                Message::User(blocks) => blocks.as_slice(),
+                crate::provider::protocol::Message::User(blocks) => blocks.as_slice(),
                 _ => &[],
             });
             let mut texts = blocks.filter_map(|block| match block {
-                UserContent::Text { text } => Some(text.as_str()),
+                crate::provider::protocol::UserContent::Text { text } => Some(text.as_str()),
                 _ => None,
             });
             let block = texts.next() == Some("block");
@@ -334,16 +342,8 @@ mod tests {
     fn test_context(capacity: u64, max_output: u64) -> super::AgentContext {
         let profile = ModelProfile::new("test", "test", None, capacity, max_output, false);
         let request = ModelRequest {
-            model: profile.model.clone(),
-            system: vec![],
-            history: Vec::new(),
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
-            tools: vec![],
-            response_schema: None,
-            reasoning: None,
             max_output_tokens: Some(max_output),
-            blobs: Default::default(),
+            ..ModelRequest::test(&profile.model)
         };
         let provider = Box::new(Context {
             tracking: Arc::new(Tracking::default()),
@@ -352,11 +352,11 @@ mod tests {
         super::AgentContext {
             profile,
             template: request.try_into().unwrap(),
-            projected: vec![],
+            projected: crate::session::Projection::default(),
             meter: super::TokenMeter::default(),
             provider,
             unavailable_tools: Default::default(),
-            through: 0,
+            through: RecordSeq::default(),
             prefix: 0,
             skipped_at: None,
         }
@@ -367,7 +367,7 @@ mod tests {
         let mut context = test_context(128_000, 1_000);
         let request = |context: &super::AgentContext| {
             let text = "x".repeat(40_000);
-            context.request(UserContent::Runtime { text })
+            context.request(context.tail(UserPart::Text { text }).as_ref())
         };
         let raw = context.meter.estimate(&request(&context));
         for actual in [raw / 2, raw * 3] {
@@ -378,12 +378,13 @@ mod tests {
             assert_eq!(context.meter.estimate(&request(&context)), actual);
             // New history is scaled by the same ratio.
             let text = "y".repeat(80_000);
-            context.projected = vec![(1, Message::User(vec![UserContent::Text { text }]))];
+            context.projected.messages =
+                vec![(1.into(), Message::User(vec![UserPart::Text { text }]))];
             let grown = super::super::compaction::estimate_request(&request(&context));
             let expected = u128::from(grown) * u128::from(actual) / u128::from(raw);
             let found = context.meter.estimate(&request(&context));
             assert_eq!(u128::from(found), expected);
-            context.projected.clear();
+            context.projected.messages.clear();
         }
     }
 
@@ -469,7 +470,7 @@ mod tests {
             let sender = session.runtime.spawn_agent(launch).await.unwrap();
             tracking.fail_all_calls.store(fail, Ordering::SeqCst);
             let (done, received) = oneshot::channel();
-            let content = vec![UserContent::Text {
+            let content = vec![UserPart::Text {
                 text: "block".into(),
             }];
             let input = AgentCommand::Input {

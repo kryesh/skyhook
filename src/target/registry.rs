@@ -9,56 +9,68 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use super::{SshOptions, TargetConfig, TargetType};
-use crate::tool::{
-    AdmissionError,
-    diagnostic::{Operation, Subject},
-    policy::{Capability, CapabilitySet},
+use super::{SshAuth, SshOptions, TargetConfig, TargetName, TargetRef, Transport};
+use crate::{
+    named_enum::named_enum,
+    tool::{
+        AdmissionError,
+        diagnostic::{Operation, Subject},
+        policy::{Capability, CapabilitySet},
+    },
 };
 
-pub const ROOT_TARGET: &str = "root";
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum TargetSource {
-    Builtin,
-    Config,
-    Session,
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+    pub enum TargetSource {
+        Builtin = "builtin",
+        Config = "config",
+        Session = "session",
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct TargetDefinition {
-    pub name: String,
-    pub r#type: TargetType,
+    pub name: TargetName,
     pub host: String,
     pub ssh: SshOptions,
     pub workspace: PathBuf,
     /// A native jump (ProxyJump) within the SSH connection `origin` starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub via: Option<String>,
+    pub via: Option<TargetName>,
     /// The target whose shim starts the SSH connection; `None` is root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub origin: Option<String>,
+    pub origin: Option<TargetName>,
     pub source: TargetSource,
     pub revision: u64,
 }
 
 impl TargetDefinition {
-    pub fn from_config(
-        name: String,
-        config: TargetConfig,
-        source: TargetSource,
-    ) -> Result<Self, TargetError> {
+    /// A configured definition; the registry stamps session-added ones when it
+    /// installs them.
+    pub fn from_config(name: String, config: TargetConfig) -> Result<Self, TargetError> {
+        let Transport::Ssh = config.r#type;
+        let link = |edge, link: Option<String>| {
+            link.map(|link| {
+                TargetRef::try_from(link).map_err(|_| TargetError::InvalidReference { edge })
+            })
+            .transpose()
+        };
+        // `origin: root` spells the default; a jump through root is no route.
+        let origin =
+            link(TargetEdge::Origin, config.origin)?.and_then(|origin| origin.name().cloned());
+        let via = match link(TargetEdge::Via, config.via)? {
+            Some(TargetRef::Root) => return Err(TargetError::RootCannotBeJump),
+            via => via.and_then(|via| via.name().cloned()),
+        };
         let definition = Self {
-            name,
-            r#type: config.r#type.into(),
+            name: TargetName::try_from(name)?,
             host: config.host,
             ssh: config.ssh,
             workspace: config.workspace,
-            via: config.via,
-            origin: config.origin.filter(|origin| origin != ROOT_TARGET),
-            source,
+            via,
+            origin,
+            source: TargetSource::Config,
             revision: 1,
         };
         definition.validate()?;
@@ -66,35 +78,21 @@ impl TargetDefinition {
     }
 
     /// The previous target in this target's route: its jump, otherwise its origin.
-    pub fn parent(&self) -> Option<&str> {
+    pub fn parent(&self) -> Option<&TargetName> {
         self.parent_edge().map(|(_, name)| name)
     }
 
-    pub(crate) fn parent_edge(&self) -> Option<(TargetEdge, &str)> {
+    pub(crate) fn parent_edge(&self) -> Option<(TargetEdge, &TargetName)> {
         self.via
-            .as_deref()
+            .as_ref()
             .map(|name| (TargetEdge::Via, name))
-            .or_else(|| {
-                self.origin
-                    .as_deref()
-                    .map(|name| (TargetEdge::Origin, name))
-            })
+            .or_else(|| self.origin.as_ref().map(|name| (TargetEdge::Origin, name)))
     }
 
     pub(crate) fn validate(&self) -> Result<(), TargetError> {
-        validate_name(&self.name)?;
-        if self.r#type != TargetType::Ssh {
-            return Err(TargetError::BuiltinOnly);
-        }
         validate_endpoint(&self.host, self.ssh.user.as_deref())?;
-        if [&self.via, &self.origin]
-            .into_iter()
-            .any(|link| link.as_deref() == Some(ROOT_TARGET))
-        {
-            return Err(TargetError::RootCannotBeJump);
-        }
         if self.via.is_some() && self.via == self.origin {
-            return Err(TargetError::ViaIsOrigin(self.name.clone()));
+            return Err(TargetError::ViaIsOrigin(self.name.to_string()));
         }
         for (key, value) in &self.ssh.options {
             crate::remote::ssh::validate_option(key, value)?;
@@ -102,7 +100,7 @@ impl TargetDefinition {
         let proxy_command =
             (self.ssh.options.keys()).any(|key| key.eq_ignore_ascii_case("proxycommand"));
         if proxy_command && self.via.is_some() {
-            return Err(TargetError::ProxyCommandWithVia(self.name.clone()));
+            return Err(TargetError::ProxyCommandWithVia(self.name.to_string()));
         }
         Ok(())
     }
@@ -112,40 +110,40 @@ impl TargetDefinition {
         Self::from_config(
             name.to_owned(),
             TargetConfig {
-                r#type: super::TargetConfigType::Ssh,
+                r#type: Transport::Ssh,
                 host: format!("{name}.example.com"),
                 ssh: SshOptions::default(),
                 workspace: workspace.into(),
                 via: via.map(str::to_owned),
                 origin: None,
             },
-            TargetSource::Config,
         )
         .unwrap()
     }
 }
 
-#[derive(Clone, Debug, JsonSchema, Serialize, PartialEq, Eq)]
-pub struct TargetRecord {
-    pub name: String,
-    /// local identifies the Skyhook session host; ssh identifies a remote target.
-    pub r#type: TargetType,
-    pub source: TargetSource,
-    pub host: String,
-    pub user: Option<String>,
-    pub port: Option<u16>,
-    pub workspace: PathBuf,
-    pub via: Option<String>,
-    pub origin: Option<String>,
-    pub auth: &'static str,
-    pub external_agent: bool,
+/// A listed target without its key path: the session host, or an SSH target.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TargetRecord {
+    Root,
+    Ssh {
+        name: TargetName,
+        source: TargetSource,
+        host: String,
+        user: Option<String>,
+        port: Option<u16>,
+        workspace: PathBuf,
+        via: Option<TargetName>,
+        origin: Option<TargetName>,
+        auth: SshAuth,
+        external_agent: bool,
+    },
 }
 
 impl From<&TargetDefinition> for TargetRecord {
     fn from(value: &TargetDefinition) -> Self {
-        Self {
+        Self::Ssh {
             name: value.name.clone(),
-            r#type: value.r#type,
             source: value.source,
             host: value.host.clone(),
             user: value.ssh.user.clone(),
@@ -161,7 +159,7 @@ impl From<&TargetDefinition> for TargetRecord {
 
 #[derive(Clone, Default)]
 pub struct TargetRegistry {
-    entries: Arc<RwLock<BTreeMap<String, TargetDefinition>>>,
+    entries: Arc<RwLock<BTreeMap<TargetName, TargetDefinition>>>,
     /// Serializes updates from preparation through publication, so readers only
     /// wait for the in-memory install, never for the journal append.
     updates: Arc<tokio::sync::Mutex<()>>,
@@ -188,42 +186,27 @@ impl TargetRegistry {
         let visible = |target: &&TargetDefinition| {
             capabilities.contains(Capability::SshAgent) || !needs_ssh_agent(&entries, &target.name)
         };
-        let mut records = vec![TargetRecord {
-            name: ROOT_TARGET.to_owned(),
-            r#type: TargetType::Local,
-            source: TargetSource::Builtin,
-            host: "localhost".to_owned(),
-            user: None,
-            port: None,
-            workspace: PathBuf::from("."),
-            via: None,
-            origin: None,
-            auth: "local",
-            external_agent: false,
-        }];
-        records.extend(entries.values().filter(visible).map(TargetRecord::from));
-        records
+        std::iter::once(TargetRecord::Root)
+            .chain(entries.values().filter(visible).map(TargetRecord::from))
+            .collect()
     }
 
     /// Whether reaching `name` forwards an agent Skyhook does not own. Such targets
     /// are invisible to callers without the ssh_agent capability.
-    pub async fn needs_ssh_agent(&self, name: &str) -> bool {
+    pub async fn needs_ssh_agent(&self, name: &TargetName) -> bool {
         needs_ssh_agent(&*self.entries.read().await, name)
     }
 
-    pub async fn get(&self, name: &str) -> Result<TargetDefinition, TargetError> {
-        if name == ROOT_TARGET {
-            return Err(TargetError::RootIsLocal);
-        }
+    pub async fn get(&self, name: &TargetName) -> Result<TargetDefinition, TargetError> {
         self.entries
             .read()
             .await
             .get(name)
             .cloned()
-            .ok_or_else(|| TargetError::Unknown(name.to_owned()))
+            .ok_or_else(|| TargetError::Unknown(name.to_string()))
     }
 
-    pub async fn route(&self, name: &str) -> Result<Vec<TargetDefinition>, TargetError> {
+    pub async fn route(&self, name: &TargetName) -> Result<Vec<TargetDefinition>, TargetError> {
         let entries = self.entries.read().await;
         let mut route = walk_route(&entries, name)?
             .into_iter()
@@ -240,7 +223,7 @@ impl TargetRegistry {
     pub async fn upsert_many(
         &self,
         definitions: Vec<TargetDefinition>,
-    ) -> Result<(Vec<TargetDefinition>, Vec<String>), TargetError> {
+    ) -> Result<(Vec<TargetDefinition>, Vec<TargetName>), TargetError> {
         Ok(self.prepare_upsert_many(definitions).await?.publish().await)
     }
 
@@ -285,10 +268,10 @@ impl TargetRegistry {
 /// must retain this value until its corresponding live publication completes.
 pub(super) struct PreparedTargetUpdate {
     _update: tokio::sync::OwnedMutexGuard<()>,
-    entries: Arc<RwLock<BTreeMap<String, TargetDefinition>>>,
-    next: BTreeMap<String, TargetDefinition>,
+    entries: Arc<RwLock<BTreeMap<TargetName, TargetDefinition>>>,
+    next: BTreeMap<TargetName, TargetDefinition>,
     saved: Vec<TargetDefinition>,
-    invalidated: Vec<String>,
+    invalidated: Vec<TargetName>,
 }
 
 impl PreparedTargetUpdate {
@@ -296,42 +279,48 @@ impl PreparedTargetUpdate {
         &self.saved
     }
 
-    pub(super) async fn publish(self) -> (Vec<TargetDefinition>, Vec<String>) {
+    pub(super) async fn publish(self) -> (Vec<TargetDefinition>, Vec<TargetName>) {
         *self.entries.write().await = self.next;
         (self.saved, self.invalidated)
     }
 }
 
-fn needs_ssh_agent(entries: &BTreeMap<String, TargetDefinition>, name: &str) -> bool {
+fn needs_ssh_agent(entries: &BTreeMap<TargetName, TargetDefinition>, name: &TargetName) -> bool {
     walk_route(entries, name).is_ok_and(|route| route.iter().any(|hop| hop.ssh.external_agent))
 }
 
-fn dependants(entries: &BTreeMap<String, TargetDefinition>, changed: &str) -> Vec<String> {
+fn dependants(
+    entries: &BTreeMap<TargetName, TargetDefinition>,
+    changed: &TargetName,
+) -> Vec<TargetName> {
     entries
         .keys()
         .filter(|name| {
             walk_route(entries, name)
-                .is_ok_and(|route| route.iter().any(|target| target.name == changed))
+                .is_ok_and(|route| route.iter().any(|target| &target.name == changed))
         })
         .cloned()
         .collect()
 }
 
-fn validate_graph(entries: &BTreeMap<String, TargetDefinition>) -> Result<(), TargetError> {
+fn validate_graph(entries: &BTreeMap<TargetName, TargetDefinition>) -> Result<(), TargetError> {
+    let origin_of = |target: &TargetDefinition| {
+        (target.origin.clone()).map_or(TargetRef::Root, TargetRef::Named)
+    };
     for (name, target) in entries {
         let route = walk_route(entries, name)?;
         target.validate()?;
         // Jumps belong to the connection their origin starts, so a jump's key paths
         // and agent are never reinterpreted on another machine. The origin ends the
         // chain: jumps without via link to it.
-        let origin = target.origin.as_deref();
-        for jump in (route.iter().skip(1)).take_while(|hop| Some(hop.name.as_str()) != origin) {
+        let origin = target.origin.as_ref();
+        for jump in (route.iter().skip(1)).take_while(|hop| Some(&hop.name) != origin) {
             if jump.origin != target.origin {
                 return Err(TargetError::OriginMismatch {
-                    target: name.clone(),
-                    jump: jump.name.clone(),
-                    origin: origin.unwrap_or(ROOT_TARGET).to_owned(),
-                    jump_origin: jump.origin.as_deref().unwrap_or(ROOT_TARGET).to_owned(),
+                    target: name.to_string(),
+                    jump: jump.name.to_string(),
+                    origin: origin_of(target).to_string(),
+                    jump_origin: origin_of(jump).to_string(),
                 });
             }
         }
@@ -341,7 +330,7 @@ fn validate_graph(entries: &BTreeMap<String, TargetDefinition>) -> Result<(), Ta
 
 /// Validate known route edges while permitting references supplied at runtime.
 pub(super) fn validate_route_cycles(
-    entries: &BTreeMap<String, TargetDefinition>,
+    entries: &BTreeMap<TargetName, TargetDefinition>,
 ) -> Result<(), TargetError> {
     for name in entries.keys() {
         walk_partial_route(entries, name, MissingReference::Allow)?;
@@ -355,15 +344,15 @@ enum MissingReference {
 }
 
 fn walk_route<'a>(
-    entries: &'a BTreeMap<String, TargetDefinition>,
-    name: &str,
+    entries: &'a BTreeMap<TargetName, TargetDefinition>,
+    name: &TargetName,
 ) -> Result<Vec<&'a TargetDefinition>, TargetError> {
     walk_partial_route(entries, name, MissingReference::Reject)
 }
 
 fn walk_partial_route<'a>(
-    entries: &'a BTreeMap<String, TargetDefinition>,
-    name: &str,
+    entries: &'a BTreeMap<TargetName, TargetDefinition>,
+    name: &TargetName,
     missing: MissingReference,
 ) -> Result<Vec<&'a TargetDefinition>, TargetError> {
     let mut route = Vec::new();
@@ -371,11 +360,11 @@ fn walk_partial_route<'a>(
     let mut visited = BTreeSet::new();
     loop {
         if !visited.insert(current) {
-            return Err(TargetError::Cycle(current.to_owned()));
+            return Err(TargetError::Cycle(current.to_string()));
         }
         let Some(target) = entries.get(current) else {
             return match missing {
-                MissingReference::Reject => Err(TargetError::Unknown(current.to_owned())),
+                MissingReference::Reject => Err(TargetError::Unknown(current.to_string())),
                 MissingReference::Allow => Ok(route),
             };
         };
@@ -386,31 +375,14 @@ fn walk_partial_route<'a>(
         if !entries.contains_key(parent) {
             return match missing {
                 MissingReference::Reject => Err(TargetError::UnknownReference {
-                    target: target.name.clone(),
+                    target: target.name.to_string(),
                     edge,
-                    reference: parent.to_owned(),
+                    reference: parent.to_string(),
                 }),
                 MissingReference::Allow => Ok(route),
             };
         }
-        // Validated definitions never link to root.
         current = parent;
-    }
-}
-
-fn validate_name(name: &str) -> Result<(), TargetError> {
-    if name == ROOT_TARGET {
-        return Err(TargetError::ReservedName);
-    }
-    let valid = !name.is_empty()
-        && name.len() <= 128
-        && name
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
-    if valid {
-        Ok(())
-    } else {
-        Err(TargetError::InvalidName(name.to_owned()))
     }
 }
 
@@ -448,8 +420,6 @@ impl std::fmt::Display for TargetEdge {
 
 #[derive(Clone, Debug, Error)]
 pub enum TargetError {
-    #[error("only the session host root may use type = local; named targets require type = ssh")]
-    BuiltinOnly,
     #[error("target name `root` is reserved for the Skyhook session host; choose a different name")]
     ReservedName,
     #[error("invalid target name `{0}`")]
@@ -485,6 +455,8 @@ pub enum TargetError {
     InvalidUser,
     #[error("unknown target `{0}`")]
     Unknown(String),
+    #[error("invalid {edge} target name")]
+    InvalidReference { edge: TargetEdge },
     #[error("target `{target}` references unknown {edge} target `{reference}`")]
     UnknownReference {
         target: String,
@@ -493,8 +465,6 @@ pub enum TargetError {
     },
     #[error("target route contains a cycle at `{0}`")]
     Cycle(String),
-    #[error("`root` identifies the Skyhook session host")]
-    RootIsLocal,
     #[error("`root` cannot be used as a jump target")]
     RootCannotBeJump,
 }
@@ -505,7 +475,6 @@ impl TargetError {
     pub(crate) fn into_admission_error(self) -> AdmissionError {
         let argument = |name: &str| Subject::argument(name.split('.'));
         let (subject, reason) = match &self {
-            Self::BuiltinOnly => (argument("type"), None),
             Self::ReservedName => (argument("name"), None),
             Self::InvalidName(_) => (
                 argument("name"),
@@ -531,7 +500,7 @@ impl TargetError {
                 Some("SSH option value cannot contain control characters"),
             ),
             Self::DedicatedSshOption(_, field) => {
-                return AdmissionError::invalid(format!(
+                return AdmissionError::invalid_arguments(format!(
                     "SSH option must be set through the {field} field, not ssh.options"
                 ))
                 .operation(Operation::Validate, argument("ssh.options"));
@@ -553,6 +522,7 @@ impl TargetError {
             ),
             Self::InvalidUser => (argument("ssh.user"), None),
             Self::Unknown(_) => (argument("target"), Some("unknown target")),
+            Self::InvalidReference { edge } => (argument(&edge.to_string()), None),
             Self::UnknownReference { edge, .. } => match edge {
                 TargetEdge::Origin => (argument("origin"), Some("unknown origin target")),
                 TargetEdge::Via => (argument("via"), Some("unknown jump target")),
@@ -561,11 +531,10 @@ impl TargetError {
                 Subject::Label("target route".into()),
                 Some("target route contains a cycle"),
             ),
-            Self::RootIsLocal => (argument("target"), None),
             Self::RootCannotBeJump => (argument("via"), None),
         };
         // Variants without a payload render nothing private.
-        AdmissionError::invalid(reason.map_or_else(|| self.to_string(), str::to_owned))
+        AdmissionError::invalid_arguments(reason.map_or_else(|| self.to_string(), str::to_owned))
             .operation(Operation::Validate, subject)
     }
 }
@@ -578,6 +547,10 @@ mod tests {
         TargetDefinition::test(name, ".", via)
     }
 
+    fn name(name: &str) -> TargetName {
+        name.parse().unwrap()
+    }
+
     #[tokio::test]
     async fn routes_are_outermost_first_and_cycles_are_rejected() {
         let registry = TargetRegistry::from_definitions([
@@ -586,7 +559,7 @@ mod tests {
             target("build", Some("bastion")),
         ])
         .unwrap();
-        let route = registry.route("build").await.unwrap();
+        let route = registry.route(&name("build")).await.unwrap();
         let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
         assert_eq!(names, ["edge", "bastion", "build"]);
         let mut changed = target("edge", Some("build"));
@@ -602,20 +575,7 @@ mod tests {
         let (saved, _) = registry.upsert_many(batch).await.unwrap();
         let revisions: Vec<_> = saved.iter().map(|target| target.revision).collect();
         assert_eq!(revisions, [1, 2]);
-        assert_eq!(registry.get("build").await.unwrap().revision, 2);
-    }
-
-    #[tokio::test]
-    async fn records_redact_key_paths() {
-        let mut value = target("build", None);
-        value.ssh.auth = super::super::TargetAuth::Key {
-            path: PathBuf::from("secret-key"),
-        };
-        let registry = TargetRegistry::from_definitions([value]).unwrap();
-        let records = registry.list(&CapabilitySet::default()).await;
-        let json = serde_json::to_string(&records).unwrap();
-        assert!(!json.contains("secret-key"));
-        assert!(json.contains("\"auth\":\"key\""));
+        assert_eq!(registry.get(&name("build")).await.unwrap().revision, 2);
     }
 
     #[test]
@@ -658,8 +618,8 @@ mod tests {
         for edge in [TargetEdge::Via, TargetEdge::Origin] {
             let mut invalid = target("invalid", None);
             match edge {
-                TargetEdge::Via => invalid.via = Some("missing".into()),
-                TargetEdge::Origin => invalid.origin = Some("missing".into()),
+                TargetEdge::Via => invalid.via = Some(name("missing")),
+                TargetEdge::Origin => invalid.origin = Some(name("missing")),
             }
             let result = registry
                 .upsert_many(vec![target("added", None), invalid])
@@ -672,7 +632,7 @@ mod tests {
             assert_eq!(registry.definitions().await, before);
         }
         assert!(
-            matches!(registry.route("absent").await, Err(TargetError::Unknown(name)) if name == "absent")
+            matches!(registry.route(&name("absent")).await, Err(TargetError::Unknown(unknown)) if unknown == "absent")
         );
     }
 
@@ -680,7 +640,7 @@ mod tests {
     async fn jumps_share_the_origin_that_starts_their_connection() {
         let shim = target("shim", None);
         let mut jump = target("jump", None);
-        jump.origin = Some("shim".into());
+        jump.origin = Some(name("shim"));
         let mut destination = target("destination", Some("jump"));
         let mismatched = [shim.clone(), jump.clone(), destination.clone()];
         assert!(matches!(
@@ -689,24 +649,48 @@ mod tests {
         ));
         // A jump reached from root cannot continue a connection started on shim.
         let mut remote = target("remote", Some("root-jump"));
-        remote.origin = Some("shim".into());
+        remote.origin = Some(name("shim"));
         let mismatched = [shim.clone(), target("root-jump", None), remote];
         assert!(matches!(
             TargetRegistry::from_definitions(mismatched),
-            Err(TargetError::OriginMismatch { jump_origin, .. }) if jump_origin == ROOT_TARGET
+            Err(TargetError::OriginMismatch { jump_origin, .. }) if jump_origin == "root"
         ));
-        destination.origin = Some("shim".into());
+        destination.origin = Some(name("shim"));
         // Origins nest: deep's connection starts on destination, itself reached from shim.
         let mut deep = target("deep", None);
-        deep.origin = Some("destination".into());
+        deep.origin = Some(name("destination"));
         let registry = TargetRegistry::from_definitions([shim, jump, destination, deep]).unwrap();
-        let route = registry.route("deep").await.unwrap();
+        let route = registry.route(&name("deep")).await.unwrap();
         let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
         assert_eq!(names, ["shim", "jump", "destination", "deep"]);
-        let config =
-            serde_json::json!({"type": "ssh", "host": "h", "via": "shim", "origin": "shim"});
-        let config = serde_json::from_value(config).unwrap();
-        let via_origin = TargetDefinition::from_config("h".into(), config, TargetSource::Config);
+        let from_config = |config: serde_json::Value| {
+            let config = serde_json::from_value(config).unwrap();
+            TargetDefinition::from_config("h".into(), config)
+        };
+        let via_origin = from_config(
+            serde_json::json!({"type": "ssh", "host": "h", "via": "shim", "origin": "shim"}),
+        );
         assert!(matches!(via_origin, Err(TargetError::ViaIsOrigin(_))));
+        // `origin: root` spells the default; root is never a jump.
+        let from_root =
+            from_config(serde_json::json!({"type": "ssh", "host": "h", "origin": "root"}));
+        assert_eq!(from_root.unwrap().origin, None);
+        let via_root = from_config(serde_json::json!({"type": "ssh", "host": "h", "via": "root"}));
+        assert!(matches!(via_root, Err(TargetError::RootCannotBeJump)));
+        // A bad link is the link's fault, not the valid name's.
+        for edge in [TargetEdge::Origin, TargetEdge::Via] {
+            let bad = from_config(
+                serde_json::json!({"type": "ssh", "host": "h", edge.to_string(): "bad target"}),
+            );
+            let error = bad.unwrap_err();
+            assert!(
+                matches!(error, TargetError::InvalidReference { edge: found } if found == edge)
+            );
+            let diagnostic = error.into_admission_error().diagnostic();
+            assert_eq!(
+                diagnostic.context.subject,
+                Subject::argument([edge.to_string()])
+            );
+        }
     }
 }

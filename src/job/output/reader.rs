@@ -216,7 +216,7 @@ impl Seek for CaptureReader {
 
 fn check_cancelled(cancellation: &super::super::CancellationToken) -> Result<(), ToolError> {
     if cancellation.is_cancelled() {
-        Err(ToolError::Cancelled)
+        Err(ToolError::cancelled())
     } else {
         Ok(())
     }
@@ -242,7 +242,7 @@ fn response(
     next: Option<(usize, usize)>,
 ) -> OutputPreview {
     OutputPreview {
-        field: selection.field.clone(),
+        field: selection.field.to_string(),
         lines,
         total_lines: total,
         next_start: next.map(|(start, _)| start),
@@ -251,8 +251,8 @@ fn response(
 }
 
 fn invalid_offset() -> ToolError {
-    ToolError::InvalidArguments(
-        "offset must be within the starting line at a UTF-8 character boundary".into(),
+    ToolError::invalid_arguments(
+        "offset must be within the starting line at a UTF-8 character boundary",
     )
 }
 
@@ -382,10 +382,10 @@ pub(super) fn page(
         let valid = match std::str::from_utf8(&raw) {
             Ok(_) => raw.len(),
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => return Err(ToolError::Failed("saved output is not UTF-8".into())),
+            Err(_) => return Err(ToolError::failed("saved output is not UTF-8")),
         };
         if terminal && full && valid < raw.len() {
-            return Err(ToolError::Failed("saved output is not UTF-8".into()));
+            return Err(ToolError::failed("saved output is not UTF-8"));
         }
         // A live trailing CR may become part of CRLF. Keep the returned offset
         // valid if the LF arrives between requests.
@@ -473,15 +473,15 @@ fn search(
         while lookahead.len() <= selection.context {
             let raw = read_piece(&mut reader, index.bytes, 4 * 1024 * 1024 + 1)?;
             if raw.len() > 4 * 1024 * 1024 {
-                return Err(ToolError::Failed(
-                    "regex source line exceeds 4 MiB; read this field without a pattern".into(),
+                return Err(ToolError::failed(
+                    "regex source line exceeds 4 MiB; read this field without a pattern",
                 ));
             }
             if raw.is_empty() || (!terminal && !raw.ends_with(b"\n")) {
                 break;
             }
             let raw = String::from_utf8(raw)
-                .map_err(|_| ToolError::Failed("saved output is not UTF-8".into()))?;
+                .map_err(|_| ToolError::failed("saved output is not UTF-8"))?;
             let text = raw
                 .strip_suffix('\n')
                 .map(|s| s.strip_suffix('\r').unwrap_or(s))
@@ -489,7 +489,7 @@ fn search(
                 .to_owned();
             let matched = matcher
                 .is_match(text.as_bytes())
-                .map_err(|error| ToolError::Failed(error.to_string()))?;
+                .map_err(ToolError::failed)?;
             lookahead.push_back((text, matched));
         }
         if lookahead.is_empty() {
@@ -556,7 +556,7 @@ mod tests {
 
     fn selection(start: usize, offset: usize) -> Selection {
         Selection {
-            field: "/result/stdout".into(),
+            field: "/result/stdout".parse().unwrap(),
             matcher: None,
             context: 0,
             start,

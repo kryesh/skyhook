@@ -11,7 +11,7 @@ pub(super) struct ActiveObservation {
 /// Neither half can be installed separately by the event loop.
 pub struct PreparedObservation {
     pub(super) active: ActiveObservation,
-    snapshot: ObservationSnapshot,
+    pub(super) snapshot: ObservationSnapshot,
 }
 impl PreparedObservation {
     pub async fn subscribe(session: SessionHandle) -> Self {
@@ -28,20 +28,25 @@ impl PreparedObservation {
 
 impl App {
     pub fn session(&self) -> Option<&SessionHandle> {
-        self.observation.as_ref().map(|active| &active.session)
+        match &self.phase {
+            Phase::Open { observation, .. } => Some(&observation.session),
+            Phase::Draft { .. } => None,
+        }
     }
 
-    pub(super) fn install_observation(&mut self, prepared: Option<PreparedObservation>) {
-        let (active, snapshot) = match prepared {
-            Some(PreparedObservation { active, snapshot }) => (Some(active), snapshot),
-            None => (None, ObservationSnapshot::default()),
-        };
-        self.observation = active;
-        self.snapshot = snapshot;
+    /// The draft this session grew out of, whose notices it now owns.
+    pub(super) fn attached_draft(&self) -> Option<&AgentId> {
+        match &self.phase {
+            Phase::Open { attached_draft, .. } => attached_draft.as_ref(),
+            Phase::Draft { .. } => None,
+        }
     }
 
     fn receiver_mut(&mut self) -> Option<&mut broadcast::Receiver<ObservedEvent>> {
-        self.observation.as_mut()?.receiver.as_mut()
+        match &mut self.phase {
+            Phase::Open { observation, .. } => observation.receiver.as_mut(),
+            Phase::Draft { .. } => None,
+        }
     }
 
     pub async fn recv_observation(&mut self) -> Result<ObservedEvent, broadcast::error::RecvError> {
@@ -61,17 +66,18 @@ impl App {
     }
 
     pub fn close_observation(&mut self) {
-        if let Some(active) = &mut self.observation {
-            active.receiver = None;
+        if let Phase::Open { observation, .. } = &mut self.phase {
+            observation.receiver = None;
         }
     }
 
     pub async fn resubscribe(&mut self) {
-        let Some(session) = self.session().cloned() else {
+        let Phase::Open { observation, .. } = &mut self.phase else {
             return;
         };
-        let prepared = PreparedObservation::subscribe(session).await;
-        self.install_observation(Some(prepared));
+        let prepared = PreparedObservation::subscribe(observation.session.clone()).await;
+        *observation = prepared.active;
+        self.snapshot = prepared.snapshot;
         self.reset_projection();
     }
 
@@ -84,6 +90,13 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
+
+    fn replace_receiver(app: &mut App, receiver: broadcast::Receiver<ObservedEvent>) {
+        let Phase::Open { observation, .. } = &mut app.phase else {
+            panic!("fixture has a session");
+        };
+        observation.receiver = Some(receiver);
+    }
 
     fn has_status(app: &App, text: &str) -> bool {
         let mut records = app.snapshot.records.values();
@@ -98,7 +111,7 @@ mod tests {
         let session = app.session().unwrap().clone();
         let root = session.root_agent().clone();
         let (sender, receiver) = broadcast::channel(1);
-        app.observation.as_mut().unwrap().receiver = Some(receiver);
+        replace_receiver(&mut app, receiver);
         drop(sender);
         let closed = app.recv_observation().await;
         assert!(matches!(closed, Err(broadcast::error::RecvError::Closed)));
@@ -124,7 +137,7 @@ mod tests {
         let (sender, receiver) = broadcast::channel(1);
         sender.send(event.clone()).unwrap();
         sender.send(event).unwrap();
-        app.observation.as_mut().unwrap().receiver = Some(receiver);
+        replace_receiver(&mut app, receiver);
         let lagged = app.recv_observation().await;
         assert!(matches!(
             lagged,

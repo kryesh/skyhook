@@ -6,21 +6,21 @@ use crate::{
     remote::{PreparedConnection, RemoteError, RemoteManager},
     tool::{
         authorization::{AuthorizationCoordinator, AuthorizationSubject},
-        diagnostic::{DiagnosticContext, Effects, FailureSite, Operation, Subject},
+        diagnostic::{Effects, FailureSite, Operation, PartialContext, Subject},
         policy::{ApprovalGrant, Capability, CapabilitySet, PermissionUse, ResourceId},
     },
 };
 
-use super::{TargetDefinition, TargetError, TargetRegistry};
+use super::{TargetDefinition, TargetError, TargetName, TargetRegistry};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RouteIdentity {
-    destination: String,
+    destination: TargetName,
     pub hops: Vec<(String, u64)>,
 }
 
 impl RouteIdentity {
-    pub fn destination(&self) -> &str {
+    pub fn destination(&self) -> &TargetName {
         &self.destination
     }
 }
@@ -38,7 +38,7 @@ impl ResolvedRoute {
         let destination = definitions.last()?.name.clone();
         let hops = definitions
             .iter()
-            .map(|hop| (hop.name.clone(), hop.revision))
+            .map(|hop| (hop.name.to_string(), hop.revision))
             .collect();
         Some(Self {
             identity: RouteIdentity { destination, hops },
@@ -64,7 +64,7 @@ impl ResolvedRoute {
     /// forwards an agent Skyhook does not own.
     pub fn permissions(&self) -> Vec<PermissionUse> {
         let resource = ResourceId::route(
-            self.identity.destination.clone(),
+            self.identity.destination.to_string(),
             self.identity.hops.clone(),
         );
         let external = self.definitions.iter().any(|hop| hop.ssh.external_agent);
@@ -88,7 +88,6 @@ impl ResolvedRoute {
         };
         serde_json::json!({
             "destination": destination.name,
-            "type": destination.r#type,
             "host": destination.host,
             "origin": destination.origin,
             "route": names(false),
@@ -121,20 +120,7 @@ impl TargetRouter {
                 arguments,
             )
             .await
-            .map_err(|error| match error {
-                crate::tool::authorization::AuthorizationError::Cancelled => {
-                    crate::tool::ToolError::Cancelled
-                }
-                crate::tool::authorization::AuthorizationError::Denied(reason) => {
-                    crate::tool::ToolError::Denied(reason)
-                }
-                crate::tool::authorization::AuthorizationError::Unavailable => {
-                    crate::tool::ToolError::Denied("required capability is unavailable".into())
-                }
-                error => {
-                    crate::tool::ToolError::Failed(RemoteError::authorization(error).to_string())
-                }
-            })
+            .map_err(|error| crate::tool::AdmissionError::from(error).into())
     }
 
     pub fn new(
@@ -175,15 +161,17 @@ impl TargetRouter {
         // keeps the registry unchanged until staging.
         if !subject.capabilities.contains(Capability::SshAgent) {
             if self.targets.needs_ssh_agent(&definition.name).await {
-                return Err(rejected(TargetError::NameUnavailable(definition.name)));
+                return Err(rejected(TargetError::NameUnavailable(
+                    definition.name.to_string(),
+                )));
             }
             if let Some((edge, parent)) = definition.parent_edge()
                 && self.targets.needs_ssh_agent(parent).await
             {
                 return Err(rejected(TargetError::UnknownReference {
-                    target: definition.name.clone(),
+                    target: definition.name.to_string(),
                     edge,
-                    reference: parent.to_owned(),
+                    reference: parent.to_string(),
                 }));
             }
         }
@@ -231,7 +219,7 @@ impl TargetRouter {
                 .authorization
                 .revoke(|grant| {
                     matches!(&grant.resource, ResourceId::Route { destination, .. }
-                        if invalidated.contains(destination))
+                        if invalidated.iter().any(|name| name.as_str() == destination))
                 })
                 .await;
             router.remote.invalidate(&invalidated).await;
@@ -240,7 +228,7 @@ impl TargetRouter {
         .await
         .map_err(|_| {
             registration_error(
-                RemoteError::Protocol("target publication owner lost".into()),
+                RemoteError::ConnectionTask("target publication owner lost".into()),
                 Operation::Wait,
                 Effects::MayHaveExecuted,
             )
@@ -255,14 +243,14 @@ impl TargetRouter {
     /// route forwards an external agent is unknown.
     pub async fn resolve(
         &self,
-        target: &str,
+        target: &TargetName,
         capabilities: &CapabilitySet,
     ) -> Result<ResolvedRoute, TargetError> {
         let definitions = self.targets.route(target).await?;
         if !capabilities.contains(Capability::SshAgent)
             && definitions.iter().any(|hop| hop.ssh.external_agent)
         {
-            return Err(TargetError::Unknown(target.to_owned()));
+            return Err(TargetError::Unknown(target.to_string()));
         }
         // Successful registry resolution always includes the requested destination.
         Ok(ResolvedRoute::from_definitions(definitions)
@@ -298,8 +286,7 @@ impl TargetRouter {
                     route.permissions(),
                     route.authorization_arguments(),
                 )
-                .await
-                .map_err(RemoteError::authorization)?;
+                .await?;
         }
     }
 }
@@ -311,8 +298,8 @@ fn registration_error(
     operation: Operation,
     effects: Effects,
 ) -> RemoteError {
-    error.into().fallback_context(
-        DiagnosticContext::new(operation, Subject::Label("target registration".into()))
+    error.into().or(
+        PartialContext::new(operation, Subject::Label("target registration".into()))
             .at(FailureSite::Host)
             .effects(effects),
     )
@@ -334,8 +321,9 @@ mod tests {
         },
         session::{AppendBoundary, SessionStore},
         tests::RecordingPolicy,
+        tool::authorization::AuthorizationError,
         tool::{
-            diagnostic::{Cause, Diagnostic},
+            diagnostic::{Cause, PartialDiagnostic},
             policy::PolicyDecision,
         },
     };
@@ -374,6 +362,10 @@ mod tests {
         TargetDefinition::test(name, format!("/{name}"), via)
     }
 
+    fn name(name: &str) -> TargetName {
+        name.parse().unwrap()
+    }
+
     fn registry(targets: &[(&str, Option<&str>)]) -> TargetRegistry {
         TargetRegistry::from_definitions(targets.iter().map(|(name, via)| target(name, *via)))
             .unwrap()
@@ -389,7 +381,7 @@ mod tests {
         let route = ResolvedRoute::from_definitions(definitions.clone()).unwrap();
         assert_eq!(route.definitions(), definitions.as_slice());
         assert_eq!(route.destination(), &definitions[1]);
-        assert_eq!(route.identity.destination(), "build");
+        assert_eq!(route.identity.destination(), &name("build"));
         let hops = vec![("gateway".into(), 7), ("build".into(), 19)];
         assert_eq!(route.identity.hops, hops);
         let resource = ResourceId::route("build", hops);
@@ -420,29 +412,29 @@ mod tests {
         let without = CapabilitySet::default();
         let mut with = without.clone();
         with.insert(Capability::SshAgent);
-        for name in ["external", "behind"] {
-            let hidden = router.resolve(name, &without).await;
-            assert!(matches!(hidden, Err(TargetError::Unknown(_))), "{name}");
-            router.resolve(name, &with).await.unwrap();
+        for hidden in ["external", "behind"] {
+            let resolved = router.resolve(&name(hidden), &without).await;
+            assert!(matches!(resolved, Err(TargetError::Unknown(_))), "{hidden}");
+            router.resolve(&name(hidden), &with).await.unwrap();
         }
-        let names = |records: Vec<crate::target::TargetRecord>| {
+        let listed = |records: Vec<crate::target::TargetRecord>| {
             records
                 .into_iter()
-                .map(|record| record.name)
+                .map(|record| match record {
+                    crate::target::TargetRecord::Root => "root".to_owned(),
+                    crate::target::TargetRecord::Ssh { name, .. } => name.to_string(),
+                })
                 .collect::<Vec<_>>()
         };
-        assert_eq!(
-            names(router.targets.list(&without).await),
-            [crate::target::ROOT_TARGET]
-        );
-        assert_eq!(names(router.targets.list(&with).await).len(), 3);
+        assert_eq!(listed(router.targets.list(&without).await), ["root"]);
+        assert_eq!(listed(router.targets.list(&with).await).len(), 3);
         // Hidden targets can be neither replaced nor routed through.
         let (_directory, store) = ephemeral_store().await;
         let subject = subject_for(&store);
         let mut via = target("new", None);
-        via.via = Some("behind".into());
+        via.via = Some(name("behind"));
         let mut origin = target("new", None);
-        origin.origin = Some("behind".into());
+        origin.origin = Some(name("behind"));
         for (definition, argument) in [
             (target("external", None), "name"),
             (via, "via"),
@@ -506,7 +498,7 @@ mod tests {
         subject: &AuthorizationSubject,
     ) -> Result<PreparedConnection, RemoteError> {
         let route = router
-            .resolve("build", &CapabilitySet::default())
+            .resolve(&name("build"), &CapabilitySet::default())
             .await
             .unwrap();
         approve(router, &route, subject).await?;
@@ -526,7 +518,7 @@ mod tests {
             permissions,
             arguments,
         );
-        authorize.await.map_err(RemoteError::authorization)
+        Ok(authorize.await?)
     }
 
     fn spawn_prepare(
@@ -544,18 +536,18 @@ mod tests {
         let router = router(targets, policy.clone(), None);
         let subject = subject();
         let original = router
-            .resolve("build", &CapabilitySet::default())
+            .resolve(&name("build"), &CapabilitySet::default())
             .await
             .unwrap();
         assert!(matches!(
             approve(&router, &original, &subject).await,
-            Err(RemoteError::ApprovalDenied(reason)) if reason.contains("no")
+            Err(RemoteError::Authorization(AuthorizationError::Denied(reason))) if reason.contains("no")
         ));
         approve(&router, &original, &subject).await.unwrap();
 
         replace_target(&router, target("gateway", None)).await;
         let changed = router
-            .resolve("build", &CapabilitySet::default())
+            .resolve(&name("build"), &CapabilitySet::default())
             .await
             .unwrap();
         assert_ne!(original.identity(), changed.identity());
@@ -572,7 +564,7 @@ mod tests {
             Some(factory.clone()),
         );
         let admitted = router
-            .resolve("build", &CapabilitySet::default())
+            .resolve(&name("build"), &CapabilitySet::default())
             .await
             .unwrap();
         factory.ready.add_permits(1);
@@ -581,7 +573,7 @@ mod tests {
 
         replace_target(&router, target("build", None)).await;
         let current = router
-            .resolve("build", &CapabilitySet::default())
+            .resolve(&name("build"), &CapabilitySet::default())
             .await
             .unwrap();
         assert_ne!(admitted.identity(), current.identity());
@@ -605,7 +597,7 @@ mod tests {
         );
         let subject = subject();
         let route = router
-            .resolve("build", &CapabilitySet::default())
+            .resolve(&name("build"), &CapabilitySet::default())
             .await
             .unwrap();
         approve(&router, &route, &subject).await.unwrap();
@@ -616,7 +608,7 @@ mod tests {
             .await;
         assert_eq!(policy.requests.lock().unwrap().len(), 1);
         assert!(matches!(approve(&router, &route, &subject).await,
-            Err(RemoteError::ApprovalDenied(reason)) if reason == "revoked"));
+            Err(RemoteError::Authorization(AuthorizationError::Denied(reason))) if reason == "revoked"));
         drop(prepared.unwrap());
         router.shutdown().await;
     }
@@ -682,7 +674,7 @@ mod tests {
             assert!(!shutdown.is_finished(), "shutdown must drain publication");
             resume.send(()).unwrap();
             shutdown.await.unwrap();
-            let saved = targets.get("build").await.unwrap();
+            let saved = targets.get(&name("build")).await.unwrap();
             assert_eq!(saved.revision, 2);
             let records = store.records().await;
             assert!(matches!(&records.last().unwrap().event,
@@ -711,7 +703,7 @@ mod tests {
         assert_eq!(diagnostic.cause, Cause::Cancelled);
         assert_eq!(diagnostic.context.site, FailureSite::Host);
         assert_eq!(diagnostic.context.effects, Effects::Unchanged);
-        assert!(router.targets.get("cancelled").await.is_err());
+        assert!(router.targets.get(&name("cancelled")).await.is_err());
         assert_eq!(factory.starts.load(Ordering::SeqCst), 0);
         router.shutdown().await;
     }
@@ -733,7 +725,7 @@ mod tests {
             assert_eq!(diagnostic.context.operation, Operation::Save);
             // No live publication occurred, but persistence may have committed.
             assert_eq!(diagnostic.context.effects, Effects::Unknown);
-            assert_eq!(targets.get("build").await.unwrap(), original);
+            assert_eq!(targets.get(&name("build")).await.unwrap(), original);
             assert!(router.mutation.try_write().is_ok());
             let recovery = match store.drain().await {
                 Err(crate::session::SessionError::AppendUnavailable(recovery)) => recovery,
@@ -743,8 +735,10 @@ mod tests {
             assert!(!recovery.reason.is_empty());
             assert_eq!(
                 diagnostic.cause,
-                Diagnostic::session(&crate::session::SessionError::AppendIndeterminate(recovery))
-                    .cause
+                PartialDiagnostic::session(&crate::session::SessionError::AppendIndeterminate(
+                    recovery
+                ))
+                .cause
             );
             router.shutdown().await;
         }
@@ -760,7 +754,7 @@ mod tests {
         let diagnostic = error.into_tool_error().diagnostic();
         assert_eq!(
             diagnostic.cause,
-            Diagnostic::session(&crate::session::SessionError::WrongSession).cause
+            PartialDiagnostic::session(&crate::session::SessionError::WrongSession).cause
         );
         assert_eq!(diagnostic.context.operation, Operation::Save);
         assert_eq!(diagnostic.context.site, FailureSite::Host);

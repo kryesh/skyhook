@@ -13,6 +13,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::named_enum::named_enum;
+
 pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_IMAGES_PER_SUBMISSION: usize = 8;
 pub const MAX_IMAGE_BYTES_PER_SUBMISSION: u64 = 32 * 1024 * 1024;
@@ -94,19 +96,18 @@ pub enum MediaError {
     Allocation(#[source] std::collections::TryReserveError),
 }
 
-/// A supported image encoding, identified from the image bytes themselves.
-#[derive(
-    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
-)]
-pub enum ImageFormat {
-    #[serde(rename = "image/png")]
-    Png,
-    #[serde(rename = "image/jpeg")]
-    Jpeg,
-    #[serde(rename = "image/gif")]
-    Gif,
-    #[serde(rename = "image/webp")]
-    WebP,
+named_enum! {
+    /// A supported image encoding, identified from the image bytes themselves and
+    /// spelled as its media type.
+    #[derive(
+        Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+    )]
+    pub enum ImageFormat {
+        Png = "image/png",
+        Jpeg = "image/jpeg",
+        Gif = "image/gif",
+        WebP = "image/webp",
+    }
 }
 
 impl ImageFormat {
@@ -125,11 +126,16 @@ impl ImageFormat {
     }
 
     pub const fn media_type(self) -> &'static str {
+        self.as_str()
+    }
+
+    /// The conventional file extension for names shown to the model.
+    pub const fn extension(self) -> &'static str {
         match self {
-            Self::Png => "image/png",
-            Self::Jpeg => "image/jpeg",
-            Self::Gif => "image/gif",
-            Self::WebP => "image/webp",
+            Self::Png => "png",
+            Self::Jpeg => "jpg",
+            Self::Gif => "gif",
+            Self::WebP => "webp",
         }
     }
 }
@@ -373,10 +379,6 @@ mod tests {
             assert_eq!(image.file.as_deref(), Some("shot.png"));
             assert_eq!(image.format, ImageFormat::Png);
             let mut request = ModelRequest {
-                model: "fixture".into(),
-                system: vec![],
-                tail: Vec::new(),
-                history_lifetime: Default::default(),
                 history: vec![
                     Message::User(vec![UserContent::Attachment {
                         attachment: AttachmentRef::Text(text.clone()),
@@ -389,11 +391,7 @@ mod tests {
                         is_error: false,
                     }]),
                 ],
-                tools: vec![],
-                response_schema: None,
-                reasoning: None,
-                max_output_tokens: None,
-                blobs: LoadedBlobs::default(),
+                ..ModelRequest::test("fixture")
             };
             assert!(matches!(
                 request.blobs.get(&image.blob),

@@ -474,11 +474,8 @@ mod tests {
 
     #[test]
     fn runtime_tail_joins_the_final_turn_instead_of_posing_as_the_user() {
-        let state = || {
-            Message::User(vec![UserContent::Runtime {
-                text: "<skyhook_state>".into(),
-            }])
-        };
+        let text = "<skyhook_state>";
+        let state = || Message::User(vec![UserContent::Runtime { text: text.into() }]);
         let call = AssistantItem::tool_call("c", 0, inspect("call", json!({})));
         let result = Message::Tool(vec![ToolResult {
             call_id: "call".into(),
@@ -496,16 +493,16 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0], without_tail["messages"][0]);
         let tool = without_tail["messages"][1]["content"].as_str().unwrap();
-        assert_eq!(messages[1]["content"], format!("{tool}\n\n<skyhook_state>"));
+        assert_eq!(messages[1]["content"], format!("{tool}\n\n{text}"));
         // A user turn gains a part; an instruction or an assistant turn keeps its own message.
         let mut req = request("test-model");
         req.tail = vec![state()];
         let body = encode(&req, ChatReasoningReplay::Unsupported).unwrap();
         assert_eq!(
             body["messages"],
-            json!([{"role":"user","content":"hello\n\n<skyhook_state>"}])
+            json!([{"role":"user","content":format!("hello\n\n{text}")}])
         );
-        req.tail.push(Message::User(vec![UserContent::Compaction {
+        req.tail.push(Message::User(vec![UserContent::Text {
             text: "compact".into(),
         }]));
         let body = encode(&req, ChatReasoningReplay::Unsupported).unwrap();

@@ -1,7 +1,7 @@
 //! Collect job outcomes, import remote payloads, and present execution failures.
 
 use super::*;
-use crate::tool::diagnostic::safe_text;
+use crate::tool::diagnostic::{Diagnostic, safe_text};
 use thiserror::Error;
 
 #[derive(Clone, Copy)]
@@ -29,6 +29,7 @@ impl ToolExecutor {
             .jobs
             .present_output_with(
                 crate::job::output::OutputArgs::new(job),
+                crate::job::CancellationToken::new(),
                 self.diagnostic_viewer(),
                 crate::job::output::OutputOptions::Model {
                     presentation: crate::job::OutputPresentation::Automatic,
@@ -87,7 +88,7 @@ impl ToolExecutor {
         }
         let mut envelope = self.shared.jobs.wait_foreground(job).await?;
         self.shared.jobs.hydrate_envelope(&mut envelope).await?;
-        envelope.render_diagnostics(self.diagnostic_viewer());
+        envelope.render_output_diagnostic(self.diagnostic_viewer());
         if !envelope.state.is_terminal() {
             return Ok(ExecutionResult {
                 job,
@@ -114,7 +115,7 @@ impl ToolExecutor {
             let is_error = envelope.state != JobState::Completed;
             let value = if !is_error && policy == crate::tool::ToolResultPolicy::JobView {
                 envelope.output.take().ok_or_else(|| {
-                    ToolError::Failed("job-output query completed without a response".into())
+                    ToolError::failed("job-output query completed without a response")
                 })?
             } else {
                 envelope
@@ -136,17 +137,15 @@ impl ToolExecutor {
                 output: ToolOutput::new(envelope.output.unwrap_or(Value::Null)).with_images(images),
             })
         } else {
-            let diagnostic = envelope.diagnostic.unwrap_or_else(|| {
-                Diagnostic::new(
-                    DiagnosticContext::default(),
-                    Cause::Message(format!("job ended as {:?}", envelope.state)),
-                )
-            });
-            let output = envelope
-                .output
-                .map(|value| Box::new(ToolOutput::new(value).with_images(images)));
+            let mut failure = envelope.diagnostic.map_or_else(
+                || ToolError::failed(format!("job ended as {:?}", envelope.state)),
+                |diagnostic| ToolError::from_diagnostic(diagnostic, None),
+            );
+            if let Some(value) = envelope.output {
+                failure = failure.with_result(ToolOutput::new(value).with_images(images));
+            }
             Err(ExecutionError::Failure {
-                failure: ToolError::from_diagnostic(diagnostic, output).into_failure(),
+                failure,
                 capabilities: self.capabilities.clone(),
             })
         }
@@ -181,9 +180,9 @@ pub struct ExecutionResult {
 
 #[derive(Debug, Error)]
 pub enum ExecutionError {
-    #[error("{}", failure.diagnostic.render(capabilities))]
+    #[error("{}", failure.diagnostic().render(capabilities))]
     Failure {
-        failure: Box<crate::tool::invocation::OperationFailure<ToolOutput>>,
+        failure: ToolError,
         capabilities: CapabilitySet,
     },
     #[error("unknown tool `{0}`")]
@@ -196,17 +195,12 @@ pub enum ExecutionError {
     ScriptUnavailable(String),
     #[error(transparent)]
     Tool(#[from] ToolError),
-    #[error("tool authorization denied: {0}")]
-    Denied(String),
 }
 
 impl From<JobError> for ExecutionError {
     fn from(error: JobError) -> Self {
         // Job state lives on the session host; the caller names the failed stage.
-        Self::Tool(
-            ToolError::from(error)
-                .fallback_context(DiagnosticContext::default().at(FailureSite::Host)),
-        )
+        Self::Tool(ToolError::from(error).or(PartialContext::default().at(FailureSite::Host)))
     }
 }
 
@@ -229,7 +223,7 @@ impl ExecutionError {
         self,
         tool: &str,
         parent: Option<JobId>,
-        name: Option<&str>,
+        name: Option<crate::tool::registry::JobName>,
         viewer: crate::tool::diagnostic::DiagnosticViewer<'_>,
     ) -> ToolOutput {
         let message = match &self {
@@ -243,7 +237,7 @@ impl ExecutionError {
         let metadata = crate::job::JobMetadata {
             tool: Some(tool.to_owned()),
             parent,
-            name: name.map(str::to_owned),
+            name: name.map(String::from),
             ..Default::default()
         };
         let view = crate::job::JobView::failure(message, value, diagnostic.is_denial(), metadata);
@@ -251,29 +245,23 @@ impl ExecutionError {
     }
 
     pub(crate) fn diagnostic(&self) -> Diagnostic {
+        self.facts().resolve()
+    }
+
+    pub(super) fn facts(&self) -> PartialDiagnostic {
         match self {
-            Self::Failure { failure, .. } => failure.diagnostic.clone(),
-            Self::Tool(error) => error.diagnostic(),
-            Self::Denied(reason) => {
-                Diagnostic::new(DiagnosticContext::default(), Cause::Denied(reason.clone()))
-            }
-            error => Diagnostic::new(
-                DiagnosticContext::default(),
+            Self::Failure { failure, .. } | Self::Tool(failure) => failure.facts().clone(),
+            error => PartialDiagnostic::new(
+                PartialContext::default(),
                 Cause::Message(safe_text(&error.to_string())),
             ),
         }
     }
 
-    /// Complete missing boundary facts; those chosen nearer the failure win.
-    pub(super) fn contextualize(
-        self,
-        fallback: DiagnosticContext,
-        capabilities: &CapabilitySet,
-    ) -> Self {
-        let mut failure = self.into_tool_error().into_failure();
-        failure.diagnostic.context.fallback(fallback);
+    /// Fill the facts still unset; those chosen nearer the failure win.
+    pub(super) fn or(self, fallback: PartialContext, capabilities: &CapabilitySet) -> Self {
         Self::Failure {
-            failure,
+            failure: self.into_tool_error().or(fallback),
             capabilities: capabilities.clone(),
         }
     }
@@ -281,9 +269,8 @@ impl ExecutionError {
     /// Normalize once for tool adapters, preserving typed causes and partial results.
     pub(crate) fn into_tool_error(self) -> ToolError {
         match self {
-            Self::Failure { failure, .. } => ToolError::Failure(failure),
-            Self::Tool(error) => error,
-            error => ToolError::from_diagnostic(error.diagnostic(), None),
+            Self::Failure { failure, .. } | Self::Tool(failure) => failure,
+            error => ToolError::from_facts(error.facts(), None),
         }
     }
 }
@@ -293,7 +280,8 @@ mod tests {
     use super::*;
     use crate::{
         job::{JobRole, JobSpec},
-        provider::protocol::{AssistantItem, Message},
+        provider::protocol::AssistantItem,
+        session::Message,
         tool::ToolRegistryBuilder,
     };
     use serde_json::json;
@@ -348,7 +336,7 @@ mod tests {
         let executor = runtime.executor(builder);
         for location in [
             ExecutionLocation::root(runtime.root.path().to_owned()),
-            ExecutionLocation::named("worker", "/remote".into()),
+            ExecutionLocation::named("worker".parse().unwrap(), "/remote".into()),
         ] {
             let executor = executor.clone().with_location(location.clone());
             let call = |kind, tool: &'static str, args| {
@@ -416,7 +404,7 @@ mod tests {
             .into_response(
                 "missing",
                 Some(JobId::new(7).unwrap()),
-                Some("requested-name"),
+                crate::tool::registry::JobName::try_from("requested-name".to_owned()).ok(),
                 executor.diagnostic_viewer(),
             )
             .value;
@@ -437,7 +425,7 @@ mod tests {
             &runtime,
             JobSpec {
                 background: true,
-                name: Some("fast-job".into()),
+                name: Some("fast-job".parse().unwrap()),
                 ..JobSpec::test(runtime.agent.clone(), "fast")
             },
         )
@@ -483,18 +471,12 @@ mod tests {
                 role: JobRole::Agent,
                 ..JobSpec::test(runtime.agent.clone(), "delegate")
             };
-            let job = created(&runtime, spec).await;
+            let job = runtime.jobs.test_running(spec).await.into_test_id();
             let started = crate::session::fixture::child_started(
-                Some(runtime.agent.clone()),
                 Some(job),
                 ExecutionLocation::root(runtime.root.path().to_owned()),
             );
             runtime.store.append(child.clone(), started).await.unwrap();
-            runtime
-                .jobs
-                .transition(job, JobState::Running)
-                .await
-                .unwrap();
             let text: String = (0..500)
                 .map(|line| format!("child answer line {line}\n"))
                 .collect();
@@ -516,6 +498,7 @@ mod tests {
                     .jobs
                     .present_output_with(
                         crate::job::output::OutputArgs::new(job),
+                        crate::job::CancellationToken::new(),
                         &CapabilitySet::default(),
                         crate::job::output::OutputOptions::Model {
                             presentation: crate::job::OutputPresentation::Automatic,
@@ -523,7 +506,7 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                assert_eq!(notification.view["meta"]["last_message"], sequence);
+                assert_eq!(notification.view()["meta"]["last_message"], json!(sequence));
             }
             let pending = runtime.jobs.pending_delivery(&runtime.agent).await.unwrap();
             if background {

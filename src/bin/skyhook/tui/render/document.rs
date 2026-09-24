@@ -99,14 +99,26 @@ pub(super) fn layout_document_or_plain_with_expansion(
         document.layout_lines(Some(highlights))
     } else {
         debug_assert!(!block && entry.surface != Surface::Reasoning);
-        model::clean(entry.text())
-            .split('\n')
-            .map(|s| {
-                (
-                    Line::from(s.to_owned()),
-                    super::super::tool_view::Wrap::Hard,
-                )
-            })
+        // A running entry leaves its first cells to the spinner: after the
+        // disclosure glyph of a title, or before an untitled body.
+        let title = entry
+            .title()
+            .map(|title| model::clean(&title.line(entry.running)));
+        let gutter = if title.is_none() && entry.running {
+            "  "
+        } else {
+            ""
+        };
+        let body = model::clean(entry.body());
+        let body = (title.is_none() || !body.is_empty()).then_some(body);
+        let body = body.iter().flat_map(|body| body.split('\n')).enumerate();
+        title
+            .into_iter()
+            .chain(body.map(|(index, line)| {
+                let gutter = if index == 0 { gutter } else { "" };
+                format!("{gutter}{line}")
+            }))
+            .map(|line| (Line::from(line), super::super::tool_view::Wrap::Hard))
             .collect()
     };
     let mut rows = Vec::new();
@@ -182,7 +194,7 @@ mod tests {
         let Section::Line(header) = body.sections.remove(0) else {
             panic!("argument fixture starts with its tool header");
         };
-        let mut entry = model::Entry::card(model::EntryKey::Record(1), header, Some(body));
+        let mut entry = model::Entry::card(model::EntryKey::UnsavedStatus(1), header, Some(body));
         entry.default_open = true;
         entry.compact_after = true;
         for width in [0, 1, 2, 8, 12, 40, 120, 24] {
@@ -305,7 +317,7 @@ mod tests {
             Run::new(" · #42", Role::Muted),
         ];
         let text = header_line(&header).to_string();
-        let key = model::EntryKey::Record(1);
+        let key = model::EntryKey::UnsavedStatus(1);
         let entry = model::Entry::card(key.clone(), header.clone(), None);
         assert_eq!(entry.text(), text);
         let expanded = model::Entry::card(key, header, Some(Document::default()));

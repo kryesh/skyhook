@@ -5,12 +5,13 @@ use std::path::{Path, PathBuf};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::target::{ROOT_TARGET, TargetDefinition};
+use crate::target::{TargetDefinition, TargetName, TargetRef};
 
 /// Canonical execution target and workspace.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq, Hash)]
 pub struct ExecutionLocation {
-    pub target: String,
+    #[schemars(with = "String")]
+    pub target: TargetRef,
     #[serde(with = "native_path")]
     #[schemars(with = "String")]
     pub workspace: PathBuf,
@@ -86,29 +87,33 @@ impl ExecutionLocation {
         match selection {
             LocationSelection::Inherit => caller.clone(),
             LocationSelection::Root => Self::root(root_workspace.to_owned()),
-            LocationSelection::Other(target) if target.name == caller.target => caller.clone(),
-            LocationSelection::Other(target) => Self::named(&target.name, target.workspace.clone()),
+            LocationSelection::Other(target) if caller.target.name() == Some(&target.name) => {
+                caller.clone()
+            }
+            LocationSelection::Other(target) => {
+                Self::named(target.name.clone(), target.workspace.clone())
+            }
         }
     }
 
     #[must_use]
     pub fn root(workspace: PathBuf) -> Self {
         Self {
-            target: ROOT_TARGET.to_owned(),
+            target: TargetRef::Root,
             workspace,
         }
     }
 
     #[must_use]
-    pub fn named(target: impl Into<String>, workspace: PathBuf) -> Self {
+    pub fn named(target: TargetName, workspace: PathBuf) -> Self {
         Self {
-            target: target.into(),
+            target: TargetRef::Named(target),
             workspace,
         }
     }
 
     pub fn is_root(&self) -> bool {
-        self.target == ROOT_TARGET
+        self.target == TargetRef::Root
     }
 }
 
@@ -119,7 +124,7 @@ mod tests {
     #[test]
     fn selection_resolves_inherit_root_and_other_targets() {
         let root = Path::new("/root");
-        let build = ExecutionLocation::named("build", "/caller-override".into());
+        let build = ExecutionLocation::named("build".parse().unwrap(), "/caller-override".into());
         let overridden = ExecutionLocation::root("/override".into());
         let current = TargetDefinition::test("build", "/configured", None);
         let other = TargetDefinition::test("other", "relative directory/../project", None);
@@ -141,7 +146,10 @@ mod tests {
             (
                 &build,
                 LocationSelection::Other(&other),
-                ExecutionLocation::named("other", "relative directory/../project".into()),
+                ExecutionLocation::named(
+                    "other".parse().unwrap(),
+                    "relative directory/../project".into(),
+                ),
             ),
         ] {
             assert_eq!(ExecutionLocation::select(caller, root, selection), expected);

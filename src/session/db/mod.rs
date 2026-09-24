@@ -8,6 +8,11 @@ use std::path::Path;
 use futures_util::FutureExt;
 use libsql::{Builder, Connection, OpenFlags, Row, Value};
 
+use crate::{
+    named_enum::{NamedEnum, named_enum},
+    session::{MessageSeq, RecordSeq, RequestSeq},
+};
+
 mod decode;
 mod diagnostic;
 mod encode;
@@ -23,7 +28,7 @@ pub use state::SessionSummary;
 pub(super) use state::{interrupted_work, summary};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 11;
+pub(super) const USER_VERSION: i64 = 12;
 const SCHEMA: &str = include_str!("../schema.sql");
 /// Payload tables outside the append-only ledger: blob writes and output upserts.
 const MUTABLE_TABLES: [&str; 6] = [
@@ -82,6 +87,17 @@ macro_rules! sql_integer {
 }
 sql_integer!(i64, u64, u32, u16, usize);
 
+macro_rules! sql_sequence {
+    ($($type:ty),*) => {$(
+        impl Sql for $type {
+            fn sql(self) -> Value {
+                self.get().sql()
+            }
+        }
+    )*};
+}
+sql_sequence!(RecordSeq, RequestSeq, MessageSeq);
+
 impl Sql for bool {
     fn sql(self) -> Value {
         Value::Integer(i64::from(self))
@@ -127,6 +143,74 @@ impl Sql for Value {
 impl<T: Sql> Sql for Option<T> {
     fn sql(self) -> Value {
         self.map_or(Value::Null, Sql::sql)
+    }
+}
+
+impl<T: NamedEnum> Sql for T {
+    fn sql(self) -> Value {
+        Value::Text(self.as_str().to_owned())
+    }
+}
+
+fn parse_enum<T: NamedEnum>(text: String) -> DbResult<T> {
+    T::parse(&text).ok_or_else(|| {
+        corrupt(format!(
+            "{text:?} is not a {}",
+            std::any::type_name::<T>()
+                .rsplit("::")
+                .next()
+                .unwrap_or_default()
+        ))
+    })
+}
+
+/// Column `index` of `row` as one of `T`'s spellings.
+pub(super) fn enum_column<T: NamedEnum>(row: &Row, index: i32) -> DbResult<T> {
+    parse_enum(row.get::<String>(index)?)
+}
+
+pub(super) fn optional_enum_column<T: NamedEnum>(row: &Row, index: i32) -> DbResult<Option<T>> {
+    row.get::<Option<String>>(index)?
+        .map(parse_enum)
+        .transpose()
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(super) enum MessageRole {
+        User = "user",
+        Assistant = "assistant",
+        Tool = "tool",
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(super) enum UserPartKind {
+        Text = "text",
+        Attachment = "attachment",
+        State = "state",
+        JobEvents = "job_events",
+        ParentInput = "parent_input",
+        Compaction = "compaction",
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(super) enum JobEventKind {
+        Message = "message",
+        Job = "job",
+    }
+}
+
+named_enum! {
+    /// How a completed response ended; `cut` rows also name their `Truncation`.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(super) enum ResponseOutcome {
+        Answer = "answer",
+        ToolUse = "tool_use",
+        Cut = "cut",
     }
 }
 
@@ -318,11 +402,11 @@ mod tests {
     use crate::{
         execution::ExecutionLocation,
         identity::{AgentId, EventId, JobId, SessionId},
-        job::{JobRole, JobState},
+        job::{JobEnd, JobRole, JobState, JobTransition},
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef},
-        provider::protocol::{AssistantItem, Message, ToolCall, ToolResult, UserContent},
+        provider::protocol::{AssistantItem, ToolCall, ToolResult},
         session::{
-            EventRecord, ModelCallOrigin, SessionEvent,
+            EventRecord, Message, ModelCallOrigin, RecordSeq, SessionEvent, UserPart,
             fixture::{child_started, start_events},
         },
     };
@@ -363,14 +447,14 @@ mod tests {
         pub(super) fn commit(
             &mut self,
             events: Vec<(AgentId, SessionEvent)>,
-        ) -> Result<Vec<u64>, super::DbError> {
+        ) -> Result<Vec<RecordSeq>, super::DbError> {
             let first = self.records.len() as u64 + 1;
             let records: Vec<_> = events
                 .into_iter()
                 .enumerate()
                 .map(|(offset, (agent, event))| EventRecord {
                     id: EventId::generate().unwrap(),
-                    sequence: first + offset as u64,
+                    sequence: (first + offset as u64).into(),
                     timestamp_millis: 1_700_000_000_000 + offset as i64,
                     agent,
                     event,
@@ -398,7 +482,7 @@ mod tests {
             root
         }
 
-        pub(super) fn one(&mut self, agent: AgentId, event: SessionEvent) -> u64 {
+        pub(super) fn one(&mut self, agent: AgentId, event: SessionEvent) -> RecordSeq {
             self.commit(vec![(agent, event)]).unwrap()[0]
         }
 
@@ -421,7 +505,7 @@ mod tests {
     }
 
     pub(super) fn user(text: &str) -> Message {
-        Message::User(vec![UserContent::Text { text: text.into() }])
+        Message::User(vec![UserPart::Text { text: text.into() }])
     }
 
     fn call(id: &str, name: &str) -> AssistantItem {
@@ -458,7 +542,7 @@ mod tests {
             };
         }
         // A second root agent.
-        fixture.reject(root.clone(), child_started(None, None, workspace));
+        fixture.reject(root.clone(), child_started(None, workspace));
         // Results need an open committed call; messages carry one result.
         fixture.reject(root.clone(), result("missing", "read", Vec::new()));
         let assistant = one!(SessionEvent::MessageCommitted {
@@ -467,20 +551,20 @@ mod tests {
         fixture.reject(root.clone(), result("a", "write", Vec::new()));
         one!(result("a", "read", Vec::new()));
         fixture.reject(root.clone(), result("a", "read", Vec::new()));
-        // Unknown jobs, terminal transitions and duplicate finishes.
+        // Unknown jobs and duplicate finishes.
         let job = JobId::new(1).unwrap();
         fixture.reject(
             root.clone(),
             SessionEvent::JobStateChanged {
                 job,
-                state: JobState::Running,
+                state: JobTransition::Running,
             },
         );
         one!(SessionEvent::JobCreated {
             job,
             parent: None,
             origin: Some(ModelCallOrigin {
-                message: assistant,
+                message: assistant.message(),
                 call_id: "a".into(),
             }),
             tool: "read".into(),
@@ -490,16 +574,8 @@ mod tests {
             output_schema: None,
             accepts_input: false,
             background: false,
-            authorization_scope: None,
             location: ExecutionLocation::root("/workspace".into()),
         });
-        fixture.reject(
-            root.clone(),
-            SessionEvent::JobStateChanged {
-                job,
-                state: JobState::Completed,
-            },
-        );
         let finished = |state| SessionEvent::JobFinished {
             job,
             state,
@@ -507,13 +583,13 @@ mod tests {
             output_diagnostic: None,
             images: Vec::new(),
         };
-        one!(finished(JobState::Completed));
-        fixture.reject(root.clone(), finished(JobState::Failed));
+        one!(finished(JobEnd::Completed));
+        fixture.reject(root.clone(), finished(JobEnd::Failed));
         one!(SessionEvent::JobStateChanged {
             job,
-            state: JobState::Running,
+            state: JobTransition::Running,
         });
-        one!(finished(JobState::Failed));
+        one!(finished(JobEnd::Failed));
         // Unstored blobs cannot be referenced.
         let image = ImageRef {
             file: None,
@@ -523,7 +599,7 @@ mod tests {
         fixture.reject(
             root.clone(),
             SessionEvent::MessageCommitted {
-                message: Message::User(vec![UserContent::Attachment {
+                message: Message::User(vec![UserPart::Attachment {
                     attachment: AttachmentRef::Image(image),
                 }]),
             },
@@ -536,7 +612,7 @@ mod tests {
                     message: "kept?".into(),
                 },
             ),
-            (root.clone(), finished(JobState::Completed)),
+            (root.clone(), finished(JobEnd::Completed)),
         ]);
         assert!(batch.is_err());
         fixture.assert_round_trip();
@@ -547,17 +623,95 @@ mod tests {
         assert!(foreign_keys.is_empty());
     }
 
+    /// Every dictionary seeds exactly its enum's spellings.
     #[test]
-    fn a_new_database_lists_every_supported_capability() {
+    fn dictionaries_list_every_enum_spelling() {
+        use crate::{
+            named_enum::NamedEnum,
+            provider::{
+                profile::StateMode,
+                protocol::{Binding, HistoryLifetime, ItemKind},
+            },
+            session::{EntryKind, ModelFailureKind, ModelPurpose, Truncation},
+            target::{SshAuth, TargetSource},
+            tool::{
+                diagnostic::{Effects, IoKind, Operation, PathRole},
+                policy::{ApprovalCoverage, Capability},
+            },
+        };
+        fn spellings<T: NamedEnum>() -> Vec<String> {
+            let mut names: Vec<_> = T::ALL.iter().map(|name| name.as_str().to_owned()).collect();
+            names.sort();
+            names
+        }
         let fixture = Fixture::new();
-        let query = "SELECT name FROM capability";
-        let mut names = fixture
+        for (table, expected) in [
+            ("capability", spellings::<Capability>()),
+            ("entry_kind", spellings::<EntryKind>()),
+            ("target_source", spellings::<TargetSource>()),
+            ("ssh_auth", spellings::<SshAuth>()),
+            ("state_mode", spellings::<StateMode>()),
+            ("model_purpose", spellings::<ModelPurpose>()),
+            ("message_role", spellings::<super::MessageRole>()),
+            ("image_format", spellings::<ImageFormat>()),
+            ("user_part_kind", spellings::<super::UserPartKind>()),
+            ("item_kind", spellings::<ItemKind>()),
+            ("replay_binding", spellings::<Binding>()),
+            ("todo_status", spellings::<crate::agent::TodoStatus>()),
+            ("history_lifetime", spellings::<HistoryLifetime>()),
+            ("model_failure_kind", spellings::<ModelFailureKind>()),
+            ("response_outcome", spellings::<super::ResponseOutcome>()),
+            ("cut_reason", spellings::<Truncation>()),
+            ("job_role", spellings::<JobRole>()),
+            ("job_state", spellings::<JobState>()),
+            ("capture_kind", spellings::<crate::job::CaptureKind>()),
+            ("diagnostic_slot", spellings::<super::diagnostic::Slot>()),
+            ("diagnostic_operation", spellings::<Operation>()),
+            (
+                "diagnostic_subject",
+                spellings::<super::diagnostic::SubjectKind>(),
+            ),
+            (
+                "diagnostic_site",
+                spellings::<super::diagnostic::SiteKind>(),
+            ),
+            ("diagnostic_effects", spellings::<Effects>()),
+            (
+                "diagnostic_cause",
+                spellings::<super::diagnostic::CauseKind>(),
+            ),
+            ("diagnostic_io_kind", spellings::<IoKind>()),
+            ("diagnostic_path_role", spellings::<PathRole>()),
+            ("approval_coverage", spellings::<ApprovalCoverage>()),
+            (
+                "resource_kind",
+                spellings::<crate::tool::policy::ResourceKind>(),
+            ),
+            ("job_event_kind", spellings::<super::JobEventKind>()),
+        ] {
+            let query = format!("SELECT name FROM {table} ORDER BY name");
+            let names = fixture
+                .db
+                .query(&query, Vec::new(), |row| Ok(row.get::<String>(0)?))
+                .unwrap();
+            assert_eq!(names, expected, "{table}");
+        }
+        let terminal = fixture
             .db
-            .query(query, Vec::new(), |row| Ok(row.get::<String>(0)?));
-        names.as_mut().unwrap().sort();
-        let mut supported = crate::tool::policy::Capability::ALL.map(|c| c.as_str().to_owned());
-        supported.sort();
-        assert_eq!(names.unwrap(), supported);
+            .query("SELECT name, terminal FROM job_state", Vec::new(), |row| {
+                Ok((row.get::<String>(0)?, row.get::<bool>(1)?))
+            })
+            .unwrap();
+        for state in JobState::ALL {
+            assert!(terminal.contains(&(state.as_str().to_owned(), state.is_terminal())));
+        }
+        // The two journaled subsets split the dictionary by its `terminal` column.
+        for transition in JobTransition::ALL {
+            assert!(terminal.contains(&(transition.as_str().to_owned(), false)));
+        }
+        for end in JobEnd::ALL {
+            assert!(terminal.contains(&(end.as_str().to_owned(), true)));
+        }
     }
 
     #[test]
@@ -594,7 +748,6 @@ mod tests {
                 output_schema: None,
                 accepts_input: true,
                 background: false,
-                authorization_scope: None,
                 location: ExecutionLocation::root("/w".into()),
             },
         );
@@ -614,16 +767,16 @@ mod tests {
             row.unwrap().unwrap()
         };
         for (event, expected) in [
-            (state(JobState::Running), 0),
-            (state(JobState::WaitingInput), 0),
-            (state(JobState::Running), 0),
-            (finished(JobState::Completed), 0),
-            (state(JobState::Running), 1),
-            (state(JobState::WaitingInput), 1),
-            (state(JobState::Running), 1),
-            (finished(JobState::Interrupted), 1),
-            (finished(JobState::Cancelled), 1),
-            (state(JobState::Running), 2),
+            (state(JobTransition::Running), 0),
+            (state(JobTransition::WaitingInput), 0),
+            (state(JobTransition::Running), 0),
+            (finished(JobEnd::Completed), 0),
+            (state(JobTransition::Running), 1),
+            (state(JobTransition::WaitingInput), 1),
+            (state(JobTransition::Running), 1),
+            (finished(JobEnd::Interrupted), 1),
+            (finished(JobEnd::Cancelled), 1),
+            (state(JobTransition::Running), 2),
         ] {
             fixture.one(root.clone(), event);
             assert_eq!(generation(&fixture), expected);

@@ -14,17 +14,20 @@ pub mod ssh;
 mod transport;
 pub mod worker;
 
-pub use artifact::{ArtifactError, EmbeddedShim, EmbeddedShimCatalog};
+pub use artifact::{
+    Arch, ArtifactError, EmbeddedShim, EmbeddedShimCatalog, Os, Platform, ShimProtocol,
+};
 #[cfg(test)]
 pub(crate) use backend::{ConnectionFactory, ConnectionRequest};
 #[cfg(test)]
 pub(crate) use client::test_transport;
-pub use manager::RemoteError;
+pub(crate) use error::{DeploymentError, ProtocolError, SshError};
+pub(crate) use manager::RemoteError;
 #[cfg(test)]
 pub(crate) use manager::tests::PendingHandshakeFactory;
 pub(crate) use manager::{PreparedConnection, RemoteManager};
 pub use prompt::{
-    RejectSensitivePrompts, SecretValue, SensitivePrompt, SensitivePromptError,
+    PromptAnswer, RejectSensitivePrompts, SecretValue, SensitivePrompt, SensitivePromptError,
     SensitivePromptFuture, SensitivePromptHandler, SensitivePromptKind,
 };
 pub(crate) use ssh::AskpassServer;

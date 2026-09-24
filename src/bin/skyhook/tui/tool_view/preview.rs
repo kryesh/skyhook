@@ -1,6 +1,7 @@
 //! Saved-output presentation boundary. Pages are validated once from their wire
 //! shape and dropped when malformed.
 use serde_json::Value;
+use skyhook::job::FieldPointer;
 use std::num::NonZeroUsize;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -11,8 +12,7 @@ pub(super) enum Pagination {
 
 #[derive(Clone)]
 pub(super) struct PreviewView {
-    /// JSON pointer of the selected field; empty for the whole document.
-    field: String,
+    field: FieldPointer,
     source: String,
     pagination: Pagination,
     line_count: usize,
@@ -25,7 +25,7 @@ pub(super) struct PreviewView {
 impl PreviewView {
     pub(super) fn wire(preview: Option<&Value>) -> Option<Self> {
         let preview = preview.filter(|preview| preview.is_object())?;
-        let field = preview.get("field")?.as_str()?.into();
+        let field = preview.get("field")?.as_str()?.parse().ok()?;
         let lines = preview.get("lines")?.as_array()?;
         let strings = lines
             .iter()
@@ -43,7 +43,7 @@ impl PreviewView {
         Some(page)
     }
 
-    pub(super) fn field(&self) -> &str {
+    pub(super) fn field(&self) -> &FieldPointer {
         &self.field
     }
     pub(super) fn source(&self) -> &str {
@@ -53,15 +53,15 @@ impl PreviewView {
         self.pagination
     }
 
-    pub(super) fn continuation(&self) -> Option<(&str, usize, usize)> {
+    pub(super) fn continuation(&self) -> Option<(FieldPointer, usize, usize)> {
         match self.pagination {
             Pagination::End => None,
-            Pagination::More { start, offset } => Some((self.field.as_str(), start, offset)),
+            Pagination::More { start, offset } => Some((self.field.clone(), start, offset)),
         }
     }
 
     pub(super) fn empty_whole(&self) -> bool {
-        self.field.is_empty() && self.line_count == 0
+        self.field.is_root() && self.line_count == 0
     }
 
     pub(super) fn complete_document(&self) -> Option<&Value> {
@@ -69,7 +69,7 @@ impl PreviewView {
     }
 
     fn validate_complete_document(&self) -> Option<Value> {
-        if !self.field.is_empty()
+        if !self.field.is_root()
             || self.pagination != Pagination::End
             || self.total_lines != Some(self.line_count)
         {
@@ -104,8 +104,8 @@ fn wire_pagination(value: &Value) -> Option<Pagination> {
 /// A source cursor `(field, start, offset)` is independent of displayed text.
 /// Historical truncation entries have no page lines, so admit only their
 /// cursor fields.
-pub(super) fn wire_continuation(value: &Value) -> Option<(&str, usize, usize)> {
-    let field = value.get("field")?.as_str()?;
+pub(super) fn wire_continuation(value: &Value) -> Option<(FieldPointer, usize, usize)> {
+    let field = value.get("field")?.as_str()?.parse().ok()?;
     match wire_pagination(value)? {
         Pagination::End => None,
         Pagination::More { start, offset } => Some((field, start, offset)),

@@ -1,23 +1,21 @@
 //! Immutable runtime admission and configuration-bound model selection.
 //!
 //! Raw configuration remains available for inspection and caller overrides. Only
-//! this boundary retains the provider/catalog proof used for runtime construction.
+//! this boundary retains the catalog proof used for runtime construction.
 
-use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 
-use super::{Config, ConfigError, providers::ValidatedProvider};
-use crate::{agent::HarnessBuilder, provider::profile::ModelProfile};
+use super::{Config, ConfigError};
+use crate::{
+    agent::{Catalog, HarnessBuilder},
+    provider::profile::ModelProfile,
+};
 
 /// An admitted, immutable configuration generation. Admission validates settings
 /// and model/provider membership without reading credentials or starting work.
 /// Clone shares that generation; reload admits a new one.
 #[derive(Clone)]
-pub struct RuntimeConfig(Arc<AdmittedConfig>);
-
-struct AdmittedConfig {
-    config: Config,
-    providers: BTreeMap<String, ValidatedProvider>,
-}
+pub struct RuntimeConfig(Arc<Config>);
 
 /// A model selected from, and retaining, exactly one immutable configuration.
 /// Names remain open-ended external identifiers; the index is process-local and
@@ -32,16 +30,16 @@ pub struct ConfiguredModel {
 }
 
 impl Config {
-    /// Seal caller overrides into a runtime configuration. Provider settings are
-    /// admitted before targets and the model catalog; all admission and selection
-    /// errors precede credential lookup, provider contexts, or workspace access.
+    /// Seal caller overrides into a runtime configuration. Targets and model limits
+    /// are checked before the catalog; all admission and selection errors precede
+    /// credential lookup, provider contexts, or workspace access.
     pub fn into_runtime(self) -> Result<RuntimeConfig, ConfigError> {
-        let providers = self.validate_structure()?;
+        self.validate_structure()?;
         if self.models.is_empty() {
             return Err(ConfigError::NoModels);
         }
         for (name, profile) in &self.models {
-            if !providers.contains_key(&profile.provider) {
+            if !self.providers.contains_key(&profile.provider) {
                 return Err(ConfigError::UnknownModelProvider {
                     model: name.clone(),
                     provider: profile.provider.clone(),
@@ -52,16 +50,13 @@ impl Config {
             let message = "default_mode is not a declared mode";
             return Err(ConfigError::Mode(self.default_mode.clone(), message.into()));
         }
-        Ok(RuntimeConfig(Arc::new(AdmittedConfig {
-            config: self,
-            providers,
-        })))
+        Ok(RuntimeConfig(Arc::new(self)))
     }
 }
 
 impl RuntimeConfig {
     pub fn config(&self) -> &Config {
-        &self.0.config
+        &self.0
     }
 
     /// Admit an external or persisted name against this configuration generation.
@@ -77,14 +72,22 @@ impl RuntimeConfig {
     }
 
     /// Admit an external mode name, or the configured default when none is given.
+    /// Modes are looked up by name wherever they apply, so the admitted name is
+    /// the selection.
     pub fn select_mode(&self, name: Option<&str>) -> Result<&str, ConfigError> {
-        let config = self.config();
-        let name = name.unwrap_or(&config.default_mode);
-        let (_, name, _) = config
+        let Some(name) = name else {
+            return Ok(self.default_mode());
+        };
+        self.config()
             .modes
-            .get_full(name)
-            .ok_or_else(|| ConfigError::Mode(name.into(), "mode is not configured".into()))?;
-        Ok(name)
+            .get_key_value(name)
+            .map(|(name, _)| name.as_str())
+            .ok_or_else(|| ConfigError::Mode(name.into(), "mode is not configured".into()))
+    }
+
+    /// The mode a new session starts in; admission proved it declared.
+    pub fn default_mode(&self) -> &str {
+        &self.config().default_mode
     }
 
     /// The first configured model in source/merge order. Runtime admission proves
@@ -122,25 +125,33 @@ impl ConfiguredModel {
 
     /// Construct providers only after pure admission and selection. Environment
     /// keys retain build-time lookup; command auth remains lazy until invocation.
+    /// The builder starts from this admitted catalog without checking it again.
     pub fn harness_builder(
         &self,
         workspace: impl Into<PathBuf>,
     ) -> Result<HarnessBuilder, ConfigError> {
         let config = self.config.config();
-        let mut builder = HarnessBuilder::new(workspace)
-            .default_model_profile(self.name())
+        let providers = config
+            .providers
+            .iter()
+            .map(|(name, settings)| Ok((name.clone(), settings.clone().build(name)?)))
+            .collect::<Result<_, ConfigError>>()?;
+        let catalog = Catalog {
+            providers,
+            model_profiles: config
+                .models
+                .iter()
+                .map(|(name, profile)| (name.clone(), profile.clone()))
+                .collect(),
+            default_model_profile: self.name().to_owned(),
+            modes: config.modes.clone(),
+            mode: Some(self.config.default_mode().to_owned()),
+        };
+        let mut builder = HarnessBuilder::admitted(workspace, catalog)
             .max_child_depth(config.max_child_depth)
             .capabilities(config.ceiling())
-            .modes(config.modes.clone())
-            .mode(self.config.select_mode(None)?)
             .mcp(config.mcp.clone())
             .targets_config(config.targets.clone());
-        for (name, settings) in &self.config.0.providers {
-            builder = builder.provider(name.clone(), settings.clone().build(name)?);
-        }
-        for (name, profile) in &config.models {
-            builder = builder.model_profile(name.clone(), profile.clone());
-        }
         if let Some(root) = &config.session_root {
             builder = builder.session_root(root.clone());
         }
@@ -151,44 +162,20 @@ impl ConfiguredModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::ProviderConfig;
 
     const VENDOR: &str = "vendor / 任意";
 
-    fn config() -> Config {
-        Config::from_yaml(
-            r#"
-providers:
-  vendor / 任意:
-    kind: openai
-    api: chat_completions
-    base_url: http://127.0.0.1:1/v1
-models:
-  z first / 任意:
-    provider: vendor / 任意
-    model: external:model/version
-    max_context: 8192
-    max_output: 512
-  a second:
-    provider: vendor / 任意
-    model: another-external-model
-    max_context: 4096
-    max_output: 256
-"#,
+    fn text(base_url: &str, authentication: &str, models: &str) -> String {
+        let models = if models.is_empty() { " {}" } else { models };
+        format!(
+            "providers:\n  vendor / 任意:\n    kind: openai\n    api: chat_completions\n    base_url: {base_url}\n{authentication}models:\n{models}"
         )
-        .unwrap()
     }
 
-    fn vendor(config: &mut Config) -> (&mut String, &mut Option<String>) {
-        let Some(ProviderConfig::Openai {
-            base_url,
-            api_key_env,
-            ..
-        }) = config.providers.get_mut(VENDOR)
-        else {
-            unreachable!()
-        };
-        (base_url, api_key_env)
+    const MODELS: &str = "  z first / 任意:\n    provider: vendor / 任意\n    model: external:model/version\n    max_context: 8192\n    max_output: 512\n  a second:\n    provider: vendor / 任意\n    model: another-external-model\n    max_context: 4096\n    max_output: 256\n";
+
+    fn config() -> Config {
+        Config::from_yaml(&text("http://127.0.0.1:1/v1", "", MODELS)).unwrap()
     }
 
     #[test]
@@ -229,8 +216,8 @@ models:
         let file_name = root.path().file_name().unwrap().to_string_lossy();
         let variable = format!("SKYHOOK_ABSENT_{file_name}");
         assert!(std::env::var_os(&variable).is_none());
-        let mut raw = config();
-        *vendor(&mut raw).1 = Some(variable.clone());
+        let keyed = format!("    api_key_env: {variable}\n");
+        let mut raw = Config::from_yaml(&text("http://127.0.0.1:1/v1", &keyed, MODELS)).unwrap();
         raw.models["a second"].provider = "missing provider".into();
         assert!(
             matches!(raw.clone().into_runtime(), Err(ConfigError::UnknownModelProvider { model, provider })
@@ -249,21 +236,21 @@ models:
         );
         assert!(!root.path().join(".skyhook").exists());
 
-        // Provider structure precedes catalog checks, and an empty catalog is
-        // rejected before any secret lookup.
-        let mut raw = config();
-        raw.models.clear();
-        *vendor(&mut raw).0 = "not an endpoint".into();
+        // Provider settings are rejected at parse time, naming the entry; targets
+        // precede catalog checks, and an empty catalog is rejected before any
+        // secret lookup.
+        let error = Config::from_yaml(&text("not an endpoint", "", "")).unwrap_err();
+        let error = error.to_string();
         assert!(
-            matches!(raw.clone().into_runtime(), Err(ConfigError::Provider(name, _)) if name == VENDOR)
+            error.contains("`providers.vendor / 任意`: base_url"),
+            "{error}"
         );
-        let (base_url, api_key_env) = vendor(&mut raw);
-        *base_url = "http://127.0.0.1:1/v1".into();
-        *api_key_env = Some("SKYHOOK_EMPTY_CATALOG_MUST_NOT_LOOK_UP_SECRET".into());
+        let secret = "    api_key_env: SKYHOOK_EMPTY_CATALOG_MUST_NOT_LOOK_UP_SECRET\n";
+        let mut raw = Config::from_yaml(&text("http://127.0.0.1:1/v1", secret, "")).unwrap();
         raw.targets = crate::yaml::parse("root:\n  type: ssh\n  host: unused").unwrap();
         assert!(matches!(
             raw.clone().into_runtime(),
-            Err(ConfigError::Structure(_))
+            Err(ConfigError::Targets(_))
         ));
         raw.targets.entries.clear();
         assert!(matches!(raw.into_runtime(), Err(ConfigError::NoModels)));

@@ -21,11 +21,11 @@ pub struct TextPosition {
     pub byte: usize,
 }
 
-/// Inline reasoning and activity spinners are not navigable or copyable entries.
+/// Inline reasoning and the working indicator are not navigable or copyable entries.
 pub fn entry_selectable(entry: &model::Entry) -> bool {
     entry.expandable()
         || !(entry.surface == Surface::Reasoning
-            || (entry.surface == Surface::Muted && entry.running))
+            || matches!(entry.key(), model::EntryKey::Working(_)))
 }
 
 impl Row {
@@ -261,7 +261,11 @@ mod tests {
     }
 
     fn source_row(text: &str) -> Row {
-        let entry = model::Entry::new(model::EntryKey::Record(777), text.to_owned(), Surface::Tool);
+        let entry = model::Entry::new(
+            model::EntryKey::UnsavedStatus(777),
+            text.to_owned(),
+            Surface::Tool,
+        );
         EntryGeometry::new(&entry, 30, 0).row(Line::from(text.to_owned()), false, false)
     }
 
@@ -275,7 +279,8 @@ mod tests {
         let tab = Tab::Jobs;
         assert!(!entry.is_expanded(&view, tab, true));
         let job = model::EntryKey::Job(skyhook::identity::JobId::new(1).unwrap());
-        entry = model::Entry::expandable_text(job, entry.text().to_owned(), Surface::Tool);
+        let title = entry.title().unwrap().clone();
+        entry = model::Entry::titled(job, title, entry.body().to_owned(), Surface::Tool);
         assert!(entry.is_expanded(&view, tab, true));
         entry = expandable_entry();
         entry.surface = Surface::Reasoning;
@@ -295,8 +300,13 @@ mod tests {
     #[test]
     fn selection_preserves_soft_wrapped_text_and_code_whitespace() {
         let source = "  first line with enough text to wrap\n    second line  ";
-        let text = format!("Agent\n```text\n{source}\n```");
-        let entry = model::Entry::new(model::EntryKey::Record(2), text, Surface::Agent);
+        let text = format!("```text\n{source}\n```");
+        let entry = model::Entry::titled(
+            model::EntryKey::UnsavedStatus(2),
+            model::Title::plain("Agent"),
+            text,
+            Surface::Agent,
+        );
         let rows = layout(&entry, 30);
         let start = rows
             .iter()
@@ -320,8 +330,9 @@ mod tests {
         assert_eq!(selected_text(&blocks, selection), expected);
         assert_eq!(selected_text(&blocks, (selection.1, selection.0)), expected);
         // The single-pass painter geometry agrees with per-byte lookup.
-        let list = model::Entry::new(
-            model::EntryKey::Record(3),
+        let list = model::Entry::titled(
+            model::EntryKey::UnsavedStatus(3),
+            model::Title::plain("Agent"),
             "- 界 wide item that wraps onto more rows\n  > quoted 👩‍💻 text".to_owned(),
             Surface::Agent,
         );
@@ -334,11 +345,16 @@ mod tests {
             }
         }
         for (text, unchanged) in [
-            (format!("{}\nLater streaming text", entry.text()), true),
-            (entry.text().replace("first", "other"), false),
+            (format!("{}\nLater streaming text", entry.body()), true),
+            (entry.body().replace("first", "other"), false),
         ] {
             let updated = layout(
-                &model::Entry::new(entry.key().clone(), text, entry.surface),
+                &model::Entry::titled(
+                    entry.key().clone(),
+                    entry.title().unwrap().clone(),
+                    text,
+                    entry.surface,
+                ),
                 30,
             );
             let same = selection_unchanged(
@@ -375,7 +391,7 @@ mod tests {
         reflowed.layout =
             markdown::RowLayout::source(Line::from("  "), 0, 0, None).with_flow(false, true);
         let mut rekeyed = row.clone();
-        rekeyed.entry_key = std::sync::Arc::new(model::EntryKey::Record(778));
+        rekeyed.entry_key = std::sync::Arc::new(model::EntryKey::UnsavedStatus(778));
         for changed in [reflowed, rekeyed, source_row("else")] {
             assert!(!unchanged(&row, &changed));
         }

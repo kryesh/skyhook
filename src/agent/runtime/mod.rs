@@ -1,5 +1,4 @@
 //! Shared session state and journal observation for provider-neutral agent runtimes.
-
 use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -23,12 +22,15 @@ use crate::{
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
     provider::profile::ModelProfile,
     provider::protocol::{
-        CutReason, LiveResponse, Message, ModelRequest, Outcome, Step as LiveStep, SystemSegment,
-        ToolCall, ToolResult, Usage, UserContent, visible_text,
+        CutReason, LiveResponse, ModelRequest, Outcome, Step as LiveStep, SystemSegment, ToolCall,
+        ToolResult, Usage, visible_text,
     },
     provider::{Provider, ProviderError},
     remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
-    session::{EventRecord, SessionError, SessionEvent, SessionStore},
+    session::{
+        EventRecord, Message, MessageSeq, RecordSeq, RequestSeq, SessionError, SessionEvent,
+        SessionStore, UserPart,
+    },
     target::{TargetDefinition, TargetRegistry, TargetsConfig},
     tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
     tool::policy::{AllowAll, Policy},
@@ -36,10 +38,10 @@ use crate::{
     tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
 };
 
-pub use super::error::HarnessError;
+pub use super::error::{HarnessError, TurnFailure};
 use super::interaction::{QuestionHandler, RuntimeEvent};
 use super::observation::RuntimeEvents;
-use super::{AgentActivity, Observation};
+use super::{AgentActivity, Observation, Settlement};
 use super::{TodoItem, todo::TodoStore};
 
 mod compact;
@@ -59,12 +61,14 @@ const AGENT_CHANNEL_CAPACITY: usize = 64;
 /// Initial generation plus two reconnects. Compaction has its own additive budget.
 mod builder;
 mod dispatch;
+use dispatch::CreatedCall;
 mod driver;
 mod lifecycle;
 mod recovery;
 mod session;
 mod state;
 mod turn;
+pub(crate) use builder::Catalog;
 pub use builder::HarnessBuilder;
 
 #[derive(Clone)]
@@ -100,11 +104,17 @@ impl SessionRuntime {
     fn mode_capabilities(&self, name: &str) -> Result<CapabilitySet, HarnessError> {
         let mode = self.modes.get(name);
         let mode = mode.ok_or_else(|| HarnessError::UnknownMode(name.to_owned()))?;
+        Ok(self.granted_by(mode))
+    }
+
+    /// A declared mode's grant: its capabilities within the session ceiling, and
+    /// interactivity wherever the session has it.
+    fn granted_by(&self, mode: &Mode) -> CapabilitySet {
         let mut capabilities = &mode.capabilities.iter().copied().collect() & &self.capabilities;
         if self.capabilities.contains(Capability::Interactive) {
             capabilities.insert(Capability::Interactive);
         }
-        Ok(capabilities)
+        capabilities
     }
 }
 
@@ -136,28 +146,62 @@ impl ContinueOutcome {
     }
 }
 
-/// Options for continuing a failed or interrupted turn without new input.
+/// Model and mode selections carried by a submitted or queued message, or by a
+/// continued turn. Issued by [`SessionHandle::selection`], so it only ever names a
+/// model profile and a mode the issuing runtime instance has.
 #[derive(Clone, Debug, Default)]
-pub struct ContinueOptions {
-    /// Model profile to apply before continuing. Omitted retains the agent's active
-    /// model, which for a refusal would deterministically refuse again.
-    pub model: Option<String>,
-    /// Mode to apply before continuing. Omitted retains the active mode.
-    pub mode: Option<String>,
+pub struct Selection {
+    /// Model profile when this input is consumed. Omitted retains the agent's
+    /// active model, which for a refusal would deterministically refuse again;
+    /// later explicit queued selections can change it.
+    pub model: Option<SessionModel>,
+    /// Mode when this input is consumed: the root agent's capabilities, tools and
+    /// mode instructions from then on. Omitted retains the active mode.
+    pub mode: Option<SessionMode>,
 }
 
-/// Options captured when a user submits a message, including queued messages.
-#[derive(Clone, Debug, Default)]
-pub struct PromptOptions {
-    /// Configured model profile when this input is consumed. Omitted retains the
-    /// agent's active model; later explicit queued selections can change it.
-    pub model: Option<String>,
-    /// Configured mode when this input is consumed: the root agent's capabilities,
-    /// tools and mode instructions from then on. Omitted retains the active mode.
-    pub mode: Option<String>,
+/// A model profile one runtime instance admitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionModel {
+    runtime: RuntimeInstance,
+    name: String,
+}
+
+/// A mode one runtime instance admitted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionMode {
+    runtime: RuntimeInstance,
+    name: String,
+}
+
+/// Process-local identity of one runtime instance and its immutable catalog. A
+/// resumed or reloaded session is a new instance, whatever its durable id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct RuntimeInstance(u64);
+
+impl RuntimeInstance {
+    fn next() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+impl SessionModel {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl SessionMode {
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
 }
 
 struct SessionRuntime {
+    instance: RuntimeInstance,
     harness: Arc<HarnessInner>,
     /// The most any agent can hold: the harness ceiling, never more than the session
     /// started with. A mode grants the root agent a subset.
@@ -180,7 +224,7 @@ struct SessionRuntime {
     usage: Mutex<Usage>,
     events: RuntimeEvents,
     // Fully replayed journal prefix, not the highest (possibly out-of-order) live event.
-    caught_up_sequence: Mutex<u64>,
+    caught_up_sequence: Mutex<RecordSeq>,
     #[cfg(test)]
     store_forwarding_gate: Arc<Mutex<()>>,
     shutting_down: std::sync::atomic::AtomicBool,
@@ -212,39 +256,13 @@ impl AgentControl {
     }
 }
 
-/// Why an agent request ended without an answer. An interrupt stays typed so an
-/// owner can recognise it without comparing rendered messages.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum RequestFailure {
-    Interrupted,
-    Failed(String),
-}
-
-impl From<&HarnessError> for RequestFailure {
-    fn from(error: &HarnessError) -> Self {
-        match error {
-            HarnessError::Interrupted => Self::Interrupted,
-            error => Self::Failed(error.to_string()),
-        }
-    }
-}
-
-impl std::fmt::Display for RequestFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Interrupted => HarnessError::Interrupted.fmt(f),
-            Self::Failed(message) => f.write_str(message),
-        }
-    }
-}
-
-type RequestCompletion = oneshot::Sender<Result<String, RequestFailure>>;
+type RequestCompletion = oneshot::Sender<Result<String, TurnFailure>>;
 
 enum AgentCommand {
     QueuedInputs(Vec<queue::QueuedInput>),
     Input {
-        options: PromptOptions,
-        content: Vec<UserContent>,
+        options: Selection,
+        content: Vec<UserPart>,
         done: Option<RequestCompletion>,
     },
     JobsReady,
@@ -399,17 +417,17 @@ impl SessionRuntime {
         &self,
         agent: &AgentId,
         message: Message,
-    ) -> Result<u64, SessionError> {
+    ) -> Result<MessageSeq, SessionError> {
         let record = self
             .store
             .append(agent.clone(), SessionEvent::MessageCommitted { message })
             .await?;
-        Ok(record.sequence)
+        Ok(record.sequence.message())
     }
 }
 fn contains_images(messages: &[Message]) -> bool {
     messages.iter().any(|message| match message {
-        Message::User(content) => content.iter().any(UserContent::is_image),
+        Message::User(content) => content.iter().any(UserPart::is_image),
         Message::Tool(results) => results.iter().any(|result| !result.images.is_empty()),
         Message::Assistant(_) => false,
     })
@@ -417,6 +435,8 @@ fn contains_images(messages: &[Message]) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// What a provider received, as distinct from what the session journals.
+    pub(crate) use crate::provider::protocol::{Message as Sent, UserContent as SentPart};
     pub(super) use std::{
         future::Future,
         sync::{
@@ -772,16 +792,22 @@ mod tests {
         )
     }
 
-    pub(super) fn request_runtime_state(request: &ModelRequest) -> &str {
-        let [Message::User(content)] = request.tail.as_slice() else {
+    /// The rendered runtime state at the end of the request, without its tags.
+    pub(super) fn request_runtime_state(request: &ModelRequest) -> String {
+        let [crate::provider::protocol::Message::User(content)] = request.tail.as_slice() else {
             panic!("expected transient runtime state at the end of the request");
         };
-        let (prefix, suffix) = ("<skyhook_state>\n", "\n</skyhook_state>");
         let state = content.iter().find_map(|content| match content {
-            UserContent::Runtime { text } => text.strip_prefix(prefix)?.strip_suffix(suffix),
+            crate::provider::protocol::UserContent::Runtime { text } => Some(text.clone()),
             _ => None,
         });
-        state.expect("request has a compact runtime state block")
+        let state = state.expect("request has a runtime state block");
+        let (prefix, suffix) = ("<skyhook_state>\n", "\n</skyhook_state>");
+        state
+            .strip_prefix(prefix)
+            .and_then(|state| state.strip_suffix(suffix))
+            .expect("rendered state is tagged")
+            .to_owned()
     }
 
     pub(super) fn test_builder(
@@ -855,10 +881,7 @@ mod tests {
             role: crate::job::JobRole::Agent,
             ..crate::job::JobSpec::test(session.root.clone(), "agent")
         };
-        let job = jobs.create(spec).await.unwrap().into_test_id();
-        let running = crate::job::JobState::Running;
-        jobs.transition(job, running).await.unwrap();
-        job
+        jobs.test_running(spec).await.into_test_id()
     }
 
     // A separate parent inbox keeps the idle root from consuming a child's responses.
@@ -976,13 +999,6 @@ mod tests {
         results
     }
 
-    pub(super) fn model(profile: &str) -> PromptOptions {
-        PromptOptions {
-            model: Some(profile.to_owned()),
-            mode: None,
-        }
-    }
-
     /// A valid, otherwise empty compaction continuation.
     pub(super) fn summary_json() -> serde_json::Value {
         json!({
@@ -1036,7 +1052,7 @@ mod tests {
         let initial_count = observation.snapshot.records.len();
         // 600 gated appends overflow the 512-slot channel, forcing the Lagged catch-up.
         let forwarding = session.runtime.store_forwarding_gate.lock().await;
-        let mut last = 0;
+        let mut last = RecordSeq::default();
         for _ in 0..600 {
             let record = session
                 .runtime

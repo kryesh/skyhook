@@ -19,11 +19,22 @@ pub struct SensitivePrompt {
     pub message: String,
 }
 
+impl SensitivePromptKind {
+    /// Host-key and agent-key prompts are answered `Confirmed` or `Rejected`;
+    /// every other kind is answered with a `Secret`.
+    #[must_use]
+    pub const fn is_confirmation(self) -> bool {
+        matches!(self, Self::HostConfirmation | Self::AgentConfirmation)
+    }
+}
+
 pub struct SecretValue(Zeroizing<String>);
 
+/// A handler's answer to a sensitive prompt.
 #[derive(Debug, Deserialize, Serialize)]
-pub(crate) enum PromptAnswer {
-    Accepted(SecretValue),
+pub enum PromptAnswer {
+    Secret(SecretValue),
+    Confirmed,
     Rejected,
 }
 
@@ -46,7 +57,7 @@ impl std::fmt::Debug for SecretValue {
 }
 
 pub type SensitivePromptFuture =
-    Pin<Box<dyn Future<Output = Result<SecretValue, SensitivePromptError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<PromptAnswer, SensitivePromptError>> + Send + 'static>>;
 
 pub trait SensitivePromptHandler: Send + Sync {
     fn prompt(&self, prompt: SensitivePrompt) -> SensitivePromptFuture;

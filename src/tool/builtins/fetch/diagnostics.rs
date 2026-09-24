@@ -293,11 +293,11 @@ impl FetchError {
     /// generic payloads and error displays are never accepted as fetch evidence.
     pub fn from_tool_error(error: LocalError, phase: FetchPhase) -> Self {
         // Inspect native sources before normalization discards the wrapped evidence.
-        if let LocalError::Io(error) = error {
-            return FetchDiagnostic::from_io(&error, phase).into();
+        if let Some(error) = error.native_io() {
+            return FetchDiagnostic::from_io(error, phase).into();
         }
         // General tool output is not authoritative HTTP response evidence.
-        let (diagnostic, _) = error.into_parts();
+        let (diagnostic, _) = error.into_facts();
         match diagnostic.cause {
             Cause::Io { kind, code, .. } => {
                 let error_kind = if kind == IoKind::TimedOut {
@@ -322,9 +322,7 @@ impl FetchError {
             | Cause::Interrupted
             | Cause::Denied(_)
             | Cause::InvalidArguments(_)
-            | Cause::InputClosed => {
-                Self::Passthrough(LocalError::from_diagnostic(diagnostic, None))
-            }
+            | Cause::InputClosed => Self::Passthrough(LocalError::from_facts(diagnostic, None)),
         }
     }
 
@@ -556,7 +554,7 @@ mod tests {
 
     #[test]
     fn normalized_io_classifies_by_typed_kind_and_keeps_the_os_code() {
-        use crate::tool::diagnostic::{Diagnostic, DiagnosticContext};
+        use crate::tool::diagnostic::{PartialContext, PartialDiagnostic};
 
         for (kind, expected) in [
             (IoKind::TimedOut, FetchErrorKind::Timeout),
@@ -568,8 +566,8 @@ mod tests {
                 code: Some(12345),
                 detail: None,
             };
-            let error = LocalError::from_diagnostic(
-                Diagnostic::new(DiagnosticContext::default(), cause),
+            let error = LocalError::from_facts(
+                PartialDiagnostic::new(PartialContext::default(), cause),
                 None,
             );
             let admitted = FetchError::from_tool_error(error, FetchPhase::ResponseBody)
@@ -675,7 +673,7 @@ mod tests {
         ] {
             for diagnostic in [
                 FetchDiagnostic::from_io(&error, phase),
-                FetchError::from_tool_error(LocalError::Io(error), phase)
+                FetchError::from_tool_error(LocalError::io(error), phase)
                     .into_diagnostic()
                     .unwrap(),
             ] {
@@ -702,7 +700,7 @@ mod tests {
             let os = io::Error::other(io::Error::from_raw_os_error(code));
             for diagnostic in [
                 FetchDiagnostic::from_io(&os, Phase::LocalIo),
-                FetchError::from_tool_error(LocalError::Io(os), Phase::LocalIo)
+                FetchError::from_tool_error(LocalError::io(os), Phase::LocalIo)
                     .into_diagnostic()
                     .unwrap(),
             ] {

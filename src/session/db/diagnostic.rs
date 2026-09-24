@@ -5,40 +5,63 @@ use std::collections::HashMap;
 use libsql::Row;
 
 use super::{
-    Db, DbResult, Encoder, corrupt,
+    Db, DbResult, Encoder,
     decode::{path, u64_of},
     encode::path_bytes,
-    params,
+    enum_column, params,
 };
 use crate::{
     execution::ExecutionLocation,
     identity::JobId,
-    tool::diagnostic::{
-        Cause, Diagnostic, DiagnosticContext, Effects, FailureSite, IoKind, Operation, PathFact,
-        PathRole, Subject,
-    },
+    named_enum::named_enum,
+    tool::diagnostic::{Cause, Diagnostic, DiagnosticContext, FailureSite, PathFact, Subject},
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(super) enum Slot {
-    Diagnostic,
-    OutputDiagnostic,
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    pub(super) enum Slot {
+        Diagnostic = "diagnostic",
+        OutputDiagnostic = "output_diagnostic",
+    }
 }
 
-impl Slot {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Diagnostic => "diagnostic",
-            Self::OutputDiagnostic => "output_diagnostic",
-        }
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(super) enum SubjectKind {
+        None = "none",
+        Path = "path",
+        WorkingDirectory = "working_directory",
+        StagingFile = "staging_file",
+        ParentDirectory = "parent_directory",
+        DirectoryEntry = "directory_entry",
+        Argument = "argument",
+        Tool = "tool",
+        Job = "job",
+        Process = "process",
+        Label = "label",
     }
+}
 
-    fn parse(value: &str) -> DbResult<Self> {
-        match value {
-            "diagnostic" => Ok(Self::Diagnostic),
-            "output_diagnostic" => Ok(Self::OutputDiagnostic),
-            _ => Err(corrupt("unknown diagnostic slot")),
-        }
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(super) enum SiteKind {
+        Invocation = "invocation",
+        Host = "host",
+        Execution = "execution",
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub(super) enum CauseKind {
+        Io = "io",
+        InvalidArguments = "invalid_arguments",
+        Denied = "denied",
+        Cancelled = "cancelled",
+        Interrupted = "interrupted",
+        InputClosed = "input_closed",
+        Message = "message",
+        Json = "json",
     }
 }
 
@@ -52,48 +75,61 @@ impl Encoder {
     ) -> DbResult<()> {
         let context = &diagnostic.context;
         let (subject, subject_path, subject_text, subject_job) = match &context.subject {
-            Subject::None => ("none", None, None, None),
-            Subject::Path(path) => ("path", Some(path_bytes(path)), None, None),
-            Subject::WorkingDirectory(path) => {
-                ("working_directory", Some(path_bytes(path)), None, None)
+            Subject::None => (SubjectKind::None, None, None, None),
+            Subject::Path(path) => (SubjectKind::Path, Some(path_bytes(path)), None, None),
+            Subject::WorkingDirectory(path) => (
+                SubjectKind::WorkingDirectory,
+                Some(path_bytes(path)),
+                None,
+                None,
+            ),
+            Subject::StagingFile(path) => {
+                (SubjectKind::StagingFile, Some(path_bytes(path)), None, None)
             }
-            Subject::StagingFile(path) => ("staging_file", Some(path_bytes(path)), None, None),
-            Subject::ParentDirectory(path) => {
-                ("parent_directory", Some(path_bytes(path)), None, None)
-            }
-            Subject::DirectoryEntry(path) => {
-                ("directory_entry", Some(path_bytes(path)), None, None)
-            }
-            Subject::Argument(text) => ("argument", None, Some(text), None),
-            Subject::Tool(text) => ("tool", None, Some(text), None),
-            Subject::Job(job) => ("job", None, None, Some(job.get())),
-            Subject::Process => ("process", None, None, None),
-            Subject::Label(text) => ("label", None, Some(text), None),
+            Subject::ParentDirectory(path) => (
+                SubjectKind::ParentDirectory,
+                Some(path_bytes(path)),
+                None,
+                None,
+            ),
+            Subject::DirectoryEntry(path) => (
+                SubjectKind::DirectoryEntry,
+                Some(path_bytes(path)),
+                None,
+                None,
+            ),
+            Subject::Argument(text) => (SubjectKind::Argument, None, Some(text), None),
+            Subject::Tool(text) => (SubjectKind::Tool, None, Some(text), None),
+            Subject::Job(job) => (SubjectKind::Job, None, None, Some(job.get())),
+            Subject::Process => (SubjectKind::Process, None, None, None),
+            Subject::Label(text) => (SubjectKind::Label, None, Some(text), None),
         };
         let (site, target, workspace) = match &context.site {
-            FailureSite::Invocation => ("invocation", None, None),
-            FailureSite::Host => ("host", None, None),
+            FailureSite::Invocation => (SiteKind::Invocation, None, None),
+            FailureSite::Host => (SiteKind::Host, None, None),
             FailureSite::Execution(location) => (
-                "execution",
-                Some(self.target(db, &location.target)?),
+                SiteKind::Execution,
+                Some(self.target(db, location.target.as_str())?),
                 Some(path_bytes(&location.workspace)),
             ),
         };
         let (cause, io_kind, io_code, cause_text, io_detail) = match &diagnostic.cause {
             Cause::Io { kind, code, detail } => (
-                "io",
-                Some(kind.as_str()),
+                CauseKind::Io,
+                Some(*kind),
                 code.map(i64::from),
                 None,
                 detail.as_ref(),
             ),
-            Cause::InvalidArguments(text) => ("invalid_arguments", None, None, Some(text), None),
-            Cause::Denied(text) => ("denied", None, None, Some(text), None),
-            Cause::Cancelled => ("cancelled", None, None, None, None),
-            Cause::Interrupted => ("interrupted", None, None, None, None),
-            Cause::InputClosed => ("input_closed", None, None, None, None),
-            Cause::Message(text) => ("message", None, None, Some(text), None),
-            Cause::Json => ("json", None, None, None, None),
+            Cause::InvalidArguments(text) => {
+                (CauseKind::InvalidArguments, None, None, Some(text), None)
+            }
+            Cause::Denied(text) => (CauseKind::Denied, None, None, Some(text), None),
+            Cause::Cancelled => (CauseKind::Cancelled, None, None, None, None),
+            Cause::Interrupted => (CauseKind::Interrupted, None, None, None, None),
+            Cause::InputClosed => (CauseKind::InputClosed, None, None, None, None),
+            Cause::Message(text) => (CauseKind::Message, None, None, Some(text), None),
+            Cause::Json => (CauseKind::Json, None, None, None, None),
         };
         db.execute(
             "INSERT INTO job_finish_diagnostic (finish, slot, operation, subject, subject_path, \
@@ -102,8 +138,8 @@ impl Encoder {
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 finish,
-                slot.as_str(),
-                context.operation.as_str(),
+                slot,
+                context.operation,
                 subject,
                 subject_path,
                 subject_text,
@@ -111,7 +147,7 @@ impl Encoder {
                 site,
                 target,
                 workspace,
-                context.effects.as_str(),
+                context.effects,
                 cause,
                 io_kind,
                 io_code,
@@ -123,13 +159,7 @@ impl Encoder {
             db.execute(
                 "INSERT INTO diagnostic_path (finish, slot, position, role, path) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    finish,
-                    slot.as_str(),
-                    position,
-                    fact.role.as_str(),
-                    path_bytes(&fact.path)
-                ],
+                params![finish, slot, position, fact.role, path_bytes(&fact.path)],
             )?;
         }
         Ok(())
@@ -137,57 +167,49 @@ impl Encoder {
 }
 
 fn decode(row: &Row, paths: Vec<PathFact>) -> DbResult<Diagnostic> {
-    let operation = Operation::parse(&row.get::<String>(2)?)
-        .ok_or_else(|| corrupt("unknown diagnostic operation"))?;
-    let subject = match row.get::<String>(3)?.as_str() {
-        "none" => Subject::None,
-        "path" => Subject::Path(path(row.get(4)?)),
-        "working_directory" => Subject::WorkingDirectory(path(row.get(4)?)),
-        "staging_file" => Subject::StagingFile(path(row.get(4)?)),
-        "parent_directory" => Subject::ParentDirectory(path(row.get(4)?)),
-        "directory_entry" => Subject::DirectoryEntry(path(row.get(4)?)),
-        "argument" => Subject::Argument(row.get(5)?),
-        "tool" => Subject::Tool(row.get(5)?),
-        "job" => Subject::Job(
-            JobId::new(u64_of(row.get(6)?)).map_err(|error| corrupt(error.to_string()))?,
+    let subject = match enum_column(row, 3)? {
+        SubjectKind::None => Subject::None,
+        SubjectKind::Path => Subject::Path(path(row.get(4)?)),
+        SubjectKind::WorkingDirectory => Subject::WorkingDirectory(path(row.get(4)?)),
+        SubjectKind::StagingFile => Subject::StagingFile(path(row.get(4)?)),
+        SubjectKind::ParentDirectory => Subject::ParentDirectory(path(row.get(4)?)),
+        SubjectKind::DirectoryEntry => Subject::DirectoryEntry(path(row.get(4)?)),
+        SubjectKind::Argument => Subject::Argument(row.get(5)?),
+        SubjectKind::Tool => Subject::Tool(row.get(5)?),
+        SubjectKind::Job => Subject::Job(
+            JobId::new(u64_of(row.get(6)?)).map_err(|error| super::corrupt(error.to_string()))?,
         ),
-        "process" => Subject::Process,
-        "label" => Subject::Label(row.get(5)?),
-        _ => return Err(corrupt("unknown diagnostic subject")),
+        SubjectKind::Process => Subject::Process,
+        SubjectKind::Label => Subject::Label(row.get(5)?),
     };
-    let site = match row.get::<String>(7)?.as_str() {
-        "invocation" => FailureSite::Invocation,
-        "host" => FailureSite::Host,
-        "execution" => FailureSite::Execution(ExecutionLocation {
-            target: row.get(8)?,
+    let site = match enum_column(row, 7)? {
+        SiteKind::Invocation => FailureSite::Invocation,
+        SiteKind::Host => FailureSite::Host,
+        SiteKind::Execution => FailureSite::Execution(ExecutionLocation {
+            target: super::decode::target_ref(row.get(8)?)?,
             workspace: path(row.get(9)?),
         }),
-        _ => return Err(corrupt("unknown diagnostic failure site")),
     };
-    let effects = Effects::parse(&row.get::<String>(10)?)
-        .ok_or_else(|| corrupt("unknown diagnostic effects"))?;
-    let cause = match row.get::<String>(11)?.as_str() {
-        "io" => Cause::Io {
-            kind: IoKind::parse(&row.get::<String>(12)?)
-                .ok_or_else(|| corrupt("unknown diagnostic IO kind"))?,
+    let cause = match enum_column(row, 11)? {
+        CauseKind::Io => Cause::Io {
+            kind: enum_column(row, 12)?,
             code: row.get(13)?,
             detail: row.get(15)?,
         },
-        "invalid_arguments" => Cause::InvalidArguments(row.get(14)?),
-        "denied" => Cause::Denied(row.get(14)?),
-        "cancelled" => Cause::Cancelled,
-        "interrupted" => Cause::Interrupted,
-        "input_closed" => Cause::InputClosed,
-        "message" => Cause::Message(row.get(14)?),
-        "json" => Cause::Json,
-        _ => return Err(corrupt("unknown diagnostic cause")),
+        CauseKind::InvalidArguments => Cause::InvalidArguments(row.get(14)?),
+        CauseKind::Denied => Cause::Denied(row.get(14)?),
+        CauseKind::Cancelled => Cause::Cancelled,
+        CauseKind::Interrupted => Cause::Interrupted,
+        CauseKind::InputClosed => Cause::InputClosed,
+        CauseKind::Message => Cause::Message(row.get(14)?),
+        CauseKind::Json => Cause::Json,
     };
     Ok(Diagnostic {
         context: DiagnosticContext {
-            operation,
+            operation: enum_column(row, 2)?,
             subject,
             site,
-            effects,
+            effects: enum_column(row, 10)?,
             paths,
         },
         cause,
@@ -201,10 +223,9 @@ pub(super) fn load(db: &Db) -> DbResult<HashMap<(i64, Slot), Diagnostic>> {
         Vec::new(),
         |row| {
             Ok((
-                (row.get(0)?, Slot::parse(&row.get::<String>(1)?)?),
+                (row.get(0)?, enum_column(row, 1)?),
                 PathFact {
-                    role: PathRole::parse(&row.get::<String>(2)?)
-                        .ok_or_else(|| corrupt("unknown diagnostic path role"))?,
+                    role: enum_column(row, 2)?,
                     path: path(row.get(3)?),
                 },
             ))
@@ -220,7 +241,7 @@ pub(super) fn load(db: &Db) -> DbResult<HashMap<(i64, Slot), Diagnostic>> {
              LEFT JOIN target t ON t.id = d.location_target",
             Vec::new(),
             |row| {
-                let key = (row.get(0)?, Slot::parse(&row.get::<String>(1)?)?);
+                let key = (row.get(0)?, enum_column(row, 1)?);
                 Ok((key, decode(row, paths.remove(&key).unwrap_or_default())?))
             },
         )?
@@ -232,8 +253,9 @@ pub(super) fn load(db: &Db) -> DbResult<HashMap<(i64, Slot), Diagnostic>> {
 mod tests {
     use super::*;
     use crate::{
-        job::{JobRole, JobState},
+        job::{JobEnd, JobRole},
         session::{SessionEvent, db::tests::Fixture},
+        tool::diagnostic::{Effects, IoKind, Operation, PartialContext, PathRole},
     };
 
     fn finish(
@@ -256,7 +278,6 @@ mod tests {
                 output_schema: None,
                 accepts_input: false,
                 background: false,
-                authorization_scope: None,
                 location: ExecutionLocation::root("/workspace".into()),
             },
         );
@@ -264,46 +285,12 @@ mod tests {
             root,
             SessionEvent::JobFinished {
                 job,
-                state: JobState::Completed,
+                state: JobEnd::Completed,
                 diagnostic,
                 output_diagnostic,
                 images: Vec::new(),
             },
         );
-    }
-
-    #[test]
-    fn dictionaries_list_every_diagnostic_vocabulary_word() {
-        let fixture = Fixture::new();
-        for (table, mut words) in [
-            (
-                "diagnostic_operation",
-                Operation::ALL
-                    .iter()
-                    .map(|w| w.as_str())
-                    .collect::<Vec<_>>(),
-            ),
-            (
-                "diagnostic_effects",
-                Effects::ALL.iter().map(|w| w.as_str()).collect(),
-            ),
-            (
-                "diagnostic_io_kind",
-                IoKind::ALL.iter().map(|w| w.as_str()).collect(),
-            ),
-            (
-                "diagnostic_path_role",
-                PathRole::ALL.iter().map(|w| w.as_str()).collect(),
-            ),
-        ] {
-            let query = format!("SELECT name FROM {table} ORDER BY name");
-            let names = fixture
-                .db
-                .query(&query, Vec::new(), |row| Ok(row.get::<String>(0)?))
-                .unwrap();
-            words.sort_unstable();
-            assert_eq!(names, words, "{table}");
-        }
     }
 
     #[test]
@@ -331,7 +318,10 @@ mod tests {
         let sites = [
             FailureSite::Invocation,
             FailureSite::Host,
-            FailureSite::Execution(ExecutionLocation::named("worker", native.clone())),
+            FailureSite::Execution(ExecutionLocation::named(
+                "worker".parse().unwrap(),
+                native.clone(),
+            )),
         ];
         let causes = [
             Cause::Io {
@@ -374,9 +364,10 @@ mod tests {
                 cause: causes[index % causes.len()].clone(),
             };
             let output_diagnostic = Diagnostic::new(
-                DiagnosticContext::new(Operation::FinishCapture, Subject::Label("stdout".into()))
+                PartialContext::new(Operation::FinishCapture, Subject::Label("stdout".into()))
                     .at(FailureSite::Host)
-                    .effects(Effects::OutputIncomplete),
+                    .effects(Effects::OutputIncomplete)
+                    .resolve(),
                 Cause::Io {
                     kind: IoKind::ALL[index % IoKind::ALL.len()],
                     code: Some(-123),

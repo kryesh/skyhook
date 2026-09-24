@@ -26,15 +26,21 @@ that can be customized before `build().await`; hosts supplying their own provide
 profiles can instead start with `HarnessBuilder::new(workspace)`.
 
 The configuration-backed builder carries the configured modes and selects the configured default.
-`mode(name)` selects another, and `capabilities(set)` limits what modes can grant. A builder without
-modes gives the root agent that capability set directly. `PromptOptions::model` and
-`PromptOptions::mode` carry selections with a submitted message; omitted selections retain the
-active model and mode. A mode change applies to the root agent from the boundary that consumes
-it, not retroactively to children it already started. A session pins each mode's definition on
+`mode(name)` selects another, and `capabilities(set)` limits what modes can grant; `build()` rejects
+a selected mode the modes do not declare, whichever was set first. A builder without modes gives the
+root agent that capability set directly, and no mode applies. `SessionHandle::selection(model, mode)` issues the
+`Selection` a submitted message or a continued turn carries, rejecting a model profile or mode the
+session does not have; omitted selections retain the active model and mode. A mode change applies
+to the root agent from the boundary that consumes it, not retroactively to children it already
+started. A session pins each mode's definition on
 first use and cannot outgrow its original capability ceiling.
 
 Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
-and an embedded shim catalog. Core `Config` loading does not load `.env`; environment setup belongs
+and an embedded shim catalog. A `SensitivePromptHandler` answers each `SensitivePrompt` with a
+`PromptAnswer`: `Secret` for passwords, passphrases and keyboard-interactive prompts, and
+`Confirmed` or `Rejected` for the confirmation kinds (`SensitivePromptKind::is_confirmation`), which
+cover host keys and agent key use. A handler error means no answer could be obtained; `Rejected` is a
+decision, and so is an answer of the wrong shape for the prompt's kind. Core `Config` loading does not load `.env`; environment setup belongs
 to the host (the CLI performs its own startup loading).
 
 The builder defaults to `<workspace>/.skyhook/sessions`. `HarnessBuilder::session_root`, including
@@ -85,9 +91,9 @@ before starting agents and opens fresh provider contexts; it does not reuse old 
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases now use format 10 for structured diagnostics. Format 9 databases are not
-migrated and cannot be resumed with this version; retain a compatible Skyhook version to inspect
-or resume those sessions, or start a new session.
+Session databases use format 12. Earlier formats are not migrated and cannot be resumed with
+this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
+new session.
 
 Await `SessionHandle::shutdown()` before releasing the host's session owner. Shutdown stops runtime
 producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
@@ -126,16 +132,20 @@ or authentication headers:
   including the model ID, reasoning setting, and output limit. Context records describe request
   settings, not the lifetime of a `ProviderContext` resource.
 - `model_requested` identifies one frozen logical request before its first invocation. It references
-  the context record and stores `history` as ordered source-event sequences, `tail` as exact inline
-  messages, `history_lifetime`, and purpose. Retries refer back to this request using
-  `model_attempt_started`, with separate failure/interruption or completion outcomes. Ordinary
-  requests reuse a context record while their settings remain applicable; summarization has a
-  separate context with its structured response schema.
+  the context record and stores the checkpoint it opens with, `history` as ordered source-event
+  sequences, `tail` as exact inline messages, and `history_lifetime`. Retries refer back to this
+  request using `model_attempt_started`, with separate failure/interruption or completion outcomes.
+  Ordinary requests reuse a context record while their settings remain applicable; summarization
+  has a separate context with its structured response schema.
 - `compaction` stores the exact replacement message, retained original message references, covered
-  frontier, previous checkpoint, summary request and attempt, token estimates, schema version,
-  and reconciled owner todos. History and todos become active together after persistence.
+  frontier, the summary attempt that produced it, token estimates, and reconciled owner todos.
+  History and todos become active together after persistence.
+- Runtime state and job-event content are stored structurally and rendered for the model on
+  reconstruction, so a request replays the text the model was sent.
 - Reconstruction resolves those references and inline values. It does not consult current
-  configuration, prompt code, live jobs, or the current compaction renderer. Failed and interrupted
+  configuration, live jobs, or the current compaction renderer. Runtime state and job events are
+  rendered by the current state renderer and job-view serialization, which are therefore part of
+  the session format: a change to either is a database version bump. Failed and interrupted
   requests keep their recorded inputs; usage identifies the originating request, including summary
   requests and failed attempts.
 

@@ -1,92 +1,91 @@
 //! Snapshot and present durable child messages and job notifications.
-
-use super::{PendingEventBatch, SessionRuntime};
-use crate::{provider::protocol::UserContent, tool::diagnostic::DiagnosticViewer};
+use super::SessionRuntime;
+use crate::{
+    job::{JobView, PendingDelivery},
+    session::{JobEvent, UserPart},
+    tool::diagnostic::DiagnosticViewer,
+};
 
 impl SessionRuntime {
+    /// The owner's pending events, with the receipt whose commit delivers them.
+    /// None when nothing is pending, so no empty receipt holds the delivery gate
+    /// across a model request.
     pub(in crate::agent::runtime) async fn pending_event_content<'a>(
         &self,
         agent: &crate::identity::AgentId,
         viewer: impl Into<DiagnosticViewer<'a>>,
-    ) -> Result<(Vec<UserContent>, PendingEventBatch), crate::agent::runtime::HarnessError> {
+    ) -> Result<Option<(Vec<UserPart>, PendingDelivery)>, crate::agent::runtime::HarnessError> {
         let pending = self.jobs.pending_delivery(agent).await?;
         let content = self.job_event_content(&pending, viewer.into()).await;
-        // Never hold an empty receipt's delivery gate across a model request.
-        let jobs = (!content.is_empty()).then_some(pending);
-        let batch = PendingEventBatch {
-            jobs,
-            store: self.store.clone(),
-            agent: agent.clone(),
-            message: crate::provider::protocol::Message::User(content.clone()),
-        };
-        Ok((content, batch))
+        Ok((!content.is_empty()).then_some((content, pending)))
     }
 
     async fn job_event_content(
         &self,
         pending: &crate::job::PendingDelivery,
         viewer: DiagnosticViewer<'_>,
-    ) -> Vec<UserContent> {
-        let mut presented = Vec::new();
-        for message in pending.messages() {
-            let mut event = serde_json::to_value(message).expect("child messages serialize");
-            event["kind"] = serde_json::json!("message");
-            presented.push(event);
-        }
+    ) -> Vec<UserPart> {
+        let mut events: Vec<_> = pending
+            .messages()
+            .iter()
+            .cloned()
+            .map(JobEvent::Message)
+            .collect();
         for job in pending.envelopes() {
-            match self
+            let view = self
                 .jobs
                 .present_output_with(
                     crate::job::output::OutputArgs::new(job.id),
+                    crate::job::CancellationToken::new(),
                     viewer,
                     crate::job::output::OutputOptions::Host {
                         presentation: crate::job::OutputPresentation::Automatic,
                     },
                 )
                 .await
-                .map(crate::job::PresentedOutput::into_view)
-            {
-                Ok(view) => presented.push(view),
-                Err(error) => presented.push(
-                    serde_json::json!({"id":job.id,"state":job.state,"error":error.diagnostic().render_for(viewer)}),
-                ),
-            }
+                .map(crate::job::PresentedOutput::into_job_view);
+            events.push(JobEvent::Job(Box::new(view.unwrap_or_else(|error| {
+                JobView {
+                    id: Some(job.id),
+                    state: job.state.presented(),
+                    has_result: false,
+                    result: serde_json::Value::Null,
+                    error: Some(error.diagnostic().render_for(viewer)),
+                    meta: None,
+                    presentation: None,
+                }
+            }))));
         }
-        if presented.is_empty() {
+        if events.is_empty() {
             return Vec::new();
         }
-        vec![UserContent::Runtime {
-            text: format!(
-                "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-                serde_json::to_string(&presented).unwrap_or_else(|_| "[]".to_owned())
-            ),
-        }]
+        vec![UserPart::JobEvents { events }]
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::receipt::tests::{fixture_child, fixture_message};
     use super::super::tests::*;
     use crate::agent::runtime::tests::count;
     use crate::agent::runtime::*;
-    use crate::job::JobState;
+    use crate::job::{JobSpec, JobState};
 
     /// Every runtime job-event envelope of the request, as its parsed entries.
     /// `agent_messages`/`events` flatten across envelopes; batching claims need the
     /// envelope grouping, since one envelope is exactly one delivery snapshot.
     fn envelopes(request: &ModelRequest) -> Vec<Vec<serde_json::Value>> {
-        let (prefix, suffix) = ("<skyhook_job_events>\n", "\n</skyhook_job_events>");
         let blocks = request.messages().flat_map(|message| match message {
-            Message::User(content) => content.as_slice(),
+            Sent::User(content) => content.as_slice(),
             _ => &[],
         });
         blocks
             .filter_map(|block| match block {
-                UserContent::Runtime { text } => text.strip_prefix(prefix)?.strip_suffix(suffix),
+                SentPart::Runtime { text } => text
+                    .strip_prefix("<skyhook_job_events>\n")
+                    .and_then(|events| events.strip_suffix("\n</skyhook_job_events>")),
                 _ => None,
             })
-            .map(|text| serde_json::from_str(text).unwrap())
+            .map(|events| serde_json::from_str(events).unwrap())
             .collect()
     }
 
@@ -436,7 +435,7 @@ mod tests {
         let messages = rendered(&addendum);
         assert_eq!(messages.matches("please add an addendum").count(), 1);
         assert!(addendum.messages().any(|message| matches!(message,
-            Message::Assistant(content) if content == &[AssistantItem::text("report", 0, A)])));
+            Sent::Assistant(content) if content == &[AssistantItem::text("report", 0, A)])));
         if !parent_already_waiting {
             assert!(!tracking.requested_from(4));
             tracking.release(2);
@@ -782,12 +781,171 @@ mod tests {
         // Both entries share one persisted runtime envelope, not separate transactions.
         let records = runtime.store.records().await;
         let root_records = records.iter().filter(|record| record.agent == session.root);
-        let envelopes = count!(root_records, SessionEvent::MessageCommitted { message: Message::User(content) } if content.len() == 1 && content.iter().all(|block| matches!(block, UserContent::Runtime { .. })));
+        let envelopes = count!(root_records, SessionEvent::MessageCommitted { message: Message::User(content) } if content.len() == 1 && content.iter().all(|block| matches!(block, UserPart::JobEvents { .. })));
         assert_ne!(envelopes, 0);
         // the earlier answer must not finish the caller's turn
         assert!(!turn.is_finished());
         assert!(!runtime.jobs.has_pending(session.root_agent()).await);
         tracking.release(1);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    /// Publish through the same durable source-history path as a real child, without
+    /// invoking another provider. The owner stays gated while a test prepares receipts.
+    async fn fixture_child(session: &SessionHandle, root: &Path) -> (JobId, AgentId) {
+        let runtime = &session.runtime;
+        let spec = JobSpec {
+            background: true,
+            role: crate::job::JobRole::Agent,
+            ..JobSpec::test(session.root.clone(), "agent")
+        };
+        let id = runtime.jobs.test_running(spec).await.into_test_id();
+        let child = session.root.child(123);
+        let started = crate::session::fixture::child_started(
+            Some(id),
+            crate::execution::ExecutionLocation::root(root.to_path_buf()),
+        );
+        runtime.store.append(child.clone(), started).await.unwrap();
+        (id, child)
+    }
+
+    async fn fixture_message(
+        session: &SessionHandle,
+        job: JobId,
+        child: &AgentId,
+        text: &str,
+    ) -> MessageSeq {
+        let message = Message::Assistant(vec![AssistantItem::text("fixture-reply", 0, text)]);
+        let jobs = &session.runtime.jobs;
+        // Fixture progress stands in for a non-terminal child reply: it wakes the owner.
+        let committed =
+            jobs.commit_child_message(child, job, message, text.to_owned(), true, |_| Vec::new());
+        committed.await.unwrap()
+    }
+
+    /// The owner's pending events and the receipt that delivers them.
+    async fn pending_content(
+        session: &SessionHandle,
+    ) -> (Vec<UserPart>, crate::job::PendingDelivery) {
+        let runtime = &session.runtime;
+        let capabilities = &runtime.capabilities;
+        let pending = runtime.pending_event_content(session.root_agent(), capabilities);
+        pending.await.unwrap().expect("events are pending")
+    }
+
+    /// Snapshotting must not consume the only durable copy of a child's progress.
+    #[tokio::test(start_paused = true)]
+    async fn child_progress_snapshot_survives_abandoned_parent_commits() {
+        let tracking = tracking(vec![("root", answer()), ("root", answer())]);
+        let (root, session) = start(&tracking).await;
+        let runtime = &session.runtime;
+        let turn = prompt(&session);
+        tracking.request(0).await;
+        let (job, child) = fixture_child(&session, root.path()).await;
+        let first = fixture_message(&session, job, &child, "retained-progress").await;
+        let (content, batch) = pending_content(&session).await;
+        assert_eq!(content.len(), 1);
+        drop(batch);
+        assert!(runtime.jobs.has_pending(session.root_agent()).await);
+
+        let (retry, batch) = pending_content(&session).await;
+        // abandoning a receipt must retain its source message
+        assert_eq!(retry, content);
+        let sequence = batch.commit(Message::User(retry)).await.unwrap();
+        let records = runtime.store.records().await;
+        let committed = records
+            .iter()
+            .find(|record| record.sequence == RecordSeq::from(sequence));
+        let committed = committed.unwrap();
+        assert_eq!(&committed.agent, session.root_agent());
+        assert!(matches!(&committed.event,
+            SessionEvent::MessageCommitted { message: Message::User(saved) } if saved == &content));
+        assert!(!runtime.jobs.has_pending(session.root_agent()).await);
+        // Equal text is a new independent event when its source sequence differs.
+        let second = fixture_message(&session, job, &child, "retained-progress").await;
+        assert_ne!(first, second);
+        let (remaining, batch) = pending_content(&session).await;
+        let remaining = serde_json::to_string(&remaining).unwrap();
+        assert!(remaining.contains("retained-progress"));
+        drop(batch);
+        tracking.release(0);
+        let next = tracking.pass(1).await;
+        let delivered = agent_messages(&next);
+        assert_eq!(delivered.len(), 2);
+        let found = (&delivered[0]["message"], &delivered[1]["message"]);
+        assert_eq!(found, (&json!(first), &json!(second)));
+        assert!(!runtime.jobs.has_pending(session.root_agent()).await);
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_started_commit_finishes_acknowledgments_and_serializes_the_next_snapshot()
+    {
+        for with_completion in [true, false] {
+            cancelled_notification_commit(with_completion).await;
+        }
+    }
+
+    async fn cancelled_notification_commit(with_completion: bool) {
+        let tracking = tracking(vec![("root", answer()), ("root", answer())]);
+        let (root, session) = start(&tracking).await;
+        let runtime = &session.runtime;
+        let turn = prompt(&session);
+        tracking.request(0).await;
+        let completion = if with_completion {
+            Some(complete_background(&session, &session.root, "committed-completion").await)
+        } else {
+            None
+        };
+        let (job, child) = fixture_child(&session, root.path()).await;
+        fixture_message(&session, job, &child, "committed-progress").await;
+        let (content, batch) = pending_content(&session).await;
+        // progress and completion share the same envelope
+        assert_eq!(content.len(), 1);
+        assert!(runtime.jobs.has_pending(session.root_agent()).await);
+        let mut records = runtime.store.subscribe();
+        {
+            let commit = batch.commit(Message::User(content));
+            tokio::pin!(commit);
+            // Unpolled since scheduling: dropping the caller models an interrupt just
+            // after this transaction's ownership boundary.
+            assert!(futures_util::poll!(commit.as_mut()).is_pending());
+        }
+        {
+            // An immediate resumed request cannot snapshot progress still owned by
+            // the interrupted caller's transaction, even without any terminal job.
+            let next_batch = pending_content(&session);
+            tokio::pin!(next_batch);
+            assert!(futures_util::poll!(next_batch.as_mut()).is_pending());
+        }
+        bounded(async {
+            loop {
+                let record = records.recv().await.unwrap();
+                if matches!(&record.event, SessionEvent::MessageCommitted { message } if matches!(message, Message::User(_))) {
+                    break;
+                }
+            }
+            while runtime.jobs.has_pending(session.root_agent()).await {
+                poll().await;
+            }
+        })
+        .await;
+        // Duplicate wake commands do not reconstruct already acknowledged output.
+        session.root_tx.jobs_ready();
+        session.root_tx.jobs_ready();
+        tracking.release(0);
+        bounded(turn).await.unwrap().unwrap();
+        let turn = prompt(&session);
+        let next = tracking.pass(1).await;
+        assert_eq!(agent_messages(&next).len(), 1);
+        let completions = events(&next)
+            .iter()
+            .map(|event| event["id"].clone())
+            .collect::<Vec<_>>();
+        let expected = completion.map(|job| json!(job.get()));
+        assert_eq!(completions, expected.into_iter().collect::<Vec<_>>());
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }

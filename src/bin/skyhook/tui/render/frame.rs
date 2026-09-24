@@ -22,12 +22,12 @@ fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
     }
     // Advertise continuing only while something can be continued, so a refusal
     // names the key that resolves it.
-    if app.snapshot.activity.values().any(|activity| {
-        matches!(
-            activity,
-            AgentActivity::Failed(_) | AgentActivity::Interrupted
-        )
-    }) {
+    if app
+        .snapshot
+        .activity
+        .values()
+        .any(AgentActivity::is_retryable)
+    {
         hints.push((Command::Retry, "Continue"));
     }
     hints
@@ -516,7 +516,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let model = if app.selected.path().is_empty() {
         app.model.as_str()
     } else {
-        agent.map_or(app.model.as_str(), |a| a.model.as_str())
+        agent.map_or(app.model.as_str(), |a| a.model.as_deref().unwrap_or("-"))
     };
     let model = app
         .launch
@@ -604,35 +604,21 @@ fn footer_metadata(model: &str, session: &str, width: u16) -> String {
 mod tests {
     use super::*;
     use crate::tui::{
-        app::{Work, tests::fixture},
+        app::{
+            Work,
+            tests::{fixture, push_record},
+        },
         theme::ContentTheme,
     };
     use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
-    use skyhook::{
-        provider::protocol::{AssistantItem, Message},
-        session::{EventRecord, SessionEvent},
-    };
+    use skyhook::provider::protocol::AssistantItem;
+    use skyhook::session::{Message, SessionEvent};
     use std::time::Duration;
 
-    fn push_record(app: &mut App, event: SessionEvent) {
-        let records = &app.snapshot.records;
-        let sequence = records
-            .last_key_value()
-            .map_or(1, |(sequence, _)| sequence + 1);
-        let record = EventRecord {
-            id: skyhook::identity::EventId::generate().unwrap(),
-            sequence,
-            timestamp_millis: sequence as i64 * 1000,
-            agent: app.selected.clone(),
-            event,
-        };
-        app.snapshot.records.insert(sequence, record);
-    }
-
-    fn commit_message(app: &mut App, text: &str) {
+    async fn commit_message(app: &mut App, text: &str) {
         let message = Message::Assistant(vec![AssistantItem::text("frame-test", 0, text)]);
-        push_record(app, SessionEvent::MessageCommitted { message });
+        push_record(app, SessionEvent::MessageCommitted { message }).await;
         app.refresh();
     }
 
@@ -641,10 +627,8 @@ mod tests {
         use skyhook::agent::{TodoItem, TodoStatus};
         let (root, mut app) = fixture().await;
         let text = "right-aligned user text ".repeat(12);
-        let message = Message::User(vec![skyhook::provider::protocol::UserContent::Text {
-            text,
-        }]);
-        push_record(&mut app, SessionEvent::MessageCommitted { message });
+        let message = Message::User(vec![skyhook::session::UserPart::Text { text }]);
+        push_record(&mut app, SessionEvent::MessageCommitted { message }).await;
         let items = [
             ("parse", TodoStatus::Completed),
             (
@@ -661,7 +645,8 @@ mod tests {
             SessionEvent::TodosReplaced {
                 items: items.into(),
             },
-        );
+        )
+        .await;
         let screen = |app: &mut App, width| {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal.draw(|frame| draw(frame, app)).unwrap();
@@ -735,18 +720,30 @@ mod tests {
     #[tokio::test]
     async fn request_headers_stay_outside_the_scrolling_rows() {
         let (_root, mut app) = fixture().await;
+        let profile = app.launch.model.profile().clone();
+        let context = skyhook::session::ModelContext {
+            purpose: skyhook::session::ModelPurpose::Agent,
+            profile: skyhook::session::ProfileSnapshot {
+                name: "fixture".into(),
+                profile,
+            },
+            system: Vec::new(),
+            tools: Vec::new(),
+            response_schema: None,
+        };
+        let context = push_record(&mut app, SessionEvent::ModelContext { context }).await;
         for _ in 0..30 {
-            let purpose = skyhook::session::ModelPurpose::Agent;
             push_record(
                 &mut app,
                 SessionEvent::ModelRequested {
-                    context: 0,
+                    context,
+                    checkpoint: None,
                     history: Vec::new(),
                     tail: Vec::new(),
                     history_lifetime: Default::default(),
-                    purpose,
                 },
-            );
+            )
+            .await;
         }
         app.tab = Tab::Requests;
         app.refresh();
@@ -788,9 +785,12 @@ mod tests {
     async fn expanded_items_paint_solid_code_backgrounds_across_clipped_rows() {
         let (_root, mut app) = fixture().await;
         app.content_dirty = false;
-        let text = format!("Expandable tool\n{}", "body\n\n".repeat(20));
-        let mut entry =
-            model::Entry::expandable_text(model::EntryKey::Record(1), text, Surface::Tool);
+        let mut entry = model::Entry::titled(
+            model::EntryKey::UnsavedStatus(1),
+            model::Title::disclosed("Expandable tool", true),
+            "body\n\n".repeat(20),
+            Surface::Tool,
+        );
         entry.default_open = true;
         app.install_entries(vec![entry]);
         let p = Palette::new();
@@ -826,7 +826,8 @@ mod tests {
         commit_message(
             &mut app,
             "# Example\n\n```rust\nlet answer = 42;\n```\n\n**Done**",
-        );
+        )
+        .await;
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
         let accent = ContentTheme::new().accent;
         // A cold frame, an explicit reset at unchanged dimensions, then resizes
@@ -866,7 +867,7 @@ mod tests {
     #[tokio::test]
     async fn latest_activity_hit_restores_follow_tail_and_disappears() {
         let (_root, mut app) = fixture().await;
-        commit_message(&mut app, &"ordinary prose\n".repeat(100));
+        commit_message(&mut app, &"ordinary prose\n".repeat(100)).await;
         let latest = |app: &App| {
             let mut hits = app.hits.iter();
             hits.find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))

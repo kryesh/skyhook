@@ -1,36 +1,10 @@
-//! One journal-derived error block per failed logical request, not per attempt.
+//! One journal-derived status block per failed, retrying or interrupted request,
+//! not per attempt.
 use super::{Entry, EntryKey, Projection, Surface};
-use skyhook::agent::{AgentActivity, ObservationSnapshot};
+use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::ItemKind;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) enum RetryState {
-    Started {
-        attempt: u64,
-    },
-    Failed {
-        attempt: u64,
-        error: String,
-    },
-    /// The model declined to answer. Terminal for this request and never retried
-    /// automatically, so it is presented as an error rather than a pending retry.
-    Refused {
-        attempt: u64,
-        error: String,
-    },
-    Scheduled {
-        attempt: u64,
-        delay_millis: u64,
-        error: String,
-    },
-}
-
-impl RetryState {
-    pub(super) fn has_error(&self) -> bool {
-        !matches!(self, Self::Started { .. })
-    }
-}
+use skyhook::session::{RequestPhase, RequestSeq};
 
 /// Refusals are deterministic for a given request, so a plain retry repeats it.
 pub(super) const REFUSAL_HINT: &str =
@@ -63,51 +37,47 @@ pub(super) fn retry_entry(
     snapshot: &ObservationSnapshot,
     projection: &Projection,
     agent: &AgentId,
-    request: u64,
+    request: RequestSeq,
 ) -> Option<Entry> {
-    let info = projection.requests.get(&request)?;
-    let state = info.retry.as_ref()?;
-    // Started attempts have no diagnostic; scheduled retries always have one.
-    let refused = matches!(state, RetryState::Refused { .. });
-    let (attempt, delay_millis, error) = match state {
-        RetryState::Started { .. } => return None,
-        RetryState::Failed { attempt, error } | RetryState::Refused { attempt, error } => {
-            (*attempt, None, error)
+    let phase = &projection.ledger.get(request)?.phase;
+    let mut text = match phase {
+        RequestPhase::Requested
+        | RequestPhase::Open { .. }
+        | RequestPhase::Completed { .. }
+        | RequestPhase::Interrupted { attempt: None } => return None,
+        RequestPhase::Failed { attempt, error, .. } => {
+            let attempt = attempt.map_or(String::new(), |attempt| format!(" · attempt {attempt}"));
+            format!("Request failed{attempt}\n{}", diagnostic(error))
         }
-        RetryState::Scheduled {
+        RequestPhase::Refused { attempt, error } => {
+            format!(
+                "Model declined to respond · attempt {attempt}\n{}",
+                diagnostic(error)
+            )
+        }
+        RequestPhase::Retrying {
             attempt,
-            delay_millis,
+            delay,
             error,
-        } => (*attempt, Some(*delay_millis), error),
+        } => format!(
+            "Retrying · attempt {} · retry delay {} ms\n{}",
+            attempt + 1,
+            delay.as_millis(),
+            diagnostic(error)
+        ),
+        RequestPhase::Interrupted {
+            attempt: Some(attempt),
+        } => format!("Interrupted · attempt {attempt}"),
     };
-    let interrupted = projection.active_request.get(agent) == Some(&request)
-        && matches!(
-            snapshot.activity.get(agent),
-            Some(AgentActivity::Interrupted)
-        );
-    let running = projection.active_request.get(agent) == Some(&request)
-        && !interrupted
-        && delay_millis.is_some();
-    let label = if refused {
-        "Model declined to respond"
-    } else if interrupted {
-        "Interrupted"
-    } else if delay_millis.is_some() {
-        "Retrying"
-    } else {
-        "Request failed"
-    };
-    // A running header leaves its first cell to the spinner.
-    let gutter = if running { "  " } else { "" };
-    let mut text = format!("{gutter}{label} · attempt {attempt}");
-    if let Some(delay) = delay_millis.filter(|_| !interrupted) {
-        text.push_str(&format!(" · retry delay {delay} ms"));
-    }
-    text.push_str(&format!("\n{}", diagnostic(error)));
-    // Committed content is rendered by the normal message renderer, not twice.
-    if info.response.is_none()
-        && let Some(response) = snapshot.responses.get(&(agent.clone(), request))
-    {
+    // A partial response that committed (an abort) or settled without a failure
+    // (an interruption) renders at its journal position, not in the card.
+    let partial = matches!(
+        phase,
+        RequestPhase::Failed { message: None, .. }
+            | RequestPhase::Refused { .. }
+            | RequestPhase::Retrying { .. }
+    );
+    if partial && let Some(response) = snapshot.responses.get(&(agent.clone(), request)) {
         for block in response.blocks() {
             if block.kind == ItemKind::Text && !block.text.trim().is_empty() {
                 text.push('\n');
@@ -115,6 +85,7 @@ pub(super) fn retry_entry(
             }
         }
     }
+    let refused = matches!(phase, RequestPhase::Refused { .. });
     if refused {
         // Last line, after any partial response above, so the one actionable
         // instruction is not buried. The same request refuses again unchanged.
@@ -126,7 +97,7 @@ pub(super) fn retry_entry(
         Surface::Status
     };
     let mut entry = Entry::new(EntryKey::Retry(request), text, surface);
-    entry.running = running;
+    entry.running = matches!(phase, RequestPhase::Retrying { .. });
     Some(entry)
 }
 
@@ -142,59 +113,5 @@ mod tests {
         let long = diagnostic(&"界".repeat(DIAGNOSTIC_CHAR_LIMIT + 1));
         assert_eq!(long.chars().count(), DIAGNOSTIC_CHAR_LIMIT);
         assert!(long.ends_with('…'));
-    }
-    #[test]
-    fn retry_phases_preserve_unlimited_bounded_and_interrupted_labels() {
-        use skyhook::identity::SessionId;
-        let agent = AgentId::root(SessionId::from_bytes([1; 16]));
-        let mut projection = Projection::default();
-        let mut snapshot = ObservationSnapshot::default();
-        projection.active_request.insert(agent.clone(), 4);
-        let scheduled = |attempt, delay_millis| RetryState::Scheduled {
-            attempt,
-            delay_millis,
-            error: "failure".into(),
-        };
-        for (state, expected, running) in [
-            (RetryState::Started { attempt: 1 }, None, false),
-            (
-                RetryState::Failed {
-                    attempt: 1,
-                    error: "failure".into(),
-                },
-                Some("Request failed · attempt 1\nfailure"),
-                false,
-            ),
-            (
-                scheduled(2, 0),
-                Some("  Retrying · attempt 2 · retry delay 0 ms\nfailure"),
-                true,
-            ),
-            (
-                scheduled(3, 100),
-                Some("  Retrying · attempt 3 · retry delay 100 ms\nfailure"),
-                true,
-            ),
-        ] {
-            assert_eq!(state.has_error(), expected.is_some());
-            projection.requests.entry(4).or_default().retry = Some(state);
-            let entry = retry_entry(&snapshot, &projection, &agent, 4);
-            assert_eq!(entry.as_ref().map(Entry::text), expected);
-            assert_eq!(entry.as_ref().is_some_and(|entry| entry.running), running);
-        }
-        snapshot
-            .activity
-            .insert(agent.clone(), AgentActivity::Interrupted);
-        let entry = retry_entry(&snapshot, &projection, &agent, 4).unwrap();
-        assert_eq!(entry.text(), "Interrupted · attempt 3\nfailure");
-        assert!(!entry.running);
-        // Historical schedules retain their diagnostic but do not animate.
-        projection.active_request.insert(agent.clone(), 5);
-        let entry = retry_entry(&snapshot, &projection, &agent, 4).unwrap();
-        assert_eq!(
-            entry.text(),
-            "Retrying · attempt 3 · retry delay 100 ms\nfailure"
-        );
-        assert!(!entry.running);
     }
 }

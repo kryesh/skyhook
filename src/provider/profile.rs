@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::named_enum::named_enum;
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelProfile {
@@ -17,18 +19,19 @@ pub struct ModelProfile {
     pub hint: Option<String>,
 }
 
-/// How per-request runtime state (date, jobs, todos) reaches the model.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum StateMode {
-    /// Never send runtime state.
-    None,
-    /// Send current state after history; it never enters history.
-    #[default]
-    Dynamic,
-    /// Commit each request's state to history, keeping history append-only for providers
-    /// that bind signed reasoning to the exact earlier conversation.
-    Persist,
+named_enum! {
+    /// How per-request runtime state (date, jobs, todos) reaches the model.
+    #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+    pub enum StateMode {
+        /// Never send runtime state.
+        None = "none",
+        /// Send current state after history; it never enters history.
+        #[default]
+        Dynamic = "dynamic",
+        /// Commit each request's state to history, keeping history append-only for providers
+        /// that bind signed reasoning to the exact earlier conversation.
+        Persist = "persist",
+    }
 }
 
 impl ModelProfile {

@@ -1,5 +1,5 @@
 use crate::tool::ToolOptions;
-use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, Subject};
+use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
 use crate::tool::invocation::{LocalCatalogBuilder, LocalError};
 use crate::tool::output::ProducedOutput;
 use std::{
@@ -31,7 +31,10 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         |context, args| async move {
             let root = PathBuf::from(&args.path);
             let capture = context
-                .pending_stream_capture("/result/matches", crate::tool::output::CaptureKind::Json)
+                .pending_stream_capture(
+                    crate::tool::output::FieldPointer::result().property("matches"),
+                    crate::tool::output::CaptureKind::Json,
+                )
                 .await
                 .map_err(|error| {
                     error.operation(
@@ -64,7 +67,10 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         |context, args| async move {
             let root = PathBuf::from(&args.path);
             let capture = context
-                .pending_stream_capture("/result/paths", crate::tool::output::CaptureKind::Json)
+                .pending_stream_capture(
+                    crate::tool::output::FieldPointer::result().property("paths"),
+                    crate::tool::output::CaptureKind::Json,
+                )
                 .await
                 .map_err(|error| {
                     error.operation(
@@ -132,12 +138,12 @@ fn overrides<'a>(
     for (pattern, subject) in patterns {
         // Upstream diagnostics embed the pattern; identify its argument instead.
         builder.add(pattern).map_err(|_| {
-            LocalError::invalid("glob pattern could not be compiled")
+            LocalError::invalid_arguments("glob pattern could not be compiled")
                 .operation(Operation::Validate, subject)
         })?;
     }
     builder.build().map_err(|_| {
-        LocalError::invalid("glob patterns could not be compiled")
+        LocalError::invalid_arguments("glob patterns could not be compiled")
             .operation(Operation::Validate, Subject::Label("glob patterns".into()))
     })
 }
@@ -163,13 +169,14 @@ fn search_blocking(
         }
     }
     let matcher = matcher_builder.build(&args.pattern).map_err(|_| {
-        LocalError::invalid("regular expression could not be compiled")
+        LocalError::invalid_arguments("regular expression could not be compiled")
             .operation(Operation::Validate, Subject::argument(["pattern"]))
     })?;
 
-    let metadata = std::fs::metadata(root).map_err(LocalError::annotated(
-        DiagnosticContext::new(Operation::Inspect, Subject::path(root)),
-    ))?;
+    let metadata = std::fs::metadata(root).map_err(LocalError::annotated(PartialContext::new(
+        Operation::Inspect,
+        Subject::path(root),
+    )))?;
     let files: Box<dyn Iterator<Item = Result<PathBuf, LocalError>>> = if metadata.is_file() {
         Box::new(std::iter::once(Ok(root.to_owned())))
     } else if metadata.is_dir() {
@@ -204,7 +211,7 @@ fn search_blocking(
         .map_err(|error| capture_error(error, Operation::WriteCapture))?;
     for path in files {
         if cancellation.is_cancelled() {
-            return Err(LocalError::Cancelled
+            return Err(LocalError::cancelled()
                 .operation(Operation::Read, Subject::path(root))
                 .effects(Effects::OutputIncomplete));
         }
@@ -240,9 +247,10 @@ fn glob_blocking(
     capture: PendingOutput,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<FinishedOutput, LocalError> {
-    let metadata = std::fs::metadata(root).map_err(LocalError::annotated(
-        DiagnosticContext::new(Operation::Inspect, Subject::path(root)),
-    ))?;
+    let metadata = std::fs::metadata(root).map_err(LocalError::annotated(PartialContext::new(
+        Operation::Inspect,
+        Subject::path(root),
+    )))?;
     if !metadata.is_dir() {
         return Err(LocalError::failed("glob root is not a directory")
             .operation(Operation::Inspect, Subject::path(root)));
@@ -257,7 +265,7 @@ fn glob_blocking(
         .map_err(|error| capture_error(error, Operation::WriteCapture))?;
     for entry in walk.build() {
         if cancellation.is_cancelled() {
-            return Err(LocalError::Cancelled
+            return Err(LocalError::cancelled()
                 .operation(Operation::ReadDirectory, Subject::path(root))
                 .effects(Effects::OutputIncomplete));
         }
@@ -282,7 +290,7 @@ fn walk_error(error: ignore::Error, root: &Path) -> LocalError {
         ignore::Error::Partial(mut errors) if errors.len() == 1 => {
             return walk_error(errors.remove(0), root);
         }
-        ignore::Error::Io(error) => LocalError::Io(error),
+        ignore::Error::Io(error) => LocalError::io(error),
         ignore::Error::Loop { child, .. } => {
             return LocalError::failed("symbolic link loop")
                 .operation(Operation::ReadDirectory, Subject::path(child))
@@ -297,7 +305,7 @@ fn walk_error(error: ignore::Error, root: &Path) -> LocalError {
 }
 
 fn capture_error(error: std::io::Error, operation: Operation) -> LocalError {
-    LocalError::Io(error)
+    LocalError::io(error)
         .operation(operation, Subject::Label("result capture".into()))
         .effects(Effects::OutputIncomplete)
 }
@@ -404,10 +412,10 @@ impl From<std::io::Error> for SearchStop {
 impl SearchStop {
     fn into_tool_error(self, path: &Path) -> LocalError {
         match self {
-            Self::Cancelled => LocalError::Cancelled
+            Self::Cancelled => LocalError::cancelled()
                 .operation(Operation::Read, Subject::path(path))
                 .effects(Effects::OutputIncomplete),
-            Self::Io(error) => LocalError::Io(error)
+            Self::Io(error) => LocalError::io(error)
                 .operation(Operation::Read, Subject::path(path))
                 .effects(Effects::OutputIncomplete),
             Self::Capture(error) => capture_error(error, Operation::WriteCapture),
@@ -559,14 +567,17 @@ pub(crate) fn output_matcher(
     pattern: &str,
 ) -> Result<grep_regex::RegexMatcher, crate::tool::invocation::AdmissionError> {
     common_matcher().build(pattern).map_err(|_| {
-        crate::tool::invocation::AdmissionError::invalid("regular expression could not be compiled")
-            .operation(Operation::Validate, Subject::argument(["pattern"]))
+        crate::tool::invocation::AdmissionError::invalid_arguments(
+            "regular expression could not be compiled",
+        )
+        .operation(Operation::Validate, Subject::argument(["pattern"]))
     })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::CancellationToken;
     use crate::tool::ToolRegistryBuilder;
     use crate::tool::diagnostic::{Cause, IoKind};
     use crate::tool::output::OutputSink;
@@ -610,12 +621,10 @@ mod tests {
 
         fn pending(&self) -> PendingOutput {
             self.runtime
-                .block_on(
-                    self.output.pending_stream_capture(
-                        "/result/test",
-                        crate::tool::output::CaptureKind::Json,
-                    ),
-                )
+                .block_on(self.output.pending_stream_capture(
+                    crate::tool::output::FieldPointer::result().property("test"),
+                    crate::tool::output::CaptureKind::Json,
+                ))
                 .unwrap()
         }
     }
@@ -850,11 +859,11 @@ mod tests {
             "/result/matches"
         );
         let mut query = crate::job::JobOutputQuery::new(preview.job);
-        query.field = Some("/result/matches".into());
+        query.field = Some("/result/matches".parse().unwrap());
         query.pattern = Some("500: needle".into());
         let page = runtime
             .jobs
-            .inspect_output(query, &Default::default())
+            .inspect_output(query, CancellationToken::new(), &Default::default())
             .await
             .unwrap();
         let lines = page["presentation"]["preview"]["lines"].as_array().unwrap();

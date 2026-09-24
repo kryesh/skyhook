@@ -224,7 +224,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 plan.client.connect_timeout, plan.client.proxy_origin());
             let outcome = tokio::select! {
                 biased;
-                () = context.cancelled() => Ok(Err(diagnostics::FetchError::Passthrough(LocalError::Cancelled))),
+                () = context.cancelled() => Ok(Err(diagnostics::FetchError::Passthrough(LocalError::cancelled()))),
                 result = tokio::time::timeout(timeout, execute(&context, plan, &mut progress)) => result,
             };
             match outcome {
@@ -238,12 +238,13 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
 }
 
 fn invalid(error: impl std::fmt::Display) -> LocalError {
-    LocalError::invalid(error)
+    LocalError::invalid_arguments(error)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::job::CancellationToken;
     use crate::tool::ToolRegistryBuilder;
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use serde_json::json;
@@ -403,13 +404,13 @@ mod tests {
             assert_eq!(json!(projected), marker);
 
             let mut query = JobOutputQuery::new(call.job);
-            query.field = Some(pointer);
+            query.field = Some(pointer.parse().unwrap());
             let mut full = String::new();
             let mut pages = 0;
             loop {
                 let page = runtime
                     .jobs
-                    .inspect_output(query.clone(), &Default::default())
+                    .inspect_output(query.clone(), CancellationToken::new(), &Default::default())
                     .await
                     .unwrap();
                 let preview = &page["presentation"]["preview"];
@@ -428,7 +429,7 @@ mod tests {
             (query.start, query.offset) = (Some(1), Some(prefix.len()));
             let remainder = runtime
                 .jobs
-                .inspect_output(query, &Default::default())
+                .inspect_output(query, CancellationToken::new(), &Default::default())
                 .await
                 .unwrap();
             assert_eq!(

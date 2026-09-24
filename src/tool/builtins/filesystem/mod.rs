@@ -56,7 +56,10 @@ mod tests {
         );
         let permission = last_permission();
         assert_eq!(permission.capability, Capability::Read);
-        assert_eq!(permission.resource, ResourceId::path("root", &outside));
+        assert_eq!(
+            permission.resource,
+            ResourceId::path(&crate::target::TargetRef::Root, &outside)
+        );
 
         let destination = root.join("new-outside.txt");
         let write = json!({"path": destination, "content": "new"});
@@ -73,7 +76,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read.output.value["path"], "input.txt");
-        let expected = ResourceId::path("root", &child_workspace.join("input.txt"));
+        let expected = ResourceId::path(
+            &crate::target::TargetRef::Root,
+            &child_workspace.join("input.txt"),
+        );
         let requests = policy.requests.lock().unwrap();
         let permissions = &requests.last().unwrap().permissions;
         assert!(

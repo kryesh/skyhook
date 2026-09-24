@@ -3,7 +3,8 @@ use std::{collections::BTreeMap, num::NonZeroU16, path::PathBuf};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use super::{TargetDefinition, TargetError, TargetSource};
+use super::{TargetDefinition, TargetError};
+use crate::named_enum::named_enum;
 
 /// Named targets. A later configuration layer replaces a same-named target whole.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -25,9 +26,7 @@ impl TargetsConfig {
     pub(crate) fn definitions(&self) -> Result<Vec<TargetDefinition>, TargetError> {
         self.entries
             .iter()
-            .map(|(name, config)| {
-                TargetDefinition::from_config(name.clone(), config.clone(), TargetSource::Config)
-            })
+            .map(|(name, config)| TargetDefinition::from_config(name.clone(), config.clone()))
             .collect()
     }
 }
@@ -35,7 +34,7 @@ impl TargetsConfig {
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TargetConfig {
-    pub r#type: TargetConfigType,
+    pub r#type: Transport,
     /// Hostname or IP address.
     pub host: String,
     #[serde(default)]
@@ -50,35 +49,11 @@ pub struct TargetConfig {
     pub origin: Option<String>,
 }
 
-/// Transports supported when creating a named target.
+/// The transport of a named target; the session host is not a named target.
 #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum TargetConfigType {
+pub enum Transport {
     Ssh,
-}
-
-impl From<TargetConfigType> for TargetType {
-    fn from(value: TargetConfigType) -> Self {
-        match value {
-            TargetConfigType::Ssh => Self::Ssh,
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum TargetType {
-    Local,
-    Ssh,
-}
-
-impl TargetType {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Local => "local",
-            Self::Ssh => "ssh",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
@@ -114,13 +89,23 @@ pub enum TargetAuth {
     },
 }
 
+named_enum! {
+    /// The authentication method of a `TargetAuth`, without its key path.
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub enum SshAuth {
+        Default = "default",
+        Agent = "agent",
+        Key = "key",
+    }
+}
+
 impl TargetAuth {
     #[must_use]
-    pub const fn kind(&self) -> &'static str {
+    pub const fn kind(&self) -> SshAuth {
         match self {
-            Self::Default => "default",
-            Self::Agent => "agent",
-            Self::Key { .. } => "key",
+            Self::Default => SshAuth::Default,
+            Self::Agent => SshAuth::Agent,
+            Self::Key { .. } => SshAuth::Key,
         }
     }
 }

@@ -122,10 +122,10 @@ mod tests {
         let mut store = OutputStore::default();
         let (old, _) = store.begin(job()).unwrap();
         let mut query = JobOutputQuery::new(job());
-        query.field = Some("/result/stdout".into());
+        query.field = Some("/result/stdout".parse().unwrap());
         store.set_query(query);
         let (current, query) = store.begin(job()).unwrap();
-        assert_eq!(query.field.as_deref(), Some("/result/stdout"));
+        assert_eq!(query.field, Some("/result/stdout".parse().unwrap()));
         assert!(!store.complete(old, true, value("old")));
         assert!(store.begin(job()).is_none());
         assert!(!store.is_final(job()));

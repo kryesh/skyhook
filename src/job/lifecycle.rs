@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// What a journaled change hands back: the job's agent and whether its
+/// completions wake an owner.
+pub(super) struct Applied {
+    pub(super) agent: AgentId,
+    pub(super) background: bool,
+}
+
 impl JobManager {
     /// After stopping creation producers, wait for admitted creation owners to
     /// finish map publication and any abandoned-lease finalization.
@@ -43,7 +50,7 @@ impl JobManager {
             return Err(JobError::Unknown(parent));
         }
         let raw = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = JobId::new(raw).map_err(|error| JobError::Internal(error.to_string()))?;
+        let id = JobId::new(raw).map_err(|_| JobError::InvalidId)?;
         let created = self
             .inner
             .store
@@ -60,7 +67,6 @@ impl JobManager {
                     output_schema: spec.output_schema.clone(),
                     accepts_input: spec.accepts_input,
                     background: spec.background,
-                    authorization_scope: spec.authorization_scope,
                     location: spec.location.clone(),
                 },
             )
@@ -107,45 +113,59 @@ impl JobManager {
             result
         })
         .await
-        .map_err(|error| JobError::Internal(format!("{owner} owner lost: {error}")))?
+        .map_err(|error| JobError::OwnerLost {
+            owner,
+            reason: error.to_string(),
+        })?
     }
 
-    pub async fn transition(&self, id: JobId, state: JobState) -> Result<(), JobError> {
-        if state.is_terminal() {
-            return Err(JobError::InvalidTransition);
+    /// Journal one change to a job and apply it, in the order every change keeps
+    /// under the job's operation lock: refused before the append when the phase
+    /// does not admit its step, applied and announced after. `event` is what the
+    /// journal records; a volatile change records nothing. `settle` runs on the
+    /// entry with the change applied.
+    pub(super) async fn journal_change<T>(
+        &self,
+        id: JobId,
+        change: JobChange,
+        event: Option<SessionEvent>,
+        settle: impl FnOnce(&mut JobEntry) -> T,
+    ) -> Result<(Applied, T), JobError> {
+        let agent = {
+            let jobs = self.inner.jobs.lock().await;
+            let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
+            if !entry.admits(change.step()) {
+                return Err(JobError::AlreadyTerminal(id));
+            }
+            entry.agent.clone()
+        };
+        if let Some(event) = event {
+            self.inner.store.append(agent.clone(), event).await?;
         }
+        let (notify, background, settled) = {
+            let mut jobs = self.inner.jobs.lock().await;
+            let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
+            entry
+                .apply(change)
+                .map_err(|rejected| rejected.journaled(id))?;
+            (entry.notify.clone(), entry.background, settle(entry))
+        };
+        notify.notify_waiters();
+        Ok((Applied { agent, background }, settled))
+    }
+
+    /// A lease's startup transition. Its stage guarantees the order, so the only
+    /// phase that refuses is a job finished underneath it.
+    pub(super) async fn advance(&self, id: JobId, state: JobTransition) -> Result<(), JobError> {
         let operation = self.operation(id).await?.lock_owned().await;
         self.spawn_owned(
             operation,
             "transition publication",
             move |manager| async move {
-                let agent = {
-                    let jobs = manager.inner.jobs.lock().await;
-                    let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-                    let valid = matches!(
-                        (entry.state, state),
-                        (
-                            JobState::Queued,
-                            JobState::AwaitingApproval | JobState::Running
-                        ) | (JobState::AwaitingApproval, JobState::Running)
-                    );
-                    if !valid {
-                        return Err(JobError::InvalidTransition);
-                    }
-                    entry.agent.clone()
-                };
+                let event = SessionEvent::JobStateChanged { job: id, state };
                 manager
-                    .inner
-                    .store
-                    .append(agent, SessionEvent::JobStateChanged { job: id, state })
+                    .journal_change(id, JobChange::Advance(state), Some(event), |_| ())
                     .await?;
-                let notify = {
-                    let mut jobs = manager.inner.jobs.lock().await;
-                    let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-                    entry.state = state;
-                    entry.notify.clone()
-                };
-                notify.notify_waiters();
                 Ok(())
             },
         )
@@ -154,94 +174,91 @@ impl JobManager {
 
     pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
         let operation = self.operation(id).await?.lock_owned().await;
-        self.spawn_owned(operation, "finalization publication", move |manager| async move {
-            let _delivery = manager.inner.delivery_operation.lock().await;
-            let state = outcome.state();
-            let (output, mut diagnostic) = match outcome {
-                JobOutcome::Completed(output) => (Some(output), None),
-                JobOutcome::Failed { diagnostic, output } => (output, Some(diagnostic)),
-            };
-            let (agent, published) = {
-                let jobs = manager.inner.jobs.lock().await;
-                let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-                if entry.state.is_terminal()
-                    && !(entry.state == JobState::Interrupted && state == JobState::Cancelled)
-                {
-                    return Err(JobError::AlreadyTerminal(id));
-                }
-                let published = (entry.state == JobState::Interrupted).then(|| {
-                    if let (Some(diagnostic), Some(previous)) =
-                        (&mut diagnostic, &entry.diagnostic)
-                    {
-                        diagnostic.context.fallback(previous.context.clone());
-                    }
-                    (entry.images.clone(), entry.output_diagnostic.clone())
-                });
-                (entry.agent.clone(), published)
-            };
-            // Cancelling an interruption ends resumability, not its published
-            // output. Leave the saved document and capture references untouched;
-            // hydrating and resaving them would lose completeness and may be huge.
-            let (images, output_diagnostic) = if let Some(published) = published {
-                published
-            } else {
+        self.spawn_owned(
+            operation,
+            "finalization publication",
+            move |manager| async move {
+                let _delivery = manager.inner.delivery_operation.lock().await;
+                let end = outcome.end();
+                let (output, mut diagnostic) = match outcome {
+                    JobOutcome::Completed(output) => (Some(output), None),
+                    JobOutcome::Failed { diagnostic, output } => (output, Some(diagnostic)),
+                };
                 let capture_complete = output
                     .as_ref()
                     .is_some_and(|output| output.streams == crate::tool::StreamEnd::Finished);
                 let (mut output, images, captures, output_diagnostic) =
                     output.map_or((None, Vec::new(), Vec::new(), None), |mut output| {
                         let captures = output.take_captures();
-                        (Some(output.value), output.images, captures, output.diagnostic)
+                        (
+                            Some(output.value),
+                            output.images,
+                            captures,
+                            output.diagnostic,
+                        )
                     });
                 // Diagnostic facts, not an early capability-specific rendering, are
                 // authoritative. Saved documents keep only the registered slot.
                 if output_diagnostic.is_some()
-                    && let Some(message) = output.as_mut().and_then(|output| output.pointer_mut("/error/message"))
+                    && let Some(message) = output
+                        .as_mut()
+                        .and_then(|output| output.pointer_mut("/error/message"))
                 {
                     *message = Value::Null;
                 }
-                let saved = manager.output(id);
-                // Captures have independent pointer/type metadata. A failed tool need not
-                // produce a result, and unfinished JSON captures are not valid result trees.
-                let document = serde_json::json!({"capture_complete":capture_complete, "has_result":output.is_some(), "result":output, "error":null});
-                output::blocking(move || output::save_completed(&saved, &document, captures))
+                let mut finished = Box::new(Finished {
+                    end,
+                    images,
+                    diagnostic: None,
+                    output_diagnostic: output_diagnostic.map(PartialDiagnostic::resolve),
+                });
+                let previous = {
+                    let jobs = manager.inner.jobs.lock().await;
+                    let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
+                    if !entry.admits(JobStep::Finish(end)) {
+                        return Err(JobError::AlreadyTerminal(id));
+                    }
+                    entry.finished().cloned()
+                };
+                if let Some(previous) = previous {
+                    // Cancelling an interruption ends resumability, not its published
+                    // output. Leave the saved document and capture references untouched;
+                    // hydrating and resaving them would lose completeness and may be huge.
+                    if let Some(interrupted) = previous.diagnostic {
+                        diagnostic = diagnostic.map(|d| d.or(interrupted.context.into()));
+                    }
+                    finished.images = previous.images;
+                    finished.output_diagnostic = previous.output_diagnostic;
+                } else {
+                    let saved = manager.output(id);
+                    // Captures have independent pointer/type metadata. A failed tool need not
+                    // produce a result, and unfinished JSON captures are not valid result trees.
+                    output::blocking(move || {
+                        output::save_completed(&saved, output, capture_complete, captures)
+                    })
                     .await
-                    .map_err(|e| JobError::Internal(e.to_string()))?;
-                (images, output_diagnostic)
-            };
-            manager.inner
-                .store
-                .append(
-                    agent.clone(),
-                    SessionEvent::JobFinished {
-                        job: id,
-                        state,
-                        diagnostic: diagnostic.clone(),
-                        output_diagnostic: output_diagnostic.clone(),
-                        images: images.clone(),
-                    },
-                )
-                .await?;
-            let (notify, background) = {
-                let mut jobs = manager.inner.jobs.lock().await;
-                let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-                if entry.state.is_terminal()
-                    && !(entry.state == JobState::Interrupted && state == JobState::Cancelled)
-                {
-                    return Err(JobError::AlreadyTerminal(id));
+                    .map_err(|error| JobError::Output(Box::new(error)))?;
                 }
-                entry.apply_finished(state, images, diagnostic, output_diagnostic);
-                (entry.notify.clone(), entry.background)
-            };
-            notify.notify_waiters();
-            if background {
-                let _ = manager
-                    .inner
-                    .completions
-                    .send(JobCompletion { agent, job: id });
-            }
-            Ok(())
-        })
+                finished.diagnostic = diagnostic.map(PartialDiagnostic::resolve);
+                let event = SessionEvent::JobFinished {
+                    job: id,
+                    state: end,
+                    diagnostic: finished.diagnostic.clone(),
+                    output_diagnostic: finished.output_diagnostic.clone(),
+                    images: finished.images.clone(),
+                };
+                let (applied, ()) = manager
+                    .journal_change(id, JobChange::Finish(finished), Some(event), |_| ())
+                    .await?;
+                if applied.background {
+                    let _ = manager.inner.completions.send(JobCompletion {
+                        agent: applied.agent,
+                        job: id,
+                    });
+                }
+                Ok(())
+            },
+        )
         .await
     }
 
@@ -256,7 +273,7 @@ impl JobManager {
     ) -> Result<(), JobError> {
         let mut jobs = self.inner.jobs.lock().await;
         let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-        if entry.state.is_terminal() {
+        if entry.end().is_some() {
             task_abort.abort();
             return Err(JobError::AlreadyTerminal(id));
         }
@@ -264,41 +281,40 @@ impl JobManager {
         Ok(())
     }
 
-    /// Preserve a live, observable terminal result when durable finalization is unavailable.
+    /// Preserve a live, observable terminal result when durable finalization is
+    /// unavailable. Ordered after any finalization in flight, so it never ends a
+    /// job the journal has just ended differently.
     pub(crate) async fn fail_volatile(&self, id: JobId, error: String) {
-        let _delivery = self.inner.delivery_operation.lock().await;
-        let terminal = {
-            let mut jobs = self.inner.jobs.lock().await;
-            let Some(entry) = jobs.get_mut(&id) else {
-                return;
-            };
-            if entry.state.is_terminal() {
-                return;
-            }
-            entry.apply_finished(
-                JobState::Failed,
-                Vec::new(),
-                Some(
-                    crate::tool::ToolError::Failed(error)
-                        .operation(
-                            crate::tool::diagnostic::Operation::Save,
-                            crate::tool::diagnostic::Subject::Job(id),
-                        )
-                        .at(crate::tool::diagnostic::FailureSite::Host)
-                        .diagnostic(),
-                ),
-                None,
-            );
-            Some((entry.agent.clone(), entry.notify.clone(), entry.background))
+        let Ok(operation) = self.operation(id).await else {
+            return;
         };
-        if let Some((agent, notify, background)) = terminal {
-            notify.notify_waiters();
-            if background {
-                let _ = self
-                    .inner
-                    .completions
-                    .send(JobCompletion { agent, job: id });
-            }
+        let _operation = operation.lock_owned().await;
+        let _delivery = self.inner.delivery_operation.lock().await;
+        let failed = Box::new(Finished {
+            end: JobEnd::Failed,
+            images: Vec::new(),
+            diagnostic: Some(
+                crate::tool::ToolError::failed(error)
+                    .operation(
+                        crate::tool::diagnostic::Operation::Save,
+                        crate::tool::diagnostic::Subject::Job(id),
+                    )
+                    .at(crate::tool::diagnostic::FailureSite::Host)
+                    .diagnostic(),
+            ),
+            output_diagnostic: None,
+        });
+        let Ok((applied, ())) = self
+            .journal_change(id, JobChange::Finish(failed), None, |_| ())
+            .await
+        else {
+            return;
+        };
+        if applied.background {
+            let _ = self.inner.completions.send(JobCompletion {
+                agent: applied.agent,
+                job: id,
+            });
         }
     }
 }
@@ -347,8 +363,8 @@ mod tests {
             let (_root, jobs, agent) = super::super::tests::runtime().await;
             let id = jobs.test_create(JobSpec::test(agent, "capture")).await;
             let output = jobs.output(id);
-            let field = "/result/stdout";
-            let mut writer = PendingCapture::create(&output, field, CaptureKind::Text)
+            let field = "/result/stdout".parse().unwrap();
+            let mut writer = PendingCapture::create(&output, &field, CaptureKind::Text)
                 .unwrap()
                 .open();
             writer.write_all(b"partial \xff output").unwrap();
@@ -365,7 +381,7 @@ mod tests {
             let journaled = jobs.store().records().await.into_iter().any(|record| {
                 matches!(
                     record.event,
-                    SessionEvent::JobFinished { job, state: JobState::Completed, .. } if job == id
+                    SessionEvent::JobFinished { job, state: JobEnd::Completed, .. } if job == id
                 )
             });
             assert!(journaled, "unreadable: {unreadable}");
@@ -428,8 +444,7 @@ mod tests {
             assert_eq!(failed.state, JobState::Failed);
             assert!(
                 failed
-                    .error
-                    .as_deref()
+                    .rendered_error(&CapabilitySet::default())
                     .is_some_and(|error| error.contains(expected)),
                 "{tool}"
             );
@@ -486,35 +501,46 @@ mod tests {
         ResumeInput,
     }
 
-    /// Creates job 1 (except for `Create`) in the state each operation requires.
-    async fn owned_job(op: Op) -> (tempfile::TempDir, JobManager, AgentId, JobId) {
+    /// Creates job 1 (except for `Create`) in the state each operation requires,
+    /// holding its lease while it is live.
+    async fn owned_job(op: Op) -> (tempfile::TempDir, JobManager, AgentId, JobId, Box<dyn Send>) {
         let (root, jobs, agent) = crate::job::tests::runtime().await;
         let id = JobId::new(1).unwrap();
-        if op != Op::Create {
-            let spec = JobSpec {
-                accepts_input: true,
-                ..JobSpec::test(agent.clone(), "owned")
-            };
-            assert_eq!(jobs.test_create(spec).await, id);
-        }
-        match op {
+        let spec = JobSpec {
+            accepts_input: true,
+            ..JobSpec::test(agent.clone(), "owned")
+        };
+        let lease: Box<dyn Send> = match op {
+            Op::Create => Box::new(()),
+            Op::Transition => {
+                let lease = jobs.test_approving(spec).await;
+                assert_eq!(lease.id(), id);
+                Box::new(lease)
+            }
             Op::Claim | Op::Send => {
+                assert_eq!(jobs.test_create(spec).await, id);
                 let handler: ResumeHandler = Arc::new(|value, _| {
                     Box::pin(async move { Ok(ToolOutput::new(value.unwrap())) })
                 });
                 jobs.set_resume_handler(id, handler).await.unwrap();
                 jobs.test_finish(id, serde_json::json!("previous")).await;
+                Box::new(())
             }
             Op::RequestInput | Op::ResumeInput => {
-                jobs.transition(id, JobState::Running).await.unwrap();
+                let lease = jobs.test_running(spec).await;
+                assert_eq!(lease.id(), id);
                 if op == Op::ResumeInput {
-                    let question = serde_json::json!({"question":"before"});
+                    let question = crate::job::tests::question("before");
                     jobs.request_input(id, question).await.unwrap();
                 }
+                Box::new(lease)
             }
-            Op::Create | Op::Transition | Op::Finish => {}
-        }
-        (root, jobs, agent, id)
+            Op::Finish => {
+                assert_eq!(jobs.test_create(spec).await, id);
+                Box::new(())
+            }
+        };
+        (root, jobs, agent, id, lease)
     }
 
     async fn run(op: Op, jobs: JobManager, agent: AgentId, id: JobId) -> Result<(), JobError> {
@@ -523,7 +549,7 @@ mod tests {
                 .create(JobSpec::test(agent, "abandoned"))
                 .await
                 .map(drop),
-            Op::Transition => jobs.transition(id, JobState::Running).await,
+            Op::Transition => jobs.advance(id, JobTransition::Running).await,
             Op::Finish => {
                 let output = ToolOutput::new(serde_json::json!({"text":"done"}));
                 jobs.finish(id, JobOutcome::Completed(output)).await
@@ -531,7 +557,7 @@ mod tests {
             Op::Claim => jobs.claim(id).await,
             Op::Send => jobs.send(id, serde_json::json!("resumed")).await,
             Op::RequestInput => {
-                let question = serde_json::json!({"question":"after"});
+                let question = crate::job::tests::question("after");
                 jobs.request_input(id, question).await
             }
             Op::ResumeInput => jobs.resume_input(id).await,
@@ -554,7 +580,7 @@ mod tests {
         ];
         for op in ops {
             let case = format!("{op:?}");
-            let (_root, jobs, agent, id) = owned_job(op).await;
+            let (_root, jobs, agent, id, _lease) = owned_job(op).await;
             let state = async |jobs: &JobManager| jobs.metadata(id).await.ok().map(|m| m.state);
             let delivery = async |jobs: &JobManager| jobs.inner.jobs.lock().await[&id].delivery;
             let before = state(&jobs).await;
@@ -605,7 +631,7 @@ mod tests {
             Create | Finish | Claim | Send => state(&replay).await == Some(expected),
             Transition | RequestInput | ResumeInput => {
                 count(&jobs, |event| {
-                    matches!(event, SessionEvent::JobStateChanged { job, state } if *job == id && *state == expected)
+                    matches!(event, SessionEvent::JobStateChanged { job, state } if *job == id && JobState::from(*state) == expected)
                 })
                 .await
                     > 0
@@ -632,7 +658,7 @@ mod tests {
     #[tokio::test]
     async fn indeterminate_appends_do_not_publish_live_success_or_retry() {
         for op in [Op::Create, Op::Transition, Op::Finish, Op::Claim] {
-            let (_root, jobs, agent, id) = owned_job(op).await;
+            let (_root, jobs, agent, id, _lease) = owned_job(op).await;
             let sequence = jobs.store().records().await.len() as u64 + 1;
             jobs.store()
                 .fail_append_at(AppendBoundary::Publication)
@@ -641,7 +667,11 @@ mod tests {
             let JobError::Session(SessionError::AppendIndeterminate(recovery)) = error else {
                 panic!("{op:?}: expected recovery-required failure: {error}");
             };
-            assert_eq!(recovery.identity.sequence, sequence, "{op:?}");
+            assert_eq!(
+                recovery.identity.sequence,
+                RecordSeq::from(sequence),
+                "{op:?}"
+            );
             let retried = run(op, jobs.clone(), agent, id).await;
             assert!(
                 matches!(retried, Err(JobError::Session(SessionError::AppendUnavailable(ref later))) if later == &recovery),
@@ -656,7 +686,12 @@ mod tests {
                     assert!(jobs.inner.jobs.lock().await[&id].delivery == DeliveryState::Pending);
                 }
                 _ => {
-                    assert_eq!(jobs.metadata(id).await.unwrap().state, JobState::Queued);
+                    let expected = if op == Op::Transition {
+                        JobState::AwaitingApproval
+                    } else {
+                        JobState::Queued
+                    };
+                    assert_eq!(jobs.metadata(id).await.unwrap().state, expected);
                     assert!(jobs.operation(id).await.unwrap().try_lock().is_ok());
                 }
             }

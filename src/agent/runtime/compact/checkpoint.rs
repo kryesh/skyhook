@@ -3,21 +3,24 @@
 use super::retention::{
     included_message_jobs, included_output_jobs, retained_sources, retention_budget,
 };
-use super::{HarnessError, SessionRuntime, TokenMeter, TurnContext, compaction, context_sources};
+use super::{HarnessError, SessionRuntime, TokenMeter, TurnContext, compaction};
 use crate::{
     agent::runtime::state,
     identity::JobId,
     provider::{
         ProviderContext,
-        protocol::{HistoryLifetime, Message, ModelRequest, ResponseSchema},
+        protocol::{HistoryLifetime, ModelRequest, ResponseSchema},
     },
-    session::{CompactionCheckpoint, ModelCallOrigin, ModelPurpose, SessionEvent, project_history},
+    session::{
+        AttemptRef, CompactionCheckpoint, Message, ModelCallOrigin, ModelPurpose, RecordSeq,
+        RequestSeq, SessionEvent, project_history,
+    },
 };
 use std::collections::BTreeSet;
 
 pub(super) struct CompactionInput<'a> {
     pub(super) meter: &'a mut TokenMeter,
-    pub(super) context: u64,
+    pub(super) context: RecordSeq,
     pub(super) request: &'a ModelRequest,
     pub(super) max_context: u64,
     pub(super) model_attempt: &'a mut u64,
@@ -29,7 +32,7 @@ impl SessionRuntime {
         turn: &TurnContext<'_>,
         provider: &mut dyn ProviderContext,
         source: CompactionInput<'_>,
-        request_sequence: &mut Option<u64>,
+        request_sequence: &mut Option<RequestSeq>,
         launches: &mut Vec<(JobId, Option<ModelCallOrigin>)>,
     ) -> Result<bool, HarnessError> {
         let CompactionInput {
@@ -41,12 +44,10 @@ impl SessionRuntime {
         } = source;
         let agent = turn.agent;
         let records = self.store.records().await;
-        let frontier = records.last().map_or(0, |record| record.sequence);
-        let projected = project_history(&records, agent)?;
-        let previous = records.iter().rev().find_map(|record| {
-            (&record.agent == agent && matches!(record.event, SessionEvent::Compaction { .. }))
-                .then_some(record.sequence)
-        });
+        let frontier = records
+            .last()
+            .map_or(RecordSeq::default(), |record| record.sequence);
+        let projected = project_history(&records, agent);
         for launch in self.jobs.active_launches(agent).await {
             if !launches.contains(&launch) {
                 launches.push(launch);
@@ -62,18 +63,14 @@ impl SessionRuntime {
             turn.location,
         )
         .await;
+        // A fresh snapshot replaces the input's state tail, when its state mode sends one.
+        let sends_state = !input.tail.is_empty();
+        let state = sends_state.then(|| Message::User(vec![runtime]));
         let mut input = ModelRequest {
             model: input.model.clone(),
             system: input.system.clone(),
-            history: crate::session::merge_tool_results(
-                projected.iter().map(|(_, message)| message.clone()),
-            ),
-            // A fresh snapshot replaces the input's state tail, when its state mode sends one.
-            tail: if input.tail.is_empty() {
-                Vec::new()
-            } else {
-                vec![Message::User(vec![runtime])]
-            },
+            history: crate::session::render_history(projected.history()),
+            tail: state.iter().map(Message::render).collect(),
             history_lifetime: HistoryLifetime::Extends,
             tools: input.tools.clone(),
             reasoning: input.reasoning.clone(),
@@ -83,9 +80,10 @@ impl SessionRuntime {
         };
         let before_tokens = compaction::estimate_request(&input);
         // Keep only the original template for the post-compaction estimate.
-        let summary_history = std::mem::take(&mut input.history);
-        let summary_tail = std::mem::take(&mut input.tail);
-        let directive = compaction::directive();
+        input.history.clear();
+        input.tail.clear();
+        let summary_tail: Vec<Message> =
+            state.into_iter().chain([compaction::directive()]).collect();
         let mut summary_request = input.clone();
         // Summarization cannot execute tools. Keep their historical calls/results
         // as evidence, but advertise no callable tools on this request.
@@ -96,12 +94,12 @@ impl SessionRuntime {
         });
         let template = summary_request.clone();
         // Dropping tools changes the conversation, invalidating bound reasoning.
-        summary_request.history = summary_history
-            .into_iter()
-            .filter_map(Message::without_bound_reasoning)
-            .collect();
-        summary_request.tail = summary_tail;
-        summary_request.tail.push(directive);
+        summary_request.history = crate::session::render_history(
+            projected
+                .history()
+                .filter_map(Message::without_bound_reasoning),
+        );
+        summary_request.tail = summary_tail.iter().map(Message::render).collect();
         // The checkpoint replaces this history once the summary completes.
         summary_request.history_lifetime = HistoryLifetime::Detached;
         let profile = records
@@ -138,14 +136,14 @@ impl SessionRuntime {
                 agent.clone(),
                 SessionEvent::ModelRequested {
                     context: summary_context.sequence,
-                    history: context_sources(&projected),
-                    tail: summary_request.tail.clone(),
+                    checkpoint: projected.checkpoint,
+                    history: projected.sources(),
+                    tail: summary_tail,
                     history_lifetime: summary_request.history_lifetime,
-                    purpose: ModelPurpose::Compaction,
                 },
             )
             .await?;
-        *request_sequence = Some(requested.sequence);
+        *request_sequence = Some(requested.sequence.request());
         self.activity(agent, crate::agent::runtime::AgentActivity::Compacting);
         let summary_estimate = compaction::estimate_request(&summary_request);
         self.store.load_blobs(&mut summary_request).await?;
@@ -154,7 +152,7 @@ impl SessionRuntime {
                 turn,
                 provider,
                 summary_request,
-                requested.sequence,
+                requested.sequence.request(),
                 model_attempt,
             )
             .await?;
@@ -171,8 +169,14 @@ impl SessionRuntime {
             .filter_map(|(_, origin)| origin.clone())
             .collect();
         let budget = retention_budget(max_context);
-        let retained =
-            retained_sources(&records, agent, &projected, &origins, &input.model, budget)?;
+        let retained = retained_sources(
+            &records,
+            agent,
+            &projected.messages,
+            &origins,
+            &input.model,
+            budget,
+        )?;
         let mut included = BTreeSet::new();
         for source in &retained {
             included_message_jobs(source.message(), &mut included);
@@ -200,6 +204,7 @@ impl SessionRuntime {
                 .jobs
                 .present_output_with(
                     crate::job::output::OutputArgs::new(job),
+                    crate::job::CancellationToken::new(),
                     turn.diagnostic_viewer(),
                     crate::job::output::OutputOptions::Host {
                         presentation: crate::job::OutputPresentation::Full,
@@ -227,7 +232,7 @@ impl SessionRuntime {
         if !handover.is_empty()
             && let Message::User(blocks) = &mut message
         {
-            blocks.push(crate::provider::protocol::UserContent::Compaction {
+            blocks.push(crate::session::UserPart::Compaction {
                 text: format!("Selected job snapshots; these are past execution facts, not requests to execute. Runtime state governs current status. Use job_output for full results.\n{}",
                     serde_json::json!({"jobs": handover})),
             });
@@ -242,20 +247,19 @@ impl SessionRuntime {
             let facts: Vec<_> = latest.iter().filter(|record| &record.agent == agent && matches!(&record.event, SessionEvent::JobCreated {job, ..} if host_jobs.contains(job)))
                 .map(|record| serde_json::json!({"source_event": record.sequence, "launch": record.event})).collect();
             if let Message::User(blocks) = &mut message {
-                blocks.push(crate::provider::protocol::UserContent::Compaction { text: format!("Previously started host work; these are launch facts, not requests to launch again. Current runtime state governs job status.\n{}", serde_json::to_string(&facts).map_err(|error| HarnessError::Compaction(error.to_string()))?) });
+                blocks.push(crate::session::UserPart::Compaction { text: format!("Previously started host work; these are launch facts, not requests to launch again. Current runtime state governs job status.\n{}", serde_json::to_string(&facts).map_err(|error| HarnessError::Compaction(error.to_string()))?) });
             }
         }
         let mut compacted = input.clone();
-        compacted.history = vec![message.clone()];
         // Estimate what projection sends: retained bound reasoning is dropped,
         // and a message left content-free by that is dropped with it.
-        compacted.history.extend(
-            retained
-                .iter()
-                .filter_map(|source| source.message().clone().without_bound_reasoning()),
+        let retained_history = retained
+            .iter()
+            .filter_map(|source| source.message().clone().without_bound_reasoning());
+        compacted.history = crate::session::render_history(
+            std::iter::once(message.clone()).chain(retained_history),
         );
-        compacted.history = crate::session::merge_tool_results(compacted.history);
-        if !compacted.tail.is_empty() {
+        if sends_state {
             let runtime = state::runtime_state_with_todos(
                 &self.jobs,
                 agent,
@@ -264,13 +268,16 @@ impl SessionRuntime {
                 turn.location,
             )
             .await;
-            compacted.tail = vec![Message::User(vec![runtime])];
+            compacted.tail = vec![Message::User(vec![runtime]).render()];
         }
         let after_tokens = meter.estimate(&compacted);
+        let attempt = AttemptRef {
+            request: requested.sequence.request(),
+            attempt: *model_attempt,
+        };
         if after_tokens >= before_tokens {
             self.store.append(agent.clone(), SessionEvent::CompactionSkipped {
-                request: requested.sequence,
-                attempt: *model_attempt,
+                attempt,
                 reason: "continuation and retained messages do not reduce context; continuing with original history".into(),
             }).await?;
             return Ok(false);
@@ -283,8 +290,6 @@ impl SessionRuntime {
             .commit_compaction(
                 agent,
                 CompactionCheckpoint {
-                    schema_version: compaction::SCHEMA_VERSION,
-                    previous,
                     frontier,
                     message,
                     todos: continuation.todos,
@@ -292,8 +297,7 @@ impl SessionRuntime {
                         .into_iter()
                         .map(|source| source.into_sequence())
                         .collect(),
-                    request: requested.sequence,
-                    attempt: *model_attempt,
+                    attempt,
                     before_tokens,
                     after_tokens,
                 },
@@ -322,8 +326,8 @@ mod tests {
     use crate::{
         agent::TodoStatus,
         job::{JobOutcome, JobSpec},
-        provider::protocol::{AssistantItem, Message, ToolCall, ToolResult, UserContent},
-        session::{EventRecord, ModelPurpose, SessionEvent},
+        provider::protocol::{AssistantItem, ToolCall, ToolResult},
+        session::{EventRecord, Message, ModelPurpose, SessionEvent, UserPart},
         tool::ToolOutput,
     };
     use serde_json::{Value, json};
@@ -360,7 +364,7 @@ mod tests {
             is_error: false,
         };
         for message in [
-            Message::User(vec![UserContent::Attachment { attachment }]),
+            Message::User(vec![UserPart::Attachment { attachment }]),
             Message::Assistant(vec![AssistantItem::tool_call("image-call", 0, call)]),
             Message::Tool(vec![result]),
         ] {
@@ -372,18 +376,16 @@ mod tests {
             let request = requests.iter().find(|r| r.response_schema.is_some());
             let request = request.unwrap();
             let images = request.messages().flat_map(|message| match message {
-                Message::User(parts) => parts
+                Sent::User(parts) => parts
                     .iter()
                     .filter_map(|part| match part {
-                        UserContent::Attachment {
+                        SentPart::Attachment {
                             attachment: crate::media::AttachmentRef::Image(image),
                         } => Some(image),
                         _ => None,
                     })
                     .collect(),
-                Message::Tool(results) => {
-                    results.iter().flat_map(|result| &result.images).collect()
-                }
+                Sent::Tool(results) => results.iter().flat_map(|result| &result.images).collect(),
                 _ => Vec::new(),
             });
             assert_eq!(images.collect::<Vec<_>>(), [&user_image, &tool_image]);
@@ -454,17 +456,25 @@ mod tests {
         next.await.unwrap();
         let requests = fixture.provider.requests.lock().unwrap().clone();
         let request = requests.last().unwrap();
-        let Some(Message::User(content)) = request.tail.last() else {
+        let Some(Sent::User(content)) = request.tail.last() else {
             panic!("fresh state")
         };
-        let UserContent::Runtime { text } = &content[0] else {
+        let SentPart::Runtime { text } = &content[0] else {
             panic!("runtime state")
         };
         assert!(text.contains("Verify the fresh finding") && text.contains("in_progress"));
         assert!(!text.contains("root-research"));
         let found = runtime.todos.inspect(agent, None).await.unwrap().items;
         assert_eq!(found, updated);
-        let summaries = count!(&records, SessionEvent::ModelRequested { purpose, .. } if *purpose == ModelPurpose::Compaction);
+        let summaries = records
+            .iter()
+            .filter(|record| {
+                crate::session::request_context(record, |sequence| {
+                    crate::session::record_at(&records, sequence)
+                })
+                .is_some_and(|context| context.purpose == ModelPurpose::Compaction)
+            })
+            .count();
         assert_eq!(summaries, 2);
         fixture.session.shutdown().await.unwrap();
     }
@@ -499,7 +509,7 @@ mod tests {
         let records = fixture.records().await;
         let checkpoint = checkpoint(&records);
         assert!(
-            matches!(&checkpoint.message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserContent::Compaction { text } if text.contains(markdown) && !text.contains("Reasoning before the answer"))))
+            matches!(&checkpoint.message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserPart::Compaction { text } if text.contains(markdown) && !text.contains("Reasoning before the answer"))))
         );
         assert_eq!(checkpoint.todos, reconciled);
         let found = runtime.todos.inspect(agent, None).await.unwrap().items;
@@ -541,7 +551,7 @@ mod tests {
         let snapshot: Value = blocks
             .iter()
             .find_map(|block| match block {
-                UserContent::Compaction { text } => text
+                UserPart::Compaction { text } => text
                     .split_once('\n')
                     .and_then(|(_, value)| serde_json::from_str::<Value>(value).ok())
                     .filter(|value| value.get("jobs").is_some()),

@@ -1,7 +1,6 @@
 //! Batches questions and routes answers through host handlers or stable agent jobs.
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
-use serde_json::json;
 use std::{
     collections::{HashMap, HashSet},
     sync::{
@@ -115,6 +114,12 @@ impl PendingQuestion {
         Ok(())
     }
 
+    /// The batch less the questions `jobs` asked; None once every one is answered.
+    fn without(mut self, jobs: &[JobId]) -> Option<Self> {
+        self.entries.retain(|entry| !jobs.contains(&entry.job));
+        (!self.entries.is_empty()).then_some(self)
+    }
+
     fn output(&self) -> crate::agent::QuestionOutput {
         crate::agent::QuestionOutput {
             questions: self
@@ -181,8 +186,8 @@ impl QuestionCoordinator {
                 .capabilities()
                 .contains(crate::tool::policy::Capability::Interactive)
         {
-            return Err(crate::tool::ToolError::Denied(
-                "root questions require the interactive capability".to_owned(),
+            return Err(crate::tool::ToolError::denied(
+                "root questions require the interactive capability",
             )
             .operation(Operation::Authorize, subject)
             .effects(Effects::NotStarted));
@@ -217,8 +222,7 @@ impl QuestionCoordinator {
             });
         }
         received.await.unwrap_or_else(|_| {
-            Err(ToolError::Failed("question batch stopped".to_owned())
-                .operation(Operation::Receive, subject))
+            Err(ToolError::failed("question batch stopped").operation(Operation::Receive, subject))
         })
     }
 
@@ -226,22 +230,25 @@ impl QuestionCoordinator {
         &self,
         agent: &AgentId,
         calls: &[ToolCall],
-        registry: &crate::tool::ToolRegistry,
+        executor: &crate::tool::executor::ToolExecutor,
     ) {
+        let (registry, surface) = (executor.registry(), executor.surface_for_agent(agent));
         let count = calls
             .iter()
             .filter(|call| {
-                registry
-                    .get(call.name())
-                    .is_some_and(|tool| tool.job_role() == crate::job::JobRole::Question)
-                    && call
-                        .arguments()
-                        .get("bg")
-                        .is_none_or(serde_json::Value::is_boolean)
-                    && serde_json::from_value::<Question>(serde_json::Value::Object(
-                        call.arguments().clone(),
-                    ))
-                    .is_ok()
+                let Some((tool, spec)) = registry.get(call.name()).zip(surface.get(call.name()))
+                else {
+                    return false;
+                };
+                tool.job_role() == crate::job::JobRole::Question
+                    && crate::tool::registry::split_envelope(
+                        spec,
+                        &tool,
+                        serde_json::Value::Object(call.arguments().clone()),
+                    )
+                    .is_ok_and(|(arguments, _)| {
+                        serde_json::from_value::<Question>(arguments).is_ok()
+                    })
             })
             .count();
         if count > 0 {
@@ -258,18 +265,20 @@ impl QuestionCoordinator {
         if batch.is_empty() {
             return;
         }
-        let questions = batch
+        let entries = batch
             .iter()
-            .map(|pending| pending.question.clone())
-            .collect::<Vec<_>>();
-        if let Some(duplicate) = duplicate_question_id(questions.iter().map(|q| q.id.as_str())) {
-            send_question_error(
-                batch,
-                ToolError::Failed(format!("duplicate question id `{duplicate}`"))
-                    .effects(Effects::NotStarted),
-            );
-            return;
-        }
+            .map(|pending| {
+                PendingQuestionEntry::new(pending.question.clone(), pending.context.job())
+            })
+            .collect();
+        let questions = match PendingQuestion::new(entries) {
+            Ok(questions) => questions,
+            Err(error) => {
+                let error = super::tools::harness_error(error).effects(Effects::NotStarted);
+                send_question_error(batch, error);
+                return;
+            }
+        };
         // Only explicit background asks expose their own input state. Marking a
         // foreground ask WaitingInput would cause its native call to return early.
         for pending in &batch {
@@ -282,9 +291,9 @@ impl QuestionCoordinator {
                     .jobs
                     .request_input(
                         pending.context.job(),
-                        json!(crate::agent::QuestionOutput {
-                            questions: vec![pending.question.clone()]
-                        }),
+                        crate::agent::QuestionOutput {
+                            questions: vec![pending.question.clone()],
+                        },
                     )
                     .await
             {
@@ -293,8 +302,9 @@ impl QuestionCoordinator {
             }
         }
         if agent.parent().is_some() {
-            self.present_child_questions(batch).await;
+            self.present_child_questions(batch, questions).await;
         } else {
+            let questions = questions.output().questions;
             self.present_root_questions(agent, batch, questions).await;
         }
     }
@@ -355,7 +365,7 @@ impl QuestionCoordinator {
                         .unwrap_or(false)
                 {
                     item.take().unwrap().finish(
-                        Err(ToolError::Failed(QuestionError::Unavailable.to_string())
+                        Err(ToolError::failed(QuestionError::Unavailable.to_string())
                             .effects(Effects::NotStarted)),
                         Operation::Prepare,
                     );
@@ -371,7 +381,7 @@ impl QuestionCoordinator {
                     };
                     for (ask, result) in pending.iter_mut().zip(results) {
                         if let Some(ask) = ask.take() {
-                            ask.finish(result.map_err(ToolError::Failed), Operation::Receive);
+                            ask.finish(result.map_err(ToolError::failed), Operation::Receive);
                         }
                     }
                 }
@@ -384,20 +394,7 @@ impl QuestionCoordinator {
         }
     }
 
-    async fn present_child_questions(&self, batch: Vec<PendingAsk>) {
-        let entries = batch
-            .iter()
-            .map(|pending| {
-                PendingQuestionEntry::new(pending.question.clone(), pending.context.job())
-            })
-            .collect();
-        let questions = match PendingQuestion::new(entries) {
-            Ok(questions) => questions,
-            Err(error) => {
-                send_question_error(batch, super::tools::harness_error(error));
-                return;
-            }
-        };
+    async fn present_child_questions(&self, batch: Vec<PendingAsk>, questions: PendingQuestion) {
         let owner_job = match self.open_child_questions(questions).await {
             Ok(owner_job) => owner_job,
             Err(error) => {
@@ -433,7 +430,7 @@ impl QuestionCoordinator {
             questions
         };
         self.jobs
-            .request_input(owner_job, json!(combined.output()))
+            .request_input(owner_job, combined.output())
             .await?;
         pending.insert(owner_job, combined);
         Ok(owner_job)
@@ -445,20 +442,18 @@ impl QuestionCoordinator {
         resolved_jobs: &[JobId],
     ) -> Result<(), HarnessError> {
         let mut pending = self.pending.lock().await;
-        let Some(batch) = pending.get_mut(&owner_job) else {
+        let Some(batch) = pending.remove(&owner_job) else {
             return Ok(());
         };
         // Retire resolved questions before the fallible job update, so a failure
         // never routes later answers to finished ask jobs.
-        batch
-            .entries
-            .retain(|entry| !resolved_jobs.contains(&entry.job));
-        if batch.entries.is_empty() {
-            pending.remove(&owner_job);
-            self.jobs.resume_input(owner_job).await?;
-        } else {
-            let output = json!(batch.output());
-            self.jobs.request_input(owner_job, output).await?;
+        match batch.without(resolved_jobs) {
+            Some(remaining) => {
+                let output = remaining.output();
+                pending.insert(owner_job, remaining);
+                self.jobs.request_input(owner_job, output).await?;
+            }
+            None => self.jobs.resume_input(owner_job).await?,
         }
         Ok(())
     }
@@ -485,11 +480,7 @@ impl QuestionCoordinator {
         let answers = if pending.entries.len() == 1 && !keyed {
             vec![(&pending.entries[0], value)]
         } else {
-            let values = value.as_object().ok_or_else(|| {
-                HarnessError::Agent(
-                    "answers to multiple questions must be keyed by question id".to_owned(),
-                )
-            })?;
+            let values = keyed_answers(&value).map_err(HarnessError::Agent)?;
             let answers = pending
                 .entries
                 .iter()
@@ -571,10 +562,10 @@ fn question_subject(question: &Question) -> Subject {
 }
 
 fn send_question_error(batch: Vec<PendingAsk>, error: ToolError) {
-    let diagnostic = error.diagnostic();
+    let (diagnostic, _) = error.into_facts();
     for pending in batch {
         pending.finish(
-            Err(ToolError::from_diagnostic(diagnostic.clone(), None)),
+            Err(ToolError::from_facts(diagnostic.clone(), None)),
             Operation::Prepare,
         );
     }
@@ -585,6 +576,15 @@ fn duplicate_question_id<'a>(mut ids: impl Iterator<Item = &'a str>) -> Option<&
     ids.find(|id| !seen.insert(*id))
 }
 
+/// Answers to several questions, keyed by question id.
+fn keyed_answers(
+    answer: &serde_json::Value,
+) -> Result<&serde_json::Map<String, serde_json::Value>, String> {
+    answer
+        .as_object()
+        .ok_or_else(|| "answers to multiple questions must be keyed by question id".to_owned())
+}
+
 fn split_answers(
     ids: &[String],
     answer: serde_json::Value,
@@ -592,11 +592,9 @@ fn split_answers(
     if ids.len() == 1 {
         return vec![Ok(answer)];
     }
-    let Some(answers) = answer.as_object() else {
-        return ids
-            .iter()
-            .map(|_| Err("answers to multiple questions must be keyed by question id".to_owned()))
-            .collect();
+    let answers = match keyed_answers(&answer) {
+        Ok(answers) => answers,
+        Err(error) => return ids.iter().map(|_| Err(error.clone())).collect(),
     };
     ids.iter()
         .map(|id| {
@@ -616,6 +614,7 @@ mod tests {
         job::{JobEnvelope, JobSpec, JobState},
         tool::{ToolContext, ToolError, policy::Capability},
     };
+    use serde_json::json;
 
     type Batches = Arc<StdMutex<Vec<Vec<Question>>>>;
     type Backgrounds = Arc<StdMutex<Vec<bool>>>;
@@ -663,7 +662,7 @@ mod tests {
             Subject::Label("question \"stable-id\"".into())
         );
 
-        for cause in [ToolError::Cancelled, ToolError::Interrupted] {
+        for cause in [ToolError::cancelled(), ToolError::interrupted()] {
             let diagnostic = cause.diagnostic();
             let error =
                 super::finish_child_answer(&question, Err(cause), Err(failure())).unwrap_err();
@@ -732,7 +731,9 @@ mod tests {
             ids.sort_unstable();
             assert_eq!(ids, ["first", "second"]);
             let requests = requests.lock().unwrap();
-            let Message::Tool(results) = requests[1].history.last().unwrap() else {
+            let crate::provider::protocol::Message::Tool(results) =
+                requests[1].history.last().unwrap()
+            else {
                 panic!("missing tool results")
             };
             assert_eq!(results[0].result["result"], "yes");
@@ -755,10 +756,10 @@ mod tests {
             let call = |id| ToolCall::new(id, "ask", json!({"id":id, "prompt":"Question?"}));
             let calls = ["first", "second"].map(|id| call(id).unwrap());
             let (runtime, agent) = (&session.runtime, session.root.clone());
-            let registry = runtime.executor.registry();
-            let prepared = runtime
-                .questions
-                .prepare_question_batch(&agent, &calls, registry);
+            let prepared =
+                runtime
+                    .questions
+                    .prepare_question_batch(&agent, &calls, &runtime.executor);
             prepared.await;
             let source = format!(
                 "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer:answer.unwrap()}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
@@ -774,7 +775,12 @@ mod tests {
                     let job = serde_json::from_value(job.clone()).unwrap();
                     let result = terminal(&session, job).await;
                     assert_eq!(result.state, JobState::Failed);
-                    assert!(result.error.unwrap().contains("question cancelled"));
+                    assert!(
+                        result
+                            .rendered_error(&CapabilitySet::default())
+                            .unwrap()
+                            .contains("question cancelled")
+                    );
                 } else if background {
                     let error = ask["error"].as_str().unwrap();
                     assert!(error.contains("question cancelled"));
@@ -796,12 +802,9 @@ mod tests {
         let (executor, jobs) = (&session.runtime.executor, &session.runtime.jobs);
         let waiting_with = |count: usize| {
             move |job: &JobEnvelope| {
-                job.state == JobState::WaitingInput
-                    && job.output.as_ref().unwrap()["questions"]
-                        .as_array()
-                        .unwrap()
-                        .len()
-                        == count
+                job.question
+                    .as_ref()
+                    .is_some_and(|question| question.questions.len() == count)
             }
         };
         let mut asks = Vec::new();
@@ -828,7 +831,7 @@ mod tests {
             if index == 0 {
                 let remaining = jobs.snapshot(owner).await.unwrap();
                 assert_eq!(remaining.state, JobState::WaitingInput);
-                assert_eq!(remaining.output.unwrap()["questions"][0]["id"], "second");
+                assert_eq!(remaining.question.unwrap().questions[0].id, "second");
             }
         }
         assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
@@ -850,9 +853,7 @@ mod tests {
                 accepts_input: true,
                 ..JobSpec::test(session.root.child(1), "ask")
             };
-            let ask = jobs.create(spec).await.unwrap().into_test_fixture();
-            jobs.transition(ask.id(), JobState::Running).await.unwrap();
-            asks.push(ask);
+            asks.push(jobs.test_running(spec).await);
         }
         let coordinator = &session.runtime.questions;
         let pending = pending_questions(&[("first", asks[0].id()), ("second", asks[1].id())]);
@@ -871,14 +872,18 @@ mod tests {
             }
         })
         .await;
-        let (mut first_input, mut second_input) = (asks[0].take_input(), asks[1].take_input());
+        let mut asks = asks.into_iter();
+        let (first, second) = (asks.next().unwrap(), asks.next().unwrap());
+        let resolved = [first.id(), second.id()];
+        let cancellation = first.cancellation_token();
+        let (mut first_input, _first) = first.split();
+        let (mut second_input, _second) = second.split();
         assert_eq!(first_input.recv().await.unwrap(), json!("yes"));
         assert_eq!(second_input.recv().await.unwrap(), json!(2));
-        let resolved = [asks[0].id(), asks[1].id()];
         let resolve = coordinator.resolve_child_question(owner, &resolved);
         resolve.await.unwrap();
         assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
-        let pending = pending_questions(&[("cancel", asks[0].id())]);
+        let pending = pending_questions(&[("cancel", resolved[0])]);
         coordinator.open_child_questions(pending).await.unwrap();
         bounded(async {
             for _ in 0..40 {
@@ -888,9 +893,9 @@ mod tests {
             coordinator.cancel_child_question(owner).await;
         })
         .await;
-        assert!(asks[0].cancellation_token().is_cancelled());
-        for ask in asks {
-            jobs.cancel(ask.id()).await.unwrap();
+        assert!(cancellation.is_cancelled());
+        for ask in resolved {
+            jobs.cancel(ask).await.unwrap();
         }
         jobs.cancel(owner).await.unwrap();
         shutdown_session(session).await;
@@ -928,10 +933,9 @@ mod tests {
             role: crate::job::JobRole::Question,
             ..JobSpec::test(session.root.child(1), "ask")
         };
-        let mut ask = jobs.create(spec).await.unwrap().into_test_fixture();
+        let ask = jobs.test_running(spec).await;
         let job = ask.id();
-        jobs.transition(job, JobState::Running).await.unwrap();
-        let mut input = ask.take_input();
+        let (mut input, _worker) = ask.split();
         for _ in 0..input.max_capacity() {
             jobs.send(job, json!("backlog")).await.unwrap();
         }
@@ -1016,7 +1020,7 @@ mod tests {
             let launched = bounded(session.run_script(launch)).await.unwrap();
             let owner = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
             let waiting = until(&session, owner, |job| job.state == JobState::WaitingInput).await;
-            assert_eq!(waiting.output.unwrap()["questions"][0]["id"], "child");
+            assert_eq!(waiting.question.unwrap().questions[0].id, "child");
             let send = format!("return await tool.job({owner}).send({{value:'parent-answer'}});");
             bounded(session.run_script(send)).await.unwrap();
             assert_eq!(terminal(&session, owner).await.output, Some(json!("done")));
@@ -1060,16 +1064,17 @@ mod tests {
                     background,
                     ..JobSpec::test(session.root.clone(), "ask")
                 };
-                let mut lease = jobs.create(spec).await.unwrap().into_test_fixture();
+                let lease = jobs.test_running(spec).await;
+                let job = lease.id();
                 let here = crate::execution::ExecutionLocation::root(root.path().to_owned());
                 let subject = crate::tool::authorization::AuthorizationSubject {
                     agent: session.root.clone(),
-                    job: lease.id(),
+                    job,
                     parent: None,
                     capabilities: session.runtime.capabilities.clone(),
                     cancellation: lease.cancellation_token(),
                 };
-                let input = lease.take_input();
+                let (input, _worker) = lease.split();
                 let context = ToolContext::new(subject, here.clone(), here, input, jobs.clone());
                 let question = Question {
                     id: "bypass".into(),
@@ -1082,9 +1087,9 @@ mod tests {
                     error.diagnostic().cause,
                     crate::tool::diagnostic::Cause::Denied(_)
                 ));
-                let state = jobs.snapshot(lease.id()).await.unwrap().state;
+                let state = jobs.snapshot(job).await.unwrap().state;
                 assert_ne!(state, JobState::WaitingInput);
-                jobs.cancel(lease.id()).await.unwrap();
+                jobs.cancel(job).await.unwrap();
             }
             assert!(batches.lock().unwrap().is_empty());
             shutdown_session(session).await;

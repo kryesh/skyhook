@@ -52,7 +52,7 @@ impl<T> Item<T> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum OutputAction {
     Automatic,
-    Field(String),
+    Field(FieldPointer),
     Search,
     Next,
 }
@@ -444,8 +444,7 @@ impl App {
             }
             Command::Retry => {
                 if self.start.is_creating() || self.stopping
-                    || !self.snapshot.activity.values().any(|activity|
-                        matches!(activity, AgentActivity::Failed(_) | AgentActivity::Interrupted))
+                    || !self.snapshot.activity.values().any(AgentActivity::is_retryable)
                 {
                     self.notice("No failed or interrupted turns to retry");
                     return;
@@ -453,16 +452,13 @@ impl App {
                 let Some(session) = self.session().cloned() else { return; };
                 // Only own a new root operation if the old one has already ended.
                 // Resuming suspended children must leave a waiting parent alone.
-                let owns_operation = !self.operation && matches!(
-                    self.snapshot.activity.get(self.root_agent()),
-                    Some(AgentActivity::Failed(_) | AgentActivity::Interrupted),
-                );
+                let owns_operation = !self.operation && self.root_interrupted();
                 if owns_operation { self.operation = true; }
                 // A pending model or mode choice is otherwise captured only by a submitted
                 // message. Forward it here too: a refusal repeats deterministically
                 // on the same model, so "swap then continue" must actually swap.
                 let active = self.projection.agents.iter().find(|agent| &agent.id == self.root_agent());
-                let model = active.map(|agent| &agent.model);
+                let model = active.and_then(|agent| agent.model.as_ref());
                 let model = (model != Some(&self.model)).then(|| self.model.clone());
                 let mode = active.and_then(|agent| agent.mode.as_ref());
                 let mode = (mode != Some(&self.mode)).then(|| self.mode.clone());
@@ -471,9 +467,10 @@ impl App {
                 notices.send("Continue requested");
                 let requested = model.is_some() || mode.is_some();
                 tokio::spawn(async move {
-                    let outcome = session
-                        .continue_turn_with(skyhook::agent::ContinueOptions { model, mode })
-                        .await;
+                    let outcome = match session.selection(model.as_deref(), mode.as_deref()) {
+                        Ok(selection) => session.continue_turn_with(selection).await,
+                        Err(error) => Err(error),
+                    };
                     let result = match &outcome {
                         // Only a continued root turn adopts a model change, and the
                         // gate above admits historical failures too, so report what
@@ -810,7 +807,7 @@ impl App {
                                 .query(job)
                                 .cloned()
                                 .unwrap_or_else(|| JobOutputQuery::new(job));
-                            query.field = Some(field.to_owned());
+                            query.field = Some(field);
                             query.start = Some(start);
                             query.offset = (offset != 0).then_some(offset);
                             self.set_output_query(query);
@@ -869,7 +866,8 @@ impl App {
 fn output_items(fields: Vec<String>) -> Vec<Item<OutputAction>> {
     let mut items: Vec<_> = fields
         .into_iter()
-        .map(|field| Item::new(OutputAction::Field(field.clone()), field, ""))
+        .filter_map(|field| FieldPointer::try_from(field).ok())
+        .map(|field| Item::new(OutputAction::Field(field.clone()), field.to_string(), ""))
         .collect();
     items.extend([
         Item::new(
@@ -877,7 +875,11 @@ fn output_items(fields: Vec<String>) -> Vec<Item<OutputAction>> {
             "automatic output",
             "structured result and live captures",
         ),
-        Item::new(OutputAction::Field(String::new()), "complete result", ""),
+        Item::new(
+            OutputAction::Field(FieldPointer::root()),
+            "complete result",
+            "",
+        ),
         Item::new(OutputAction::Search, "Search this field", "regex"),
         Item::new(OutputAction::Next, "Next page", ""),
     ]);
@@ -1005,7 +1007,7 @@ mod tests {
         let job = job_named(&app, "script");
         select_job(&mut app, job);
         let mut query = JobOutputQuery::new(job);
-        query.field = Some("/result/console".into());
+        query.field = Some("/result/console".parse().unwrap());
         let session = app.session().unwrap().clone();
         let page = session.inspect_output(query.clone()).await.unwrap();
         assert_eq!(page.get("result"), Some(&serde_json::Value::Null));
@@ -1038,18 +1040,18 @@ mod tests {
         // Discovery must not replace the displayed page.
         assert_eq!(app.outputs.get(&job).unwrap().value(), &page);
         assert_eq!(
-            app.outputs.query(job).unwrap().field.as_deref(),
-            Some("/result/console")
+            app.outputs.query(job).unwrap().field,
+            Some("/result/console".parse().unwrap())
         );
         let custom = "/result/value/custom/a~1b~0c/0";
         let selected = items
             .iter()
-            .position(|item| item.value == OutputAction::Field(custom.into()));
+            .position(|item| item.value == OutputAction::Field(custom.parse().unwrap()));
         menu.selected = selected.unwrap();
         app.choose();
         assert_eq!(
-            app.outputs.query(job).unwrap().field.as_deref(),
-            Some(custom)
+            app.outputs.query(job).unwrap().field,
+            Some(custom.parse().unwrap())
         );
         let query = app.outputs.query(job).unwrap().clone();
         let output = session.inspect_output(query).await.unwrap();
@@ -1066,7 +1068,7 @@ mod tests {
                 let snapshot = session.observe().await.snapshot;
                 let failures = snapshot.records.values().filter(|record| {
                     matches!(record.event, SessionEvent::JobFinished {
-                        job, state: skyhook::job::JobState::Failed, ..
+                        job, state: skyhook::job::JobEnd::Failed, ..
                     } if job == child_job)
                 });
                 // The live job settles just after its journal commit; a retry

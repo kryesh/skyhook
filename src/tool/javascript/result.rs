@@ -131,12 +131,12 @@ mod tests {
                 "only terminal publication inserts a captured placeholder"
             );
             assert_eq!(output.captures.len(), 1);
-            assert_eq!(output.captures[0].field(), "/result/console");
+            assert_eq!(output.captures[0].field().as_str(), "/result/console");
             // snapshot() hydrates finalized captures; only the stored terminal
             // document uses a captured-field placeholder.
             let (expected, outcome) = if failure {
                 let expected = json!({"value": null, "console": "captured console\n", "failure": {"message": "failed"}});
-                let outcome = crate::tool::ToolError::Failed("failed".into())
+                let outcome = crate::tool::ToolError::failed("failed")
                     .with_result(output)
                     .into();
                 (expected, outcome)

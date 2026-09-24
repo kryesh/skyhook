@@ -1,15 +1,18 @@
 //! Job output rows per generation. Capture chunks record the newlines before them,
 //! so line seeks are indexed lookups.
 
-use super::{Db, DbError, DbResult, SharedDb, params, rejected, u64_of as integer};
+use super::{
+    Db, DbError, DbResult, SharedDb, corrupt, enum_column, params, rejected, u64_of as integer,
+};
+use crate::{job::CaptureKind, tool::output::FieldPointer};
 
 /// Largest chunk row written; readers accept any length the schema allows.
 const CHUNK_BYTES: usize = 256 * 1024;
 
 pub(crate) struct CaptureRow {
     pub id: i64,
-    pub pointer: String,
-    pub kind: String,
+    pub pointer: FieldPointer,
+    pub kind: CaptureKind,
     /// Bytes stored so far, including a capture whose writer is still open.
     pub bytes: u64,
     /// The saved terminal document references this capture as a result field.
@@ -25,7 +28,20 @@ pub(crate) struct CaptureExtent {
 }
 
 pub(crate) struct Presentation {
-    pub fields: Vec<String>,
+    pub fields: Vec<FieldPointer>,
+}
+
+/// One run's saved product: its result JSON, if the run produced one, and the
+/// pointers of the captures it references.
+pub(crate) struct SavedOutput {
+    pub result: Option<String>,
+    pub captures_complete: bool,
+    pub fields: Vec<FieldPointer>,
+}
+
+/// The schema checks pointer spelling on insert; a row that fails here is corrupt.
+fn pointer(row: &libsql::Row, index: i32) -> DbResult<FieldPointer> {
+    FieldPointer::try_from(row.get::<String>(index)?).map_err(|error| corrupt(error.to_string()))
 }
 
 fn generation(db: &Db, job: u64) -> DbResult<i64> {
@@ -56,10 +72,10 @@ fn extent(db: &Db, capture: i64) -> DbResult<CaptureExtent> {
         .unwrap_or_default())
 }
 
-/// Every generation's saved documents and capture bytes, as lossy text.
+/// Every generation's saved result (as `{"result": ...}`) and capture bytes, as lossy text.
 pub(crate) fn output_text(db: &Db) -> DbResult<Vec<String>> {
     let mut text = db.query(
-        "SELECT document FROM job_output ORDER BY job, generation",
+        "SELECT json_object('result', json(result)) FROM job_output ORDER BY job, generation",
         Vec::new(),
         |row| Ok(row.get::<String>(0)?),
     )?;
@@ -84,8 +100,8 @@ impl SharedDb {
     pub(crate) fn create_capture(
         &self,
         job: u64,
-        pointer: &str,
-        kind: &str,
+        pointer: &FieldPointer,
+        kind: CaptureKind,
         rendered: bool,
     ) -> Result<Option<i64>, DbError> {
         let db = self.lock();
@@ -94,19 +110,23 @@ impl SharedDb {
             "INSERT INTO job_capture (job, generation, pointer, capture_kind, rendered) \
              VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (job, generation, pointer) DO NOTHING \
              RETURNING id",
-            params![job, generation, pointer, kind, rendered],
+            params![job, generation, pointer.as_str(), kind, rendered],
             |row| Ok(row.get::<i64>(0)?),
         )
     }
 
     /// A finished cached rendering of `pointer` in the current generation.
-    pub(crate) fn rendering(&self, job: u64, pointer: &str) -> Result<Option<i64>, DbError> {
+    pub(crate) fn rendering(
+        &self,
+        job: u64,
+        pointer: &FieldPointer,
+    ) -> Result<Option<i64>, DbError> {
         self.lock().query_row(
             "SELECT c.id FROM job_capture c JOIN job_generation g \
                ON g.job = c.job AND g.generation = c.generation \
              WHERE c.job = ?1 AND c.pointer = ?2 AND c.rendered = 1 \
                AND c.final_bytes IS NOT NULL",
-            params![job, pointer],
+            params![job, pointer.as_str()],
             |row| Ok(row.get::<i64>(0)?),
         )
     }
@@ -117,7 +137,11 @@ impl SharedDb {
             .map(drop)
     }
 
-    pub(crate) fn resolve_capture_kind(&self, capture: i64, kind: &str) -> Result<(), DbError> {
+    pub(crate) fn resolve_capture_kind(
+        &self,
+        capture: i64,
+        kind: CaptureKind,
+    ) -> Result<(), DbError> {
         self.lock()
             .execute(
                 "UPDATE job_capture SET capture_kind = ?2 WHERE id = ?1 AND capture_kind <> ?2",
@@ -151,8 +175,8 @@ impl SharedDb {
             |row| {
                 Ok(CaptureRow {
                     id: row.get(0)?,
-                    pointer: row.get(1)?,
-                    kind: row.get(2)?,
+                    pointer: pointer(row, 1)?,
+                    kind: enum_column(row, 2)?,
                     bytes: integer(row.get(3)?),
                     referenced: row.get::<i64>(4)? != 0,
                 })
@@ -260,11 +284,12 @@ impl SharedDb {
             .collect())
     }
 
-    /// Replace the current generation's terminal document and its referenced captures.
+    /// Replace the current generation's product and its referenced captures.
     pub(crate) fn save_output(
         &self,
         job: u64,
-        document: &str,
+        result: Option<&str>,
+        captures_complete: bool,
         referenced: &[i64],
     ) -> Result<(), DbError> {
         let db = self.lock();
@@ -272,10 +297,11 @@ impl SharedDb {
             let generation = generation(&db, job)?;
             let output = db
                 .query_row(
-                    "INSERT INTO job_output (job, generation, document) VALUES (?1, ?2, ?3) \
-                     ON CONFLICT (job, generation) DO UPDATE SET document = excluded.document \
-                     RETURNING id",
-                    params![job, generation, document],
+                    "INSERT INTO job_output (job, generation, captures_complete, result) \
+                     VALUES (?1, ?2, ?3, ?4) ON CONFLICT (job, generation) DO UPDATE \
+                     SET captures_complete = excluded.captures_complete, \
+                     result = excluded.result RETURNING id",
+                    params![job, generation, captures_complete, result],
                     |row| Ok(row.get::<i64>(0)?),
                 )?
                 .ok_or_else(|| rejected("job output upsert returned no row"))?;
@@ -299,14 +325,21 @@ impl SharedDb {
         })
     }
 
-    /// The current generation's document and the pointers of its referenced captures.
-    pub(crate) fn output(&self, job: u64) -> Result<Option<(String, Vec<String>)>, DbError> {
+    /// The current generation's product, once the run finished.
+    pub(crate) fn output(&self, job: u64) -> Result<Option<SavedOutput>, DbError> {
         let db = self.lock();
-        let Some((output, document)) = db.query_row(
-            "SELECT o.id, o.document FROM job_output o JOIN job_generation g \
-               ON g.job = o.job AND g.generation = o.generation WHERE o.job = ?1",
+        let Some((output, result, captures_complete)) = db.query_row(
+            "SELECT o.id, o.result, o.captures_complete FROM job_output o \
+             JOIN job_generation g ON g.job = o.job AND g.generation = o.generation \
+             WHERE o.job = ?1",
             params![job],
-            |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<i64>(0)?,
+                    row.get::<Option<String>>(1)?,
+                    row.get::<bool>(2)?,
+                ))
+            },
         )?
         else {
             return Ok(None);
@@ -315,9 +348,13 @@ impl SharedDb {
             "SELECT c.pointer FROM job_output_field f JOIN job_capture c ON c.id = f.capture \
              WHERE f.output = ?1 ORDER BY c.pointer",
             params![output],
-            |row| Ok(row.get::<String>(0)?),
+            |row| pointer(row, 0),
         )?;
-        Ok(Some((document, fields)))
+        Ok(Some(SavedOutput {
+            result,
+            captures_complete,
+            fields,
+        }))
     }
 
     pub(crate) fn save_presentation(
@@ -336,7 +373,7 @@ impl SharedDb {
                 db.execute(
                     "INSERT INTO job_presentation (job, generation, pointer) \
                      VALUES (?1, ?2, ?3)",
-                    params![job, generation, pointer],
+                    params![job, generation, pointer.as_str()],
                 )?;
             }
             Ok(())
@@ -349,7 +386,7 @@ impl SharedDb {
                ON g.job = p.job AND g.generation = p.generation \
              WHERE p.job = ?1 ORDER BY p.id",
             params![job],
-            |row| Ok(row.get::<String>(0)?),
+            |row| pointer(row, 0),
         )?;
         Ok(Presentation { fields })
     }

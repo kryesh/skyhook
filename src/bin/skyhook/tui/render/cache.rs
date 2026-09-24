@@ -58,23 +58,10 @@ pub(super) struct EntryLayout<'a> {
     pub(super) expanded: bool,
 }
 
-/// Markdown layout and syntax metadata must see the same source: generated
-/// message/reasoning titles are not part of the Markdown body. Offsets are in
-/// the original UTF-8 entry text; both consumers use this one checked boundary.
-pub(super) fn markdown_body_offset(entry: &model::Entry) -> usize {
-    if matches!(entry.surface, Surface::User | Surface::Agent) || entry.expandable() {
-        entry
-            .text()
-            .find('\n')
-            .map_or(entry.text().len(), |end| end + 1)
-    } else {
-        0
-    }
-}
-
+/// Markdown layout and syntax metadata see the same source: the body under any
+/// generated title.
 pub(super) fn update_markdown_fences(entry: &model::Entry, fences: &mut code::Fences) {
-    let offset = markdown_body_offset(entry);
-    fences.update(&entry.text()[offset..]);
+    fences.update(entry.body());
 }
 
 pub(super) fn update_entry_rows(
@@ -111,21 +98,21 @@ pub(super) fn update_entry_rows(
         let block_width = geometry.block_width;
         let make_row = |line, header, continued| geometry.row(line, header, continued);
         let blank = |surface, x, width| geometry.blank(surface, x, width);
-        let has_title = block || entry.expandable();
-        let body_offset = markdown_body_offset(entry);
         rows.clear();
         if block {
             rows.push(blank(entry.surface, x, block_width));
         }
-        if has_title {
-            let (title, _) = entry.text().split_once('\n').unwrap_or((entry.text(), ""));
+        // A running entry leaves its first cells to the spinner: after the
+        // disclosure glyph of a title, or before an untitled body.
+        if let Some(title) = entry.title() {
+            let title = model::clean(&title.line(entry.running));
             let title = if block {
                 Line::from(Span::styled(
-                    model::clean(title),
+                    title,
                     Style::default().add_modifier(Modifier::BOLD),
                 ))
             } else {
-                Line::from(model::clean(title))
+                Line::from(title)
             };
             for (part, line) in wrap_words(title, body_width as usize)
                 .into_iter()
@@ -134,9 +121,8 @@ pub(super) fn update_entry_rows(
                 rows.push(make_row(line, part == 0, part > 0));
             }
         }
-        let body = &entry.text()[body_offset..];
-        let prefix = if entry.surface == Surface::Reasoning && !entry.expandable() && entry.running
-        {
+        let body = entry.body();
+        let prefix = if entry.title().is_none() && entry.running {
             "  "
         } else {
             ""
@@ -354,69 +340,18 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
 mod tests {
     use super::*;
 
-    fn text_entry(text: String, surface: Surface, expandable: bool) -> model::Entry {
-        let key = model::EntryKey::Record(1);
-        if expandable {
-            model::Entry::expandable_text(key, text, surface)
-        } else {
-            model::Entry::new(key, text, surface)
-        }
-    }
-
-    fn fences(body: &str) -> code::Fences {
-        let mut fences = code::Fences::default();
-        fences.update(body);
-        fences
-    }
-
-    // Checks the shared entry-to-body translation at the title boundary.
-    #[test]
-    fn fence_metadata_uses_body_offsets_for_full_replacements() {
-        let body = "2. ```rust\n   let café = 42;\n   ```\n\nTail";
-        for (surface, expandable, title) in [
-            (Surface::Agent, false, "Agent [worker] 🦀\n"),
-            (Surface::User, false, "User\n"),
-            (Surface::Reasoning, true, "▾ Thinking\n"),
-            (Surface::Reasoning, false, ""),
-        ] {
-            let full = format!("{title}{body}");
-            let mut actual = code::Fences::default();
-            let boundary = title.len();
-            for end in [
-                0,
-                boundary.saturating_sub(1),
-                boundary,
-                boundary + 1,
-                full.len(),
-            ] {
-                let entry = text_entry(full[..end].to_owned(), surface, expandable);
-                update_markdown_fences(&entry, &mut actual);
-                let expected = &full[boundary.min(end)..end];
-                let expected = if title.is_empty() {
-                    &full[..end]
-                } else {
-                    expected
-                };
-                assert_eq!(
-                    actual.document,
-                    fences(expected).document,
-                    "{title:?}, end={end}"
-                );
-            }
-            assert_eq!(actual.document.sections.len(), 1);
-            // Preserve the authoritative equal-length replacement scenario.
-            let entry = text_entry(full.replace("42", "43"), surface, expandable);
-            update_markdown_fences(&entry, &mut actual);
-            assert_eq!(actual.document, fences(&body.replace("42", "43")).document);
-        }
-    }
-
     #[test]
     fn full_entry_replacements_preserve_unicode_on_resize() {
         let highlights = super::super::super::tool_view::HighlightCache::default();
-        let source = "Title\nwords 界 👩‍💻\n\n```rust\nlet n = 4;\n```\n\n| A | B |\n| - | - |\n| x | long words |";
+        let body =
+            "words 界 👩‍💻\n\n```rust\nlet n = 4;\n```\n\n| A | B |\n| - | - |\n| x | long words |";
         for surface in [Surface::Reasoning, Surface::User, Surface::Agent] {
-            let mut entry = text_entry(source.to_owned(), surface, true);
+            let mut entry = model::Entry::titled(
+                model::EntryKey::UnsavedStatus(1),
+                model::Title::disclosed("Title", true),
+                body.to_owned(),
+                surface,
+            );
             entry.default_open = true;
             let mut rows = Vec::new();
             for width in [24, 8, 40] {

@@ -12,7 +12,7 @@ use tokio::fs;
 
 use crate::tool::{
     AdmissionError, RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
-    diagnostic::{DiagnosticContext, FailureSite, Operation, Subject, deserialize_arguments},
+    diagnostic::{FailureSite, Operation, PartialContext, Subject, deserialize_arguments},
     policy::{Capability, CapabilitySet},
 };
 use crate::{
@@ -55,7 +55,7 @@ impl TryFrom<SkillArgs> for SkillRequest {
             ("to", args.to.as_deref()),
         ] {
             if value.is_some_and(|value| value.trim().is_empty()) {
-                return Err(AdmissionError::InvalidArguments(format!(
+                return Err(AdmissionError::invalid_arguments(format!(
                     "{name} must not be empty"
                 )));
             }
@@ -63,9 +63,7 @@ impl TryFrom<SkillArgs> for SkillRequest {
         let operation = match (args.path, args.to) {
             (None, None) => SkillOperation::Instructions,
             (None, Some(_)) => {
-                return Err(AdmissionError::InvalidArguments(
-                    "to requires path".to_owned(),
-                ));
+                return Err(AdmissionError::invalid_arguments("to requires path"));
             }
             (Some(asset), None) => SkillOperation::Inspect { asset },
             // Destination is an ordinary authorized workspace path, NOT a
@@ -210,8 +208,8 @@ fn host_warning(error: ToolError) -> String {
         .render(&CapabilitySet::default())
 }
 
-fn at(operation: Operation, path: &Path) -> DiagnosticContext {
-    DiagnosticContext::new(operation, Subject::path(path))
+fn at(operation: Operation, path: &Path) -> PartialContext {
+    PartialContext::new(operation, Subject::path(path))
 }
 
 async fn scan_root(
@@ -224,7 +222,7 @@ async fn scan_root(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
         Err(error) => {
             warnings.push(host_warning(
-                ToolError::Io(error).context(at(Operation::ReadDirectory, root)),
+                ToolError::io(error).context(at(Operation::ReadDirectory, root)),
             ));
             return;
         }
@@ -236,7 +234,7 @@ async fn scan_root(
             Ok(None) => break,
             Err(error) => {
                 warnings.push(host_warning(
-                    ToolError::Io(error).context(at(Operation::ReadDirectory, root)),
+                    ToolError::io(error).context(at(Operation::ReadDirectory, root)),
                 ));
                 break;
             }
@@ -315,7 +313,7 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
         .map_err(|error| match error {
             BoundedReadError::TooLarge { .. } => exceeds(),
             BoundedReadError::Io(error) => {
-                ToolError::Io(error).context(at(Operation::Read, &instruction_path))
+                ToolError::io(error).context(at(Operation::Read, &instruction_path))
             }
         })?;
     let instructions = String::from_utf8(bytes).map_err(|error| {
@@ -463,7 +461,7 @@ async fn read_asset(
         .map_err(|error| match error {
             BoundedReadError::TooLarge { .. } => exceeds(),
             BoundedReadError::Io(error) => {
-                ToolError::Io(error).context(at(Operation::Read, source))
+                ToolError::io(error).context(at(Operation::Read, source))
             }
         })
 }
@@ -577,11 +575,11 @@ async fn asset_tree(
                 if !is_root {
                     tree.insert_str(tree.len() - 1, " [unreadable]");
                 }
-                unreadable.push(ToolError::Io(error).context(at(Operation::ReadDirectory, &path)));
+                unreadable.push(ToolError::io(error).context(at(Operation::ReadDirectory, &path)));
                 continue;
             }
             (Err(error), None) => {
-                return Err(ToolError::Io(error).context(at(Operation::ReadDirectory, &path)));
+                return Err(ToolError::io(error).context(at(Operation::ReadDirectory, &path)));
             }
         };
         let mut children = Vec::new();
@@ -636,8 +634,8 @@ fn check_asset_syntax(asset: &str) -> Result<(), ToolError> {
             .components()
             .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
     {
-        return Err(ToolError::InvalidArguments(
-            "asset path must be relative and cannot contain `..`".to_owned(),
+        return Err(ToolError::invalid_arguments(
+            "asset path must be relative and cannot contain `..`",
         ));
     }
     Ok(())
@@ -883,7 +881,7 @@ mod tests {
     fn skill_requests_admit_operations_and_reject_blank_or_malformed_fields() {
         let request = |value| {
             serde_json::from_value::<SkillArgs>(value)
-                .map_err(AdmissionError::invalid)
+                .map_err(AdmissionError::invalid_arguments)
                 .and_then(SkillRequest::try_from)
         };
         let operation = |value| request(value).unwrap().operation;
@@ -913,7 +911,7 @@ mod tests {
         ] {
             let result = request(value.clone());
             assert!(
-                matches!(result, Err(AdmissionError::InvalidArguments(_))),
+                matches!(result, Err(error) if matches!(error.diagnostic().cause, Cause::InvalidArguments(_))),
                 "{value}"
             );
         }

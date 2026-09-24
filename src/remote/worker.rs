@@ -133,8 +133,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
             Request::AuthorizationDecision {
                 request_id,
                 authorization_id,
-                allowed,
-                reason,
+                decision,
             } => {
                 if let Some(request) = self.active.get(&request_id)
                     && let Some(sender) = request
@@ -143,14 +142,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
                         .unwrap_or_else(PoisonError::into_inner)
                         .remove(&authorization_id)
                 {
-                    let decision = if allowed {
-                        Ok(())
-                    } else {
-                        Err(AdmissionError::Denied(
-                            reason.unwrap_or_else(|| "denied by host".into()),
-                        ))
-                    };
-                    let _ = sender.send(decision);
+                    let _ = sender.send(decision.into_result().map_err(AdmissionError::from));
                 }
             }
             control @ (Request::OpenSsh { .. }
@@ -212,11 +204,11 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
                     result = &mut call => result,
                     () = cancellation.cancelled() => {
                         let _ = tokio::time::timeout(CANCELLATION_GRACE, &mut call).await;
-                        Err(LocalError::Cancelled)
+                        Err(LocalError::cancelled())
                     }
                 };
                 if cancellation.is_cancelled() {
-                    Err(LocalError::Cancelled)
+                    Err(LocalError::cancelled())
                 } else {
                     result
                 }
@@ -224,7 +216,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
             .await;
             let result = match produced.settle().await {
                 Ok(()) => execution.map(Into::into).map_err(remote_error),
-                Err(error) => Err(remote_error(LocalError::Io(error))),
+                Err(error) => Err(remote_error(LocalError::io(error))),
             };
             (WorkerTask::Request(id), sender.finish(result).await)
         });
@@ -306,8 +298,8 @@ impl<W: AsyncWrite + Unpin + Send + 'static> LocalAuthorizer for ForwardAuthoriz
         let request_id = self.request_id;
         let tool = self.tool.clone();
         Box::pin(async move {
-            let id = id
-                .ok_or_else(|| AdmissionError::Failed("authorization ID space exhausted".into()))?;
+            let id =
+                id.ok_or_else(|| AdmissionError::failed("authorization ID space exhausted"))?;
             let (sender, receiver) = oneshot::channel();
             pending
                 .lock()
@@ -327,7 +319,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> LocalAuthorizer for ForwardAuthoriz
             .await?;
             receiver
                 .await
-                .map_err(|_| AdmissionError::Denied("host authorization channel closed".into()))?
+                .map_err(|_| AdmissionError::denied("host authorization channel closed"))?
         })
     }
 }
@@ -398,7 +390,7 @@ mod tests {
                     output: Box::new(output),
                     owner: Box::new(()),
                 },
-                "remote",
+                &"remote".parse().unwrap(),
                 authorization.clone(),
                 Arc::new(RejectSensitivePrompts),
                 &tokio_util::task::TaskTracker::new(),
@@ -418,28 +410,26 @@ mod tests {
             let mut spec = JobSpec::test(self.runtime.agent.clone(), name);
             spec.arguments = arguments.clone();
             spec.location = ExecutionLocation {
-                target: "remote".into(),
+                target: "remote".parse().unwrap(),
                 workspace: std::fs::canonicalize(".").unwrap(),
             };
             let location = spec.location.clone();
-            let mut lease = self.runtime.jobs.create(spec).await.unwrap();
+            let lease = self.runtime.jobs.create(spec).await.unwrap();
+            let lease = lease.test_run().await;
             let job = lease.id();
-            self.runtime
-                .jobs
-                .transition(job, JobState::Running)
-                .await
-                .unwrap();
+            let cancellation = lease.cancellation_token();
+            let (input, worker) = lease.split();
             let context = ToolContext::new(
                 AuthorizationSubject {
                     agent: self.runtime.agent.clone(),
                     job,
                     parent: None,
                     capabilities,
-                    cancellation: lease.cancellation_token(),
+                    cancellation,
                 },
                 location,
                 ExecutionLocation::root(self.runtime.root.path().to_owned()),
-                lease.take_input(),
+                input,
                 self.runtime.jobs.clone(),
             )
             .with_invocation_authority(
@@ -449,7 +439,7 @@ mod tests {
             );
             let connection = self.connection.clone();
             let name = name.to_owned();
-            lease
+            worker
                 .start_supervised(async move {
                     let result = connection
                         .execute(
@@ -460,7 +450,7 @@ mod tests {
                         )
                         .await;
                     if context.is_cancelled() {
-                        Err(crate::tool::ToolError::Cancelled)
+                        Err(crate::tool::ToolError::cancelled())
                     } else {
                         result.map_err(crate::remote::RemoteError::into_tool_error)
                     }
@@ -570,7 +560,7 @@ mod tests {
                 .unwrap(),
             text.as_bytes()
         );
-        let expected = ResourceId::path("remote", &path);
+        let expected = ResourceId::path(&"remote".parse().unwrap(), &path);
         assert!(
             policy
                 .requests
@@ -622,7 +612,7 @@ mod tests {
         assert_eq!(
             result.output_diagnostic.unwrap().context.site,
             crate::tool::diagnostic::FailureSite::Execution(ExecutionLocation::named(
-                "remote",
+                "remote".parse().unwrap(),
                 std::fs::canonicalize(".").unwrap(),
             )),
         );
@@ -666,7 +656,8 @@ mod tests {
             request
                 .permissions
                 .iter()
-                .any(|permission| permission.resource == ResourceId::path("remote", file.path()))
+                .any(|permission| permission.resource
+                    == ResourceId::path(&"remote".parse().unwrap(), file.path()))
         );
         let sibling = worker
             .tool(
@@ -746,8 +737,8 @@ mod tests {
         let result = worker.result(job).await;
         assert_eq!(result.state, JobState::Failed);
         assert_eq!(result.output.unwrap()["timed_out"], true);
-        let saved = worker.runtime.jobs.output(job).test_document().unwrap();
-        assert_eq!(saved["capture_complete"], false);
+        let saved = worker.runtime.jobs.output(job);
+        assert_eq!(saved.test_captures_complete(), Some(false));
         assert_eq!(
             worker
                 .runtime

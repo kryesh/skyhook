@@ -1,6 +1,12 @@
--- Skyhook session database (application_id 0x534B5948, user_version 11). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 12). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
+--
+-- Skyhook-typed data is normalized. The only JSON text columns hold shapes a model, a
+-- tool's own schema or a provider defines: tool_call.arguments, tool_result.result,
+-- job.arguments, job.output_schema, tool_definition.input_schema,
+-- model_context.response_schema, reasoning_replay.payload, job_output.result and
+-- user_part_job_event.view.
 
 -- ───────────────────────── Ledger, session, agents ─────────────────────────
 
@@ -9,10 +15,9 @@ CREATE TABLE session (
   public_id BLOB NOT NULL CHECK (length(public_id) = 16)
 ) STRICT;
 
--- The capability names, which every capability column references.
-CREATE TABLE capability (
-  name TEXT PRIMARY KEY
-) STRICT, WITHOUT ROWID;
+-- Dictionaries seed the spellings of the enums they name; each is the same
+-- spelling the enum uses in JSON.
+CREATE TABLE capability (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 INSERT INTO capability (name) VALUES
   ('read'),('write'),('exec'),('network'),('targets'),('ssh_agent'),('agents'),('interactive'),('mcp');
 
@@ -39,22 +44,26 @@ CREATE TABLE agent (
 ) STRICT;
 CREATE UNIQUE INDEX agent_single_root ON agent((parent IS NULL)) WHERE parent IS NULL;
 
+-- Subtype tables narrow kind with a CHECK to the kinds they hold.
+CREATE TABLE entry_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO entry_kind (name) VALUES
+  ('session_started'),('title_set'),('targets_upserted'),
+  ('agent_started'),('agent_completed'),('agent_interrupted'),('agent_failed'),('model_changed'),
+  ('mode_changed'),
+  ('todos_replaced'),('message_committed'),('status'),
+  ('model_context'),('model_requested'),('model_attempt_started'),('model_failed'),
+  ('model_recovery_scheduled'),('model_attempt_interrupted'),('response_completed'),('usage'),
+  ('compaction'),('compaction_skipped'),('compaction_failed'),
+  ('job_created'),('job_state_changed'),('job_finished'),
+  ('job_claimed'),('job_injected'),('job_message_delivered'),
+  ('approval_granted'),('approval_revoked');
+
 CREATE TABLE entry (
   seq INTEGER PRIMARY KEY,                       -- insert NULL ... RETURNING seq
   public_id BLOB NOT NULL UNIQUE CHECK (length(public_id) = 16),
   agent INTEGER NOT NULL REFERENCES agent(id),
   created_millis INTEGER NOT NULL,
-  kind TEXT NOT NULL CHECK (kind IN (
-    'session_started','title_set','targets_upserted',
-    'agent_started','agent_completed','agent_interrupted','agent_failed','model_selected',
-    'mode_changed',
-    'todos_replaced','message_committed','status',
-    'model_context','model_requested','model_attempt_started','model_failed',
-    'model_recovery_scheduled','model_attempt_interrupted','response_completed','usage',
-    'compaction','compaction_skipped','compaction_failed',
-    'job_created','job_state_changed','job_finished',
-    'job_claimed','job_injected','job_message_delivered',
-    'approval_granted','approval_revoked')),
+  kind TEXT NOT NULL REFERENCES entry_kind(name),
   UNIQUE (seq, kind)
 ) STRICT;
 CREATE UNIQUE INDEX entry_one_agent_start ON entry(agent) WHERE kind = 'agent_started';
@@ -70,18 +79,24 @@ CREATE TABLE entry_text (
 
 -- ───────────────────────── Targets ─────────────────────────
 
+CREATE TABLE target_source (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO target_source (name) VALUES ('builtin'),('config'),('session');
+CREATE TABLE ssh_auth (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO ssh_auth (name) VALUES ('default'),('agent'),('key');
+
+-- via/origin NULL means the route starts at root.
 CREATE TABLE target_revision (
   id INTEGER PRIMARY KEY,
   target INTEGER NOT NULL REFERENCES target(id),
   entry INTEGER NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('session_started','targets_upserted')),
   revision INTEGER NOT NULL CHECK (revision > 0),
-  source TEXT NOT NULL CHECK (source IN ('builtin','config','session')),
+  source TEXT NOT NULL REFERENCES target_source(name),
   host TEXT NOT NULL,
   workspace BLOB NOT NULL,
   ssh_user TEXT,
   ssh_port INTEGER CHECK (ssh_port BETWEEN 1 AND 65535),
-  ssh_auth TEXT NOT NULL CHECK (ssh_auth IN ('default','agent','key')),
+  ssh_auth TEXT NOT NULL REFERENCES ssh_auth(name),
   ssh_key_path BLOB,
   ssh_external_agent INTEGER NOT NULL CHECK (ssh_external_agent IN (0,1)),
   via INTEGER REFERENCES target(id),
@@ -100,6 +115,9 @@ CREATE TABLE target_ssh_option (
 
 -- ───────────────────────── Pinned contract ─────────────────────────
 
+CREATE TABLE state_mode (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO state_mode (name) VALUES ('none'),('dynamic'),('persist');
+
 CREATE TABLE model_profile (
   id INTEGER PRIMARY KEY,
   name TEXT NOT NULL,
@@ -109,7 +127,7 @@ CREATE TABLE model_profile (
   max_context INTEGER NOT NULL CHECK (max_context > 0),
   max_output INTEGER NOT NULL CHECK (max_output > 0),
   supports_images INTEGER NOT NULL CHECK (supports_images IN (0,1)),
-  state_mode TEXT NOT NULL CHECK (state_mode IN ('none','dynamic','persist')),
+  state_mode TEXT NOT NULL REFERENCES state_mode(name),
   hint TEXT,
   digest BLOB NOT NULL UNIQUE CHECK (length(digest) = 32),
   CHECK (max_output < max_context)
@@ -164,7 +182,7 @@ CREATE TABLE agent_mode (
 
 CREATE TABLE model_selection (                   -- ModelChanged only
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'model_selected' CHECK (kind = 'model_selected'),
+  kind TEXT NOT NULL DEFAULT 'model_changed' CHECK (kind = 'model_changed'),
   profile INTEGER NOT NULL REFERENCES model_profile(id),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
@@ -190,17 +208,19 @@ CREATE TABLE tool_definition (
   digest BLOB NOT NULL UNIQUE CHECK (length(digest) = 32)
 ) STRICT;
 
+CREATE TABLE model_purpose (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO model_purpose (name) VALUES ('agent'),('compaction');
+
 -- provider/model/reasoning/max_output_tokens derive from profile.
 -- The agent's first purpose='agent' context is written in its agent_started transaction.
 CREATE TABLE model_context (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'model_context' CHECK (kind = 'model_context'),
-  purpose TEXT NOT NULL CHECK (purpose IN ('agent','compaction')),
+  purpose TEXT NOT NULL REFERENCES model_purpose(name),
   profile INTEGER NOT NULL REFERENCES model_profile(id),
   system_prompt INTEGER NOT NULL REFERENCES system_prompt(id),
   response_schema_name TEXT,
   response_schema TEXT CHECK (response_schema IS NULL OR json_valid(response_schema)),
-  UNIQUE (entry, purpose),
   CHECK ((response_schema_name IS NULL) = (response_schema IS NULL)),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
@@ -220,28 +240,95 @@ CREATE TABLE blob (
   bytes BLOB NOT NULL
 ) STRICT;
 
+CREATE TABLE message_role (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO message_role (name) VALUES ('user'),('assistant'),('tool');
+CREATE TABLE image_format (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO image_format (name) VALUES ('image/png'),('image/jpeg'),('image/gif'),('image/webp');
+
 CREATE TABLE message (
   id INTEGER PRIMARY KEY,
-  role TEXT NOT NULL CHECK (role IN ('user','assistant','tool')),
+  role TEXT NOT NULL REFERENCES message_role(name),
   UNIQUE (id, role)
 ) STRICT;
+
+-- state and job_events parts hold their content in the user_part_* tables.
+CREATE TABLE user_part_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO user_part_kind (name) VALUES
+  ('text'),('attachment'),('state'),('job_events'),('parent_input'),('compaction');
 
 CREATE TABLE user_part (
   id INTEGER PRIMARY KEY,
   message INTEGER NOT NULL,
   role TEXT NOT NULL DEFAULT 'user' CHECK (role = 'user'),
   position INTEGER NOT NULL CHECK (position >= 0),
-  kind TEXT NOT NULL CHECK (kind IN ('text','attachment','runtime','parent_input','compaction')),
+  kind TEXT NOT NULL REFERENCES user_part_kind(name),
   text TEXT,
   blob BLOB REFERENCES blob(sha256),               -- AttachmentRef
-  image_format TEXT CHECK (image_format IN ('image/png','image/jpeg','image/gif','image/webp')),
+  image_format TEXT REFERENCES image_format(name),
   file TEXT,                                       -- NULL = no file name
   UNIQUE (message, position),
   CHECK ((kind = 'attachment') = (blob IS NOT NULL)),
-  CHECK ((kind = 'attachment') = (text IS NULL)),
+  CHECK ((kind IN ('attachment','state','job_events')) = (text IS NULL)),
   CHECK (kind = 'attachment' OR (image_format IS NULL AND file IS NULL)),
   FOREIGN KEY (message, role) REFERENCES message(id, role)
 ) STRICT;
+
+-- The agent's state as a request sent it: its date and location, live jobs and todos.
+CREATE TABLE user_part_state (
+  part INTEGER PRIMARY KEY REFERENCES user_part(id),
+  date TEXT NOT NULL,
+  location_target INTEGER NOT NULL REFERENCES target(id),
+  location_workspace BLOB NOT NULL
+) STRICT;
+
+-- Jobs in pre-order; parent_position nests an agent job's active children.
+-- turns/tool_calls are an agent job's progress.
+CREATE TABLE user_part_state_job (
+  part INTEGER NOT NULL REFERENCES user_part_state(part),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  parent_position INTEGER,
+  job INTEGER NOT NULL REFERENCES job(id),
+  tool TEXT NOT NULL,
+  name TEXT,
+  state TEXT NOT NULL REFERENCES job_state(name),
+  target INTEGER REFERENCES target(id),
+  workspace BLOB NOT NULL,
+  age_seconds INTEGER NOT NULL CHECK (age_seconds >= 0),
+  turns INTEGER CHECK (turns >= 0),
+  tool_calls INTEGER CHECK (tool_calls >= 0),
+  PRIMARY KEY (part, position),
+  CHECK ((turns IS NULL) = (tool_calls IS NULL)),
+  CHECK ((tool = 'agent') = (turns IS NOT NULL)),
+  FOREIGN KEY (part, parent_position) REFERENCES user_part_state_job(part, position)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE user_part_state_todo (
+  part INTEGER NOT NULL REFERENCES user_part_state(part),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  text TEXT NOT NULL,
+  status TEXT NOT NULL REFERENCES todo_status(name),
+  PRIMARY KEY (part, position)
+) STRICT, WITHOUT ROWID;
+
+CREATE TABLE job_event_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO job_event_kind (name) VALUES ('message'),('job');
+
+-- A job-events notification: a child's reply (message) or a job's presented view (job).
+-- Like a tool result, the view is the JSON document the model received.
+CREATE TABLE user_part_job_event (
+  part INTEGER NOT NULL REFERENCES user_part(id),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  kind TEXT NOT NULL REFERENCES job_event_kind(name),
+  job INTEGER NOT NULL REFERENCES job(id),
+  name TEXT,
+  source INTEGER REFERENCES message_commit(entry),
+  text TEXT,
+  view TEXT CHECK (view IS NULL OR json_valid(view)),
+  PRIMARY KEY (part, position),
+  CHECK ((kind = 'message') = (source IS NOT NULL AND text IS NOT NULL)),
+  CHECK ((kind = 'job') = (view IS NOT NULL)),
+  CHECK (kind = 'message' OR name IS NULL)
+) STRICT, WITHOUT ROWID;
 
 -- Assistant items are text, reasoning (with optional replay), or one tool call each.
 CREATE TABLE item_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
@@ -311,7 +398,7 @@ CREATE TABLE tool_result_image (
   result INTEGER NOT NULL REFERENCES tool_result(message),
   position INTEGER NOT NULL CHECK (position >= 0),
   blob BLOB NOT NULL REFERENCES blob(sha256),
-  format TEXT NOT NULL CHECK (format IN ('image/png','image/jpeg','image/gif','image/webp')),
+  format TEXT NOT NULL REFERENCES image_format(name),
   file TEXT,
   PRIMARY KEY (result, position)
 ) STRICT, WITHOUT ROWID;
@@ -323,12 +410,15 @@ CREATE TABLE message_commit (
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
+CREATE TABLE todo_status (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO todo_status (name) VALUES ('pending'),('in_progress'),('completed');
+
 CREATE TABLE todo_item (
   entry INTEGER NOT NULL,
   kind TEXT NOT NULL CHECK (kind IN ('todos_replaced','compaction')),
   position INTEGER NOT NULL CHECK (position >= 0),
   text TEXT NOT NULL,
-  status TEXT NOT NULL CHECK (status IN ('pending','in_progress','completed')),
+  status TEXT NOT NULL REFERENCES todo_status(name),
   PRIMARY KEY (entry, position),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT, WITHOUT ROWID;
@@ -339,18 +429,17 @@ CREATE TABLE todo_item (
 CREATE TABLE history_lifetime (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 INSERT INTO history_lifetime (name) VALUES ('extends'),('detached');
 
+-- The context belongs to the requesting agent (checked on insert).
 CREATE TABLE model_request (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'model_requested' CHECK (kind = 'model_requested'),
-  context INTEGER NOT NULL,
-  purpose TEXT NOT NULL CHECK (purpose IN ('agent','compaction')),
+  context INTEGER NOT NULL REFERENCES model_context(entry),
   -- History is the checkpoint, its retained sources, then the agent's commits after the
   -- checkpoint's frontier up to history_through, less model_request_omitted.
   checkpoint INTEGER REFERENCES compaction(entry),
   history_through INTEGER REFERENCES message_commit(entry),
   history_lifetime TEXT NOT NULL REFERENCES history_lifetime(name),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
-  FOREIGN KEY (context, purpose) REFERENCES model_context(entry, purpose)
+  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
 -- A source in that range the request left out, such as one with nothing left to send.
@@ -386,10 +475,13 @@ CREATE TABLE attempt_outcome (
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
+CREATE TABLE model_failure_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO model_failure_kind (name) VALUES ('error'),('refusal');
+
 CREATE TABLE model_failure (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'model_failed' CHECK (kind = 'model_failed'),
-  failure TEXT NOT NULL CHECK (failure IN ('error','refusal')),
+  failure TEXT NOT NULL REFERENCES model_failure_kind(name),
   error TEXT NOT NULL,
   FOREIGN KEY (entry, kind) REFERENCES attempt_outcome(entry, kind)
 ) STRICT;
@@ -411,7 +503,7 @@ INSERT INTO cut_reason (name) VALUES ('max_tokens'),('incomplete');
 CREATE TABLE model_response (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'response_completed' CHECK (kind = 'response_completed'),
-  message INTEGER UNIQUE REFERENCES message_commit(message),
+  message INTEGER NOT NULL UNIQUE REFERENCES message_commit(message),
   outcome TEXT NOT NULL REFERENCES response_outcome(name),
   cut_reason TEXT REFERENCES cut_reason(name),
   CHECK ((outcome = 'cut') = (cut_reason IS NOT NULL)),
@@ -421,19 +513,17 @@ CREATE TABLE model_response (
 CREATE TABLE usage (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'usage' CHECK (kind = 'usage'),
-  request INTEGER REFERENCES model_request(entry),
+  request INTEGER NOT NULL REFERENCES model_request(entry),
   input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
   cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
   output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
--- previous = latest earlier compaction of the same agent; request and attempt come from
--- the entry's attempt_outcome (both derived).
+-- The summary attempt is the entry's attempt_outcome.
 CREATE TABLE compaction (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'compaction' CHECK (kind = 'compaction'),
-  schema_version INTEGER NOT NULL CHECK (schema_version > 0),
   frontier INTEGER NOT NULL REFERENCES entry(seq),
   message INTEGER NOT NULL REFERENCES message(id),
   before_tokens INTEGER NOT NULL CHECK (before_tokens >= 0),
@@ -463,6 +553,19 @@ CREATE TABLE compaction_outcome (
 
 -- ───────────────────────── Jobs and outputs ─────────────────────────
 
+CREATE TABLE job_role (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO job_role (name) VALUES ('tool'),('agent'),('script'),('question');
+
+-- Transitions name live states and finishes terminal ones.
+CREATE TABLE job_state (
+  name TEXT PRIMARY KEY,
+  terminal INTEGER NOT NULL CHECK (terminal IN (0,1)),
+  UNIQUE (name, terminal)
+) STRICT, WITHOUT ROWID;
+INSERT INTO job_state (name, terminal) VALUES
+  ('queued',0),('awaiting_approval',0),('running',0),('waiting_input',0),
+  ('completed',1),('failed',1),('cancelled',1),('interrupted',1);
+
 CREATE TABLE job (
   id INTEGER PRIMARY KEY CHECK (id > 0),         -- JobId
   created INTEGER NOT NULL UNIQUE,
@@ -471,12 +574,11 @@ CREATE TABLE job (
   origin_call INTEGER UNIQUE REFERENCES tool_call(item),
   tool TEXT NOT NULL,
   name TEXT,
-  role TEXT NOT NULL CHECK (role IN ('tool','agent','script','question')),
+  role TEXT NOT NULL REFERENCES job_role(name),
   arguments TEXT NOT NULL CHECK (json_valid(arguments)),
   output_schema TEXT CHECK (output_schema IS NULL OR json_valid(output_schema)),
   accepts_input INTEGER NOT NULL CHECK (accepts_input IN (0,1)),
   background INTEGER NOT NULL CHECK (background IN (0,1)),
-  authorization_scope INTEGER,
   location_target INTEGER NOT NULL REFERENCES target(id),
   location_workspace BLOB NOT NULL,
   FOREIGN KEY (created, kind) REFERENCES entry(seq, kind)
@@ -486,8 +588,10 @@ CREATE TABLE job_transition (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'job_state_changed' CHECK (kind = 'job_state_changed'),
   job INTEGER NOT NULL REFERENCES job(id),
-  state TEXT NOT NULL CHECK (state IN ('queued','awaiting_approval','running','waiting_input')),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  state TEXT NOT NULL,
+  terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal = 0),
+  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
+  FOREIGN KEY (state, terminal) REFERENCES job_state(name, terminal)
 ) STRICT;
 CREATE INDEX job_transition_job ON job_transition(job, entry);
 
@@ -505,11 +609,17 @@ CREATE TABLE job_output (
   id INTEGER PRIMARY KEY,
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,
-  -- Compact terminal document: referenced captures are emptied placeholders.
-  document TEXT NOT NULL CHECK (json_valid(document)),
+  -- Every capture the producer finished was admitted into the result.
+  captures_complete INTEGER NOT NULL CHECK (captures_complete IN (0,1)),
+  -- The tool's result, NULL when the run produced none ('null' is a literal null);
+  -- referenced captures are emptied placeholders.
+  result TEXT CHECK (result IS NULL OR json_valid(result)),
   UNIQUE (job, generation),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
 ) STRICT;
+
+CREATE TABLE capture_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO capture_kind (name) VALUES ('text'),('json'),('unknown');
 
 -- Streamed or offloaded bytes at one JSON Pointer. A row exists from reservation, so
 -- partial output stays readable; an abandoned builtin capture deletes its row.
@@ -518,7 +628,7 @@ CREATE TABLE job_capture (
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,
   pointer TEXT NOT NULL CHECK (pointer = '' OR pointer LIKE '/%'),
-  capture_kind TEXT NOT NULL CHECK (capture_kind IN ('text','json','unknown')),
+  capture_kind TEXT NOT NULL REFERENCES capture_kind(name),
   final_bytes INTEGER CHECK (final_bytes >= 0),   -- set once when the writer finishes
   final_lines INTEGER CHECK (final_lines >= 0),
   -- A cached page rendering of a saved value, not producer output.
@@ -577,13 +687,14 @@ CREATE TABLE job_finish (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'job_finished' CHECK (kind = 'job_finished'),
   job INTEGER NOT NULL REFERENCES job(id),
-  state TEXT NOT NULL CHECK (state IN ('completed','failed','cancelled','interrupted')),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  state TEXT NOT NULL,
+  terminal INTEGER NOT NULL DEFAULT 1 CHECK (terminal = 1),
+  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
+  FOREIGN KEY (state, terminal) REFERENCES job_state(name, terminal)
 ) STRICT;
 CREATE INDEX job_finish_job ON job_finish(job, entry);
 
 -- Diagnostics retain typed terminal and output-persistence facts, never rendered errors.
--- Dictionary keys are stable spellings of the shared diagnostic enums, not JSON payloads.
 CREATE TABLE diagnostic_slot (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 INSERT INTO diagnostic_slot (name) VALUES ('diagnostic'),('output_diagnostic');
 
@@ -671,7 +782,7 @@ CREATE TABLE job_finish_image (
   finish INTEGER NOT NULL REFERENCES job_finish(entry),
   position INTEGER NOT NULL CHECK (position >= 0),
   blob BLOB NOT NULL REFERENCES blob(sha256),
-  format TEXT NOT NULL CHECK (format IN ('image/png','image/jpeg','image/gif','image/webp')),
+  format TEXT NOT NULL REFERENCES image_format(name),
   file TEXT,
   PRIMARY KEY (finish, position)
 ) STRICT, WITHOUT ROWID;
@@ -690,14 +801,52 @@ CREATE TABLE job_delivery (
 
 -- ───────────────────────── Approvals ─────────────────────────
 
+CREATE TABLE approval_coverage (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO approval_coverage (name) VALUES ('exact'),('descendants');
+CREATE TABLE resource_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO resource_kind (name) VALUES
+  ('workspace'),('path'),('network'),('route'),('session'),('mcp');
+
+-- One ResourceId per grant: target is the execution target of a workspace, path or
+-- network resource and the destination of a route; path components and route hops
+-- are the child tables.
 CREATE TABLE approval_grant (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL DEFAULT 'approval_granted' CHECK (kind = 'approval_granted'),
   capability TEXT NOT NULL REFERENCES capability(name),
-  resource TEXT NOT NULL CHECK (json_valid(resource)),   -- ResourceId wire form
-  coverage TEXT NOT NULL CHECK (coverage IN ('exact','descendants')),
+  resource_kind TEXT NOT NULL REFERENCES resource_kind(name),
+  target INTEGER REFERENCES target(id),
+  path TEXT,
+  origin TEXT,
+  session_name TEXT,
+  mcp_server TEXT,
+  mcp_tool TEXT,
+  coverage TEXT NOT NULL REFERENCES approval_coverage(name),
+  CHECK ((resource_kind IN ('workspace','path','network','route')) = (target IS NOT NULL)),
+  CHECK ((resource_kind = 'workspace') = (path IS NOT NULL)),
+  CHECK ((resource_kind = 'network') = (origin IS NOT NULL)),
+  CHECK ((resource_kind = 'session') = (session_name IS NOT NULL)),
+  CHECK ((resource_kind = 'mcp') = (mcp_server IS NOT NULL)),
+  CHECK ((resource_kind = 'mcp') = (mcp_tool IS NOT NULL)),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
+
+CREATE TABLE approval_grant_path_component (
+  grant_entry INTEGER NOT NULL REFERENCES approval_grant(entry),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  component TEXT NOT NULL,
+  PRIMARY KEY (grant_entry, position)
+) STRICT, WITHOUT ROWID;
+
+-- Hops name journaled target revisions; root is never a hop.
+CREATE TABLE approval_grant_route_hop (
+  grant_entry INTEGER NOT NULL REFERENCES approval_grant(entry),
+  position INTEGER NOT NULL CHECK (position >= 0),
+  target INTEGER NOT NULL REFERENCES target(id),
+  revision INTEGER NOT NULL,
+  PRIMARY KEY (grant_entry, position),
+  FOREIGN KEY (target, revision) REFERENCES target_revision(target, revision)
+) STRICT, WITHOUT ROWID;
 
 -- Revocations are written in the same transaction as the targets_upserted that causes them.
 CREATE TABLE approval_revocation (

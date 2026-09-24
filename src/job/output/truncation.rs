@@ -16,24 +16,29 @@ pub(super) fn project(
     saved: &Saved,
     schema: &Value,
     cancellation: &super::super::CancellationToken,
-    annotated: &BTreeSet<String>,
+    annotated: &BTreeSet<FieldPointer>,
 ) -> Result<Projected, ToolError> {
-    let mut document = saved
-        .document
-        .clone()
-        .ok_or_else(|| ToolError::Failed("saved output document is missing".into()))?;
+    let product = saved
+        .product
+        .as_ref()
+        .ok_or_else(|| ToolError::failed("saved output is missing"))?;
+    let mut document = product.document();
     let mut projection = Projection {
         saved,
         truncated: Vec::new(),
         cancellation,
         annotated,
     };
-    projection.visit(&mut document["result"], "/result", &[schema], schema)?;
+    projection.visit(
+        &mut document["result"],
+        &FieldPointer::result(),
+        &[schema],
+        schema,
+    )?;
     Ok(Projected {
         result: document["result"].take(),
         truncated: projection.truncated,
-        notice: (document["capture_complete"].as_bool() == Some(false))
-            .then(|| "Output incomplete.".into()),
+        notice: (!product.captures_complete).then(|| "Output incomplete.".into()),
     })
 }
 
@@ -41,19 +46,19 @@ struct Projection<'a> {
     saved: &'a Saved,
     truncated: Vec<OutputTruncation>,
     cancellation: &'a super::super::CancellationToken,
-    annotated: &'a BTreeSet<String>,
+    annotated: &'a BTreeSet<FieldPointer>,
 }
 
 impl Projection<'_> {
     fn visit(
         &mut self,
         value: &mut Value,
-        field: &str,
+        field: &FieldPointer,
         schemas: &[&Value],
         root: &Value,
     ) -> Result<(), ToolError> {
         if self.cancellation.is_cancelled() {
-            return Err(ToolError::Cancelled);
+            return Err(ToolError::cancelled());
         }
         let applicable = ApplicableSchemas::new(schemas, root, value);
         if (self.annotated.contains(field) || applicable.is_annotated())
@@ -80,7 +85,7 @@ impl Projection<'_> {
                     .rposition(|&b| b == b'\n')
                     .map_or(end, |last| end - last - 1);
                 self.truncated.push(OutputTruncation {
-                    field: field.into(),
+                    field: field.to_string(),
                     total_lines: index.total_lines,
                     next_start: line,
                     next_offset: offset,
@@ -90,20 +95,20 @@ impl Projection<'_> {
         }
         // Storage offloading does not grant permission to truncate a field.
         // Stored fields were validated as UTF-8 or JSON when saved.
-        if self.saved.fields.iter().any(|stored| stored == field) {
+        if self.saved.fields.contains(field) {
             load_field(self.saved, value, field)?;
         }
         match value {
             Value::Object(map) => {
                 for (key, child) in map {
                     let children = applicable.property(key);
-                    self.visit(child, &property_field(field, key), &children, root)?;
+                    self.visit(child, &field.property(key), &children, root)?;
                 }
             }
             Value::Array(items) => {
                 for (index, child) in items.iter_mut().enumerate() {
                     let children = applicable.item(index);
-                    self.visit(child, &format!("{field}/{index}"), &children, root)?;
+                    self.visit(child, &field.index(index), &children, root)?;
                 }
             }
             _ => {}
@@ -114,37 +119,37 @@ impl Projection<'_> {
 
 /// Resolve the same annotations used by native projection, before crossing the JS
 /// bridge. Keep descendant annotations as well, since scripts can extract them.
-pub(crate) fn annotated_fields(value: &Value, schema: &Value) -> BTreeSet<String> {
+pub(crate) fn annotated_fields(value: &Value, schema: &Value) -> BTreeSet<FieldPointer> {
     fn visit(
         value: &Value,
-        field: &str,
+        field: &FieldPointer,
         schemas: &[&Value],
         root: &Value,
-        fields: &mut BTreeSet<String>,
+        fields: &mut BTreeSet<FieldPointer>,
     ) {
         let applicable = ApplicableSchemas::new(schemas, root, value);
         if (value.is_string() || value.is_array() || value.is_object()) && applicable.is_annotated()
         {
-            fields.insert(field.to_owned());
+            fields.insert(field.clone());
         }
         match value {
             Value::Object(map) => {
                 for (key, child) in map {
                     let schemas = applicable.property(key);
-                    visit(child, &property_field(field, key), &schemas, root, fields);
+                    visit(child, &field.property(key), &schemas, root, fields);
                 }
             }
             Value::Array(items) => {
                 for (index, child) in items.iter().enumerate() {
                     let schemas = applicable.item(index);
-                    visit(child, &format!("{field}/{index}"), &schemas, root, fields);
+                    visit(child, &field.index(index), &schemas, root, fields);
                 }
             }
             _ => {}
         }
     }
     let mut fields = BTreeSet::new();
-    visit(value, "", &[schema], schema, &mut fields);
+    visit(value, &FieldPointer::root(), &[schema], schema, &mut fields);
     fields
 }
 
@@ -199,7 +204,7 @@ fn string_prefix(bytes: &[u8]) -> Result<(Value, usize, bool), ToolError> {
     match std::str::from_utf8(&bytes[..end]) {
         Ok(_) => {}
         Err(error) if error.error_len().is_none() => end = error.valid_up_to(),
-        Err(_) => return Err(ToolError::Failed("saved output is not UTF-8".into())),
+        Err(_) => return Err(ToolError::failed("saved output is not UTF-8")),
     }
     if end < bytes.len()
         && let Some(last) = bytes[..end].iter().rposition(|&b| b == b'\n')
@@ -445,7 +450,7 @@ mod tests {
         let id = manager.test_create(spec).await;
         let output = ToolOutput::new(value);
         let outcome = match error {
-            Some(message) => ToolError::Failed(message).with_result(output).into(),
+            Some(message) => ToolError::failed(message).with_result(output).into(),
             None => JobOutcome::Completed(output),
         };
         manager.finish(id, outcome).await.unwrap();
@@ -459,7 +464,8 @@ mod tests {
             position["field"]
                 .as_str()
                 .unwrap_or("/result/stdout")
-                .into(),
+                .parse()
+                .unwrap(),
         );
         args.start = Some(position["next_start"].as_u64().unwrap() as usize);
         args.offset = Some(position["next_offset"].as_u64().unwrap_or(0) as usize);
@@ -496,12 +502,17 @@ mod tests {
         for field in ["metadata", "extra", "exit_code"] {
             assert_eq!(result[field], value[field]);
         }
-        let rendered_error = ToolError::Failed(error)
+        let rendered_error = ToolError::failed(error)
             .diagnostic()
             .render(&Default::default());
         assert_eq!(view["error"], rendered_error);
         assert_eq!(
-            manager.metadata(id).await.unwrap().error.as_deref(),
+            manager
+                .metadata(id)
+                .await
+                .unwrap()
+                .rendered_error(&CapabilitySet::default())
+                .as_deref(),
             Some(rendered_error.as_str())
         );
         assert!(view.get("console").is_none() && view["presentation"]["preview"].is_null());
@@ -511,6 +522,7 @@ mod tests {
         );
         assert_eq!(manager.snapshot(id).await.unwrap().output.unwrap(), value);
         let session = manager.store().id();
+        manager.drain_supervisors().await;
         drop(manager);
         let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
         let restored = JobManager::restore(store, &records).await.unwrap();

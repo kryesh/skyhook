@@ -74,7 +74,8 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &App, rect: Rect, p: Palette)
     let configured = &app.launch.model.config().config().mcp;
     let statuses = app.session().map(|session| session.mcp_servers());
     for name in configured.keys() {
-        let (mark, detail, color) = match statuses.and_then(|statuses| statuses.get(name)) {
+        let (mark, detail, color) = match statuses.as_ref().and_then(|statuses| statuses.get(name))
+        {
             Some(McpServerStatus::Connected { tools }) => ("●", format!("{tools} tools"), p.accent),
             Some(McpServerStatus::Failed(error)) => ("✗", format!("failed: {error}"), p.warning),
             Some(McpServerStatus::Skipped) => ("○", "skipped".into(), p.muted),

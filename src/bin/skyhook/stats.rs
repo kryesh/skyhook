@@ -130,7 +130,8 @@ fn ratio(requests: &RequestStats) -> String {
 /// Time from the agent's start to its final completion; unfinished agents show none.
 fn elapsed(agent: &AgentStats) -> String {
     agent
-        .finished
+        .outcome
+        .finished_at()
         .map_or_else(|| "—".into(), |finished| duration(agent.started, finished))
 }
 
@@ -427,9 +428,8 @@ mod tests {
             model: None,
             parent: None,
             owner_job: None,
-            outcome: skyhook::session::stats::AgentOutcome::Completed,
+            outcome: skyhook::session::stats::AgentOutcome::Running,
             started: Default::default(),
-            finished: None,
             usage: Default::default(),
             requests: Default::default(),
             compactions: Default::default(),

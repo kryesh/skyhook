@@ -6,9 +6,29 @@ use super::*;
 
 mod input;
 
-const PENDING: u8 = 0;
-const CANCELLED: u8 = 1;
-const CLAIMED: u8 = 2;
+/// Who has a queued input: nobody yet, its submitter (withdrawn), or the runtime.
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Claim {
+    Pending = 0,
+    Cancelled = 1,
+    Claimed = 2,
+}
+
+impl Claim {
+    fn load(atomic: &AtomicU8, ordering: Ordering) -> Self {
+        Self::from_stored(atomic.load(ordering))
+    }
+
+    fn from_stored(value: u8) -> Self {
+        match value {
+            0 => Self::Pending,
+            1 => Self::Cancelled,
+            2 => Self::Claimed,
+            _ => unreachable!("only a Claim is stored"),
+        }
+    }
+}
 
 /// Clonable handle deciding whether a queued input may still be withdrawn.
 /// Cancellation and the runtime's claim are mutually exclusive.
@@ -20,25 +40,36 @@ impl QueuedPromptCancellation {
     /// the runtime already claimed the input: await its receipt.
     #[must_use]
     pub fn cancel(&self) -> bool {
-        self.transition(CANCELLED) != CLAIMED
+        self.transition(Claim::Cancelled) != Claim::Claimed
     }
 
     #[must_use]
     pub fn is_claimed(&self) -> bool {
-        self.0.load(Ordering::Acquire) == CLAIMED
+        Claim::load(&self.0, Ordering::Acquire) == Claim::Claimed
     }
 
     fn try_claim(&self) -> bool {
-        self.transition(CLAIMED) == PENDING
+        self.transition(Claim::Claimed) == Claim::Pending
     }
 
-    /// Move a pending input to `phase`; returns the phase found.
-    fn transition(&self, phase: u8) -> u8 {
-        let result = self
-            .0
-            .compare_exchange(PENDING, phase, Ordering::AcqRel, Ordering::Acquire);
-        result.unwrap_or_else(|found| found)
+    /// Move a pending input to `claim`; returns the claim found.
+    fn transition(&self, claim: Claim) -> Claim {
+        let result = self.0.compare_exchange(
+            Claim::Pending as u8,
+            claim as u8,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        Claim::from_stored(result.unwrap_or_else(|found| found))
     }
+}
+
+/// What consuming a queued batch did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct BatchOutcome {
+    pub(super) consumed: bool,
+    /// A claimed member failed: reject the batches queued behind it.
+    pub(super) failed: bool,
 }
 
 /// One submission for the request-boundary mailbox.
@@ -46,14 +77,14 @@ impl QueuedPromptCancellation {
 pub struct QueuedPrompt {
     pub text: String,
     pub attachments: Vec<crate::media::Attachment>,
-    pub options: PromptOptions,
+    pub options: Selection,
     /// Keep a clone to withdraw the input before the runtime claims it.
     pub cancellation: QueuedPromptCancellation,
 }
 
 pub(super) struct QueuedInput {
-    pub content: Vec<UserContent>,
-    pub options: PromptOptions,
+    pub content: Vec<UserPart>,
+    pub options: Selection,
     pub cancellation: QueuedPromptCancellation,
     pub committed: oneshot::Sender<Result<(), HarnessError>>,
 }
@@ -132,30 +163,29 @@ pub(super) fn reject_pending(
 impl SessionRuntime {
     /// Consume every member before allowing a provider request, even if commits
     /// yield. An interrupt, or a claimed member that fails, rejects the unclaimed
-    /// remainder. Returns whether anything was consumed and whether a member
-    /// failed: the caller must then `reject_pending` the batches queued behind it.
+    /// remainder; the caller must then `reject_pending` the batches queued behind it.
     pub(super) async fn consume_queued_batch(
         &self,
         turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
         settings: &mut AgentSettings,
         inputs: Vec<QueuedInput>,
-    ) -> (bool, bool) {
+    ) -> BatchOutcome {
         let cancellation = turn.cancellation;
-        let (mut consumed, mut failed) = (false, false);
+        let mut outcome = BatchOutcome::default();
         for input in inputs {
-            if failed || cancellation.is_cancelled() {
+            if outcome.failed || cancellation.is_cancelled() {
                 input.reject(HarnessError::Interrupted);
             } else {
                 let claim = input.cancellation.clone();
                 let committed = self
                     .consume_queued_input(turn, context, settings, input)
                     .await;
-                failed = !committed && claim.is_claimed();
-                consumed |= committed;
+                outcome.failed = !committed && claim.is_claimed();
+                outcome.consumed |= committed;
             }
         }
-        (consumed, failed)
+        outcome
     }
 
     /// Drain a bounded snapshot of the mailbox, preserving all non-queue commands
@@ -177,11 +207,11 @@ impl SessionRuntime {
             let Ok(command) = rx.try_recv() else { break };
             match command {
                 AgentCommand::QueuedInputs(inputs) => {
-                    let (committed, failed) = self
+                    let batch = self
                         .consume_queued_batch(turn, context, settings, inputs)
                         .await;
-                    consumed |= committed;
-                    if failed {
+                    consumed |= batch.consumed;
+                    if batch.failed {
                         reject_pending(rx, deferred);
                     }
                 }
@@ -201,6 +231,7 @@ mod tests {
         AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, events,
         quiet_root, response,
     };
+    pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
 
     pub(super) fn count(script: &Script) -> usize {
         script.requests.lock().unwrap().len()
@@ -266,7 +297,7 @@ mod tests {
         attachments: Vec<crate::media::Attachment>,
         model: Option<&str>,
     ) -> (Receipt, QueuedPromptCancellation) {
-        let input = queued(text, attachments, model);
+        let input = queued(session, text, attachments, model);
         let cancellation = input.cancellation.clone();
         let session = session.clone();
         let receipt =
@@ -277,8 +308,8 @@ mod tests {
     }
 
     /// Whether a message carries the successful result of the first response's todo call.
-    pub(super) fn todo_finished(message: &Message) -> bool {
-        matches!(message, Message::Tool(results)
+    pub(super) fn todo_finished(message: &Sent) -> bool {
+        matches!(message, Sent::Tool(results)
             if results.iter().any(|result| result.call_id == "queue-todo" && !result.is_error))
     }
 
@@ -301,22 +332,31 @@ mod tests {
         .await;
     }
 
-    pub(super) fn texts<'a>(messages: impl IntoIterator<Item = &'a Message>) -> Vec<String> {
-        messages
+    /// The fixture's own prompts are sent as user text prefixed `test:`.
+    pub(super) fn texts<'a>(messages: impl IntoIterator<Item = &'a Sent>) -> Vec<String> {
+        user_texts(messages)
             .into_iter()
-            .filter_map(|message| match message {
-                Message::User(blocks) => blocks.iter().find_map(|block| match block {
-                    UserContent::Text { text } if text.starts_with("test:") => Some(text.clone()),
-                    _ => None,
-                }),
+            .filter(|text| text.starts_with("test:"))
+            .collect()
+    }
+
+    fn user_texts<'a>(messages: impl IntoIterator<Item = &'a Sent>) -> Vec<String> {
+        let blocks = messages.into_iter().flat_map(|message| match message {
+            Sent::User(blocks) => blocks.as_slice(),
+            _ => &[],
+        });
+        blocks
+            .filter_map(|block| match block {
+                SentPart::Text { text } => Some(text.clone()),
                 _ => None,
             })
             .collect()
     }
 
-    pub(super) async fn committed(session: &SessionHandle) -> Vec<Message> {
+    /// Committed history as a provider would receive it.
+    pub(super) async fn committed(session: &SessionHandle) -> Vec<Sent> {
         let records = session.runtime.store.records().await;
-        events!(records, SessionEvent::MessageCommitted { message } => message.clone())
+        events!(records, SessionEvent::MessageCommitted { message } => message.render())
     }
 
     pub(super) async fn model_changes(session: &SessionHandle) -> Vec<String> {
@@ -329,21 +369,17 @@ mod tests {
         bounded(session.root_tx.closed()).await;
     }
 
-    pub(super) fn parent_inputs<'a>(
-        messages: impl IntoIterator<Item = &'a Message>,
-    ) -> Vec<String> {
-        let blocks = messages.into_iter().flat_map(|message| match message {
-            Message::User(blocks) => blocks.as_slice(),
-            _ => &[],
-        });
-        let inputs = blocks.filter_map(|block| match block {
-            UserContent::ParentInput { text } => Some(text.clone()),
-            _ => None,
-        });
-        inputs.collect()
+    /// Parent input reaches the model as user text; the fixture's own prompts are
+    /// the `test:` ones, so every other user text is parent input.
+    pub(super) fn parent_inputs<'a>(messages: impl IntoIterator<Item = &'a Sent>) -> Vec<String> {
+        user_texts(messages)
+            .into_iter()
+            .filter(|text| !text.starts_with("test:"))
+            .collect()
     }
 
     fn queued(
+        session: &SessionHandle,
         text: &str,
         attachments: Vec<crate::media::Attachment>,
         model: Option<&str>,
@@ -351,10 +387,7 @@ mod tests {
         QueuedPrompt {
             text: text.into(),
             attachments,
-            options: PromptOptions {
-                model: model.map(str::to_owned),
-                mode: None,
-            },
+            options: session.selection(model, None).unwrap(),
             cancellation: QueuedPromptCancellation::default(),
         }
     }
@@ -369,9 +402,9 @@ mod tests {
             image: png.clone(),
         };
         let inputs = vec![
-            queued("test:first", vec![], Some("second")),
-            queued("test:image", vec![image], None),
-            queued("test:last", vec![], Some("third")),
+            queued(&session, "test:first", vec![], Some("second")),
+            queued(&session, "test:image", vec![image], None),
+            queued(&session, "test:last", vec![], Some("third")),
         ];
         let tokens = inputs.iter().map(|input| input.cancellation.clone());
         let tokens = tokens.collect::<Vec<_>>();
@@ -384,8 +417,8 @@ mod tests {
         assert_eq!(request.model, "third-model");
         let file = file.display().to_string();
         assert!(request.messages().any(|message| matches!(message,
-            Message::User(blocks) if blocks.iter().any(|block| matches!(block,
-                UserContent::Attachment { attachment: crate::media::AttachmentRef::Image(image) }
+            Sent::User(blocks) if blocks.iter().any(|block| matches!(block,
+                SentPart::Attachment { attachment: crate::media::AttachmentRef::Image(image) }
                     if image.file.as_deref() == Some(file.as_str())
                         && request.blobs.get(&image.blob).ok() == Some(png.bytes()))))));
         tracking.release(0);
@@ -412,15 +445,19 @@ mod tests {
             image: crate::tests::png(&vec![0; MAX_IMAGE_BYTES as usize]),
         };
         let inputs = vec![
-            queued("test:one", vec![], Some("second")),
+            queued(&session, "test:one", vec![], Some("second")),
             QueuedPrompt {
                 cancellation: canceled.clone(),
-                ..queued("test:canceled", vec![], Some("third"))
+                ..queued(&session, "test:canceled", vec![], Some("third"))
             },
-            queued("test:two", vec![], None),
-            queued("test:oversized-image", vec![oversized], Some("third")),
-            queued("test:invalid", vec![], Some("missing")),
-            queued("test:behind", vec![], None),
+            queued(&session, "test:two", vec![], None),
+            queued(
+                &session,
+                "test:oversized-image",
+                vec![oversized],
+                Some("third"),
+            ),
+            queued(&session, "test:behind", vec![], None),
         ];
         let enqueue = enqueue_batch(&session, inputs);
         buffered(&session, 1).await;
@@ -435,7 +472,6 @@ mod tests {
                 Err(Interrupted),
                 Ok(()),
                 Err(ImageLimit),
-                Err(Interrupted),
                 Err(Interrupted)
             ]
         ));
@@ -455,8 +491,8 @@ mod tests {
             let turn = prompt(&session, "test:initial");
             tracking.request(0).await;
             let inputs = vec![
-                queued("test:one", vec![], None),
-                queued("test:two", vec![], Some("second")),
+                queued(&session, "test:one", vec![], None),
+                queued(&session, "test:two", vec![], Some("second")),
             ];
             let enqueue = enqueue_batch(&session, inputs);
             buffered(&session, 1).await;
@@ -479,7 +515,7 @@ mod tests {
     #[tokio::test]
     async fn idle_batch_of_a_canceled_input_starts_no_turn_and_journals_nothing() {
         let (_root, tracking, session) = start(false).await;
-        let input = queued("test:already-canceled", vec![], Some("second"));
+        let input = queued(&session, "test:already-canceled", vec![], Some("second"));
         assert!(input.cancellation.cancel());
         let results = bounded(enqueue_prompts(&session, vec![input])).await;
         assert!(matches!(results[..], [Err(HarnessError::Interrupted)]));
@@ -497,8 +533,8 @@ mod tests {
             image: crate::tests::png(b"unsupported"),
         };
         let inputs = vec![
-            queued("test:image", vec![image], Some("blind")),
-            queued("test:behind", vec![], None),
+            queued(&session, "test:image", vec![image], Some("blind")),
+            queued(&session, "test:behind", vec![], None),
         ];
         let results = bounded(enqueue_prompts(&session, inputs)).await;
         use HarnessError::{ImagesUnsupported, Interrupted};
@@ -523,12 +559,12 @@ mod tests {
         let first = enqueue_batch(
             &session,
             vec![
-                queued("test:before", vec![], None),
-                queued("test:image", vec![image], Some("blind")),
+                queued(&session, "test:before", vec![], None),
+                queued(&session, "test:image", vec![image], Some("blind")),
             ],
         );
         buffered(&session, 1).await;
-        let later = enqueue_batch(&session, vec![queued("test:later", vec![], None)]);
+        let later = enqueue_batch(&session, vec![queued(&session, "test:later", vec![], None)]);
         buffered(&session, 2).await;
         tracking.release(0);
         use HarnessError::{ImagesUnsupported, Interrupted};
@@ -570,8 +606,8 @@ mod tests {
             let turn = prompt(&session, "test:initial");
             tracking.request(0).await;
             let inputs = vec![
-                queued("test:one", vec![], Some("second")),
-                queued("test:two", vec![], Some("third")),
+                queued(&session, "test:one", vec![], Some("second")),
+                queued(&session, "test:two", vec![], Some("third")),
             ];
             let claim = inputs[0].cancellation.clone();
             let enqueue = enqueue_batch(&session, inputs);

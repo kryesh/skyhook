@@ -3,7 +3,7 @@ use super::super::transport::Client;
 use super::McpError;
 use crate::tool::{
     ToolError,
-    diagnostic::{DiagnosticContext, Operation, Subject},
+    diagnostic::{Operation, PartialContext, Subject},
 };
 use rmcp::model::{PaginatedRequestParams, Tool};
 use std::collections::HashSet;
@@ -39,7 +39,7 @@ pub(super) fn bounded_json_size(value: &impl serde::Serialize, limit: usize) -> 
 pub(super) async fn discover(client: &Client) -> Result<Vec<Tool>, ToolError> {
     // Keep the known discovery operation separate from the sanitized SDK cause.
     let failure = |error: McpError| {
-        ToolError::from(error).context(DiagnosticContext::new(
+        ToolError::from(error).context(PartialContext::new(
             Operation::Read,
             Subject::Label("MCP tools/list discovery".into()),
         ))
@@ -162,10 +162,11 @@ mod tests {
         let diagnostic = error.diagnostic();
         assert_eq!(
             diagnostic.context,
-            DiagnosticContext::new(
+            PartialContext::new(
                 Operation::Read,
                 Subject::Label("MCP tools/list discovery".into()),
-            ),
+            )
+            .resolve(),
         );
         assert_eq!(
             diagnostic.cause,

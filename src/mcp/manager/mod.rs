@@ -9,7 +9,7 @@ mod connection;
 use super::config::McpServerConfig;
 use crate::tool::{
     ToolError,
-    diagnostic::{DiagnosticContext, Effects, Operation, Subject},
+    diagnostic::{Effects, Operation, PartialContext, Subject},
     policy::{Capability, CapabilitySet},
 };
 use catalog::bounded_json_size;
@@ -42,8 +42,10 @@ pub enum McpError {
     Closed,
     #[error("MCP tool is not in the startup catalog")]
     UnknownTool { server: String, tool: String },
-    #[error("MCP request failed: {0}")]
-    Request(String),
+    #[error("MCP tool arguments exceed size limit")]
+    ArgumentsTooLarge,
+    #[error("MCP tool result exceeds size limit")]
+    ResultTooLarge,
     #[error("server JSON-RPC error {0}")]
     JsonRpc(i32),
     #[error("MCP I/O failed: {}", .0.kind())]
@@ -75,9 +77,27 @@ pub enum McpError {
 impl From<McpError> for ToolError {
     fn from(error: McpError) -> Self {
         match error {
-            McpError::Cancelled => Self::Cancelled,
-            McpError::Io(error) => Self::Io(error),
-            other => Self::Failed(other.to_string()),
+            McpError::Cancelled => Self::cancelled(),
+            McpError::Io(error) => Self::io(error),
+            error @ (McpError::Configuration(_)
+            | McpError::Startup(_)
+            | McpError::Timeout
+            | McpError::Closed
+            | McpError::UnknownTool { .. }
+            | McpError::ArgumentsTooLarge
+            | McpError::ResultTooLarge
+            | McpError::JsonRpc(_)
+            | McpError::HttpStatus(_)
+            | McpError::TransportClosed
+            | McpError::UnexpectedResponse
+            | McpError::Transport
+            | McpError::AuthenticationRequired
+            | McpError::InsufficientScope
+            | McpError::SessionExpired
+            | McpError::Decode
+            | McpError::ProtocolVersion
+            | McpError::SubscriptionLagged
+            | McpError::InputRequiredRoundsExceeded) => Self::failed(error),
         }
     }
 }
@@ -98,6 +118,13 @@ pub enum McpServerStatus {
     },
     Failed(String),
     /// Never started: excluded by capability policy, or startup was cancelled.
+    Skipped,
+}
+
+/// One configured server: its live session, or why it has none.
+enum ServerEntry {
+    Connected { server: Server, tools: usize },
+    Failed(String),
     Skipped,
 }
 
@@ -123,8 +150,7 @@ impl Drop for CancelOnDrop {
 pub struct McpManager {
     catalog: Vec<DiscoveredTool>,
     warnings: Vec<String>,
-    servers: BTreeMap<String, Server>,
-    statuses: BTreeMap<String, McpServerStatus>,
+    servers: BTreeMap<String, ServerEntry>,
     closed: CancellationToken,
 }
 
@@ -140,10 +166,9 @@ impl McpManager {
         let mut manager = Self {
             catalog: Vec::new(),
             warnings: Vec::new(),
-            servers: BTreeMap::new(),
-            statuses: configs
+            servers: configs
                 .keys()
-                .map(|name| (name.clone(), McpServerStatus::Skipped))
+                .map(|name| (name.clone(), ServerEntry::Skipped))
                 .collect(),
             closed: CancellationToken::new(),
         };
@@ -175,10 +200,12 @@ impl McpManager {
             let Some((name, result)) = result else {
                 continue;
             };
-            match result {
+            let entry = match result {
                 Ok((tools, server)) => {
-                    let status = McpServerStatus::Connected { tools: tools.len() };
-                    manager.statuses.insert(name.clone(), status);
+                    let entry = ServerEntry::Connected {
+                        server,
+                        tools: tools.len(),
+                    };
                     manager
                         .catalog
                         .extend(tools.into_iter().map(|tool| DiscoveredTool {
@@ -186,17 +213,16 @@ impl McpManager {
                             tool,
                             capabilities: policy.clone(),
                         }));
-                    manager.servers.insert(name, server);
+                    entry
                 }
                 Err(error) => {
                     manager
                         .warnings
                         .push(format!("MCP server {name:?} unavailable: {error}"));
-                    manager
-                        .statuses
-                        .insert(name, McpServerStatus::Failed(error.to_string()));
+                    ServerEntry::Failed(error.to_string())
                 }
-            }
+            };
+            manager.servers.insert(name, entry);
         }
         manager
             .catalog
@@ -214,8 +240,20 @@ impl McpManager {
         &self.warnings
     }
     /// Every configured server, including those that failed or were skipped.
-    pub fn servers(&self) -> &BTreeMap<String, McpServerStatus> {
-        &self.statuses
+    pub fn servers(&self) -> BTreeMap<String, McpServerStatus> {
+        self.servers
+            .iter()
+            .map(|(name, entry)| {
+                let status = match entry {
+                    ServerEntry::Connected { tools, .. } => {
+                        McpServerStatus::Connected { tools: *tools }
+                    }
+                    ServerEntry::Failed(error) => McpServerStatus::Failed(error.clone()),
+                    ServerEntry::Skipped => McpServerStatus::Skipped,
+                };
+                (name.clone(), status)
+            })
+            .collect()
     }
 
     /// Send exactly one request. Cancellation and timeout report an uncertain
@@ -233,7 +271,7 @@ impl McpManager {
             .map_err(|error| {
                 let subject = Subject::Label(format!("MCP server {server}, tool {tool}"));
                 ToolError::from(error)
-                    .context(DiagnosticContext::new(stage.0, subject).effects(stage.1))
+                    .context(PartialContext::new(stage.0, subject).effects(stage.1))
             })
     }
 
@@ -252,23 +290,24 @@ impl McpManager {
         if cancel.is_cancelled() {
             return Err(McpError::Cancelled);
         }
-        if !self
+        let advertised = self
             .catalog
             .iter()
-            .any(|entry| entry.server == server && entry.tool.name == tool)
-        {
+            .any(|entry| entry.server == server && entry.tool.name == tool);
+        let Some(ServerEntry::Connected { server, .. }) =
+            self.servers.get(server).filter(|_| advertised)
+        else {
             return Err(McpError::UnknownTool {
                 server: server.into(),
                 tool: tool.into(),
             });
-        }
-        let server = self.servers.get(server).expect("catalog server exists");
+        };
         let deadline = tokio::time::Instant::now() + server.timeout;
         let _permit = guarded(&self.closed, &cancel, deadline, server.calls.acquire())
             .await?
             .map_err(|_| McpError::Closed)?;
         if bounded_json_size(&arguments, MAX_RESULT_BYTES).is_none() {
-            return Err(McpError::Request("tool arguments exceed size limit".into()));
+            return Err(McpError::ArgumentsTooLarge);
         }
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(
             CallToolRequestParams::new(tool.to_owned()).with_arguments(arguments),
@@ -289,7 +328,7 @@ impl McpManager {
             Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => {
                 if bounded_json_size(&result, MAX_RESULT_BYTES).is_none() {
                     *stage = (Operation::Receive, Effects::OutputIncomplete);
-                    Err(McpError::Request("tool result exceeds size limit".into()))
+                    Err(McpError::ResultTooLarge)
                 } else {
                     Ok(result)
                 }
@@ -312,8 +351,10 @@ impl McpManager {
     /// Externally managed HTTP servers never have an OwnedProcess.
     pub async fn shutdown(&self) {
         self.closed.cancel();
-        for server in self.servers.values() {
-            server.shutdown().await;
+        for entry in self.servers.values() {
+            if let ServerEntry::Connected { server, .. } = entry {
+                server.shutdown().await;
+            }
         }
     }
 }
@@ -608,11 +649,9 @@ for line in sys.stdin:
             assert!(manager.catalog().is_empty());
             // Missing header resolution or command startup would produce a warning.
             assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
-            assert!(
-                manager
-                    .servers()
-                    .values()
-                    .eq([&McpServerStatus::Skipped; 2])
+            assert_eq!(
+                manager.servers().into_values().collect::<Vec<_>>(),
+                [McpServerStatus::Skipped, McpServerStatus::Skipped]
             );
             assert!(!fixture.directory.path().join("pid").exists());
             let accepted = listener.accept().unwrap_err();
@@ -680,11 +719,10 @@ for line in sys.stdin:
         assert!(is(&error, McpError::Cancelled), "{error:?}");
         assert_eq!(stage(error), (Operation::Prepare, Effects::NotStarted));
         // Cancellation while waiting for a call slot is also definitely pre-send.
-        let permits = manager.servers["fixture"]
-            .calls
-            .acquire_many(16)
-            .await
-            .unwrap();
+        let ServerEntry::Connected { server, .. } = &manager.servers["fixture"] else {
+            panic!("fixture server is connected")
+        };
+        let permits = server.calls.acquire_many(16).await.unwrap();
         let cancel = CancellationToken::new();
         let call = manager.call("fixture", "slow", Map::new(), cancel.clone());
         tokio::pin!(call);
@@ -729,11 +767,12 @@ for line in sys.stdin:
         assert_eq!(diagnostic.cause, Cause::Cancelled);
         assert_eq!(
             diagnostic.context,
-            DiagnosticContext::new(
+            PartialContext::new(
                 Operation::Receive,
                 Subject::Label("MCP server fixture, tool slow".into())
             )
             .effects(Effects::MayHaveExecuted)
+            .resolve()
         );
         wait_for_file(Path::new(&cancelled)).await;
         fixture_call(&manager, "echo").await.unwrap();

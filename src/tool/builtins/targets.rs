@@ -30,24 +30,94 @@ struct TargetAddArgs {
     config: TargetConfig,
 }
 
+/// local identifies the Skyhook session host; ssh identifies a remote target.
+#[derive(Clone, Copy, Serialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+enum TargetKind {
+    Local,
+    Ssh,
+}
+
 #[derive(Serialize, JsonSchema)]
 struct CompactTarget {
     name: String,
-    r#type: crate::target::TargetType,
+    r#type: TargetKind,
     host: String,
     workspace: Option<std::path::PathBuf>,
     via: Option<String>,
     origin: Option<String>,
 }
+
 impl From<TargetRecord> for CompactTarget {
     fn from(record: TargetRecord) -> Self {
+        let detailed = DetailedTarget::from(record);
         Self {
-            name: record.name,
-            r#type: record.r#type,
-            host: record.host,
-            workspace: (record.workspace != std::path::Path::new(".")).then_some(record.workspace),
-            via: record.via,
-            origin: record.origin,
+            name: detailed.name,
+            r#type: detailed.r#type,
+            host: detailed.host,
+            workspace: (detailed.workspace != std::path::Path::new("."))
+                .then_some(detailed.workspace),
+            via: detailed.via,
+            origin: detailed.origin,
+        }
+    }
+}
+
+#[derive(Serialize, JsonSchema)]
+struct DetailedTarget {
+    name: String,
+    r#type: TargetKind,
+    source: TargetSource,
+    host: String,
+    user: Option<String>,
+    port: Option<u16>,
+    workspace: std::path::PathBuf,
+    via: Option<String>,
+    origin: Option<String>,
+    auth: &'static str,
+    external_agent: bool,
+}
+
+impl From<TargetRecord> for DetailedTarget {
+    fn from(record: TargetRecord) -> Self {
+        match record {
+            TargetRecord::Root => Self {
+                name: crate::target::TargetRef::Root.to_string(),
+                r#type: TargetKind::Local,
+                source: TargetSource::Builtin,
+                host: "localhost".into(),
+                user: None,
+                port: None,
+                workspace: ".".into(),
+                via: None,
+                origin: None,
+                auth: "local",
+                external_agent: false,
+            },
+            TargetRecord::Ssh {
+                name,
+                source,
+                host,
+                user,
+                port,
+                workspace,
+                via,
+                origin,
+                auth,
+                external_agent,
+            } => Self {
+                name: name.to_string(),
+                r#type: TargetKind::Ssh,
+                source,
+                host,
+                user,
+                port,
+                workspace,
+                via: via.map(|via| via.to_string()),
+                origin: origin.map(|origin| origin.to_string()),
+                auth: auth.as_str(),
+                external_agent,
+            },
         }
     }
 }
@@ -56,7 +126,7 @@ impl From<TargetRecord> for CompactTarget {
 #[serde(untagged)]
 enum TargetView {
     Compact(CompactTarget),
-    Detailed(TargetRecord),
+    Detailed(DetailedTarget),
 }
 
 pub(super) fn register(
@@ -77,7 +147,7 @@ pub(super) fn register(
                     .into_iter()
                     .map(|record| {
                         if args.details {
-                            TargetView::Detailed(record)
+                            TargetView::Detailed(record.into())
                         } else {
                             TargetView::Compact(record.into())
                         }
@@ -117,12 +187,10 @@ ssh.options can run commands, so it also requires exec."#,
             let router = router.clone();
             let store = store.clone();
             async move {
-                let definition =
-                    TargetDefinition::from_config(args.name, args.config, TargetSource::Session)
-                        .map_err(|error| {
-                            ToolError::from(error.into_admission_error())
-                                .effects(Effects::Unchanged)
-                        })?;
+                let definition = TargetDefinition::from_config(args.name, args.config)
+                    .map_err(|error| {
+                        ToolError::from(error.into_admission_error()).effects(Effects::Unchanged)
+                    })?;
                 let added = router
                     .add(definition, context.invocation_subject()?, &store)
                     .await
@@ -219,34 +287,36 @@ mod tests {
 
     #[test]
     fn target_views_keep_null_routing_and_detailed_defaults() {
-        let detailed = TargetRecord {
-            name: "root".into(),
-            r#type: crate::target::TargetType::Local,
-            source: TargetSource::Builtin,
-            host: "localhost".into(),
-            user: None,
-            port: None,
-            workspace: ".".into(),
-            via: None,
-            origin: None,
-            auth: "local",
-            external_agent: false,
-        };
         assert_eq!(
-            serde_json::to_value(CompactTarget::from(detailed.clone())).unwrap(),
+            serde_json::to_value(CompactTarget::from(TargetRecord::Root)).unwrap(),
             serde_json::json!({
                 "name":"root", "type":"local", "host":"localhost",
                 "workspace":null, "via":null, "origin":null
             })
         );
         assert_eq!(
-            serde_json::to_value(detailed).unwrap(),
+            serde_json::to_value(DetailedTarget::from(TargetRecord::Root)).unwrap(),
             serde_json::json!({
                 "name":"root", "type":"local", "source":"builtin", "host":"localhost",
                 "user":null, "port":null, "workspace":".", "via":null, "origin":null,
                 "auth":"local", "external_agent":false
             })
         );
+        let mut build = TargetDefinition::test("build", "/srv", Some("gateway"));
+        build.ssh.auth = crate::target::TargetAuth::Key {
+            path: "secret-key".into(),
+        };
+        let record = TargetRecord::from(&build);
+        assert_eq!(
+            serde_json::to_value(CompactTarget::from(record.clone())).unwrap(),
+            serde_json::json!({
+                "name":"build", "type":"ssh", "host":"build.example.com",
+                "workspace":"/srv", "via":"gateway", "origin":null
+            })
+        );
+        let detailed = serde_json::to_value(DetailedTarget::from(record)).unwrap();
+        assert_eq!(detailed["auth"], "key");
+        assert!(!detailed.to_string().contains("secret-key"));
     }
 
     #[test]

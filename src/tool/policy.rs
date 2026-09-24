@@ -1,81 +1,32 @@
 use std::{
     collections::BTreeSet,
-    fmt,
     future::Future,
     path::{Component, Path},
     pin::Pin,
-    str::FromStr,
 };
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::identity::{AgentId, JobId};
+use crate::{
+    identity::{AgentId, JobId},
+    named_enum::named_enum,
+    target::TargetRef,
+};
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum Capability {
-    Read,
-    Write,
-    Exec,
-    Network,
-    Targets,
-    /// Forward an SSH agent Skyhook does not own (`ssh.external_agent`).
-    SshAgent,
-    Agents,
-    Interactive,
-    Mcp,
-}
-
-impl Capability {
-    pub const ALL: [Self; 9] = [
-        Self::Read,
-        Self::Write,
-        Self::Exec,
-        Self::Network,
-        Self::Targets,
-        Self::SshAgent,
-        Self::Agents,
-        Self::Interactive,
-        Self::Mcp,
-    ];
-
-    #[must_use]
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Read => "read",
-            Self::Write => "write",
-            Self::Exec => "exec",
-            Self::Network => "network",
-            Self::Targets => "targets",
-            Self::SshAgent => "ssh_agent",
-            Self::Agents => "agents",
-            Self::Interactive => "interactive",
-            Self::Mcp => "mcp",
-        }
-    }
-}
-
-impl fmt::Display for Capability {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "unknown capability {0:?}; expected read, write, exec, network, targets, ssh_agent, agents, interactive, or mcp"
-)]
-pub struct ParseCapabilityError(String);
-
-impl FromStr for Capability {
-    type Err = ParseCapabilityError;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        Self::ALL
-            .into_iter()
-            .find(|capability| capability.as_str() == value)
-            .ok_or_else(|| ParseCapabilityError(value.to_owned()))
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    pub enum Capability {
+        Read = "read",
+        Write = "write",
+        Exec = "exec",
+        Network = "network",
+        Targets = "targets",
+        /// Forward an SSH agent Skyhook does not own (`ssh.external_agent`).
+        SshAgent = "ssh_agent",
+        Agents = "agents",
+        Interactive = "interactive",
+        Mcp = "mcp",
     }
 }
 
@@ -201,6 +152,18 @@ pub enum ResourceId {
     },
 }
 
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub(crate) enum ResourceKind {
+        Workspace = "workspace",
+        Path = "path",
+        Network = "network",
+        Route = "route",
+        Session = "session",
+        Mcp = "mcp",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("unknown or malformed permission resource: {0}")]
 pub struct ResourceError(String);
@@ -213,15 +176,15 @@ struct ResourceWire {
 
 impl ResourceId {
     #[must_use]
-    pub fn workspace(target: &str, workspace: &Path) -> Self {
+    pub fn workspace(target: &TargetRef, workspace: &Path) -> Self {
         Self::Workspace {
-            target: target.into(),
+            target: target.to_string(),
             path: workspace.to_string_lossy().into_owned(),
         }
     }
 
     #[must_use]
-    pub fn path(target: &str, path: &Path) -> Self {
+    pub fn path(target: &TargetRef, path: &Path) -> Self {
         let components = path
             .components()
             .map(|component| match component {
@@ -233,7 +196,7 @@ impl ResourceId {
             })
             .collect();
         Self::Path {
-            target: target.into(),
+            target: target.to_string(),
             components,
         }
     }
@@ -241,9 +204,9 @@ impl ResourceId {
     /// Callers obtain the normalized HTTP(S) origin from a validated URL parser,
     /// omitting path, query, user information and default ports.
     #[must_use]
-    pub fn network(target: &str, normalized_origin: &str) -> Self {
+    pub fn network(target: &TargetRef, normalized_origin: &str) -> Self {
         Self::Network {
-            target: target.into(),
+            target: target.to_string(),
             origin: normalized_origin.into(),
         }
     }
@@ -266,6 +229,17 @@ impl ResourceId {
         Self::Mcp {
             server: server.into(),
             tool: tool.into(),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> ResourceKind {
+        match self {
+            Self::Workspace { .. } => ResourceKind::Workspace,
+            Self::Path { .. } => ResourceKind::Path,
+            Self::Network { .. } => ResourceKind::Network,
+            Self::Route { .. } => ResourceKind::Route,
+            Self::Session { .. } => ResourceKind::Session,
+            Self::Mcp { .. } => ResourceKind::Mcp,
         }
     }
 
@@ -319,7 +293,10 @@ impl TryFrom<ResourceWire> for ResourceId {
                 target: target.clone(),
                 components: components.to_vec(),
             }),
-            ("network", [target, origin]) => Ok(Self::network(target, origin)),
+            ("network", [target, origin]) => Ok(Self::Network {
+                target: target.clone(),
+                origin: origin.clone(),
+            }),
             ("session", [name]) => Ok(Self::session(name)),
             ("mcp", [server, tool]) => Ok(Self::mcp(server, tool)),
             ("route", [destination, hops @ ..]) if hops.len() % 2 == 0 => {
@@ -368,11 +345,12 @@ impl From<ResourceId> for ResourceWire {
     }
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(rename_all = "snake_case")]
-pub enum ApprovalCoverage {
-    Exact,
-    Descendants,
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+    pub enum ApprovalCoverage {
+        Exact = "exact",
+        Descendants = "descendants",
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
@@ -502,23 +480,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capability_names_round_trip_and_reject_unknown_names() {
-        assert_eq!(Capability::Network.as_str(), "network");
-        for capability in Capability::ALL {
-            let name = capability.as_str();
-            assert_eq!(name.parse::<Capability>().unwrap(), capability);
-            assert_eq!(serde_json::to_value(capability).unwrap(), name);
-            assert_eq!(
-                serde_json::from_value::<Capability>(serde_json::json!(name)).unwrap(),
-                capability
-            );
-        }
-        for invalid in ["", "READ", " read", "read,write", "unknown"] {
-            assert!(invalid.parse::<Capability>().is_err());
-        }
-    }
-
-    #[test]
     fn exact_sets_do_not_inherit_defaults() {
         assert_eq!(CapabilitySet::empty().iter().count(), 0);
         let exact: CapabilitySet = [Capability::Mcp].into_iter().collect();
@@ -568,8 +529,8 @@ mod tests {
 
     #[test]
     fn descendant_matching_preserves_vector_boundaries_and_route_identity() {
-        let parent = ResourceId::path("root", Path::new("/a"));
-        let child = ResourceId::path("root", Path::new("/a/b"));
+        let parent = ResourceId::path(&crate::target::TargetRef::Root, Path::new("/a"));
+        let child = ResourceId::path(&crate::target::TargetRef::Root, Path::new("/a/b"));
         let exact = ApprovalGrant::exact(Capability::Read, parent.clone());
         let descendants = ApprovalGrant::descendants(Capability::Read, parent);
         assert!(!exact.covers(Capability::Read, &child));
@@ -577,7 +538,7 @@ mod tests {
         assert!(!descendants.covers(Capability::Write, &child));
         assert!(!descendants.covers(
             Capability::Read,
-            &ResourceId::path("root", Path::new("/ab"))
+            &ResourceId::path(&crate::target::TargetRef::Root, Path::new("/ab"))
         ));
         let hops = vec![("jump".into(), 1), ("build".into(), 2)];
         let route = ResourceId::route("build", hops.clone());
@@ -600,14 +561,14 @@ mod tests {
 
     #[test]
     fn network_resources_are_scoped_by_target_and_origin() {
-        let resource = ResourceId::network("root", "https://example.test");
+        let resource = ResourceId::network(&crate::target::TargetRef::Root, "https://example.test");
         let grant = ApprovalGrant::exact(Capability::Network, resource.clone());
         assert!(grant.covers(Capability::Network, &resource));
         for other in [
-            ResourceId::network("build", "https://example.test"),
-            ResourceId::network("root", "http://example.test"),
-            ResourceId::network("root", "https://example.test:8443"),
-            ResourceId::network("root", "https://other.test"),
+            ResourceId::network(&"build".parse().unwrap(), "https://example.test"),
+            ResourceId::network(&crate::target::TargetRef::Root, "http://example.test"),
+            ResourceId::network(&crate::target::TargetRef::Root, "https://example.test:8443"),
+            ResourceId::network(&crate::target::TargetRef::Root, "https://other.test"),
         ] {
             assert!(!grant.covers(Capability::Network, &other));
         }

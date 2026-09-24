@@ -109,7 +109,8 @@ job_output({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
 `field` is a JSON Pointer: `/result/content` selects a file snapshot, `/result/stdout` and
 `/result/stderr` select process streams. For scripts, `/result/console` selects captured console
 text and `/result/value` selects the JavaScript return (append pointer segments for nested data,
-for example `/result/value/items`). Objects and
+for example `/result/value/items`). The empty pointer `""` selects the whole saved output, a
+page of `{"result": ...}`. Objects and
 arrays have deterministic JSON text views. Long lines are split into UTF-8-safe fragments;
 the next position identifies where to continue. Regex matching is case-sensitive unless inline
 flags override it. Matching supports lines up to 4 MiB and reports an explicit resource error

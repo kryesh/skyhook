@@ -2,7 +2,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use super::Message;
-use crate::{identity::AgentId, media::LoadedBlobs};
+use crate::{
+    identity::AgentId,
+    media::LoadedBlobs,
+    named_enum::named_enum,
+    newtype::{Blank, nonblank, string_newtype},
+};
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SystemSegment {
@@ -36,6 +41,23 @@ pub struct ModelRequest {
 }
 
 impl ModelRequest {
+    /// An empty request for `model`: no history, tools, schema or limits.
+    #[cfg(test)]
+    pub(crate) fn test(model: &str) -> Self {
+        Self {
+            model: model.into(),
+            system: Vec::new(),
+            history: Vec::new(),
+            tail: Vec::new(),
+            history_lifetime: HistoryLifetime::default(),
+            tools: Vec::new(),
+            response_schema: None,
+            reasoning: None,
+            max_output_tokens: None,
+            blobs: LoadedBlobs::default(),
+        }
+    }
+
     /// Every message in send order: history, then tail.
     pub fn messages(&self) -> impl DoubleEndedIterator<Item = &Message> + Clone {
         self.history.iter().chain(&self.tail)
@@ -46,45 +68,28 @@ impl ModelRequest {
     }
 }
 
-/// Whether later requests in this model context will extend this request's history.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum HistoryLifetime {
-    /// Later requests in this context extend this history.
-    #[default]
-    Extends,
-    /// This history is sent once under settings no other request in the context shares
-    /// (compaction summaries), so there is no cached prefix to read or extend.
-    Detached,
+named_enum! {
+    /// Whether later requests in this model context will extend this request's history.
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    pub enum HistoryLifetime {
+        /// Later requests in this context extend this history.
+        #[default]
+        Extends = "extends",
+        /// This history is sent once under settings no other request in the context shares
+        /// (compaction summaries), so there is no cached prefix to read or extend.
+        Detached = "detached",
+    }
 }
 
-/// Stable identity of one conversation's provider context. Backends may send it as
-/// cache-affinity metadata; it never selects history.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct ContextId(String);
-
-impl ContextId {
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
+string_newtype! {
+    /// Stable identity of one conversation's provider context. Backends may send it as
+    /// cache-affinity metadata; it never selects history.
+    pub struct ContextId(Blank) = |id| nonblank("context identity", id);
 }
 
 impl From<&AgentId> for ContextId {
     fn from(agent: &AgentId) -> Self {
         Self(agent.to_string())
-    }
-}
-
-impl From<&str> for ContextId {
-    fn from(id: &str) -> Self {
-        Self(id.to_owned())
-    }
-}
-
-impl From<String> for ContextId {
-    fn from(id: String) -> Self {
-        Self(id)
     }
 }
 

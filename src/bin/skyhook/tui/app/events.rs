@@ -1,4 +1,5 @@
 use super::*;
+use crate::launch::LaunchError;
 use crate::tui::tool_view::OutputView;
 
 // Query presence, capture selection and preview metadata belong to core.
@@ -33,7 +34,7 @@ pub enum Work {
         result: Result<Attachment, String>,
     },
     Started {
-        result: Result<SessionHandle, String>,
+        result: Result<SessionHandle, LaunchError>,
     },
     StatusFailed {
         session: Option<SessionId>,
@@ -131,9 +132,9 @@ impl App {
                 message,
             } if (session == self.session_id()
                 && (session.is_some() || agent == self.selected))
-                || (session.is_none() && self.attached_draft.as_ref() == Some(&agent)) =>
+                || (session.is_none() && self.attached_draft() == Some(&agent)) =>
             {
-                let agent = if self.attached_draft.as_ref() == Some(&agent) {
+                let agent = if self.attached_draft() == Some(&agent) {
                     self.root_agent().clone()
                 } else {
                     agent
@@ -282,7 +283,12 @@ impl App {
                     InputTarget::Search => {
                         self.search_editor.as_mut().unwrap().insert(&text);
                     }
-                    InputTarget::Prompt => {
+                    InputTarget::Prompt
+                        if self
+                            .prompts
+                            .front()
+                            .is_some_and(|prompt| prompt.takes_text()) =>
+                    {
                         let outcome = self.prompt_input_mut().editor.insert(&text);
                         if self.multiple_questions() && outcome.text_changed {
                             self.set_question_editing(true);
@@ -295,7 +301,7 @@ impl App {
                     InputTarget::Composer => {
                         self.editor.insert(&text);
                     }
-                    InputTarget::None => {}
+                    InputTarget::Prompt | InputTarget::None => {}
                 }
             }
             Event::Mouse(mouse) => {
@@ -492,6 +498,7 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
+    use skyhook::session::Message;
 
     async fn fetch_output(app: &mut App, job: JobId) -> Value {
         let mut rx = capture_work(app);
@@ -588,7 +595,7 @@ mod tests {
         assert!(app.outputs.query(job).is_none());
 
         let mut query = JobOutputQuery::new(job);
-        query.field = Some("/result/stderr".into());
+        query.field = Some("/result/stderr".parse().unwrap());
         app.outputs.set_query(query);
         let selected = fetch_output(&mut app, job).await;
         assert_eq!(
@@ -600,8 +607,8 @@ mod tests {
             .into_iter()
             .flatten();
         assert!(captures.all(|capture| capture["output"].is_null()));
-        let field = app.outputs.query(job).unwrap().field.as_deref();
-        assert_eq!(field, Some("/result/stderr"));
+        let field = app.outputs.query(job).unwrap().field.clone();
+        assert_eq!(field, Some("/result/stderr".parse().unwrap()));
         session.shutdown().await.unwrap();
     }
 
@@ -673,7 +680,7 @@ mod tests {
             for word in ["bravo", "e\u{301}界🙂"] {
                 let (_root, mut app) = fixture().await;
                 let text = format!("Sender\nAlpha **{word}** omega");
-                let entry = Entry::new(model::EntryKey::Record(1), text, surface);
+                let entry = Entry::new(model::EntryKey::UnsavedStatus(0), text, surface);
                 app.install_entries(vec![entry]);
                 app.content_dirty = false;
                 let buffer = draw_buffer(&mut app);
@@ -719,21 +726,12 @@ mod tests {
     #[tokio::test]
     async fn pre_job_failure_updates_the_existing_tool_card_and_expands_in_place() {
         use crate::tui::theme::ContentTheme;
-        use skyhook::provider::protocol::{AssistantItem, Message, ToolCall, ToolResult};
+        use skyhook::provider::protocol::{AssistantItem, ToolCall, ToolResult};
         let (_root, mut app) = fixture().await;
-        let agent = app.selected.clone();
-        let commit = |app: &mut App, message| {
-            let sequence = app.snapshot.records.last_key_value().unwrap().0 + 1;
-            let record = skyhook::session::EventRecord {
-                id: skyhook::identity::EventId::generate().unwrap(),
-                sequence,
-                timestamp_millis: 0,
-                agent: agent.clone(),
-                event: SessionEvent::MessageCommitted { message },
-            };
-            app.snapshot.records.insert(sequence, record);
+        async fn commit(app: &mut App, message: Message) {
+            push_record(app, SessionEvent::MessageCommitted { message }).await;
             app.refresh();
-        };
+        }
         let tool_cards = |app: &App| {
             let entries = app.entries().iter();
             let cards = entries.filter(|entry| entry.surface == model::Surface::Tool);
@@ -741,7 +739,7 @@ mod tests {
         };
         let call = ToolCall::new("denied-call", "exec", json!({"argv": ["cargo", "test"]}));
         let call = AssistantItem::tool_call("call-item", 0, call.unwrap());
-        commit(&mut app, Message::Assistant(vec![call]));
+        commit(&mut app, Message::Assistant(vec![call])).await;
         draw(&mut app);
         let key = tool_cards(&app)[0].key().clone();
         let result = ToolResult {
@@ -751,7 +749,7 @@ mod tests {
             images: vec![],
             is_error: true,
         };
-        commit(&mut app, Message::Tool(vec![result]));
+        commit(&mut app, Message::Tool(vec![result])).await;
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
         let buffer = draw_buffer(&mut app);
         let cards = tool_cards(&app);
@@ -885,6 +883,6 @@ mod tests {
             (query.start, query.offset.unwrap_or(0)),
             (at("next_start"), at("next_offset").unwrap_or(0))
         );
-        assert_eq!(query.field.as_deref(), Some("/result/content"));
+        assert_eq!(query.field, Some("/result/content".parse().unwrap()));
     }
 }

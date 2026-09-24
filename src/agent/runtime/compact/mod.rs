@@ -5,9 +5,9 @@ use crate::{
     identity::AgentId,
     provider::{
         ProviderContext,
-        protocol::{Message, ModelRequest, Usage},
+        protocol::{ModelRequest, Usage},
     },
-    session::{EventRecord, SessionEvent},
+    session::{AttemptRef, CompactionFailure, EventRecord, RecordSeq, SessionEvent},
 };
 
 /// Context/validation recovery is bounded independently of transient retries.
@@ -43,10 +43,7 @@ impl TokenMeter {
         for record in records.iter().rev().filter(|record| &record.agent == agent) {
             match &record.event {
                 SessionEvent::ModelChanged { .. } | SessionEvent::ModeChanged { .. } => break,
-                SessionEvent::Usage {
-                    request: Some(request),
-                    usage,
-                } => {
+                SessionEvent::Usage { request, usage } => {
                     if let Ok((_, request)) =
                         crate::session::reconstruct_model_request(records, *request)
                     {
@@ -81,10 +78,6 @@ impl TokenMeter {
     }
 }
 
-pub(super) fn context_sources(projected: &[(u64, Message)]) -> Vec<u64> {
-    projected.iter().map(|(sequence, _)| *sequence).collect()
-}
-
 impl SessionRuntime {
     /// Whether a checkpoint was installed; a summary that cannot shrink the context is skipped.
     pub(super) async fn compact_history(
@@ -92,7 +85,7 @@ impl SessionRuntime {
         turn: &TurnContext<'_>,
         provider: &mut dyn ProviderContext,
         meter: &mut TokenMeter,
-        context: u64,
+        context: RecordSeq,
         input: &ModelRequest,
         max_context: u64,
     ) -> Result<bool, HarnessError> {
@@ -117,7 +110,16 @@ impl SessionRuntime {
                 )
                 .await;
             // Only an attempt of this summary request belongs to its outcome.
-            let summary_attempt = (model_attempt > attempted).then_some(model_attempt);
+            let failure = match request_sequence {
+                None => CompactionFailure::BeforeRequest,
+                Some(request) if model_attempt > attempted => {
+                    CompactionFailure::Attempted(AttemptRef {
+                        request,
+                        attempt: model_attempt,
+                    })
+                }
+                Some(request) => CompactionFailure::Requested(request),
+            };
             match result {
                 Ok(installed) => return Ok(installed),
                 Err(error) => {
@@ -125,8 +127,7 @@ impl SessionRuntime {
                         .append(
                             turn.agent.clone(),
                             SessionEvent::CompactionFailed {
-                                request: request_sequence,
-                                attempt: request_sequence.and(summary_attempt),
+                                failure,
                                 error: format!(
                                     "attempt {attempt}/{MAX_COMPACTION_ATTEMPTS}: {error}"
                                 ),
@@ -159,6 +160,7 @@ mod tests {
     use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
+    pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
     pub(super) use crate::agent::runtime::tests::{
         count, delta, events, summary_json, test_builder, todo, usage,
     };
@@ -169,11 +171,11 @@ mod tests {
         provider::{
             Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
             protocol::{
-                AssistantItem, Completion, ContextId, CutReason, ItemKind, Message, ModelRequest,
-                ResponseEvent, ToolCall, Usage, UserContent,
+                AssistantItem, Completion, ContextId, CutReason, ItemKind, ModelRequest,
+                ResponseEvent, ToolCall, Usage,
             },
         },
-        session::{SessionEvent, project_history},
+        session::{Message, SessionEvent, UserPart, project_history},
         tool::policy::CapabilitySet,
     };
 
@@ -213,7 +215,7 @@ mod tests {
         fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
             let provider = self.clone();
             let started = async move {
-                let summary = request.tail.last() == Some(&compaction::directive());
+                let summary = request.tail.last() == Some(&compaction::directive().render());
                 provider.requests.lock().unwrap().push(request);
                 let counters = [
                     (
@@ -345,7 +347,7 @@ mod tests {
             let research = Message::Assistant(vec![AssistantItem::text("text/0", 0, research)]);
             runtime.commit(root, research).await.unwrap();
             let text = "Continue the existing task.".into();
-            let next = Message::User(vec![UserContent::Text { text }]);
+            let next = Message::User(vec![UserPart::Text { text }]);
             runtime.commit(root, next).await.unwrap();
         }
 
@@ -376,14 +378,14 @@ mod tests {
             let store = &runtime.store;
             let sequence = store.append(agent.clone(), context).await.unwrap().sequence;
             let mut input = self.template.clone();
-            let history = project_history(&runtime.store.records().await, agent).unwrap();
-            input.history = history.into_iter().map(|(_, message)| message).collect();
+            let history = project_history(&runtime.store.records().await, agent);
+            input.history = crate::session::render_history(history.history());
             let capabilities = CapabilitySet::default();
             let location = ExecutionLocation::root(self.workspace.path().to_path_buf());
             let (jobs, todos) = (&runtime.jobs, &runtime.todos);
             let state =
                 state::runtime_state_content(jobs, todos, agent, &capabilities, &location).await;
-            input.tail = vec![Message::User(vec![state])];
+            input.tail = vec![crate::session::Message::User(vec![state]).render()];
             let turn = TurnContext {
                 agent,
                 owner_job: None,
@@ -424,7 +426,7 @@ mod tests {
         fixture.provider.block.store(true, Ordering::SeqCst);
         let todos = vec![todo("Keep on interruption", TodoStatus::InProgress)];
         runtime.todos.replace(agent, todos.clone()).await.unwrap();
-        let before = project_history(&fixture.records().await, agent).unwrap();
+        let before = project_history(&fixture.records().await, agent);
         let cancellation = CancellationToken::new();
         let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
             tokio::join!(fixture.compact(&cancellation), async {
@@ -436,7 +438,7 @@ mod tests {
         .unwrap();
         assert!(matches!(result, Err(HarnessError::Interrupted)));
         let records = fixture.records().await;
-        assert_eq!(project_history(&records, agent).unwrap(), before);
+        assert_eq!(project_history(&records, agent), before);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
         let found = runtime.todos.inspect(agent, None).await.unwrap().items;
         assert_eq!(found, todos);
@@ -461,17 +463,17 @@ mod tests {
                     fixture.set_summary(invalid);
                 }
             }
-            let before = project_history(&fixture.records().await, agent).unwrap();
+            let before = project_history(&fixture.records().await, agent);
             let cancellation = CancellationToken::new();
             let error = fixture.compact(&cancellation).await.unwrap_err();
             let records = fixture.records().await;
             if failure == "truncated" {
                 assert!(error.to_string().contains("truncated"));
-                let failed = count!(&records, SessionEvent::CompactionFailed { request, .. } if request.is_some());
+                let failed = count!(&records, SessionEvent::CompactionFailed { failure, .. } if failure.request().is_some());
                 assert_ne!(failed, 0);
             }
             let requests = fixture.provider.requests.lock().unwrap().len();
-            let unchanged = project_history(&records, agent).unwrap() == before;
+            let unchanged = project_history(&records, agent) == before;
             let compactions = count!(&records, SessionEvent::Compaction { .. });
             let kept_todos = todos.inspect(agent, None).await.unwrap().items == old_todos;
             let outcome = (requests, unchanged, compactions, kept_todos);

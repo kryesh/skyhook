@@ -1,9 +1,12 @@
 //! Tool registration, execution metadata, and capability-scoped surfaces.
 
 mod docs;
+mod envelope;
 mod schema;
 
 pub(crate) use docs::{ScriptManifest, job_view_type};
+pub(crate) use envelope::split_envelope;
+pub use envelope::{ExecutionEnvelope, JobLaunch, JobName};
 use schema::{
     add_nested_schema_property, add_schema_property, ensure_no_target, tags_first,
     target_property_schema, validate_object_schema, validate_output_schema, validate_schema,
@@ -36,14 +39,14 @@ pub(crate) type AdmittedInvocation = Invocation<ToolContext, ToolOutput>;
 
 pub trait OutputValue: std::fmt::Debug + Send + 'static {
     fn from_value(value: Value) -> Self;
-    fn with_diagnostic(self, diagnostic: super::diagnostic::Diagnostic) -> Self;
+    fn with_diagnostic(self, diagnostic: super::diagnostic::PartialDiagnostic) -> Self;
 }
 
 impl OutputValue for ToolOutput {
     fn from_value(value: Value) -> Self {
         Self::new(value)
     }
-    fn with_diagnostic(self, diagnostic: super::diagnostic::Diagnostic) -> Self {
+    fn with_diagnostic(self, diagnostic: super::diagnostic::PartialDiagnostic) -> Self {
         self.with_diagnostic(diagnostic)
     }
 }
@@ -62,6 +65,13 @@ type InvocationFuture<O> = BoxFuture<'static, Result<O, OperationError<O>>>;
 pub(crate) struct Invocation<C, O>(Box<dyn FnOnce(C) -> InvocationFuture<O> + Send>);
 
 impl<C, O> Invocation<C, O> {
+    pub(crate) fn new<Fut>(run: impl FnOnce(C) -> Fut + Send + 'static) -> Self
+    where
+        Fut: Future<Output = Result<O, OperationError<O>>> + Send + 'static,
+    {
+        Self(Box::new(move |context| Box::pin(run(context))))
+    }
+
     pub(crate) fn call(self, context: C) -> InvocationFuture<O> {
         (self.0)(context)
     }
@@ -94,7 +104,7 @@ impl ToolSpec {
     pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), AdmissionError> {
         let arguments = arguments
             .as_object()
-            .ok_or(AdmissionError::ArgumentsMustBeObject)?;
+            .ok_or(AdmissionError::arguments_must_be_object())?;
         if self.input_schema["additionalProperties"] == false
             && let Some(argument) = arguments.keys().find(|argument| {
                 !self.input_schema["properties"]
@@ -102,7 +112,7 @@ impl ToolSpec {
                     .is_some_and(|properties| properties.contains_key(*argument))
             })
         {
-            return Err(AdmissionError::InvalidArguments(format!(
+            return Err(AdmissionError::invalid_arguments(format!(
                 "unknown argument `{argument}`"
             )));
         }
@@ -193,7 +203,7 @@ pub struct PathArgument {
 }
 
 fn unidentified_pointer(pointer: &str) -> AdmissionError {
-    AdmissionError::InvalidArguments(format!(
+    AdmissionError::invalid_arguments(format!(
         "path pointer `{pointer}` does not identify an argument"
     ))
 }
@@ -239,7 +249,7 @@ impl PathArgument {
         };
         match value {
             Some(Value::String(value)) => Ok(Some(value)),
-            Some(_) => Err(AdmissionError::InvalidArguments(format!(
+            Some(_) => Err(AdmissionError::invalid_arguments(format!(
                 "{} must be a string",
                 self.name()
             ))),
@@ -259,7 +269,7 @@ impl PathArgument {
             PathBinding::TopLevel { name, .. } => {
                 arguments
                     .as_object_mut()
-                    .ok_or(AdmissionError::ArgumentsMustBeObject)?
+                    .ok_or(AdmissionError::arguments_must_be_object())?
                     .insert(name.clone(), value);
             }
             PathBinding::Pointer(pointer) => {
@@ -584,26 +594,6 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
             .map(|schema| schema.generate(capabilities))
     }
 
-    pub(crate) fn take_job_name(
-        &self,
-        arguments: &mut Value,
-    ) -> Result<Option<String>, AdmissionError> {
-        if !self.execution.supports_name {
-            return Ok(None);
-        }
-        let value = arguments
-            .as_object_mut()
-            .ok_or(AdmissionError::ArgumentsMustBeObject)?
-            .remove("name");
-        match value {
-            None | Some(Value::Null) => Ok(None),
-            Some(Value::String(name)) if valid_job_name(&name) => Ok(Some(name)),
-            _ => Err(AdmissionError::InvalidArguments(
-                "name must be lowercase kebab-case: start with a letter, use only a-z, 0-9, and single hyphens between nonempty words".to_owned(),
-            )),
-        }
-    }
-
     pub async fn call(&self, context: C, arguments: Value) -> Result<O, OperationError<O>> {
         self.validate_arguments(&arguments)?;
         self.admit(arguments.clone(), &arguments)?
@@ -632,26 +622,25 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
             Some((path, convert))
         });
         let admitted = (self.admit)(arguments)?;
-        Ok(Invocation(Box::new(move |context| {
-            Box::pin(async move {
-                match admitted.call(context).await {
-                    Err(error) => {
-                        let diagnostic = error.diagnostic();
-                        let output = convert.and_then(|(path, convert)| {
-                            error
-                                .is_source_filesystem_io()
-                                .then(|| convert(&path, &diagnostic))
-                                .flatten()
-                        });
-                        match output {
-                            Some(output) => Ok(O::from_value(output).with_diagnostic(diagnostic)),
-                            None => Err(error),
+        Ok(Invocation::new(move |context| async move {
+            match admitted.call(context).await {
+                Err(error) => {
+                    let output = convert.and_then(|(path, convert)| {
+                        error
+                            .is_source_filesystem_io()
+                            .then(|| convert(&path, &error.diagnostic()))
+                            .flatten()
+                    });
+                    match output {
+                        Some(output) => {
+                            Ok(O::from_value(output).with_diagnostic(error.into_facts().0))
                         }
+                        None => Err(error),
                     }
-                    result => result,
                 }
-            })
-        })))
+                result => result,
+            }
+        }))
     }
 
     pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), AdmissionError> {
@@ -745,7 +734,7 @@ impl ToolSurface {
 
     pub fn validate_arguments(&self, name: &str, arguments: &Value) -> Result<(), AdmissionError> {
         let tool = self.get(name).ok_or_else(|| {
-            AdmissionError::InvalidArguments(format!("tool `{name}` is unavailable"))
+            AdmissionError::invalid_arguments(format!("tool `{name}` is unavailable"))
         })?;
         tool.validate_arguments(arguments)
     }
@@ -820,25 +809,6 @@ impl<C: Send + 'static, O: OutputValue> Catalog<C, O> {
             job_envelope: crate::job::presented_job_schema(false),
         }
     }
-
-    pub fn split_execution(
-        &self,
-        tool: &ToolSpec,
-        mut arguments: Value,
-    ) -> Result<(Value, bool), AdmissionError> {
-        let object = arguments
-            .as_object_mut()
-            .ok_or(AdmissionError::ArgumentsMustBeObject)?;
-        let background = match object.remove("bg") {
-            None => false,
-            Some(Value::Bool(value)) if tool.supports_background => value,
-            Some(Value::Bool(_)) => {
-                return Err(AdmissionError::BackgroundUnsupported(tool.name.clone()));
-            }
-            Some(_) => return Err(AdmissionError::InvalidBackground),
-        };
-        Ok((arguments, background))
-    }
 }
 
 pub struct CatalogBuilder<C, O: OutputValue> {
@@ -875,13 +845,11 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         let handler = Arc::new(handler);
         self.register_admission(name, description, input_schema, options, move |arguments| {
             let handler = handler.clone();
-            Ok(Invocation(Box::new(move |context| {
-                Box::pin(handler(context, arguments))
-            })))
+            Ok(Invocation::new(move |context| handler(context, arguments)))
         })
     }
 
-    fn register_admission(
+    pub(crate) fn register_admission(
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
@@ -1065,9 +1033,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         self.register_admission(name, description, input_schema, options, move |arguments| {
             let input = super::diagnostic::deserialize_arguments::<I>(arguments)?;
             let handler = handler.clone();
-            Ok(Invocation(Box::new(move |context| {
-                Box::pin(handler(context, input))
-            })))
+            Ok(Invocation::new(move |context| handler(context, input)))
         })
     }
 
@@ -1134,16 +1100,6 @@ fn validate_name(name: &str) -> Result<(), RegistryError> {
     }
 }
 
-fn valid_job_name(name: &str) -> bool {
-    name.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
-        && name.split('-').all(|word| {
-            !word.is_empty()
-                && word
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        })
-}
-
 #[derive(Debug, Error)]
 pub enum RegistryError {
     #[error("invalid tool name `{0}`")]
@@ -1197,31 +1153,27 @@ impl ToolRegistryBuilder {
                 execution: tool.execution.clone(),
                 admit: Arc::new(move |arguments: Value| {
                     let admitted = (local.admit)(arguments.clone())?;
-                    Ok(Invocation(Box::new(move |context: ToolContext| {
-                        Box::pin(async move {
-                            let output = crate::job::output::HostOutput::new(
-                                context.store().clone(),
-                                context.job(),
-                            );
-                            let local = LocalContext::new(
-                                context.execution_location().clone(),
-                                context.capabilities().clone(),
-                                context.process_environment.clone(),
-                                context.cancellation_token(),
-                                output.context(),
-                                Arc::new(HostAuthorizer(context)),
-                                arguments,
-                            );
-                            let result = admitted.call(local).await;
-                            output.context().settle().await?;
-                            match result {
-                                Ok(value) => Ok(output.finish(value)?),
-                                Err(error) => {
-                                    Err(error.try_map_output(|value| output.finish(value))?)
-                                }
-                            }
-                        })
-                    })))
+                    Ok(Invocation::new(move |context: ToolContext| async move {
+                        let output = crate::job::output::HostOutput::new(
+                            context.store().clone(),
+                            context.job(),
+                        );
+                        let local = LocalContext::new(
+                            context.execution_location().clone(),
+                            context.capabilities().clone(),
+                            context.process_environment.clone(),
+                            context.cancellation_token(),
+                            output.context(),
+                            Arc::new(HostAuthorizer(context)),
+                            arguments,
+                        );
+                        let result = admitted.call(local).await;
+                        output.context().settle().await?;
+                        match result {
+                            Ok(value) => Ok(output.finish(value)?),
+                            Err(error) => Err(error.try_map_output(|value| output.finish(value))?),
+                        }
+                    }))
                 }),
             };
             self.tools.insert(name, Arc::new(host));
@@ -1267,7 +1219,7 @@ mod admission_tests {
                             )
                             .operation(Operation::StoreImage, Subject::Label("source".into()))
                         } else {
-                            ToolError::Io(std::io::ErrorKind::PermissionDenied.into())
+                            ToolError::io(std::io::ErrorKind::PermissionDenied.into())
                                 .operation(Operation::Read, Subject::path("source"))
                         })
                     },
@@ -1408,9 +1360,9 @@ mod admission_tests {
         let lease = runtime
             .jobs
             .create(JobSpec::test(runtime.agent.clone(), "product"));
-        let mut lease = lease.await.unwrap();
+        let lease = lease.await.unwrap().test_run().await;
         let job = lease.id();
-        let context = runtime.tool_context(&mut lease);
+        let (context, worker) = runtime.tool_context(lease);
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register_product::<Input, Output, _, _>(
@@ -1443,7 +1395,7 @@ mod admission_tests {
         assert_eq!(captures.len(), 1);
         assert!(captures[0].matches(job, "/result/content"));
         assert!(output.take_captures().is_empty());
-        lease.fail(ToolError::Cancelled.into()).await;
+        worker.fail(ToolError::cancelled().into()).await;
     }
 
     #[test]
@@ -1553,11 +1505,12 @@ mod admission_tests {
         };
         let args = output::OutputArgs::new(source);
         let capabilities = CapabilitySet::default();
-        let projected = runtime
-            .jobs
-            .present_output_with(args, &capabilities, options);
+        let projected =
+            runtime
+                .jobs
+                .present_output_with(args, Default::default(), &capabilities, options);
         let projected = projected.await.unwrap();
-        let expected = projected.view().clone();
+        let expected = projected.view();
         let mut builder = ToolRegistryBuilder::default();
         builder
             .register_presented::<Empty, _, _>(
@@ -1593,7 +1546,7 @@ mod admission_tests {
                 "presented",
                 "rejected",
                 options,
-                |_, _| async { Err(ToolError::Cancelled) },
+                |_, _| async { Err(ToolError::cancelled()) },
             );
             assert!(matches!(
                 result,

@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+use crate::session::RequestSeq;
 use crate::{identity::AgentId, session::EventRecord};
 
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
@@ -30,7 +31,7 @@ pub struct Question {
 }
 
 /// A suspended child's question batch, returned in its agent job's output.
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
 pub(crate) struct QuestionOutput {
     pub questions: Vec<Question>,
 }
@@ -70,14 +71,13 @@ pub enum RuntimeEvent {
     /// Provider-native item/block lifecycle, validated by the observation reducer.
     ResponseEvent {
         agent: AgentId,
-        request: u64,
+        request: RequestSeq,
         event: crate::provider::protocol::ResponseEvent,
     },
     ResponseSettled {
         agent: AgentId,
-        request: u64,
-        message: Option<u64>,
-        error: Option<String>,
+        request: RequestSeq,
+        settlement: super::Settlement,
     },
     Activity {
         agent: AgentId,

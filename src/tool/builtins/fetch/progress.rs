@@ -1,7 +1,7 @@
 //! Per-operation context retained even when the outer deadline cancels a request.
 use std::time::{Duration, Instant};
 
-use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, Subject};
+use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
 
 use reqwest::Method;
 use schemars::JsonSchema;
@@ -51,7 +51,7 @@ struct FailureResponse {
 pub(super) struct FetchProgress {
     started: Instant,
     pub(super) phase: FetchPhase,
-    context: DiagnosticContext,
+    context: PartialContext,
     /// Once a request is sent, a failure no longer proves the server did nothing.
     request_sent: bool,
     /// The response accounting owner records observed decoded bytes, including the
@@ -92,7 +92,7 @@ impl FetchProgress {
 
     /// Phase and operation are recorded before work begins, including across
     /// awaits cancelled by the outer deadline. Execution site is bound centrally.
-    pub fn operation(&mut self, phase: FetchPhase, context: DiagnosticContext) {
+    pub fn operation(&mut self, phase: FetchPhase, context: PartialContext) {
         self.phase = phase;
         self.context = context;
     }
@@ -102,17 +102,14 @@ impl FetchProgress {
     }
 
     pub fn local_io(&mut self, operation: Operation, subject: Subject) {
-        self.operation(
-            FetchPhase::LocalIo,
-            DiagnosticContext::new(operation, subject),
-        );
+        self.operation(FetchPhase::LocalIo, PartialContext::new(operation, subject));
     }
 
     /// Download staging never touches the destination before its final rename.
     pub fn download_io(&mut self, operation: Operation, path: &std::path::Path) {
         self.operation(
             FetchPhase::LocalIo,
-            DiagnosticContext::new(operation, Subject::path(path)).effects(Effects::Unchanged),
+            PartialContext::new(operation, Subject::path(path)).effects(Effects::Unchanged),
         );
     }
 
@@ -172,7 +169,7 @@ impl FetchProgress {
         match error.into_diagnostic() {
             Ok(diagnostic) => self.diagnostic_failure(diagnostic),
             // Cancellation, denial and argument contracts retain their original metadata.
-            Err(error) => error.fallback_context(self.context.clone()),
+            Err(error) => error.or(self.context.clone()),
         }
     }
 
@@ -214,7 +211,7 @@ impl FetchProgress {
     }
 }
 
-fn phase_context(phase: FetchPhase) -> DiagnosticContext {
+fn phase_context(phase: FetchPhase) -> PartialContext {
     let (operation, subject) = match phase {
         FetchPhase::ClientPreparation => (Operation::Prepare, "HTTP client"),
         FetchPhase::Request => (Operation::Send, "HTTP request"),
@@ -229,7 +226,7 @@ fn phase_context(phase: FetchPhase) -> DiagnosticContext {
         FetchPhase::Extraction => (Operation::Capture, "HTML text extraction"),
         FetchPhase::LocalIo => (Operation::Prepare, "fetch files"),
     };
-    DiagnosticContext::new(operation, Subject::Label(subject.into()))
+    PartialContext::new(operation, Subject::Label(subject.into()))
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -240,7 +237,7 @@ fn duration_ms(duration: Duration) -> u64 {
 mod tests {
     use super::super::tests::{executor, fetch, progress_for, response, server, stalled_server};
     use super::*;
-    use crate::tool::diagnostic::{Cause, Diagnostic, FailureSite};
+    use crate::tool::diagnostic::{Cause, FailureSite, PartialDiagnostic};
     use serde_json::{Value, json};
     use std::time::Duration;
     use tokio::net::TcpListener;
@@ -285,8 +282,8 @@ mod tests {
                     let output = result
                         .unwrap_err()
                         .into_tool_error()
-                        .into_failure()
-                        .output
+                        .into_parts()
+                        .1
                         .unwrap()
                         .value;
                     assert_eq!(output["diagnostic"]["error_kind"], kind);
@@ -329,7 +326,7 @@ mod tests {
         let case = async |include_headers: Option<bool>| {
             let arguments = with_headers(json!({"url":refused}), include_headers);
             let error = fetch(&runtime, &executor, arguments).await.unwrap_err();
-            let output = error.into_tool_error().into_failure().output.unwrap().value;
+            let output = error.into_tool_error().into_parts().1.unwrap().value;
             assert_eq!(output["diagnostic"]["error_kind"], "connection_refused");
             assert!(output.get("status").is_none() && output.get("headers").is_none());
 
@@ -337,7 +334,7 @@ mod tests {
             let (url, _ready, task) = stalled_server(head).await;
             let arguments = with_headers(json!({"url":url,"timeout":1}), include_headers);
             let error = fetch(&runtime, &executor, arguments).await.unwrap_err();
-            let output = error.into_tool_error().into_failure().output.unwrap().value;
+            let output = error.into_tool_error().into_parts().1.unwrap().value;
             assert_eq!(output["status"], 200);
             assert_eq!(output["diagnostic"]["timeout"]["kind"], "total");
             if include_headers == Some(true) {
@@ -365,9 +362,9 @@ mod tests {
                 "headers":{"authorization":["secret"]}, "url":"https://secret:secret@host/secret",
                 "body":{"kind":"text", "text":"secret"}, "extra":"secret"
             }));
-            let supplied = LocalError::from_diagnostic(
-                Diagnostic::new(DiagnosticContext::default(), cause),
-                Some(Box::new(forged)),
+            let supplied = LocalError::from_facts(
+                PartialDiagnostic::new(PartialContext::default(), cause),
+                Some(forged),
             );
             let error = progress.failure(FetchError::from_tool_error(
                 supplied,
@@ -399,7 +396,7 @@ mod tests {
     #[test]
     fn admission_and_control_flow_keep_cause_and_context_but_discard_supplied_output() {
         let progress = progress_for(json!({"url":"https://example.org"})).1;
-        let authorization = DiagnosticContext::new(
+        let authorization = PartialContext::new(
             Operation::Authorize,
             Subject::Label("network permission".into()),
         )
@@ -415,18 +412,21 @@ mod tests {
             // A boundary that named no context of its own gets the current fetch operation.
             for (supplied, expected) in [
                 (authorization.clone(), &authorization),
-                (DiagnosticContext::default(), &progress.context),
+                (PartialContext::default(), &progress.context),
             ] {
-                let error = LocalError::from_diagnostic(
-                    Diagnostic::new(supplied, cause.clone()),
-                    Some(Box::new(ProducedOutput::new(json!({"status":200})))),
+                let error = LocalError::from_facts(
+                    PartialDiagnostic::new(supplied, cause.clone()),
+                    Some(ProducedOutput::new(json!({"status":200}))),
                 );
                 let admitted = progress.failure(FetchError::from_tool_error(
                     error,
                     FetchPhase::Authorization,
                 ));
-                let (diagnostic, output) = admitted.into_parts();
-                assert_eq!(diagnostic, Diagnostic::new(expected.clone(), cause.clone()));
+                let (diagnostic, output) = admitted.into_facts();
+                assert_eq!(
+                    diagnostic,
+                    PartialDiagnostic::new(expected.clone(), cause.clone())
+                );
                 assert!(output.is_none());
             }
         }
@@ -437,17 +437,24 @@ mod tests {
         let mut progress = progress_for(json!({"url":"https://example.org"})).1;
         progress.request_started();
         for (operation, path, effects) in [
-            (Operation::SyncFile, "download-stage", Effects::Unchanged),
-            (Operation::Rename, "download", Effects::Unknown),
+            (
+                Operation::SyncFile,
+                "download-stage",
+                Some(Effects::Unchanged),
+            ),
+            (Operation::Rename, "download", None),
         ] {
             if operation == Operation::SyncFile {
                 progress.download_io(operation, std::path::Path::new(path));
             } else {
                 progress.local_io(operation, Subject::path(path));
             }
-            let context = DiagnosticContext::new(operation, Subject::path(path)).effects(effects);
+            let mut context = PartialContext::new(operation, Subject::path(path));
+            if let Some(effects) = effects {
+                context = context.effects(effects);
+            }
             let error = progress.timeout(7);
-            assert_eq!(error.diagnostic().context, context);
+            assert_eq!(error.facts().context, context);
             let (diagnostic, Some(output)) = error.into_parts() else {
                 panic!("structured timeout")
             };

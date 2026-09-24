@@ -226,7 +226,10 @@ mod tests {
             let competing = sender.request(RequestId::FIRST.next().unwrap());
             let output = competing.context();
             let capture = output
-                .pending_stream_capture("/result/stdout", crate::tool::output::CaptureKind::Text)
+                .pending_stream_capture(
+                    crate::tool::output::FieldPointer::result().property("stdout"),
+                    crate::tool::output::CaptureKind::Text,
+                )
                 .await
                 .unwrap();
             let completion = tokio::spawn(result.finish(Ok(RemoteToolOutput {

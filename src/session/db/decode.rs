@@ -5,32 +5,34 @@ use std::collections::HashMap;
 use libsql::Row;
 use serde::de::DeserializeOwned;
 
-use super::{Db, DbResult, corrupt, diagnostic};
+use super::{
+    Db, DbResult, JobEventKind, MessageRole, ResponseOutcome, UserPartKind, corrupt, diagnostic,
+    enum_column, optional_enum_column,
+};
 use crate::{
     agent::TodoItem,
     execution::ExecutionLocation,
     identity::{AgentId, EventId, JobId, SessionId},
-    media::{AttachmentRef, BlobDigest, BlobRef, ImageRef, TextRef},
+    job::{AgentMessage, AgentProgress},
+    media::{AttachmentRef, BlobDigest, BlobRef, ImageFormat, ImageRef, TextRef},
     provider::{
         profile::ModelProfile,
         protocol::{
-            AssistantItem, CutReason, ItemId, ItemKind, Message, Outcome, Position, Provenance,
-            Replay, ResponseSchema, SystemSegment, TextBlock, ToolCall, ToolDefinition, ToolResult,
-            Usage, UserContent,
+            AssistantItem, ItemId, ItemKind, Position, Provenance, Replay, ResponseSchema,
+            SystemSegment, TextBlock, ToolCall, ToolDefinition, ToolResult, Usage,
         },
     },
     session::{
-        CompactionCheckpoint, EventRecord, ModelCallOrigin, ModelContext, ProfileSnapshot,
-        SessionEvent,
+        AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, EntryKind,
+        EventRecord, JobEvent, Message, ModelCallOrigin, ModelContext, ProfileSnapshot, RecordSeq,
+        RuntimeState, SessionEvent, StateJob, StateJobKind, UserPart,
     },
-    target::{SshOptions, TargetAuth, TargetDefinition, TargetType},
-    tool::policy::Capability,
+    target::{SshAuth, SshOptions, TargetAuth, TargetDefinition, TargetName, TargetRef},
+    tool::{
+        policy::{ApprovalGrant, Capability, ResourceId, ResourceKind},
+        registry::JobName,
+    },
 };
-
-pub(in crate::session) fn parse_variant<T: DeserializeOwned>(text: String) -> DbResult<T> {
-    serde_json::from_value(serde_json::Value::String(text))
-        .map_err(|error| corrupt(error.to_string()))
-}
 
 fn parse_json<T: DeserializeOwned>(text: &str) -> DbResult<T> {
     serde_json::from_str(text).map_err(|error| corrupt(error.to_string()))
@@ -61,6 +63,11 @@ fn bytes<const N: usize>(value: Vec<u8>) -> DbResult<[u8; N]> {
     value
         .try_into()
         .map_err(|_| corrupt("identifier has the wrong length"))
+}
+
+/// A journal sequence read back from its row.
+pub(super) fn sequence(value: i64) -> RecordSeq {
+    RecordSeq::new(u64_of(value))
 }
 
 pub(in crate::session) fn u64_of(value: i64) -> u64 {
@@ -96,21 +103,29 @@ fn grouped<T>(
     Ok(groups)
 }
 
-/// kind, text, blob (digest, length), image format, file name
-type UserPart = (
-    String,
+/// part, kind, text, blob (digest, length), image format, file name
+type UserPartRow = (
+    i64,
+    UserPartKind,
     Option<String>,
     Option<(Vec<u8>, u64)>,
-    Option<String>,
+    Option<ImageFormat>,
     Option<String>,
 );
 /// position, provider id, text
 type Block = (i64, String, String);
+/// A state job row before its children are attached: position, parent position, job.
+type StateJobRow = (u64, Option<u64>, StateJob);
 
 struct Messages {
-    roles: HashMap<i64, String>,
-    parts: HashMap<i64, Vec<UserPart>>,
-    items: HashMap<i64, Vec<(i64, i64, String, String)>>,
+    roles: HashMap<i64, MessageRole>,
+    parts: HashMap<i64, Vec<UserPartRow>>,
+    /// date, location, per state part
+    states: HashMap<i64, (String, ExecutionLocation)>,
+    state_jobs: HashMap<i64, Vec<StateJobRow>>,
+    state_todos: HashMap<i64, Vec<TodoItem>>,
+    job_events: HashMap<i64, Vec<JobEvent>>,
+    items: HashMap<i64, Vec<(i64, i64, String, ItemKind)>>,
     replays: HashMap<i64, Replay>,
     blocks: HashMap<i64, Vec<Block>>,
     /// call id, name, arguments
@@ -131,7 +146,7 @@ fn blob(sha256: Vec<u8>, bytes: u64) -> DbResult<BlobRef> {
 fn image(row: &Row, at: i32) -> DbResult<ImageRef> {
     Ok(ImageRef {
         blob: blob(row.get(at)?, row.get(at + 1)?)?,
-        format: parse_variant(row.get(at + 2)?)?,
+        format: enum_column(row, at + 2)?,
         file: row.get(at + 3)?,
     })
 }
@@ -142,28 +157,132 @@ fn position(value: i64) -> DbResult<Position> {
         .map_err(|_| corrupt("position does not fit"))
 }
 
+/// The jobs under `parent`, in position order, with their own children attached.
+fn state_tree(rows: &[StateJobRow], parent: Option<u64>) -> Vec<StateJob> {
+    rows.iter()
+        .filter(|(_, above, _)| *above == parent)
+        .map(|(position, _, job)| StateJob {
+            children: state_tree(rows, Some(*position)),
+            ..job.clone()
+        })
+        .collect()
+}
+
+fn job_event(row: &Row) -> DbResult<JobEvent> {
+    Ok(match enum_column(row, 1)? {
+        JobEventKind::Message => JobEvent::Message(AgentMessage {
+            id: job(row.get(2)?)?,
+            name: row.get(3)?,
+            message: row
+                .get::<Option<i64>>(4)?
+                .map(|entry| sequence(entry).message())
+                .ok_or_else(|| corrupt("child message has no source"))?,
+            text: row
+                .get::<Option<String>>(5)?
+                .ok_or_else(|| corrupt("child message has no text"))?,
+        }),
+        JobEventKind::Job => JobEvent::Job(Box::new(parse_json(
+            &row.get::<Option<String>>(6)?
+                .ok_or_else(|| corrupt("job view has no document"))?,
+        )?)),
+    })
+}
+
 impl Messages {
     fn load(db: &Db) -> DbResult<Self> {
         Ok(Self {
-            roles: keyed(db, "SELECT id, role FROM message", |row| Ok(row.get(1)?))?,
+            roles: keyed(db, "SELECT id, role FROM message", |row| {
+                enum_column(row, 1)
+            })?,
             parts: grouped(
                 db,
-                "SELECT p.message, p.kind, p.text, p.blob, length(b.bytes), p.image_format, p.file \
-                 FROM user_part p LEFT JOIN blob b ON b.sha256 = p.blob \
+                "SELECT p.message, p.id, p.kind, p.text, p.blob, length(b.bytes), \
+                 p.image_format, p.file FROM user_part p LEFT JOIN blob b ON b.sha256 = p.blob \
                  ORDER BY p.message, p.position",
                 |row| {
-                    let blob = match row.get::<Option<Vec<u8>>>(3)? {
-                        Some(digest) => Some((digest, row.get(4)?)),
+                    let blob = match row.get::<Option<Vec<u8>>>(4)? {
+                        Some(digest) => Some((digest, row.get(5)?)),
                         None => None,
                     };
-                    Ok((row.get(1)?, row.get(2)?, blob, row.get(5)?, row.get(6)?))
+                    Ok((
+                        row.get(1)?,
+                        enum_column(row, 2)?,
+                        row.get(3)?,
+                        blob,
+                        optional_enum_column(row, 6)?,
+                        row.get(7)?,
+                    ))
                 },
+            )?,
+            states: keyed(
+                db,
+                "SELECT s.part, s.date, t.name, s.location_workspace FROM user_part_state s \
+                 JOIN target t ON t.id = s.location_target",
+                |row| {
+                    let location = ExecutionLocation {
+                        target: target_ref(row.get(2)?)?,
+                        workspace: path(row.get(3)?),
+                    };
+                    Ok((row.get(1)?, location))
+                },
+            )?,
+            state_jobs: grouped(
+                db,
+                "SELECT j.part, j.position, j.parent_position, j.job, j.tool, j.name, j.state, \
+                 t.name, j.workspace, j.age_seconds, j.turns, j.tool_calls \
+                 FROM user_part_state_job j LEFT JOIN target t ON t.id = j.target \
+                 ORDER BY j.part, j.position",
+                |row| {
+                    let tool: String = row.get(4)?;
+                    let progress = (row.get::<Option<u64>>(10)?, row.get::<Option<u64>>(11)?);
+                    let kind = match (tool.as_str(), progress) {
+                        (StateJobKind::AGENT, (Some(turns), Some(tool_calls))) => {
+                            StateJobKind::Agent {
+                                progress: AgentProgress { turns, tool_calls },
+                            }
+                        }
+                        (_, (None, None)) if tool != StateJobKind::AGENT => {
+                            StateJobKind::Tool { tool }
+                        }
+                        _ => return Err(corrupt("state job progress does not match its tool")),
+                    };
+                    Ok((
+                        row.get::<u64>(1)?,
+                        row.get::<Option<u64>>(2)?,
+                        StateJob {
+                            job: job(row.get(3)?)?,
+                            kind,
+                            name: row.get(5)?,
+                            state: enum_column(row, 6)?,
+                            target: row.get::<Option<String>>(7)?.map(target_ref).transpose()?,
+                            workspace: path(row.get(8)?),
+                            age_seconds: row.get(9)?,
+                            children: Vec::new(),
+                        },
+                    ))
+                },
+            )?,
+            state_todos: grouped(
+                db,
+                "SELECT part, text, status FROM user_part_state_todo ORDER BY part, position",
+                |row| {
+                    Ok(TodoItem {
+                        text: row.get(1)?,
+                        status: enum_column(row, 2)?,
+                    })
+                },
+            )?,
+            job_events: grouped(
+                db,
+                "SELECT e.part, e.kind, e.job, e.name, e.source, e.text, e.view \
+                 FROM user_part_job_event e ORDER BY e.part, e.position",
+                job_event,
             )?,
             items: grouped(
                 db,
                 "SELECT message, id, position, provider_id, kind FROM assistant_item \
                  ORDER BY message, position",
-                |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?)),
+                |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, enum_column(row, 4)?)),
             )?,
             replays: keyed(
                 db,
@@ -176,7 +295,7 @@ impl Messages {
                             scope: parsed(row.get(3)?)?,
                         },
                         payload: parse_json(&row.get::<String>(4)?)?,
-                        binding: parse_variant(row.get(5)?)?,
+                        binding: enum_column(row, 5)?,
                     })
                 },
             )?,
@@ -212,17 +331,37 @@ impl Messages {
             .roles
             .get(&id)
             .ok_or_else(|| corrupt("referenced message is missing"))?;
-        Ok(match role.as_str() {
-            "user" => {
+        Ok(match role {
+            MessageRole::User => {
                 let mut content = Vec::new();
-                for (kind, text, blob, format, file) in self.parts.get(&id).into_iter().flatten() {
+                for (part, kind, text, blob, format, file) in
+                    self.parts.get(&id).into_iter().flatten()
+                {
                     let text = || text.clone().ok_or_else(|| corrupt("text part has no text"));
-                    content.push(match kind.as_str() {
-                        "text" => UserContent::Text { text: text()? },
-                        "runtime" => UserContent::Runtime { text: text()? },
-                        "parent_input" => UserContent::ParentInput { text: text()? },
-                        "compaction" => UserContent::Compaction { text: text()? },
-                        "attachment" => {
+                    content.push(match kind {
+                        UserPartKind::Text => UserPart::Text { text: text()? },
+                        UserPartKind::ParentInput => UserPart::ParentInput { text: text()? },
+                        UserPartKind::Compaction => UserPart::Compaction { text: text()? },
+                        UserPartKind::State => {
+                            let (date, location) = self
+                                .states
+                                .get(part)
+                                .cloned()
+                                .ok_or_else(|| corrupt("state part has no state"))?;
+                            let jobs = self.state_jobs.get(part).map_or(&[][..], Vec::as_slice);
+                            UserPart::State {
+                                state: RuntimeState {
+                                    date,
+                                    jobs: state_tree(jobs, None),
+                                    todos: self.state_todos.get(part).cloned().unwrap_or_default(),
+                                    location,
+                                },
+                            }
+                        }
+                        UserPartKind::JobEvents => UserPart::JobEvents {
+                            events: self.job_events.get(part).cloned().unwrap_or_default(),
+                        },
+                        UserPartKind::Attachment => {
                             let (digest, bytes) = blob
                                 .clone()
                                 .ok_or_else(|| corrupt("attachment has no blob"))?;
@@ -230,19 +369,18 @@ impl Messages {
                             let attachment = match format {
                                 Some(format) => AttachmentRef::Image(ImageRef {
                                     file,
-                                    format: parse_variant(format.clone())?,
+                                    format: *format,
                                     blob,
                                 }),
                                 None => AttachmentRef::Text(TextRef { file, blob }),
                             };
-                            UserContent::Attachment { attachment }
+                            UserPart::Attachment { attachment }
                         }
-                        other => return Err(corrupt(format!("unknown user part {other}"))),
                     });
                 }
                 Message::User(content)
             }
-            "assistant" => {
+            MessageRole::Assistant => {
                 let mut items = Vec::new();
                 for (item, item_position, provider_id, kind) in
                     self.items.get(&id).into_iter().flatten()
@@ -263,7 +401,6 @@ impl Messages {
                             })
                             .collect::<DbResult<Vec<_>>>()
                     };
-                    let kind: ItemKind = parse_variant(kind.clone())?;
                     items.push(match (kind, self.calls.get(item)) {
                         (ItemKind::Text, None) => AssistantItem::Text {
                             id,
@@ -293,7 +430,7 @@ impl Messages {
                 }
                 Message::Assistant(items)
             }
-            "tool" => {
+            MessageRole::Tool => {
                 let (call_id, name, result, is_error) = self
                     .results
                     .get(&id)
@@ -306,14 +443,8 @@ impl Messages {
                     is_error: *is_error,
                 }])
             }
-            other => return Err(corrupt(format!("unknown message role {other}"))),
         })
     }
-}
-
-fn capability(text: String) -> DbResult<Capability> {
-    text.parse()
-        .map_err(|error: crate::tool::policy::ParseCapabilityError| corrupt(error.to_string()))
 }
 
 /// Capability sets iterate in declaration order.
@@ -337,12 +468,21 @@ fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
                     max_context: row.get(5)?,
                     max_output: row.get(6)?,
                     supports_images: row.get(7)?,
-                    state_mode: parse_variant(row.get(8)?)?,
+                    state_mode: enum_column(row, 8)?,
                     hint: row.get(9)?,
                 },
             })
         },
     )
+}
+
+/// Journaled target names were validated when written; anything else is corruption.
+pub(super) fn target_ref(name: String) -> DbResult<TargetRef> {
+    TargetRef::try_from(name).map_err(|error| corrupt(error.to_string()))
+}
+
+fn target_name(name: String) -> DbResult<TargetName> {
+    TargetName::try_from(name).map_err(|error| corrupt(error.to_string()))
 }
 
 fn targets(db: &Db) -> DbResult<HashMap<i64, Vec<TargetDefinition>>> {
@@ -360,21 +500,17 @@ fn targets(db: &Db) -> DbResult<HashMap<i64, Vec<TargetDefinition>>> {
          ORDER BY r.entry, r.id",
         Vec::new(),
         |row| {
-            let auth = match (
-                row.get::<String>(9)?.as_str(),
-                row.get::<Option<Vec<u8>>>(10)?,
-            ) {
-                ("default", None) => TargetAuth::Default,
-                ("agent", None) => TargetAuth::Agent,
-                ("key", Some(key)) => TargetAuth::Key { path: path(key) },
+            let auth = match (enum_column(row, 9)?, row.get::<Option<Vec<u8>>>(10)?) {
+                (SshAuth::Default, None) => TargetAuth::Default,
+                (SshAuth::Agent, None) => TargetAuth::Agent,
+                (SshAuth::Key, Some(key)) => TargetAuth::Key { path: path(key) },
                 _ => return Err(corrupt("target authentication is inconsistent")),
             };
             let port = row.get::<Option<u32>>(8)?;
             Ok((
                 row.get::<i64>(0)?,
                 TargetDefinition {
-                    name: row.get(2)?,
-                    r#type: TargetType::Ssh,
+                    name: target_name(row.get(2)?)?,
                     host: row.get(5)?,
                     ssh: SshOptions {
                         user: row.get(7)?,
@@ -391,9 +527,15 @@ fn targets(db: &Db) -> DbResult<HashMap<i64, Vec<TargetDefinition>>> {
                             .collect(),
                     },
                     workspace: path(row.get(6)?),
-                    via: row.get(12)?,
-                    origin: row.get(13)?,
-                    source: parse_variant(row.get(4)?)?,
+                    via: row
+                        .get::<Option<String>>(12)?
+                        .map(target_name)
+                        .transpose()?,
+                    origin: row
+                        .get::<Option<String>>(13)?
+                        .map(target_name)
+                        .transpose()?,
+                    source: enum_column(row, 4)?,
                     revision: row.get(3)?,
                 },
             ))
@@ -429,13 +571,15 @@ pub(in crate::session) fn decode_records(
         |row| {
             Ok(TodoItem {
                 text: row.get(1)?,
-                status: parse_variant(row.get(2)?)?,
+                status: enum_column(row, 2)?,
             })
         },
     )?;
-    let location = |target: String, workspace: Vec<u8>| ExecutionLocation {
-        target,
-        workspace: path(workspace),
+    let location = |target: String, workspace: Vec<u8>| {
+        DbResult::Ok(ExecutionLocation {
+            target: target_ref(target)?,
+            workspace: path(workspace),
+        })
     };
     // Parents always precede children, so one ordered pass builds every path.
     let mut agents: HashMap<i64, AgentId> = HashMap::new();
@@ -469,7 +613,7 @@ pub(in crate::session) fn decode_records(
     let agent_capabilities = grouped(
         db,
         "SELECT entry, capability FROM agent_capability",
-        |row| capability(row.get(1)?),
+        |row| enum_column(row, 1),
     )?;
     let prompts = grouped(
         db,
@@ -522,7 +666,7 @@ pub(in crate::session) fn decode_records(
     )?;
 
     let mode_capabilities = grouped(db, "SELECT mode, capability FROM mode_capability", |row| {
-        capability(row.get(1)?)
+        enum_column(row, 1)
     })?;
     // Mode definitions by the entry that pinned them.
     let pinned_modes = db.query(
@@ -554,10 +698,11 @@ pub(in crate::session) fn decode_records(
     }
     load!("SELECT entry, kind, text FROM entry_text", |row| {
         let text = row.get(2)?;
-        match row.get::<String>(1)?.as_str() {
-            "title_set" => SessionEvent::TitleSet { title: text },
-            "status" => SessionEvent::Status { message: text },
-            _ => SessionEvent::AgentFailed { error: text },
+        match enum_column(row, 1)? {
+            EntryKind::TitleSet => SessionEvent::TitleSet { title: text },
+            EntryKind::Status => SessionEvent::Status { message: text },
+            EntryKind::AgentFailed => SessionEvent::AgentFailed { error: text },
+            kind => return Err(corrupt(format!("{kind} entry has a text row"))),
         }
     });
     let capabilities_at = |entry: i64| {
@@ -571,13 +716,12 @@ pub(in crate::session) fn decode_records(
          JOIN target t ON t.id = s.location_target \
          LEFT JOIN agent_mode am ON am.entry = s.entry LEFT JOIN mode m ON m.id = am.mode",
         |row| SessionEvent::AgentStarted {
-            parent: row.get::<Option<i64>>(2)?.map(agent_of).transpose()?,
             owner_job: row.get::<Option<i64>>(3)?.map(job).transpose()?,
             profile: row.get::<Option<i64>>(7)?.map(profile).transpose()?,
             available_depth: row.get(4)?,
             mode: selection(row.get(0)?, row.get(8)?),
             capabilities: capabilities_at(row.get(0)?),
-            location: location(row.get(5)?, row.get(6)?),
+            location: location(row.get(5)?, row.get(6)?)?,
         }
     );
     load!(
@@ -613,7 +757,7 @@ pub(in crate::session) fn decode_records(
             };
             SessionEvent::ModelContext {
                 context: ModelContext {
-                    purpose: parse_variant(row.get(1)?)?,
+                    purpose: enum_column(row, 1)?,
                     profile: profile(row.get(2)?)?,
                     system: prompts
                         .get(&row.get::<i64>(3)?)
@@ -626,141 +770,144 @@ pub(in crate::session) fn decode_records(
         }
     );
     load!(
-        "SELECT r.entry, r.context, r.purpose, r.checkpoint, r.history_lifetime, \
-         r.history_through, e.agent, coalesce(c.frontier, 0) FROM model_request r \
+        "SELECT r.entry, r.context, r.checkpoint, r.history_lifetime, r.history_through, \
+         e.agent, coalesce(c.frontier, 0) FROM model_request r \
          JOIN entry e ON e.seq = r.entry LEFT JOIN compaction c ON c.entry = r.checkpoint",
         |row| {
             let seq = row.get::<i64>(0)?;
-            let checkpoint = row.get::<Option<i64>>(3)?;
-            let (through, frontier) = (row.get::<Option<u64>>(5)?, row.get::<u64>(7)?);
+            let checkpoint = row.get::<Option<i64>>(2)?;
+            let (through, frontier) = (row.get::<Option<u64>>(4)?, row.get::<u64>(6)?);
             let kept = checkpoint.and_then(|checkpoint| retained.get(&checkpoint));
             let later = commits
-                .get(&row.get::<i64>(6)?)
+                .get(&row.get::<i64>(5)?)
                 .map_or(&[][..], Vec::as_slice);
             let later = later
                 .iter()
                 .filter(|&&source| source > frontier && Some(source) <= through);
             let omitted = omitted.get(&seq).map_or(&[][..], Vec::as_slice);
             SessionEvent::ModelRequested {
-                context: row.get(1)?,
-                history: checkpoint
-                    .map(u64_of)
+                context: sequence(row.get(1)?),
+                checkpoint: checkpoint.map(sequence),
+                history: kept
                     .into_iter()
-                    .chain(kept.into_iter().flatten().chain(later).copied())
+                    .flatten()
+                    .chain(later)
+                    .copied()
                     .filter(|source| !omitted.contains(source))
+                    .map(|source| RecordSeq::new(source).message())
                     .collect(),
                 tail: tails.get(&seq).cloned().unwrap_or_default(),
-                history_lifetime: parse_variant(row.get(4)?)?,
-                purpose: parse_variant(row.get(2)?)?,
+                history_lifetime: enum_column(row, 3)?,
             }
         }
     );
+    let attempt = |row: &Row, at: i32| -> DbResult<AttemptRef> {
+        Ok(AttemptRef {
+            request: sequence(row.get(at)?).request(),
+            attempt: row.get(at + 1)?,
+        })
+    };
     load!(
-        "SELECT c.entry, c.schema_version, a.request, a.attempt, c.frontier, c.message, \
-         c.before_tokens, c.after_tokens FROM compaction c \
+        "SELECT c.entry, a.request, a.attempt, c.frontier, c.message, c.before_tokens, \
+         c.after_tokens FROM compaction c \
          JOIN attempt_outcome o ON o.entry = c.entry JOIN model_attempt a ON a.entry = o.attempt",
         |row| {
             let seq = row.get::<i64>(0)?;
             SessionEvent::Compaction {
                 checkpoint: CompactionCheckpoint {
-                    schema_version: u16::try_from(row.get::<u32>(1)?)
-                        .map_err(|_| corrupt("schema version overflow"))?,
-                    // Linked in sequence order below.
-                    previous: None,
-                    frontier: row.get(4)?,
-                    message: messages.message(row.get(5)?)?,
+                    frontier: sequence(row.get(3)?),
+                    message: messages.message(row.get(4)?)?,
                     todos: todos.get(&seq).cloned().unwrap_or_default(),
-                    retained: retained.get(&seq).cloned().unwrap_or_default(),
-                    request: row.get(2)?,
-                    attempt: row.get(3)?,
-                    before_tokens: row.get(6)?,
-                    after_tokens: row.get(7)?,
+                    retained: retained
+                        .get(&seq)
+                        .map(|retained| {
+                            retained
+                                .iter()
+                                .map(|source| RecordSeq::new(*source).message())
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                    attempt: attempt(row, 1)?,
+                    before_tokens: row.get(5)?,
+                    after_tokens: row.get(6)?,
                 },
             }
         }
     );
     load!("SELECT entry, request, attempt FROM model_attempt", |row| {
-        SessionEvent::ModelAttemptStarted {
-            request: row.get(1)?,
-            attempt: row.get(2)?,
-        }
+        SessionEvent::ModelAttemptStarted(attempt(row, 1)?)
     });
     load!(
         "SELECT f.entry, a.request, a.attempt, f.error, f.failure FROM model_failure f \
          JOIN attempt_outcome o ON o.entry = f.entry JOIN model_attempt a ON a.entry = o.attempt",
         |row| SessionEvent::ModelFailed {
-            request: row.get(1)?,
-            attempt: row.get(2)?,
+            attempt: attempt(row, 1)?,
             error: row.get(3)?,
-            kind: parse_variant(row.get(4)?)?,
+            kind: enum_column(row, 4)?,
         }
     );
     load!(
         "SELECT o.entry, a.request, a.attempt FROM attempt_outcome o \
          JOIN model_attempt a ON a.entry = o.attempt WHERE o.kind = 'model_attempt_interrupted'",
-        |row| SessionEvent::ModelAttemptInterrupted {
-            request: row.get(1)?,
-            attempt: row.get(2)?,
-        }
+        |row| SessionEvent::ModelAttemptInterrupted(attempt(row, 1)?)
     );
     load!(
         "SELECT r.entry, a.request, a.attempt, m.entry, r.outcome, r.cut_reason \
          FROM model_response r JOIN attempt_outcome o ON o.entry = r.entry \
          JOIN model_attempt a ON a.entry = o.attempt \
-         LEFT JOIN message_commit m ON m.message = r.message",
+         JOIN message_commit m ON m.message = r.message",
         |row| SessionEvent::ResponseCompleted {
-            request: row.get(1)?,
-            attempt: row.get(2)?,
-            message: row.get(3)?,
-            outcome: match (
-                row.get::<String>(4)?.as_str(),
-                row.get::<Option<String>>(5)?
-            ) {
-                ("answer", None) => Outcome::Answer,
-                ("tool_use", None) => Outcome::ToolUse,
-                ("cut", Some(reason)) => Outcome::Cut(parse_variant::<CutReason>(reason)?),
+            attempt: attempt(row, 1)?,
+            message: sequence(row.get(3)?).message(),
+            outcome: match (enum_column(row, 4)?, optional_enum_column(row, 5)?) {
+                (ResponseOutcome::Answer, None) => CompletedOutcome::Answer,
+                (ResponseOutcome::ToolUse, None) => CompletedOutcome::ToolUse,
+                (ResponseOutcome::Cut, Some(truncation)) => CompletedOutcome::Cut(truncation),
                 _ => return Err(corrupt("response outcome does not match its cut reason")),
             },
         }
     );
     load!(
-        "SELECT v.entry, a.request, a.attempt, v.delay_millis, f.error \
-         FROM model_recovery v JOIN model_failure f ON f.entry = v.failure \
-         JOIN attempt_outcome o ON o.entry = f.entry JOIN model_attempt a ON a.entry = o.attempt",
+        "SELECT entry, failure, delay_millis FROM model_recovery",
         |row| SessionEvent::ModelRecoveryScheduled {
-            request: row.get(1)?,
-            attempt: row.get::<u64>(2)?.saturating_add(1),
-            delay_millis: row.get(3)?,
-            error: row.get(4)?,
+            failure: sequence(row.get(1)?),
+            delay_millis: row.get(2)?,
         }
     );
     load!(
         "SELECT o.entry, o.kind, o.request, a.attempt, o.reason FROM compaction_outcome o \
          LEFT JOIN model_attempt a ON a.entry = o.attempt",
         |row| {
-            let (request, attempt, reason) = (
-                row.get::<Option<u64>>(2)?,
-                row.get::<Option<u64>>(3)?,
-                row.get(4)?,
-            );
-            match row.get::<String>(1)?.as_str() {
-                "compaction_skipped" => SessionEvent::CompactionSkipped {
-                    request: request.ok_or_else(|| corrupt("skipped compaction has no request"))?,
+            let reason = row.get(4)?;
+            let request = row
+                .get::<Option<i64>>(2)?
+                .map(|request| sequence(request).request());
+            let attempt = match (request, row.get::<Option<u64>>(3)?) {
+                (Some(request), Some(attempt)) => Some(AttemptRef { request, attempt }),
+                (_, None) => None,
+                (None, Some(_)) => return Err(corrupt("compaction attempt has no request")),
+            };
+            match enum_column(row, 1)? {
+                EntryKind::CompactionSkipped => SessionEvent::CompactionSkipped {
                     attempt: attempt.ok_or_else(|| corrupt("skipped compaction has no attempt"))?,
                     reason,
                 },
-                _ => SessionEvent::CompactionFailed {
-                    request,
-                    attempt,
+                EntryKind::CompactionFailed => SessionEvent::CompactionFailed {
+                    failure: match (request, attempt) {
+                        (None, _) => CompactionFailure::BeforeRequest,
+                        (Some(request), None) => CompactionFailure::Requested(request),
+                        (Some(_), Some(attempt)) => CompactionFailure::Attempted(attempt),
+                    },
                     error: reason,
                 },
+                kind => return Err(corrupt(format!("{kind} entry has a compaction outcome"))),
             }
         }
     );
     load!(
         "SELECT entry, request, input_tokens, cached_input_tokens, output_tokens FROM usage",
         |row| SessionEvent::Usage {
-            request: row.get(1)?,
+            request: sequence(row.get(1)?).request(),
             usage: Usage {
                 input_tokens: row.get(2)?,
                 cached_input_tokens: row.get(3)?,
@@ -771,17 +918,22 @@ pub(in crate::session) fn decode_records(
     load!(
         "SELECT j.created, j.id, j.parent, j.origin_call, m.entry, c.call_id, j.tool, j.name, \
          j.role, j.arguments, j.output_schema, j.accepts_input, j.background, t.name, \
-         j.location_workspace, j.authorization_scope FROM job j \
+         j.location_workspace FROM job j \
          JOIN target t ON t.id = j.location_target \
          LEFT JOIN tool_call c ON c.item = j.origin_call \
          LEFT JOIN assistant_item i ON i.id = c.item \
          LEFT JOIN message_commit m ON m.message = i.message",
         |row| {
-            let origin = match (row.get::<Option<i64>>(3)?, row.get(4)?, row.get(5)?) {
+            let origin = match (
+                row.get::<Option<i64>>(3)?,
+                row.get::<Option<i64>>(4)?,
+                row.get(5)?,
+            ) {
                 (None, _, _) => None,
-                (Some(_), Some(message), Some(call_id)) => {
-                    Some(ModelCallOrigin { message, call_id })
-                }
+                (Some(_), Some(message), Some(call_id)) => Some(ModelCallOrigin {
+                    message: sequence(message).message(),
+                    call_id,
+                }),
                 _ => return Err(corrupt("job origin call is not committed")),
             };
             SessionEvent::JobCreated {
@@ -789,8 +941,12 @@ pub(in crate::session) fn decode_records(
                 parent: row.get::<Option<i64>>(2)?.map(job).transpose()?,
                 origin,
                 tool: row.get(6)?,
-                role: parse_variant(row.get(8)?)?,
-                name: row.get(7)?,
+                role: enum_column(row, 8)?,
+                name: row
+                    .get::<Option<String>>(7)?
+                    .map(JobName::try_from)
+                    .transpose()
+                    .map_err(|_| corrupt("job name is invalid"))?,
                 arguments: parse_json(&row.get::<String>(9)?)?,
                 output_schema: row
                     .get::<Option<String>>(10)?
@@ -799,35 +955,82 @@ pub(in crate::session) fn decode_records(
                     .transpose()?,
                 accepts_input: row.get(11)?,
                 background: row.get(12)?,
-                authorization_scope: row.get(15)?,
-                location: location(row.get(13)?, row.get(14)?),
+                location: location(row.get(13)?, row.get(14)?)?,
+            }
+        }
+    );
+    let path_components = grouped(
+        db,
+        "SELECT grant_entry, component FROM approval_grant_path_component \
+         ORDER BY grant_entry, position",
+        |row| Ok(row.get::<String>(1)?),
+    )?;
+    let route_hops = grouped(
+        db,
+        "SELECT h.grant_entry, t.name, h.revision FROM approval_grant_route_hop h \
+         JOIN target t ON t.id = h.target ORDER BY h.grant_entry, h.position",
+        |row| Ok((row.get::<String>(1)?, row.get::<u64>(2)?)),
+    )?;
+    load!(
+        "SELECT g.entry, g.capability, g.resource_kind, t.name, g.path, g.origin, \
+         g.session_name, g.mcp_server, g.mcp_tool, g.coverage FROM approval_grant g \
+         LEFT JOIN target t ON t.id = g.target",
+        |row| {
+            let seq = row.get::<i64>(0)?;
+            let text = |index: i32| -> DbResult<String> {
+                row.get::<Option<String>>(index)?
+                    .ok_or_else(|| corrupt("approval grant resource column is missing"))
+            };
+            let resource = match enum_column(row, 2)? {
+                ResourceKind::Workspace => ResourceId::Workspace {
+                    target: text(3)?,
+                    path: text(4)?,
+                },
+                ResourceKind::Path => ResourceId::Path {
+                    target: text(3)?,
+                    components: path_components.get(&seq).cloned().unwrap_or_default(),
+                },
+                ResourceKind::Network => ResourceId::Network {
+                    target: text(3)?,
+                    origin: text(5)?,
+                },
+                ResourceKind::Route => ResourceId::Route {
+                    destination: text(3)?,
+                    hops: route_hops.get(&seq).cloned().unwrap_or_default(),
+                },
+                ResourceKind::Session => ResourceId::Session { name: text(6)? },
+                ResourceKind::Mcp => ResourceId::Mcp {
+                    server: text(7)?,
+                    tool: text(8)?,
+                },
+            };
+            SessionEvent::ApprovalGranted {
+                grant: ApprovalGrant {
+                    capability: enum_column(row, 1)?,
+                    resource,
+                    coverage: enum_column(row, 9)?,
+                },
             }
         }
     );
     load!(
-        "SELECT entry, capability, resource, coverage FROM approval_grant",
-        |row| SessionEvent::ApprovalGranted {
-            grant: crate::tool::policy::ApprovalGrant {
-                capability: capability(row.get(1)?)?,
-                resource: parse_json(&row.get::<String>(2)?)?,
-                coverage: parse_variant(row.get(3)?)?,
-            },
-        }
-    );
-    load!(
         "SELECT entry, grant_entry FROM approval_revocation",
-        |row| { SessionEvent::ApprovalRevoked { grant: row.get(1)? } }
+        |row| {
+            SessionEvent::ApprovalRevoked {
+                grant: sequence(row.get(1)?),
+            }
+        }
     );
     load!("SELECT entry, job, state FROM job_transition", |row| {
         SessionEvent::JobStateChanged {
             job: job(row.get(1)?)?,
-            state: parse_variant(row.get(2)?)?,
+            state: enum_column(row, 2)?,
         }
     });
     load!("SELECT entry, job, state FROM job_finish", |row| {
         SessionEvent::JobFinished {
             job: job(row.get(1)?)?,
-            state: parse_variant(row.get(2)?)?,
+            state: enum_column(row, 2)?,
             diagnostic: diagnostics
                 .get(&(row.get::<i64>(0)?, diagnostic::Slot::Diagnostic))
                 .cloned(),
@@ -844,16 +1047,22 @@ pub(in crate::session) fn decode_records(
         "SELECT entry, kind, job, notification, source FROM job_delivery",
         |row| {
             let job = job(row.get(2)?)?;
-            let notification = row.get::<Option<u64>>(3)?;
+            let notification = row
+                .get::<Option<i64>>(3)?
+                .map(|entry| sequence(entry).message());
             let missing = || corrupt("message delivery has no notification or source");
-            match row.get::<String>(1)?.as_str() {
-                "job_claimed" => SessionEvent::JobClaimed { job },
-                "job_injected" => SessionEvent::JobInjected { job },
-                _ => SessionEvent::JobMessageDelivered {
+            match enum_column(row, 1)? {
+                EntryKind::JobClaimed => SessionEvent::JobClaimed { job },
+                EntryKind::JobInjected => SessionEvent::JobInjected { job },
+                EntryKind::JobMessageDelivered => SessionEvent::JobMessageDelivered {
                     job,
-                    source: row.get::<Option<u64>>(4)?.ok_or_else(missing)?,
+                    source: row
+                        .get::<Option<i64>>(4)?
+                        .map(|entry| sequence(entry).message())
+                        .ok_or_else(missing)?,
                     notification: notification.ok_or_else(missing)?,
                 },
+                kind => return Err(corrupt(format!("{kind} entry has a delivery row"))),
             }
         }
     );
@@ -866,7 +1075,7 @@ pub(in crate::session) fn decode_records(
     let session_capabilities = sorted(db.query(
         "SELECT capability FROM session_capability",
         Vec::new(),
-        |row| capability(row.get(0)?),
+        |row| enum_column(row, 0),
     )?);
     let entries = db.query(
         "SELECT seq, public_id, agent, created_millis, kind FROM entry ORDER BY seq",
@@ -877,36 +1086,32 @@ pub(in crate::session) fn decode_records(
                 row.get::<Vec<u8>>(1)?,
                 row.get::<i64>(2)?,
                 row.get::<i64>(3)?,
-                row.get::<String>(4)?,
+                enum_column::<EntryKind>(row, 4)?,
             ))
         },
     )?;
-    let mut last_compaction: HashMap<i64, u64> = HashMap::new();
     let mut records = Vec::with_capacity(entries.len());
     for (seq, public_id, agent, created, kind) in entries {
-        let mut event = match kind.as_str() {
-            "session_started" => SessionEvent::SessionStarted {
+        let event = match kind {
+            EntryKind::SessionStarted => SessionEvent::SessionStarted {
                 targets: targets.get(&seq).cloned().unwrap_or_default(),
                 capabilities: session_capabilities.clone(),
             },
-            "targets_upserted" => SessionEvent::TargetsUpserted {
+            EntryKind::TargetsUpserted => SessionEvent::TargetsUpserted {
                 targets: targets.get(&seq).cloned().unwrap_or_default(),
             },
-            "todos_replaced" => SessionEvent::TodosReplaced {
+            EntryKind::TodosReplaced => SessionEvent::TodosReplaced {
                 items: todos.get(&seq).cloned().unwrap_or_default(),
             },
-            "agent_completed" => SessionEvent::AgentCompleted,
-            "agent_interrupted" => SessionEvent::AgentInterrupted,
+            EntryKind::AgentCompleted => SessionEvent::AgentCompleted,
+            EntryKind::AgentInterrupted => SessionEvent::AgentInterrupted,
             _ => events
                 .remove(&seq)
                 .ok_or_else(|| corrupt(format!("entry {seq} ({kind}) has no {kind} row")))?,
         };
-        if let SessionEvent::Compaction { checkpoint } = &mut event {
-            checkpoint.previous = last_compaction.insert(agent, u64_of(seq));
-        }
         records.push(EventRecord {
             id: event_id(public_id)?,
-            sequence: u64_of(seq),
+            sequence: self::sequence(seq),
             timestamp_millis: created,
             agent: agent_of(agent)?,
             event,

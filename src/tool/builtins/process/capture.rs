@@ -29,7 +29,7 @@ impl Capture {
             LocalError::from(error)
                 .context(super::started(
                     Operation::CreateCapture,
-                    Subject::Label(field.pointer()),
+                    Subject::Label(field.pointer().into()),
                 ))
                 .opaque_io()
         })?;
@@ -38,8 +38,8 @@ impl Capture {
 
     /// Storage errors may echo captured output, so only their classification is kept.
     fn failed(&self, operation: Operation) -> impl FnOnce(std::io::Error) -> LocalError + use<> {
-        let context = super::started(operation, Subject::Label(self.field.pointer()));
-        move |error| LocalError::Io(error).context(context).opaque_io()
+        let context = super::started(operation, Subject::Label(self.field.pointer().into()));
+        move |error| LocalError::io(error).context(context).opaque_io()
     }
 
     pub(super) async fn write_bytes(&mut self, bytes: &[u8]) -> Result<(), LocalError> {

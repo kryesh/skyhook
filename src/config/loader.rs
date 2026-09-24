@@ -190,8 +190,8 @@ fn deserialize(value: &serde_json::Value) -> Result<Config, String> {
     if value.as_object().is_none_or(serde_json::Map::is_empty) {
         return Err("configuration is empty".to_owned());
     }
-    let config: Config = serde_json::from_value(value.clone())
-        .map_err(|error| format!("invalid configuration: {error}"))?;
+    let config =
+        Config::from_value(value).map_err(|error| format!("invalid configuration: {error}"))?;
     config
         .validate_structure()
         .map_err(|error| error.to_string())?;
@@ -592,6 +592,14 @@ mod tests {
         let mut resolved = f.resolve().await.unwrap();
         assert!(resolved.report.diagnostics.is_empty());
         assert!(resolved.normalized_yaml.contains("api_key_env"));
+        // Resolved provider defaults are written back, like MCP timeouts.
+        for resolved_default in [
+            "startup_timeout_secs: 600",
+            "read_idle_timeout_secs: 600",
+            "chat_reasoning_replay: reasoning_content",
+        ] {
+            assert!(resolved.normalized_yaml.contains(resolved_default));
+        }
         resolved.config.approve_all = true;
         resolved.config.modes[0].capabilities.clear();
         let config = Config::from_yaml(&resolved.config.to_yaml().unwrap()).unwrap();
@@ -626,23 +634,26 @@ mod tests {
         let f = Fixture::new();
         write(
             &f.xdg,
-            format!("{MODEL}{PROVIDER}    api_key_env: UNUSED_KEY\n"),
+            format!("{MODEL}{PROVIDER}    api_key_env: UNUSED_KEY\n    startup_timeout_secs: 5\n"),
         );
         write(
             &f.local,
-            "providers:\n  local:\n    api_key_env: null\n    api_key_command: echo unused\n",
+            "providers:\n  local:\n    api_key_env: null\n    api_key_command: echo unused\n    startup_timeout_secs: null\n",
         );
         let config = f.resolve().await.unwrap().config;
-        let crate::config::ProviderConfig::Openai {
+        let crate::config::RawProviderConfig::Openai {
             api_key_env,
             api_key_command,
+            startup_timeout_secs,
             ..
-        } = &config.providers["local"]
+        } = crate::config::RawProviderConfig::from(config.providers["local"].clone())
         else {
             panic!("expected OpenAI provider");
         };
         assert!(api_key_env.is_none());
         assert_eq!(api_key_command.as_deref(), Some("echo unused"));
+        let default_startup = crate::provider::backends::ProviderTimeouts::default().startup;
+        assert_eq!(startup_timeout_secs, Some(default_startup.as_secs()));
 
         for overlay in [
             "approve_all: null",
@@ -765,7 +776,7 @@ mod tests {
         let registry =
             TargetRegistry::from_definitions(resolved.config.targets.definitions().unwrap())
                 .unwrap();
-        let route = registry.route("a").await.unwrap();
+        let route = registry.route(&"a".parse().unwrap()).await.unwrap();
         let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
         assert_eq!(names, ["c", "b", "a"]);
     }

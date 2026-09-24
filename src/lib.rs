@@ -10,12 +10,16 @@ pub mod identity;
 pub mod job;
 pub mod mcp;
 pub mod media;
+mod named_enum;
+mod newtype;
 pub mod provider;
 pub mod remote;
 pub mod session;
 pub mod target;
 pub mod tool;
 mod yaml;
+
+pub use {named_enum::UnknownName, newtype::Blank};
 
 pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     media::BlobDigest::of(bytes.as_ref()).to_string()
@@ -30,7 +34,7 @@ mod tests {
     use crate::{
         execution::ExecutionLocation,
         identity::{AgentId, JobId},
-        job::{JobLease, JobManager},
+        job::{JobLease, JobManager, JobWorker, stage},
         session::SessionStore,
         tool::{
             ToolContext, ToolRegistryBuilder,
@@ -135,16 +139,20 @@ mod tests {
             }
         }
 
-        /// A root-located context for the lease's job, taking its input channel.
-        pub fn tool_context(&self, lease: &mut JobLease) -> ToolContext {
+        /// A root-located context for a running job, and the worker that
+        /// keeps it alive.
+        pub fn tool_context(&self, lease: JobLease<stage::Running>) -> (ToolContext, JobWorker) {
             let location = ExecutionLocation::root(self.root.path().to_owned());
-            ToolContext::new(
-                self.subject(lease.id(), lease.cancellation_token()),
+            let subject = self.subject(lease.id(), lease.cancellation_token());
+            let (input, worker) = lease.split();
+            let context = ToolContext::new(
+                subject,
                 location.clone(),
                 location,
-                lease.take_input(),
+                input,
                 self.jobs.clone(),
-            )
+            );
+            (context, worker)
         }
     }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::launch::LaunchError;
 
 pub(super) enum PendingStart {
     Input(Box<QueuedInput>),
@@ -57,14 +58,17 @@ impl App {
     }
     pub(super) fn session_started(&mut self, prepared: PreparedObservation) {
         let pending = self.start.take_action();
-        let draft = self.selected.clone();
-        self.attached_draft = Some(draft.clone());
-        self.install_observation(Some(prepared));
-        self.selected = self
-            .session()
-            .expect("started session")
-            .root_agent()
-            .clone();
+        let draft = self.root_agent().clone();
+        let attached_draft = match &self.phase {
+            Phase::Draft { root } => Some(root.clone()),
+            Phase::Open { attached_draft, .. } => attached_draft.clone(),
+        };
+        self.phase = Phase::Open {
+            observation: prepared.active,
+            attached_draft,
+        };
+        self.snapshot = prepared.snapshot;
+        self.selected = self.root_agent().clone();
         if let Some(view) = self.views.remove(&draft) {
             self.views.insert(self.selected.clone(), view);
         }
@@ -105,12 +109,12 @@ impl App {
             None => {}
         }
     }
-    pub(super) fn start_failed(&mut self, error: String) {
+    pub(super) fn start_failed(&mut self, error: LaunchError) {
         // Keep an explicit script retry separate from composer input.
         let pending = self.start.take_action();
         self.park_action(pending);
         self.paused = true;
-        self.notice(error);
+        self.notice(error.to_string());
         if self.stopping {
             self.finish_shutdown();
         }

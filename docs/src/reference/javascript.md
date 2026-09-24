@@ -62,7 +62,9 @@ whether that payload is available. `meta` is `null` on an ordinary successful fo
 when no full metadata is needed. Background, status, inspection, and failure responses carry
 `meta` when available. It has nullable `parent`, `tool`, `name`, `target`, `workspace`,
 `last_message`, `code`, and `executed` fields. `target` is `null` when target capabilities are
-unavailable. A pre-admission failure can have `id: null`.
+unavailable. A pre-admission failure can have `id: null`, as can a call the runtime could not
+make at all: a tool that is no longer available, or a call interrupted while the session was not
+running, is answered with this same failure shape.
 
 `presentation` is `null` when a successful foreground response has no truncation, page, capture,
 question, or notice. When present, it groups `preview`, `truncated`, `captures`, `question`, and

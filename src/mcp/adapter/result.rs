@@ -7,7 +7,7 @@ use crate::{
     session::SessionStore,
     tool::{
         ToolError, ToolOutput,
-        diagnostic::{DiagnosticContext, Effects, Operation, Subject},
+        diagnostic::{Effects, Operation, PartialContext, Subject},
     },
 };
 #[cfg(test)]
@@ -78,16 +78,10 @@ struct McpImage {
 
 impl McpImage {
     fn new(index: usize, image: &ImageRef) -> Self {
-        let extension = match image.format {
-            ImageFormat::Png => "png",
-            ImageFormat::Jpeg => "jpg",
-            ImageFormat::Gif => "gif",
-            ImageFormat::WebP => "webp",
-        };
         Self {
             sha256: image.blob.sha256,
             media_type: image.format.media_type(),
-            name: format!("mcp-image-{index}.{extension}"),
+            name: format!("mcp-image-{index}.{}", image.format.extension()),
             bytes: image.blob.bytes,
         }
     }
@@ -179,47 +173,34 @@ async fn import_image(
     subject: &Subject,
 ) -> Result<ImageRef, ToolError> {
     let context = |operation| {
-        DiagnosticContext::new(operation, subject.clone()).effects(Effects::OutputIncomplete)
+        PartialContext::new(operation, subject.clone()).effects(Effects::OutputIncomplete)
     };
     let import_context = context(Operation::Deserialize);
     let limit = usize::try_from(MAX_IMAGE_BYTES).expect("image limit fits usize");
     let bytes = decode_base64_bounded(source, limit).map_err(|error| {
         match error {
-            MediaError::TooLarge => {
-                ToolError::Failed("MCP images exceed attachment limits".to_owned())
-            }
-            other => ToolError::Failed(format!("invalid MCP image encoding: {other}")),
+            MediaError::TooLarge => ToolError::failed("MCP images exceed attachment limits"),
+            other => ToolError::failed(format!("invalid MCP image encoding: {other}")),
         }
         .context(import_context.clone())
     })?;
     let total_bytes = total_bytes + bytes.len() as u64;
     if image_count >= MAX_IMAGES_PER_SUBMISSION || total_bytes > MAX_IMAGE_BYTES_PER_SUBMISSION {
         return Err(
-            ToolError::Failed("MCP images exceed attachment limits".to_owned())
-                .context(import_context),
+            ToolError::failed("MCP images exceed attachment limits").context(import_context)
         );
     }
     // The declared type governs admission; bytes of another format are invalid
     // rather than silently re-typed.
-    let declared = match mime_type {
-        "image/png" => ImageFormat::Png,
-        "image/jpeg" => ImageFormat::Jpeg,
-        "image/gif" => ImageFormat::Gif,
-        "image/webp" => ImageFormat::WebP,
-        _ => {
-            return Err(
-                ToolError::Failed("unsupported MCP image type".into()).context(import_context)
-            );
-        }
-    };
+    let declared = mime_type.parse::<ImageFormat>().map_err(|_| {
+        ToolError::failed("unsupported MCP image type").context(import_context.clone())
+    })?;
     let image = Image::new(bytes)
         .ok()
         .filter(|image| image.format() == declared)
         .ok_or_else(|| {
-            ToolError::Failed(
-                "invalid MCP image: data does not match its declared image type".into(),
-            )
-            .context(import_context)
+            ToolError::failed("invalid MCP image: data does not match its declared image type")
+                .context(import_context)
         })?;
     store
         .store_image(None, &image)

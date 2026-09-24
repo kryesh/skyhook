@@ -185,6 +185,9 @@ Each retry gets fresh deadlines, so these settings do not limit the total time s
 response. Cancel the request to stop waiting; the server may continue processing if it does not
 honor disconnects. See [model failure recovery](#model-failure-recovery) for retry behavior.
 
+`skyhook dump config` writes the resolved timeouts and, for Chat Completions, the resolved
+`chat_reasoning_replay`, so a dump shows the defaults an entry left implicit.
+
 See [authentication](authentication.md) for API-key and Codex login setup,
 and [sessions and context](../guide/sessions-and-context.md#conversation-compaction) for
 context budgeting and compaction.

@@ -88,7 +88,7 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
         .await
         .map_err(source(Operation::Inspect, &path))?;
     if metadata.len() > MAX_IMAGE_BYTES {
-        return Err(LocalError::Failed(format!(
+        return Err(LocalError::failed(format!(
             "non-UTF-8 file is {} bytes, exceeding the {MAX_IMAGE_BYTES}-byte image limit",
             metadata.len()
         ))
@@ -101,11 +101,10 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
         .await
         .map_err(|error| match error {
             BoundedReadError::Io(error) => source(Operation::Read, &path)(error),
-            error => LocalError::Failed(error.to_string())
-                .operation(Operation::Read, Subject::path(&path)),
+            error => LocalError::failed(error).operation(Operation::Read, Subject::path(&path)),
         })?;
     let image = crate::media::Image::new(bytes).map_err(|_| {
-        LocalError::Failed("file is neither UTF-8 nor a supported image".to_owned())
+        LocalError::failed("file is neither UTF-8 nor a supported image")
             .operation(Operation::Deserialize, Subject::path(&path))
     })?;
     let reference = context
@@ -157,7 +156,7 @@ async fn read_text(
             &cancellation,
         )? {
             Utf8Read::Complete => Ok(Some(capture.finish().map_err(|error| {
-                LocalError::Io(error).operation(Operation::FinishCapture, Subject::path(&path))
+                LocalError::io(error).operation(Operation::FinishCapture, Subject::path(&path))
             })?)),
             Utf8Read::NotUtf8 => Ok(None),
         }
@@ -190,12 +189,12 @@ fn copy_utf8(
     let mut buffer = [0; 64 * 1024];
     let mut pending = Vec::new();
     let cancelled = || {
-        LocalError::Cancelled
+        LocalError::cancelled()
             .operation(Operation::Read, Subject::path(path))
             .effects(Effects::OutputIncomplete)
     };
     let capture =
-        |error| LocalError::Io(error).operation(Operation::WriteCapture, Subject::path(path));
+        |error| LocalError::io(error).operation(Operation::WriteCapture, Subject::path(path));
     loop {
         if cancellation.is_cancelled() {
             return Err(cancelled());
@@ -615,7 +614,8 @@ mod tests {
         assert_eq!(result.output.value["content"], "one\ntwo\nthree\n");
         fs::write(&path, "changed").await.unwrap();
         let mut args = crate::job::output::OutputArgs::new(result.job);
-        (args.field, args.start, args.limit) = (Some("/result/content".into()), Some(2), Some(1));
+        (args.field, args.start, args.limit) =
+            (Some("/result/content".parse().unwrap()), Some(2), Some(1));
         let page = runtime
             .jobs
             .present_output(args, &Default::default())

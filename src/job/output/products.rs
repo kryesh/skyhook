@@ -1,9 +1,12 @@
 //! Canonical output query and presentation products. Wire JSON is an adapter,
 //! not an admission path for a presentation or its associated attachments.
 use super::{OutputArgs, Value};
-use crate::{job::JobState, media::ImageRef};
+use crate::{
+    job::{JobState, JobView},
+    media::ImageRef,
+};
 use schemars::JsonSchema;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 /// Attachment intent depends on presence, never on equality to default values:
 /// any explicit field/page selector, including explicitly supplied defaults,
@@ -35,8 +38,8 @@ impl OutputArgs {
 }
 
 /// A source page with explicit continuation defaults at end of output.
-#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
-pub(crate) struct OutputPreview {
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct OutputPreview {
     pub(crate) field: String,
     pub(crate) lines: Vec<String>,
     pub(crate) total_lines: Option<usize>,
@@ -46,8 +49,8 @@ pub(crate) struct OutputPreview {
 }
 
 /// A truncated structured field and its source continuation.
-#[derive(Clone, Debug, Serialize, JsonSchema, PartialEq, Eq)]
-pub(crate) struct OutputTruncation {
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub struct OutputTruncation {
     pub(crate) field: String,
     pub(crate) total_lines: usize,
     #[schemars(range(min = 1))]
@@ -61,12 +64,12 @@ pub(crate) struct OutputTruncation {
 #[derive(Clone, Debug)]
 pub struct PresentedOutput {
     pub state: JobState,
-    pub(crate) view: Value,
+    pub(crate) view: JobView,
     pub images: Vec<ImageRef>,
     /// Captures absent from a whole presentation, as `(captures index, field)`
     /// in the descriptor's stable order. Hydration is opt-in through
     /// `inspect_output_with_captures`.
-    pub(super) capture_targets: Vec<(usize, String)>,
+    pub(super) capture_targets: Vec<(usize, crate::tool::output::FieldPointer)>,
 }
 
 impl PresentedOutput {
@@ -77,24 +80,34 @@ impl PresentedOutput {
         index: usize,
         page: Result<PresentedOutput, crate::tool::ToolError>,
     ) {
-        self.view["presentation"]["captures"][index]["output"] = match page {
+        let Some(capture) = self
+            .view
+            .presentation
+            .as_mut()
+            .and_then(|presentation| presentation.captures.get_mut(index))
+        else {
+            return;
+        };
+        capture.output = Some(Box::new(match page {
             Ok(page) => page.view,
-            Err(error) => crate::job::JobView::failure(
+            Err(error) => JobView::failure(
                 error.to_string(),
                 None,
                 false,
                 crate::job::JobMetadata::default(),
-            )
-            .into_value(),
-        };
+            ),
+        }));
     }
-    pub fn view(&self) -> &Value {
-        &self.view
+    pub fn view(&self) -> Value {
+        self.view.clone().into_value()
     }
     pub fn into_parts(self) -> (JobState, Value, Vec<ImageRef>) {
-        (self.state, self.view, self.images)
+        (self.state, self.view.into_value(), self.images)
     }
     pub fn into_view(self) -> Value {
+        self.view.into_value()
+    }
+    pub(crate) fn into_job_view(self) -> JobView {
         self.view
     }
 }

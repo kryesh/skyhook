@@ -28,7 +28,7 @@ pub(crate) fn install_script_tool(
                     .upgrade()
                     .and_then(|slot| slot.get().cloned())
                     .ok_or_else(|| {
-                        ToolError::Failed("script executor is not initialized".to_owned())
+                        ToolError::failed("script executor is not initialized")
                             .operation(Operation::Prepare, Subject::Label("script executor".into()))
                             .effects(Effects::NotStarted)
                     })?

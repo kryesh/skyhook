@@ -1,5 +1,5 @@
 use crate::remote::{
-    SecretValue, SensitivePrompt, SensitivePromptHandler, SensitivePromptKind, prompt::PromptAnswer,
+    PromptAnswer, SecretValue, SensitivePrompt, SensitivePromptHandler, SensitivePromptKind,
 };
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -141,7 +141,12 @@ async fn serve_one(
     };
     let answer = tokio::select! {
         result = handler.prompt(SensitivePrompt {kind, message:request.prompt}) => match result {
-            Ok(value) => PromptAnswer::Accepted(value), Err(_) => PromptAnswer::Rejected,
+            // A confirmation is answered by choice and everything else with a
+            // secret; a handler that mixes them never lets OpenSSH proceed.
+            Ok(PromptAnswer::Secret(_)) if kind.is_confirmation() => PromptAnswer::Rejected,
+            Ok(PromptAnswer::Confirmed) if !kind.is_confirmation() => PromptAnswer::Rejected,
+            Ok(answer) => answer,
+            Err(_) => PromptAnswer::Rejected,
         },
         () = gone => PromptAnswer::Rejected,
     };
@@ -177,38 +182,23 @@ fn classify(prompt: &str, hint: Option<&str>) -> SensitivePromptKind {
 
 pub fn run_helper(socket: &Path, prompt: String) -> Result<(), Box<dyn std::error::Error>> {
     let hint = std::env::var("SSH_ASKPASS_PROMPT").ok();
-    let confirmation = classify(&prompt, hint.as_deref()) == SensitivePromptKind::AgentConfirmation;
     let request = serde_json::to_vec(&AskpassRequest { prompt, hint })?;
     let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
     stream.write_all(&request)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = Zeroizing::new(Vec::new());
     stream.take(64 * 1024).read_to_end(&mut response)?;
-    if let Some(value) = answer_value(
-        serde_json::from_slice::<PromptAnswer>(&response)?,
-        confirmation,
-    )? {
-        std::io::stdout().write_all(value.expose().as_bytes())?;
-    }
+    let value = answer_value(serde_json::from_slice::<PromptAnswer>(&response)?)?;
+    std::io::stdout().write_all(value.expose().as_bytes())?;
     Ok(())
 }
 
-fn answer_value(
-    answer: PromptAnswer,
-    confirmation: bool,
-) -> Result<Option<SecretValue>, &'static str> {
+/// What the helper prints. OpenSSH reads `yes` back for host-key confirmations
+/// and only the exit status for agent confirmations; a rejection exits nonzero.
+fn answer_value(answer: PromptAnswer) -> Result<SecretValue, &'static str> {
     match answer {
-        PromptAnswer::Accepted(value) if confirmation => {
-            if matches!(
-                value.expose().trim().to_ascii_lowercase().as_str(),
-                "yes" | "y"
-            ) {
-                Ok(None)
-            } else {
-                Err("authentication confirmation declined")
-            }
-        }
-        PromptAnswer::Accepted(value) => Ok(Some(value)),
+        PromptAnswer::Secret(value) => Ok(value),
+        PromptAnswer::Confirmed => Ok(SecretValue::new("yes".into())),
         PromptAnswer::Rejected => {
             Err("authentication interaction unavailable, declined or cancelled")
         }
@@ -229,7 +219,7 @@ mod tests {
         fn prompt(&self, prompt: SensitivePrompt) -> crate::remote::SensitivePromptFuture {
             assert_eq!(prompt.kind, SensitivePromptKind::Password);
             self.calls.fetch_add(1, Ordering::SeqCst);
-            let value = SecretValue::new(self.value.into());
+            let value = PromptAnswer::Secret(SecretValue::new(self.value.into()));
             Box::pin(async move { Ok(value) })
         }
     }
@@ -241,9 +231,17 @@ mod tests {
         })
     }
 
-    async fn ask(mut client: UnixStream) -> PromptAnswer {
-        let request = br#"{"prompt":"Password:","hint":null}"#;
-        client.write_all(request).await.unwrap();
+    async fn ask(client: UnixStream) -> PromptAnswer {
+        ask_for(client, "Password:").await
+    }
+
+    async fn ask_for(mut client: UnixStream, prompt: &str) -> PromptAnswer {
+        let request = serde_json::to_vec(&AskpassRequest {
+            prompt: prompt.into(),
+            hint: None,
+        })
+        .unwrap();
+        client.write_all(&request).await.unwrap();
         client.shutdown().await.unwrap();
         let mut bytes = Zeroizing::new(Vec::new());
         client.read_to_end(&mut bytes).await.unwrap();
@@ -256,8 +254,8 @@ mod tests {
             .await
             .expect("askpass request timed out")
         {
-            PromptAnswer::Accepted(value) => value,
-            PromptAnswer::Rejected => panic!("password request unexpectedly rejected"),
+            PromptAnswer::Secret(value) => value,
+            answer => panic!("password request unexpectedly answered {answer:?}"),
         }
     }
 
@@ -382,6 +380,32 @@ mod tests {
         }
     }
 
+    /// The handler contract is not a type guarantee: an answer of the wrong shape
+    /// for the prompt's kind is a rejection, never a confirmation.
+    #[tokio::test]
+    async fn mismatched_answers_reject() {
+        struct Mismatched;
+        impl SensitivePromptHandler for Mismatched {
+            fn prompt(&self, prompt: SensitivePrompt) -> crate::remote::SensitivePromptFuture {
+                let answer = if prompt.kind.is_confirmation() {
+                    PromptAnswer::Secret(SecretValue::new("no".into()))
+                } else {
+                    PromptAnswer::Confirmed
+                };
+                Box::pin(async move { Ok(answer) })
+            }
+        }
+        for prompt in ["Are you sure (yes/no)?", "Password:"] {
+            let (client, server) = UnixStream::pair().unwrap();
+            let task = tokio::spawn(serve_one(server, Arc::new(Mismatched)));
+            assert!(matches!(
+                ask_for(client, prompt).await,
+                PromptAnswer::Rejected
+            ));
+            task.await.unwrap().unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn rejected_prompts_are_distinct_from_empty_secrets() {
         let (client, server) = UnixStream::pair().unwrap();
@@ -389,17 +413,19 @@ mod tests {
         let task = tokio::spawn(serve_one(server, rejecting));
         assert!(matches!(ask(client).await, PromptAnswer::Rejected));
         task.await.unwrap().unwrap();
-        let empty = serde_json::from_str::<PromptAnswer>(r#"{"Accepted":""}"#).unwrap();
-        assert!(matches!(empty, PromptAnswer::Accepted(_)));
+        let empty = serde_json::from_str::<PromptAnswer>(r#"{"Secret":""}"#).unwrap();
+        assert!(matches!(empty, PromptAnswer::Secret(_)));
     }
 
     #[test]
     fn confirmation_denial_is_failure_and_empty_password_is_success() {
-        let accepted = |value: &str| PromptAnswer::Accepted(SecretValue::new(value.into()));
-        assert!(answer_value(accepted("no"), true).is_err());
-        assert!(answer_value(accepted("yes"), true).unwrap().is_none());
-        let empty = answer_value(accepted(""), false).unwrap().unwrap();
-        assert_eq!(empty.expose(), "");
-        assert!(!format!("{:?}", accepted("never-print-this")).contains("never-print-this"));
+        let secret = |value: &str| PromptAnswer::Secret(SecretValue::new(value.into()));
+        assert!(answer_value(PromptAnswer::Rejected).is_err());
+        assert_eq!(
+            answer_value(PromptAnswer::Confirmed).unwrap().expose(),
+            "yes"
+        );
+        assert_eq!(answer_value(secret("")).unwrap().expose(), "");
+        assert!(!format!("{:?}", secret("never-print-this")).contains("never-print-this"));
     }
 }

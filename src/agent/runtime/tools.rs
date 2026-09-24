@@ -1,5 +1,4 @@
 //! Agent-specific tools layered on top of the general coding tool set.
-
 use std::{
     collections::BTreeMap,
     path::PathBuf,
@@ -14,7 +13,7 @@ use tokio::sync::oneshot;
 use crate::{
     agent::{Question, TodoItem, todo::TodoStore},
     provider::profile::ModelProfile,
-    provider::protocol::UserContent,
+    session::UserPart,
     tool::{
         RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
         diagnostic::{Effects, FailureSite, Operation, Subject},
@@ -22,7 +21,7 @@ use crate::{
     },
 };
 
-use super::{AgentCommand, AgentLaunch, RequestFailure, SessionRuntime, queue::QueuedInput};
+use super::{AgentCommand, AgentLaunch, SessionRuntime, TurnFailure, queue::QueuedInput};
 
 /// Connect only root-eligible MCP servers; adapters enforce per-agent gates later.
 pub(super) async fn connect_mcp(
@@ -269,7 +268,7 @@ fn register_child_agent(
                     .operation(Operation::Inspect, Subject::Job(context.job())).effects(Effects::Unchanged))?.name
                     && let Some(id) = runtime.jobs.child_name_owner(context.agent(), &name, context.job()).await
                 {
-                    return Err(ToolError::InvalidArguments(format!(
+                    return Err(ToolError::invalid_arguments(format!(
                         "child `{name}` already exists as job {id}; message it with tool.job({id}).send({{value: ...}}), or pick another name"
                     )).operation(Operation::Validate, Subject::Job(id)).effects(Effects::NotStarted));
                 }
@@ -277,15 +276,20 @@ fn register_child_agent(
                 let model = input.model
                     .or_else(|| runtime.agents()
                         .get(context.agent()).map(|agent| agent.model_profile.clone()))
-                    .ok_or_else(|| ToolError::Failed("parent agent is no longer running".into())
+                    .ok_or_else(|| ToolError::failed("parent agent is no longer running")
                         .operation(Operation::Lookup, Subject::Label(format!("parent agent {}", context.agent()))).effects(Effects::NotStarted))?;
-                let target = input.target.as_deref().unwrap_or(&context.caller_location().target);
-                let definition = if target == crate::target::ROOT_TARGET {
-                    None
-                } else {
-                    let route = runtime.router.resolve(target, context.capabilities()).await;
-                    Some(route.map_err(|error| ToolError::from(error.into_admission_error())
-                        .operation(Operation::Lookup, Subject::argument(["target"])).effects(Effects::NotStarted))?.destination().clone())
+                let target_error = |error: crate::target::TargetError| ToolError::from(error.into_admission_error())
+                    .operation(Operation::Lookup, Subject::argument(["target"])).effects(Effects::NotStarted);
+                let target = match &input.target {
+                    Some(target) => target.parse::<crate::target::TargetRef>().map_err(target_error)?,
+                    None => context.caller_location().target.clone(),
+                };
+                let definition = match &target {
+                    crate::target::TargetRef::Root => None,
+                    crate::target::TargetRef::Named(name) => {
+                        let route = runtime.router.resolve(name, context.capabilities()).await;
+                        Some(route.map_err(target_error)?.destination().clone())
+                    }
                 };
                 let mut location = crate::execution::ExecutionLocation::select(
                     context.caller_location(),
@@ -329,7 +333,7 @@ fn register_child_agent(
                     .operation(Operation::Prepare, Subject::Job(context.job())).effects(Effects::Started))?;
                 run_child_request(
                     &runtime, &context, &child, &sender,
-                    vec![UserContent::Text { text: input.prompt }],
+                    vec![UserPart::Text { text: input.prompt }],
                 ).await
             }
         },
@@ -359,7 +363,7 @@ pub(super) fn child_resume_handler(
                 .shutting_down
                 .load(std::sync::atomic::Ordering::Acquire)
             {
-                return Err(ToolError::Cancelled
+                return Err(ToolError::cancelled()
                     .operation(
                         Operation::Prepare,
                         Subject::Label(format!("child agent {child}")),
@@ -407,16 +411,16 @@ pub(super) fn child_resume_handler(
     })
 }
 
-fn owner_input(value: &serde_json::Value) -> UserContent {
+fn owner_input(value: &serde_json::Value) -> UserPart {
     let text = format!("Owner input: {value}");
-    UserContent::ParentInput { text }
+    UserPart::ParentInput { text }
 }
 
 /// Start a child turn; the receiver resolves with its answer.
 async fn send_child_input(
     sender: &super::AgentSender,
-    content: Vec<UserContent>,
-) -> Result<oneshot::Receiver<Result<String, RequestFailure>>, ToolError> {
+    content: Vec<UserPart>,
+) -> Result<oneshot::Receiver<Result<String, TurnFailure>>, ToolError> {
     let (done, received) = oneshot::channel();
     let input = AgentCommand::Input {
         options: Default::default(),
@@ -424,7 +428,7 @@ async fn send_child_input(
         done: Some(done),
     };
     let sent = sender.send(input).await;
-    sent.map_err(|_| ToolError::Failed("child agent stopped before accepting input".to_owned()))?;
+    sent.map_err(|_| ToolError::failed("child agent stopped before accepting input"))?;
     Ok(received)
 }
 
@@ -433,7 +437,7 @@ async fn run_child_request(
     context: &crate::tool::ToolContext,
     child: &crate::identity::AgentId,
     sender: &super::AgentSender,
-    content: Vec<UserContent>,
+    content: Vec<UserPart>,
 ) -> Result<String, ToolError> {
     let job = context.job();
     // Resumption runs this outside dispatch, which would otherwise bind the host site.
@@ -449,8 +453,8 @@ async fn run_child_request(
         .agents()
         .get(child)
         .ok_or_else(|| {
-            failure(Operation::Lookup, Effects::NotStarted)(ToolError::Failed(
-                "child agent stopped".into(),
+            failure(Operation::Lookup, Effects::NotStarted)(ToolError::failed(
+                "child agent stopped",
             ))
         })?
         .control
@@ -464,10 +468,10 @@ async fn run_child_request(
         tokio::select! {
             result = &mut done_rx => {
                 let text = result
-                    .map_err(|_| failure(Operation::Receive, Effects::Started)(ToolError::Failed("child agent stopped before returning a result".to_owned())))?
+                    .map_err(|_| failure(Operation::Receive, Effects::Started)(ToolError::failed("child agent stopped before returning a result")))?
                     .map_err(|error| failure(Operation::Wait, Effects::Started)(match error {
-                        RequestFailure::Interrupted => ToolError::Interrupted,
-                        RequestFailure::Failed(message) => ToolError::Failed(message),
+                        TurnFailure::Interrupted => ToolError::interrupted(),
+                        other => ToolError::failed(other),
                     }))?;
                 let inputs = context.drain_input_or_close().await;
                 if inputs.is_empty() { return Ok(text); }
@@ -508,21 +512,21 @@ async fn run_child_request(
                         content: vec![owner_input(&value)],
                         cancellation: Default::default(),
                         committed,
-                    }])).await.map_err(|_| failure(Operation::Send, Effects::NotStarted)(ToolError::Failed("child agent stopped before accepting owner input".to_owned())))?;
+                    }])).await.map_err(|_| failure(Operation::Send, Effects::NotStarted)(ToolError::failed("child agent stopped before accepting owner input")))?;
                 }
             }
         }
     }
 }
 
-fn invalid_argument(argument: &str, message: impl Into<String>) -> ToolError {
-    ToolError::InvalidArguments(message.into())
+fn invalid_argument(argument: &str, message: impl std::fmt::Display) -> ToolError {
+    ToolError::invalid_arguments(message)
         .operation(Operation::Validate, Subject::argument([argument]))
         .effects(Effects::NotStarted)
 }
 
 fn runtime_unavailable() -> ToolError {
-    ToolError::Failed("session runtime is unavailable".to_owned())
+    ToolError::failed("session runtime is unavailable")
         .operation(
             Operation::Lookup,
             Subject::Label("session runtime".to_owned()),
@@ -535,8 +539,8 @@ fn runtime_unavailable() -> ToolError {
 pub(super) fn harness_error(error: crate::agent::HarnessError) -> ToolError {
     use crate::agent::HarnessError;
     match error {
-        HarnessError::Interrupted => ToolError::Interrupted,
-        HarnessError::Io(error) => ToolError::Io(error),
+        HarnessError::Interrupted => ToolError::interrupted(),
+        HarnessError::Io(error) => ToolError::io(error),
         HarnessError::Session(error) => error.into(),
         HarnessError::Job(error) => error.into(),
         HarnessError::Execution(error) => error.into_tool_error(),
@@ -834,7 +838,7 @@ for line in sys.stdin:
                 executor = executor
                     .with_capabilities(CapabilitySet::default())
                     .with_location(ExecutionLocation::named(
-                        "private-missing-target",
+                        "private-missing-target".parse().unwrap(),
                         root.path().to_path_buf(),
                     ));
             } else {
@@ -920,7 +924,9 @@ for line in sys.stdin:
                     .any(|tool| tool.name == "agent")
             };
             assert_eq!((offers(0), offers(1)), (false, true));
-            let Some(Message::Tool(results)) = captured[2].history.last() else {
+            let Some(crate::provider::protocol::Message::Tool(results)) =
+                captured[2].history.last()
+            else {
                 panic!("expected the refused delegation");
             };
             let refusal = results[0].result.to_string();
@@ -1043,8 +1049,10 @@ for line in sys.stdin:
         let name = mcp_name(&session);
         // This location has no route/worker. A targeted dispatch would fail; Host
         // dispatch must still use the session-owning process and its MCP manager.
-        let location =
-            ExecutionLocation::named("unconnected-remote", PathBuf::from("/remote/workspace"));
+        let location = ExecutionLocation::named(
+            "unconnected-remote".parse().unwrap(),
+            PathBuf::from("/remote/workspace"),
+        );
         let remote = session.runtime.executor.clone().with_location(location);
         let output = remote.execute(session.root.clone(), &name, json!({"text":"host"}), None);
         let output = output.await.unwrap().output.value;

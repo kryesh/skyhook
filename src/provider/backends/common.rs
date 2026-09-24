@@ -95,18 +95,13 @@ pub(crate) fn user_parts(
     text_type: &str,
     image: impl Fn(&ImageRef) -> Result<Value, ProviderError>,
 ) -> Result<Vec<Value>, ProviderError> {
-    let text = |text: &str| json!({"type":text_type, "text":text});
+    let part = |text: &str| json!({"type":text_type, "text":text});
     parts
         .iter()
-        .map(|part| match part {
-            UserContent::Text { text: value }
-            | UserContent::Runtime { text: value }
-            | UserContent::ParentInput { text: value }
-            | UserContent::Compaction { text: value } => Ok(text(value)),
-            UserContent::Attachment { attachment } => match attachment {
-                AttachmentRef::Image(reference) => image(reference),
-                AttachmentRef::Text(file) => Ok(text(&attachment_text(request, file)?)),
-            },
+        .map(|content| match content.text() {
+            Ok(text) => Ok(part(&text)),
+            Err(AttachmentRef::Image(reference)) => image(reference),
+            Err(AttachmentRef::Text(file)) => Ok(part(&attachment_text(request, file)?)),
         })
         .collect()
 }
@@ -146,12 +141,9 @@ pub(crate) fn attach_runtime_tail(
     let Message::User(parts) = message else {
         return false;
     };
-    let texts: Option<Vec<&str>> = parts
+    let texts: Option<Vec<_>> = parts
         .iter()
-        .map(|part| match part {
-            UserContent::Runtime { text } => Some(text.as_str()),
-            _ => None,
-        })
+        .map(|part| part.is_runtime().then(|| part.text().ok()).flatten())
         .collect();
     let (Some(texts), Some(last)) = (texts.filter(|texts| !texts.is_empty()), items.last_mut())
     else {
@@ -170,7 +162,7 @@ pub(crate) fn attach_runtime_tail(
     if let Some(Value::String(output)) = tool_output(last) {
         for text in texts {
             output.push_str("\n\n");
-            output.push_str(text);
+            output.push_str(&text);
         }
         return true;
     }
@@ -380,18 +372,11 @@ pub(super) mod tests {
     pub(crate) fn request(model: &str) -> ModelRequest {
         use crate::provider::protocol::{Message, ModelRequest, UserContent};
         ModelRequest {
-            model: model.into(),
-            system: vec![],
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
             history: vec![Message::User(vec![UserContent::Text {
                 text: "hello".into(),
             }])],
-            tools: vec![],
-            response_schema: None,
-            reasoning: None,
             max_output_tokens: Some(8192),
-            blobs: Default::default(),
+            ..ModelRequest::test(model)
         }
     }
 

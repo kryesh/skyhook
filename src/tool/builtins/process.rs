@@ -1,5 +1,5 @@
 use crate::tool::ToolOptions;
-use crate::tool::diagnostic::{DiagnosticContext, Effects, Operation, Subject};
+use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
 use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
 use std::process::{ExitStatus, Stdio};
@@ -39,7 +39,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         options(),
         move |context, args| async move {
             let (program, arguments) = args.argv.split_first().ok_or_else(|| {
-                LocalError::InvalidArguments("argv cannot be empty".to_owned())
+                LocalError::invalid_arguments("argv cannot be empty")
                     .operation(Operation::Validate, Subject::argument(["argv"]))
                     .effects(Effects::NotStarted)
             })?;
@@ -57,11 +57,9 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         options(),
         move |context, args| async move {
             if args.command.is_empty() {
-                return Err(
-                    LocalError::InvalidArguments("command cannot be empty".to_owned())
-                        .operation(Operation::Validate, Subject::argument(["command"]))
-                        .effects(Effects::NotStarted),
-                );
+                return Err(LocalError::invalid_arguments("command cannot be empty")
+                    .operation(Operation::Validate, Subject::argument(["command"]))
+                    .effects(Effects::NotStarted));
             }
             let cwd = working_directory(&args.cwd).await?;
             let mut command = Command::new("/bin/sh");
@@ -77,12 +75,12 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
 async fn working_directory(cwd: &str) -> Result<&std::path::Path, LocalError> {
     let path = std::path::Path::new(cwd);
     let metadata = tokio::fs::metadata(path).await.map_err(|error| {
-        LocalError::Io(error)
+        LocalError::io(error)
             .operation(Operation::Inspect, Subject::working_directory(path))
             .effects(Effects::NotStarted)
     })?;
     if !metadata.is_dir() {
-        return Err(LocalError::Failed("not a directory".to_owned())
+        return Err(LocalError::failed("not a directory")
             .operation(Operation::Validate, Subject::working_directory(path))
             .effects(Effects::NotStarted));
     }
@@ -96,7 +94,7 @@ async fn run_process(
 ) -> Result<ProcessResult, LocalError> {
     if timeout.is_some_and(|seconds| !(1..=3_600).contains(&seconds)) {
         return Err(
-            LocalError::InvalidArguments("timeout must be 1 through 3600".to_owned())
+            LocalError::invalid_arguments("timeout must be 1 through 3600")
                 .operation(Operation::Validate, Subject::argument(["timeout"]))
                 .effects(Effects::NotStarted),
         );
@@ -111,7 +109,7 @@ async fn run_process(
                 crate::remote::RejectSensitivePrompts,
             ))
             .map_err(|error| {
-                LocalError::Io(error)
+                LocalError::io(error)
                     .operation(
                         Operation::Prepare,
                         Subject::Label("noninteractive askpass".to_owned()),
@@ -149,26 +147,26 @@ async fn run_process(
         }
     }
     if context.is_cancelled() {
-        return Err(LocalError::Cancelled
+        return Err(LocalError::cancelled()
             .operation(Operation::Spawn, Subject::Process)
             .effects(Effects::NotStarted));
     }
     // Spawn can fail while setting up the child or loading its interpreter. In
     // particular, ENOENT does not establish that the executable itself is absent.
     let mut child = command.spawn().map_err(|error| {
-        LocalError::Io(error)
+        LocalError::io(error)
             .operation(Operation::Spawn, Subject::Process)
             .effects(Effects::NotStarted)
     })?;
     #[cfg(unix)]
     let group = ProcessGroup(
         i32::try_from(child.id().expect("spawned process has an ID")).map_err(|_| {
-            LocalError::Failed("process ID is out of range".to_owned())
+            LocalError::failed("process ID is out of range")
                 .context(started(Operation::Prepare, Subject::Process))
         })?,
     );
     let pipe_unavailable = |pipe: &str| {
-        LocalError::Failed("pipe unavailable".to_owned())
+        LocalError::failed("pipe unavailable")
             .context(started(Operation::Prepare, Subject::Label(pipe.to_owned())))
     };
     let stdout = child
@@ -255,7 +253,7 @@ async fn run_process(
         }
         ProcessCompletion::Cancelled => {
             finish(stop().await?).await?;
-            Err(LocalError::Cancelled.context(started(Operation::Wait, Subject::Process)))
+            Err(LocalError::cancelled().context(started(Operation::Wait, Subject::Process)))
         }
     }
 }
@@ -264,8 +262,8 @@ const STDOUT_PIPE: &str = "stdout pipe";
 const STDERR_PIPE: &str = "stderr pipe";
 
 /// After spawn the command may already have had effects.
-fn started(operation: Operation, subject: Subject) -> DiagnosticContext {
-    DiagnosticContext::new(operation, subject).effects(Effects::Started)
+fn started(operation: Operation, subject: Subject) -> PartialContext {
+    PartialContext::new(operation, subject).effects(Effects::Started)
 }
 
 enum ProcessCompletion {
@@ -303,7 +301,7 @@ where
     let mut buffer = vec![0_u8; PROCESS_CHUNK];
     loop {
         let read = stream.read(&mut buffer).await.map_err(|error| {
-            LocalError::Io(error)
+            LocalError::io(error)
                 .context(started(Operation::Read, Subject::Label(pipe.to_owned())))
                 .opaque_io()
         })?;
@@ -393,7 +391,7 @@ mod tests {
     use super::*;
     use crate::tool::ToolRegistryBuilder;
     use crate::{
-        job::{JobState, output::OutputArgs},
+        job::{CancellationToken, JobState, output::OutputArgs},
         tests::TestRuntime,
         tool::{
             diagnostic::{Cause, IoKind},
@@ -484,7 +482,7 @@ mod tests {
             assert_eq!(output.output.value, expected);
             let args = OutputArgs::new(output.job);
             let view = jobs
-                .inspect_output(args, &Default::default())
+                .inspect_output(args, CancellationToken::new(), &Default::default())
                 .await
                 .unwrap();
             assert_eq!(view["presentation"]["notice"], Value::Null);
@@ -645,7 +643,7 @@ mod tests {
             assert_eq!(diagnostic.context.operation, operation);
             assert_eq!(
                 diagnostic.context.subject,
-                Subject::Label(TextCaptureField::Stdout.pointer())
+                Subject::Label(TextCaptureField::Stdout.pointer().into())
             );
             assert_eq!(diagnostic.context.effects, Effects::Started);
             assert_eq!(diagnostic.cause, opaque);
@@ -703,7 +701,7 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(2), async {
                 loop {
                     let mut args = OutputArgs::new(running.job);
-                    args.field = Some("/result/stdout".into());
+                    args.field = Some("/result/stdout".parse().unwrap());
                     let view = jobs
                         .present_output(args, &Default::default())
                         .await

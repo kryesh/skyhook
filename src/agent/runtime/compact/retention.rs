@@ -1,17 +1,15 @@
 //! Preserve complete tool exchanges and identify outputs already carried by history.
-
 use super::{HarnessError, compaction};
 use crate::{
     identity::{AgentId, JobId},
-    provider::protocol::Message,
-    session::{EventRecord, ModelCallOrigin, SessionEvent},
+    session::{EventRecord, Message, MessageSeq, ModelCallOrigin, RecordSeq, SessionEvent},
 };
 use std::collections::BTreeSet;
 
 /// An original message selected from one immutable journal snapshot.
 /// Only retention can construct the sequence/payload pair; no payload is cloned.
 pub(super) struct RetainedSource<'a> {
-    sequence: u64,
+    sequence: MessageSeq,
     message: &'a Message,
 }
 
@@ -20,7 +18,7 @@ impl RetainedSource<'_> {
         self.message
     }
 
-    pub(super) fn into_sequence(self) -> u64 {
+    pub(super) fn into_sequence(self) -> MessageSeq {
         self.sequence
     }
 }
@@ -35,7 +33,7 @@ pub(in crate::agent::runtime) fn retention_budget(max_context: u64) -> u64 {
 pub(super) fn retained_sources<'a>(
     records: &'a [EventRecord],
     agent: &AgentId,
-    projected: &[(u64, Message)],
+    projected: &[(RecordSeq, Message)],
     origins: &[ModelCallOrigin],
     model: &str,
     budget: u64,
@@ -62,7 +60,9 @@ pub(super) fn retained_sources<'a>(
     let mut start = visible.len();
     for (index, (_, message)) in visible.iter().enumerate().rev() {
         let kept = message.clone().without_bound_reasoning();
-        let tokens = kept.map_or(0, |kept| compaction::estimate_message(&kept, model));
+        let tokens = kept.map_or(0, |kept| {
+            compaction::estimate_message(&kept.render(), model)
+        });
         if total > 0 && total.saturating_add(tokens) > budget {
             break;
         }
@@ -77,7 +77,7 @@ pub(super) fn retained_sources<'a>(
     for origin in origins {
         let index = originals
             .iter()
-            .position(|(id, _)| *id == origin.message)
+            .position(|(id, _)| *id == RecordSeq::from(origin.message))
             .ok_or_else(|| {
                 HarnessError::Compaction("active job creator message is missing".into())
             })?;
@@ -118,16 +118,42 @@ pub(super) fn retained_sources<'a>(
                 ));
             }
         }
-        retained.insert(origin.message);
+        retained.insert(RecordSeq::from(origin.message));
         retained.extend(exchange.iter().map(|(sequence, _)| *sequence));
     }
     let mut sources: Vec<_> = originals
         .into_iter()
         .filter(|(sequence, _)| retained.contains(sequence))
-        .map(|(sequence, message)| RetainedSource { sequence, message })
+        .map(|(sequence, message)| RetainedSource {
+            sequence: sequence.message(),
+            message,
+        })
         .collect();
     sources.sort_unstable_by_key(|source| source.sequence);
     Ok(sources)
+}
+
+/// A presented view supplies output when it carries a result, an error or a page;
+/// its result and capture pages may embed further views.
+fn included_view_jobs(view: &crate::job::JobView, jobs: &mut BTreeSet<JobId>) {
+    let presentation = view.presentation.as_ref();
+    let paged = presentation.is_some_and(|presentation| {
+        presentation.preview.is_some() || presentation.question.is_some()
+    });
+    if let Some(id) = view.id
+        && (view.has_result || view.error.is_some() || paged)
+    {
+        jobs.insert(id);
+    }
+    included_output_jobs(&view.result, jobs);
+    for capture in presentation
+        .into_iter()
+        .flat_map(|presentation| &presentation.captures)
+    {
+        if let Some(page) = &capture.output {
+            included_view_jobs(page, jobs);
+        }
+    }
 }
 
 // Only actual result envelopes count; status-only listings do not supply output.
@@ -173,13 +199,12 @@ pub(super) fn included_message_jobs(message: &Message, jobs: &mut BTreeSet<JobId
         }
         Message::User(blocks) => {
             for block in blocks {
-                if let crate::provider::protocol::UserContent::Runtime { text } = block
-                    && let Some(payload) = text
-                        .strip_prefix("<skyhook_job_events>\n")
-                        .and_then(|text| text.strip_suffix("\n</skyhook_job_events>"))
-                    && let Ok(value) = serde_json::from_str(payload)
-                {
-                    included_output_jobs(&value, jobs);
+                if let crate::session::UserPart::JobEvents { events } = block {
+                    for event in events {
+                        if let crate::session::JobEvent::Job(view) = event {
+                            included_view_jobs(view, jobs);
+                        }
+                    }
                 }
             }
         }
@@ -191,8 +216,9 @@ pub(super) fn included_message_jobs(message: &Message, jobs: &mut BTreeSet<JobId
 mod tests {
     use super::*;
     use crate::provider::protocol::{
-        AssistantItem, Binding, Provenance, Replay, Scope, ToolCall, ToolResult, UserContent,
+        AssistantItem, Binding, Provenance, Replay, Scope, ToolCall, ToolResult,
     };
+    use crate::session::UserPart;
     use serde_json::json;
 
     fn committed(agent: &AgentId, messages: impl IntoIterator<Item = Message>) -> Vec<EventRecord> {
@@ -201,7 +227,7 @@ mod tests {
             .enumerate()
             .map(|(i, message)| EventRecord {
                 id: crate::identity::EventId::generate().unwrap(),
-                sequence: i as u64 + 1,
+                sequence: (i as u64 + 1).into(),
                 timestamp_millis: 0,
                 agent: agent.clone(),
                 event: SessionEvent::MessageCommitted { message },
@@ -210,7 +236,7 @@ mod tests {
     }
 
     fn user(text: String) -> Message {
-        Message::User(vec![UserContent::Text { text }])
+        Message::User(vec![UserPart::Text { text }])
     }
 
     #[test]
@@ -242,15 +268,21 @@ mod tests {
             let records = committed(&agent, [exchange.clone(), results.clone(), tail.clone()]);
             // Active creator is no longer visible after an earlier compaction.
             let origin = ModelCallOrigin {
-                message: 1,
+                message: 1.into(),
                 call_id: "call".into(),
             };
-            let retained =
-                retained_sources(&records, &agent, &[(3, tail)], &[origin], "model", 8_000)
-                    .unwrap();
+            let retained = retained_sources(
+                &records,
+                &agent,
+                &[(3.into(), tail)],
+                &[origin],
+                "model",
+                8_000,
+            )
+            .unwrap();
             let sequences = retained
                 .iter()
-                .map(|source| source.sequence)
+                .map(|source| source.sequence.get())
                 .collect::<Vec<_>>();
             assert_eq!(sequences, vec![1, 2, 3]);
             // Original message identity is retained, not a visible-only reconstruction.
@@ -270,27 +302,27 @@ mod tests {
             user("x".repeat(31_920)),
         ];
         let records = committed(&agent, messages.clone());
-        let mut projected: Vec<_> = (1..).zip(messages).collect();
-        let sequences = |projected: &[(u64, Message)], max_context| {
+        let mut projected: Vec<_> = (1u64..).map(RecordSeq::from).zip(messages).collect();
+        let sequences = |projected: &[(RecordSeq, Message)], max_context| {
             let budget = retention_budget(max_context);
             let retained =
                 retained_sources(&records, &agent, projected, &[], "model", budget).unwrap();
             retained
                 .into_iter()
-                .map(RetainedSource::into_sequence)
+                .map(|source| source.into_sequence().get())
                 .collect::<Vec<_>>()
         };
         assert_eq!(sequences(&projected, 128_000), vec![2, 3, 4]);
         // A larger window keeps the same tail; a smaller one keeps proportionally less.
         assert_eq!(sequences(&projected, 1_000_000), vec![2, 3, 4]);
         assert_eq!(sequences(&projected, 127_000), vec![4]);
-        let sequences = |projected: &[(u64, Message)]| sequences(projected, 128_000);
+        let sequences = |projected: &[(RecordSeq, Message)]| sequences(projected, 128_000);
         // Even an oversized final message survives; its payload is the original,
         // not the temporary projection used for token accounting.
         projected[3].1 = user("x".repeat(40_000));
         assert_eq!(sequences(&projected), vec![4]);
         // A synthetic projected continuation is not an original message source.
-        projected.push((99, user("synthetic".into())));
+        projected.push((99.into(), user("synthetic".into())));
         assert_eq!(sequences(&projected), vec![4]);
         assert!(sequences(&[]).is_empty());
     }

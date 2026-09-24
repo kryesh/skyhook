@@ -1,25 +1,24 @@
 //! Tab selection and ordered conversation projection, including call/result provenance.
-
 use crate::tui::app::OutputStore;
 
 use super::jobs::{call_entry, job_entry};
-use super::live::{
-    reasoning_entry, reasoning_key, response_block_key, response_entries, working_entry,
+use super::live::{block_key, reasoning_entry, response_entries, working_entry};
+use super::notifications::job_event_entries;
+use super::requests::request_entry;
+use super::{
+    Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Title, number, pretty,
 };
-use super::notifications::{is_job_notification, job_event_entries};
-use super::requests::{request_entry, request_running};
-use super::{Entry, EntryKey, EntryView, Projection, Surface, Tab, number, pretty};
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
-use skyhook::provider::protocol::{AssistantItem, Message, UserContent};
-use skyhook::session::SessionEvent;
+use skyhook::provider::protocol::{AssistantItem, BlockRef};
+use skyhook::session::{Message, MessageSeq, RecordSeq, RequestPhase, SessionEvent, UserPart};
 use std::collections::{HashMap, HashSet};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolGroup {
-    Response(u64),
+    Response(MessageSeq),
     Script(JobId),
-    Notification(u64, usize),
+    Notification(RecordSeq, usize),
 }
 
 /// Shared by retained UI content and fresh export construction.
@@ -46,14 +45,10 @@ pub fn entries(
     match tab {
         Tab::Requests => records
             .iter()
+            .filter(|r| matches!(r.event, SessionEvent::ModelRequested { .. }))
             .filter_map(|r| {
-                if let SessionEvent::ModelRequested { purpose, .. } = &r.event {
-                    let info = projection.requests.get(&r.sequence)?;
-                    let running = request_running(info, snapshot, projection, agent, r.sequence);
-                    Some(request_entry(r.sequence, purpose, info, running))
-                } else {
-                    None
-                }
+                let record = projection.ledger.get(r.sequence.request())?;
+                Some(request_entry(r.sequence.request(), record))
             })
             .collect(),
         Tab::Jobs => projection
@@ -73,7 +68,7 @@ pub fn entries(
             // only within the current agent's most recent assistant turn, consuming
             // each call once. Never let an old/reused ID suppress a later result.
             let mut pending = HashMap::new();
-            let mut turn = None;
+            let mut turn: Option<MessageSeq> = None;
             let mut call_results = HashMap::new();
             let mut matched_results = HashSet::new();
             for record in &records {
@@ -82,11 +77,11 @@ pub fn entries(
                         message: Message::Assistant(items),
                     } => {
                         pending.clear();
-                        turn = Some(record.sequence);
+                        turn = Some(record.sequence.message());
                         for call in items.iter().filter_map(|item| item.call()) {
                             pending.insert(
                                 (call.id().to_owned(), call.name().to_owned()),
-                                record.sequence,
+                                record.sequence.message(),
                             );
                         }
                     }
@@ -97,8 +92,9 @@ pub fn entries(
                     } if turn.is_none_or(|turn| turn <= origin.message) => {
                         // Retained job provenance also identifies a call whose
                         // assistant message is no longer in the retained history.
-                        pending.insert((origin.call_id.clone(), tool.clone()), origin.message);
-                        turn = Some(origin.message);
+                        let message = origin.message;
+                        pending.insert((origin.call_id.clone(), tool.clone()), message);
+                        turn = Some(message);
                     }
                     SessionEvent::MessageCommitted {
                         message: Message::Tool(results),
@@ -122,53 +118,50 @@ pub fn entries(
                 let key = EntryKey::Record(record.sequence);
                 match &record.event {
                     SessionEvent::ModelRequested { .. } => {
+                        let request = record.sequence.request();
                         if let Some(entry) =
-                            super::retry::retry_entry(snapshot, projection, agent, record.sequence)
+                            super::retry::retry_entry(snapshot, projection, agent, request)
                         {
                             entries.push(entry);
-                            continue;
                         }
-                        if let Some(response) =
-                            snapshot.responses.get(&(agent.clone(), record.sequence))
-                            && response.settled
-                            && !projection.live_response(record.sequence, response)
-                            && !projection.response_committed(record.sequence)
+                        // A settled response no commit replaced (an interrupted
+                        // attempt) stays at its journal position; a failure's is
+                        // part of its status card.
+                        let phase = projection.ledger.get(request).map(|record| &record.phase);
+                        if matches!(
+                            phase,
+                            Some(RequestPhase::Interrupted { .. } | RequestPhase::Completed { .. })
+                        ) && let Some(response) =
+                            snapshot.responses.get(&(agent.clone(), request))
+                            && response.settlement().is_some()
                         {
-                            entries.extend(response_entries(
-                                record.sequence,
-                                response,
-                                view,
-                                agent_name,
-                            ));
+                            entries.extend(response_entries(request, response, view, agent_name));
                         }
                     }
                     SessionEvent::MessageCommitted { message } => match message {
                         Message::User(blocks) => {
                             for (i, block) in blocks.iter().enumerate() {
-                                let (text, surface) = match block {
-                                    UserContent::Text { text } => (
-                                        format!(
-                                            "{}\n{text}",
-                                            if agent.path().is_empty() {
-                                                "You"
-                                            } else {
-                                                "Parent"
-                                            }
-                                        ),
+                                let (title, text, surface) = match block {
+                                    UserPart::Text { text } => (
+                                        if agent.path().is_empty() {
+                                            "You"
+                                        } else {
+                                            "Parent"
+                                        },
+                                        text.clone(),
                                         Surface::User,
                                     ),
-                                    UserContent::ParentInput { text } => {
-                                        (format!("Parent\n{text}"), Surface::User)
+                                    UserPart::ParentInput { text } => {
+                                        ("Parent", text.clone(), Surface::User)
                                     }
-                                    UserContent::Attachment { attachment } => (
-                                        format!("Attachment\n{}", pretty(attachment)),
-                                        Surface::User,
-                                    ),
-                                    UserContent::Runtime { text } if is_job_notification(text) => {
+                                    UserPart::Attachment { attachment } => {
+                                        ("Attachment", pretty(attachment), Surface::User)
+                                    }
+                                    UserPart::JobEvents { events } => {
                                         for entry in job_event_entries(
                                             record.sequence,
                                             i,
-                                            text,
+                                            events,
                                             projection,
                                             view,
                                             all_details,
@@ -182,34 +175,33 @@ pub fn entries(
                                         continue;
                                     }
                                     // Persisted runtime state is model context, not conversation.
-                                    UserContent::Runtime { text }
-                                        if text.starts_with("<skyhook_state>") =>
-                                    {
-                                        continue;
-                                    }
-                                    UserContent::Runtime { text } => {
-                                        (format!("Harness notification\n{text}"), Surface::Muted)
-                                    }
-                                    UserContent::Compaction { text } => {
-                                        (format!("Compaction\n{text}"), Surface::Muted)
+                                    UserPart::State { .. } => continue,
+                                    UserPart::Compaction { text } => {
+                                        ("Compaction", text.clone(), Surface::Muted)
                                     }
                                 };
-                                entries.push(Entry::new(
+                                entries.push(Entry::titled(
                                     EntryKey::UserBlock {
                                         record: record.sequence,
                                         index: i,
                                     },
+                                    Title::plain(title),
                                     text,
                                     surface,
                                 ));
                             }
                         }
                         Message::Assistant(items) => {
-                            let request = projection
-                                .response_requests
-                                .get(&record.sequence)
-                                .copied()
-                                .unwrap_or(record.sequence);
+                            let message = record.sequence.message();
+                            let response = projection
+                                .ledger
+                                .request_of(message)
+                                .map_or(ResponseRef::Message(message), ResponseRef::Request);
+                            let footer = projection
+                                .ledger
+                                .request_of(message)
+                                .and_then(|request| projection.ledger.get(request))
+                                .map(|request| request.profile.profile.model.clone());
                             // The model footer sits under the last visible text of an
                             // answer; a working turn (one with calls) has none.
                             let final_text = (!items.iter().any(|item| item.call().is_some()))
@@ -229,26 +221,20 @@ pub fn entries(
                                             .iter()
                                             .filter(|block| !block.text.trim().is_empty())
                                         {
-                                            let mut entry = Entry::new(
-                                                response_block_key(
-                                                    request,
-                                                    id.as_str(),
-                                                    block.id.as_str(),
-                                                ),
-                                                format!("{agent_name}\n{}", block.text),
+                                            let block_ref = BlockRef {
+                                                item: id.clone(),
+                                                block: block.id.clone(),
+                                            };
+                                            let mut entry = Entry::titled(
+                                                block_key(response, &block_ref),
+                                                Title::plain(agent_name),
+                                                block.text.clone(),
                                                 Surface::Agent,
                                             );
                                             if final_text
                                                 .is_some_and(|last| std::ptr::eq(last, block))
                                             {
-                                                entry.footer = projection
-                                                    .response_requests
-                                                    .get(&record.sequence)
-                                                    .and_then(|request| {
-                                                        projection.requests.get(request)
-                                                    })
-                                                    .and_then(|request| request.start.as_ref())
-                                                    .and_then(|start| start.model.clone());
+                                                entry.footer.clone_from(&footer);
                                             }
                                             entries.push(entry);
                                         }
@@ -258,49 +244,45 @@ pub fn entries(
                                             .iter()
                                             .filter(|block| !block.text.trim().is_empty())
                                         {
+                                            let block_ref = BlockRef {
+                                                item: id.clone(),
+                                                block: block.id.clone(),
+                                            };
                                             entries.push(reasoning_entry(
-                                                reasoning_key(
-                                                    request,
-                                                    id.as_str(),
-                                                    block.id.as_str(),
-                                                ),
+                                                block_key(response, &block_ref),
                                                 &block.text,
                                                 view,
                                                 super::live::ReasoningStatus::Complete,
                                             ));
                                         }
                                     }
-                                    AssistantItem::ToolCall { id, call, .. } => {
+                                    AssistantItem::ToolCall { call, .. } => {
                                         let exists = projection.tool_origins.contains(&(
                                             agent.clone(),
-                                            record.sequence,
+                                            message,
                                             call.id().to_owned(),
                                         ));
                                         if !exists {
-                                            let block_key = response_block_key(
-                                                request,
-                                                id.as_str(),
-                                                id.as_str(),
-                                            );
+                                            let call_key = EntryKey::ToolCall {
+                                                message,
+                                                call: call.id().to_owned(),
+                                            };
                                             let e = call_entry(
-                                                block_key.clone(),
+                                                call_key.clone(),
                                                 (
                                                     call.name(),
                                                     Some(call.arguments()),
                                                     call_results
-                                                        .get(&(
-                                                            record.sequence,
-                                                            call.id().to_owned(),
-                                                        ))
+                                                        .get(&(message, call.id().to_owned()))
                                                         .copied(),
                                                 ),
                                                 agent,
                                                 projection,
-                                                view.is_expanded(&block_key, all_details),
+                                                view.is_expanded(&call_key, all_details),
                                             );
                                             tool_groups.insert(
                                                 e.key().clone(),
-                                                ToolGroup::Response(record.sequence),
+                                                ToolGroup::Response(message),
                                             );
                                             entries.push(e);
                                         }
@@ -349,27 +331,19 @@ pub fn entries(
                         }
                     }
                     SessionEvent::Compaction { checkpoint } => {
-                        let key = EntryKey::Record(record.sequence);
                         let open = view.is_expanded(&key, false);
-                        let e = Entry::expandable_text(
-                            key,
-                            format!(
-                                "{} Context compacted · {} → {}{}",
-                                if open { "▾" } else { "▸" },
-                                number(checkpoint.before_tokens),
-                                number(checkpoint.after_tokens),
-                                if open {
-                                    format!(
-                                        "\nSummary and retained sources\n{}",
-                                        pretty(checkpoint)
-                                    )
-                                } else {
-                                    String::new()
-                                }
-                            ),
-                            Surface::Muted,
+                        let title = format!(
+                            "Context compacted · {} → {}",
+                            number(checkpoint.before_tokens),
+                            number(checkpoint.after_tokens),
                         );
-                        entries.push(e);
+                        let body = if open {
+                            format!("Summary and retained sources\n{}", pretty(checkpoint))
+                        } else {
+                            String::new()
+                        };
+                        let title = Title::disclosed(title, open);
+                        entries.push(Entry::titled(key, title, body, Surface::Muted));
                     }
                     SessionEvent::Status { message } => entries.push(Entry::new(
                         key,
@@ -423,9 +397,7 @@ pub fn entries(
 #[cfg(test)]
 mod tests {
     use super::super::View;
-    use super::super::tests::{
-        call_record, delta, record, replay, request, result_record, root, update,
-    };
+    use super::super::tests::{Journal, replay, update};
     use super::*;
     use skyhook::agent::{AgentActivity, RuntimeEvent};
     use skyhook::identity::AgentId;
@@ -448,61 +420,54 @@ mod tests {
         entries(snapshot, &projection, view, &outputs, true)
     }
 
-    fn commit(snapshot: &mut ObservationSnapshot, agent: &AgentId, message: Message) -> u64 {
-        record(snapshot, agent, SessionEvent::MessageCommitted { message })
+    async fn commit(journal: &mut Journal, agent: &AgentId, message: Message) -> MessageSeq {
+        journal
+            .record(agent, SessionEvent::MessageCommitted { message })
+            .await
+            .message()
     }
 
     fn user(text: &str) -> Message {
-        Message::User(vec![UserContent::Text { text: text.into() }])
+        Message::User(vec![UserPart::Text { text: text.into() }])
     }
 
-    #[test]
-    fn synchronous_results_are_turn_scoped_and_orphans_remain_expandable() {
-        let agent = root(72);
-        let mut snapshot = ObservationSnapshot::default();
+    #[tokio::test]
+    async fn synchronous_results_are_turn_scoped() {
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
         for error in [false, true] {
-            call_record(&mut snapshot, &agent, "reused");
-            result_record(&mut snapshot, &agent, "reused", error);
+            journal.call_record(&agent, "reused").await;
+            journal.result_record(&agent, "reused", error).await;
         }
-        result_record(&mut snapshot, &agent, "orphan", true);
-
-        let cards = render(&snapshot, &agent, true);
-        assert_eq!(cards.len(), 3);
+        let cards = render(&journal.snapshot, &agent, true);
+        assert_eq!(cards.len(), 2);
         assert!(cards[0].text().starts_with("▾ ✓ exec · Completed"));
-        assert!(
-            cards[1..]
-                .iter()
-                .all(|card| card.text().starts_with("▾ × exec · Failed"))
-        );
+        assert!(cards[1].text().starts_with("▾ × exec · Failed"));
         assert_ne!(cards[0].key(), cards[1].key());
-        assert!(!cards[2].text().contains("Arguments"));
         assert!(
-            cards[2].text().contains("Output") && cards[2].text().contains("permission_denied")
+            cards[1].text().contains("Output") && cards[1].text().contains("permission_denied")
         );
         assert!(cards.iter().all(|card| card.expandable()
             && card.job_id().is_none()
             && card.surface == Surface::Tool));
 
         // A new assistant turn closes the old call scope even if its old call
-        // never produced a result. Same-ID results in other agents cannot bind.
-        let other = agent.child(1);
-        result_record(&mut snapshot, &other, "reused", true);
-        call_record(&mut snapshot, &agent, "pending");
-        call_record(&mut snapshot, &agent, "new-turn");
-        result_record(&mut snapshot, &agent, "pending", true);
-        let cards = render(&snapshot, &agent, false);
+        // never produced a result: the late result stands alone.
+        journal.call_record(&agent, "pending").await;
+        journal.call_record(&agent, "new-turn").await;
+        journal.result_record(&agent, "pending", true).await;
+        let cards = render(&journal.snapshot, &agent, false);
         let texts: Vec<_> = cards.iter().map(Entry::text).collect();
-        assert_eq!(texts[3..], ["▸ exec", "▸ exec", "▸ × exec · Failed"]);
-        assert_eq!(render(&snapshot, &other, false).len(), 1);
+        assert_eq!(texts[2..], ["▸ exec", "▸ exec", "▸ × exec · Failed"]);
     }
 
-    #[test]
-    fn admitted_results_use_exact_job_provenance_even_without_retained_calls() {
+    #[tokio::test]
+    async fn admitted_results_use_exact_job_provenance_even_without_retained_calls() {
         use skyhook::{execution::ExecutionLocation, session::ModelCallOrigin};
         for retained in [false, true] {
-            let agent = root(73);
-            let mut snapshot = ObservationSnapshot::default();
-            let origin = call_record(&mut snapshot, &agent, "reused");
+            let mut journal = Journal::new().await;
+            let agent = journal.agent();
+            let origin = journal.call_record(&agent, "reused").await;
             let created = SessionEvent::JobCreated {
                 job: JobId::new(42).unwrap(),
                 parent: None,
@@ -517,19 +482,18 @@ mod tests {
                 output_schema: None,
                 accepts_input: false,
                 background: false,
-                authorization_scope: None,
                 location: ExecutionLocation::root("/workspace".into()),
             };
-            record(&mut snapshot, &agent, created);
-            result_record(&mut snapshot, &agent, "reused", false);
+            journal.record(&agent, created).await;
+            journal.result_record(&agent, "reused", false).await;
             if !retained {
-                snapshot.records.remove(&origin);
+                journal.snapshot.records.remove(&origin.into());
             }
             // A later call reuses the ID but fails before creating a job.
-            call_record(&mut snapshot, &agent, "reused");
-            result_record(&mut snapshot, &agent, "reused", true);
+            journal.call_record(&agent, "reused").await;
+            journal.result_record(&agent, "reused", true).await;
 
-            let cards = render(&snapshot, &agent, false);
+            let cards = render(&journal.snapshot, &agent, false);
             assert_eq!(cards.len(), 2);
             assert_eq!(cards[0].job_id(), Some(JobId::new(42).unwrap()));
             assert_eq!(
@@ -539,22 +503,22 @@ mod tests {
         }
     }
 
-    #[test]
-    fn whitespace_only_turns_neither_create_agent_cards_nor_steal_the_answer_footer() {
-        let agent = root(3);
+    #[tokio::test]
+    async fn whitespace_only_turns_neither_create_agent_cards_nor_steal_the_answer_footer() {
         let call = ToolCall::new("call_read", "read", serde_json::json!({"path":"."})).unwrap();
         for whitespace in ["\n\n", "\n\n\n", " \t\r\n", "\u{2003}"] {
-            let mut snapshot = ObservationSnapshot::default();
-            request(&mut snapshot, &agent, None);
+            let mut journal = Journal::new().await;
+            let agent = journal.agent();
+            journal.request(&agent, None).await;
             let reasoning = "Inspect the repository.";
             let message = Message::Assistant(vec![
                 AssistantItem::reasoning("reasoning", 0, reasoning, Some(replay())),
                 AssistantItem::text("separator", 1, whitespace),
                 AssistantItem::tool_call("tool", 2, call.clone()),
             ]);
-            commit(&mut snapshot, &agent, message);
+            commit(&mut journal, &agent, message).await;
 
-            let cards = render(&snapshot, &agent, true);
+            let cards = render(&journal.snapshot, &agent, true);
             assert!(cards.iter().all(|card| card.surface != Surface::Agent));
             assert!(
                 cards
@@ -569,15 +533,16 @@ mod tests {
             );
         }
 
-        let mut snapshot = ObservationSnapshot::default();
-        request(&mut snapshot, &agent, None);
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
+        journal.request(&agent, None).await;
         let answer = "  Actual answer with spacing.\n";
         let message = Message::Assistant(vec![
             AssistantItem::text("answer", 0, answer),
             AssistantItem::text("separator", 1, "\n\n"),
         ]);
-        commit(&mut snapshot, &agent, message);
-        let cards = render(&snapshot, &agent, false);
+        commit(&mut journal, &agent, message).await;
+        let cards = render(&journal.snapshot, &agent, false);
         let answers: Vec<_> = cards
             .iter()
             .filter(|card| card.surface == Surface::Agent)
@@ -587,132 +552,25 @@ mod tests {
         assert_eq!(answers[0].footer.as_deref(), Some("fixture-model"));
     }
 
-    #[test]
-    fn conversation_projects_mixed_job_events_without_reclassifying_user_text() {
-        const RECEIVED: &str = "Agent message received by model";
-        let agent = root(2);
-        let messages = format!(
-            "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-            serde_json::json!([
-                {"kind":"message","id":253,"message":6577,"text":"first progress"},
-                {"kind":"message","id":253,"message":6578,"text":"second progress"},
-            ]),
-        );
-        let jobs = format!(
-            "<skyhook_job_events>\n{}\n</skyhook_job_events>",
-            serde_json::json!([
-                {"kind":"message","id":253,"name":"reviewer","message":6579,"text":"independent reply"},
-                {"id":253,"state":"completed","has_result":false,"result":null,"error":null,"meta":{"parent":null,"tool":"agent","name":null,"target":null,"workspace":null,"last_message":6579,"code":null,"executed":null},"presentation":null},
-                {"kind":"message","id":254,"message":6580,"text":"another child reply"},
-                {"id":255,"state":"completed","has_result":true,"result":{"stdout":"tool output"},"error":null,"meta":{"parent":null,"tool":"exec","name":null,"target":null,"workspace":null,"last_message":null,"code":null,"executed":null},"presentation":null},
-            ]),
-        );
-        let message = Message::User(vec![
-            UserContent::Runtime {
-                text: messages.clone(),
-            },
-            UserContent::Runtime { text: jobs },
-            UserContent::Text {
-                text: messages.clone(),
-            },
-            UserContent::Runtime {
-                text: "ordinary scheduler note".into(),
-            },
-        ]);
-        // Saved histories retain the original runtime envelopes; rendering is presentation-only.
-        let saved = serde_json::to_vec(&message).unwrap();
-        let mut snapshot = ObservationSnapshot::default();
-        let sequence = commit(
-            &mut snapshot,
-            &agent,
-            serde_json::from_slice(&saved).unwrap(),
-        );
-
-        let cards = render(&snapshot, &agent, true);
-        let notifications: Vec<_> = cards
-            .iter()
-            .filter(|entry| entry.surface == Surface::Tool)
-            .collect();
-        let expected: [(usize, usize, &[&str], &[&str]); 6] = [
-            (0, 0, &["first progress"], &[]),
-            (0, 1, &["second progress"], &[]),
-            (
-                1,
-                0,
-                &[
-                    "agent #253 · reviewer · message #6579",
-                    RECEIVED,
-                    "independent reply",
-                ],
-                &[],
-            ),
-            (
-                1,
-                1,
-                &["agent #253 · completed"],
-                &[RECEIVED, "independent reply"],
-            ),
-            (
-                1,
-                2,
-                &[
-                    "agent #254 · message #6580",
-                    RECEIVED,
-                    "another child reply",
-                ],
-                &[],
-            ),
-            (1, 3, &["exec #255 · completed", "tool output"], &[RECEIVED]),
-        ];
-        assert_eq!(notifications.len(), expected.len());
-        for (entry, (block, event, present, absent)) in notifications.iter().zip(expected) {
-            let key = EntryKey::Notification {
-                record: sequence,
-                block,
-                event: Some(event),
-            };
-            let text = entry.text();
-            assert_eq!(entry.key(), &key);
-            assert!(present.iter().all(|part| text.contains(part)), "{text}");
-            assert!(!absent.iter().any(|part| text.contains(part)), "{text}");
-            assert!(entry.expandable() && entry.job_id().is_none());
-            assert!(!text.contains("<skyhook_") && !text.contains("Harness notification"));
-        }
-        assert!(notifications[0].compact_after && !notifications[1].compact_after);
-        let user = format!("You\n{messages}");
-        assert!(
-            cards
-                .iter()
-                .any(|entry| entry.surface == Surface::User && entry.text() == user)
-        );
-        assert!(cards.iter().any(|entry| entry.surface == Surface::Muted
-            && entry.text() == "Harness notification\nordinary scheduler note"));
-        let SessionEvent::MessageCommitted { message: stored } = &snapshot.records[&sequence].event
-        else {
-            panic!("message history changed during rendering");
-        };
-        assert_eq!(serde_json::to_vec(stored).unwrap(), saved);
-    }
-
-    #[test]
-    fn refusals_reach_the_transcript_as_errors_through_the_real_projection() {
+    #[tokio::test]
+    async fn refusals_reach_the_transcript_as_errors_through_the_real_projection() {
         // Guards the journal-to-card wiring: rendering a refusal as an ordinary
         // failure would restore the silent-failure UX this classification exists
         // to prevent.
-        let mut snapshot = ObservationSnapshot::default();
-        let agent = root(1);
-        let refused_request = request(&mut snapshot, &agent, None);
-        let error = "the model declined to respond: content filter; \
-                     the response contained no content"
-            .to_string();
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
+        let refused_request = journal.request(&agent, None).await.request;
+        let error = "content filter; the response contained no content".to_string();
         let refused = SessionEvent::ModelFailed {
-            request: refused_request,
-            attempt: 1,
+            attempt: skyhook::session::AttemptRef {
+                request: refused_request,
+                attempt: 1,
+            },
             error: error.clone(),
             kind: skyhook::session::ModelFailureKind::Refusal,
         };
-        record(&mut snapshot, &agent, refused);
-        let entries = render(&snapshot, &agent, false);
+        journal.record(&agent, refused).await;
+        let entries = render(&journal.snapshot, &agent, false);
         let card = entries
             .iter()
             .find(|entry| entry.key() == &EntryKey::Retry(refused_request))
@@ -724,16 +582,19 @@ mod tests {
         assert_eq!(lines.next(), Some(super::super::retry::REFUSAL_HINT));
         assert_eq!(lines.next(), None);
         // An ordinary failure keeps the muted presentation and gains no hint.
-        let mut snapshot = ObservationSnapshot::default();
-        let failed_request = request(&mut snapshot, &agent, None);
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
+        let failed_request = journal.request(&agent, None).await.request;
         let failed = SessionEvent::ModelFailed {
-            request: failed_request,
-            attempt: 1,
+            attempt: skyhook::session::AttemptRef {
+                request: failed_request,
+                attempt: 1,
+            },
             error: "Protocol: rejected".to_owned(),
             kind: skyhook::session::ModelFailureKind::Error,
         };
-        record(&mut snapshot, &agent, failed);
-        let entries = render(&snapshot, &agent, false);
+        journal.record(&agent, failed).await;
+        let entries = render(&journal.snapshot, &agent, false);
         let card = entries
             .iter()
             .find(|entry| entry.key() == &EntryKey::Retry(failed_request))
@@ -745,44 +606,62 @@ mod tests {
         );
     }
 
-    #[test]
-    fn partial_attempts_stay_before_retry_and_followup_while_current_stream_stays_last() {
-        let mut snapshot = ObservationSnapshot::default();
-        let agent = root(1);
-        let failed = request(&mut snapshot, &agent, None);
-        let context = Some(failed - 1);
-        delta(&mut snapshot, &agent, failed, "text", "failed partial");
+    #[tokio::test]
+    async fn partial_attempts_stay_before_retry_and_followup_while_current_stream_stays_last() {
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
+        let failed = journal.request(&agent, None).await;
+        let context = Some(failed.context);
+        let failed = failed.request;
+        journal.delta(&agent, failed, "text", "failed partial");
         let error = "stream lost".into();
         let event = SessionEvent::ModelFailed {
-            request: failed,
-            attempt: 1,
+            attempt: skyhook::session::AttemptRef {
+                request: failed,
+                attempt: 1,
+            },
             error,
             kind: skyhook::session::ModelFailureKind::Error,
         };
-        record(&mut snapshot, &agent, event);
-        let retry = request(&mut snapshot, &agent, context);
+        journal.record(&agent, event).await;
+        let retry = journal.request(&agent, context).await.request;
         let answer = AssistantItem::text("text", 1, "successful retry");
-        commit(&mut snapshot, &agent, Message::Assistant(vec![answer]));
-        commit(&mut snapshot, &agent, user("new followup"));
-        let interrupted = request(&mut snapshot, &agent, context);
-        delta(
-            &mut snapshot,
-            &agent,
-            interrupted,
-            "text",
-            "interrupted partial",
-        );
-        let activity = AgentActivity::Interrupted;
+        let message = commit(&mut journal, &agent, Message::Assistant(vec![answer])).await;
+        journal
+            .record(
+                &agent,
+                SessionEvent::ResponseCompleted {
+                    attempt: skyhook::session::AttemptRef {
+                        request: retry,
+                        attempt: 1,
+                    },
+                    message,
+                    outcome: skyhook::session::CompletedOutcome::Answer,
+                },
+            )
+            .await;
+        commit(&mut journal, &agent, user("new followup")).await;
+        let interrupted = journal.request(&agent, context).await.request;
+        journal.delta(&agent, interrupted, "reasoning", "interrupted thinking");
+        journal.delta(&agent, interrupted, "text", "interrupted partial");
+        let activity = AgentActivity::Stopped(skyhook::agent::TurnFailure::Interrupted);
         let event = RuntimeEvent::Activity {
             agent: agent.clone(),
             activity,
         };
-        update(&mut snapshot, event);
-        let current = request(&mut snapshot, &agent, context);
-        delta(&mut snapshot, &agent, current, "text", "current stream");
-        delta(&mut snapshot, &agent.child(1), retry, "text", "child only");
+        update(&mut journal.snapshot, event);
+        let cut = skyhook::session::AttemptRef {
+            request: interrupted,
+            attempt: 1,
+        };
+        journal
+            .record(&agent, SessionEvent::ModelAttemptInterrupted(cut))
+            .await;
+        let current = journal.request(&agent, context).await.request;
+        journal.delta(&agent, current, "text", "current stream");
+        journal.delta(&agent.child(1), retry, "text", "child only");
 
-        let entries = render(&snapshot, &agent, false);
+        let entries = render(&journal.snapshot, &agent, false);
         let text = entries
             .iter()
             .map(Entry::text)
@@ -792,7 +671,9 @@ mod tests {
             "failed partial",
             "successful retry",
             "new followup",
-            "interrupted partial",
+            "Interrupted · attempt 1",
+            "interrupted thinking",
+            "Incomplete response\ninterrupted partial",
             "current stream",
         ];
         for pair in order.windows(2) {
@@ -803,72 +684,37 @@ mod tests {
             );
         }
         assert_eq!(text.matches("failed partial").count(), 1);
+        assert_eq!(text.matches("interrupted partial").count(), 1);
         assert!(!text.contains("child only"));
         assert!(entries.last().unwrap().text().contains("current stream"));
     }
 
-    #[test]
-    fn ordinary_conversation_is_identical_with_or_without_attempt_tracking() {
-        let agent = root(2);
-        let mut plain = ObservationSnapshot::default();
-        let request = request(&mut plain, &agent, None);
-        let mut tracked = plain.clone();
-        let attempt = 1;
-        record(
-            &mut tracked,
-            &agent,
-            SessionEvent::ModelAttemptStarted { request, attempt },
-        );
-        let call = ToolCall::new("call", "read", serde_json::json!({"path":"README.md"})).unwrap();
-        let message = Message::Assistant(vec![
-            AssistantItem::reasoning("reasoning", 0, "Normal reasoning", Some(replay())),
-            AssistantItem::text("answer", 1, "Normal answer"),
-            AssistantItem::tool_call("tool", 2, call),
-        ]);
-        for step in 0..3 {
-            for snapshot in [&mut plain, &mut tracked] {
-                match step {
-                    0 => {
-                        let activity = AgentActivity::Working;
-                        let agent = agent.clone();
-                        update(snapshot, RuntimeEvent::Activity { agent, activity });
-                    }
-                    1 => delta(snapshot, &agent, request, "text", "normal stream"),
-                    _ => _ = commit(snapshot, &agent, message.clone()),
-                }
-            }
-            let normal = render_with(&plain, &agent, true);
-            assert!(normal == render_with(&tracked, &agent, true));
-            assert!(normal.iter().all(|entry| !entry.text().contains("attempt")));
-        }
-    }
-
-    #[test]
-    fn retry_card_is_one_compact_safe_entry_and_leaves_the_stored_error_intact() {
-        let agent = root(1);
-        let mut snapshot = ObservationSnapshot::default();
-        let request = request(&mut snapshot, &agent, None);
+    #[tokio::test]
+    async fn retry_card_is_one_compact_safe_entry_and_leaves_the_stored_error_intact() {
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
+        let request = journal.request(&agent, None).await.request;
         let error = format!("HTTP 503 overloaded\n\u{1b}[31m{}", "x".repeat(1000));
         let failed = SessionEvent::ModelFailed {
-            request,
-            attempt: 1,
+            attempt: skyhook::session::AttemptRef {
+                request,
+                attempt: 1,
+            },
             error: error.clone(),
             kind: skyhook::session::ModelFailureKind::Error,
         };
-        record(&mut snapshot, &agent, failed);
+        let failure = journal.record(&agent, failed).await;
         let scheduled = SessionEvent::ModelRecoveryScheduled {
-            request,
-            attempt: 2,
+            failure,
             delay_millis: 1000,
-            error: error.clone(),
         };
-        record(&mut snapshot, &agent, scheduled);
-        let cards = render(&snapshot, &agent, false);
+        journal.record(&agent, scheduled).await;
+        let cards = render(&journal.snapshot, &agent, false);
         let text = cards[0].text();
         assert_eq!((cards.len(), text.lines().count()), (1, 2));
         assert!(text.contains("attempt 2") && text.contains("HTTP 503 overloaded"));
         assert!(!text.contains('\u{1b}') && text.chars().count() < 320 && text.ends_with('…'));
-        assert!(snapshot.records.values().any(|r| matches!(&r.event,
-            SessionEvent::ModelFailed { error: stored, .. } if stored == &error)));
+        assert!(journal.snapshot.records.values().any(|r| matches!(&r.event,
+            SessionEvent::ModelFailed { error: stored, .. } if stored.as_str() == error)));
     }
 }

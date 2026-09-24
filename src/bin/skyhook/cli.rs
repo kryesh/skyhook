@@ -192,7 +192,18 @@ pub(super) struct ExecutionRequest {
     pub(super) config: ConfigRequest,
     pub(super) resume: Option<SessionId>,
     pub(super) model: Option<String>,
+}
+
+pub(super) struct BatchRequest {
+    pub(super) execution: ExecutionRequest,
     pub(super) permissions: PermissionArgs,
+}
+
+/// The terminal always runs in a configured mode; an explicit name may be one only
+/// the resumed session still knows.
+pub(super) struct InteractiveRequest {
+    pub(super) execution: ExecutionRequest,
+    pub(super) mode: Option<String>,
 }
 
 /// Only paths are admitted here: in particular headless input I/O must remain
@@ -206,8 +217,8 @@ pub(super) enum Invocation {
     Auth(AuthCommand),
     Inspect(Inspection),
     Stats(StatsRequest),
-    Headless(ExecutionRequest, InitialInput),
-    Interactive(ExecutionRequest, Option<InitialInput>),
+    Headless(BatchRequest, InitialInput),
+    Interactive(InteractiveRequest, Option<InitialInput>),
 }
 
 pub(super) fn parse_from<I, T>(args: I) -> Result<Invocation, clap::Error>
@@ -266,24 +277,32 @@ impl TryFrom<Args> for Invocation {
                     Some(Capabilities(capabilities)) => PermissionArgs::Exact(capabilities),
                     None => PermissionArgs::Mode(mode),
                 };
-                let (request, input) = session.into_request(permissions);
+                let (execution, input) = session.into_request();
                 let input = input.ok_or_else(|| {
                     clap::Error::raw(
                         clap::error::ErrorKind::MissingRequiredArgument,
                         "batch requires --prompt or --script\n",
                     )
                 })?;
+                let request = BatchRequest {
+                    execution,
+                    permissions,
+                };
                 return Ok(Self::Headless(request, input));
             }
             None => {}
         }
-        let (request, input) = args.session.into_request(PermissionArgs::Mode(args.mode));
+        let (execution, input) = args.session.into_request();
+        let request = InteractiveRequest {
+            execution,
+            mode: args.mode,
+        };
         Ok(Self::Interactive(request, input))
     }
 }
 
 impl SessionArgs {
-    fn into_request(self, permissions: PermissionArgs) -> (ExecutionRequest, Option<InitialInput>) {
+    fn into_request(self) -> (ExecutionRequest, Option<InitialInput>) {
         // Clap rejects both together: `--prompt` is `conflicts_with = "script"`.
         let input = match self.prompt {
             Some(text) => Some(InitialInput::Prompt {
@@ -296,7 +315,6 @@ impl SessionArgs {
             config: self.config,
             resume: self.resume,
             model: self.model,
-            permissions,
         };
         (request, input)
     }
@@ -359,10 +377,8 @@ mod tests {
             assert_eq!(parsed.is_ok(), valid, "{args:?}");
         }
         let permissions = |args: &[&str]| match parse_from([&["skyhook"], args].concat()) {
-            Ok(Invocation::Headless(request, _) | Invocation::Interactive(request, _)) => {
-                request.permissions
-            }
-            _ => panic!("session invocation"),
+            Ok(Invocation::Headless(request, _)) => request.permissions,
+            _ => panic!("batch invocation"),
         };
         assert!(matches!(
             permissions(&["batch", "-p", "x", "--capabilities="]),
@@ -373,12 +389,17 @@ mod tests {
             PermissionArgs::Exact(capabilities)
                 if capabilities == [Capability::Read, Capability::Exec, Capability::Targets]
         ));
-        for args in [&["batch", "-p", "x", "--mode", "m"][..], &["--mode", "m"]] {
-            assert!(matches!(permissions(args), PermissionArgs::Mode(Some(mode)) if mode == "m"));
-        }
+        assert!(matches!(
+            permissions(&["batch", "-p", "x", "--mode", "m"]),
+            PermissionArgs::Mode(Some(mode)) if mode == "m"
+        ));
         assert!(matches!(
             permissions(&["batch", "-s", "x"]),
             PermissionArgs::Mode(None)
+        ));
+        assert!(matches!(
+            parse_from(["skyhook", "--mode", "m"]),
+            Ok(Invocation::Interactive(request, _)) if request.mode.as_deref() == Some("m")
         ));
     }
 

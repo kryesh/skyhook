@@ -42,8 +42,9 @@ successful replies have no retry labels. Retries continue until success or cance
 
 The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
 tab, while reading positions and expanded rows remain separate for each agent. Requests include
-compaction requests and token summaries; transient retries appear under the same request. Full request
-bodies are available in the session log, not rendered in the UI. Status messages, including
+compaction requests and token summaries; transient retries appear under the same request, which
+reads **Retrying** while the next attempt is pending. Full request bodies are available in the
+session log, not rendered in the UI. Status messages, including
 skill warnings, interruptions, and errors, appear in the conversation and are saved with the
 session, but are not sent to the model. Connection and MCP startup warnings describe this
 installation rather than the session, so they are shown but not saved.

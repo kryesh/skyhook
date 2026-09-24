@@ -242,7 +242,9 @@ impl RequestColumns {
                 let color: Color = match row.status {
                     model::RequestStatus::Completed => p.content.success,
                     model::RequestStatus::Failed => p.content.error,
-                    model::RequestStatus::Interrupted => p.content.warning,
+                    model::RequestStatus::Interrupted | model::RequestStatus::Retrying => {
+                        p.content.warning
+                    }
                     model::RequestStatus::Running => p.content.info,
                 };
                 spans.push(Span::styled(
@@ -273,10 +275,11 @@ impl RequestColumns {
 mod tests {
     use super::*;
     use ratatui::widgets::Widget;
+    use skyhook::session::RequestSeq;
 
-    fn request(sequence: u64, status: model::RequestStatus, output: u64) -> model::RequestRow {
+    fn request(status: model::RequestStatus, output: u64) -> model::RequestRow {
         model::RequestRow {
-            sequence,
+            sequence: RequestSeq::default(),
             purpose: skyhook::session::ModelPurpose::Agent,
             model: "model".into(),
             status,
@@ -358,8 +361,8 @@ mod tests {
 
     #[test]
     fn request_rows_reserve_spinner_gutter_and_align_with_statistics_headers() {
-        let running = request(7, model::RequestStatus::Running, 84);
-        let completed = request(123, model::RequestStatus::Completed, 84);
+        let running = request(model::RequestStatus::Running, 84);
+        let completed = request(model::RequestStatus::Completed, 84);
         let columns = RequestColumns::new([&running, &completed]);
         let header = columns.header(100, Palette::new()).unwrap().to_string();
         for row in [&running, &completed] {
@@ -385,7 +388,7 @@ mod tests {
         }
 
         let row = model::RequestRow {
-            sequence: 12345,
+            sequence: RequestSeq::default(),
             purpose: skyhook::session::ModelPurpose::Compaction,
             model: "long model 界界 😀".into(),
             status: model::RequestStatus::Running,
@@ -415,8 +418,8 @@ mod tests {
             rows.map(|row| model::Entry::request_entry((*row).clone()))
                 .collect::<Vec<_>>()
         };
-        let short = request(1, model::RequestStatus::Completed, 1);
-        let mut long = request(u64::MAX, model::RequestStatus::Completed, u64::MAX);
+        let short = request(model::RequestStatus::Completed, 1);
+        let mut long = request(model::RequestStatus::Completed, u64::MAX);
         long.model = "a very long model name".into();
         let small = entries(&[&short, &short]);
         let large = entries(&[&short, &long]);

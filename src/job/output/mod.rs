@@ -13,7 +13,8 @@ pub(crate) use captures::{
 };
 pub(crate) use reader::Source;
 mod truncation;
-use super::{JobError, JobManager, JobRole, JobState, OutputPresentation, views};
+use super::{JobEnd, JobError, JobManager, JobState, OutputPresentation, views};
+pub use crate::tool::output::FieldPointer;
 use crate::{
     identity::JobId,
     session::{CaptureRow, SharedDb},
@@ -50,7 +51,7 @@ pub fn omit_null_fields(value: &mut Value) {
 }
 
 fn database(error: crate::session::DbError) -> ToolError {
-    ToolError::Io(std::io::Error::other(error))
+    ToolError::io(std::io::Error::other(error))
 }
 
 /// One job's output rows in the session database. Every operation locks the
@@ -61,17 +62,32 @@ pub(crate) struct Output {
     job: JobId,
 }
 
-/// A snapshot of the saved document and capture registrations. Capture bytes stay
+/// One run's terminal product. `result` is `None` when the run produced none; a
+/// literal null result is `Some(Value::Null)`.
+struct Product {
+    result: Option<Value>,
+    /// Every capture the producer finished was admitted into the result.
+    captures_complete: bool,
+}
+
+impl Product {
+    /// The product as pointers address it: `{"result": ...}`, with referenced
+    /// fields as placeholders and a missing result as null.
+    fn document(&self) -> Value {
+        json!({"result": self.result})
+    }
+}
+
+/// A snapshot of the saved product and capture registrations. Capture bytes stay
 /// in the database and are read live, so an open capture can still grow.
 pub(crate) struct Saved {
     output: Output,
-    /// Compact terminal document; referenced fields are emptied placeholders.
-    document: Option<Value>,
-    /// Pointers the document references, in pointer order.
-    fields: Vec<String>,
-    captures: BTreeMap<String, CaptureRow>,
+    product: Option<Product>,
+    /// Pointers the product references, in pointer order.
+    fields: Vec<FieldPointer>,
+    captures: BTreeMap<FieldPointer, CaptureRow>,
     /// Capability-filtered slots must never reuse capability-independent render caches.
-    diagnostic_fields: BTreeSet<String>,
+    diagnostic_fields: BTreeSet<FieldPointer>,
 }
 
 impl Saved {
@@ -79,13 +95,20 @@ impl Saved {
         let job = output.job.get();
         let saved = output.db.output(job).map_err(database)?;
         let captures = output.db.captures(job).map_err(database)?;
-        let (document, fields) = match saved {
-            Some((document, fields)) => (Some(serde_json::from_str(&document)?), fields),
+        let (product, fields) = match saved {
+            Some(saved) => {
+                let result = saved.result.as_deref().map(serde_json::from_str);
+                let product = Product {
+                    result: result.transpose()?,
+                    captures_complete: saved.captures_complete,
+                };
+                (Some(product), saved.fields)
+            }
             None => (None, Vec::new()),
         };
         Ok(Self {
             output: output.clone(),
-            document,
+            product,
             fields,
             diagnostic_fields: BTreeSet::new(),
             captures: captures
@@ -95,76 +118,60 @@ impl Saved {
         })
     }
 
-    /// Replace only registered presentation-owned slots before selection or
-    /// paging. No inference from tool names or traversal of user error objects.
+    /// Replace the registered presentation-owned slot before selection or paging.
+    /// No inference from tool names or traversal of user error objects.
     fn present_diagnostics(
         &mut self,
-        diagnostic: Option<&crate::tool::diagnostic::Diagnostic>,
         output_diagnostic: Option<&crate::tool::diagnostic::Diagnostic>,
         viewer: DiagnosticViewer<'_>,
     ) -> Result<(), ToolError> {
-        let Some(mut document) = self.document.take() else {
+        let Some(diagnostic) = output_diagnostic else {
             return Ok(());
         };
-        for (field, diagnostic) in [
-            ("/error", diagnostic),
-            ("/result/error/message", output_diagnostic),
-        ] {
-            let Some(diagnostic) = diagnostic else {
-                continue;
-            };
-            // A producer can have offloaded a containing value. Hydrate only
-            // that ancestor before replacing its registered diagnostic slot.
-            let ancestor = self
-                .fields
-                .iter()
-                .find(|stored| {
-                    field == stored.as_str()
-                        || field
-                            .strip_prefix(stored.as_str())
-                            .is_some_and(|rest| rest.starts_with('/'))
-                })
-                .cloned();
-            if let Some(ancestor) = &ancestor {
-                hydrate_field(self, &mut document, ancestor)?;
-            }
-            if let Some(value) = document.pointer_mut(field) {
-                *value = Value::String(diagnostic.render_for(viewer));
-                self.diagnostic_fields.insert(field.to_owned());
-                if let Some(ancestor) = ancestor {
-                    self.fields.retain(|stored| stored != &ancestor);
-                }
-                self.captures.retain(|pointer, _| {
-                    pointer != field
-                        && !field
-                            .strip_prefix(pointer.as_str())
-                            .is_some_and(|rest| rest.starts_with('/'))
-                });
-            }
+        let Some(mut product) = self.product.take() else {
+            return Ok(());
+        };
+        let field = FieldPointer::result().property("error").property("message");
+        let mut document = product.document();
+        // A producer can have offloaded a containing value. Hydrate only that
+        // ancestor before replacing its registered diagnostic slot.
+        let ancestor = self
+            .fields
+            .iter()
+            .find(|stored| *stored == &field || stored.contains(&field))
+            .cloned();
+        if let Some(ancestor) = &ancestor {
+            hydrate_field(self, &mut document, ancestor)?;
         }
-        self.document = Some(document);
+        if let Some(value) = document.pointer_mut(field.as_str()) {
+            *value = Value::String(diagnostic.render_for(viewer));
+            product.result = Some(document["result"].take());
+            if let Some(ancestor) = ancestor {
+                self.fields.retain(|stored| stored != &ancestor);
+            }
+            self.captures
+                .retain(|pointer, _| pointer != &field && !pointer.contains(&field));
+            self.diagnostic_fields.insert(field);
+        }
+        self.product = Some(product);
         Ok(())
     }
 
-    fn cacheable(&self, field: &str) -> bool {
-        !self.diagnostic_fields.iter().any(|diagnostic| {
-            diagnostic == field
-                || diagnostic
-                    .strip_prefix(field)
-                    .is_some_and(|rest| rest.starts_with('/'))
-        })
+    fn cacheable(&self, field: &FieldPointer) -> bool {
+        !self
+            .diagnostic_fields
+            .iter()
+            .any(|diagnostic| diagnostic == field || field.contains(diagnostic))
     }
 
-    /// Saved presence is explicit because JSON cannot distinguish `None` from
-    /// `Some(null)`.
     fn has_result(&self) -> bool {
-        self.document
+        self.product
             .as_ref()
-            .is_some_and(|document| document["has_result"] == true)
+            .is_some_and(|product| product.result.is_some())
     }
 
     /// Any registered capture at `field`, complete or not.
-    fn capture(&self, field: &str) -> Option<Source> {
+    fn capture(&self, field: &FieldPointer) -> Option<Source> {
         self.captures.get(field).map(|capture| {
             Source::Capture(reader::CaptureReader::new(
                 self.output.db.clone(),
@@ -174,16 +181,15 @@ impl Saved {
     }
 
     /// The bytes of a referenced field, which the document stores as a placeholder.
-    fn stored(&self, field: &str) -> Option<Source> {
+    fn stored(&self, field: &FieldPointer) -> Option<Source> {
         self.fields
-            .iter()
-            .any(|stored| stored == field)
+            .contains(field)
             .then(|| self.capture(field))
             .flatten()
     }
 
     /// All bytes of the capture at `field`, if one is registered.
-    pub(crate) fn bytes(&self, field: &str) -> Result<Option<Vec<u8>>, ToolError> {
+    pub(crate) fn bytes(&self, field: &FieldPointer) -> Result<Option<Vec<u8>>, ToolError> {
         let Some(mut source) = self.capture(field) else {
             return Ok(None);
         };
@@ -198,7 +204,7 @@ impl Saved {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub(crate) struct ScriptPresentation {
     #[serde(default)]
-    pub fields: BTreeSet<String>,
+    pub fields: BTreeSet<FieldPointer>,
 }
 
 impl ScriptPresentation {
@@ -215,7 +221,7 @@ impl ScriptPresentation {
 pub struct OutputArgs {
     pub job: JobId,
     /// JSON Pointer in saved content, e.g. /result/stdout, /result/content, /result/console.
-    pub field: Option<String>,
+    pub field: Option<FieldPointer>,
     /// One-based first source line; use returned next_start to continue.
     #[schemars(range(min = 1), extend("default" = 1))]
     pub start: Option<usize>,
@@ -230,9 +236,6 @@ pub struct OutputArgs {
     /// Zero-based UTF-8 byte offset within the starting line; use returned next_offset to continue.
     #[schemars(range(min = 0), extend("default" = 0))]
     pub offset: Option<usize>,
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub(crate) cancellation: Option<super::CancellationToken>,
 }
 
 impl OutputArgs {
@@ -245,22 +248,16 @@ impl OutputArgs {
             pattern: None,
             context: None,
             offset: None,
-            cancellation: None,
         }
     }
 }
 #[derive(Clone)]
 struct Selection {
-    field: String,
+    field: FieldPointer,
     matcher: Option<std::sync::Arc<grep_regex::RegexMatcher>>,
     context: usize,
     start: usize,
     offset: usize,
-}
-
-/// The JSON Pointer of object member `key` under `field`.
-fn property_field(field: &str, key: &str) -> String {
-    format!("{field}/{}", key.replace('~', "~0").replace('/', "~1"))
 }
 
 /// Run blocking output work off the async workers.
@@ -268,17 +265,18 @@ pub(super) async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> Result<T, ToolError> + Send + 'static,
 ) -> Result<T, ToolError> {
     let joined = tokio::task::spawn_blocking(work).await;
-    joined.map_err(|error| ToolError::Failed(error.to_string()))?
+    joined.map_err(ToolError::failed)?
 }
 
-/// Persist a compact document whose referenced and large strings live in captures.
-/// `referenced` names completed captures the document installs; other strings over
+/// Persist a compact product whose referenced and large strings live in captures.
+/// `referenced` names completed captures the result installs; other strings over
 /// 4 KiB are offloaded into new text captures, unless an unreferenced raw capture
 /// already owns that pointer.
 fn save_document(
     output: &Output,
-    document: &Value,
-    referenced: &BTreeSet<String>,
+    result: Option<Value>,
+    captures_complete: bool,
+    referenced: &BTreeSet<FieldPointer>,
 ) -> Result<(), ToolError> {
     let registered = output
         .db
@@ -287,13 +285,14 @@ fn save_document(
         .into_iter()
         .map(|capture| (capture.pointer, capture.id))
         .collect::<BTreeMap<_, _>>();
-    let mut document = document.clone();
+    let has_result = result.is_some();
+    let mut document = json!({"result": result});
     let mut fields = Vec::new();
     fn visit(
         output: &Output,
-        registered: &BTreeMap<String, i64>,
-        referenced: &BTreeSet<String>,
-        field: &str,
+        registered: &BTreeMap<FieldPointer, i64>,
+        referenced: &BTreeSet<FieldPointer>,
+        field: &FieldPointer,
         value: &mut Value,
         fields: &mut Vec<i64>,
     ) -> Result<(), ToolError> {
@@ -320,13 +319,13 @@ fn save_document(
             }
             Value::Object(map) => {
                 for (key, value) in map {
-                    let child = property_field(field, key);
+                    let child = field.property(key);
                     visit(output, registered, referenced, &child, value, fields)?;
                 }
             }
             Value::Array(items) => {
                 for (index, value) in items.iter_mut().enumerate() {
-                    let child = format!("{field}/{index}");
+                    let child = field.index(index);
                     visit(output, registered, referenced, &child, value, fields)?;
                 }
             }
@@ -338,15 +337,19 @@ fn save_document(
         output,
         &registered,
         referenced,
-        "",
+        &FieldPointer::root(),
         &mut document,
         &mut fields,
     )?;
+    let result = has_result
+        .then(|| serde_json::to_string(&document["result"]))
+        .transpose()?;
     output
         .db
         .save_output(
             output.job.get(),
-            &serde_json::to_string(&document)?,
+            result.as_deref(),
+            captures_complete,
             &fields,
         )
         .map_err(database)
@@ -360,18 +363,18 @@ fn hydrate(saved: &Saved, mut value: Value) -> Result<Value, ToolError> {
     Ok(value)
 }
 
-fn hydrate_field(saved: &Saved, value: &mut Value, field: &str) -> Result<(), ToolError> {
+fn hydrate_field(saved: &Saved, value: &mut Value, field: &FieldPointer) -> Result<(), ToolError> {
     let target = value
-        .pointer_mut(field)
-        .ok_or_else(|| ToolError::Failed("invalid saved output field".into()))?;
+        .pointer_mut(field.as_str())
+        .ok_or_else(|| ToolError::failed("invalid saved output field"))?;
     load_field(saved, target, field)
 }
 
 /// Replace a stored field's placeholder with its bytes.
-fn load_field(saved: &Saved, target: &mut Value, field: &str) -> Result<(), ToolError> {
+fn load_field(saved: &Saved, target: &mut Value, field: &FieldPointer) -> Result<(), ToolError> {
     let bytes = saved
         .bytes(field)?
-        .ok_or_else(|| ToolError::Failed("saved output field is missing".into()))?;
+        .ok_or_else(|| ToolError::failed("saved output field is missing"))?;
     *target = if target.is_string() {
         Value::String(String::from_utf8_lossy(&bytes).into_owned())
     } else {
@@ -382,13 +385,13 @@ fn load_field(saved: &Saved, target: &mut Value, field: &str) -> Result<(), Tool
 
 fn render(
     saved: &Saved,
-    field: &str,
+    field: &FieldPointer,
     value: &Value,
     out: &mut impl Write,
     cancellation: &super::CancellationToken,
 ) -> Result<(), ToolError> {
     if cancellation.is_cancelled() {
-        return Err(ToolError::Cancelled);
+        return Err(ToolError::cancelled());
     }
     if let Some(mut source) = saved.stored(field) {
         if !value.is_string() {
@@ -400,7 +403,7 @@ fn render(
         // Escape a stored string incrementally rather than hydrating it.
         loop {
             if cancellation.is_cancelled() {
-                return Err(ToolError::Cancelled);
+                return Err(ToolError::cancelled());
             }
             let bytes = input.fill_buf()?;
             if bytes.is_empty() {
@@ -429,7 +432,7 @@ fn render(
                 }
                 serde_json::to_writer(&mut *out, key)?;
                 out.write_all(b": ")?;
-                render(saved, &property_field(field, key), value, out, cancellation)?;
+                render(saved, &field.property(key), value, out, cancellation)?;
             }
             out.write_all(b"\n}")?;
         }
@@ -439,7 +442,7 @@ fn render(
                 if index > 0 {
                     out.write_all(b",\n")?;
                 }
-                render(saved, &format!("{field}/{index}"), value, out, cancellation)?;
+                render(saved, &field.index(index), value, out, cancellation)?;
             }
             out.write_all(b"\n]")?;
         }
@@ -494,6 +497,7 @@ impl JobManager {
     ) -> Result<Value, ToolError> {
         self.present_output_with(
             args,
+            super::CancellationToken::new(),
             capabilities,
             OutputOptions::Model {
                 presentation: crate::job::OutputPresentation::Full,
@@ -509,9 +513,10 @@ impl JobManager {
     pub async fn inspect_output(
         &self,
         args: OutputArgs,
+        cancellation: super::CancellationToken,
         capabilities: &CapabilitySet,
     ) -> Result<Value, ToolError> {
-        self.present_output_with(args, capabilities, OutputOptions::HOST)
+        self.present_output_with(args, cancellation, capabilities, OutputOptions::HOST)
             .await
             .map(PresentedOutput::into_view)
     }
@@ -522,22 +527,22 @@ impl JobManager {
         let terminal = self
             .metadata(job)
             .await
-            .map_err(|error| ToolError::Failed(error.to_string()))?
+            .map_err(ToolError::failed)?
             .state
             .is_terminal();
         let output = self.output(job);
         blocking(move || {
-            fn visit(value: &Value, pointer: String, paths: &mut Vec<String>) {
+            fn visit(value: &Value, pointer: &FieldPointer, paths: &mut Vec<FieldPointer>) {
                 paths.push(pointer.clone());
                 match value {
                     Value::Object(object) => {
                         for (key, value) in object {
-                            visit(value, property_field(&pointer, key), paths);
+                            visit(value, &pointer.property(key), paths);
                         }
                     }
                     Value::Array(array) => {
                         for (index, value) in array.iter().enumerate() {
-                            visit(value, format!("{pointer}/{index}"), paths);
+                            visit(value, &pointer.index(index), paths);
                         }
                     }
                     _ => {}
@@ -545,19 +550,20 @@ impl JobManager {
             }
             let mut paths = Vec::new();
             let saved = Saved::load(&output)?;
-            if terminal && let Some(mut document) = saved.document.clone() {
+            if terminal && let Some(product) = &saved.product {
+                let mut document = product.document();
                 // Containers have selectable descendants; large text captures
                 // do not need to be loaded merely to enumerate their pointers.
                 for field in &saved.fields {
                     if document
-                        .pointer(field)
+                        .pointer(field.as_str())
                         .is_some_and(|value| value.is_object() || value.is_array())
                     {
                         hydrate_field(&saved, &mut document, field)?;
                     }
                 }
                 if let Some(result) = document.get("result") {
-                    visit(result, "/result".into(), &mut paths);
+                    visit(result, &FieldPointer::result(), &mut paths);
                 }
             }
             for capture in captures::available_captures(&saved, terminal) {
@@ -565,7 +571,7 @@ impl JobManager {
                     paths.push(capture.field);
                 }
             }
-            Ok(paths)
+            Ok(paths.into_iter().map(String::from).collect())
         })
         .await
     }
@@ -577,21 +583,27 @@ impl JobManager {
     pub async fn inspect_output_with_captures(
         &self,
         args: OutputArgs,
+        cancellation: super::CancellationToken,
         capabilities: &CapabilitySet,
     ) -> Result<PresentedOutput, ToolError> {
         use futures_util::{StreamExt, stream};
 
         let mut output = self
-            .present_output_with(args.clone(), capabilities, OutputOptions::HOST)
+            .present_output_with(
+                args.clone(),
+                cancellation.clone(),
+                capabilities,
+                OutputOptions::HOST,
+            )
             .await?;
         let mut pages = stream::iter(std::mem::take(&mut output.capture_targets))
             .map(|(index, field)| {
                 let mut query = OutputArgs::new(args.job);
                 query.field = Some(field);
-                query.cancellation = args.cancellation.clone();
+                let cancellation = cancellation.clone();
                 async move {
                     let page = self
-                        .present_output_with(query, capabilities, OutputOptions::HOST)
+                        .present_output_with(query, cancellation, capabilities, OutputOptions::HOST)
                         .await;
                     (index, page)
                 }
@@ -608,6 +620,7 @@ impl JobManager {
     pub(crate) async fn present_output_with<'a>(
         &self,
         args: OutputArgs,
+        cancellation: super::CancellationToken,
         viewer: impl Into<DiagnosticViewer<'a>>,
         options: OutputOptions,
     ) -> Result<PresentedOutput, ToolError> {
@@ -618,29 +631,22 @@ impl JobManager {
         };
         let limit = args.limit.unwrap_or(100);
         if !(1..=1000).contains(&limit) || args.start == Some(0) || args.context.unwrap_or(0) > 20 {
-            return Err(ToolError::InvalidArguments(
-                "limit must be 1-1000, start positive, and context 0-20".into(),
+            return Err(ToolError::invalid_arguments(
+                "limit must be 1-1000, start positive, and context 0-20",
             ));
         }
         if args.context.unwrap_or(0) > 0 && args.pattern.is_none() {
-            return Err(ToolError::InvalidArguments(
-                "context requires pattern".into(),
-            ));
+            return Err(ToolError::invalid_arguments("context requires pattern"));
         }
         let output_selection = args.selection();
         let explicit = output_selection == OutputSelection::Explicit;
         let mut selection = Selection {
-            field: args.field.clone().unwrap_or_else(|| "/result".into()),
+            field: args.field.clone().unwrap_or_else(FieldPointer::result),
             matcher: None,
             context: args.context.unwrap_or(0),
             start: args.start.unwrap_or(1),
             offset: args.offset.unwrap_or(0),
         };
-        if !selection.field.is_empty() && !selection.field.starts_with('/') {
-            return Err(ToolError::InvalidArguments(
-                "field must be a JSON Pointer".into(),
-            ));
-        }
         // Validate the pattern even when no output exists yet.
         if let Some(pattern) = &args.pattern {
             selection.matcher = Some(std::sync::Arc::new(
@@ -651,23 +657,26 @@ impl JobManager {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs
                 .get(&args.job)
-                .ok_or_else(|| ToolError::Failed(format!("unknown job {}", args.job)))?;
+                .ok_or_else(|| ToolError::failed(format!("unknown job {}", args.job)))?;
             (
                 entry.envelope(args.job),
                 entry.output_schema.clone().unwrap_or(Value::Bool(true)),
                 // A background child's reply arrived as an event; a foreground
                 // child's is its result.
-                entry.last_agent_message.filter(|_| {
-                    !explicit
-                        && presentation == OutputPresentation::Automatic
-                        && entry.role == JobRole::Agent
-                        && entry.state == JobState::Completed
-                        && views::effectively_background(&jobs, args.job)
-                }),
-                if output_selection == OutputSelection::WholeWithImages {
-                    entry.images.clone()
-                } else {
-                    Vec::new()
+                entry
+                    .child()
+                    .and_then(|child| child.last_message)
+                    .filter(|_| {
+                        !explicit
+                            && presentation == OutputPresentation::Automatic
+                            && entry.end() == Some(JobEnd::Completed)
+                            && views::effectively_background(&jobs, args.job)
+                    }),
+                match entry.finished() {
+                    Some(finished) if output_selection == OutputSelection::WholeWithImages => {
+                        finished.images.clone()
+                    }
+                    _ => Vec::new(),
                 },
             )
         };
@@ -676,20 +685,18 @@ impl JobManager {
             let mut view = envelope.metadata_view(viewer);
             view.meta.as_mut().expect("metadata view").last_message = last_message;
             if acknowledge {
-                self.claim(args.job)
-                    .await
-                    .map_err(|error| ToolError::Failed(error.to_string()))?;
+                self.claim(args.job).await.map_err(ToolError::failed)?;
             }
             return Ok(PresentedOutput {
                 state: envelope.state,
-                view: view.into_value(),
+                view,
                 images,
                 capture_targets: Vec::new(),
             });
         }
         let terminal = envelope.state.is_terminal();
         let question = envelope.state == JobState::WaitingInput;
-        let live_question = envelope.output.take();
+        let live_question = envelope.question.take();
         let mut view = if !acknowledge || explicit || presentation == OutputPresentation::Full {
             envelope.metadata_view(viewer)
         } else {
@@ -698,25 +705,17 @@ impl JobManager {
         let mut annotations = views::Presentation::default();
         let output = self.output(args.job);
         let mut saved = blocking(move || Saved::load(&output)).await?;
-        saved.present_diagnostics(
-            envelope.diagnostic.as_ref(),
-            envelope.output_diagnostic.as_ref(),
-            viewer,
-        )?;
+        saved.present_diagnostics(envelope.output_diagnostic.as_ref(), viewer)?;
         let saved = std::sync::Arc::new(saved);
         let captures = captures::available_captures(&saved, terminal);
         let incomplete_capture = terminal
             && captures.iter().any(|capture| {
                 !capture.complete
                     && (!explicit
-                        || selection.field.is_empty()
                         || capture.field == selection.field
-                        || capture
-                            .field
-                            .strip_prefix(&selection.field)
-                            .is_some_and(|suffix| suffix.starts_with('/')))
+                        || selection.field.contains(&capture.field))
             });
-        let structured = !explicit && terminal && saved.document.is_some();
+        let structured = !explicit && terminal && saved.product.is_some();
         let mut presented_question = false;
         let mut question_page = None;
         if structured {
@@ -724,7 +723,7 @@ impl JobManager {
             let script_presentation =
                 blocking(move || ScriptPresentation::load(&presentation_output)).await?;
             let projected = saved.clone();
-            let cancellation = args.cancellation.clone().unwrap_or_default();
+            let cancellation = cancellation.clone();
             let projected = blocking(move || {
                 truncation::project(
                     &projected,
@@ -737,9 +736,8 @@ impl JobManager {
             view.result = projected.result;
             annotations.truncated = projected.truncated;
             annotations.notice = projected.notice;
-            // A terminal document may contain only an error/capture inventory.
-            // Result presence, not document presence or non-nullness, establishes
-            // availability (an explicitly stored null is still a real result).
+            // A terminal product may hold no result at all, while an explicitly
+            // stored null is still a real result.
             view.has_result = saved.has_result();
         } else if question && let Some(value) = live_question {
             if !explicit {
@@ -749,7 +747,7 @@ impl JobManager {
                 let bytes = serde_json::to_vec_pretty(&value)?;
                 let key =
                     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(Sha256::digest(&bytes));
-                let field = format!("/questions/{key}");
+                let field = questions().property(&key);
                 if args.field.is_none() {
                     selection.field = field.clone();
                 }
@@ -760,20 +758,20 @@ impl JobManager {
             }
         }
         if !structured && annotations.question.is_none() {
-            if !explicit && !question && saved.document.is_some() {
-                selection.field = String::new();
+            if !explicit && !question && saved.product.is_some() {
+                selection.field = FieldPointer::root();
             }
             let paged = saved.clone();
             let c = selection.clone();
-            let cancellation = args.cancellation.clone().unwrap_or_default();
+            let cancellation = cancellation.clone();
             // A whole-result query always resolves to "/result" or "" here.
             let unavailable =
-                !terminal && !question && (c.field == "/result" || c.field.is_empty());
+                !terminal && !question && (c.field == FieldPointer::result() || c.field.is_root());
             let page = if unavailable {
                 reader::empty(&c, None, false)
             } else {
                 blocking(move || {
-                    let closed = terminal || c.field.starts_with("/questions/");
+                    let closed = terminal || questions().contains(&c.field);
                     let source = match question_page {
                         Some(bytes) => Some(Source::Memory(std::io::Cursor::new(bytes))),
                         None => field_source(&paged, &c.field, &cancellation)?,
@@ -782,15 +780,13 @@ impl JobManager {
                 })
                 .await?
             };
-            if terminal {
-                let complete = saved
-                    .document
+            if terminal
+                && saved
+                    .product
                     .as_ref()
-                    .and_then(|document| document.get("capture_complete"))
-                    .and_then(Value::as_bool);
-                if complete == Some(false) {
-                    annotations.notice = Some("Output incomplete.".into());
-                }
+                    .is_some_and(|product| !product.captures_complete)
+            {
+                annotations.notice = Some("Output incomplete.".into());
             }
             annotations.preview = Some(page);
         }
@@ -798,11 +794,9 @@ impl JobManager {
             annotations.notice = Some("Output incomplete.".into());
         }
         if acknowledge
-            && ((terminal && !selection.field.starts_with("/questions/")) || presented_question)
+            && ((terminal && !questions().contains(&selection.field)) || presented_question)
         {
-            self.claim(args.job)
-                .await
-                .map_err(|e| ToolError::Failed(e.to_string()))?;
+            self.claim(args.job).await.map_err(ToolError::failed)?;
         }
         // An unavailable result gets a public null placeholder, but an explicit
         // payload null remains authoritative. Hydration targets come from
@@ -815,9 +809,10 @@ impl JobManager {
             .collect();
         annotations.captures = captures;
         view.presentation = annotations.into_option();
-        let view = view.into_value();
+        let value = serde_json::to_value(&view)?;
         capture_targets.retain(|(_, field)| {
-            view.pointer(field).is_none() || (field == "/result" && view["has_result"] == false)
+            value.pointer(field.as_str()).is_none()
+                || (*field == FieldPointer::result() && !view.has_result)
         });
         Ok(PresentedOutput {
             state: envelope.state,
@@ -839,13 +834,13 @@ impl JobManager {
             let saved = Saved::load(&output)?;
             let has_result = saved.has_result();
             saved
-                .document
-                .clone()
-                .map(|document| hydrate(&saved, document).map(|value| (has_result, value)))
+                .product
+                .as_ref()
+                .map(|product| hydrate(&saved, product.document()).map(|value| (has_result, value)))
                 .transpose()
         })
         .await
-        .map_err(|e| JobError::Internal(e.to_string()))?;
+        .map_err(|error| JobError::Output(Box::new(error)))?;
         if let Some((has_result, mut value)) = value {
             envelope.output = if has_result {
                 value.get_mut("result").map(Value::take)
@@ -866,38 +861,35 @@ impl JobManager {
     }
 }
 
+/// The pages a waiting job's question batches are read from.
+fn questions() -> FieldPointer {
+    FieldPointer::root().property("questions")
+}
+
 /// The pageable bytes of `field`: a registered capture, or a rendering of the value
 /// the saved document holds there. `None` when neither exists yet.
 fn field_source(
     saved: &Saved,
-    field: &str,
+    field: &FieldPointer,
     cancellation: &super::CancellationToken,
 ) -> Result<Option<Source>, ToolError> {
     if let Some(source) = saved.capture(field) {
         return Ok(Some(source));
     }
-    let Some(mut document) = saved.document.clone() else {
+    let Some(product) = &saved.product else {
         return Ok(None);
     };
-    if document.pointer(field).is_none() {
+    let mut document = product.document();
+    if document.pointer(field.as_str()).is_none() {
         // Stored containers hide their descendants in the compact document.
         // Only load the selected ancestor, not unrelated large output fields.
-        if let Some(ancestor) = saved.fields.iter().find(|stored| {
-            field
-                .strip_prefix(stored.as_str())
-                .is_some_and(|suffix| suffix.starts_with('/'))
-        }) {
+        if let Some(ancestor) = saved.fields.iter().find(|stored| stored.contains(field)) {
             hydrate_field(saved, &mut document, ancestor)?;
         }
     }
-    if field.is_empty() {
-        // Whole-output pages contain the public document, not internal capture metadata.
-        let output = document.as_object_mut().expect("saved output document");
-        output.remove("capture_complete");
-    }
     let value = document
-        .pointer(field)
-        .ok_or_else(|| ToolError::InvalidArguments("field does not exist in this result".into()))?;
+        .pointer(field.as_str())
+        .ok_or_else(|| ToolError::invalid_arguments("field does not exist in this result"))?;
     materialize_field(saved, field, value, cancellation).map(Some)
 }
 
@@ -905,7 +897,7 @@ fn field_source(
 // pagination positions.
 fn materialize_field(
     saved: &Saved,
-    field: &str,
+    field: &FieldPointer,
     value: &Value,
     cancellation: &super::CancellationToken,
 ) -> Result<Source, ToolError> {
@@ -920,12 +912,7 @@ fn materialize_field(
     };
     // Values enclosing stored fields need disk-backed rendering. Reuse a saved
     // rendering only when its contents are independent of the reader.
-    let encloses_stored = saved.fields.iter().any(|stored| {
-        field.is_empty()
-            || stored
-                .strip_prefix(field)
-                .is_some_and(|suffix| suffix.starts_with('/'))
-    });
+    let encloses_stored = saved.fields.iter().any(|stored| field.contains(stored));
     let db = &saved.output.db;
     let job = saved.output.job.get();
     if encloses_stored && saved.cacheable(field) {
@@ -968,10 +955,11 @@ pub(crate) fn presentation_size(output: &Output) -> usize {
     let Ok(saved) = Saved::load(output) else {
         return PAGE_BYTES;
     };
-    let Some(document) = &saved.document else {
+    let Some(product) = &saved.product else {
         return PAGE_BYTES;
     };
-    let compact = serde_json::to_vec(document).map_or(PAGE_BYTES, |bytes| bytes.len());
+    let document = product.document();
+    let compact = serde_json::to_vec(&document).map_or(PAGE_BYTES, |bytes| bytes.len());
     saved.fields.iter().fold(compact, |total, field| {
         total.saturating_add(saved.captures.get(field).map_or(PAGE_BYTES, |capture| {
             usize::try_from(capture.bytes)
@@ -987,10 +975,11 @@ impl Output {
     /// Register `field` holding `bytes`, as an unfinished producer leaves it,
     /// replacing any capture already there.
     pub(crate) fn test_capture(&self, field: &str, kind: CaptureKind, bytes: &[u8]) {
-        if let Some(existing) = Saved::load(self).unwrap().captures.get(field) {
+        let field: FieldPointer = field.parse().unwrap();
+        if let Some(existing) = Saved::load(self).unwrap().captures.get(&field) {
             self.db.delete_capture(existing.id).unwrap();
         }
-        let mut writer = PendingCapture::create(self, field, kind).unwrap().open();
+        let mut writer = PendingCapture::create(self, &field, kind).unwrap().open();
         writer.write_all(bytes).unwrap();
         writer.flush().unwrap();
         // Keep the row: dropping a writer only deletes abandoned builtin text captures.
@@ -998,15 +987,26 @@ impl Output {
     }
 
     pub(crate) fn test_bytes(&self, field: &str) -> Option<Vec<u8>> {
-        Saved::load(self).unwrap().bytes(field).unwrap()
+        Saved::load(self)
+            .unwrap()
+            .bytes(&field.parse().unwrap())
+            .unwrap()
     }
 
-    /// The compact saved document, if the job has finished.
+    /// The compact saved product as `{"result": ...}`, if the job has finished.
     pub(crate) fn test_document(&self) -> Option<Value> {
-        Saved::load(self).unwrap().document
+        Saved::load(self)
+            .unwrap()
+            .product
+            .map(|product| product.document())
     }
 
-    pub(crate) fn test_fields(&self) -> Vec<String> {
+    pub(crate) fn test_captures_complete(&self) -> Option<bool> {
+        let saved = Saved::load(self).unwrap();
+        saved.product.map(|product| product.captures_complete)
+    }
+
+    pub(crate) fn test_fields(&self) -> Vec<FieldPointer> {
         Saved::load(self).unwrap().fields
     }
 
@@ -1018,16 +1018,15 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{JobOutcome, JobSpec, tests::runtime};
+    use crate::job::{CancellationToken, JobOutcome, JobRole, JobSpec, tests::runtime};
 
     /// A running fixture job, finished with `value` when one is given.
     pub(super) async fn fixture(value: Option<Value>) -> (tempfile::TempDir, JobManager, JobId) {
         let (root, manager, agent) = runtime().await;
         let id = manager
-            .test_lease(JobSpec::test(agent, "fixture"))
+            .test_running(JobSpec::test(agent, "fixture"))
             .await
-            .id();
-        manager.transition(id, JobState::Running).await.unwrap();
+            .into_test_id();
         if let Some(value) = value {
             manager.test_finish(id, value).await;
         }
@@ -1036,13 +1035,13 @@ mod tests {
 
     fn field_args(id: JobId, field: &str) -> OutputArgs {
         let mut args = OutputArgs::new(id);
-        args.field = Some(field.into());
+        args.field = Some(field.parse().unwrap());
         args
     }
 
     async fn host(manager: &JobManager, args: OutputArgs) -> Value {
         manager
-            .inspect_output(args, &Default::default())
+            .inspect_output(args, CancellationToken::new(), &Default::default())
             .await
             .unwrap()
     }
@@ -1052,13 +1051,11 @@ mod tests {
         let (_root, manager, agent) = runtime().await;
         let mut script = JobSpec::test(agent.clone(), "script");
         script.role = JobRole::Script;
-        let script = manager.test_create(script).await;
-        manager.transition(script, JobState::Running).await.unwrap();
+        let script = manager.test_running(script).await.into_test_id();
 
         let mut child = JobSpec::test(agent, "read");
         child.parent = Some(script);
-        let child = manager.test_create(child).await;
-        manager.transition(child, JobState::Running).await.unwrap();
+        let child = manager.test_running(child).await.into_test_id();
         manager.test_finish(child, json!({"child":"native"})).await;
 
         let returned = json!({"kind":"script-value", "child_id":child.get()});
@@ -1110,6 +1107,7 @@ mod tests {
         let whole = manager
             .present_output_with(
                 OutputArgs::new(id),
+                Default::default(),
                 &Default::default(),
                 OutputOptions::HOST,
             )
@@ -1124,7 +1122,7 @@ mod tests {
         for field in ["field", "start", "limit", "pattern", "context", "offset"] {
             let mut args = OutputArgs::new(id);
             match field {
-                "field" => args.field = Some("/result/text".into()),
+                "field" => args.field = Some("/result/text".parse().unwrap()),
                 "start" => args.start = Some(1),
                 "limit" => args.limit = Some(100),
                 "pattern" => args.pattern = Some(String::new()),
@@ -1134,7 +1132,7 @@ mod tests {
             }
             let selection = args.selection();
             let product = manager
-                .inspect_output_with_captures(args, &Default::default())
+                .inspect_output_with_captures(args, CancellationToken::new(), &Default::default())
                 .await
                 .unwrap();
             assert!(
@@ -1218,8 +1216,8 @@ mod tests {
             for terminal in [false, true] {
                 if terminal {
                     let outcome = match outcome {
-                        "cancelled" => ToolError::Cancelled.into(),
-                        "failed" => ToolError::Failed("injected failure".into()).into(),
+                        "cancelled" => ToolError::cancelled().into(),
+                        "failed" => ToolError::failed("injected failure").into(),
                         _ => JobOutcome::Completed(crate::tool::ToolOutput::new(
                             json!({"abandoned":null}),
                         )),
@@ -1257,10 +1255,10 @@ mod tests {
             let outcome = match state {
                 JobState::Completed => JobOutcome::Completed(output.unwrap()),
                 JobState::Failed => JobOutcome::Failed {
-                    diagnostic: ToolError::Failed("failure".into()).diagnostic(),
+                    diagnostic: ToolError::failed("failure").into_facts().0,
                     output,
                 },
-                _ => ToolError::Cancelled.into(),
+                _ => ToolError::cancelled().into(),
             };
             let (_root, manager, id) = fixture(None).await;
             manager.finish(id, outcome).await.unwrap();
@@ -1283,8 +1281,7 @@ mod tests {
         spec.output_schema = Some(json!({"type":"object","properties":{
             "value":{}, "console":{"type":"string","x-skyhook-truncatable":true}
         }}));
-        let id = manager.test_create(spec).await;
-        manager.transition(id, JobState::Running).await.unwrap();
+        let id = manager.test_running(spec).await.into_test_id();
         let console = "console\n".repeat(150);
         manager
             .output(id)
@@ -1299,7 +1296,7 @@ mod tests {
         };
         assert_eq!(lines(&model(&manager, query.clone()).await), 50);
         manager
-            .finish(id, ToolError::Cancelled.into())
+            .finish(id, ToolError::cancelled().into())
             .await
             .unwrap();
         let view = model(&manager, OutputArgs::new(id)).await;
@@ -1327,7 +1324,7 @@ mod tests {
                 .unwrap();
             for field in [None, Some("/result/stdout"), Some("")] {
                 let mut query = OutputArgs::new(job);
-                query.field = field.map(str::to_owned);
+                query.field = field.map(|field| field.parse().unwrap());
                 let view = model(&manager, query).await;
                 assert!(!view.to_string().contains("capture_complete"));
                 if complete {
@@ -1337,6 +1334,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A producer can offload the diagnostic slot itself, not only an ancestor.
+    /// Presenting the diagnostic replaces that stored field too, so a whole-result
+    /// read never chases a reference to a capture that no longer exists.
+    #[tokio::test]
+    async fn presented_diagnostic_replaces_an_offloaded_slot() {
+        let message = "m".repeat(5000);
+        let (_root, manager, id) = fixture(Some(json!({"error":{"message": message}}))).await;
+        let output = manager.output(id);
+        let slot: FieldPointer = "/result/error/message".parse().unwrap();
+        assert_eq!(output.test_fields(), [slot]);
+        let mut saved = Saved::load(&output).unwrap();
+        let diagnostic = ToolError::failed("boom").diagnostic();
+        let capabilities = CapabilitySet::default();
+        let viewer = DiagnosticViewer::from(&capabilities);
+        saved
+            .present_diagnostics(Some(&diagnostic), viewer)
+            .unwrap();
+        assert!(saved.fields.is_empty());
+        let cancellation = CancellationToken::default();
+        let root = FieldPointer::root();
+        let mut source = field_source(&saved, &root, &cancellation).unwrap().unwrap();
+        let mut whole = String::new();
+        source.read_to_string(&mut whole).unwrap();
+        assert!(whole.contains("boom") && !whole.contains("mmmm"), "{whole}");
     }
 
     #[tokio::test]
@@ -1363,10 +1386,11 @@ mod tests {
         // cache reservation. Its continuations must match the shared rendering.
         let output = manager.output(id);
         let mut saved = Saved::load(&output).unwrap();
-        let cancellation = super::super::CancellationToken::default();
-        let pending = PendingCapture::rendering(&output, "").unwrap();
+        let cancellation = CancellationToken::default();
+        let root = FieldPointer::root();
+        let pending = PendingCapture::rendering(&output, &root).unwrap();
         let mut selection = Selection {
-            field: String::new(),
+            field: root.clone(),
             matcher: None,
             context: 0,
             start: 1,
@@ -1374,7 +1398,7 @@ mod tests {
         };
         let mut pages = Vec::new();
         for _ in 0..2 {
-            let mut source = field_source(&saved, "", &cancellation).unwrap().unwrap();
+            let mut source = field_source(&saved, &root, &cancellation).unwrap().unwrap();
             assert!(matches!(&source, Source::Temporary(_)));
             // Projection reads a prefix before indexing, unlike explicit pages.
             let mut first = [0];
@@ -1388,7 +1412,7 @@ mod tests {
         assert!(selection.offset > 0);
         drop(pending);
         for (selection, expected) in pages {
-            let source = field_source(&saved, "", &cancellation).unwrap().unwrap();
+            let source = field_source(&saved, &root, &cancellation).unwrap().unwrap();
             assert!(matches!(&source, Source::Capture(_)));
             assert_eq!(
                 reader::page(Some(source), &selection, 100, true, &cancellation).unwrap(),
@@ -1398,7 +1422,9 @@ mod tests {
 
         // Presented diagnostics bypass even a finished shared rendering. Keep
         // paging/privacy coverage here without loading a whole rendered document.
-        saved.diagnostic_fields.insert("/error".into());
+        saved
+            .diagnostic_fields
+            .insert("/result/error/message".parse().unwrap());
         selection.start = 1;
         selection.offset = 0;
         selection.matcher = Some(std::sync::Arc::new(
@@ -1409,8 +1435,9 @@ mod tests {
             "restricted viewer-rendering",
             "privileged viewer-rendering",
         ] {
-            saved.document.as_mut().unwrap()["error"] = json!(message);
-            let source = field_source(&saved, "", &cancellation).unwrap().unwrap();
+            let result = saved.product.as_mut().unwrap().result.as_mut().unwrap();
+            result["error"] = json!({"message": message});
+            let source = field_source(&saved, &root, &cancellation).unwrap().unwrap();
             assert!(matches!(&source, Source::Temporary(_)));
             let page = reader::page(Some(source), &selection, 100, true, &cancellation).unwrap();
             assert_eq!(page.lines.len(), 1);
@@ -1460,11 +1487,11 @@ mod tests {
     async fn hydrated(manager: &JobManager, job: JobId) -> PresentedOutput {
         let args = OutputArgs::new(job);
         let output = manager
-            .inspect_output_with_captures(args, &Default::default())
+            .inspect_output_with_captures(args, CancellationToken::new(), &Default::default())
             .await
             .unwrap();
         assert!(
-            jsonschema::is_valid(&crate::job::presented_job_schema(false), output.view()),
+            jsonschema::is_valid(&crate::job::presented_job_schema(false), &output.view()),
             "{}",
             output.view()
         );
@@ -1492,9 +1519,8 @@ mod tests {
             }
             let output = hydrated(&manager, job).await;
             assert_eq!(output.state.is_terminal(), terminal);
-            let captures = output.view()["presentation"]["captures"]
-                .as_array()
-                .unwrap();
+            let view = output.view();
+            let captures = view["presentation"]["captures"].as_array().unwrap();
             assert_eq!(captures.len(), fields.len());
             for (capture, field) in captures.iter().zip(&fields) {
                 assert_eq!(
@@ -1590,13 +1616,20 @@ mod tests {
         let mut invalid = OutputArgs::new(job);
         invalid.start = Some(0);
         let result = manager
-            .inspect_output_with_captures(invalid, &Default::default())
+            .inspect_output_with_captures(invalid, CancellationToken::new(), &Default::default())
             .await;
-        assert!(matches!(result, Err(ToolError::InvalidArguments(_))));
+        assert!(matches!(
+            result,
+            Err(error) if matches!(error.diagnostic().cause, crate::tool::diagnostic::Cause::InvalidArguments(_))
+        ));
         let unknown = OutputArgs::new(JobId::new(job.get() + 100).unwrap());
         assert!(
             manager
-                .inspect_output_with_captures(unknown, &Default::default())
+                .inspect_output_with_captures(
+                    unknown,
+                    CancellationToken::new(),
+                    &Default::default()
+                )
                 .await
                 .is_err()
         );

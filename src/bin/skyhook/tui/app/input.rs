@@ -93,6 +93,10 @@ impl App {
         }
         if matches!(target, InputTarget::Prompt) {
             let options = self.prompt_options();
+            let takes_text = self
+                .prompts
+                .front()
+                .is_some_and(|prompt| prompt.takes_text());
             let multiple = self.multiple_questions();
             let editing_question = multiple
                 && matches!(
@@ -143,6 +147,8 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.answer(),
+                // A choice-only prompt has no text to edit.
+                _ if !takes_text => {}
                 _ => {
                     if editing_question
                         && matches!(
@@ -568,7 +574,11 @@ mod tests {
         attach(&mut app, session).await;
         let entries = (0..12).map(|index| {
             let text = format!("skyhook\nMessage {index}");
-            model::Entry::new(model::EntryKey::Record(index), text, model::Surface::Agent)
+            model::Entry::new(
+                model::EntryKey::UnsavedStatus(index),
+                text,
+                model::Surface::Agent,
+            )
         });
         app.install_entries(entries.collect());
         app.content_dirty = false;

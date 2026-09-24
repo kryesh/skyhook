@@ -1,9 +1,9 @@
 //! Private shim control services. These messages never enter tool output or session events.
 use super::{
-    SensitivePrompt, SensitivePromptError, SensitivePromptFuture, SensitivePromptHandler,
+    PromptAnswer, SensitivePrompt, SensitivePromptError, SensitivePromptFuture,
+    SensitivePromptHandler,
     backend::ProcessEnvironment,
     flow::{CHUNK_BYTES, Credits, WINDOW},
-    prompt::PromptAnswer,
     protocol::{PromptId, Request, RequestId, Response, spawn_owned_write, write_frame},
 };
 use std::{
@@ -83,10 +83,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> SensitivePromptHandler for ForwardP
                 registration.complete();
                 return Err(SensitivePromptError::Unavailable);
             }
-            let result = match receiver.await {
-                Ok(PromptAnswer::Accepted(value)) => Ok(value),
-                _ => Err(SensitivePromptError::Cancelled),
-            };
+            let result = receiver.await.map_err(|_| SensitivePromptError::Cancelled);
             registration.complete();
             result
         })
@@ -341,11 +338,14 @@ mod tests {
             .unwrap()
             .remove(&prompt_id)
             .unwrap()
-            .send(PromptAnswer::Accepted(crate::remote::SecretValue::new(
+            .send(PromptAnswer::Secret(crate::remote::SecretValue::new(
                 "secret".into(),
             )))
             .unwrap();
-        assert_eq!(future.await.unwrap().expose(), "secret");
+        let PromptAnswer::Secret(secret) = future.await.unwrap() else {
+            panic!("expected the forwarded secret")
+        };
+        assert_eq!(secret.expose(), "secret");
         assert!(prompts.answers.lock().unwrap().is_empty());
         // A pending cancellation task would hold the writer open and emit a frame.
         drop(prompts);

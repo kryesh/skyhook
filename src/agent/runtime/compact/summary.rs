@@ -5,6 +5,7 @@ use crate::provider::{
     ProviderContext, ProviderError,
     protocol::{LiveResponse, ModelRequest, Outcome, Step as LiveStep, Usage},
 };
+use crate::session::RequestSeq;
 use futures_util::StreamExt;
 
 impl SessionRuntime {
@@ -13,7 +14,7 @@ impl SessionRuntime {
         turn: &TurnContext<'_>,
         provider: &mut dyn ProviderContext,
         request: ModelRequest,
-        request_sequence: u64,
+        request_sequence: RequestSeq,
         model_attempt: &mut u64,
     ) -> Result<(compaction::Continuation, Usage), HarnessError> {
         let mut transient_attempt = 0u64;
@@ -22,13 +23,14 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             *model_attempt = model_attempt.saturating_add(1);
+            let attempt = crate::session::AttemptRef {
+                request: request_sequence,
+                attempt: *model_attempt,
+            };
             self.store
                 .append(
                     turn.agent.clone(),
-                    crate::session::SessionEvent::ModelAttemptStarted {
-                        request: request_sequence,
-                        attempt: *model_attempt,
-                    },
+                    crate::session::SessionEvent::ModelAttemptStarted(attempt),
                 )
                 .await?;
             match self
@@ -38,12 +40,10 @@ impl SessionRuntime {
                 // The summary request stays frozen too, and transient failures do not
                 // consume the separate validation budget in `compact_history`.
                 Err(HarnessError::Provider(error)) => {
-                    let attempt = (*model_attempt, &mut transient_attempt);
                     let recovered = self
                         .recover_model_failure(
                             turn,
-                            request_sequence,
-                            attempt,
+                            (attempt, &mut transient_attempt),
                             Usage::default(),
                             error,
                         )
@@ -62,7 +62,7 @@ impl SessionRuntime {
         turn: &TurnContext<'_>,
         provider: &mut dyn ProviderContext,
         request: ModelRequest,
-        request_sequence: u64,
+        request_sequence: RequestSeq,
     ) -> Result<(compaction::Continuation, Usage), HarnessError> {
         let agent = turn.agent;
         let mut stream = provider.invoke(request);
@@ -120,7 +120,10 @@ impl SessionRuntime {
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
-    use crate::{agent::runtime::HarnessError, provider::protocol::Message, session::SessionEvent};
+    use crate::{
+        agent::runtime::HarnessError,
+        session::{Message, SessionEvent},
+    };
     use std::{sync::atomic::Ordering, time::Duration};
     use tokio_util::sync::CancellationToken;
 
@@ -201,7 +204,7 @@ mod tests {
         let failures = &fixture.provider.summary_stream_failures;
         failures.store(5, Ordering::SeqCst);
         let root = &fixture.session.root;
-        let before = crate::session::project_history(&fixture.records().await, root).unwrap();
+        let before = crate::session::project_history(&fixture.records().await, root);
         let cancellation = CancellationToken::new();
         let mut events = fixture.session.runtime.events.observe().updates;
         let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
@@ -221,7 +224,7 @@ mod tests {
         assert!(matches!(result, Err(HarnessError::Interrupted)));
         assert_eq!(failures.load(Ordering::SeqCst), 1);
         let records = fixture.records().await;
-        let found = crate::session::project_history(&records, root).unwrap();
+        let found = crate::session::project_history(&records, root);
         assert_eq!(found, before);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
         fixture.assert_no_tool_execution().await;
@@ -264,8 +267,8 @@ mod tests {
             let mut requested = records.iter().rev();
             let requested =
                 requested.find(|r| matches!(r.event, SessionEvent::ModelRequested { .. }));
-            let requested = requested.unwrap().sequence;
-            let observed_events = events!(&records, SessionEvent::Usage { request: Some(request), usage } if *request == requested => *usage);
+            let requested = requested.unwrap().sequence.request();
+            let observed_events = events!(&records, SessionEvent::Usage { request, usage } if *request == requested => *usage);
             assert_eq!(observed_events, vec![observed]);
             assert_eq!(fixture.session.usage().await, observed);
             let committed = count!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(items) }

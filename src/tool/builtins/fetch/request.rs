@@ -250,7 +250,7 @@ pub(super) async fn execute(
     let response = loop {
         if context.is_cancelled() {
             return Err(FetchError::from_tool_error(
-                LocalError::Cancelled,
+                LocalError::cancelled(),
                 progress.phase,
             ));
         }

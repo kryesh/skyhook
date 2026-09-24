@@ -6,24 +6,200 @@ use serde_json::Value;
 use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, EventId, JobId},
-    job::{JobRole, JobState},
+    job::{JobEnd, JobRole, JobTransition},
     media::ImageRef,
+    named_enum::named_enum,
     provider::{
         profile::ModelProfile,
         protocol::{
-            HistoryLifetime, Message, ModelRequest, Outcome, ResponseSchema, SystemSegment,
+            CutReason, HistoryLifetime, ModelRequest, Outcome, ResponseSchema, SystemSegment,
             ToolDefinition, Usage,
         },
     },
+    session::Message,
     target::TargetDefinition,
-    tool::policy::{ApprovalGrant, Capability},
+    tool::{
+        policy::{ApprovalGrant, Capability},
+        registry::JobName,
+    },
 };
 
-#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
+named_enum! {
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
+    pub enum ModelPurpose {
+        Agent = "agent",
+        Compaction = "compaction",
+    }
+}
+
+named_enum! {
+    /// Why a completed response ended early. Refusals and aborts fail the turn
+    /// instead, so they are never journaled as a completed response.
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
+    pub enum Truncation {
+        MaxTokens = "max_tokens",
+        Incomplete = "incomplete",
+    }
+}
+
+/// How a response that completed the turn ended.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
-pub enum ModelPurpose {
-    Agent,
-    Compaction,
+pub enum CompletedOutcome {
+    Answer,
+    ToolUse,
+    Cut(Truncation),
+}
+
+/// A refusal or abort is the cut that fails the turn instead.
+impl TryFrom<Outcome> for CompletedOutcome {
+    type Error = CutReason;
+
+    fn try_from(outcome: Outcome) -> Result<Self, CutReason> {
+        Ok(match outcome {
+            Outcome::Answer => Self::Answer,
+            Outcome::ToolUse => Self::ToolUse,
+            Outcome::Cut(CutReason::MaxTokens) => Self::Cut(Truncation::MaxTokens),
+            Outcome::Cut(CutReason::Incomplete) => Self::Cut(Truncation::Incomplete),
+            Outcome::Cut(reason @ (CutReason::Refusal | CutReason::Aborted)) => return Err(reason),
+        })
+    }
+}
+
+/// A journal sequence only the store's append and the database decoder mint;
+/// everything else holds one it received from a record. This crate's own tests
+/// mint through `From<u64>`; tests elsewhere append to a store.
+macro_rules! sequence {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(
+            Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize,
+        )]
+        #[serde(transparent)]
+        pub struct $name(u64);
+
+        /// Spelled as an integer wherever a schema names it.
+        impl schemars::JsonSchema for $name {
+            fn schema_name() -> std::borrow::Cow<'static, str> {
+                u64::schema_name()
+            }
+            fn schema_id() -> std::borrow::Cow<'static, str> {
+                u64::schema_id()
+            }
+            fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+                u64::json_schema(generator)
+            }
+            fn inline_schema() -> bool {
+                true
+            }
+        }
+
+        impl $name {
+            /// The number, for storage and wire formats that carry it as one.
+            #[must_use]
+            pub const fn get(self) -> u64 {
+                self.0
+            }
+        }
+
+        #[cfg(test)]
+        impl From<u64> for $name {
+            fn from(sequence: u64) -> Self {
+                Self(sequence)
+            }
+        }
+
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
+    };
+}
+
+sequence! {
+    /// The sequence of any journal record.
+    RecordSeq
+}
+sequence! {
+    /// The sequence of a `ModelRequested` record.
+    RequestSeq
+}
+sequence! {
+    /// The sequence of a `MessageCommitted` record.
+    MessageSeq
+}
+
+impl RecordSeq {
+    pub(in crate::session) const fn new(sequence: u64) -> Self {
+        Self(sequence)
+    }
+
+    /// The sequence the next record takes.
+    #[must_use]
+    pub(in crate::session) const fn next(self) -> Self {
+        Self(self.0.saturating_add(1))
+    }
+
+    /// This record's sequence as the request it is; the caller matched the event.
+    #[must_use]
+    pub const fn request(self) -> RequestSeq {
+        RequestSeq(self.0)
+    }
+
+    /// This record's sequence as the commit it is; the caller matched the event.
+    #[must_use]
+    pub const fn message(self) -> MessageSeq {
+        MessageSeq(self.0)
+    }
+}
+
+impl From<RequestSeq> for RecordSeq {
+    fn from(sequence: RequestSeq) -> Self {
+        Self(sequence.0)
+    }
+}
+
+impl From<MessageSeq> for RecordSeq {
+    fn from(sequence: MessageSeq) -> Self {
+        Self(sequence.0)
+    }
+}
+
+/// One provider invocation of a frozen logical request: the `ModelRequested`
+/// sequence and the 1-based attempt number.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash)]
+pub struct AttemptRef {
+    pub request: RequestSeq,
+    pub attempt: u64,
+}
+
+/// How far a failed compaction round got before it failed.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionFailure {
+    BeforeRequest,
+    Requested(RequestSeq),
+    Attempted(AttemptRef),
+}
+
+impl CompactionFailure {
+    #[must_use]
+    pub fn request(self) -> Option<RequestSeq> {
+        match self {
+            Self::BeforeRequest => None,
+            Self::Requested(request) => Some(request),
+            Self::Attempted(attempt) => Some(attempt.request),
+        }
+    }
+
+    #[must_use]
+    pub fn attempt(self) -> Option<AttemptRef> {
+        match self {
+            Self::Attempted(attempt) => Some(attempt),
+            Self::BeforeRequest | Self::Requested(_) => None,
+        }
+    }
 }
 
 /// A named model profile exactly as it was applied, independent of later configuration.
@@ -36,24 +212,20 @@ pub struct ProfileSnapshot {
 /// Durable replacement of one agent's model-visible history.
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct CompactionCheckpoint {
-    /// Version of the structured continuation schema used for this checkpoint.
-    pub schema_version: u16,
-    pub previous: Option<u64>,
-    pub frontier: u64,
+    pub frontier: RecordSeq,
     pub message: Message,
     /// Reconciled owner todos, activated atomically with this history replacement.
     pub todos: Vec<crate::agent::TodoItem>,
-    pub retained: Vec<u64>,
-    pub request: u64,
-    /// The summary attempt of `request` that produced this checkpoint.
-    pub attempt: u64,
+    pub retained: Vec<MessageSeq>,
+    /// The summary attempt that produced this checkpoint.
+    pub attempt: AttemptRef,
     pub before_tokens: u64,
     pub after_tokens: u64,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ModelCallOrigin {
-    pub message: u64,
+    pub message: MessageSeq,
     pub call_id: String,
 }
 
@@ -70,6 +242,18 @@ pub struct ModelContext {
 }
 
 impl ModelContext {
+    /// A context with no system prompt, tools or response schema.
+    #[cfg(test)]
+    pub(crate) fn test(purpose: ModelPurpose, profile: ProfileSnapshot) -> Self {
+        Self {
+            purpose,
+            profile,
+            system: Vec::new(),
+            tools: Vec::new(),
+            response_schema: None,
+        }
+    }
+
     /// The history-free request these settings describe.
     #[must_use]
     pub fn template(&self) -> ModelRequest {
@@ -113,7 +297,6 @@ pub enum SessionEvent {
         targets: Vec<TargetDefinition>,
     },
     AgentStarted {
-        parent: Option<AgentId>,
         #[serde(skip_serializing_if = "Option::is_none")]
         owner_job: Option<JobId>,
         /// None for a tool-only agent without a model, such as a remote worker.
@@ -149,69 +332,54 @@ pub enum SessionEvent {
     },
     /// A provider call with exact ordered messages, independent of future state/configuration.
     ModelRequested {
-        context: u64,
-        /// Journal sequences sent as history: the agent's checkpoint, its retained
-        /// messages, then every later committed message up to the last one named.
-        history: Vec<u64>,
+        context: RecordSeq,
+        /// The compaction whose message opens the history, when the agent has one.
+        checkpoint: Option<RecordSeq>,
+        /// Committed messages sent after the checkpoint: its retained messages, then
+        /// every later committed message up to the last one named.
+        history: Vec<MessageSeq>,
         /// Request-specific messages sent after history.
         tail: Vec<Message>,
         history_lifetime: HistoryLifetime,
-        purpose: ModelPurpose,
     },
     Compaction {
         checkpoint: CompactionCheckpoint,
     },
     /// A new attempt starts for an existing frozen logical request. This resets
     /// its live output in host projections without changing model history.
-    ModelAttemptStarted {
-        request: u64,
-        attempt: u64,
-    },
+    ModelAttemptStarted(AttemptRef),
     ModelFailed {
-        request: u64,
-        attempt: u64,
+        attempt: AttemptRef,
         error: String,
         kind: ModelFailureKind,
     },
     /// An attempt ended without an outcome: cancelled, or open when the session stopped.
-    ModelAttemptInterrupted {
-        request: u64,
-        attempt: u64,
-    },
-    /// How a response that completed the turn ended. Refusals and aborts fail the
-    /// turn before this point and are recorded by `ModelFailed` instead, so the
-    /// outcome here is an answer, tool use, or a truncation.
+    ModelAttemptInterrupted(AttemptRef),
+    /// Refusals and aborts fail the turn before this point and are recorded by
+    /// `ModelFailed` instead.
     ResponseCompleted {
-        request: u64,
-        attempt: u64,
+        attempt: AttemptRef,
         /// The committed assistant message this response produced.
-        message: Option<u64>,
-        outcome: Outcome,
+        message: MessageSeq,
+        outcome: CompletedOutcome,
     },
-    /// A failed model request will be retried after a recovery delay.
+    /// The `ModelFailed` at `failure` will be retried after a recovery delay.
     /// This is host-facing status, not model-visible conversation history.
     ModelRecoveryScheduled {
-        /// Sequence of the failed `ModelRequested` event.
-        request: u64,
-        /// The next logical invocation; the failed attempt is `attempt - 1`.
-        attempt: u64,
+        failure: RecordSeq,
         /// Backoff scheduled before the next invocation.
         delay_millis: u64,
-        /// The failure that triggered this recovery.
-        error: String,
     },
     CompactionSkipped {
-        request: u64,
-        attempt: u64,
+        attempt: AttemptRef,
         reason: String,
     },
     CompactionFailed {
-        request: Option<u64>,
-        attempt: Option<u64>,
+        failure: CompactionFailure,
         error: String,
     },
     Usage {
-        request: Option<u64>,
+        request: RequestSeq,
         usage: Usage,
     },
     JobCreated {
@@ -221,14 +389,11 @@ pub enum SessionEvent {
         tool: String,
         role: JobRole,
         #[serde(skip_serializing_if = "Option::is_none")]
-        name: Option<String>,
+        name: Option<JobName>,
         arguments: Value,
         output_schema: Option<Value>,
         accepts_input: bool,
         background: bool,
-        /// Host authorization scope the job's requests are grouped under.
-        #[serde(skip_serializing_if = "Option::is_none")]
-        authorization_scope: Option<u64>,
         location: ExecutionLocation,
     },
     /// A policy approved this grant for the rest of the session.
@@ -237,15 +402,15 @@ pub enum SessionEvent {
     },
     /// The grant journaled at sequence `grant` no longer applies.
     ApprovalRevoked {
-        grant: u64,
+        grant: RecordSeq,
     },
     JobStateChanged {
         job: JobId,
-        state: JobState,
+        state: JobTransition,
     },
     JobFinished {
         job: JobId,
-        state: JobState,
+        state: JobEnd,
         #[serde(skip_serializing_if = "Option::is_none")]
         diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -262,8 +427,8 @@ pub enum SessionEvent {
     /// The child reply committed at `source` reached the owner in `notification`.
     JobMessageDelivered {
         job: JobId,
-        source: u64,
-        notification: u64,
+        source: MessageSeq,
+        notification: MessageSeq,
     },
     AgentCompleted,
     AgentInterrupted,
@@ -275,22 +440,99 @@ pub enum SessionEvent {
     },
 }
 
-/// Classification of a failed model request.
-#[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ModelFailureKind {
-    /// Transport, protocol, or validation failure.
-    #[default]
-    Error,
-    /// The model declined to answer. Deterministic for a given request, so it is
-    /// never retried automatically; only a parent agent or a human may retry it.
-    Refusal,
+named_enum! {
+    /// Classification of a failed model request.
+    #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq, Deserialize)]
+    pub enum ModelFailureKind {
+        /// Transport, protocol, or validation failure.
+        #[default]
+        Error = "error",
+        /// The model declined to answer. Deterministic for a given request, so it is
+        /// never retried automatically; only a parent agent or a human may retry it.
+        Refusal = "refusal",
+    }
+}
+
+named_enum! {
+    /// The journal's name for each event, also the entry's subtype table selector.
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
+    pub(crate) enum EntryKind {
+        SessionStarted = "session_started",
+        TitleSet = "title_set",
+        TargetsUpserted = "targets_upserted",
+        AgentStarted = "agent_started",
+        AgentCompleted = "agent_completed",
+        AgentInterrupted = "agent_interrupted",
+        AgentFailed = "agent_failed",
+        ModelChanged = "model_changed",
+        ModeChanged = "mode_changed",
+        TodosReplaced = "todos_replaced",
+        MessageCommitted = "message_committed",
+        Status = "status",
+        ModelContext = "model_context",
+        ModelRequested = "model_requested",
+        ModelAttemptStarted = "model_attempt_started",
+        ModelFailed = "model_failed",
+        ModelRecoveryScheduled = "model_recovery_scheduled",
+        ModelAttemptInterrupted = "model_attempt_interrupted",
+        ResponseCompleted = "response_completed",
+        Usage = "usage",
+        Compaction = "compaction",
+        CompactionSkipped = "compaction_skipped",
+        CompactionFailed = "compaction_failed",
+        JobCreated = "job_created",
+        JobStateChanged = "job_state_changed",
+        JobFinished = "job_finished",
+        JobClaimed = "job_claimed",
+        JobInjected = "job_injected",
+        JobMessageDelivered = "job_message_delivered",
+        ApprovalGranted = "approval_granted",
+        ApprovalRevoked = "approval_revoked",
+    }
+}
+
+impl SessionEvent {
+    pub(crate) fn kind(&self) -> EntryKind {
+        match self {
+            Self::SessionStarted { .. } => EntryKind::SessionStarted,
+            Self::TitleSet { .. } => EntryKind::TitleSet,
+            Self::TargetsUpserted { .. } => EntryKind::TargetsUpserted,
+            Self::AgentStarted { .. } => EntryKind::AgentStarted,
+            Self::TodosReplaced { .. } => EntryKind::TodosReplaced,
+            Self::ModelChanged { .. } => EntryKind::ModelChanged,
+            Self::ModeChanged { .. } => EntryKind::ModeChanged,
+            Self::MessageCommitted { .. } => EntryKind::MessageCommitted,
+            Self::Status { .. } => EntryKind::Status,
+            Self::ModelContext { .. } => EntryKind::ModelContext,
+            Self::ModelRequested { .. } => EntryKind::ModelRequested,
+            Self::Compaction { .. } => EntryKind::Compaction,
+            Self::ModelAttemptStarted { .. } => EntryKind::ModelAttemptStarted,
+            Self::ModelFailed { .. } => EntryKind::ModelFailed,
+            Self::ModelAttemptInterrupted { .. } => EntryKind::ModelAttemptInterrupted,
+            Self::ResponseCompleted { .. } => EntryKind::ResponseCompleted,
+            Self::ModelRecoveryScheduled { .. } => EntryKind::ModelRecoveryScheduled,
+            Self::CompactionSkipped { .. } => EntryKind::CompactionSkipped,
+            Self::CompactionFailed { .. } => EntryKind::CompactionFailed,
+            Self::Usage { .. } => EntryKind::Usage,
+            Self::JobCreated { .. } => EntryKind::JobCreated,
+            Self::ApprovalGranted { .. } => EntryKind::ApprovalGranted,
+            Self::ApprovalRevoked { .. } => EntryKind::ApprovalRevoked,
+            Self::JobStateChanged { .. } => EntryKind::JobStateChanged,
+            Self::JobFinished { .. } => EntryKind::JobFinished,
+            Self::JobClaimed { .. } => EntryKind::JobClaimed,
+            Self::JobInjected { .. } => EntryKind::JobInjected,
+            Self::JobMessageDelivered { .. } => EntryKind::JobMessageDelivered,
+            Self::AgentCompleted => EntryKind::AgentCompleted,
+            Self::AgentInterrupted => EntryKind::AgentInterrupted,
+            Self::AgentFailed { .. } => EntryKind::AgentFailed,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct EventRecord {
     pub id: EventId,
-    pub sequence: u64,
+    pub sequence: RecordSeq,
     pub timestamp_millis: i64,
     pub agent: AgentId,
     pub event: SessionEvent,

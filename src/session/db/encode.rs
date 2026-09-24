@@ -1,26 +1,26 @@
 //! Decompose session events into normalized rows inside the caller's transaction.
-
 use std::collections::HashMap;
 
 use libsql::Value;
 use serde::Serialize;
 
-use super::{Db, DbResult, corrupt, diagnostic::Slot, params, rejected};
+use super::{
+    Db, DbResult, JobEventKind, MessageRole, ResponseOutcome, UserPartKind, corrupt,
+    diagnostic::Slot, enum_column, params, rejected,
+};
 use crate::{
     identity::AgentId,
+    job::JobEnd,
     media::{AttachmentRef, BlobRef, ImageRef},
-    provider::protocol::{AssistantItem, CutReason, Message, Outcome, ToolResult, UserContent},
-    session::{CompactionCheckpoint, EventRecord, ModelContext, ProfileSnapshot, SessionEvent},
-    target::TargetDefinition,
+    provider::protocol::{AssistantItem, ToolResult},
+    session::{
+        AttemptRef, CompactionCheckpoint, CompletedOutcome, EntryKind, EventRecord, JobEvent,
+        Message, MessageSeq, ModelContext, ProfileSnapshot, RequestSeq, RuntimeState, SessionEvent,
+        StateJob, StateJobKind, UserPart,
+    },
+    target::{TargetDefinition, TargetName},
+    tool::policy::{ApprovalGrant, ResourceId},
 };
-
-/// The serde spelling of a unit enum variant, which the schema's CHECK constraints use.
-fn variant(value: &impl Serialize) -> DbResult<String> {
-    match serde_json::to_value(value) {
-        Ok(serde_json::Value::String(text)) => Ok(text),
-        _ => Err(corrupt("enum value has no plain text spelling")),
-    }
-}
 
 fn json(value: &impl Serialize) -> DbResult<String> {
     serde_json::to_string(value).map_err(|error| corrupt(error.to_string()))
@@ -67,7 +67,7 @@ impl Encoder {
                 for capability in capabilities {
                     db.execute(
                         "INSERT INTO session_capability (capability) VALUES (?1)",
-                        params![capability.as_str()],
+                        params![*capability],
                     )?;
                 }
             }
@@ -79,18 +79,18 @@ impl Encoder {
                 "INSERT INTO entry (seq, public_id, agent, created_millis, kind) \
                  VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
-                    record.sequence,
+                    record.sequence.get(),
                     record.id.to_bytes().to_vec(),
                     agent,
                     record.timestamp_millis,
-                    kind(&record.event)
+                    record.event.kind()
                 ],
             )
             .and_then(|_| self.subtype(db, record, agent))
             .map_err(|error| match error {
                 super::DbError::Sql(error) => rejected(format!(
                     "{} entry {}: {error}",
-                    kind(&record.event),
+                    record.event.kind(),
                     record.sequence
                 )),
                 error => error,
@@ -101,18 +101,15 @@ impl Encoder {
 
     fn start_agent(&mut self, db: &Db, record: &EventRecord) -> DbResult<()> {
         if let SessionEvent::AgentStarted {
-            parent,
             owner_job,
             available_depth,
             ..
         } = &record.event
         {
-            if record.agent.parent() != *parent {
-                return Err(rejected("agent start parent differs from its identity"));
-            }
-            let parent = parent
-                .as_ref()
-                .map(|parent| self.agent(db, parent))
+            let parent = record
+                .agent
+                .parent()
+                .map(|parent| self.agent(db, &parent))
                 .transpose()?;
             let id = db.insert(
                 "INSERT INTO agent (parent, child_index, owner_job, available_depth) \
@@ -130,7 +127,7 @@ impl Encoder {
     }
 
     fn subtype(&mut self, db: &Db, record: &EventRecord, agent: i64) -> DbResult<()> {
-        let (seq, kind) = (record.sequence, kind(&record.event));
+        let (seq, kind) = (record.sequence.get(), record.event.kind());
         match &record.event {
             SessionEvent::SessionStarted { targets, .. }
             | SessionEvent::TargetsUpserted { targets } => {
@@ -147,7 +144,7 @@ impl Encoder {
                     .as_ref()
                     .map(|profile| self.profile(db, profile))
                     .transpose()?;
-                let target = self.target(db, &location.target)?;
+                let target = self.target(db, location.target.as_str())?;
                 db.execute(
                     "INSERT INTO agent_start (entry, profile, location_target, \
                      location_workspace) VALUES (?1, ?2, ?3, ?4)",
@@ -188,26 +185,20 @@ impl Encoder {
             SessionEvent::ModelContext { context } => self.context(db, seq, context)?,
             SessionEvent::ModelRequested {
                 context,
-                history,
+                checkpoint,
+                history: sources,
                 tail,
                 history_lifetime,
-                purpose,
             } => {
-                let first_is_checkpoint = match history.first() {
-                    Some(first) => db
-                        .query_row(
-                            "SELECT 1 FROM compaction WHERE entry = ?1",
-                            params![*first],
-                            |_| Ok(()),
-                        )?
-                        .is_some(),
-                    None => false,
-                };
-                let (checkpoint, sources) = if first_is_checkpoint {
-                    (Some(history[0]), &history[1..])
-                } else {
-                    (None, &history[..])
-                };
+                let context_agent = db.query_row(
+                    "SELECT e.agent FROM model_context c JOIN entry e ON e.seq = c.entry \
+                     WHERE c.entry = ?1",
+                    params![*context],
+                    |row| Ok(row.get::<i64>(0)?),
+                )?;
+                if context_agent != Some(agent) {
+                    return Err(rejected("request context must belong to the same agent"));
+                }
                 // History is recorded as its range less the sources it left out.
                 let through = sources.last().copied();
                 let derived = db.query(
@@ -217,26 +208,19 @@ impl Encoder {
                        JOIN entry e ON e.seq = m.entry WHERE e.agent = ?2 AND m.entry <= ?3 \
                        AND m.entry > coalesce((SELECT frontier FROM compaction WHERE entry = ?1), 0)) \
                      ORDER BY part, source",
-                    params![checkpoint, agent, through],
-                    |row| Ok(row.get::<u64>(0)?),
+                    params![*checkpoint, agent, through],
+                    |row| Ok(super::decode::sequence(row.get(0)?).message()),
                 )?;
-                let sent = |source: &&u64| sources.binary_search(source).is_ok();
+                let sent = |source: &&MessageSeq| sources.binary_search(source).is_ok();
                 if !derived.iter().filter(sent).eq(sources) {
                     return Err(rejected(
                         "request history is not from the agent's projected history",
                     ));
                 }
                 db.execute(
-                    "INSERT INTO model_request (entry, context, purpose, checkpoint, \
-                     history_through, history_lifetime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        seq,
-                        *context,
-                        variant(purpose)?,
-                        checkpoint,
-                        through,
-                        variant(history_lifetime)?
-                    ],
+                    "INSERT INTO model_request (entry, context, checkpoint, history_through, \
+                     history_lifetime) VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![seq, *context, *checkpoint, through, *history_lifetime],
                 )?;
                 for source in derived.iter().filter(|source| !sent(source)) {
                     db.execute(
@@ -254,55 +238,43 @@ impl Encoder {
                 }
             }
             SessionEvent::Compaction { checkpoint } => self.compaction(db, seq, checkpoint)?,
-            SessionEvent::ModelAttemptStarted { request, attempt } => {
+            SessionEvent::ModelAttemptStarted(attempt) => {
                 db.execute(
                     "INSERT INTO model_attempt (entry, request, attempt) VALUES (?1, ?2, ?3)",
-                    params![seq, *request, *attempt],
+                    params![seq, attempt.request, attempt.attempt],
                 )?;
             }
             SessionEvent::ModelFailed {
-                request,
                 attempt,
                 error,
-                kind,
+                kind: failure,
             } => {
-                outcome(db, seq, "model_failed", *request, *attempt)?;
+                outcome(db, seq, kind, *attempt)?;
                 db.execute(
                     "INSERT INTO model_failure (entry, failure, error) VALUES (?1, ?2, ?3)",
-                    params![seq, variant(kind)?, error],
+                    params![seq, *failure, error],
                 )?;
             }
-            SessionEvent::ModelAttemptInterrupted { request, attempt } => {
-                outcome(db, seq, kind, *request, *attempt)?;
-            }
+            SessionEvent::ModelAttemptInterrupted(attempt) => outcome(db, seq, kind, *attempt)?,
             SessionEvent::ResponseCompleted {
-                request,
                 attempt,
                 message,
                 outcome: ended,
             } => {
-                outcome(db, seq, kind, *request, *attempt)?;
-                let message = message
-                    .map(|entry| {
-                        db.query_row(
-                            "SELECT c.message FROM message_commit c \
-                             JOIN message m ON m.id = c.message \
-                             WHERE c.entry = ?1 AND m.role = 'assistant'",
-                            params![entry],
-                            |row| Ok(row.get::<i64>(0)?),
-                        )?
-                        .ok_or_else(|| rejected("response message is not a committed message"))
-                    })
-                    .transpose()?;
+                outcome(db, seq, kind, *attempt)?;
+                let message = db
+                    .query_row(
+                        "SELECT c.message FROM message_commit c \
+                         JOIN message m ON m.id = c.message \
+                         WHERE c.entry = ?1 AND m.role = ?2",
+                        params![*message, MessageRole::Assistant],
+                        |row| Ok(row.get::<i64>(0)?),
+                    )?
+                    .ok_or_else(|| rejected("response message is not a committed message"))?;
                 let (outcome, cut) = match ended {
-                    Outcome::Answer => ("answer", None),
-                    Outcome::ToolUse => ("tool_use", None),
-                    Outcome::Cut(reason @ (CutReason::MaxTokens | CutReason::Incomplete)) => {
-                        ("cut", Some(variant(reason)?))
-                    }
-                    Outcome::Cut(_) => {
-                        return Err(rejected("refused and aborted responses are failures"));
-                    }
+                    CompletedOutcome::Answer => (ResponseOutcome::Answer, None),
+                    CompletedOutcome::ToolUse => (ResponseOutcome::ToolUse, None),
+                    CompletedOutcome::Cut(truncation) => (ResponseOutcome::Cut, Some(*truncation)),
                 };
                 db.execute(
                     "INSERT INTO model_response (entry, message, outcome, cut_reason) \
@@ -311,45 +283,19 @@ impl Encoder {
                 )?;
             }
             SessionEvent::ModelRecoveryScheduled {
-                request,
-                attempt,
+                failure,
                 delay_millis,
-                error,
             } => {
-                let failed = attempt
-                    .checked_sub(1)
-                    .ok_or_else(|| rejected("recovery must follow a failed attempt"))?;
-                let failed = model_attempt(db, *request, failed)?;
-                let (failure, failure_error) = db
-                    .query_row(
-                        "SELECT f.entry, f.error FROM model_failure f \
-                         JOIN attempt_outcome o ON o.entry = f.entry WHERE o.attempt = ?1",
-                        params![failed],
-                        |row| Ok((row.get::<i64>(0)?, row.get::<String>(1)?)),
-                    )?
-                    .ok_or_else(|| rejected("recovery must follow a failed attempt"))?;
-                if &failure_error != error {
-                    return Err(rejected("recovery error differs from its failure"));
-                }
                 db.execute(
                     "INSERT INTO model_recovery (entry, failure, delay_millis) VALUES (?1, ?2, ?3)",
-                    params![seq, failure, *delay_millis],
+                    params![seq, *failure, *delay_millis],
                 )?;
             }
-            SessionEvent::CompactionSkipped {
-                request,
-                attempt,
-                reason,
-            } => compaction_outcome(db, seq, kind, Some(*request), Some(*attempt), reason)?,
-            SessionEvent::CompactionFailed {
-                request,
-                attempt,
-                error,
-            } => {
-                if request.is_none() && attempt.is_some() {
-                    return Err(rejected("a failed compaction attempt needs its request"));
-                }
-                compaction_outcome(db, seq, kind, *request, *attempt, error)?;
+            SessionEvent::CompactionSkipped { attempt, reason } => {
+                compaction_outcome(db, seq, kind, Some(attempt.request), Some(*attempt), reason)?;
+            }
+            SessionEvent::CompactionFailed { failure, error } => {
+                compaction_outcome(db, seq, kind, failure.request(), failure.attempt(), error)?;
             }
             SessionEvent::Usage { request, usage } => {
                 db.execute(
@@ -375,7 +321,6 @@ impl Encoder {
                 output_schema,
                 accepts_input,
                 background,
-                authorization_scope,
                 location,
             } => {
                 let origin = origin
@@ -392,27 +337,26 @@ impl Encoder {
                         .ok_or_else(|| rejected("job origin names no committed tool call"))
                     })
                     .transpose()?;
-                let target = self.target(db, &location.target)?;
+                let target = self.target(db, location.target.as_str())?;
                 db.execute(
                     "INSERT INTO job (id, created, parent, origin_call, tool, name, role, \
                      arguments, output_schema, accepts_input, background, location_target, \
-                     location_workspace, authorization_scope) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                     location_workspace) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
                     params![
                         job.get(),
                         seq,
                         parent.map(|parent| parent.get()),
                         origin,
                         tool,
-                        name.clone(),
-                        variant(role)?,
+                        name.clone().map(String::from),
+                        *role,
                         json(arguments)?,
                         output_schema.as_ref().map(json).transpose()?,
                         *accepts_input,
                         *background,
                         target,
                         path_bytes(&location.workspace),
-                        *authorization_scope,
                     ],
                 )?;
                 db.execute(
@@ -420,18 +364,7 @@ impl Encoder {
                     params![job.get(), seq],
                 )?;
             }
-            SessionEvent::ApprovalGranted { grant } => {
-                db.execute(
-                    "INSERT INTO approval_grant (entry, capability, resource, coverage) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![
-                        seq,
-                        grant.capability.as_str(),
-                        json(&grant.resource)?,
-                        variant(&grant.coverage)?
-                    ],
-                )?;
-            }
+            SessionEvent::ApprovalGranted { grant } => self.grant(db, seq, grant)?,
             SessionEvent::ApprovalRevoked { grant } => {
                 db.execute(
                     "INSERT INTO approval_revocation (entry, grant_entry) VALUES (?1, ?2)",
@@ -441,7 +374,7 @@ impl Encoder {
             SessionEvent::JobStateChanged { job, state } => {
                 db.execute(
                     "INSERT INTO job_transition (entry, job, state) VALUES (?1, ?2, ?3)",
-                    params![seq, job.get(), variant(state)?],
+                    params![seq, job.get(), *state],
                 )?;
                 // A finished job that runs again starts its next generation.
                 db.execute(
@@ -450,7 +383,7 @@ impl Encoder {
                      WHERE ?3 = 'running' \
                        AND (SELECT max(entry) FROM job_finish WHERE job = ?1) > coalesce( \
                          (SELECT max(entry) FROM job_transition WHERE job = ?1 AND entry < ?2), 0)",
-                    params![job.get(), seq, variant(state)?],
+                    params![job.get(), seq, *state],
                 )?;
             }
             SessionEvent::JobFinished {
@@ -467,13 +400,13 @@ impl Encoder {
                      WHERE t.job = f.job AND t.state = 'running'), 0) \
                      FROM job_finish f WHERE f.job = ?1 ORDER BY f.entry DESC LIMIT 1",
                     params![job.get()],
-                    |row| Ok((row.get::<String>(0)?, row.get::<bool>(1)?)),
+                    |row| Ok((enum_column::<JobEnd>(row, 0)?, row.get::<bool>(1)?)),
                 )?;
                 if let Some((previous, current)) = previous
-                    && (current || previous == "cancelled")
+                    && (current || previous == JobEnd::Cancelled)
                 {
                     let reopened =
-                        current && previous == "interrupted" && variant(state)? == "cancelled";
+                        current && previous == JobEnd::Interrupted && *state == JobEnd::Cancelled;
                     if !reopened {
                         return Err(rejected(format!(
                             "duplicate or invalid terminal event for job {job}"
@@ -482,7 +415,7 @@ impl Encoder {
                 }
                 db.execute(
                     "INSERT INTO job_finish (entry, job, state) VALUES (?1, ?2, ?3)",
-                    params![seq, job.get(), variant(state)?],
+                    params![seq, job.get(), *state],
                 )?;
                 for (slot, diagnostic) in [
                     (Slot::Diagnostic, diagnostic),
@@ -536,7 +469,7 @@ impl Encoder {
         &self,
         db: &Db,
         seq: u64,
-        kind: &str,
+        kind: EntryKind,
         mode: &crate::session::ModeSelection,
     ) -> DbResult<()> {
         let name = mode.name.as_str();
@@ -556,6 +489,167 @@ impl Encoder {
         Ok(())
     }
 
+    fn grant(&self, db: &Db, seq: u64, grant: &ApprovalGrant) -> DbResult<()> {
+        let target = match &grant.resource {
+            ResourceId::Workspace { target, .. }
+            | ResourceId::Path { target, .. }
+            | ResourceId::Network { target, .. }
+            | ResourceId::Route {
+                destination: target,
+                ..
+            } => Some(self.target(db, target)?),
+            ResourceId::Session { .. } | ResourceId::Mcp { .. } => None,
+        };
+        let (path, origin, session, server, tool) = match &grant.resource {
+            ResourceId::Workspace { path, .. } => (Some(path), None, None, None, None),
+            ResourceId::Network { origin, .. } => (None, Some(origin), None, None, None),
+            ResourceId::Session { name } => (None, None, Some(name), None, None),
+            ResourceId::Mcp { server, tool } => (None, None, None, Some(server), Some(tool)),
+            ResourceId::Path { .. } | ResourceId::Route { .. } => (None, None, None, None, None),
+        };
+        db.execute(
+            "INSERT INTO approval_grant (entry, capability, resource_kind, target, path, \
+             origin, session_name, mcp_server, mcp_tool, coverage) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                seq,
+                grant.capability,
+                grant.resource.kind(),
+                target,
+                path,
+                origin,
+                session,
+                server,
+                tool,
+                grant.coverage
+            ],
+        )?;
+        match &grant.resource {
+            ResourceId::Path { components, .. } => {
+                for (position, component) in components.iter().enumerate() {
+                    db.execute(
+                        "INSERT INTO approval_grant_path_component (grant_entry, position, \
+                         component) VALUES (?1, ?2, ?3)",
+                        params![seq, position, component],
+                    )?;
+                }
+            }
+            ResourceId::Route { hops, .. } => {
+                for (position, (name, revision)) in hops.iter().enumerate() {
+                    let target = self.target(db, name)?;
+                    db.execute(
+                        "INSERT INTO approval_grant_route_hop (grant_entry, position, target, \
+                         revision) VALUES (?1, ?2, ?3, ?4)",
+                        params![seq, position, target, *revision],
+                    )?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn state(&self, db: &Db, part: i64, state: &RuntimeState) -> DbResult<()> {
+        let target = self.target(db, state.location.target.as_str())?;
+        db.execute(
+            "INSERT INTO user_part_state (part, date, location_target, location_workspace) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                part,
+                &state.date,
+                target,
+                path_bytes(&state.location.workspace)
+            ],
+        )?;
+        self.state_jobs(db, part, &state.jobs, None, &mut 0)?;
+        for (position, item) in state.todos.iter().enumerate() {
+            db.execute(
+                "INSERT INTO user_part_state_todo (part, position, text, status) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![part, position, &item.text, item.status],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Jobs in pre-order, each child naming its parent's position.
+    fn state_jobs(
+        &self,
+        db: &Db,
+        part: i64,
+        jobs: &[StateJob],
+        parent: Option<u64>,
+        next: &mut u64,
+    ) -> DbResult<()> {
+        for job in jobs {
+            let position = *next;
+            *next += 1;
+            let target = job
+                .target
+                .as_ref()
+                .map(|target| self.target(db, target.as_str()))
+                .transpose()?;
+            let progress = match &job.kind {
+                StateJobKind::Agent { progress } => Some(*progress),
+                StateJobKind::Tool { .. } => None,
+            };
+            db.execute(
+                "INSERT INTO user_part_state_job (part, position, parent_position, job, tool, \
+                 name, state, target, workspace, age_seconds, turns, tool_calls) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                params![
+                    part,
+                    position,
+                    parent,
+                    job.job.get(),
+                    job.kind.tool(),
+                    job.name.clone(),
+                    job.state,
+                    target,
+                    path_bytes(&job.workspace),
+                    job.age_seconds,
+                    progress.map(|progress| progress.turns),
+                    progress.map(|progress| progress.tool_calls),
+                ],
+            )?;
+            self.state_jobs(db, part, &job.children, Some(position), next)?;
+        }
+        Ok(())
+    }
+
+    fn job_events(&self, db: &Db, part: i64, events: &[JobEvent]) -> DbResult<()> {
+        for (position, event) in events.iter().enumerate() {
+            match event {
+                JobEvent::Message(message) => {
+                    db.execute(
+                        "INSERT INTO user_part_job_event (part, position, kind, job, name, \
+                         source, text) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        params![
+                            part,
+                            position,
+                            JobEventKind::Message,
+                            message.id.get(),
+                            message.name.clone(),
+                            message.message,
+                            &message.text
+                        ],
+                    )?;
+                }
+                JobEvent::Job(view) => {
+                    let job = view
+                        .id
+                        .ok_or_else(|| rejected("job event view names no job"))?;
+                    db.execute(
+                        "INSERT INTO user_part_job_event (part, position, kind, job, view) \
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![part, position, JobEventKind::Job, job.get(), json(view)?],
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub(super) fn target(&self, db: &Db, name: &str) -> DbResult<i64> {
         db.execute(
             "INSERT INTO target (name) VALUES (?1) ON CONFLICT (name) DO NOTHING",
@@ -569,12 +663,19 @@ impl Encoder {
         .ok_or_else(|| corrupt("target row is missing"))
     }
 
-    fn targets(&self, db: &Db, seq: u64, kind: &str, targets: &[TargetDefinition]) -> DbResult<()> {
+    fn targets(
+        &self,
+        db: &Db,
+        seq: u64,
+        kind: EntryKind,
+        targets: &[TargetDefinition],
+    ) -> DbResult<()> {
         for definition in targets {
-            let target = self.target(db, &definition.name)?;
-            let named = |name: &Option<String>| {
-                let name = name.as_deref();
-                name.map(|name| self.target(db, name)).transpose()
+            let target = self.target(db, definition.name.as_str())?;
+            let named = |name: &Option<TargetName>| {
+                (name.as_ref())
+                    .map(|name| self.target(db, name.as_str()))
+                    .transpose()
             };
             let (via, origin) = (named(&definition.via)?, named(&definition.origin)?);
             let ssh = &definition.ssh;
@@ -582,9 +683,6 @@ impl Encoder {
                 crate::target::TargetAuth::Key { path } => Some(path_bytes(path)),
                 _ => None,
             };
-            if definition.r#type != crate::target::TargetType::Ssh {
-                return Err(rejected("only ssh targets are session definitions"));
-            }
             let revision = db.insert(
                 "INSERT INTO target_revision (target, entry, kind, revision, source, host, \
                  workspace, ssh_user, ssh_port, ssh_auth, ssh_key_path, ssh_external_agent, \
@@ -595,7 +693,7 @@ impl Encoder {
                     seq,
                     kind,
                     definition.revision,
-                    variant(&definition.source)?,
+                    definition.source,
                     &definition.host,
                     path_bytes(&definition.workspace),
                     ssh.user.clone(),
@@ -632,7 +730,7 @@ impl Encoder {
                 profile.max_context,
                 profile.max_output,
                 profile.supports_images,
-                variant(&profile.state_mode)?,
+                profile.state_mode,
                 profile.hint.clone(),
                 digest.clone(),
             ],
@@ -664,14 +762,7 @@ impl Encoder {
         db.execute(
             "INSERT INTO model_context (entry, purpose, profile, system_prompt, \
              response_schema_name, response_schema) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![
-                seq,
-                variant(&context.purpose)?,
-                profile,
-                prompt,
-                schema_name,
-                schema
-            ],
+            params![seq, context.purpose, profile, prompt, schema_name, schema],
         )?;
         for (position, tool) in context.tools.iter().enumerate() {
             let digest = digest(tool)?;
@@ -696,19 +787,12 @@ impl Encoder {
 
     fn compaction(&self, db: &Db, seq: u64, checkpoint: &CompactionCheckpoint) -> DbResult<()> {
         let message = self.message(db, &checkpoint.message)?;
-        outcome(
-            db,
-            seq,
-            "compaction",
-            checkpoint.request,
-            checkpoint.attempt,
-        )?;
+        outcome(db, seq, EntryKind::Compaction, checkpoint.attempt)?;
         db.execute(
-            "INSERT INTO compaction (entry, schema_version, frontier, message, \
-             before_tokens, after_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO compaction (entry, frontier, message, before_tokens, after_tokens) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
                 seq,
-                checkpoint.schema_version,
                 checkpoint.frontier,
                 message,
                 checkpoint.before_tokens,
@@ -721,7 +805,7 @@ impl Encoder {
                 params![seq, *source],
             )?;
         }
-        todos(db, seq, "compaction", &checkpoint.todos)
+        todos(db, seq, EntryKind::Compaction, &checkpoint.todos)
     }
 
     /// Insert a message committed by `agent`; a tool result binds to that agent's
@@ -749,7 +833,10 @@ impl Encoder {
         if name != result.name {
             return Err(rejected("tool result name differs from its call"));
         }
-        let message = db.insert("INSERT INTO message (role) VALUES ('tool')", Vec::new())?;
+        let message = db.insert(
+            "INSERT INTO message (role) VALUES (?1)",
+            params![MessageRole::Tool],
+        )?;
         tool_result(db, message, call, result)?;
         Ok(message)
     }
@@ -757,41 +844,52 @@ impl Encoder {
     fn message(&self, db: &Db, message: &Message) -> DbResult<i64> {
         match message {
             Message::User(parts) => {
-                let id = db.insert("INSERT INTO message (role) VALUES ('user')", Vec::new())?;
+                let id = db.insert(
+                    "INSERT INTO message (role) VALUES (?1)",
+                    params![MessageRole::User],
+                )?;
                 for (position, part) in parts.iter().enumerate() {
                     let (kind, text, attachment) = match part {
-                        UserContent::Text { text } => ("text", Some(text), None),
-                        UserContent::Runtime { text } => ("runtime", Some(text), None),
-                        UserContent::ParentInput { text } => ("parent_input", Some(text), None),
-                        UserContent::Compaction { text } => ("compaction", Some(text), None),
-                        UserContent::Attachment { attachment } => {
-                            ("attachment", None, Some(attachment))
+                        UserPart::Text { text } => (UserPartKind::Text, Some(text), None),
+                        UserPart::ParentInput { text } => {
+                            (UserPartKind::ParentInput, Some(text), None)
                         }
+                        UserPart::Compaction { text } => {
+                            (UserPartKind::Compaction, Some(text), None)
+                        }
+                        UserPart::Attachment { attachment } => {
+                            (UserPartKind::Attachment, None, Some(attachment))
+                        }
+                        UserPart::State { .. } => (UserPartKind::State, None, None),
+                        UserPart::JobEvents { .. } => (UserPartKind::JobEvents, None, None),
                     };
                     let (blob, format, file) = match attachment {
                         Some(AttachmentRef::Text(text)) => {
                             (Some(&text.blob), None, text.file.clone())
                         }
-                        Some(AttachmentRef::Image(image)) => (
-                            Some(&image.blob),
-                            Some(variant(&image.format)?),
-                            image.file.clone(),
-                        ),
+                        Some(AttachmentRef::Image(image)) => {
+                            (Some(&image.blob), Some(image.format), image.file.clone())
+                        }
                         None => (None, None, None),
                     };
                     let blob = blob.map(|blob| stored_blob(db, blob)).transpose()?;
-                    db.execute(
+                    let row = db.insert(
                         "INSERT INTO user_part (message, position, kind, text, blob, \
                          image_format, file) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         params![id, position, kind, text, blob, format, file],
                     )?;
+                    match part {
+                        UserPart::State { state } => self.state(db, row, state)?,
+                        UserPart::JobEvents { events } => self.job_events(db, row, events)?,
+                        _ => {}
+                    }
                 }
                 Ok(id)
             }
             Message::Assistant(items) => {
                 let id = db.insert(
-                    "INSERT INTO message (role) VALUES ('assistant')",
-                    Vec::new(),
+                    "INSERT INTO message (role) VALUES (?1)",
+                    params![MessageRole::Assistant],
                 )?;
                 for item in items {
                     assistant_item(db, id, item)?;
@@ -806,16 +904,11 @@ impl Encoder {
 }
 
 fn assistant_item(db: &Db, message: i64, item: &AssistantItem) -> DbResult<()> {
-    let kind = variant(&item.kind())?;
+    let kind = item.kind();
     let id = db.insert(
         "INSERT INTO assistant_item (message, position, provider_id, kind) \
          VALUES (?1, ?2, ?3, ?4)",
-        params![
-            message,
-            item.position().get(),
-            item.id().as_str(),
-            kind.clone()
-        ],
+        params![message, item.position().get(), item.id().as_str(), kind],
     )?;
     if let Some(replay) = item.replay() {
         db.execute(
@@ -827,7 +920,7 @@ fn assistant_item(db: &Db, message: i64, item: &AssistantItem) -> DbResult<()> {
                 &replay.provenance.model,
                 replay.provenance.scope.as_str(),
                 json(&replay.payload)?,
-                variant(&replay.binding)?
+                replay.binding
             ],
         )?;
     }
@@ -839,7 +932,7 @@ fn assistant_item(db: &Db, message: i64, item: &AssistantItem) -> DbResult<()> {
                      VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![
                         id,
-                        kind.clone(),
+                        kind,
                         block.position.get(),
                         block.id.as_str(),
                         block.text.clone()
@@ -888,7 +981,7 @@ fn image_row(
         &format!(
             "INSERT INTO {table} ({owner}, position, blob, format, file) VALUES (?1, ?2, ?3, ?4, ?5)"
         ),
-        params![id, position, blob, variant(&image.format)?, image.file.clone()],
+        params![id, position, blob, image.format, image.file.clone()],
     )?;
     Ok(())
 }
@@ -918,20 +1011,25 @@ fn by_digest(db: &Db, table: &str, digest: Vec<u8>) -> DbResult<i64> {
     .ok_or_else(|| corrupt(format!("{table} row is missing")))
 }
 
-fn model_attempt(db: &Db, request: u64, attempt: u64) -> DbResult<i64> {
+fn model_attempt(db: &Db, attempt: AttemptRef) -> DbResult<i64> {
     db.query_row(
         "SELECT entry FROM model_attempt WHERE request = ?1 AND attempt = ?2",
-        params![request, attempt],
+        params![attempt.request, attempt.attempt],
         |row| Ok(row.get::<i64>(0)?),
     )?
-    .ok_or_else(|| rejected(format!("request {request} has no attempt {attempt}")))
+    .ok_or_else(|| {
+        rejected(format!(
+            "request {} has no attempt {}",
+            attempt.request, attempt.attempt
+        ))
+    })
 }
 
 /// Pin a mode's definition to the entry that first uses it.
 fn pin_mode(
     db: &Db,
     seq: u64,
-    kind: &str,
+    kind: EntryKind,
     name: &str,
     mode: &crate::tool::policy::Mode,
 ) -> DbResult<()> {
@@ -948,7 +1046,7 @@ fn pin_mode(
     for capability in &mode.capabilities {
         db.execute(
             "INSERT INTO mode_capability (mode, capability) SELECT id, ?2 FROM mode WHERE name = ?1",
-            params![name, capability.as_str()],
+            params![name, *capability],
         )?;
     }
     Ok(())
@@ -957,24 +1055,24 @@ fn pin_mode(
 fn capabilities_at(
     db: &Db,
     seq: u64,
-    kind: &str,
+    kind: EntryKind,
     capabilities: &[crate::tool::policy::Capability],
 ) -> DbResult<()> {
     for capability in capabilities {
         db.execute(
             "INSERT INTO agent_capability (entry, kind, capability) VALUES (?1, ?2, ?3)",
-            params![seq, kind, capability.as_str()],
+            params![seq, kind, *capability],
         )?;
     }
     Ok(())
 }
 
-fn todos(db: &Db, seq: u64, kind: &str, items: &[crate::agent::TodoItem]) -> DbResult<()> {
+fn todos(db: &Db, seq: u64, kind: EntryKind, items: &[crate::agent::TodoItem]) -> DbResult<()> {
     for (position, item) in items.iter().enumerate() {
         db.execute(
             "INSERT INTO todo_item (entry, kind, position, text, status) \
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![seq, kind, position, &item.text, variant(&item.status)?],
+            params![seq, kind, position, &item.text, item.status],
         )?;
     }
     Ok(())
@@ -983,10 +1081,10 @@ fn todos(db: &Db, seq: u64, kind: &str, items: &[crate::agent::TodoItem]) -> DbR
 fn delivery(
     db: &Db,
     seq: u64,
-    kind: &str,
+    kind: EntryKind,
     job: crate::identity::JobId,
-    notification: Option<u64>,
-    source: Option<u64>,
+    notification: Option<MessageSeq>,
+    source: Option<MessageSeq>,
 ) -> DbResult<()> {
     db.execute(
         "INSERT INTO job_delivery (entry, kind, job, notification, source) \
@@ -996,9 +1094,9 @@ fn delivery(
     .map(drop)
 }
 
-/// Record that `attempt` of `request` ended with entry `seq`.
-fn outcome(db: &Db, seq: u64, kind: &str, request: u64, attempt: u64) -> DbResult<()> {
-    let attempt = model_attempt(db, request, attempt)?;
+/// Record that `attempt` ended with entry `seq`.
+fn outcome(db: &Db, seq: u64, kind: EntryKind, attempt: AttemptRef) -> DbResult<()> {
+    let attempt = model_attempt(db, attempt)?;
     db.execute(
         "INSERT INTO attempt_outcome (entry, kind, attempt) VALUES (?1, ?2, ?3)",
         params![seq, kind, attempt],
@@ -1010,57 +1108,20 @@ fn outcome(db: &Db, seq: u64, kind: &str, request: u64, attempt: u64) -> DbResul
 fn compaction_outcome(
     db: &Db,
     seq: u64,
-    kind: &str,
-    request: Option<u64>,
-    attempt: Option<u64>,
+    kind: EntryKind,
+    request: Option<RequestSeq>,
+    attempt: Option<AttemptRef>,
     reason: &str,
 ) -> DbResult<()> {
-    let attempt = match (request, attempt) {
-        (Some(request), Some(attempt)) => Some(model_attempt(db, request, attempt)?),
-        _ => None,
-    };
+    let attempt = attempt
+        .map(|attempt| model_attempt(db, attempt))
+        .transpose()?;
     db.execute(
         "INSERT INTO compaction_outcome (entry, kind, request, attempt, reason) \
          VALUES (?1, ?2, ?3, ?4, ?5)",
         params![seq, kind, request, attempt, reason],
     )
     .map(drop)
-}
-
-fn kind(event: &SessionEvent) -> &'static str {
-    match event {
-        SessionEvent::SessionStarted { .. } => "session_started",
-        SessionEvent::TitleSet { .. } => "title_set",
-        SessionEvent::TargetsUpserted { .. } => "targets_upserted",
-        SessionEvent::AgentStarted { .. } => "agent_started",
-        SessionEvent::TodosReplaced { .. } => "todos_replaced",
-        SessionEvent::ModelChanged { .. } => "model_selected",
-        SessionEvent::ModeChanged { .. } => "mode_changed",
-        SessionEvent::MessageCommitted { .. } => "message_committed",
-        SessionEvent::Status { .. } => "status",
-        SessionEvent::ModelContext { .. } => "model_context",
-        SessionEvent::ModelRequested { .. } => "model_requested",
-        SessionEvent::Compaction { .. } => "compaction",
-        SessionEvent::ModelAttemptStarted { .. } => "model_attempt_started",
-        SessionEvent::ModelFailed { .. } => "model_failed",
-        SessionEvent::ModelAttemptInterrupted { .. } => "model_attempt_interrupted",
-        SessionEvent::ResponseCompleted { .. } => "response_completed",
-        SessionEvent::ModelRecoveryScheduled { .. } => "model_recovery_scheduled",
-        SessionEvent::CompactionSkipped { .. } => "compaction_skipped",
-        SessionEvent::CompactionFailed { .. } => "compaction_failed",
-        SessionEvent::Usage { .. } => "usage",
-        SessionEvent::JobCreated { .. } => "job_created",
-        SessionEvent::ApprovalGranted { .. } => "approval_granted",
-        SessionEvent::ApprovalRevoked { .. } => "approval_revoked",
-        SessionEvent::JobStateChanged { .. } => "job_state_changed",
-        SessionEvent::JobFinished { .. } => "job_finished",
-        SessionEvent::JobClaimed { .. } => "job_claimed",
-        SessionEvent::JobInjected { .. } => "job_injected",
-        SessionEvent::JobMessageDelivered { .. } => "job_message_delivered",
-        SessionEvent::AgentCompleted => "agent_completed",
-        SessionEvent::AgentInterrupted => "agent_interrupted",
-        SessionEvent::AgentFailed { .. } => "agent_failed",
-    }
 }
 
 #[cfg(test)]
@@ -1071,19 +1132,23 @@ mod tests {
     use crate::{
         execution::ExecutionLocation,
         identity::JobId,
-        job::{JobRole, JobState},
+        job::JobView,
+        job::{JobEnd, JobRole, JobState, JobTransition},
         media::{AttachmentRef, ImageFormat, ImageRef, TextRef},
         provider::protocol::{
-            AssistantItem, Binding, CutReason, HistoryLifetime, Message, Outcome, Provenance,
-            Replay, ResponseSchema, Scope, SystemSegment, ToolCall, ToolDefinition, Usage,
-            UserContent,
+            AssistantItem, Binding, HistoryLifetime, Provenance, Replay, ResponseSchema, Scope,
+            SystemSegment, ToolCall, ToolDefinition, Usage,
         },
         session::{
-            CompactionCheckpoint, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose,
-            SessionEvent,
+            AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, JobEvent,
+            Message, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose, RecordSeq,
+            RuntimeState, SessionEvent, StateJob, StateJobKind, Truncation, UserPart,
             db::tests::{Fixture, result, user},
             fixture::{child_started, profile},
         },
+        target::TargetDefinition,
+        target::TargetRef,
+        tool::policy::{ApprovalGrant, Capability, ResourceId},
     };
 
     #[test]
@@ -1093,13 +1158,7 @@ mod tests {
         let context = fixture.one(
             root.clone(),
             SessionEvent::ModelContext {
-                context: ModelContext {
-                    purpose: ModelPurpose::Agent,
-                    profile: profile(),
-                    system: Vec::new(),
-                    tools: Vec::new(),
-                    response_schema: None,
-                },
+                context: ModelContext::test(ModelPurpose::Agent, profile()),
             },
         );
         let mut commit = |text| {
@@ -1107,15 +1166,19 @@ mod tests {
             fixture.one(root.clone(), SessionEvent::MessageCommitted { message })
         };
         let (first, _skipped, last) = (commit("first"), commit("skipped"), commit("last"));
-        for history in [vec![first, last], vec![last], Vec::new()] {
+        for history in [
+            vec![first.message(), last.message()],
+            vec![last.message()],
+            Vec::new(),
+        ] {
             fixture.one(
                 root.clone(),
                 SessionEvent::ModelRequested {
                     context,
+                    checkpoint: None,
                     history,
                     tail: Vec::new(),
                     history_lifetime: HistoryLifetime::Detached,
-                    purpose: ModelPurpose::Agent,
                 },
             );
         }
@@ -1178,22 +1241,19 @@ mod tests {
         }
         let prompt = one!(SessionEvent::MessageCommitted {
             message: Message::User(vec![
-                UserContent::Text {
+                UserPart::Text {
                     text: "look".into(),
                 },
-                UserContent::Attachment {
+                UserPart::Attachment {
                     attachment: AttachmentRef::Image(png.clone()),
                 },
-                UserContent::Attachment {
+                UserPart::Attachment {
                     attachment: AttachmentRef::Text(TextRef {
                         file: None,
                         blob: notes,
                     }),
                 },
-                UserContent::Runtime {
-                    text: "state".into(),
-                },
-                UserContent::ParentInput {
+                UserPart::ParentInput {
                     text: "parent".into(),
                 },
             ]),
@@ -1203,45 +1263,39 @@ mod tests {
             root.clone(),
             SessionEvent::ModelRequested {
                 context,
-                history: vec![context],
+                checkpoint: None,
+                history: vec![context.message()],
                 tail: Vec::new(),
                 history_lifetime: HistoryLifetime::Detached,
-                purpose: ModelPurpose::Agent,
             },
         );
         let request = one!(SessionEvent::ModelRequested {
             context,
-            history: vec![prompt],
+            checkpoint: None,
+            history: vec![prompt.message()],
             tail: vec![user("tail")],
             history_lifetime: HistoryLifetime::Detached,
-            purpose: ModelPurpose::Agent,
         });
-        one!(SessionEvent::ModelAttemptStarted {
-            request,
-            attempt: 1
-        });
-        one!(SessionEvent::ModelFailed {
-            request,
-            attempt: 1,
+        let attempt = |attempt| AttemptRef {
+            request: request.request(),
+            attempt,
+        };
+        one!(SessionEvent::ModelAttemptStarted(attempt(1)));
+        let failed = one!(SessionEvent::ModelFailed {
+            attempt: attempt(1),
             error: "lost".into(),
             kind: ModelFailureKind::Error,
         });
         // An attempt ends once.
-        let interrupted = SessionEvent::ModelAttemptInterrupted {
-            request,
-            attempt: 1,
-        };
-        fixture.reject(root.clone(), interrupted);
+        fixture.reject(
+            root.clone(),
+            SessionEvent::ModelAttemptInterrupted(attempt(1)),
+        );
         one!(SessionEvent::ModelRecoveryScheduled {
-            request,
-            attempt: 2,
+            failure: failed,
             delay_millis: 1000,
-            error: "lost".into(),
         });
-        one!(SessionEvent::ModelAttemptStarted {
-            request,
-            attempt: 2
-        });
+        one!(SessionEvent::ModelAttemptStarted(attempt(2)));
         let replay = Replay {
             provenance: Provenance {
                 protocol: "responses".into(),
@@ -1268,7 +1322,7 @@ mod tests {
             ]),
         });
         one!(SessionEvent::Usage {
-            request: Some(request),
+            request: request.request(),
             usage: Usage {
                 input_tokens: 10,
                 cached_input_tokens: 2,
@@ -1276,63 +1330,92 @@ mod tests {
             },
         });
         one!(SessionEvent::ResponseCompleted {
-            request,
-            attempt: 2,
-            message: Some(assistant),
-            outcome: Outcome::Cut(CutReason::MaxTokens),
+            attempt: attempt(2),
+            message: assistant.message(),
+            outcome: CompletedOutcome::Cut(Truncation::MaxTokens),
         });
         let job = JobId::new(1).unwrap();
         one!(SessionEvent::JobCreated {
             job,
             parent: None,
             origin: Some(ModelCallOrigin {
-                message: assistant,
+                message: assistant.message(),
                 call_id: "b".into(),
             }),
             tool: "read".into(),
             role: JobRole::Tool,
-            name: Some("reader".into()),
+            name: Some("reader".parse().unwrap()),
             arguments: json!({"path": "b"}),
             output_schema: Some(json!({"type": "object"})),
             accepts_input: false,
             background: true,
-            authorization_scope: Some(7),
-            location: ExecutionLocation::named("build", "/srv".into()),
+            location: ExecutionLocation::named("build".parse().unwrap(), "/srv".into()),
         });
         one!(SessionEvent::JobStateChanged {
             job,
-            state: JobState::Running,
+            state: JobTransition::Running,
         });
         one!(result("b", "read", vec![png.clone()]));
         one!(result("a", "read", Vec::new()));
         one!(SessionEvent::JobFinished {
             job,
-            state: JobState::Interrupted,
+            state: JobEnd::Interrupted,
             diagnostic: None,
             output_diagnostic: None,
             images: vec![png.clone()],
         });
         one!(SessionEvent::JobFinished {
             job,
-            state: JobState::Cancelled,
+            state: JobEnd::Cancelled,
             diagnostic: None,
             output_diagnostic: None,
             images: Vec::new(),
         });
-        let resource = crate::tool::policy::ResourceId::mcp("server", "tool");
-        let grant = one!(SessionEvent::ApprovalGranted {
-            grant: crate::tool::policy::ApprovalGrant::descendants(
-                crate::tool::policy::Capability::Mcp,
-                resource,
-            ),
+        // Every resource kind; a route names journaled target revisions.
+        one!(SessionEvent::TargetsUpserted {
+            targets: vec![TargetDefinition::test("build", "/srv", None)],
         });
-        one!(SessionEvent::ApprovalRevoked { grant });
+        let path = std::path::Path::new("/srv/a b/../c");
+        for (capability, resource) in [
+            (Capability::Mcp, ResourceId::mcp("server", "tool")),
+            (Capability::Read, ResourceId::session("scratch")),
+            (
+                Capability::Write,
+                ResourceId::workspace(&"build".parse().unwrap(), path),
+            ),
+            (
+                Capability::Read,
+                ResourceId::path(&"build".parse().unwrap(), path),
+            ),
+            (
+                Capability::Network,
+                ResourceId::network(&crate::target::TargetRef::Root, "https://example.test"),
+            ),
+            (
+                Capability::Targets,
+                ResourceId::route("build", vec![("build".into(), 1)]),
+            ),
+        ] {
+            let grant = one!(SessionEvent::ApprovalGranted {
+                grant: ApprovalGrant::descendants(capability, resource),
+            });
+            one!(SessionEvent::ApprovalRevoked { grant });
+        }
+        fixture.reject(
+            root.clone(),
+            SessionEvent::ApprovalGranted {
+                grant: ApprovalGrant::exact(
+                    Capability::Targets,
+                    ResourceId::route("build", vec![("build".into(), 2)]),
+                ),
+            },
+        );
         one!(SessionEvent::JobClaimed { job });
         one!(SessionEvent::JobInjected { job });
         one!(SessionEvent::JobMessageDelivered {
             job,
-            source: assistant,
-            notification: prompt,
+            source: assistant.message(),
+            notification: prompt.message(),
         });
         one!(SessionEvent::TodosReplaced {
             items: vec![crate::agent::TodoItem {
@@ -1342,7 +1425,7 @@ mod tests {
         });
         one!(SessionEvent::TodosReplaced { items: Vec::new() });
         // A compaction summary request and its checkpoint.
-        let frontier = fixture.records.len() as u64;
+        let frontier = RecordSeq::from(fixture.records.len() as u64);
         let summary_context = one!(SessionEvent::ModelContext {
             context: ModelContext {
                 purpose: ModelPurpose::Compaction,
@@ -1356,46 +1439,49 @@ mod tests {
         });
         let summary = one!(SessionEvent::ModelRequested {
             context: summary_context,
-            history: vec![prompt, assistant],
+            checkpoint: None,
+            history: vec![prompt.message(), assistant.message()],
             tail: vec![user("summarize")],
             history_lifetime: HistoryLifetime::Detached,
-            purpose: ModelPurpose::Compaction,
         });
-        one!(SessionEvent::ModelAttemptStarted {
-            request: summary,
+        let summary_attempt = AttemptRef {
+            request: summary.request(),
             attempt: 1,
-        });
+        };
+        one!(SessionEvent::ModelAttemptStarted(summary_attempt));
         let checkpoint = one!(SessionEvent::Compaction {
             checkpoint: CompactionCheckpoint {
-                schema_version: 2,
-                previous: None,
                 frontier,
-                message: Message::User(vec![UserContent::Compaction {
+                message: Message::User(vec![UserPart::Compaction {
                     text: "summary".into(),
                 }]),
                 todos: vec![crate::agent::TodoItem {
                     text: "kept".into(),
                     status: crate::agent::TodoStatus::Pending,
                 }],
-                retained: vec![prompt],
-                request: summary,
-                attempt: 1,
+                retained: vec![prompt.message()],
+                attempt: summary_attempt,
                 before_tokens: 100,
                 after_tokens: 10,
             },
         });
         one!(SessionEvent::ModelRequested {
             context,
-            history: vec![checkpoint, prompt],
+            checkpoint: Some(checkpoint),
+            history: vec![prompt.message()],
             tail: Vec::new(),
             history_lifetime: HistoryLifetime::Extends,
-            purpose: ModelPurpose::Agent,
         });
-        one!(SessionEvent::CompactionFailed {
-            request: None,
-            attempt: None,
-            error: "no request".into(),
-        });
+        for failure in [
+            CompactionFailure::BeforeRequest,
+            CompactionFailure::Requested(summary.request()),
+            CompactionFailure::Attempted(summary_attempt),
+        ] {
+            one!(SessionEvent::CompactionFailed {
+                failure,
+                error: "failed".into(),
+            });
+        }
         // A child agent with an owner job and its own events.
         let child = root.child(1);
         let owner = JobId::new(2).unwrap();
@@ -1410,14 +1496,114 @@ mod tests {
             output_schema: None,
             accepts_input: true,
             background: false,
-            authorization_scope: None,
             location: ExecutionLocation::root("/workspace".into()),
+        });
+        // Runtime content names journaled jobs, targets and message sources.
+        let progress = crate::job::AgentProgress {
+            turns: 2,
+            tool_calls: 5,
+        };
+        let state = RuntimeState {
+            date: "2026-09-23".into(),
+            jobs: vec![StateJob {
+                job: owner,
+                kind: StateJobKind::Agent { progress },
+                name: None,
+                state: JobState::Running,
+                target: Some(TargetRef::Root),
+                workspace: "/workspace".into(),
+                age_seconds: 4,
+                children: vec![StateJob {
+                    job,
+                    kind: StateJobKind::Tool {
+                        tool: "read".into(),
+                    },
+                    name: Some("reader".into()),
+                    state: JobState::Queued,
+                    target: None,
+                    workspace: "/srv".into(),
+                    age_seconds: 1,
+                    children: Vec::new(),
+                }],
+            }],
+            todos: vec![crate::agent::TodoItem {
+                text: "todo".into(),
+                status: crate::agent::TodoStatus::Completed,
+            }],
+            location: ExecutionLocation::root("/workspace".into()),
+        };
+        let page = JobView {
+            id: Some(job),
+            state: JobState::Completed,
+            has_result: true,
+            result: json!("line"),
+            error: None,
+            meta: None,
+            presentation: None,
+        };
+        let events = vec![
+            JobEvent::Message(crate::job::AgentMessage {
+                id: owner,
+                name: Some("worker".into()),
+                message: assistant.message(),
+                text: "progress".into(),
+            }),
+            JobEvent::Job(Box::new(JobView {
+                id: Some(job),
+                state: JobState::Failed,
+                has_result: false,
+                result: json!(null),
+                error: Some("denied".into()),
+                meta: Some(crate::job::JobMetadata {
+                    parent: Some(owner),
+                    tool: Some("read".into()),
+                    name: Some("reader".into()),
+                    target: Some("build".into()),
+                    workspace: Some("/srv".into()),
+                    last_message: Some(assistant.message()),
+                    code: Some(crate::tool::DenialCode::PermissionDenied),
+                    executed: Some(false),
+                }),
+                presentation: Some(crate::job::Presentation {
+                    preview: Some(crate::job::output::OutputPreview {
+                        field: "/result".into(),
+                        lines: vec!["line".into()],
+                        total_lines: Some(1),
+                        next_start: None,
+                        next_offset: 0,
+                    }),
+                    truncated: Vec::new(),
+                    captures: vec![crate::job::output::CaptureDescriptor {
+                        field: "/result/stdout".parse().unwrap(),
+                        kind: crate::job::CaptureKind::Text,
+                        complete: true,
+                        output: Some(Box::new(page)),
+                    }],
+                    question: None,
+                    notice: Some("Output incomplete.".into()),
+                }),
+            })),
+            JobEvent::Job(Box::new(JobView {
+                id: Some(owner),
+                state: JobState::Completed,
+                has_result: true,
+                result: json!({"answer": 1}),
+                error: None,
+                meta: Some(crate::job::JobMetadata::default()),
+                presentation: None,
+            })),
+        ];
+        one!(SessionEvent::MessageCommitted {
+            message: Message::User(vec![
+                UserPart::State { state },
+                UserPart::JobEvents { events },
+            ]),
         });
         let location = ExecutionLocation::root("/workspace".into());
         let failed = SessionEvent::AgentFailed {
             error: "failed".into(),
         };
-        let started = child_started(Some(root.clone()), Some(owner), location);
+        let started = child_started(Some(owner), location);
         let child_events = [started, failed].map(|event| (child.clone(), event));
         fixture.commit(child_events.into()).unwrap();
         for event in [

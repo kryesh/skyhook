@@ -12,31 +12,11 @@ pub(crate) use stream::{
 
 pub use crate::tool::output::CaptureKind;
 
-impl CaptureKind {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Text => "text",
-            Self::Json => "json",
-            Self::Unknown => "unknown",
-        }
-    }
-
-    pub(crate) fn parse(kind: &str) -> Self {
-        match kind {
-            "text" => Self::Text,
-            "json" => Self::Json,
-            _ => Self::Unknown,
-        }
-    }
-}
-
-use crate::tool::output::validate_field as validate_capture_field;
-
 /// Descriptors describe raw captures, not a replacement structured result. In
 /// particular, incomplete JSON is only safe to read through explicit byte paging.
-#[derive(Clone, Debug, Serialize, JsonSchema)]
-pub(crate) struct CaptureDescriptor {
-    pub(crate) field: String,
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
+pub struct CaptureDescriptor {
+    pub(crate) field: FieldPointer,
     pub(crate) kind: CaptureKind,
     pub(crate) complete: bool,
     pub(crate) output: Option<Box<crate::job::JobView>>,
@@ -48,16 +28,16 @@ pub(crate) fn available_captures(saved: &Saved, terminal: bool) -> Vec<CaptureDe
     // null). Only the saved document's field references establish completion.
     let complete = terminal
         && saved
-            .document
+            .product
             .as_ref()
-            .is_some_and(|document| document["capture_complete"].as_bool() == Some(true));
+            .is_some_and(|product| product.captures_complete);
     saved
         .captures
         .values()
         .map(|capture| CaptureDescriptor {
             output: None,
             field: capture.pointer.clone(),
-            kind: CaptureKind::parse(&capture.kind),
+            kind: capture.kind,
             complete: complete && capture.referenced,
         })
         .collect()

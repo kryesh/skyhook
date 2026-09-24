@@ -139,45 +139,44 @@ impl Arguments {
         })
     }
 
-    pub(super) fn extract<'a>(
-        &self,
-        value: &'a Value,
-    ) -> Result<&'a Map<String, Value>, AdmissionError> {
-        let object = value
-            .as_object()
-            .ok_or_else(|| rejected(AdmissionError::ArgumentsMustBeObject, String::new()))?;
-        if self.wrapped {
+    /// Unwrap the envelope and validate the upstream input once, yielding the
+    /// arguments the upstream call receives.
+    pub(super) fn admit(&self, value: Value) -> Result<Map<String, Value>, AdmissionError> {
+        let Value::Object(mut object) = value else {
+            return Err(rejected(
+                AdmissionError::arguments_must_be_object(),
+                String::new(),
+            ));
+        };
+        let (input, prefix) = if self.wrapped {
             if let Some(name) = object.keys().find(|name| name.as_str() != "arguments") {
                 return Err(rejected(
-                    AdmissionError::InvalidArguments("unknown argument".into()),
+                    AdmissionError::invalid_arguments("unknown argument"),
                     safe_argument_path(&self.schema, [ArgumentPathSegment::Property(name)]),
                 ));
             }
-            object
-                .get("arguments")
-                .and_then(Value::as_object)
-                .ok_or_else(|| {
-                    rejected(
-                        AdmissionError::InvalidArguments("`arguments` must be an object".into()),
-                        "/arguments".into(),
-                    )
-                })
+            (
+                object.remove("arguments").unwrap_or(Value::Null),
+                "/arguments",
+            )
         } else {
-            Ok(object)
-        }
-    }
-
-    pub(super) fn validate(&self, value: &Value) -> Result<(), AdmissionError> {
-        let input = Value::Object(self.extract(value)?.clone());
+            (Value::Object(object), "")
+        };
         self.validator.validate(&input).map_err(|error| {
             let (path, expectation) =
                 schema_argument_failure(&self.upstream_schema, &input, &error);
-            let prefix = if self.wrapped { "/arguments" } else { "" };
             rejected(
-                AdmissionError::InvalidArguments(expectation),
+                AdmissionError::invalid_arguments(expectation),
                 format!("{prefix}{path}"),
             )
-        })
+        })?;
+        match input {
+            Value::Object(input) => Ok(input),
+            _ => Err(rejected(
+                AdmissionError::invalid_arguments("`arguments` must be an object"),
+                prefix.to_owned(),
+            )),
+        }
     }
 }
 
@@ -208,9 +207,8 @@ mod tests {
         ] {
             let arguments = Arguments::new(schema).unwrap();
             let value = json!({"arguments":{"bg":"upstream"}});
-            arguments.validate(&value).unwrap();
             assert!(surface(&arguments.schema)(&value));
-            assert_eq!(arguments.extract(&value).unwrap()["bg"], "upstream");
+            assert_eq!(arguments.admit(value).unwrap()["bg"], "upstream");
         }
         let arguments = Arguments::new(json!({"type":"object"})).unwrap();
         for invalid in [
@@ -218,7 +216,7 @@ mod tests {
             json!({"arguments":null}),
             json!({"arguments":{},"other":1}),
         ] {
-            assert!(arguments.validate(&invalid).is_err());
+            assert!(arguments.admit(invalid).is_err());
         }
     }
 
@@ -237,9 +235,7 @@ mod tests {
             let constraint = constraint.as_object().unwrap().clone();
             original.as_object_mut().unwrap().extend(constraint);
             let arguments = Arguments::new(original).unwrap();
-            arguments
-                .validate(&json!({"arguments":{"count":1}}))
-                .unwrap();
+            arguments.admit(json!({"arguments":{"count":1}})).unwrap();
             let mut schema = arguments.schema.clone();
             schema["properties"]["bg"] = json!({"type":"boolean"});
             assert!(surface(&schema)(
@@ -259,14 +255,10 @@ mod tests {
             let check = |schema, valid, invalid| {
                 let arguments = Arguments::new(schema).unwrap();
                 let surface = surface(&arguments.schema);
-                assert!(
-                    arguments.validate(&valid).is_ok() && surface(&valid),
-                    "{dialect}"
-                );
-                assert!(
-                    arguments.validate(&invalid).is_err() && !surface(&invalid),
-                    "{dialect}"
-                );
+                assert!(surface(&valid), "{dialect}");
+                assert!(!surface(&invalid), "{dialect}");
+                assert!(arguments.admit(valid).is_ok(), "{dialect}");
+                assert!(arguments.admit(invalid).is_err(), "{dialect}");
             };
             check(
                 json!({"$schema":dialect, "type":"object",
@@ -376,10 +368,7 @@ mod tests {
                 vec!["invalid property name", "expected one of", "count"],
             ),
         ] {
-            let error = Arguments::new(schema)
-                .unwrap()
-                .validate(&value)
-                .unwrap_err();
+            let error = Arguments::new(schema).unwrap().admit(value).unwrap_err();
             let diagnostic = error.diagnostic();
             assert_eq!(diagnostic.context.subject, Subject::Argument(path.into()));
             let text = diagnostic.render(&Default::default());

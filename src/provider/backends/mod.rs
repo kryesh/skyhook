@@ -40,7 +40,7 @@ pub enum ChatReasoningReplay {
     Reasoning,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum Protocol {
     Chat {
         reasoning_replay: ChatReasoningReplay,
@@ -77,7 +77,7 @@ impl Default for ProviderTimeouts {
 }
 
 /// Parsed and validated provider settings; construct through [`NativeSettings::new`].
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct NativeSettings {
     endpoint: reqwest::Url,
     protocol: Protocol,
@@ -85,7 +85,10 @@ pub(crate) struct NativeSettings {
 }
 
 impl NativeSettings {
-    #[cfg(test)]
+    pub(crate) fn protocol(&self) -> Protocol {
+        self.protocol
+    }
+
     pub(crate) fn timeouts(&self) -> ProviderTimeouts {
         self.timeouts
     }
@@ -514,7 +517,7 @@ mod tests {
                             .unwrap()
                     };
                     let provider: Arc<dyn Provider> = Arc::new(configured("local"));
-                    let mut context = provider.open_context("initial".into()).unwrap();
+                    let mut context = provider.open_context("initial".parse().unwrap()).unwrap();
                     let user = Message::User(vec![UserContent::Text {
                         text: "find x".into(),
                     }]);
@@ -539,11 +542,11 @@ mod tests {
                         }]),
                     ];
                     drop(context);
-                    let mut resumed = provider.open_context("resumed".into()).unwrap();
+                    let mut resumed = provider.open_context("resumed".parse().unwrap()).unwrap();
                     complete(&mut *resumed, request(model, history.clone())).await;
                     // Same URL/model, different configured provider identity: no private replay crossing.
                     let foreign: Arc<dyn Provider> = Arc::new(configured("other-provider"));
-                    let mut foreign_context = foreign.open_context("foreign".into()).unwrap();
+                    let mut foreign_context = foreign.open_context("foreign".parse().unwrap()).unwrap();
                     complete(&mut *foreign_context, request(model, history)).await;
                     assert_eq!(serde_json::to_vec(&assistant).unwrap(), serialized);
                     let requests: Vec<Value> = server

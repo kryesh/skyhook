@@ -26,7 +26,8 @@ Architecture: `docs/src/development/architecture.md`.
   interdependent booleans/options, or initialization-only `None`.
 - Remove guards and tests made redundant by type guarantees; retain boundary validation.
 - Use normalized SQL tables, foreign keys, and seeded dictionaries for repeated
-  enumerations. No JSON payload columns.
+  enumerations. No JSON payload columns for Skyhook-typed data, except documents the
+  model received as tool output (tool results, job views), stored as the JSON it saw.
 
 ## Tests
 

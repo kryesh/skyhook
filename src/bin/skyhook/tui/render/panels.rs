@@ -9,7 +9,8 @@ pub(super) struct PromptLayout {
     title_start: Option<usize>,
     options: Vec<PromptOptionLine>,
     selected_start: usize,
-    input: super::super::composer::ComposerLayout,
+    /// Absent for prompts answered by choice alone.
+    input: Option<super::super::composer::ComposerLayout>,
     input_label: Vec<String>,
 }
 
@@ -47,8 +48,10 @@ impl PromptLayout {
         };
         let (options, selected_start) =
             prompt_option_lines(&choices, app.prompt_input().choice, width);
-        let secret = app.prompts.front().is_some_and(|prompt| prompt.secret());
-        let input = if secret {
+        let prompt = app.prompts.front();
+        let input = if !prompt.is_some_and(|prompt| prompt.takes_text()) {
+            None
+        } else if prompt.is_some_and(|prompt| prompt.secret()) {
             // Never give a password to the renderer. Map source graphemes onto
             // mask bytes before using the same layout as a regular input field.
             let editor = &app.prompt_input().editor;
@@ -57,9 +60,9 @@ impl PromptLayout {
             masked.set("●".repeat(editor.text().graphemes(true).count()));
             let (anchor, cursor) = (editor.anchor().map(mask), mask(editor.cursor()));
             masked.set_selection(anchor, cursor);
-            masked.layout(width as usize)
+            Some(masked.layout(width as usize))
         } else {
-            app.prompt_input().editor.layout(width as usize)
+            Some(app.prompt_input().editor.layout(width as usize))
         };
         let input_label = match question {
             Some(question) if app.prompt_input().choice < question.options.len() => {
@@ -84,19 +87,15 @@ impl PromptLayout {
     }
 
     pub(super) fn height(&self) -> u16 {
-        (self.body.len()
-            + self.options.len()
-            + (self.input.rows.len() + self.input_label.len())
-            + 1)
-        .min(u16::MAX as usize) as u16
+        (self.body.len() + self.options.len() + self.input_rows() + 1).min(u16::MAX as usize) as u16
+    }
+
+    fn input_rows(&self) -> usize {
+        self.input.as_ref().map_or(0, |input| input.rows.len()) + self.input_label.len()
     }
 
     fn row_heights(&self, height: u16) -> [u16; 3] {
-        let wanted = [
-            self.body.len(),
-            self.options.len(),
-            (self.input.rows.len() + self.input_label.len()),
-        ];
+        let wanted = [self.body.len(), self.options.len(), self.input_rows()];
         let mut rows = [0; 3];
         let mut remaining = height.saturating_sub(1);
         // Share a screen-limited box between its sections, giving unused rows
@@ -200,9 +199,6 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
         .input_label
         .len()
         .min(input_height.saturating_sub(1) as usize) as u16;
-    let visible = input_height.saturating_sub(label_height) as usize;
-    let (cursor_row, cursor_column) = layout.input.cursor;
-    let input_top = cursor_row.saturating_sub(visible.saturating_sub(1));
     let input_y = rect.bottom().saturating_sub(input_height + 1);
     for (offset, label) in layout
         .input_label
@@ -218,40 +214,38 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
             p.input,
         );
     }
-    for (offset, row) in layout
-        .input
-        .rows
-        .iter()
-        .skip(input_top)
-        .take(visible)
-        .enumerate()
-    {
-        text(
-            frame,
-            r(
-                2,
-                input_y + label_height + offset as u16,
-                rect.width.saturating_sub(4),
-                1,
-            ),
-            row.line(
-                Style::default(),
-                Style::default(),
-                Style::default().bg(p.selected),
-            ),
-            p.fg,
-            p.input,
-        );
-    }
-    if visible > 0
-        && (!app.multiple_questions() || app.question_editing())
-        && app.menu.is_none()
-        && app.search_editor.is_none()
-    {
-        frame.set_cursor_position((
-            2 + (cursor_column as u16).min(rect.width.saturating_sub(4)),
-            input_y + label_height + (cursor_row - input_top) as u16,
-        ));
+    if let Some(input) = &layout.input {
+        let visible = input_height.saturating_sub(label_height) as usize;
+        let (cursor_row, cursor_column) = input.cursor;
+        let input_top = cursor_row.saturating_sub(visible.saturating_sub(1));
+        for (offset, row) in input.rows.iter().skip(input_top).take(visible).enumerate() {
+            text(
+                frame,
+                r(
+                    2,
+                    input_y + label_height + offset as u16,
+                    rect.width.saturating_sub(4),
+                    1,
+                ),
+                row.line(
+                    Style::default(),
+                    Style::default(),
+                    Style::default().bg(p.selected),
+                ),
+                p.fg,
+                p.input,
+            );
+        }
+        if visible > 0
+            && (!app.multiple_questions() || app.question_editing())
+            && app.menu.is_none()
+            && app.search_editor.is_none()
+        {
+            frame.set_cursor_position((
+                2 + (cursor_column as u16).min(rect.width.saturating_sub(4)),
+                input_y + label_height + (cursor_row - input_top) as u16,
+            ));
+        }
     }
     let question_counter = matches!(
         app.prompts.front().map(|prompt| &prompt.kind),

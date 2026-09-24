@@ -2,6 +2,7 @@
 
 use std::{
     future::Future,
+    marker::PhantomData,
     sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -13,18 +14,90 @@ use tokio::{
     task::{AbortHandle, JoinHandle},
 };
 
-use super::{CancellationToken, JobError, JobId, JobManager, JobOutcome};
+use super::{CancellationToken, JobError, JobId, JobManager, JobOutcome, JobTransition};
 use crate::tool::{ToolError, ToolOutput};
 
-/// A fresh job's start-or-fail obligation. Dropping it cancels the job and
-/// leaves finalization to the manager.
-#[must_use = "a job lease must be started or failed"]
-pub struct JobLease {
-    input: Option<mpsc::Receiver<serde_json::Value>>,
-    completion: CompletionPermit,
+/// The stages a job lease passes through before its worker starts.
+pub mod stage {
+    /// Created and queued; approval comes next.
+    pub struct Created;
+    /// Awaiting approval; running comes next.
+    pub struct Approving;
+    /// Approved and running; a worker may be attached.
+    pub struct Running;
 }
 
-impl JobLease {
+/// A fresh job's start-or-fail obligation, typed by how far its startup has
+/// progressed. Dropping it cancels the job and leaves finalization to the manager.
+#[must_use = "a job lease must be started or failed"]
+pub struct JobLease<S = stage::Created> {
+    input: mpsc::Receiver<serde_json::Value>,
+    worker: JobWorker,
+    stage: PhantomData<S>,
+}
+
+impl<S> JobLease<S> {
+    pub fn id(&self) -> JobId {
+        self.worker.id
+    }
+
+    pub(crate) fn cancellation_token(&self) -> CancellationToken {
+        self.worker.owned().1.clone()
+    }
+
+    pub(crate) async fn fail(self, outcome: JobOutcome) {
+        self.worker.fail(outcome).await;
+    }
+
+    /// Journal the next startup transition; a job cancelled meanwhile is terminal.
+    async fn advance<N>(self, transition: JobTransition) -> Result<JobLease<N>, JobError> {
+        self.worker
+            .owned()
+            .0
+            .advance(self.worker.id, transition)
+            .await?;
+        Ok(JobLease {
+            input: self.input,
+            worker: self.worker,
+            stage: PhantomData,
+        })
+    }
+
+    /// Fixtures that only need the job's id hand it an idle owner: cancellation
+    /// finalizes it, and finishing it from outside releases the owner.
+    #[cfg(test)]
+    pub(crate) fn into_test_id(self) -> JobId {
+        let id = self.worker.id;
+        let (jobs, cancellation) = self.worker.into_owned();
+        let active = jobs.inner.supervision.enter();
+        tokio::spawn(async move {
+            let finished = async {
+                loop {
+                    let notified = {
+                        let entries = jobs.inner.jobs.lock().await;
+                        let Some(entry) = entries.get(&id).filter(|entry| entry.end().is_none())
+                        else {
+                            return;
+                        };
+                        entry.notify.clone().notified_owned()
+                    };
+                    notified.await;
+                }
+            };
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    let cancelled = ToolError::cancelled().into();
+                    crate::tool::executor::persist_completion(&jobs, id, cancelled).await;
+                }
+                () = finished => {}
+            }
+            drop(active);
+        });
+        id
+    }
+}
+
+impl JobLease<stage::Created> {
     pub(super) fn new(
         jobs: JobManager,
         id: JobId,
@@ -32,76 +105,80 @@ impl JobLease {
         input: mpsc::Receiver<serde_json::Value>,
     ) -> Self {
         Self {
-            input: Some(input),
-            completion: CompletionPermit::new(jobs, id, cancellation),
+            input,
+            worker: JobWorker::new(jobs, id, cancellation),
+            stage: PhantomData,
         }
     }
 
-    pub fn id(&self) -> JobId {
-        self.completion.id
+    pub async fn await_approval(self) -> Result<JobLease<stage::Approving>, JobError> {
+        self.advance(JobTransition::AwaitingApproval).await
     }
 
-    pub(crate) fn cancellation_token(&self) -> CancellationToken {
-        self.completion.cancellation.clone()
+    /// Approve and run, for fixtures that start work without a policy.
+    #[cfg(test)]
+    pub(crate) async fn test_run(self) -> JobLease<stage::Running> {
+        self.await_approval().await.unwrap().run().await.unwrap()
+    }
+}
+
+impl JobLease<stage::Approving> {
+    pub async fn run(self) -> Result<JobLease<stage::Running>, JobError> {
+        self.advance(JobTransition::Running).await
+    }
+}
+
+impl JobLease<stage::Running> {
+    /// The job's input mailbox and the authority to run its worker.
+    pub(crate) fn split(self) -> (mpsc::Receiver<serde_json::Value>, JobWorker) {
+        (self.input, self.worker)
+    }
+}
+
+/// The only authority to supervise and finalize this invocation. Consuming it
+/// hands completion to the caller; dropping it first cancels the job.
+pub(crate) struct JobWorker {
+    id: JobId,
+    /// Present until completion is handed on by `into_owned` or cancelled by `Drop`.
+    owned: Option<(JobManager, CancellationToken)>,
+}
+
+impl JobWorker {
+    pub(super) fn new(jobs: JobManager, id: JobId, cancellation: CancellationToken) -> Self {
+        Self {
+            id,
+            owned: Some((jobs, cancellation)),
+        }
     }
 
-    pub(crate) fn take_input(&mut self) -> mpsc::Receiver<serde_json::Value> {
-        self.input
+    fn owned(&self) -> &(JobManager, CancellationToken) {
+        self.owned
+            .as_ref()
+            .expect("a worker owns its job until completion is handed on")
+    }
+
+    fn into_owned(mut self) -> (JobManager, CancellationToken) {
+        self.owned
             .take()
-            .expect("job input is transferred only once")
+            .expect("a worker owns its job until completion is handed on")
     }
 
     pub(crate) async fn fail(self, outcome: JobOutcome) {
-        self.completion.complete(outcome).await;
+        let id = self.id;
+        let (jobs, _) = self.into_owned();
+        // The caller may disappear at the next await, but completion may not.
+        let _ = spawn_completion(jobs, id, async move { outcome }).await;
     }
 
     pub(crate) async fn start_supervised<F>(self, future: F) -> Result<(), JobError>
     where
         F: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
-        self.completion.start(future, "tool handler panicked").await
-    }
-
-    /// Manager-operation fixtures deliberately have no actual startup worker.
-    #[cfg(test)]
-    pub(crate) fn into_test_id(self) -> JobId {
-        self.into_test_fixture().id()
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_test_fixture(mut self) -> Self {
-        self.completion.jobs.take();
-        self
-    }
-}
-
-/// The only authority to supervise and finalize this invocation.
-pub(super) struct CompletionPermit {
-    jobs: Option<JobManager>,
-    id: JobId,
-    cancellation: CancellationToken,
-}
-
-impl CompletionPermit {
-    pub(super) fn new(jobs: JobManager, id: JobId, cancellation: CancellationToken) -> Self {
-        Self {
-            jobs: Some(jobs),
-            id,
-            cancellation,
-        }
-    }
-
-    async fn complete(mut self, outcome: JobOutcome) {
-        let jobs = self
-            .jobs
-            .take()
-            .expect("completion permit is consumed once");
-        // The caller may disappear at the next await, but completion may not.
-        let _ = spawn_completion(jobs, self.id, async move { outcome }).await;
+        self.start(future, "tool handler panicked").await
     }
 
     pub(super) async fn start<F>(
-        mut self,
+        self,
         future: F,
         panic_message: &'static str,
     ) -> Result<(), JobError>
@@ -109,35 +186,34 @@ impl CompletionPermit {
         F: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
     {
         let worker = WorkerGuard(tokio::spawn(future));
-        let jobs = self
-            .jobs
-            .as_ref()
-            .expect("completion permit is consumed once");
-        jobs.attach_task(self.id, worker.abort_handle()).await?;
-        let jobs = self
-            .jobs
-            .take()
-            .expect("completion permit is consumed once");
+        self.owned()
+            .0
+            .attach_task(self.id, worker.abort_handle())
+            .await?;
+        let id = self.id;
+        let (jobs, _) = self.into_owned();
         // No suspension point between relinquishing the permit and supervising.
-        spawn_completion(jobs, self.id, async move {
+        spawn_completion(jobs, id, async move {
             match worker.join().await {
                 Ok(Ok(output)) => JobOutcome::Completed(output),
                 Ok(Err(error)) => error.into(),
-                Err(error) if error.is_cancelled() => ToolError::Cancelled.into(),
-                Err(_) => ToolError::Failed(panic_message.to_owned()).into(),
+                Err(error) if error.is_cancelled() => ToolError::cancelled().into(),
+                Err(_) => ToolError::failed(panic_message).into(),
             }
         });
         Ok(())
     }
 }
 
-impl Drop for CompletionPermit {
+impl Drop for JobWorker {
     fn drop(&mut self) {
-        let Some(jobs) = self.jobs.take() else { return };
-        self.cancellation.cancel();
+        let Some((jobs, cancellation)) = self.owned.take() else {
+            return;
+        };
+        cancellation.cancel();
         // Outside a running runtime only cancellation is possible; replay recovers.
         if tokio::runtime::Handle::try_current().is_ok() {
-            spawn_completion(jobs, self.id, async { ToolError::Cancelled.into() });
+            spawn_completion(jobs, self.id, async { ToolError::cancelled().into() });
         }
     }
 }
@@ -223,7 +299,10 @@ impl<T> Drop for WorkerGuard<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{JobError, JobId, JobManager, JobSpec, JobState};
+    use crate::{
+        job::{JobError, JobId, JobManager, JobSpec, JobState},
+        tool::policy::CapabilitySet,
+    };
     use std::time::Duration;
     use tokio::sync::oneshot;
 
@@ -268,33 +347,48 @@ mod tests {
             .unwrap();
     }
 
-    /// Every startup obligation is consumed exactly once: abandonment cancels,
-    /// explicit failure and supervised panics fail, and a terminal result stays.
+    /// Every startup obligation is consumed exactly once: abandonment at any
+    /// stage cancels, explicit failure and supervised panics fail, and a job
+    /// finished underneath its lease can neither advance nor attach.
     #[tokio::test]
     async fn startup_obligations_settle_through_the_drained_owner() {
         for (tool, expected, error) in [
             ("abandoned", JobState::Cancelled, None),
+            ("abandoned-approving", JobState::Cancelled, None),
+            ("abandoned-running", JobState::Cancelled, None),
             ("rejected", JobState::Failed, Some("startup rejected")),
             ("panic", JobState::Failed, Some("tool handler panicked")),
             ("terminal", JobState::Completed, None),
+            ("terminal-running", JobState::Completed, None),
         ] {
             let (_root, jobs, lease, id) = leased(tool).await;
             let cancellation = lease.cancellation_token();
             match tool {
                 "abandoned" => drop(lease),
+                "abandoned-approving" => drop(lease.await_approval().await.unwrap()),
+                "abandoned-running" => drop(lease.test_run().await),
                 "rejected" => {
                     lease
-                        .fail(ToolError::Failed("startup rejected".into()).into())
+                        .fail(ToolError::failed("startup rejected").into())
                         .await
                 }
-                "panic" => lease
-                    .start_supervised(async { panic!("handler panic") })
-                    .await
-                    .unwrap(),
+                "panic" => {
+                    let (_input, worker) = lease.test_run().await.split();
+                    worker
+                        .start_supervised(async { panic!("handler panic") })
+                        .await
+                        .unwrap();
+                }
+                "terminal" => {
+                    jobs.test_finish(id, serde_json::json!(42)).await;
+                    let approving = lease.await_approval().await;
+                    assert!(matches!(approving, Err(JobError::AlreadyTerminal(_))));
+                }
                 _ => {
+                    let (_input, worker) = lease.test_run().await.split();
                     jobs.test_finish(id, serde_json::json!(42)).await;
                     let output = async { Ok(ToolOutput::new(serde_json::json!(0))) };
-                    let started = lease.start_supervised(output).await;
+                    let started = worker.start_supervised(output).await;
                     assert!(matches!(started, Err(JobError::AlreadyTerminal(_))));
                 }
             }
@@ -304,15 +398,14 @@ mod tests {
             if let Some(error) = error {
                 assert!(
                     result
-                        .error
-                        .as_deref()
+                        .rendered_error(&CapabilitySet::default())
                         .is_some_and(|message| message.contains(error))
                 );
             }
             if tool == "rejected" {
                 assert!(!cancellation.is_cancelled());
             }
-            if tool == "abandoned" {
+            if tool.starts_with("abandoned") {
                 assert_eq!(state(&jobs.test_replay().await, id).await, expected);
             }
         }
@@ -321,16 +414,13 @@ mod tests {
     #[tokio::test]
     async fn supervisor_drain_waits_for_worker_and_finalization() {
         let (_root, jobs, lease, id) = leased("supervised").await;
-        jobs.transition(id, JobState::AwaitingApproval)
-            .await
-            .unwrap();
-        jobs.transition(id, JobState::Running).await.unwrap();
+        let (_input, worker) = lease.test_run().await.split();
         let (release, released) = oneshot::channel();
         let work = async move {
             released.await.unwrap();
             Ok(ToolOutput::new(serde_json::json!({"done": true})))
         };
-        lease.start_supervised(work).await.unwrap();
+        worker.start_supervised(work).await.unwrap();
         assert!(
             tokio::time::timeout(Duration::from_millis(10), jobs.drain_supervisors())
                 .await
@@ -344,10 +434,11 @@ mod tests {
     #[tokio::test]
     async fn cancelling_start_during_attachment_aborts_and_finalizes() {
         let (_root, jobs, lease, id) = leased("attachment").await;
+        let (_input, worker) = lease.test_run().await.split();
         let map = jobs.inner.jobs.lock().await;
         let (started, starting) = oneshot::channel();
         let (stopped, stopping) = oneshot::channel();
-        let start = tokio::spawn(lease.start_supervised(async move {
+        let start = tokio::spawn(worker.start_supervised(async move {
             let _stopped = Stopped(Some(stopped));
             let _ = started.send(());
             std::future::pending::<Result<ToolOutput, ToolError>>().await

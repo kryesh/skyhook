@@ -96,13 +96,13 @@ impl App {
             mode: self.remembered_mode.clone(),
             sidebar: self.sidebar,
         };
-        let mut app = Self::new(observation, launch, saved, tx);
+        let mut app = Self::new(observation, launch, self.mode.clone(), saved, tx);
         if draft {
             app.model.clone_from(&self.model);
-            // A session can hold a mode the configuration, and so a draft, no longer has.
-            if app.modes().contains_key(&self.mode) {
-                app.mode.clone_from(&self.mode);
-            }
+        }
+        // A session can hold a mode the configuration, and so a draft, no longer has.
+        if !app.modes().contains_key(&app.mode) {
+            app.mode = app.launch.model.config().default_mode().to_owned();
         }
         app
     }
@@ -117,7 +117,7 @@ impl App {
             attention: !self.prompts.is_empty()
                 || matches!(
                     self.snapshot.activity.get(root),
-                    Some(AgentActivity::Failed(_))
+                    Some(AgentActivity::Stopped(failure)) if *failure != TurnFailure::Interrupted
                 ),
             working: !self.stopping && self.active_work(),
         }
@@ -138,7 +138,7 @@ mod tests {
         assert!(app.busy());
         app.snapshot
             .activity
-            .insert(agent, AgentActivity::Interrupted);
+            .insert(agent, AgentActivity::Stopped(TurnFailure::Interrupted));
         assert!(!app.busy());
     }
 }

@@ -41,23 +41,18 @@ mod tests {
 
     fn request() -> ModelRequest {
         ModelRequest {
-            model: "test".into(),
             system: vec![SystemSegment {
                 text: "system".into(),
                 cache: true,
             }],
-            history: Vec::new(),
-            tail: Vec::new(),
-            history_lifetime: HistoryLifetime::Extends,
             tools: vec![ToolDefinition {
                 name: "test".into(),
                 description: "description".into(),
                 input_schema: serde_json::json!({"type":"object"}),
             }],
-            response_schema: None,
             reasoning: Some("medium".into()),
             max_output_tokens: Some(64),
-            blobs: Default::default(),
+            ..ModelRequest::test("test")
         }
     }
 

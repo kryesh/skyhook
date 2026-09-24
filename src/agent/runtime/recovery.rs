@@ -22,13 +22,13 @@ impl SessionRuntime {
     pub(super) async fn recover_model_failure(
         &self,
         turn: &TurnContext<'_>,
-        request: u64,
-        (attempt, transient): (u64, &mut u64),
+        (attempt, transient): (crate::session::AttemptRef, &mut u64),
         usage: Usage,
         error: crate::provider::ProviderError,
     ) -> Result<Option<crate::provider::ProviderError>, HarnessError> {
         let kind = crate::session::ModelFailureKind::Error;
-        self.record_model_failure(turn.agent, request, attempt, usage, error.to_string(), kind)
+        let failure = self
+            .record_model_failure(turn.agent, attempt, usage, error.to_string(), kind)
             .await?;
         if !error.is_retryable() {
             return Ok(Some(error));
@@ -39,10 +39,8 @@ impl SessionRuntime {
         *transient = transient.saturating_add(1);
         let delay = recovery_delay(&error, *transient);
         let scheduled = SessionEvent::ModelRecoveryScheduled {
-            request,
-            attempt: attempt.saturating_add(1),
+            failure,
             delay_millis: u64::try_from(delay.as_millis()).unwrap_or(u64::MAX),
-            error: error.to_string(),
         };
         self.store.append(turn.agent.clone(), scheduled).await?;
         tokio::select! {
@@ -51,46 +49,44 @@ impl SessionRuntime {
         }
     }
 
-    /// Journal a failed attempt with its observed usage. A refusal is journaled like
-    /// any other failure; its kind keeps it out of automatic recovery.
+    /// Journal a failed attempt with its observed usage; returns the failure's
+    /// sequence. A refusal is journaled like any other failure; its kind keeps it
+    /// out of automatic recovery.
     pub(super) async fn record_model_failure(
         &self,
         agent: &AgentId,
-        request: u64,
-        attempt: u64,
+        attempt: crate::session::AttemptRef,
         usage: Usage,
         error: String,
         kind: crate::session::ModelFailureKind,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<RecordSeq, HarnessError> {
         // Observed usage and the attempt's outcome commit together.
         let mut events = Vec::new();
         if usage != Usage::default() {
-            let request = Some(request);
+            let request = attempt.request;
             events.push((agent.clone(), SessionEvent::Usage { request, usage }));
         }
         let failed = SessionEvent::ModelFailed {
-            request,
             attempt,
             error,
             kind,
         };
         events.push((agent.clone(), failed));
-        self.store.append_all(events).await?;
+        let records = self.store.append_all(events).await?;
         self.usage.lock().await.accumulate(usage);
-        Ok(())
+        Ok(records.last().expect("one record per event").sequence)
     }
 
     /// Close an attempt cancelled before it produced an outcome.
     pub(super) async fn record_attempt_interrupted(
         &self,
         agent: &AgentId,
-        request: u64,
-        attempt: u64,
+        attempt: crate::session::AttemptRef,
     ) -> Result<(), HarnessError> {
         self.store
             .append(
                 agent.clone(),
-                SessionEvent::ModelAttemptInterrupted { request, attempt },
+                SessionEvent::ModelAttemptInterrupted(attempt),
             )
             .await?;
         Ok(())
@@ -99,17 +95,11 @@ impl SessionRuntime {
     pub(super) async fn record_model_usage(
         &self,
         agent: &AgentId,
-        request: u64,
+        request: RequestSeq,
         usage: Usage,
     ) -> Result<(), HarnessError> {
         self.store
-            .append(
-                agent.clone(),
-                SessionEvent::Usage {
-                    request: Some(request),
-                    usage,
-                },
-            )
+            .append(agent.clone(), SessionEvent::Usage { request, usage })
             .await?;
         self.usage.lock().await.accumulate(usage);
         Ok(())
@@ -125,9 +115,9 @@ mod tests {
 
     use super::*;
     use crate::agent::runtime::tests::{
-        Requests, Script, Served, Step, bounded, child_launch, count, delta, enqueue_prompts,
-        events, owner, poll, response, shutdown_session, stream, summary_json, test_builder,
-        test_harness, tool_call, usage,
+        Requests, Script, Sent, SentPart, Served, Step, bounded, child_launch, count, delta,
+        enqueue_prompts, events, owner, poll, response, shutdown_session, stream, summary_json,
+        test_builder, test_harness, tool_call, usage,
     };
     use crate::provider::{
         Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
@@ -228,7 +218,7 @@ mod tests {
 
         /// Root history as JSON, plus its number of assistant messages.
         fn history(&self, records: &[EventRecord]) -> (String, usize) {
-            let history = project_history(records, &self.session.root).unwrap();
+            let history = project_history(records, &self.session.root).messages;
             let assistants = history
                 .iter()
                 .filter(|(_, message)| matches!(message, Message::Assistant(_)));
@@ -237,35 +227,46 @@ mod tests {
         }
     }
 
-    fn recoveries(records: &[EventRecord]) -> Vec<(u64, u64, u64, String)> {
-        events!(records, SessionEvent::ModelRecoveryScheduled { request, attempt, delay_millis, error }
-            => (*request, *attempt, *delay_millis, error.clone()))
+    /// Every scheduled recovery as (request, next attempt, delay, error) of its failure.
+    fn recoveries(records: &[EventRecord]) -> Vec<(RequestSeq, u64, u64, String)> {
+        records
+            .iter()
+            .filter_map(|record| match &record.event {
+                SessionEvent::ModelRecoveryScheduled {
+                    failure,
+                    delay_millis,
+                } => {
+                    let failed = records.iter().find(|record| record.sequence == *failure)?;
+                    let SessionEvent::ModelFailed { attempt, error, .. } = &failed.event else {
+                        panic!("recovery {} names no failure", record.sequence);
+                    };
+                    let next = attempt.attempt + 1;
+                    Some((attempt.request, next, *delay_millis, error.clone()))
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     fn assert_schedule(records: &[EventRecord], expected_attempts: &[u64]) {
         let scheduled = recoveries(records);
         let attempts = scheduled.iter().map(|entry| entry.1).collect::<Vec<_>>();
         assert_eq!(attempts, expected_attempts);
-        let mut transient_attempts = std::collections::HashMap::<u64, u64>::new();
+        let mut transient_attempts = std::collections::HashMap::<RequestSeq, u64>::new();
         for (request, _attempt, delay, error) in scheduled {
             let transient = transient_attempts.entry(request).or_default();
             *transient += 1;
             let expected = recovery_delay(&recoverable(), *transient).as_millis() as u64;
             assert_eq!(delay, expected);
             assert_eq!(error, recoverable().to_string());
-            let requested = records.iter().filter(|record| record.sequence == request);
-            assert_eq!(
-                count!(
-                    requested,
-                    SessionEvent::ModelRequested {
-                        purpose: ModelPurpose::Agent,
-                        ..
-                    }
-                ),
-                1
-            );
+            let requested = crate::session::record_at(records, request.into()).unwrap();
+            let context = crate::session::request_context(requested, |sequence| {
+                crate::session::record_at(records, sequence)
+            });
+            let purpose = context.expect("recovery names no request").purpose;
+            assert_eq!(purpose, ModelPurpose::Agent);
             assert_ne!(
-                count!(records, SessionEvent::ModelFailed { request: failed, error: failure, .. } if *failed == request && failure == &error),
+                count!(records, SessionEvent::ModelFailed { attempt, error: failure, .. } if attempt.request == request && failure == &error),
                 0
             );
         }
@@ -318,7 +319,7 @@ mod tests {
             file: Some(fixture.workspace.path().join("evidence.png")),
             image: crate::tests::png(b"request image fixture"),
         };
-        let (images, options) = ([image], PromptOptions::default());
+        let (images, options) = ([image], Selection::default());
         let started = tokio::time::Instant::now();
         let prompt = fixture
             .session
@@ -336,8 +337,8 @@ mod tests {
         // The retry uses the frozen hydrated request on the same context.
         assert_eq!(requests[0], requests[1]);
         assert!(requests[0].messages().any(|message| matches!(message,
-            Message::User(blocks) if blocks.iter().any(|block| matches!(block,
-                UserContent::Attachment { attachment: crate::media::AttachmentRef::Image(image) }
+            Sent::User(blocks) if blocks.iter().any(|block| matches!(block,
+                SentPart::Attachment { attachment: crate::media::AttachmentRef::Image(image) }
                     if requests[0].blobs.get(&image.blob).is_ok())))));
         assert_eq!(fixture.script.opened.load(Ordering::SeqCst), 1);
         let (history, assistants) = fixture.history(&records);
@@ -366,7 +367,7 @@ mod tests {
         assert_eq!(written, "committed");
         let records = fixture.records().await;
         let failed_request = recoveries(&records)[0].0;
-        let failed_usage = events!(&records, SessionEvent::Usage { request: Some(request), usage } if *request == failed_request => *usage);
+        let failed_usage = events!(&records, SessionEvent::Usage { request, usage } if *request == failed_request => *usage);
         // failed usage and successful usage must each be recorded exactly once
         assert_eq!(failed_usage, [observed_usage, Usage::default()]);
         assert_eq!(fixture.session.usage().await, observed_usage);
@@ -380,7 +381,7 @@ mod tests {
         assert!(
             requests[2]
                 .messages()
-                .any(|message| matches!(message, Message::Tool(_)))
+                .any(|message| matches!(message, Sent::Tool(_)))
         );
         assert_schedule(&records, &[2]);
         fixture.session.shutdown().await.unwrap();
@@ -404,7 +405,7 @@ mod tests {
         assert!(requests[3..].windows(2).all(|pair| pair[0] == pair[1]));
         assert_ne!(requests[2], requests[3]);
         for request in &requests[3..] {
-            let tool = |message: &&Message| matches!(message, Message::Tool(_));
+            let tool = |message: &&Sent| matches!(message, Sent::Tool(_));
             assert_eq!(request.messages().filter(tool).count(), 1);
         }
         let records = fixture.records().await;
@@ -428,11 +429,13 @@ mod tests {
         let records = fixture.records().await;
         let requested = count!(&records, SessionEvent::ModelRequested { .. });
         assert_eq!(requested, 1, "one frozen logical request across retries");
-        let started = events!(&records, SessionEvent::ModelAttemptStarted { request, attempt } => (*request, *attempt));
+        let started = events!(&records, SessionEvent::ModelAttemptStarted(attempt) => (attempt.request, attempt.attempt));
         let request = started[0].0;
         let attempts = (1..=failures as u64 + 1).map(|attempt| (request, attempt));
         assert_eq!(started, attempts.collect::<Vec<_>>());
-        let at_request = records.iter().filter(|record| record.sequence == request);
+        let at_request = records
+            .iter()
+            .filter(|record| record.sequence == RecordSeq::from(request));
         assert_eq!(count!(at_request, SessionEvent::ModelRequested { .. }), 1);
         assert_schedule(&records, &(2..=failures as u64 + 1).collect::<Vec<_>>());
         assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), failures);
@@ -554,7 +557,7 @@ mod tests {
         let sender = session.runtime.spawn_agent(launch).await.unwrap();
         let mut events = session.runtime.events.observe().updates;
         let (done, received) = oneshot::channel();
-        let content = vec![UserContent::Text {
+        let content = vec![UserPart::Text {
             text: "recover".into(),
         }];
         let input = AgentCommand::Input {
@@ -570,7 +573,7 @@ mod tests {
         assert_eq!(received.unwrap().unwrap().unwrap(), "child recovered");
         while let Ok(event) = events.try_recv() {
             assert!(
-                !matches!(event.event, RuntimeEvent::Activity { agent, activity: AgentActivity::Failed(_) } if agent == child)
+                !matches!(event.event, RuntimeEvent::Activity { agent, activity: AgentActivity::Stopped(_) } if agent == child)
             );
         }
         let requests = fixture.requests();
@@ -716,10 +719,10 @@ mod tests {
                 let started = async move {
                     // A separate reader sees only committed transactions.
                     let records = SessionStore::read_records(&root, session).await.unwrap();
-                    let SessionEvent::ModelAttemptStarted {
+                    let SessionEvent::ModelAttemptStarted(crate::session::AttemptRef {
                         request: sequence,
                         attempt: 1,
-                    } = records.last().unwrap().event
+                    }) = records.last().unwrap().event
                     else {
                         panic!("attempt start must be durable before invocation");
                     };

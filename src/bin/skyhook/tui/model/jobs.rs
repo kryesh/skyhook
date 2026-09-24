@@ -240,7 +240,7 @@ mod tests {
         let call = ("exec", None, Some(&result));
         let kept = serde_json::json!({"result": {"items": [null, {"keep": false}]}});
         for entry in [
-            call_entry(EntryKey::Record(1), call, &agent, &projection, true),
+            call_entry(EntryKey::UnsavedStatus(0), call, &agent, &projection, true),
             job_entry(&job, &projection, &View::default(), &outputs, true),
         ] {
             assert!(!entry.text().contains("absent") && !entry.text().contains("\"error\""));
@@ -280,7 +280,10 @@ mod tests {
             for target in ["root", "build-host"] {
                 let job = JobInfo {
                     args: serde_json::json!({"argv": ["echo", "Failed @fake Completed"]}),
-                    location: ExecutionLocation::named(target, "/workspace".into()),
+                    location: ExecutionLocation {
+                        target: target.parse().unwrap(),
+                        workspace: "/workspace".into(),
+                    },
                     error: Some("Failure details\nsecond line".into()),
                     ..job_info(&root(1), 42, JobRole::Tool, state)
                 };
@@ -360,7 +363,13 @@ mod tests {
             ToolCall::new("call", "agent", serde_json::json!({"target": "build-host"})).unwrap();
         for open in [false, true] {
             let fields = (call.name(), Some(call.arguments()), None);
-            let entry = call_entry(EntryKey::Record(1), fields, &agent, &projection, open);
+            let entry = call_entry(
+                EntryKey::UnsavedStatus(0),
+                fields,
+                &agent,
+                &projection,
+                open,
+            );
             let header = entry.header().unwrap();
             let arrow = if open { "▾" } else { "▸" };
             assert_eq!(header_text(header), format!("{arrow} agent @build-host"));

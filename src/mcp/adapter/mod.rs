@@ -8,8 +8,9 @@ use super::manager::McpManager;
 use crate::{
     session::SessionStore,
     tool::{
-        RegistryError, ToolOptions, ToolPlacement, ToolRegistryBuilder,
+        RegistryError, ToolContext, ToolOptions, ToolPlacement, ToolRegistryBuilder,
         policy::{Capability, ResourceId},
+        registry::Invocation,
     },
 };
 use arguments::Arguments;
@@ -32,21 +33,19 @@ pub fn register(
         let server = discovered.server.as_str();
         let tool = &discovered.tool;
         let adapted = match Arguments::new(Value::Object((*tool.input_schema).clone())) {
-            Ok(arguments) => Arc::new(arguments),
+            Ok(arguments) => arguments,
             Err(error) => {
                 warnings.push(format!("MCP tool {server}/{} skipped: {error}", tool.name));
                 continue;
             }
         };
-        let validator = adapted.clone();
         let options = ToolOptions::new(discovered.capabilities.clone())
             .requires(Capability::Mcp)
             .preserve_required()
             .preserve_schema_dialect()
             .background()
             .placement(ToolPlacement::Host)
-            .permission_resource(ResourceId::mcp(server, tool.name.as_ref()))
-            .argument_validator(move |value| validator.validate(value));
+            .permission_resource(ResourceId::mcp(server, tool.name.as_ref()));
         let manager = manager.clone();
         let store = store.clone();
         let server = server.to_owned();
@@ -60,19 +59,18 @@ pub fn register(
                 ""
             },
         );
-        if let Err(error) = builder.register_dynamic(
+        if let Err(error) = builder.register_admission(
             name,
             description,
             adapted.schema.clone(),
             options,
-            move |context, value| {
+            move |value| {
+                let arguments = adapted.admit(value)?;
                 let manager = manager.clone();
                 let store = store.clone();
-                let server = server.to_owned();
+                let server = server.clone();
                 let upstream_name = upstream_name.clone();
-                let adapted = adapted.clone();
-                async move {
-                    let arguments = adapted.extract(&value)?.clone();
+                Ok(Invocation::new(move |context: ToolContext| async move {
                     let result = manager
                         .call(
                             &server,
@@ -82,7 +80,7 @@ pub fn register(
                         )
                         .await?;
                     map_result(result, &store).await
-                }
+                }))
             },
         ) {
             let error = match error {
@@ -134,7 +132,7 @@ for line in sys.stdin:
     }
 
     #[tokio::test]
-    async fn registration_dispatch_capabilities_permissions_and_preapproval_validation() {
+    async fn registration_dispatch_capabilities_and_permissions() {
         let runtime = TestRuntime::new().await;
         let config = serde_json::from_value(json!({
             "transport":"stdio", "start_command":["python3","-u","-c",FIXTURE],
@@ -185,16 +183,14 @@ for line in sys.stdin:
                 .is_err()
         );
         assert!(policy.requests.lock().unwrap().is_empty());
+        // Upstream-schema rejection is an admission failure: like a typed tool,
+        // it fails its own approved job rather than being refused up front.
         for invalid in [json!({"count":"bad"}), json!({})] {
             assert!(
                 executor
                     .execute(agent(), native, invalid, None)
                     .await
                     .is_err()
-            );
-            assert!(
-                policy.requests.lock().unwrap().is_empty(),
-                "invalid or defaulted required input must not request approval"
             );
         }
         let arguments = |output: &Value| output["structuredContent"]["arguments"].clone();

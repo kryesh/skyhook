@@ -1,7 +1,7 @@
 //! One presentation boundary for manager products and historical wire output.
 use super::preview::{PreviewView, wire_continuation};
 use serde_json::Value;
-use skyhook::job::PresentedOutput;
+use skyhook::job::{FieldPointer, PresentedOutput};
 
 /// The manager's projection stays authoritative; products and historical wire
 /// output share one adapter that validates its preview shape once, not on
@@ -76,7 +76,7 @@ impl OutputView {
 
     /// Next saved-source page, in owner order: selected preview, first
     /// truncation, then first captured-read preview with a continuation.
-    pub fn continuation(&self) -> Option<(&str, usize, usize)> {
+    pub fn continuation(&self) -> Option<(FieldPointer, usize, usize)> {
         self.shape
             .preview
             .as_ref()
@@ -133,6 +133,9 @@ mod tests {
                 value["presentation"].as_object_mut().unwrap().remove(key);
             }
             let output = OutputView::historical(value.clone());
+            let expected = expected.map(|(field, start, offset)| {
+                (field.parse::<FieldPointer>().unwrap(), start, offset)
+            });
             assert_eq!(output.continuation(), expected);
             assert_eq!(output.value(), &value);
             let mut document = super::super::Document::default();

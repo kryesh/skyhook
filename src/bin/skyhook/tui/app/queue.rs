@@ -1,5 +1,5 @@
 use super::*;
-use skyhook::agent::{HarnessError, PromptOptions, QueuedPrompt, QueuedPromptCancellation};
+use skyhook::agent::{HarnessError, QueuedPrompt, QueuedPromptCancellation};
 use skyhook::session::SessionError;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -123,22 +123,20 @@ impl App {
                 .keys()
                 .next_back()
                 .copied()
-                .unwrap_or(0),
+                .unwrap_or_default(),
         ));
         let tx = self.tx.clone();
         let status = self.status.clone();
         tokio::spawn(async move {
             status.flush().await;
-            let result = session
-                .prompt_with_options(
-                    text,
-                    &attachments,
-                    skyhook::agent::PromptOptions {
-                        model: Some(model),
-                        mode: Some(mode),
-                    },
-                )
-                .await;
+            let result = match session.selection(Some(&model), Some(&mode)) {
+                Ok(selection) => {
+                    session
+                        .prompt_with_options(text, &attachments, selection)
+                        .await
+                }
+                Err(error) => Err(error),
+            };
             let _ = tx.send(Work::Done {
                 result: result.map(|_| ()).map_err(|e| e.to_string()),
             });
@@ -211,10 +209,19 @@ impl App {
             return;
         }
         let mut deliveries = Vec::new();
+        let mut rejected = None;
         for input in self.queue.iter_mut().take_while(|input| !input.unknown) {
             if input.in_flight.is_some() {
                 continue;
             }
+            // A row the session cannot take holds itself and the rows behind it back.
+            let options = match session.selection(Some(&input.model), Some(&input.mode)) {
+                Ok(options) => options,
+                Err(error) => {
+                    rejected = Some(error);
+                    break;
+                }
+            };
             let cancellation = QueuedPromptCancellation::default();
             input.generation = input.generation.wrapping_add(1);
             input.in_flight = Some(cancellation.clone());
@@ -224,13 +231,16 @@ impl App {
                 prompt: QueuedPrompt {
                     text: input.submission.text.clone(),
                     attachments: input.submission.attachments.clone(),
-                    options: PromptOptions {
-                        model: Some(input.model.clone()),
-                        mode: Some(input.mode.clone()),
-                    },
+                    options,
                     cancellation,
                 },
             });
+        }
+        if let Some(error) = rejected {
+            self.paused = true;
+            self.notice(format!(
+                "Queued message was not submitted: {error}. Resume to retry."
+            ));
         }
         if deliveries.is_empty() {
             return;
@@ -354,7 +364,7 @@ mod tests {
     use super::super::tests::*;
     use super::*;
     use skyhook::identity::EventId;
-    use skyhook::provider::protocol::UserContent;
+    use skyhook::session::{RecordSeq, UserPart};
 
     type Deliveries = mpsc::UnboundedReceiver<Vec<QueueDelivery>>;
 
@@ -422,7 +432,13 @@ mod tests {
             (vec!["first"], vec!["second"])
         );
         assert_eq!(first[0].prompt.attachments, [png_attachment("first.png")]);
-        assert_eq!(first[0].prompt.options.model.as_deref(), Some("first"));
+        let model = first[0]
+            .prompt
+            .options
+            .model
+            .as_ref()
+            .map(|model| model.name());
+        assert_eq!(model, Some("first"));
         assert!(app.queue.iter().all(|input| input.in_flight.is_some()));
         assert!(app.history.is_empty());
 
@@ -505,7 +521,7 @@ mod tests {
             identity: skyhook::session::AppendIdentity {
                 event: EventId::generate().unwrap(),
                 session: app.session_id().unwrap(),
-                sequence: 1,
+                sequence: RecordSeq::default(),
             },
             reason: "lost".into(),
         });
@@ -590,16 +606,17 @@ mod tests {
     async fn queue_waits_for_the_initial_input_to_commit() {
         let (_root, mut app, mut deliveries) = queue_fixture().await;
         let root = app.root_agent().clone();
-        app.initial_input = Some((root.clone(), 0));
+        app.initial_input = Some((root.clone(), RecordSeq::default()));
         app.submit("followup".into());
         app.tick();
         assert!(deliveries.try_recv().is_err());
-        let mut committed = app.snapshot.records.values().next_back().unwrap().clone();
-        committed.sequence += 1;
-        committed.id = EventId::generate().unwrap();
         let text = "initial".into();
-        let message = skyhook::provider::protocol::Message::User(vec![UserContent::Text { text }]);
-        committed.event = SessionEvent::MessageCommitted { message };
+        let message = skyhook::session::Message::User(vec![UserPart::Text { text }]);
+        let store = app.session().unwrap().store();
+        let committed = store
+            .append(root.clone(), SessionEvent::MessageCommitted { message })
+            .await
+            .unwrap();
         // Only a later user record from the bound root releases the gate.
         let mut other = committed.clone();
         other.agent = AgentId::root(SessionId::generate().unwrap());
@@ -612,7 +629,7 @@ mod tests {
         }
         app.initial_input = Some((root.clone(), committed.sequence));
         assert!(!observe_initial_input(&mut app.initial_input, &committed));
-        app.initial_input = Some((root, 0));
+        app.initial_input = Some((root, RecordSeq::default()));
         app.observe(ObservedEvent {
             revision: app.snapshot.revision + 1,
             event: RuntimeEvent::Record(Box::new(committed)),

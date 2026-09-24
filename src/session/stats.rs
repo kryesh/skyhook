@@ -1,6 +1,5 @@
 //! Per-agent and per-model accounting over a session journal: where tokens went,
 //! how model requests ended, what was delegated, and which tools were called.
-
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     fmt::Write as _,
@@ -12,8 +11,11 @@ use serde::Serialize;
 use crate::{
     identity::{AgentId, JobId, SessionId},
     job::JobRole,
-    provider::protocol::{Message, Usage, UserContent},
-    session::{EventRecord, ModelPurpose, SessionEvent},
+    provider::protocol::Usage,
+    session::{
+        EventRecord, Message, ModelPurpose, RecordSeq, RequestLedger, RequestPhase, SessionEvent,
+        UserPart,
+    },
 };
 
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -44,12 +46,11 @@ pub struct AgentStats {
     pub model: Option<String>,
     pub parent: Option<String>,
     pub owner_job: Option<JobId>,
-    /// A new model request after any of these makes the agent running again.
+    /// The agent's final completion, interruption, or failure, with its time. A later
+    /// model request makes the agent running again, so a resumed child reports only
+    /// its last one.
     pub outcome: AgentOutcome,
     pub started: DateTime<Utc>,
-    /// The agent's final completion, interruption, or failure. Later model requests
-    /// clear it, so a resumed child reports only its last one.
-    pub finished: Option<DateTime<Utc>>,
     /// Every usage report of the agent, including compaction requests.
     pub usage: Usage,
     pub requests: RequestStats,
@@ -67,15 +68,33 @@ pub struct AgentStats {
 pub enum AgentOutcome {
     #[default]
     Running,
-    Completed,
-    Interrupted,
+    Completed {
+        at: DateTime<Utc>,
+    },
+    Interrupted {
+        at: DateTime<Utc>,
+    },
     Failed {
+        at: DateTime<Utc>,
         error: String,
     },
 }
 
+impl AgentOutcome {
+    #[must_use]
+    pub fn finished_at(&self) -> Option<DateTime<Utc>> {
+        match self {
+            Self::Running => None,
+            Self::Completed { at } | Self::Interrupted { at } | Self::Failed { at, .. } => {
+                Some(*at)
+            }
+        }
+    }
+}
+
 /// Agent-purpose model requests. A request counts once, by its last outcome; one
-/// still open at the end of the journal counts under none of the outcomes.
+/// still open at the end of the journal counts under none of the outcomes, and one
+/// whose agent was interrupted while it was pending counts as interrupted.
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct RequestStats {
     pub requested: u64,
@@ -184,28 +203,11 @@ fn default_name(agent: &AgentId) -> String {
     format!("agent {}", agent_label(agent))
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Outcome {
-    Open,
-    Completed,
-    Failed,
-    Interrupted,
-}
-
-/// One journaled model request: whose it is, what for, on which profile, and how it ended.
-struct Request {
-    agent: AgentId,
-    purpose: ModelPurpose,
-    model: Option<String>,
-    outcome: Outcome,
-}
-
 /// Summarise a session's journal. The records must be in sequence order.
 #[must_use]
 pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStats {
     let mut agents: BTreeMap<AgentId, AgentStats> = BTreeMap::new();
-    let mut requests: HashMap<u64, Request> = HashMap::new();
-    let mut contexts: HashMap<u64, String> = HashMap::new();
+    let mut ledger = RequestLedger::default();
     let mut job_names: HashMap<JobId, String> = HashMap::new();
     // Tool calls without a result yet, per agent: call id to tool name.
     let mut open_calls: HashMap<AgentId, HashMap<String, String>> = HashMap::new();
@@ -214,20 +216,24 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     // agent completes or fails.
     let mut in_turn: HashSet<AgentId> = HashSet::new();
     // Committed assistant messages that called tools: their response continues the turn.
-    let mut calling_messages: HashSet<u64> = HashSet::new();
-    // The root's first user message, whether or not it carried text.
-    let mut initial_prompt: Option<Option<String>> = None;
-    for record in records {
-        let agent = &record.agent;
-        match &record.event {
+    let mut calling_messages: HashSet<RecordSeq> = HashSet::new();
+    // The text of the root's first user message, which may have carried none.
+    let initial_prompt = records
+        .iter()
+        .find_map(|record| match &record.event {
             SessionEvent::MessageCommitted {
                 message: Message::User(parts),
-            } if agent.path().is_empty() && initial_prompt.is_none() => {
-                initial_prompt = Some(parts.iter().find_map(|part| match part {
-                    UserContent::Text { text } => Some(text.clone()),
-                    _ => None,
-                }));
-            }
+            } if record.agent.path().is_empty() => Some(parts.iter().find_map(|part| match part {
+                UserPart::Text { text } => Some(text.clone()),
+                _ => None,
+            })),
+            _ => None,
+        })
+        .flatten();
+    for record in records {
+        ledger.observe(record);
+        let agent = &record.agent;
+        match &record.event {
             SessionEvent::AgentStarted {
                 owner_job, profile, ..
             } => {
@@ -248,66 +254,26 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     stats.model = Some(profile.name.clone());
                 }
             }
-            SessionEvent::ModelContext { context } => {
-                contexts.insert(record.sequence, context.profile.name.clone());
-            }
-            SessionEvent::ModelRequested {
-                context, purpose, ..
-            } => {
-                let model = contexts.get(context).cloned();
+            SessionEvent::ModelRequested { .. } => {
+                let Some(request) = ledger.get(record.sequence.request()) else {
+                    continue;
+                };
                 if let Some(stats) = agents.get_mut(agent) {
                     stats.outcome = AgentOutcome::Running;
-                    stats.finished = None;
-                    match purpose {
-                        ModelPurpose::Agent => stats.requests.requested += 1,
-                        ModelPurpose::Compaction => stats.compactions.requested += 1,
+                    if request.purpose == ModelPurpose::Compaction {
+                        stats.compactions.requested += 1;
                     }
                 }
-                if *purpose == ModelPurpose::Agent {
+                if request.purpose == ModelPurpose::Agent {
                     in_turn.insert(agent.clone());
-                    if let Some(model) = &model {
-                        models.entry(model.clone()).or_default().requests.requested += 1;
-                    }
-                }
-                requests.insert(
-                    record.sequence,
-                    Request {
-                        agent: agent.clone(),
-                        purpose: *purpose,
-                        model,
-                        outcome: Outcome::Open,
-                    },
-                );
-            }
-            SessionEvent::ModelAttemptStarted { request, .. } => {
-                if let Some(open) = requests.get_mut(request) {
-                    open.outcome = Outcome::Open;
-                    if open.purpose == ModelPurpose::Agent {
-                        if let Some(stats) = agents.get_mut(&open.agent) {
-                            stats.requests.attempts += 1;
-                        }
-                        if let Some(model) = &open.model {
-                            models.entry(model.clone()).or_default().requests.attempts += 1;
-                        }
-                    }
                 }
             }
-            SessionEvent::ModelFailed { request, .. } => {
-                settle(&mut requests, *request, Outcome::Failed);
-            }
-            SessionEvent::ModelAttemptInterrupted { request, .. } => {
-                settle(&mut requests, *request, Outcome::Interrupted);
-            }
-            SessionEvent::ResponseCompleted {
-                request, message, ..
-            } => {
-                settle(&mut requests, *request, Outcome::Completed);
-                if !message.is_some_and(|message| calling_messages.contains(&message)) {
+            SessionEvent::ResponseCompleted { message, .. } => {
+                if !calling_messages.contains(&RecordSeq::from(*message)) {
                     in_turn.remove(agent);
                 }
             }
             SessionEvent::Compaction { checkpoint } => {
-                settle(&mut requests, checkpoint.request, Outcome::Completed);
                 if let Some(stats) = agents.get_mut(agent) {
                     stats.compactions.completed += 1;
                     stats.compactions.before_tokens = stats
@@ -320,30 +286,19 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                         .saturating_add(checkpoint.after_tokens);
                 }
             }
-            SessionEvent::CompactionSkipped { request, .. } => {
-                settle(&mut requests, *request, Outcome::Completed);
+            SessionEvent::CompactionSkipped { .. } => {
                 if let Some(stats) = agents.get_mut(agent) {
                     stats.compactions.skipped += 1;
                 }
             }
-            SessionEvent::CompactionFailed { request, .. } => {
-                if let Some(request) = request {
-                    settle(&mut requests, *request, Outcome::Failed);
-                }
+            SessionEvent::CompactionFailed { .. } => {
                 if let Some(stats) = agents.get_mut(agent) {
                     stats.compactions.failed += 1;
                 }
             }
-            SessionEvent::Usage { request, usage } => {
-                let model = request
-                    .and_then(|request| requests.get(&request))
-                    .and_then(|request| request.model.clone())
-                    .or_else(|| agents.get(agent).and_then(|stats| stats.model.clone()));
+            SessionEvent::Usage { usage, .. } => {
                 if let Some(stats) = agents.get_mut(agent) {
                     stats.usage.accumulate(*usage);
-                }
-                if let Some(model) = model {
-                    models.entry(model).or_default().usage.accumulate(*usage);
                 }
             }
             SessionEvent::MessageCommitted {
@@ -380,7 +335,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                 job, role, name, ..
             } => {
                 if let Some(name) = name {
-                    job_names.insert(*job, name.clone());
+                    job_names.insert(*job, name.clone().into());
                 }
                 if let Some(stats) = agents.get_mut(agent) {
                     match role {
@@ -393,7 +348,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
             }
             SessionEvent::AgentCompleted => {
                 in_turn.remove(agent);
-                finish(&mut agents, record, AgentOutcome::Completed);
+                finish(&mut agents, record, |at| AgentOutcome::Completed { at });
             }
             SessionEvent::AgentInterrupted => {
                 // Shutdown interrupts every agent: one already finished stays so, an
@@ -404,9 +359,9 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     .is_some_and(|stats| stats.outcome == AgentOutcome::Running);
                 if mid_turn || unfinished {
                     let outcome = if !mid_turn && agent.path().is_empty() {
-                        AgentOutcome::Completed
+                        |at| AgentOutcome::Completed { at }
                     } else {
-                        AgentOutcome::Interrupted
+                        |at| AgentOutcome::Interrupted { at }
                     };
                     finish(&mut agents, record, outcome);
                 }
@@ -414,7 +369,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
             SessionEvent::AgentFailed { error } => {
                 in_turn.remove(agent);
                 let error = error.clone();
-                finish(&mut agents, record, AgentOutcome::Failed { error });
+                finish(&mut agents, record, |at| AgentOutcome::Failed { at, error });
             }
             _ => {}
         }
@@ -426,23 +381,26 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
             }
         }
     }
-    for request in requests.values() {
+    // The request's context names the profile, not the agent's current selection.
+    for (_, request) in ledger.iter() {
+        let model = models.entry(request.profile.name.clone()).or_default();
+        model.usage.accumulate(request.usage);
         if request.purpose != ModelPurpose::Agent {
             continue;
         }
-        let model = request
-            .model
-            .as_ref()
-            .map(|model| &mut models.entry(model.clone()).or_default().requests);
         let agent = agents
             .get_mut(&request.agent)
             .map(|stats| &mut stats.requests);
-        for stats in agent.into_iter().chain(model) {
-            match request.outcome {
-                Outcome::Open => {}
-                Outcome::Completed => stats.completed += 1,
-                Outcome::Failed => stats.failed += 1,
-                Outcome::Interrupted => stats.interrupted += 1,
+        for stats in agent.into_iter().chain([&mut model.requests]) {
+            stats.requested += 1;
+            stats.attempts += request.attempts;
+            match request.phase {
+                RequestPhase::Requested
+                | RequestPhase::Open { .. }
+                | RequestPhase::Retrying { .. } => {}
+                RequestPhase::Completed { .. } => stats.completed += 1,
+                RequestPhase::Failed { .. } | RequestPhase::Refused { .. } => stats.failed += 1,
+                RequestPhase::Interrupted { .. } => stats.interrupted += 1,
             }
         }
     }
@@ -484,7 +442,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     }
     SessionStats {
         session,
-        initial_prompt: initial_prompt.flatten(),
+        initial_prompt,
         started: time(records.first().map_or(0, |record| record.timestamp_millis)),
         finished: time(records.last().map_or(0, |record| record.timestamp_millis)),
         agents: agents.into_values().collect(),
@@ -498,16 +456,13 @@ fn time(millis: i64) -> DateTime<Utc> {
     DateTime::from_timestamp_millis(millis).unwrap_or_default()
 }
 
-fn settle(requests: &mut HashMap<u64, Request>, request: u64, outcome: Outcome) {
-    if let Some(open) = requests.get_mut(&request) {
-        open.outcome = outcome;
-    }
-}
-
-fn finish(agents: &mut BTreeMap<AgentId, AgentStats>, record: &EventRecord, outcome: AgentOutcome) {
+fn finish(
+    agents: &mut BTreeMap<AgentId, AgentStats>,
+    record: &EventRecord,
+    outcome: impl FnOnce(DateTime<Utc>) -> AgentOutcome,
+) {
     if let Some(stats) = agents.get_mut(&record.agent) {
-        stats.outcome = outcome;
-        stats.finished = Some(time(record.timestamp_millis));
+        stats.outcome = outcome(time(record.timestamp_millis));
     }
 }
 
@@ -516,11 +471,11 @@ mod tests {
     use super::*;
     use crate::{
         execution::ExecutionLocation,
-        job::{JobRole, JobState},
-        provider::protocol::{AssistantItem, HistoryLifetime, Outcome, ToolCall, ToolResult},
+        job::{JobEnd, JobRole},
+        provider::protocol::{AssistantItem, HistoryLifetime, ToolCall, ToolResult},
         session::{
-            ModelContext, ModelFailureKind, ModelPurpose, SessionEvent, fixture,
-            fixture::MemorySession,
+            AttemptRef, CompletedOutcome, MessageSeq, ModelContext, ModelFailureKind, ModelPurpose,
+            RequestSeq, SessionEvent, fixture, fixture::MemorySession,
         },
     };
     use serde_json::json;
@@ -533,32 +488,40 @@ mod tests {
         }
     }
 
-    fn context(name: &str) -> SessionEvent {
+    fn context_event(name: &str) -> SessionEvent {
         let mut profile = fixture::profile();
         profile.name = name.into();
         SessionEvent::ModelContext {
-            context: ModelContext {
-                purpose: ModelPurpose::Agent,
-                profile,
-                system: Vec::new(),
-                tools: Vec::new(),
-                response_schema: None,
-            },
+            context: ModelContext::test(ModelPurpose::Agent, profile),
         }
     }
 
-    fn requested(context: u64) -> SessionEvent {
+    fn requested(context: RecordSeq) -> SessionEvent {
         SessionEvent::ModelRequested {
             context,
+            checkpoint: None,
             history: Vec::new(),
             tail: Vec::new(),
             history_lifetime: HistoryLifetime::default(),
-            purpose: ModelPurpose::Agent,
         }
     }
 
-    fn attempt(request: u64, attempt: u64) -> SessionEvent {
-        SessionEvent::ModelAttemptStarted { request, attempt }
+    fn attempt(request: RequestSeq, attempt: u64) -> SessionEvent {
+        SessionEvent::ModelAttemptStarted(AttemptRef { request, attempt })
+    }
+
+    fn answered(request: RequestSeq, attempt: u64, message: MessageSeq) -> SessionEvent {
+        SessionEvent::ResponseCompleted {
+            attempt: AttemptRef { request, attempt },
+            message,
+            outcome: CompletedOutcome::Answer,
+        }
+    }
+
+    fn reply(text: &str) -> SessionEvent {
+        SessionEvent::MessageCommitted {
+            message: Message::Assistant(vec![AssistantItem::text("answer", 0, text)]),
+        }
     }
 
     fn call(id: &str, position: u32, name: &str) -> AssistantItem {
@@ -600,12 +563,11 @@ mod tests {
                     origin: None,
                     tool: "agent".into(),
                     role: JobRole::Agent,
-                    name: Some("worker".into()),
+                    name: Some("worker".parse().unwrap()),
                     arguments: json!({}),
                     output_schema: None,
                     accepts_input: true,
                     background: false,
-                    authorization_scope: None,
                     location: ExecutionLocation::root(session.root.path().to_path_buf()),
                 },
             )
@@ -613,10 +575,10 @@ mod tests {
         }
         let first = session.start_child(root, 1, Some(job(1))).await;
         let second = session.start_child(root, 2, Some(job(2))).await;
-        let context = append(root, context("big")).await;
+        let context = append(root, context_event("big")).await;
         // The root's turn continues through a message that called tools, whatever
         // the stop reason says, and a failure is its final outcome.
-        let request = append(root, requested(context)).await;
+        let request = append(root, requested(context)).await.request();
         append(root, attempt(request, 1)).await;
         let message = append(
             root,
@@ -624,17 +586,9 @@ mod tests {
                 message: Message::Assistant(vec![call("a", 0, "read")]),
             },
         )
-        .await;
-        append(
-            root,
-            SessionEvent::ResponseCompleted {
-                request,
-                attempt: 1,
-                message: Some(message),
-                outcome: Outcome::Answer,
-            },
-        )
-        .await;
+        .await
+        .message();
+        append(root, answered(request, 1, message)).await;
         let mid_turn = session_stats(store.id(), &store.records().await);
         append(
             root,
@@ -644,33 +598,26 @@ mod tests {
         )
         .await;
         // The first child answered but was never completed; the second completed.
-        let answered = append(&first, requested(context)).await;
-        append(&first, attempt(answered, 1)).await;
-        append(
-            &first,
-            SessionEvent::ResponseCompleted {
-                request: answered,
-                attempt: 1,
-                message: None,
-                outcome: Outcome::Answer,
-            },
-        )
-        .await;
+        let child_context = append(&first, context_event("big")).await;
+        let request = append(&first, requested(child_context)).await.request();
+        append(&first, attempt(request, 1)).await;
+        let message = append(&first, reply("answered")).await.message();
+        append(&first, answered(request, 1, message)).await;
         append(&second, SessionEvent::AgentCompleted).await;
         for agent in [&first, &second, root] {
             append(agent, SessionEvent::AgentInterrupted).await;
         }
         let stats = session_stats(store.id(), &store.records().await);
         let outcome = |index: usize| stats.agents[index].outcome.clone();
-        assert_eq!(
-            outcome(0),
-            AgentOutcome::Failed {
-                error: "boom".into()
-            }
+        assert!(matches!(outcome(0), AgentOutcome::Failed { error, .. } if error == "boom"));
+        assert!(matches!(outcome(1), AgentOutcome::Interrupted { .. }));
+        assert!(matches!(outcome(2), AgentOutcome::Completed { .. }));
+        assert!(
+            stats
+                .agents
+                .iter()
+                .all(|agent| agent.outcome.finished_at().is_some())
         );
-        assert_eq!(outcome(1), AgentOutcome::Interrupted);
-        assert_eq!(outcome(2), AgentOutcome::Completed);
-        assert!(stats.agents.iter().all(|agent| agent.finished.is_some()));
         assert_eq!(mid_turn.agents[0].outcome, AgentOutcome::Running);
         assert_eq!(stats.agents[1].path, "/worker");
         assert_eq!(stats.agents[2].path, "/worker#2");
@@ -688,20 +635,22 @@ mod tests {
         append(
             root,
             SessionEvent::MessageCommitted {
-                message: Message::User(vec![UserContent::Text {
+                message: Message::User(vec![UserPart::Text {
                     text: "survey the\n  repo".into(),
                 }]),
             },
         )
         .await;
-        let context = append(root, context("big")).await;
-        let request = append(root, requested(context)).await;
+        let context = append(root, context_event("big")).await;
+        let request = append(root, requested(context)).await.request();
         append(root, attempt(request, 1)).await;
         append(
             root,
             SessionEvent::ModelFailed {
-                request,
-                attempt: 1,
+                attempt: AttemptRef {
+                    request,
+                    attempt: 1,
+                },
                 error: "flaky".into(),
                 kind: ModelFailureKind::Error,
             },
@@ -714,21 +663,24 @@ mod tests {
                 message: Message::Assistant(vec![call("a", 0, "read"), call("b", 1, "exec")]),
             },
         )
-        .await;
+        .await
+        .message();
         append(
             root,
             SessionEvent::ResponseCompleted {
-                request,
-                attempt: 2,
-                message: Some(message),
-                outcome: Outcome::ToolUse,
+                attempt: AttemptRef {
+                    request,
+                    attempt: 2,
+                },
+                message,
+                outcome: CompletedOutcome::ToolUse,
             },
         )
         .await;
         append(
             root,
             SessionEvent::Usage {
-                request: Some(request),
+                request,
                 usage: usage(100, 40, 7),
             },
         )
@@ -749,31 +701,31 @@ mod tests {
                 origin: None,
                 tool: "agent".into(),
                 role: JobRole::Agent,
-                name: Some("worker".into()),
+                name: Some("worker".parse().unwrap()),
                 arguments: json!({}),
                 output_schema: None,
                 accepts_input: true,
                 background: false,
-                authorization_scope: None,
                 location: ExecutionLocation::root(session.root.path().to_path_buf()),
             },
         )
         .await;
         let child = session.start_child(root, 1, Some(job)).await;
-        let open = append(&child, requested(context)).await;
+        let child_context = append(&child, context_event("big")).await;
+        let open = append(&child, requested(child_context)).await.request();
         append(&child, attempt(open, 1)).await;
         append(
             &child,
-            SessionEvent::ModelAttemptInterrupted {
+            SessionEvent::ModelAttemptInterrupted(AttemptRef {
                 request: open,
                 attempt: 1,
-            },
+            }),
         )
         .await;
         append(
             &child,
             SessionEvent::Usage {
-                request: None,
+                request: open,
                 usage: usage(5, 0, 1),
             },
         )
@@ -783,18 +735,19 @@ mod tests {
         append(&child, SessionEvent::AgentCompleted).await;
         append(&child, SessionEvent::AgentInterrupted).await;
         let retained = session_stats(store.id(), &store.records().await);
-        assert_eq!(retained.agents[1].outcome, AgentOutcome::Completed);
-        let completed = retained.agents[1].finished.unwrap();
-        append(&child, requested(context)).await;
+        let completed = match retained.agents[1].outcome {
+            AgentOutcome::Completed { at } => at,
+            ref outcome => panic!("retained child reported {outcome:?}"),
+        };
+        append(&child, requested(child_context)).await;
         let resumed = session_stats(store.id(), &store.records().await);
         assert_eq!(resumed.agents[1].outcome, AgentOutcome::Running);
-        assert_eq!(resumed.agents[1].finished, None);
         append(&child, SessionEvent::AgentInterrupted).await;
         append(
             root,
             SessionEvent::JobFinished {
                 job,
-                state: JobState::Interrupted,
+                state: JobEnd::Interrupted,
                 diagnostic: None,
                 output_diagnostic: None,
                 images: Vec::new(),
@@ -803,18 +756,10 @@ mod tests {
         .await;
         // The root never completes: once a response ends its turn, the shutdown
         // interruption reports it as done.
-        let ended = append(root, requested(context)).await;
+        let ended = append(root, requested(context)).await.request();
         append(root, attempt(ended, 1)).await;
-        append(
-            root,
-            SessionEvent::ResponseCompleted {
-                request: ended,
-                attempt: 1,
-                message: None,
-                outcome: Outcome::Answer,
-            },
-        )
-        .await;
+        let message = append(root, reply("done")).await.message();
+        append(root, answered(ended, 1, message)).await;
         append(root, SessionEvent::AgentInterrupted).await;
 
         let records = store.records().await;
@@ -835,9 +780,8 @@ mod tests {
         assert_eq!(child_stats.owner_job, Some(job));
         assert_eq!(root_stats.children, 1);
         assert_eq!(root_stats.model.as_deref(), Some("test"));
-        assert_eq!(root_stats.outcome, AgentOutcome::Completed);
-        assert_eq!(child_stats.outcome, AgentOutcome::Interrupted);
-        assert!(child_stats.finished.unwrap() >= completed);
+        assert!(matches!(root_stats.outcome, AgentOutcome::Completed { .. }));
+        assert!(matches!(child_stats.outcome, AgentOutcome::Interrupted { at } if at >= completed));
         assert!(child_stats.started >= stats.started && stats.finished >= root_stats.started);
         assert_eq!(
             root_stats.requests,
@@ -849,12 +793,13 @@ mod tests {
                 attempts: 3,
             }
         );
+        // Both child requests were cut short: one mid-attempt, one before any attempt.
         assert_eq!(
             (
                 child_stats.requests.requested,
                 child_stats.requests.interrupted
             ),
-            (2, 1)
+            (2, 2)
         );
         assert_eq!(stats.models["big"].requests.requested, 4);
         assert_eq!(root_stats.usage, usage(100, 40, 7));
@@ -864,10 +809,10 @@ mod tests {
         assert_eq!((read.calls, read.errors, read.unanswered), (1, 1, 0));
         assert_eq!((exec.calls, exec.errors, exec.unanswered), (1, 0, 1));
         // The request's context names the profile, not the agent's current selection.
-        assert_eq!(stats.models["big"].usage, usage(100, 40, 7));
+        assert_eq!(stats.models["big"].usage, usage(105, 40, 8));
         assert_eq!(stats.models["big"].requests.completed, 2);
         assert_eq!(stats.models["big"].requests.attempts, 4);
-        assert_eq!(stats.models["test"].usage, usage(5, 0, 1));
+        assert!(!stats.models.contains_key("test"));
         assert_eq!(stats.totals.usage, usage(105, 40, 8));
         assert_eq!(stats.totals.tool_calls.calls, 2);
         assert_eq!(stats.tools.len(), 2);

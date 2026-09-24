@@ -68,10 +68,7 @@ const TURN_STATE: &str = "x-codex-turn-state";
 /// Whether the request answers tool calls, rather than opening a turn with user
 /// input or a wake. Runtime state after the results is part of the same request.
 fn continues_turn(request: &ModelRequest) -> bool {
-    let runtime_only = |message: &&Message| {
-        matches!(message, Message::User(parts)
-            if parts.iter().all(|part| matches!(part, UserContent::Runtime { .. })))
-    };
+    let runtime_only = |message: &&Message| matches!(message, Message::User(parts) if parts.iter().all(UserContent::is_runtime));
     let mut history = request.history.iter().rev().skip_while(runtime_only);
     matches!(history.next(), Some(Message::Tool(_)))
 }
@@ -260,7 +257,7 @@ mod tests {
 
     #[test]
     fn credentials_are_sensitive_headers() {
-        let session = ContextId::from("session");
+        let session = "session".parse::<ContextId>().unwrap();
         let headers = auth_headers("secret", "account", &session).unwrap();
         assert!(headers["authorization"].is_sensitive());
         assert!(headers["chatgpt-account-id"].is_sensitive());
@@ -292,7 +289,7 @@ mod tests {
             client: transport::client().unwrap(),
             endpoint: server.url.clone(),
         };
-        let mut context = provider.open_context("context".into()).unwrap();
+        let mut context = provider.open_context("context".parse().unwrap()).unwrap();
         let request = reasoning_tool_request(&provider.replay_scope());
         let events: Vec<_> = context.invoke(request).collect().await;
         assert!(events.iter().all(Result::is_ok), "{events:?}");
@@ -329,13 +326,13 @@ mod tests {
             client: transport::client().unwrap(),
             endpoint: server.url.clone(),
         };
-        let mut context = provider.open_context("context".into()).unwrap();
+        let mut context = provider.open_context("context".parse().unwrap()).unwrap();
         let mut request = reasoning_tool_request(&provider.replay_scope());
         let exchange = request.history.clone();
         let user = |part| Message::User(vec![part]);
         let state = || {
             user(UserContent::Runtime {
-                text: "state".into(),
+                text: "<skyhook_state>".into(),
             })
         };
         // The opening request, a tool-loop request with persisted state, a wake by a
@@ -389,7 +386,7 @@ mod tests {
         let original = reasoning_tool_request(&a.replay_scope());
         let mut same = original.clone();
         filter_reasoning_scope(&mut same, &a.replay_scope());
-        let context = ContextId::from("context");
+        let context = "context".parse::<ContextId>().unwrap();
         assert_eq!(
             responses::encode(&same, &context).unwrap()["input"][0],
             reasoning_item()

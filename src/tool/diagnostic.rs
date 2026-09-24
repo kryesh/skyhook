@@ -13,38 +13,64 @@ use serde::{Deserialize, Serialize};
 use crate::{
     execution::ExecutionLocation,
     identity::JobId,
+    named_enum::named_enum,
+    target::TargetRef,
     tool::policy::{Capability, CapabilitySet},
 };
 
-macro_rules! vocabulary {
-    ($name:ident { $($variant:ident => $text:literal),+ $(,)? }) => {
-        #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-        #[serde(rename_all = "snake_case")]
-        pub enum $name { $($variant),+ }
-        impl $name {
-            pub const ALL: &[Self] = &[$(Self::$variant),+];
-            pub const fn as_str(self) -> &'static str { match self { $(Self::$variant => $text),+ } }
-            pub fn parse(value: &str) -> Option<Self> { match value { $($text => Some(Self::$variant)),+, _ => None } }
-        }
-    };
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum Operation {
+        Execute = "execute",
+        Validate = "validate",
+        Authorize = "authorize",
+        Connect = "connect",
+        Inspect = "inspect",
+        Canonicalize = "canonicalize",
+        Read = "read",
+        ReadDirectory = "read_directory",
+        Create = "create",
+        CreateDirectories = "create_directories",
+        Write = "write",
+        Copy = "copy",
+        Remove = "remove",
+        Rename = "rename",
+        SetPermissions = "set_permissions",
+        SyncFile = "sync_file",
+        OpenDirectory = "open_directory",
+        SyncDirectory = "sync_directory",
+        Capture = "capture",
+        CreateCapture = "create_capture",
+        ReadCapture = "read_capture",
+        WriteCapture = "write_capture",
+        FinishCapture = "finish_capture",
+        StoreImage = "store_image",
+        Prepare = "prepare",
+        Spawn = "spawn",
+        Wait = "wait",
+        Terminate = "terminate",
+        Deserialize = "deserialize",
+        Lookup = "lookup",
+        Load = "load",
+        Save = "save",
+        Send = "send",
+        Receive = "receive",
+    }
 }
 
-vocabulary!(Operation {
-    Execute => "execute", Validate => "validate", Authorize => "authorize", Connect => "connect",
-    Inspect => "inspect", Canonicalize => "canonicalize", Read => "read", ReadDirectory => "read_directory",
-    Create => "create", CreateDirectories => "create_directories", Write => "write", Copy => "copy",
-    Remove => "remove", Rename => "rename", SetPermissions => "set_permissions", SyncFile => "sync_file",
-    OpenDirectory => "open_directory", SyncDirectory => "sync_directory", Capture => "capture",
-    CreateCapture => "create_capture", ReadCapture => "read_capture", WriteCapture => "write_capture",
-    FinishCapture => "finish_capture", StoreImage => "store_image", Prepare => "prepare", Spawn => "spawn",
-    Wait => "wait", Terminate => "terminate", Deserialize => "deserialize", Lookup => "lookup",
-    Load => "load", Save => "save", Send => "send", Receive => "receive"
-});
-
-vocabulary!(Effects {
-    Unknown => "unknown", NotStarted => "not_started", Started => "started", Unchanged => "unchanged",
-    DestinationReplaced => "destination_replaced", PartialChange => "partial_change", OutputIncomplete => "output_incomplete", MayHaveExecuted => "may_have_executed"
-});
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum Effects {
+        Unknown = "unknown",
+        NotStarted = "not_started",
+        Started = "started",
+        Unchanged = "unchanged",
+        DestinationReplaced = "destination_replaced",
+        PartialChange = "partial_change",
+        OutputIncomplete = "output_incomplete",
+        MayHaveExecuted = "may_have_executed",
+    }
+}
 
 /// An explicitly selected safe subject, never arbitrary serialized arguments.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -126,7 +152,7 @@ impl FailureSite {
 #[derive(Clone, Copy)]
 pub(crate) struct DiagnosticViewer<'a> {
     pub capabilities: &'a CapabilitySet,
-    target: &'a str,
+    target: &'a TargetRef,
 }
 
 impl<'a> DiagnosticViewer<'a> {
@@ -143,12 +169,18 @@ impl<'a> From<&'a CapabilitySet> for DiagnosticViewer<'a> {
     fn from(capabilities: &'a CapabilitySet) -> Self {
         Self {
             capabilities,
-            target: crate::target::ROOT_TARGET,
+            target: &TargetRef::Root,
         }
     }
 }
 
-vocabulary!(PathRole { Requested => "requested", Resolved => "resolved" });
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum PathRole {
+        Requested = "requested",
+        Resolved = "resolved",
+    }
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct PathFact {
@@ -158,6 +190,7 @@ pub struct PathFact {
     pub path: PathBuf,
 }
 
+/// The resolved facts persistence, the wire and the renderer see.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 pub struct DiagnosticContext {
     pub operation: Operation,
@@ -167,36 +200,21 @@ pub struct DiagnosticContext {
     pub paths: Vec<PathFact>,
 }
 
-impl Default for DiagnosticContext {
-    fn default() -> Self {
-        Self::new(Operation::Execute, Subject::None)
-    }
+/// The facts a failure site chose. Each boundary nearer the caller fills what
+/// is still unset with [`PartialContext::or`]; nothing set is ever replaced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PartialContext {
+    operation: Option<(Operation, Subject)>,
+    site: Option<FailureSite>,
+    effects: Option<Effects>,
+    paths: Vec<PathFact>,
 }
 
-impl DiagnosticContext {
-    pub const fn new(operation: Operation, subject: Subject) -> Self {
+impl PartialContext {
+    pub fn new(operation: Operation, subject: Subject) -> Self {
         Self {
-            operation,
-            subject,
-            site: FailureSite::Invocation,
-            effects: Effects::Unknown,
-            paths: Vec::new(),
-        }
-    }
-    /// Complete boundary context without replacing facts selected by the failure site.
-    pub(crate) fn fallback(&mut self, fallback: Self) {
-        if self.operation == Operation::Execute && self.subject == Subject::None {
-            self.operation = fallback.operation;
-            self.subject = fallback.subject;
-        }
-        if self.site == FailureSite::Invocation {
-            self.site = fallback.site;
-        }
-        if self.effects == Effects::Unknown {
-            self.effects = fallback.effects;
-        }
-        if self.paths.is_empty() {
-            self.paths = fallback.paths;
+            operation: Some((operation, subject)),
+            ..Self::default()
         }
     }
     #[must_use]
@@ -208,29 +226,105 @@ impl DiagnosticContext {
         self
     }
     #[must_use]
-    pub fn at(mut self, site: FailureSite) -> Self {
-        self.site = site;
+    pub(crate) fn paths(mut self, paths: Vec<PathFact>) -> Self {
+        self.paths = paths;
+        self
+    }
+    /// Name what failed, keeping the stage already chosen; the neutral stage
+    /// otherwise.
+    #[must_use]
+    pub fn subject(mut self, subject: Subject) -> Self {
+        let operation = self
+            .operation
+            .map_or(Operation::Execute, |(operation, _)| operation);
+        self.operation = Some((operation, subject));
         self
     }
     #[must_use]
-    pub const fn effects(mut self, effects: Effects) -> Self {
-        self.effects = effects;
+    pub fn at(mut self, site: FailureSite) -> Self {
+        self.site = Some(site);
         self
+    }
+    #[must_use]
+    pub fn effects(mut self, effects: Effects) -> Self {
+        self.effects = Some(effects);
+        self
+    }
+    /// Fill the facts this context leaves unset from `fallback`.
+    #[must_use]
+    pub fn or(self, fallback: Self) -> Self {
+        Self {
+            operation: self.operation.or(fallback.operation),
+            site: self.site.or(fallback.site),
+            effects: self.effects.or(fallback.effects),
+            paths: if self.paths.is_empty() {
+                fallback.paths
+            } else {
+                self.paths
+            },
+        }
+    }
+    /// Unset facts resolve to the neutral spellings: a plain execution failure
+    /// at the invocation whose effects are unknown.
+    pub fn resolve(self) -> DiagnosticContext {
+        let (operation, subject) = self
+            .operation
+            .unwrap_or((Operation::Execute, Subject::None));
+        DiagnosticContext {
+            operation,
+            subject,
+            site: self.site.unwrap_or(FailureSite::Invocation),
+            effects: self.effects.unwrap_or(Effects::Unknown),
+            paths: self.paths,
+        }
     }
 }
 
-vocabulary!(IoKind {
-    NotFound => "not_found", PermissionDenied => "permission_denied", AlreadyExists => "already_exists",
-    InvalidInput => "invalid_input", InvalidData => "invalid_data", TimedOut => "timed_out",
-    Interrupted => "interrupted", UnexpectedEof => "unexpected_eof", BrokenPipe => "broken_pipe",
-    ConnectionRefused => "connection_refused", ConnectionReset => "connection_reset",
-    ConnectionAborted => "connection_aborted", NotConnected => "not_connected", WouldBlock => "would_block",
-    HostUnreachable => "host_unreachable", NetworkUnreachable => "network_unreachable", NetworkDown => "network_down",
-    AddressInUse => "address_in_use", AddressNotAvailable => "address_not_available",
-    WriteZero => "write_zero", Unsupported => "unsupported", OutOfMemory => "out_of_memory",
-    IsADirectory => "is_a_directory", NotADirectory => "not_a_directory", DirectoryNotEmpty => "directory_not_empty",
-    ReadOnlyFilesystem => "read_only_filesystem", StorageFull => "storage_full", Other => "other"
-});
+/// A resolved context, restored from persistence or the wire, has every fact set.
+impl From<DiagnosticContext> for PartialContext {
+    fn from(context: DiagnosticContext) -> Self {
+        Self {
+            operation: Some((context.operation, context.subject)),
+            site: Some(context.site),
+            effects: Some(context.effects),
+            paths: context.paths,
+        }
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    pub enum IoKind {
+        NotFound = "not_found",
+        PermissionDenied = "permission_denied",
+        AlreadyExists = "already_exists",
+        InvalidInput = "invalid_input",
+        InvalidData = "invalid_data",
+        TimedOut = "timed_out",
+        Interrupted = "interrupted",
+        UnexpectedEof = "unexpected_eof",
+        BrokenPipe = "broken_pipe",
+        ConnectionRefused = "connection_refused",
+        ConnectionReset = "connection_reset",
+        ConnectionAborted = "connection_aborted",
+        NotConnected = "not_connected",
+        WouldBlock = "would_block",
+        HostUnreachable = "host_unreachable",
+        NetworkUnreachable = "network_unreachable",
+        NetworkDown = "network_down",
+        AddressInUse = "address_in_use",
+        AddressNotAvailable = "address_not_available",
+        WriteZero = "write_zero",
+        Unsupported = "unsupported",
+        OutOfMemory = "out_of_memory",
+        IsADirectory = "is_a_directory",
+        NotADirectory = "not_a_directory",
+        DirectoryNotEmpty = "directory_not_empty",
+        ReadOnlyFilesystem = "read_only_filesystem",
+        StorageFull = "storage_full",
+        Other = "other",
+    }
+}
 
 impl From<io::ErrorKind> for IoKind {
     fn from(kind: io::ErrorKind) -> Self {
@@ -307,12 +401,27 @@ pub struct Diagnostic {
     pub cause: Cause,
 }
 
-impl Diagnostic {
-    pub const fn new(context: DiagnosticContext, cause: Cause) -> Self {
+/// A failure's facts before its boundaries have filled them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PartialDiagnostic {
+    pub context: PartialContext,
+    pub cause: Cause,
+}
+
+impl PartialDiagnostic {
+    pub const fn new(context: PartialContext, cause: Cause) -> Self {
         Self { context, cause }
     }
     pub const fn is_denial(&self) -> bool {
         matches!(self.cause, Cause::Denied(_))
+    }
+    #[must_use]
+    pub fn or(mut self, fallback: PartialContext) -> Self {
+        self.context = self.context.or(fallback);
+        self
+    }
+    pub fn resolve(self) -> Diagnostic {
+        Diagnostic::new(self.context.resolve(), self.cause)
     }
     pub(crate) fn session(error: &crate::session::SessionError) -> Self {
         use crate::session::SessionError::*;
@@ -346,7 +455,22 @@ impl Diagnostic {
             WrongSession => Message("event belongs to another session".into()),
             BlobHashMismatch(_) => Message("stored blob failed its content hash check".into()),
         };
-        Self::new(DiagnosticContext::default().at(FailureSite::Host), cause)
+        Self::new(PartialContext::default().at(FailureSite::Host), cause)
+    }
+}
+
+impl From<Diagnostic> for PartialDiagnostic {
+    fn from(diagnostic: Diagnostic) -> Self {
+        Self::new(diagnostic.context.into(), diagnostic.cause)
+    }
+}
+
+impl Diagnostic {
+    pub const fn new(context: DiagnosticContext, cause: Cause) -> Self {
+        Self { context, cause }
+    }
+    pub const fn is_denial(&self) -> bool {
+        matches!(self.cause, Cause::Denied(_))
     }
     /// A worker is authoritative about its path, never about a session target alias.
     /// All worker execution sites map to the host's trusted connection destination.
@@ -385,13 +509,13 @@ impl Diagnostic {
         match &self.context.site {
             FailureSite::Invocation => {}
             FailureSite::Host => {
-                if viewer.target != crate::target::ROOT_TARGET {
+                if *viewer.target != TargetRef::Root {
                     text.push_str(" on session host");
                 }
             }
             FailureSite::Execution(location) => {
                 if capabilities.contains(Capability::Targets) {
-                    text.push_str(&format!(" on target {}", quoted(&location.target)));
+                    text.push_str(&format!(" on target {}", quoted(location.target.as_str())));
                 } else {
                     text.push_str(" in execution workspace");
                 }
@@ -568,7 +692,7 @@ pub(crate) fn deserialize_arguments<T: serde::de::DeserializeOwned + JsonSchema>
                     .unwrap_or_else(|| "invalid argument value".to_owned());
                 (path, expectation)
             });
-        super::AdmissionError::InvalidArguments(expectation)
+        super::AdmissionError::invalid_arguments(expectation)
             .operation(Operation::Deserialize, Subject::Argument(path))
     })
 }
@@ -823,9 +947,12 @@ mod tests {
     #[test]
     fn rendering_preserves_paths_but_hides_targets_and_opaque_credentials() {
         let diagnostic = Diagnostic::new(
-            DiagnosticContext::new(Operation::Read, Subject::path("two  spaces\n\u{1b}[2J")).at(
-                FailureSite::Execution(ExecutionLocation::named("bastion", "/work".into())),
-            ),
+            PartialContext::new(Operation::Read, Subject::path("two  spaces\n\u{1b}[2J"))
+                .at(FailureSite::Execution(ExecutionLocation::named(
+                    "bastion".parse().unwrap(),
+                    "/work".into(),
+                )))
+                .resolve(),
             Cause::Message("failed https://user:password@example.test/path\n\u{1b}oops".into()),
         );
         let text = diagnostic.render(&CapabilitySet::default());
@@ -837,7 +964,7 @@ mod tests {
         host.context.site = FailureSite::Host;
         let capabilities = CapabilitySet::default();
         let local = ExecutionLocation::root("/local".into());
-        let remote = ExecutionLocation::named("worker", "/remote".into());
+        let remote = ExecutionLocation::named("worker".parse().unwrap(), "/remote".into());
         assert!(
             !host
                 .render_for(DiagnosticViewer::new(&capabilities, &local))
@@ -972,11 +1099,11 @@ mod tests {
     #[test]
     fn normalization_retains_facts_and_output_but_not_local_provenance() {
         let context =
-            DiagnosticContext::new(Operation::Deserialize, Subject::argument(["items", "0"]))
+            PartialContext::new(Operation::Deserialize, Subject::argument(["items", "0"]))
                 .at(FailureSite::Host)
                 .effects(Effects::OutputIncomplete);
         let wire = Diagnostic::new(
-            DiagnosticContext::default(),
+            PartialContext::default().resolve(),
             Cause::Io {
                 kind: IoKind::PermissionDenied,
                 code: Some(2),
@@ -1006,16 +1133,16 @@ mod tests {
             assert_eq!(error.is_source_filesystem_io(), source);
             let (diagnostic, output) = error.into_parts();
             assert_eq!(diagnostic.cause, cause);
-            assert_eq!(diagnostic.context, context);
+            assert_eq!(diagnostic.context, context.clone().resolve());
             assert_eq!(output, Some(7_u16));
             let text = diagnostic.render(&CapabilitySet::default());
             assert!(!text.contains("private-payload"));
+            // Every fact of a restored diagnostic counts as chosen.
             let decoded =
                 serde_json::from_value(serde_json::to_value(&diagnostic).unwrap()).unwrap();
-            let restored =
-                OperationError::from_diagnostic(decoded, output.map(Box::new)).fallback_context(
-                    DiagnosticContext::new(Operation::Copy, Subject::path("fallback")),
-                );
+            let restored = OperationError::from_diagnostic(decoded, output).or(
+                PartialContext::new(Operation::Copy, Subject::path("fallback")),
+            );
             assert!(!restored.is_source_filesystem_io());
             assert_eq!(restored.into_parts(), (diagnostic, output));
         }
@@ -1037,7 +1164,7 @@ mod tests {
                 identity: AppendIdentity {
                     event: EventId::from_bytes([1; 16]),
                     session: SessionId::from_bytes([2; 16]),
-                    sequence: 3,
+                    sequence: 3.into(),
                 },
                 reason: SECRET.into(),
             }
@@ -1061,13 +1188,13 @@ mod tests {
                 "append rejected",
             ),
         ] {
-            let diagnostic = Diagnostic::session(&error);
+            let diagnostic = PartialDiagnostic::session(&error).resolve();
             assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains(message)));
             assert_eq!(diagnostic.context.site, FailureSite::Host);
             let text = diagnostic.render(&CapabilitySet::default());
             assert!(!text.contains(SECRET));
         }
-        let fallback = DiagnosticContext::new(
+        let fallback = PartialContext::new(
             Operation::WriteCapture,
             Subject::Job(JobId::new(7).unwrap()),
         )
@@ -1081,7 +1208,7 @@ mod tests {
             expected.redact_io_detail();
             assert_eq!(Cause::io(&opaque_io(make())), expected);
             assert_eq!(
-                ToolError::Io(make()).opaque_io().diagnostic().cause,
+                ToolError::io(make()).opaque_io().diagnostic().cause,
                 expected
             );
             for error in [
@@ -1091,10 +1218,13 @@ mod tests {
             ] {
                 let (diagnostic, output) = error
                     .with_result(ToolOutput::new(json!({"partial": true})))
-                    .fallback_context(fallback.clone())
+                    .or(fallback.clone())
                     .into_parts();
                 assert_eq!(diagnostic.cause, expected);
-                assert_eq!(diagnostic.context, fallback.clone().at(FailureSite::Host));
+                assert_eq!(
+                    diagnostic.context,
+                    fallback.clone().at(FailureSite::Host).resolve()
+                );
                 assert_eq!(output.unwrap().value, json!({"partial": true}));
             }
         }
