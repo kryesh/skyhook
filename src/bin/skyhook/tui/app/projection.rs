@@ -22,34 +22,33 @@ impl App {
         if let RuntimeEvent::Record(record) = &event.event {
             observe_initial_input(&mut self.initial_input, record);
         }
+        // Response updates replace the live response or a settled one at its
+        // journal position; records reach history through the projection.
         let (records, repaint, content) = match &event.event {
             RuntimeEvent::Record(_) => (true, true, true),
-            RuntimeEvent::ResponseEvent { agent, .. }
-            | RuntimeEvent::ResponseSettled { agent, .. } => {
+            RuntimeEvent::ResponseEvent { agent, request, .. }
+            | RuntimeEvent::ResponseSettled { agent, request, .. } => {
+                self.content_cache.observe_response(agent, *request);
                 (false, agent == &self.selected, agent == &self.selected)
             }
-            RuntimeEvent::Activity { agent, .. } => (false, true, agent == &self.selected),
+            RuntimeEvent::Activity { agent, activity } => {
+                // Stopping settles the agent's unsettled responses.
+                if matches!(activity, AgentActivity::Stopped(_)) {
+                    for ((owner, request), response) in &self.snapshot.responses {
+                        if owner == agent && response.settlement().is_none() {
+                            self.content_cache.observe_response(agent, *request);
+                        }
+                    }
+                }
+                (false, true, agent == &self.selected)
+            }
             RuntimeEvent::Context { agent, .. } => (false, agent == &self.selected, false),
             RuntimeEvent::TurnCompleted { .. } => (false, true, false),
-        };
-        // Lifecycle updates can replace the live response, but do not change
-        // recorded history. Invalidate that response without rebuilding history.
-        let append_only = if let RuntimeEvent::ResponseEvent { agent, request, .. } = &event.event {
-            self.content_cache.observe_response(agent, *request);
-            true
-        } else {
-            false
         };
         self.snapshot.apply(event);
         self.deliver_queue();
         self.dirty |= repaint;
-        if content {
-            if append_only && self.unsaved_status.is_empty() {
-                self.content_dirty = true;
-            } else {
-                self.invalidate_content();
-            }
-        }
+        self.content_dirty |= content;
         records
     }
     pub(super) fn invalidate_content(&mut self) {
@@ -83,7 +82,7 @@ impl App {
                 .collect();
             let changes = self.content_cache.update(
                 &self.snapshot,
-                &self.projection,
+                &mut self.projection,
                 model::EntryView {
                     agent: &self.selected,
                     tab: self.tab,
@@ -94,7 +93,7 @@ impl App {
                 self.content_revision,
                 overlay,
             );
-            self.render.content_changed(changes);
+            self.render.dirty.extend(changes);
             self.content_dirty = false;
         }
     }

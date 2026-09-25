@@ -1,11 +1,9 @@
 //! Wrapping and source-versus-decoration geometry for Markdown rows.
 use super::super::super::tool_view;
-use super::super::{Palette, wrap_line, wrap_words};
+use super::super::{Palette, cells, cells_width, wrap_line, wrap_words};
 use super::parser::{LineInfo, parse};
 use super::{CodeGeometry, LayoutLine, RowLayout};
 use ratatui::text::{Line, Span};
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 /// Wrap source inside its paragraph/container, then add geometry-only code
 /// padding. Measuring the entire code block keeps all its rows the same width.
@@ -67,8 +65,7 @@ pub(in super::super) fn layout_highlighted(
                     line.spans
                         .iter()
                         .skip(info.prefix_spans)
-                        .flat_map(|span| span.content.graphemes(true))
-                        .map(|g| g.width())
+                        .map(|span| cells_width(&span.content))
                         .sum::<usize>()
                 })
                 .max()
@@ -77,8 +74,8 @@ pub(in super::super) fn layout_highlighted(
             let widest = block
                 .iter()
                 .flat_map(|(line, info)| line.spans.iter().skip(info.prefix_spans))
-                .flat_map(|span| span.content.graphemes(true))
-                .map(|g| g.width())
+                .flat_map(|span| cells(&span.content))
+                .map(|(_, _, width)| width)
                 .max()
                 .unwrap_or(0);
             let code = CodeGeometry::new(width, indent, longest, widest);
@@ -107,15 +104,14 @@ fn clipped_prefix(mut line: Line<'static>, width: usize) -> Line<'static> {
         .spans
         .into_iter()
         .filter_map(|span| {
-            let mut text = String::new();
-            for grapheme in span.content.graphemes(true) {
-                if grapheme.width() > remaining {
-                    break;
-                }
-                remaining -= grapheme.width();
-                text.push_str(grapheme);
-            }
-            (!text.is_empty()).then(|| Span::styled(text, span.style))
+            let end = cells(&span.content)
+                .find(|&(_, _, width)| {
+                    let clipped = width > remaining;
+                    remaining -= if clipped { 0 } else { width };
+                    clipped
+                })
+                .map_or(span.content.len(), |(byte, _, _)| byte);
+            (end > 0).then(|| Span::styled(span.content[..end].to_owned(), span.style))
         })
         .collect();
     line

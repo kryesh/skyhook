@@ -768,15 +768,16 @@ mod tests {
         }
     }
 
-    fn number_is_painted(buffer: &Buffer, color: Color) -> bool {
-        let source = "let answer = 42;";
+    /// `source` is on screen with its trailing `42;` number painted in `color`.
+    fn number_is_painted(buffer: &Buffer, source: &str, color: Color) -> bool {
+        let number = source.len() - 3..source.len() - 1;
         buffer
             .content
             .chunks(buffer.area.width as usize)
             .any(|row| {
                 row.windows(source.len()).any(|cells| {
                     cells.iter().map(|cell| cell.symbol()).collect::<String>() == source
-                        && cells[13..15].iter().all(|cell| cell.fg == color)
+                        && cells[number.clone()].iter().all(|cell| cell.fg == color)
                 })
             })
     }
@@ -847,8 +848,12 @@ mod tests {
                 // The first frame paints fallback text and schedules the worker.
                 // Its retained rows must repaint when the worker wakes the UI,
                 // without manually invalidating content or rebuilding layout.
-                assert!(!number_is_painted(terminal.backend().buffer(), accent));
-                assert!(!app.render.changes.reset && app.render.changes.dirty.is_empty());
+                assert!(!number_is_painted(
+                    terminal.backend().buffer(),
+                    "let answer = 42;",
+                    accent
+                ));
+                assert!(!app.render.reset && app.render.dirty.is_empty());
                 assert!(!app.content_dirty);
                 let work = tokio::time::timeout(Duration::from_secs(5), ready.recv()).await;
                 let work = work.expect("highlight worker woke the UI").unwrap();
@@ -857,10 +862,45 @@ mod tests {
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             }
             assert!(
-                number_is_painted(terminal.backend().buffer(), accent),
+                number_is_painted(terminal.backend().buffer(), "let answer = 42;", accent),
                 "completed highlights did not reach the frame: width={width}, reset={reset}"
             );
             assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
+        }
+    }
+
+    #[tokio::test]
+    async fn highlighting_follows_the_viewport_through_a_transcript_beyond_the_cache() {
+        let (_root, mut app) = fixture().await;
+        let (notify, mut ready) = tokio::sync::mpsc::unbounded_channel();
+        app.render = RenderState::new(app.selected.clone(), notify);
+        // More distinct fenced sections than the highlight cache admits at once.
+        for index in 0..150 {
+            let name = match index {
+                0 => "first".to_owned(),
+                149 => "last".to_owned(),
+                _ => format!("other{index}"),
+            };
+            let text = format!("```rust\nlet {name} = 42;\n```");
+            let message = Message::Assistant(vec![AssistantItem::text("m", 0, text)]);
+            push_record(&mut app, SessionEvent::MessageCommitted { message }).await;
+        }
+        app.refresh();
+        let accent = ContentTheme::new().accent;
+        let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
+        for (scroll, source) in [(None, "let last = 42;"), (Some(0), "let first = 42;")] {
+            app.view().scroll = scroll;
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+                    if number_is_painted(terminal.backend().buffer(), source, accent) {
+                        break;
+                    }
+                    app.work(ready.recv().await.expect("highlight worker is running"));
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{source} on screen was never highlighted"));
         }
     }
 

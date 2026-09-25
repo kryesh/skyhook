@@ -105,6 +105,90 @@ mod tests {
         )
     }
 
+    /// Deliver `event` as the host does: observe it, fold records, rebuild content.
+    fn deliver(app: &mut App, event: RuntimeEvent) {
+        let revision = app.snapshot.revision + 1;
+        app.observe(ObservedEvent { revision, event });
+        app.projection.rebuild(&app.snapshot);
+        app.rebuild_content();
+    }
+
+    async fn journal(app: &mut App, event: SessionEvent) -> RecordSeq {
+        let store = app.session().unwrap().store();
+        let record = store.append(app.selected.clone(), event).await.unwrap();
+        let sequence = record.sequence;
+        deliver(app, RuntimeEvent::Record(Box::new(record)));
+        sequence
+    }
+
+    #[tokio::test]
+    async fn stopping_keeps_an_interrupted_reply_at_its_journal_position() {
+        use skyhook::provider::protocol::{BlockId, BlockRef, ItemId, ItemKind, ResponseEvent};
+        use skyhook::session::{AttemptRef, ModelContext, ModelPurpose, ProfileSnapshot};
+        let (_root, mut app) = fixture().await;
+        let agent = app.selected.clone();
+        let profile = ProfileSnapshot {
+            name: "fixture".into(),
+            profile: app.launch.model.profile().clone(),
+        };
+        let context = ModelContext {
+            purpose: ModelPurpose::Agent,
+            profile,
+            system: Vec::new(),
+            tools: Vec::new(),
+            response_schema: None,
+        };
+        let context = journal(&mut app, SessionEvent::ModelContext { context }).await;
+        let requested = SessionEvent::ModelRequested {
+            context,
+            checkpoint: None,
+            history: Vec::new(),
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
+        };
+        let request = journal(&mut app, requested).await.request();
+        let attempt = AttemptRef {
+            request,
+            attempt: 1,
+        };
+        journal(&mut app, SessionEvent::ModelAttemptStarted(attempt)).await;
+        let block = BlockRef {
+            item: ItemId::try_from("text".to_owned()).unwrap(),
+            block: BlockId::try_from("text:0".to_owned()).unwrap(),
+        };
+        let delta = ResponseEvent::Delta {
+            block,
+            kind: ItemKind::Text,
+            text: "cut short".into(),
+        };
+        let event = RuntimeEvent::ResponseEvent {
+            agent: agent.clone(),
+            request,
+            event: delta,
+        };
+        deliver(&mut app, event);
+        let shown = |app: &App| {
+            app.entries()
+                .iter()
+                .any(|entry| entry.text().contains("cut short"))
+        };
+        assert!(shown(&app), "streaming");
+        // The interruption ends the live reply before stopping settles it.
+        journal(&mut app, SessionEvent::ModelAttemptInterrupted(attempt)).await;
+        let activity = AgentActivity::Stopped(TurnFailure::Interrupted);
+        let event = RuntimeEvent::Activity {
+            agent: agent.clone(),
+            activity,
+        };
+        deliver(&mut app, event);
+        assert!(
+            app.snapshot.responses[&(agent, request)]
+                .settlement()
+                .is_some()
+        );
+        assert!(shown(&app), "settled");
+    }
+
     #[tokio::test]
     async fn closed_receiver_retains_session_and_resubscribe_installs_snapshot_with_updates() {
         let (_root, mut app) = fixture().await;

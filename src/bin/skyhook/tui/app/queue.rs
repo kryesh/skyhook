@@ -186,10 +186,14 @@ impl App {
     }
 
     pub(super) fn deliver_queue(&mut self) {
-        // Lag recovery replaces the snapshot without replaying each event.
-        for record in self.snapshot.records.values() {
-            if observe_initial_input(&mut self.initial_input, record) {
-                break;
+        // Lag recovery replaces the snapshot without replaying each event. Only
+        // records after the gate can release it.
+        if let Some(&(_, after)) = self.initial_input.as_ref() {
+            let after = (std::ops::Bound::Excluded(after), std::ops::Bound::Unbounded);
+            for record in self.snapshot.records.range(after).map(|(_, record)| record) {
+                if observe_initial_input(&mut self.initial_input, record) {
+                    break;
+                }
             }
         }
         if self.start.is_creating() || self.stopping || self.paused || self.queue.is_empty() {

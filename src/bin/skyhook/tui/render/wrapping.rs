@@ -2,6 +2,36 @@
 
 use super::*;
 
+/// Printable ASCII: every byte is its own grapheme, one cell wide.
+fn narrow_ascii(text: &str) -> bool {
+    text.bytes().all(|byte| matches!(byte, b' '..=b'~'))
+}
+
+/// A string's graphemes as `(byte offset, grapheme, cell width)`. Printable ASCII
+/// skips grapheme segmentation, which dominates layout of ordinary text.
+pub(super) fn cells(text: &str) -> impl Iterator<Item = (usize, &str, usize)> {
+    let ascii = narrow_ascii(text);
+    let narrow = ascii.then(|| (0..text.len()).map(move |byte| (byte, &text[byte..=byte], 1)));
+    let segmented = (!ascii).then(|| {
+        text.grapheme_indices(true)
+            .map(|(byte, grapheme)| (byte, grapheme, grapheme.width()))
+    });
+    narrow
+        .into_iter()
+        .flatten()
+        .chain(segmented.into_iter().flatten())
+}
+
+/// The cells a string paints, grapheme by grapheme (which can differ from its
+/// width measured as a whole).
+pub(super) fn cells_width(text: &str) -> usize {
+    if narrow_ascii(text) {
+        text.len()
+    } else {
+        cells(text).map(|(_, _, width)| width).sum()
+    }
+}
+
 pub fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     text.split('\n')
         .flat_map(|line| wrap_line(Line::from(line.to_owned()), width.max(1)))
@@ -27,25 +57,27 @@ pub(super) fn wrap_line_widths(
     let mut spans = Vec::new();
     let mut used = 0;
     for span in line.spans {
-        let mut chunk = String::new();
-        for grapheme in span.content.graphemes(true) {
-            let size = grapheme.width();
+        let mut start = 0;
+        for (byte, _, size) in cells(&span.content) {
             if used + size > width && used > 0 {
-                if !chunk.is_empty() {
-                    spans.push(Span::styled(std::mem::take(&mut chunk), span.style));
+                if byte > start {
+                    let chunk = span.content[start..byte].to_owned();
+                    spans.push(Span::styled(chunk, span.style));
                 }
                 result.push(Line {
                     spans: std::mem::take(&mut spans),
                     ..template.clone()
                 });
+                start = byte;
                 width = continuation_width.max(1);
                 used = 0;
             }
-            chunk.push_str(grapheme);
             used += size;
         }
-        if !chunk.is_empty() {
-            spans.push(Span::styled(chunk, span.style));
+        if start == 0 && !span.content.is_empty() {
+            spans.push(span);
+        } else if start < span.content.len() {
+            spans.push(Span::styled(span.content[start..].to_owned(), span.style));
         }
     }
     result.push(Line { spans, ..template });
@@ -140,22 +172,38 @@ pub(super) fn clipped_header(value: &str, width: u16) -> String {
     if value.width() <= budget {
         return value.to_owned();
     }
-    let mut result = String::new();
     let mut used = 0;
-    for grapheme in value.graphemes(true) {
-        if used + grapheme.width() > budget - 1 {
-            break;
-        }
-        result.push_str(grapheme);
-        used += grapheme.width();
-    }
-    result.push('…');
-    result
+    let end = cells(value)
+        .find(|&(_, _, width)| {
+            used += width;
+            used > budget - 1
+        })
+        .map_or(value.len(), |(byte, _, _)| byte);
+    format!("{}…", &value[..end])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cells_match_grapheme_segmentation_with_and_without_the_ascii_fast_path() {
+        for text in [
+            "",
+            "plain ascii ~!@#$%^&*()_+{}|:<>?",
+            "tab\tnewline\ncarriage\r\nnul\0",
+            "pré e\u{301}lan",
+            "👩‍💻 世界 ﻻ",
+        ] {
+            let expected: Vec<_> = text
+                .grapheme_indices(true)
+                .map(|(byte, grapheme)| (byte, grapheme, grapheme.width()))
+                .collect();
+            assert_eq!(cells(text).collect::<Vec<_>>(), expected, "{text:?}");
+            let width: usize = expected.iter().map(|(_, _, width)| width).sum();
+            assert_eq!(cells_width(text), width, "{text:?}");
+        }
+    }
 
     #[test]
     fn prose_word_wrap_preserves_graphemes_styles_and_cross_span_words() {

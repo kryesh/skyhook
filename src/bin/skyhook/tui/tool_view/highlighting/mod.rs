@@ -2,9 +2,10 @@
 mod syntax;
 use super::super::app::Work;
 use super::{Document, MAX_LINE, MAX_SECTION, Section};
+use indexmap::IndexSet;
 use ratatui::text::Line;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     hash::{DefaultHasher, Hash, Hasher},
     ops::Deref,
     sync::{Arc, mpsc},
@@ -119,7 +120,8 @@ struct Completion {
 /// Recent sections survive collapse within a bounded cache; old-session results are discarded.
 pub struct HighlightCache {
     entries: HashMap<CodeKey, CachedHighlight>,
-    working_set: HashSet<CodeKey>,
+    /// The sections the latest frame wants, most wanted first.
+    working_set: IndexSet<CodeKey>,
     sender: Option<mpsc::SyncSender<(u64, CodeKey)>>,
     receiver: mpsc::Receiver<Completion>,
     generation: u64,
@@ -158,7 +160,7 @@ impl HighlightCache {
             });
         Self {
             entries: HashMap::new(),
-            working_set: HashSet::new(),
+            working_set: IndexSet::new(),
             sender: worker.ok().map(|_| sender),
             receiver,
             generation: 0,
@@ -235,6 +237,7 @@ impl HighlightCache {
         self.schedule(selected.into_iter());
         changed
     }
+    /// Admit `keys`, then submit what the frame wants.
     fn schedule(&mut self, keys: impl Iterator<Item = CodeKey>) {
         let mut bytes: usize = self.entries.keys().map(|key| key.source.len()).sum();
         for key in keys {
@@ -271,15 +274,20 @@ impl HighlightCache {
         }
         self.submit_unscheduled();
     }
-    /// The cache, not its rendering callers, owns queue retry. A disconnected
-    /// worker disables submission until the cache is recreated. Pending sources
-    /// become evictable Unscheduled entries and keep their ordinary source-based
-    /// fallback; this is deliberately not an automatic worker-restart policy.
+    /// Submit admitted sections the frame wants, most wanted first, while the
+    /// worker queue has room. The cache, not its rendering callers, owns queue
+    /// retry. A disconnected worker disables submission until the cache is
+    /// recreated. Pending sources become evictable Unscheduled entries and keep
+    /// their ordinary source-based fallback; this is deliberately not an
+    /// automatic worker-restart policy.
     fn submit_unscheduled(&mut self) {
         let Some(sender) = &self.sender else {
             return;
         };
-        for (key, entry) in &mut self.entries {
+        for key in &self.working_set {
+            let Some(entry) = self.entries.get_mut(key) else {
+                continue;
+            };
             if !matches!(entry.state, HighlightState::Unscheduled) {
                 continue;
             }
@@ -343,7 +351,7 @@ mod tests {
         let (completed, receiver) = mpsc::channel();
         let cache = HighlightCache {
             entries: HashMap::new(),
-            working_set: HashSet::new(),
+            working_set: IndexSet::new(),
             sender: Some(sender),
             receiver,
             generation: 0,
@@ -563,6 +571,34 @@ mod tests {
         cache.schedule(keys);
         assert!(source_bytes(&cache) <= CACHE_BYTES);
         assert!(cache.entries.len() < CACHE_SECTIONS);
+    }
+
+    #[test]
+    fn sections_reach_the_worker_in_priority_order_across_refills() {
+        let (mut cache, queued, completed) = queued_cache(2);
+        let documents: Vec<_> = (0..6)
+            .map(|index| code(&format!("const value = {index};"), "js", Role::Plain))
+            .collect();
+        // Later documents are more wanted, as the visible ones are.
+        cache.prepare(documents.iter().rev());
+        let mut order = Vec::new();
+        while order.len() < documents.len() {
+            let batch: Vec<_> = queued.try_iter().collect();
+            assert!(
+                !batch.is_empty(),
+                "the worker is refilled after each completion"
+            );
+            for queued in batch {
+                order.push(queued.1.source.to_string());
+                complete(&completed, queued, None);
+            }
+            cache.poll();
+        }
+        let expected: Vec<_> = (0..6)
+            .rev()
+            .map(|index| format!("const value = {index};"))
+            .collect();
+        assert_eq!(order, expected);
     }
 
     #[test]

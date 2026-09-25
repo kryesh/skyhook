@@ -10,7 +10,7 @@ mod requests;
 mod retry;
 
 pub use super::format::{clean, footer, number, pretty};
-pub use cache::{ContentCache, ContentChanges};
+pub use cache::ContentCache;
 pub use entries::entries;
 pub use jobs::{state_name, target_suffix};
 pub use projection::{

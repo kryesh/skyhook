@@ -132,14 +132,14 @@ pub(super) fn render_row_line(
     let mut byte = 0;
     let mut column = prefix_width;
     let (source_prefix, source_prefix_width) = row.layout.source_prefix();
-    for grapheme in row.line.styled_graphemes(Style::default()) {
+    for grapheme in styled_cells(&row.line) {
         if byte == source_prefix {
             column = row
                 .layout
                 .code()
                 .map_or(prefix_width + source_prefix_width, |code| code.body_start());
         }
-        let size = grapheme.symbol.width();
+        let size = grapheme.width;
         let in_prefix = byte < source_prefix;
         let prefix_clipped = in_prefix && column + size > prefix_width + source_prefix_width;
         let body_end = row.layout.code().map_or(area.width as usize, |code| {
@@ -158,6 +158,26 @@ pub(super) fn render_row_line(
     }
 }
 
+struct StyledCell<'a> {
+    symbol: &'a str,
+    width: usize,
+    style: Style,
+}
+
+/// `Line::styled_graphemes` with widths, over the cell primitive's ASCII fast path.
+fn styled_cells<'a>(line: &'a Line<'_>) -> impl Iterator<Item = StyledCell<'a>> {
+    line.spans.iter().flat_map(move |span| {
+        let style = line.style.patch(span.style);
+        cells(&span.content)
+            .filter(|(_, symbol, _)| !symbol.contains(char::is_control))
+            .map(move |(_, symbol, width)| StyledCell {
+                symbol,
+                width,
+                style,
+            })
+    })
+}
+
 pub(super) fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer, style: Style) {
     let area = area.intersection(buffer.area);
     if area.is_empty() {
@@ -168,14 +188,14 @@ pub(super) fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer, styl
     buffer.set_style(area, style);
     let graphemes = || {
         let mut used = 0;
-        line.styled_graphemes(Style::default())
-            .filter(move |g| g.symbol.width() <= area.width as usize)
+        styled_cells(line)
+            .filter(move |g| g.width <= area.width as usize)
             .take_while(move |g| {
-                used += g.symbol.width();
+                used += g.width;
                 used <= area.width as usize
             })
     };
-    let width = graphemes().map(|g| g.symbol.width() as u16).sum::<u16>();
+    let width = graphemes().map(|g| g.width as u16).sum::<u16>();
     let mut x = area.x
         + match line.alignment.unwrap_or(Alignment::Left) {
             Alignment::Left => 0,
@@ -183,7 +203,7 @@ pub(super) fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer, styl
             Alignment::Right => area.width - width,
         };
     for grapheme in graphemes() {
-        let width = grapheme.symbol.width() as u16;
+        let width = grapheme.width as u16;
         if width != 0 {
             buffer[(x, area.y)]
                 .set_symbol(grapheme.symbol)

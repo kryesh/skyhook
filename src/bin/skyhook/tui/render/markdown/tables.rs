@@ -1,12 +1,10 @@
 //! Table sizing, cell wrapping, and bounded grid rendering.
-use super::super::wrap_words;
+use super::super::{cells, cells_width, wrap_words};
 use pulldown_cmark::Alignment;
 use ratatui::{
     style::Modifier,
     text::{Line, Span},
 };
-use unicode_segmentation::UnicodeSegmentation;
-use unicode_width::UnicodeWidthStr;
 
 struct Column {
     alignment: Alignment,
@@ -61,12 +59,10 @@ impl Table {
                 // and word wrapping agree with the actual painted cell count.
                 let spans = std::mem::take(&mut cell.spans);
                 for span in spans {
-                    let painted: usize = span.content.graphemes(true).map(|g| g.width()).sum();
-                    if painted != span.width() {
+                    if cells_width(&span.content) != span.width() {
                         cell.spans.extend(
-                            span.content
-                                .graphemes(true)
-                                .map(|g| Span::styled(g.to_owned(), span.style)),
+                            cells(&span.content)
+                                .map(|(_, g, _)| Span::styled(g.to_owned(), span.style)),
                         );
                     } else {
                         cell.spans.push(span);
@@ -75,8 +71,8 @@ impl Table {
                 column.width = column.width.max(cell.width());
                 // Never assign less room than a single grapheme needs.
                 for span in &cell.spans {
-                    for grapheme in span.content.graphemes(true) {
-                        column.minimum = column.minimum.max(grapheme.width());
+                    for (_, _, width) in cells(&span.content) {
+                        column.minimum = column.minimum.max(width);
                     }
                 }
             }
@@ -215,11 +211,9 @@ fn wrap_cell(mut cell: Line<'static>, width: usize) -> Vec<Line<'static>> {
     // Only the borderless fallback can be narrower than a grapheme. Use a
     // visible replacement there, rather than letting it overwrite the next cell.
     for span in &mut cell.spans {
-        if span.content.graphemes(true).any(|g| g.width() > width) {
-            span.content = span
-                .content
-                .graphemes(true)
-                .map(|g| if g.width() > width { "�" } else { g })
+        if cells(&span.content).any(|(_, _, w)| w > width) {
+            span.content = cells(&span.content)
+                .map(|(_, g, w)| if w > width { "�" } else { g })
                 .collect::<String>()
                 .into();
         }
@@ -249,6 +243,7 @@ mod tests {
     use super::super::render;
     use super::*;
     use ratatui::style::Style;
+    use unicode_width::UnicodeWidthStr;
 
     const KEYS: &str = "| Key | Description |\n| --- | --- |\n| x | one two three four |";
     const STYLED: &str =

@@ -517,7 +517,9 @@ mod tests {
         };
         let phase = |records: &[EventRecord], request: RequestSeq| {
             let mut ledger = RequestLedger::default();
-            records.iter().for_each(|record| ledger.observe(record));
+            for record in records {
+                ledger.observe(record);
+            }
             ledger.get(request).unwrap().phase.clone()
         };
         let interrupted = |records: &[EventRecord]| count!(records, SessionEvent::AgentInterrupted);

@@ -2,10 +2,13 @@
 
 use super::*;
 
-/// Retained renderer state. Semantic changes arrive as one value, independently
-/// of width reflow; row storage owns its own height index.
+/// Retained renderer state. Content changes arrive as dirty entry indices,
+/// independently of width reflow; row storage owns its own height index.
 pub struct RenderState {
-    pub changes: model::ContentChanges,
+    /// Entries to lay out again on the next frame.
+    pub dirty: Vec<usize>,
+    /// Lay out every entry on the next frame.
+    pub reset: bool,
     pub rows: RowBlocks,
     pub width: u16,
     pub agent: skyhook::identity::AgentId,
@@ -13,6 +16,8 @@ pub struct RenderState {
     /// Markdown fence metadata per entry, keyed independently of row storage.
     pub(super) entries: std::collections::HashMap<model::EntryKey, code::Fences>,
     pub(super) request_columns: RequestColumns,
+    /// The entries on screen when highlighting was last prepared.
+    prepared: std::ops::Range<usize>,
 }
 
 impl RenderState {
@@ -21,30 +26,22 @@ impl RenderState {
         notify: tokio::sync::mpsc::UnboundedSender<super::super::app::Work>,
     ) -> Self {
         Self {
-            changes: model::ContentChanges {
-                reset: true,
-                ..Default::default()
-            },
+            dirty: Vec::new(),
+            reset: true,
             rows: RowBlocks::default(),
             width: 0,
             agent,
             highlights: super::super::tool_view::HighlightCache::with_notify(notify),
             entries: std::collections::HashMap::new(),
             request_columns: RequestColumns::default(),
+            prepared: 0..0,
         }
-    }
-
-    pub fn content_changed(&mut self, mut changes: model::ContentChanges) {
-        changes.reset |= self.changes.reset;
-        self.changes = changes;
     }
 
     pub fn reset_session(&mut self) {
         self.entries.clear();
-        self.changes = model::ContentChanges {
-            reset: true,
-            ..Default::default()
-        };
+        self.dirty.clear();
+        self.reset = true;
         self.highlights.clear();
     }
 }
@@ -189,9 +186,8 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
         };
     app.rebuild_content();
     app.render.highlights.poll();
-    let reset =
-        app.render.changes.reset || app.render.agent != app.selected || app.render.width != width;
-    let mut dirty = std::mem::take(&mut app.render.changes.dirty);
+    let reset = app.render.reset || app.render.agent != app.selected || app.render.width != width;
+    let mut dirty = std::mem::take(&mut app.render.dirty);
     if reset {
         app.render.entries.clear();
         dirty = (0..app.content_cache.entries().len()).collect();
@@ -220,21 +216,6 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
             let cached = app.render.entries.entry(entry.key().clone()).or_default();
             update_markdown_fences(entry, cached);
         }
-    }
-    // Only changed documents are prepared on ordinary content updates.
-    let selected = app.views.get(&app.selected).map_or(0, |view| view.row);
-    if reset || content_changed || !dirty.is_empty() {
-        let documents = std::iter::once(selected)
-            .chain(dirty.iter().copied())
-            .filter_map(|i| app.content_cache.entries().get(i));
-        app.render.highlights.prepare(documents.flat_map(|entry| {
-            entry.document().into_iter().chain(
-                app.render
-                    .entries
-                    .get(entry.key())
-                    .map(|cached| &cached.document),
-            )
-        }));
     }
     let highlighted_sources = app.render.highlights.take_changed_sources();
     let mut highlighted_entries = Vec::new();
@@ -270,7 +251,7 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
     if reset {
         app.render.rows.clear();
     }
-    for index in dirty {
+    for &index in &dirty {
         let Some(entry) = app.content_cache.entries().get(index) else {
             continue;
         };
@@ -298,6 +279,16 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
     app.render
         .rows
         .truncate_entries(app.content_cache.entries().len());
+    // Fence metadata outlives relayouts; drop it once its entries are gone.
+    if app.render.entries.len() > app.content_cache.entries().len() {
+        let live: std::collections::HashSet<_> = app
+            .content_cache
+            .entries()
+            .iter()
+            .map(|entry| entry.key())
+            .collect();
+        app.render.entries.retain(|key, _| live.contains(key));
+    }
     if let (Some(selection), Some((first, before))) = (app.selection, selection_before) {
         let unchanged =
             selection_unchanged(first, &before, app.render.rows.iter_from(first), selection);
@@ -305,8 +296,7 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
             app.selection = None;
         }
     }
-    app.render.changes.dirty.clear();
-    app.render.changes.reset = false;
+    app.render.reset = false;
     if changed {
         app.render.agent = app.selected.clone();
         if let Some((old_index, key, offset)) = anchor
@@ -334,6 +324,37 @@ pub(super) fn prepare_rows(app: &mut App, width: u16, p: Palette) {
         app.render.width = width;
     }
     app.content_rows = app.render.rows.len();
+    // Highlight what is on screen first, then the selected and changed entries,
+    // newest first. The budget cannot hold every section of a long transcript.
+    let visible = visible_entries(app);
+    if reset || content_changed || !dirty.is_empty() || app.render.prepared != visible {
+        app.render.prepared = visible.clone();
+        let selected = app.views.get(&app.selected).map_or(0, |view| view.row);
+        let order = visible.chain([selected]).chain(dirty.iter().rev().copied());
+        let entries = order.filter_map(|index| app.content_cache.entries().get(index));
+        app.render.highlights.prepare(entries.flat_map(|entry| {
+            entry.document().into_iter().chain(
+                app.render
+                    .entries
+                    .get(entry.key())
+                    .map(|cached| &cached.document),
+            )
+        }));
+    }
+}
+
+/// Entries with a row inside the viewport.
+fn visible_entries(app: &App) -> std::ops::Range<usize> {
+    let rows = &app.render.rows;
+    let height = app.content_rect.height as usize;
+    let max = rows.len().saturating_sub(height);
+    let scroll = app.views.get(&app.selected).and_then(|view| view.scroll);
+    let top = scroll.map_or(max, |scroll| scroll.min(max));
+    let bottom = (top + height).min(rows.len()).saturating_sub(1);
+    match (rows.get(top), rows.get(bottom)) {
+        (Some(first), Some(last)) => first.entry..last.entry + 1,
+        _ => 0..0,
+    }
 }
 
 #[cfg(test)]

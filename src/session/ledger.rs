@@ -100,6 +100,22 @@ pub struct RequestRecord {
     pub phase: RequestPhase,
 }
 
+/// The requests one record changed: the request it names, and a pending request
+/// it interrupted.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RequestChanges {
+    interrupted: Option<RequestSeq>,
+    named: Option<RequestSeq>,
+}
+
+impl IntoIterator for RequestChanges {
+    type Item = RequestSeq;
+    type IntoIter = std::iter::Flatten<std::array::IntoIter<Option<RequestSeq>, 2>>;
+    fn into_iter(self) -> Self::IntoIter {
+        [self.interrupted, self.named].into_iter().flatten()
+    }
+}
+
 /// Every model request of a journal, in sequence order.
 #[derive(Default)]
 pub struct RequestLedger {
@@ -113,10 +129,11 @@ pub struct RequestLedger {
 }
 
 impl RequestLedger {
-    /// Fold one record. Records must arrive in sequence order; a record for a
-    /// request the ledger never saw is ignored.
-    pub fn observe(&mut self, record: &EventRecord) {
+    /// Fold one record, returning the requests it changed. Records must arrive in
+    /// sequence order; a record for a request the ledger never saw is ignored.
+    pub fn observe(&mut self, record: &EventRecord) -> RequestChanges {
         let at = record.timestamp_millis;
+        let mut changes = RequestChanges::default();
         match &record.event {
             SessionEvent::ModelContext { context } => {
                 self.contexts
@@ -124,10 +141,10 @@ impl RequestLedger {
             }
             SessionEvent::ModelRequested { context, .. } => {
                 let Some((purpose, profile)) = self.contexts.get(context).cloned() else {
-                    return;
+                    return changes;
                 };
                 // A newer request supersedes whatever the previous one left pending.
-                self.interrupt(&record.agent, at);
+                changes.interrupted = self.interrupt(&record.agent, at);
                 let request = record.sequence.request();
                 self.requests.insert(
                     request,
@@ -143,9 +160,11 @@ impl RequestLedger {
                     },
                 );
                 self.latest.insert(record.agent.clone(), request);
+                changes.named = Some(request);
             }
             SessionEvent::ModelAttemptStarted(attempt) => {
                 if let Some(request) = self.requests.get_mut(&attempt.request) {
+                    changes.named = Some(attempt.request);
                     request.attempts += 1;
                     request.finished_millis = None;
                     request.phase = RequestPhase::Open {
@@ -158,13 +177,14 @@ impl RequestLedger {
                 message: Message::Assistant(_),
             } => {
                 let Some(&request) = self.latest.get(&record.agent) else {
-                    return;
+                    return changes;
                 };
                 if let Some(open) = self.requests.get_mut(&request)
                     && let RequestPhase::Open { message, .. } = &mut open.phase
                 {
                     *message = Some(record.sequence.message());
                     self.messages.insert(record.sequence.message(), request);
+                    changes.named = Some(request);
                 }
             }
             SessionEvent::ModelFailed {
@@ -174,7 +194,7 @@ impl RequestLedger {
             } => {
                 let (attempt, request) = (attempt.attempt, attempt.request);
                 self.failures.insert(record.sequence, request);
-                self.settle(request, at, |phase| match kind {
+                changes.named = self.settle(request, at, |phase| match kind {
                     ModelFailureKind::Refusal => RequestPhase::Refused {
                         attempt,
                         error: error.clone(),
@@ -190,8 +210,8 @@ impl RequestLedger {
                 failure,
                 delay_millis,
             } => {
-                if let Some(request) = self.failures.get(failure)
-                    && let Some(failed) = self.requests.get_mut(request)
+                if let Some(&request) = self.failures.get(failure)
+                    && let Some(failed) = self.requests.get_mut(&request)
                     && let RequestPhase::Failed {
                         attempt: Some(attempt),
                         error,
@@ -204,13 +224,14 @@ impl RequestLedger {
                         error: error.clone(),
                     };
                     failed.finished_millis = Some(at);
+                    changes.named = Some(request);
                 }
             }
             SessionEvent::ModelAttemptInterrupted(attempt) => {
                 let interrupted = RequestPhase::Interrupted {
                     attempt: Some(attempt.attempt),
                 };
-                self.settle(attempt.request, at, |_| interrupted);
+                changes.named = self.settle(attempt.request, at, |_| interrupted);
             }
             SessionEvent::ResponseCompleted {
                 attempt, message, ..
@@ -219,67 +240,73 @@ impl RequestLedger {
                 let completed = RequestPhase::Completed {
                     attempt: attempt.attempt,
                 };
-                self.settle(attempt.request, at, |_| completed);
+                changes.named = self.settle(attempt.request, at, |_| completed);
             }
             SessionEvent::Compaction { checkpoint } => {
                 let completed = RequestPhase::Completed {
                     attempt: checkpoint.attempt.attempt,
                 };
-                self.settle(checkpoint.attempt.request, at, |_| completed);
+                changes.named = self.settle(checkpoint.attempt.request, at, |_| completed);
             }
             SessionEvent::CompactionSkipped { attempt, .. } => {
                 let completed = RequestPhase::Completed {
                     attempt: attempt.attempt,
                 };
-                self.settle(attempt.request, at, |_| completed);
+                changes.named = self.settle(attempt.request, at, |_| completed);
             }
             SessionEvent::CompactionFailed { failure, error } => {
                 let (request, attempt) = match failure {
-                    CompactionFailure::BeforeRequest => return,
+                    CompactionFailure::BeforeRequest => return changes,
                     CompactionFailure::Requested(request) => (*request, None),
                     CompactionFailure::Attempted(attempt) => {
                         (attempt.request, Some(attempt.attempt))
                     }
                 };
-                self.settle(request, at, |_| RequestPhase::Failed {
+                changes.named = self.settle(request, at, |_| RequestPhase::Failed {
                     attempt,
                     error: error.clone(),
                     message: None,
                 });
             }
             SessionEvent::Usage { request, usage } => {
-                if let Some(request) = self.requests.get_mut(request) {
-                    request.usage.accumulate(*usage);
+                if let Some(record) = self.requests.get_mut(request) {
+                    record.usage.accumulate(*usage);
+                    changes.named = Some(*request);
                 }
             }
-            SessionEvent::AgentInterrupted => self.interrupt(&record.agent, at),
+            SessionEvent::AgentInterrupted => {
+                changes.interrupted = self.interrupt(&record.agent, at);
+            }
             _ => {}
         }
+        changes
     }
 
+    /// Returns the request when the ledger has it.
     fn settle(
         &mut self,
         request: RequestSeq,
         at: i64,
         phase: impl FnOnce(&RequestPhase) -> RequestPhase,
-    ) {
-        if let Some(request) = self.requests.get_mut(&request) {
-            request.phase = phase(&request.phase);
-            request.finished_millis = Some(at);
-        }
+    ) -> Option<RequestSeq> {
+        let record = self.requests.get_mut(&request)?;
+        record.phase = phase(&record.phase);
+        record.finished_millis = Some(at);
+        Some(request)
     }
 
-    /// Close the agent's pending request, if any, as interrupted.
-    fn interrupt(&mut self, agent: &AgentId, at: i64) {
-        if let Some(request) = self.latest.get(agent)
-            && let Some(pending) = self.requests.get_mut(request)
-            && pending.phase.pending()
-        {
-            pending.phase = RequestPhase::Interrupted {
-                attempt: pending.phase.last_attempt(),
-            };
-            pending.finished_millis = Some(at);
+    /// Close the agent's pending request, if any, as interrupted, returning it.
+    fn interrupt(&mut self, agent: &AgentId, at: i64) -> Option<RequestSeq> {
+        let request = *self.latest.get(agent)?;
+        let pending = self.requests.get_mut(&request)?;
+        if !pending.phase.pending() {
+            return None;
         }
+        pending.phase = RequestPhase::Interrupted {
+            attempt: pending.phase.last_attempt(),
+        };
+        pending.finished_millis = Some(at);
+        Some(request)
     }
 
     #[must_use]
@@ -326,6 +353,8 @@ mod tests {
         agent: AgentId,
         ledger: RequestLedger,
         next: u64,
+        /// What the last record changed.
+        changed: Vec<RequestSeq>,
     }
 
     impl Journal {
@@ -334,19 +363,21 @@ mod tests {
                 agent: AgentId::root(SessionId::from_bytes([7; 16])),
                 ledger: RequestLedger::default(),
                 next: 1,
+                changed: Vec::new(),
             }
         }
 
         fn record(&mut self, event: SessionEvent) -> RecordSeq {
             let sequence = RecordSeq::from(self.next);
             self.next += 1;
-            self.ledger.observe(&EventRecord {
+            let changes = self.ledger.observe(&EventRecord {
                 id: EventId::generate().unwrap(),
                 sequence,
                 timestamp_millis: at(sequence),
                 agent: self.agent.clone(),
                 event,
             });
+            self.changed = changes.into_iter().collect();
             sequence
         }
 
@@ -471,6 +502,8 @@ mod tests {
         assert_eq!(journal.phase(request), &failed(Some(1), None));
         assert_eq!(journal.finished(request), Some(at(failure)));
         journal.recover(failure, 250);
+        // The recovery names only its failure; the ledger reports the request.
+        assert_eq!(journal.changed, [request]);
         let retrying = RequestPhase::Retrying {
             attempt: 1,
             delay: Duration::from_millis(250),
@@ -481,6 +514,7 @@ mod tests {
         // A schedule citing a failure the request has already left changes nothing.
         journal.recover(failure, 1);
         assert_eq!(journal.phase(request), &retrying);
+        assert_eq!(journal.changed, []);
 
         journal.attempt(request, 2);
         assert_eq!(journal.phase(request), &open(2, None));
@@ -542,9 +576,11 @@ mod tests {
         let unattempted = RequestPhase::Interrupted { attempt: None };
         assert_eq!(journal.phase(requested), &unattempted);
         assert_eq!(journal.finished(requested), Some(at(stop)));
+        assert_eq!(journal.changed, [requested]);
         // A settled request is left alone by a later interruption.
         journal.record(SessionEvent::AgentInterrupted);
         assert_eq!(journal.phase(requested), &unattempted);
+        assert_eq!(journal.changed, []);
 
         let after_attempt = RequestPhase::Interrupted { attempt: Some(1) };
         let retrying = journal.attempted(ModelPurpose::Agent);
@@ -560,6 +596,7 @@ mod tests {
         // A newer request supersedes whatever the previous one left open.
         let open = journal.attempted(ModelPurpose::Agent);
         let next = journal.request(ModelPurpose::Agent);
+        assert_eq!(journal.changed, [open, next]);
         assert_eq!(journal.phase(open), &after_attempt);
         assert_eq!(journal.open(), Some(next));
     }

@@ -55,18 +55,18 @@ impl Row {
         let mut column = self.layout.prefix.width();
         let (prefix_bytes, prefix_width) = self.layout.source_prefix();
         let prefix_end = column + prefix_width;
-        for (byte, grapheme) in text.grapheme_indices(true) {
+        for (byte, _, width) in cells(&text) {
             if byte == prefix_bytes {
                 column = self
                     .layout
                     .code()
                     .map_or(prefix_end, |code| code.body_start());
             }
-            let clipped_prefix = byte < prefix_bytes && column + grapheme.width() > prefix_end;
-            if !clipped_prefix && target < column + grapheme.width() {
+            let clipped_prefix = byte < prefix_bytes && column + width > prefix_end;
+            if !clipped_prefix && target < column + width {
                 return byte;
             }
-            column += grapheme.width();
+            column += width;
         }
         text.len()
     }
@@ -96,36 +96,27 @@ impl RowText<'_> {
         let prefix = self.endpoint(prefix_bytes)?;
         let leading = layout.prefix.width();
         Some(if byte < prefix {
-            leading
-                + self.text[..byte]
-                    .graphemes(true)
-                    .map(|g| g.width())
-                    .sum::<usize>()
-                    .min(prefix_width)
+            leading + cells_width(&self.text[..byte]).min(prefix_width)
         } else {
             layout
                 .code()
                 .map_or(leading + prefix_width, |code| code.body_start())
-                + self.text[prefix..byte]
-                    .graphemes(true)
-                    .map(|g| g.width())
-                    .sum::<usize>()
+                + cells_width(&self.text[prefix..byte])
         })
     }
     /// Every grapheme as (byte, `source_column`, width), in one pass over the row.
     pub fn source_cells(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
-        fn cells(
+        fn columns(
             text: &str,
             offset: usize,
             start: usize,
             limit: usize,
         ) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
-            text.grapheme_indices(true)
-                .scan(0usize, move |used, (byte, g)| {
-                    let column = start + (*used).min(limit);
-                    *used += g.width();
-                    Some((offset + byte, column, g.width()))
-                })
+            cells(text).scan(0usize, move |used, (byte, _, width)| {
+                let column = start + (*used).min(limit);
+                *used += width;
+                Some((offset + byte, column, width))
+            })
         }
         let layout = &self.row.layout;
         let (prefix_bytes, prefix_width) = layout.source_prefix();
@@ -136,7 +127,7 @@ impl RowText<'_> {
         self.endpoint(prefix_bytes)
             .into_iter()
             .flat_map(move |prefix| {
-                cells(&self.text[..prefix], 0, leading, prefix_width).chain(cells(
+                columns(&self.text[..prefix], 0, leading, prefix_width).chain(columns(
                     &self.text[prefix..],
                     prefix,
                     body,

@@ -204,7 +204,7 @@ impl App {
         let view = View::default();
         let changes = self.content_cache.update(
             &ObservationSnapshot::default(),
-            &Projection::default(),
+            &mut Projection::default(),
             model::EntryView {
                 agent: &self.selected,
                 tab: self.tab,
@@ -215,7 +215,7 @@ impl App {
             0,
             entries,
         );
-        self.render.content_changed(changes);
+        self.render.dirty.extend(changes);
         self.content_dirty = false;
     }
 

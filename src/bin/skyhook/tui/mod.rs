@@ -2,6 +2,7 @@ mod app;
 mod composer;
 mod editor;
 pub(crate) mod format;
+mod frames;
 mod host;
 mod keys;
 mod model;
@@ -16,7 +17,7 @@ use app::{App, PreparedObservation};
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-        EventStream,
+        Event, EventStream,
     },
     execute, queue,
     terminal::{
@@ -27,9 +28,10 @@ use crossterm::{
 use futures_util::StreamExt;
 use std::{
     io::{self, IsTerminal, Write},
+    task::Poll,
     time::Duration,
 };
-use tokio::sync::mpsc;
+use tokio::{sync::mpsc, time::Instant};
 
 pub(crate) use super::launch::Launch;
 
@@ -122,17 +124,13 @@ pub async fn run(
         previous(info);
     }));
     let _guard = TerminalGuard::enter()?;
-    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(
-        io::BufWriter::with_capacity(64 * 1024, io::stdout()),
-    ))?;
+    let (output, mut writer) = frames::Writer::spawn(io::stdout());
+    let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(output))?;
     terminal.clear()?;
     let mut input = EventStream::new();
     let mut ticks = tokio::time::interval(Duration::from_millis(100));
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Clicks and typing paint immediately. Coalesce continuous mouse/background
-    // bursts to avoid flooding the terminal; this is NOT a CPU rendering budget.
-    let frame_interval = Duration::from_millis(8);
-    let mut last_draw = tokio::time::Instant::now() - frame_interval;
+    let mut pacer = frames::Pacer::default();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
     let mut interrupt = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
@@ -145,30 +143,32 @@ pub async fn run(
     let result: io::Result<()> = async {
         while host.settle() {
             let app = host.app();
-            if app.dirty && last_draw.elapsed() >= frame_interval {
-                last_draw = tokio::time::Instant::now();
+            let now = Instant::now();
+            if app.dirty && !writer.busy() && pacer.due().is_none_or(|due| due <= now) {
                 draw_terminal(&mut terminal, app)?;
+                pacer.drawn(now, now.elapsed());
                 app.dirty = false;
             }
             if let Some(text) = app.clipboard.take() {
-                copy_terminal(&text)?;
+                copy_terminal(terminal.backend_mut(), &text)?;
             }
-            let dirty = app.dirty;
+            writer.send()?;
+            // A frame held back by the writer waits for it; otherwise for the budget.
+            let busy = writer.busy();
+            let budget = pacer.due().filter(|_| app.dirty && !busy);
             tokio::select! {
                 event = input.next() => match event {
                     Some(Ok(event)) => {
-                        // Clicks and typing paint at once; continuous mouse bursts coalesce.
-                        if !matches!(&event, crossterm::event::Event::Mouse(mouse) if matches!(mouse.kind, crossterm::event::MouseEventKind::Moved | crossterm::event::MouseEventKind::Drag(_) | crossterm::event::MouseEventKind::ScrollUp | crossterm::event::MouseEventKind::ScrollDown | crossterm::event::MouseEventKind::ScrollLeft | crossterm::event::MouseEventKind::ScrollRight)) {
-                            last_draw = tokio::time::Instant::now() - frame_interval;
-                        }
-                        host.app().event(event);
-                    },
+                        apply(&mut host, &mut pacer, event);
+                        drain(&mut input, &mut host, &mut pacer).await?;
+                    }
                     Some(Err(error)) => return Err(error),
                     None => break,
                 },
                 event = host.next() => host.handle(event).await,
                 _ = ticks.tick() => host.tick(),
-                _ = tokio::time::sleep_until(last_draw + frame_interval), if dirty => {},
+                written = writer.written(), if busy => written?,
+                _ = tokio::time::sleep_until(budget.unwrap_or(now)), if budget.is_some() => {},
                 _ = terminate.recv() => host.quit(),
                 _ = hangup.recv() => host.quit(),
                 _ = interrupt.recv() => host.quit(),
@@ -177,8 +177,51 @@ pub async fn run(
         Ok(())
     }
     .await;
+    // Everything drawn reaches the terminal before it is restored.
+    drop(terminal);
+    let written = writer.join();
     host.close().await?;
     result?;
+    written?;
+    Ok(())
+}
+
+/// Input continuing a gesture (pointer motion, drags, wheel steps) repaints within
+/// the frame budget; anything else paints as soon as the writer is free.
+fn apply(host: &mut host::Host, pacer: &mut frames::Pacer, event: Event) {
+    use crossterm::event::MouseEventKind as Kind;
+    let gesture = matches!(&event, Event::Mouse(mouse) if matches!(
+        mouse.kind,
+        Kind::Moved
+            | Kind::Drag(_)
+            | Kind::ScrollUp
+            | Kind::ScrollDown
+            | Kind::ScrollLeft
+            | Kind::ScrollRight
+    ));
+    if !gesture {
+        pacer.input();
+    }
+    host.app().event(event);
+}
+
+/// Apply every input event already queued, so one frame answers a burst: a window
+/// drag relays out once, for its latest size. A host request is settled first.
+async fn drain(
+    input: &mut EventStream,
+    host: &mut host::Host,
+    pacer: &mut frames::Pacer,
+) -> io::Result<()> {
+    while host.app().host.is_none() && !host.app().exit {
+        // Poll with this task's waker: crossterm keeps the first waker it is given
+        // until input arrives, so a no-op waker would strand later input.
+        let next = std::future::poll_fn(|cx| Poll::Ready(input.poll_next_unpin(cx))).await;
+        match next {
+            Poll::Ready(Some(Ok(event))) => apply(host, pacer, event),
+            Poll::Ready(Some(Err(error))) => return Err(error),
+            Poll::Ready(None) | Poll::Pending => break,
+        }
+    }
     Ok(())
 }
 
@@ -194,12 +237,11 @@ fn draw_terminal<W: Write>(
     rendered.and(ended)
 }
 
-fn copy_terminal(text: &str) -> io::Result<()> {
+fn copy_terminal(output: &mut impl Write, text: &str) -> io::Result<()> {
     use base64::Engine as _;
     write!(
-        io::stdout(),
+        output,
         "\x1b]52;c;{}\x07",
         base64::engine::general_purpose::STANDARD.encode(text)
-    )?;
-    io::stdout().flush()
+    )
 }

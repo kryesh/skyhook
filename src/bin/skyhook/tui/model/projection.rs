@@ -1,6 +1,7 @@
 //! Incremental journal indexes, agent lifecycle state, and usage totals.
 
 use super::super::format::agent_label;
+use super::entries::Dep;
 use super::state_name;
 use serde_json::Value;
 use skyhook::agent::{AgentActivity, ObservationSnapshot, TodoItem, TurnFailure};
@@ -171,6 +172,8 @@ pub struct Projection {
     pub(super) ledger: RequestLedger,
     /// Calls that admitted a job, so the job card stands in for the call.
     pub(super) tool_origins: HashSet<(AgentId, MessageSeq, String)>,
+    /// What records folded since the last `take_changes` touched.
+    changes: HashSet<Dep>,
 }
 impl Projection {
     pub(super) fn agent_name(&self, agent: &AgentId) -> &str {
@@ -205,6 +208,11 @@ impl Projection {
         changed
     }
 
+    /// Everything records folded since the last call touched, for history to rebuild.
+    pub(super) fn take_changes(&mut self) -> HashSet<Dep> {
+        std::mem::take(&mut self.changes)
+    }
+
     pub fn rebuild(&mut self, snapshot: &ObservationSnapshot) {
         let after = (Bound::Excluded(self.through), Bound::Unbounded);
         for (_, record) in snapshot.records.range(after) {
@@ -213,7 +221,8 @@ impl Projection {
                 .entry(record.agent.clone())
                 .or_default()
                 .push(record.sequence);
-            self.ledger.observe(record);
+            let requests = self.ledger.observe(record).into_iter();
+            self.changes.extend(requests.map(Dep::Request));
             match &record.event {
                 SessionEvent::AgentStarted {
                     profile,
@@ -223,6 +232,8 @@ impl Projection {
                     owner_job,
                     ..
                 } => {
+                    // The owner job's card shows where its agent runs.
+                    self.changes.extend(owner_job.map(Dep::Job));
                     self.agents.retain(|agent| agent.id != record.agent);
                     self.agents.push(AgentInfo {
                         id: record.agent.clone(),
@@ -250,7 +261,10 @@ impl Projection {
                     origin,
                     ..
                 } => {
+                    self.changes.insert(Dep::Job(*job));
                     if let Some(origin) = origin {
+                        let call = origin.call_id.clone();
+                        self.changes.insert(Dep::Call(origin.message, call));
                         self.tool_origins.insert((
                             record.agent.clone(),
                             origin.message,
@@ -278,6 +292,7 @@ impl Projection {
                     );
                 }
                 SessionEvent::JobStateChanged { job, state } => {
+                    self.changes.insert(Dep::Job(*job));
                     if let Some(info) = self.jobs.get_mut(job) {
                         info.state = (*state).into();
                     }
@@ -300,6 +315,7 @@ impl Projection {
                     diagnostic,
                     ..
                 } => {
+                    self.changes.insert(Dep::Job(*job));
                     let capabilities = self
                         .agents
                         .iter()

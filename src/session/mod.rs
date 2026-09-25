@@ -33,7 +33,7 @@ pub use event::{
     ModeSelection, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose, ProfileSnapshot,
     RecordSeq, RequestSeq, SessionEvent, Truncation,
 };
-pub use ledger::{RequestLedger, RequestPhase, RequestRecord};
+pub use ledger::{RequestChanges, RequestLedger, RequestPhase, RequestRecord};
 pub use request::{
     Projection, project_history, reconstruct_model_request, record_at, render_history,
     request_context,

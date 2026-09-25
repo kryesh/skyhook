@@ -96,7 +96,8 @@ would look like the user speaking again after every tool call.
 
 Hosts fold these records into one `RequestPhase` per request in `session::RequestLedger`;
 session statistics and the terminal interface read request outcomes, retry state, and
-message attribution from that fold rather than deriving them from live activity.
+message attribution from that fold rather than deriving them from live activity. Folding a
+record reports the requests it changed, so a host can refresh just those.
 
 Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized `ProviderErrorKind` values rather than error-message text: rate limits, timeouts,

@@ -1,8 +1,14 @@
 //! Tab selection and ordered conversation projection, including call/result provenance.
+//!
+//! History is a fold over sources: journal records, or jobs on the Jobs tab. Each
+//! source owns a contiguous segment of entries, rebuilt only when something it was
+//! built from changes, so a new record costs its own entries, not the history's.
 use crate::tui::app::OutputStore;
 
 use super::jobs::{call_entry, job_entry};
-use super::live::{block_key, reasoning_entry, response_entries, working_entry};
+use super::live::{
+    block_key, live_tail_responses, reasoning_entry, response_entries, working_entry,
+};
 use super::notifications::job_event_entries;
 use super::requests::request_entry;
 use super::{
@@ -10,15 +16,678 @@ use super::{
 };
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
-use skyhook::provider::protocol::{AssistantItem, BlockRef};
-use skyhook::session::{Message, MessageSeq, RecordSeq, RequestPhase, SessionEvent, UserPart};
+use skyhook::job::JobRole;
+use skyhook::provider::protocol::{AssistantItem, BlockRef, ToolResult};
+use skyhook::session::{
+    EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestPhase, RequestSeq, SessionEvent,
+    UserPart,
+};
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolGroup {
     Response(MessageSeq),
     Script(JobId),
     Notification(RecordSeq, usize),
+}
+
+/// Something history entries are built from besides their own source.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Dep {
+    /// A model request's ledger record or observed response.
+    Request(RequestSeq),
+    /// A job's state, output or owning agent.
+    Job(JobId),
+    /// A tool call's result, or the job it admitted.
+    Call(MessageSeq, String),
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum Source {
+    Record(RecordSeq),
+    Job(JobId),
+}
+
+#[derive(Clone, Copy)]
+struct Segment {
+    source: Source,
+    start: usize,
+    len: usize,
+}
+
+/// One source's entries, their tool groups, and what they were built from.
+#[derive(Default)]
+struct Built {
+    entries: Vec<Entry>,
+    groups: Vec<Option<ToolGroup>>,
+    deps: Vec<Dep>,
+}
+impl Built {
+    fn push(&mut self, entry: Entry, group: Option<ToolGroup>) {
+        self.entries.push(entry);
+        self.groups.push(group);
+    }
+}
+
+/// Everything history is built from.
+#[derive(Clone, Copy)]
+pub struct Inputs<'a> {
+    pub snapshot: &'a ObservationSnapshot,
+    pub projection: &'a Projection,
+    pub presentation: EntryView<'a>,
+    pub outputs: &'a OutputStore,
+}
+
+/// Tool results carry a call ID but no message sequence. Each pairs with a call of
+/// the agent's most recent assistant turn, consuming the call once, so an old or
+/// reused ID never claims a later result.
+#[derive(Default)]
+struct Pairing {
+    pending: HashMap<(String, String), MessageSeq>,
+    turn: Option<MessageSeq>,
+    /// A call's result, as its record and index.
+    results: HashMap<(MessageSeq, String), (RecordSeq, usize)>,
+    matched: HashSet<(RecordSeq, usize)>,
+}
+impl Pairing {
+    /// Fold one record, noting the calls it paired with a result.
+    fn observe(&mut self, record: &EventRecord, paired: &mut HashSet<Dep>) {
+        match &record.event {
+            SessionEvent::MessageCommitted {
+                message: Message::Assistant(items),
+            } => {
+                self.pending.clear();
+                self.turn = Some(record.sequence.message());
+                for call in items.iter().filter_map(|item| item.call()) {
+                    self.pending.insert(
+                        (call.id().to_owned(), call.name().to_owned()),
+                        record.sequence.message(),
+                    );
+                }
+            }
+            SessionEvent::JobCreated {
+                origin: Some(origin),
+                tool,
+                ..
+            } if self.turn.is_none_or(|turn| turn <= origin.message) => {
+                // Retained job provenance also identifies a call whose assistant
+                // message is no longer in the retained history.
+                let message = origin.message;
+                self.pending
+                    .insert((origin.call_id.clone(), tool.clone()), message);
+                self.turn = Some(message);
+            }
+            SessionEvent::MessageCommitted {
+                message: Message::Tool(results),
+            } => {
+                for (index, result) in results.iter().enumerate() {
+                    let call = (result.call_id.clone(), result.name.clone());
+                    if let Some(message) = self.pending.remove(&call) {
+                        let call = result.call_id.clone();
+                        self.results
+                            .insert((message, call.clone()), (record.sequence, index));
+                        self.matched.insert((record.sequence, index));
+                        paired.insert(Dep::Call(message, call));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn result<'a>(
+        &self,
+        snapshot: &'a ObservationSnapshot,
+        message: MessageSeq,
+        call: &str,
+    ) -> Option<&'a ToolResult> {
+        let (record, index) = *self.results.get(&(message, call.to_owned()))?;
+        match &snapshot.records.get(&record)?.event {
+            SessionEvent::MessageCommitted {
+                message: Message::Tool(results),
+            } => results.get(index),
+            _ => None,
+        }
+    }
+}
+
+/// What an update changed: entries replaced in place, and the first entry from
+/// which later entries moved.
+#[derive(Default)]
+pub struct Changed {
+    pub dirty: Vec<usize>,
+    pub shifted: Option<usize>,
+}
+impl Changed {
+    fn shift(&mut self, from: usize) {
+        self.shifted = Some(self.shifted.map_or(from, |shifted| shifted.min(from)));
+    }
+}
+
+/// Retained history for one agent and tab.
+#[derive(Default)]
+pub struct History {
+    /// How many of the agent's records have been folded.
+    folded: usize,
+    pairing: Pairing,
+    segments: Vec<Segment>,
+    index: HashMap<Source, usize>,
+    deps: HashMap<Dep, Vec<Source>>,
+    /// Each entry's tool group, for the spacing between siblings.
+    groups: Vec<Option<ToolGroup>>,
+}
+
+impl History {
+    pub fn len(&self) -> usize {
+        self.groups.len()
+    }
+
+    /// A fresh history and its entries.
+    pub fn build(inputs: Inputs<'_>) -> (Self, Vec<Entry>) {
+        let mut history = Self::default();
+        let mut entries = Vec::new();
+        let candidates = inputs.projection.jobs.keys().copied().collect();
+        // Every record is folded before any segment is built: a call's segment
+        // shows the result that arrives after it.
+        let sources = history.fold(inputs, candidates, &mut HashSet::new());
+        for source in sources {
+            history.insert(source, inputs, &mut entries, &mut Changed::default());
+        }
+        (history, entries)
+    }
+
+    /// Fold the agent's new records and rebuild what `changed` names. `entries` holds
+    /// exactly this history's entries.
+    pub fn update(
+        &mut self,
+        inputs: Inputs<'_>,
+        entries: &mut Vec<Entry>,
+        mut changed: HashSet<Dep>,
+    ) -> Changed {
+        let candidates = changed
+            .iter()
+            .filter_map(|dep| match dep {
+                Dep::Job(job) => Some(*job),
+                _ => None,
+            })
+            .collect();
+        let sources = self.fold(inputs, candidates, &mut changed);
+        let mut result = Changed::default();
+        let mut positions: Vec<_> = changed
+            .iter()
+            .filter_map(|dep| self.deps.get(dep))
+            .flatten()
+            .filter_map(|source| self.index.get(source).copied())
+            .collect();
+        positions.sort_unstable();
+        positions.dedup();
+        for position in positions {
+            self.rebuild(position, inputs, entries, &mut result);
+        }
+        for source in sources {
+            self.insert(source, inputs, entries, &mut result);
+        }
+        result
+    }
+
+    /// The entries of a source, if it has any.
+    pub fn record_entries(&self, record: RecordSeq) -> Option<Range<usize>> {
+        let segment = self.segments[*self.index.get(&Source::Record(record))?];
+        Some(segment.start..segment.start + segment.len)
+    }
+
+    /// New sources in order: the agent's unfolded records, or its jobs among
+    /// `candidates` on the Jobs tab.
+    fn fold(
+        &mut self,
+        inputs: Inputs<'_>,
+        candidates: Vec<JobId>,
+        changed: &mut HashSet<Dep>,
+    ) -> Vec<Source> {
+        let Inputs {
+            snapshot,
+            projection,
+            presentation,
+            ..
+        } = inputs;
+        let agent = presentation.agent;
+        if presentation.tab == Tab::Jobs {
+            let mut jobs: Vec<_> = candidates
+                .into_iter()
+                .filter(|job| {
+                    !self.index.contains_key(&Source::Job(*job))
+                        && projection
+                            .jobs
+                            .get(job)
+                            .is_some_and(|job| &job.agent == agent)
+                })
+                .map(Source::Job)
+                .collect();
+            jobs.sort_unstable();
+            return jobs;
+        }
+        let records = projection.records_by_agent.get(agent);
+        let records = records.map_or(&[][..], Vec::as_slice);
+        let new = &records[self.folded.min(records.len())..];
+        self.folded = records.len();
+        let mut sources = Vec::new();
+        for record in new
+            .iter()
+            .filter_map(|sequence| snapshot.records.get(sequence))
+        {
+            match presentation.tab {
+                Tab::Conversation => self.pairing.observe(record, changed),
+                Tab::Requests if !matches!(record.event, SessionEvent::ModelRequested { .. }) => {
+                    continue;
+                }
+                _ => {}
+            }
+            sources.push(Source::Record(record.sequence));
+        }
+        sources
+    }
+
+    /// Place a new source's segment in source order.
+    fn insert(
+        &mut self,
+        source: Source,
+        inputs: Inputs<'_>,
+        entries: &mut Vec<Entry>,
+        result: &mut Changed,
+    ) {
+        let position = self
+            .segments
+            .partition_point(|segment| segment.source < source);
+        let start = self
+            .segments
+            .get(position)
+            .map_or(entries.len(), |segment| segment.start);
+        let built = self.build_source(source, inputs);
+        self.register(source, &built.deps);
+        let len = built.entries.len();
+        entries.splice(start..start, built.entries);
+        self.groups.splice(start..start, built.groups);
+        self.segments
+            .insert(position, Segment { source, start, len });
+        for later in &mut self.segments[position + 1..] {
+            later.start += len;
+        }
+        for (offset, segment) in self.segments[position..].iter().enumerate() {
+            self.index.insert(segment.source, position + offset);
+        }
+        if position + 1 < self.segments.len() && len > 0 {
+            result.shift(start);
+        }
+        self.compact(
+            inputs,
+            entries,
+            start.saturating_sub(1)..start + len,
+            result,
+        );
+    }
+
+    fn rebuild(
+        &mut self,
+        position: usize,
+        inputs: Inputs<'_>,
+        entries: &mut Vec<Entry>,
+        result: &mut Changed,
+    ) {
+        let Segment { source, start, len } = self.segments[position];
+        let built = self.build_source(source, inputs);
+        self.register(source, &built.deps);
+        let new_len = built.entries.len();
+        let old: Vec<_> = entries.splice(start..start + len, built.entries).collect();
+        self.groups.splice(start..start + len, built.groups);
+        self.compact(
+            inputs,
+            entries,
+            start.saturating_sub(1)..start + new_len,
+            result,
+        );
+        if new_len == len {
+            let changed = old.iter().zip(&entries[start..]).enumerate();
+            let changed = changed.filter(|(_, (old, new))| old != new);
+            result
+                .dirty
+                .extend(changed.map(|(offset, _)| start + offset));
+        } else {
+            self.segments[position].len = new_len;
+            for later in &mut self.segments[position + 1..] {
+                later.start = later.start - len + new_len;
+            }
+            result.shift(start);
+        }
+    }
+
+    fn register(&mut self, source: Source, deps: &[Dep]) {
+        for dep in deps {
+            let sources = self.deps.entry(dep.clone()).or_default();
+            if !sources.contains(&source) {
+                sources.push(source);
+            }
+        }
+    }
+
+    /// An entry sits tight against the next when both share a tool group, or the
+    /// next is a child of its script. It is stored on the entry so equality-based
+    /// invalidation also relays out a neighbour when a sibling arrives or leaves.
+    fn compact(
+        &self,
+        inputs: Inputs<'_>,
+        entries: &mut [Entry],
+        range: Range<usize>,
+        result: &mut Changed,
+    ) {
+        if inputs.presentation.tab != Tab::Conversation {
+            return;
+        }
+        for index in range.start..range.end.min(entries.len()) {
+            let next = self.groups.get(index + 1).copied().flatten();
+            let script_child = entries[index]
+                .job_id()
+                .is_some_and(|job| next == Some(ToolGroup::Script(job)));
+            let compact =
+                script_child || self.groups[index].is_some_and(|group| next == Some(group));
+            if entries[index].compact_after != compact {
+                entries[index].compact_after = compact;
+                result.dirty.push(index);
+            }
+        }
+    }
+
+    fn build_source(&self, source: Source, inputs: Inputs<'_>) -> Built {
+        let Inputs {
+            snapshot,
+            projection,
+            presentation,
+            outputs,
+        } = inputs;
+        let mut built = Built::default();
+        match source {
+            Source::Job(job) => {
+                built.deps.push(Dep::Job(job));
+                if let Some(job) = projection.jobs.get(&job) {
+                    let (view, all) = (presentation.view, presentation.all_details);
+                    let mut entry = job_entry(job, projection, view, outputs, all);
+                    // The Jobs tab is a dense list; conversation grouping owns its
+                    // spacing separately, and expanded documents stay unchanged.
+                    entry.compact_after = true;
+                    built.push(entry, None);
+                }
+            }
+            Source::Record(sequence) => {
+                if let Some(record) = snapshot.records.get(&sequence) {
+                    if presentation.tab == Tab::Requests {
+                        let request = sequence.request();
+                        built.deps.push(Dep::Request(request));
+                        if let Some(record) = projection.ledger.get(request) {
+                            built.push(request_entry(request, record), None);
+                        }
+                    } else {
+                        self.conversation(record, inputs, &mut built);
+                    }
+                }
+            }
+        }
+        built
+    }
+
+    fn conversation(&self, record: &EventRecord, inputs: Inputs<'_>, built: &mut Built) {
+        let Inputs {
+            snapshot,
+            projection,
+            presentation,
+            outputs,
+        } = inputs;
+        let EntryView {
+            agent,
+            view,
+            all_details,
+            ..
+        } = presentation;
+        let agent_name = projection.agent_name(agent);
+        let key = EntryKey::Record(record.sequence);
+        match &record.event {
+            SessionEvent::ModelRequested { .. } => {
+                let request = record.sequence.request();
+                built.deps.push(Dep::Request(request));
+                if let Some(entry) = super::retry::retry_entry(snapshot, projection, agent, request)
+                {
+                    built.push(entry, None);
+                }
+                // A settled response no commit replaced (an interrupted attempt)
+                // stays at its journal position; a failure's is part of its card.
+                let phase = projection.ledger.get(request).map(|record| &record.phase);
+                if matches!(
+                    phase,
+                    Some(RequestPhase::Interrupted { .. } | RequestPhase::Completed { .. })
+                ) && let Some(response) = snapshot.responses.get(&(agent.clone(), request))
+                    && response.settlement().is_some()
+                {
+                    for entry in response_entries(request, response, view, agent_name) {
+                        built.push(entry, None);
+                    }
+                }
+            }
+            SessionEvent::MessageCommitted { message } => match message {
+                Message::User(blocks) => {
+                    for (i, block) in blocks.iter().enumerate() {
+                        let (title, text, surface) = match block {
+                            UserPart::Text { text } => (
+                                if agent.path().is_empty() {
+                                    "You"
+                                } else {
+                                    "Parent"
+                                },
+                                text.clone(),
+                                Surface::User,
+                            ),
+                            UserPart::ParentInput { text } => {
+                                ("Parent", text.clone(), Surface::User)
+                            }
+                            UserPart::Attachment { attachment } => {
+                                ("Attachment", pretty(attachment), Surface::User)
+                            }
+                            UserPart::JobEvents { events } => {
+                                built.deps.extend(events.iter().filter_map(|event| {
+                                    match event {
+                                        JobEvent::Message(message) => Some(message.id),
+                                        JobEvent::Job(job) => job.id(),
+                                    }
+                                    .map(Dep::Job)
+                                }));
+                                let group = ToolGroup::Notification(record.sequence, i);
+                                let entries = job_event_entries(
+                                    record.sequence,
+                                    i,
+                                    events,
+                                    projection,
+                                    view,
+                                    all_details,
+                                );
+                                for entry in entries {
+                                    built.push(entry, Some(group));
+                                }
+                                continue;
+                            }
+                            // Persisted runtime state is model context, not conversation.
+                            UserPart::State { .. } => continue,
+                            UserPart::Compaction { text } => {
+                                ("Compaction", text.clone(), Surface::Muted)
+                            }
+                        };
+                        let key = EntryKey::UserBlock {
+                            record: record.sequence,
+                            index: i,
+                        };
+                        let entry = Entry::titled(key, Title::plain(title), text, surface);
+                        built.push(entry, None);
+                    }
+                }
+                Message::Assistant(items) => {
+                    self.assistant(record, items, inputs, built);
+                }
+                Message::Tool(results) => {
+                    for (index, result) in results.iter().enumerate() {
+                        if !self.pairing.matched.contains(&(record.sequence, index)) {
+                            let result_key = EntryKey::ToolResult {
+                                record: record.sequence,
+                                call: result.call_id.clone(),
+                            };
+                            let open = view.is_expanded(&result_key, all_details);
+                            let call = (result.name.as_str(), None, Some(result));
+                            let entry = call_entry(result_key, call, agent, projection, open);
+                            built.push(entry, None);
+                        }
+                    }
+                }
+            },
+            SessionEvent::JobCreated { job, origin, .. } => {
+                built.deps.push(Dep::Job(*job));
+                if let Some(job) = projection.jobs.get(job) {
+                    let entry = job_entry(job, projection, view, outputs, all_details);
+                    // Script children belong to their immediate script, not to the
+                    // model response that launched the script.
+                    let group = job
+                        .parent
+                        .and_then(|parent| projection.jobs.get(&parent))
+                        .filter(|parent| parent.role == JobRole::Script)
+                        .map(|parent| ToolGroup::Script(parent.id))
+                        .or_else(|| {
+                            origin
+                                .as_ref()
+                                .map(|origin| ToolGroup::Response(origin.message))
+                        });
+                    built.push(entry, group);
+                }
+            }
+            SessionEvent::Compaction { checkpoint } => {
+                let open = view.is_expanded(&key, false);
+                let title = format!(
+                    "Context compacted · {} → {}",
+                    number(checkpoint.before_tokens),
+                    number(checkpoint.after_tokens),
+                );
+                let body = if open {
+                    format!("Summary and retained sources\n{}", pretty(checkpoint))
+                } else {
+                    String::new()
+                };
+                let title = Title::disclosed(title, open);
+                built.push(Entry::titled(key, title, body, Surface::Muted), None);
+            }
+            SessionEvent::Status { message } => {
+                let entry = Entry::new(key, format!("Status · {message}"), Surface::Status);
+                built.push(entry, None);
+            }
+            SessionEvent::CompactionFailed { error, .. } => {
+                let text = format!("Compaction failed; previous context retained\n{error}");
+                built.push(Entry::new(key, text, Surface::Error), None);
+            }
+            SessionEvent::CompactionSkipped { reason, .. } => {
+                let text = format!("Compaction skipped · {reason}");
+                built.push(Entry::new(key, text, Surface::Muted), None);
+            }
+            _ => {}
+        }
+    }
+
+    fn assistant(
+        &self,
+        record: &EventRecord,
+        items: &[AssistantItem],
+        inputs: Inputs<'_>,
+        built: &mut Built,
+    ) {
+        let Inputs {
+            snapshot,
+            projection,
+            presentation,
+            ..
+        } = inputs;
+        let EntryView {
+            agent,
+            view,
+            all_details,
+            ..
+        } = presentation;
+        let agent_name = projection.agent_name(agent);
+        let message = record.sequence.message();
+        let request = projection.ledger.request_of(message);
+        built.deps.extend(request.map(Dep::Request));
+        let response = request.map_or(ResponseRef::Message(message), ResponseRef::Request);
+        let footer = request
+            .and_then(|request| projection.ledger.get(request))
+            .map(|request| request.profile.profile.model.clone());
+        // The model footer sits under the last visible text of an answer; a working
+        // turn (one with calls) has none.
+        let final_text = (!items.iter().any(|item| item.call().is_some()))
+            .then(|| {
+                items.iter().rev().find_map(|item| match item {
+                    AssistantItem::Text { blocks, .. } => {
+                        blocks.iter().rfind(|block| !block.text.trim().is_empty())
+                    }
+                    _ => None,
+                })
+            })
+            .flatten();
+        for item in items {
+            match item {
+                AssistantItem::Text { id, blocks, .. } => {
+                    for block in blocks.iter().filter(|block| !block.text.trim().is_empty()) {
+                        let block_ref = BlockRef {
+                            item: id.clone(),
+                            block: block.id.clone(),
+                        };
+                        let mut entry = Entry::titled(
+                            block_key(response, &block_ref),
+                            Title::plain(agent_name),
+                            block.text.clone(),
+                            Surface::Agent,
+                        );
+                        if final_text.is_some_and(|last| std::ptr::eq(last, block)) {
+                            entry.footer.clone_from(&footer);
+                        }
+                        built.push(entry, None);
+                    }
+                }
+                AssistantItem::Reasoning { id, blocks, .. } => {
+                    for block in blocks.iter().filter(|block| !block.text.trim().is_empty()) {
+                        let block_ref = BlockRef {
+                            item: id.clone(),
+                            block: block.id.clone(),
+                        };
+                        let entry = reasoning_entry(
+                            block_key(response, &block_ref),
+                            &block.text,
+                            view,
+                            super::live::ReasoningStatus::Complete,
+                        );
+                        built.push(entry, None);
+                    }
+                }
+                AssistantItem::ToolCall { call, .. } => {
+                    let id = call.id().to_owned();
+                    built.deps.push(Dep::Call(message, id.clone()));
+                    // An admitted call is shown by its job's card instead.
+                    let admitted = (agent.clone(), message, id);
+                    if !projection.tool_origins.contains(&admitted) {
+                        let key = EntryKey::ToolCall {
+                            message,
+                            call: admitted.2,
+                        };
+                        let open = view.is_expanded(&key, all_details);
+                        let result = self.pairing.result(snapshot, message, call.id());
+                        let call = (call.name(), Some(call.arguments()), result);
+                        let entry = call_entry(key, call, agent, projection, open);
+                        built.push(entry, Some(ToolGroup::Response(message)));
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Shared by retained UI content and fresh export construction.
@@ -29,371 +698,26 @@ pub fn entries(
     outputs: &OutputStore,
     include_live: bool,
 ) -> Vec<Entry> {
-    let EntryView {
-        agent,
-        tab,
-        view,
-        all_details,
-    } = presentation;
-    let records: Vec<_> = projection
-        .records_by_agent
-        .get(agent)
-        .into_iter()
-        .flatten()
-        .filter_map(|sequence| snapshot.records.get(sequence))
-        .collect();
-    match tab {
-        Tab::Requests => records
-            .iter()
-            .filter(|r| matches!(r.event, SessionEvent::ModelRequested { .. }))
-            .filter_map(|r| {
-                let record = projection.ledger.get(r.sequence.request())?;
-                Some(request_entry(r.sequence.request(), record))
-            })
-            .collect(),
-        Tab::Jobs => projection
-            .jobs
-            .values()
-            .filter(|j| &j.agent == agent)
-            .map(|job| {
-                let mut entry = job_entry(job, projection, view, outputs, all_details);
-                // The Jobs tab is a dense list; conversation grouping owns its
-                // spacing separately, and expanded documents stay unchanged.
-                entry.compact_after = true;
-                entry
-            })
-            .collect(),
-        Tab::Conversation => {
-            // Tool results have an explicit call ID but no message sequence. Resolve
-            // only within the current agent's most recent assistant turn, consuming
-            // each call once. Never let an old/reused ID suppress a later result.
-            let mut pending = HashMap::new();
-            let mut turn: Option<MessageSeq> = None;
-            let mut call_results = HashMap::new();
-            let mut matched_results = HashSet::new();
-            for record in &records {
-                match &record.event {
-                    SessionEvent::MessageCommitted {
-                        message: Message::Assistant(items),
-                    } => {
-                        pending.clear();
-                        turn = Some(record.sequence.message());
-                        for call in items.iter().filter_map(|item| item.call()) {
-                            pending.insert(
-                                (call.id().to_owned(), call.name().to_owned()),
-                                record.sequence.message(),
-                            );
-                        }
-                    }
-                    SessionEvent::JobCreated {
-                        origin: Some(origin),
-                        tool,
-                        ..
-                    } if turn.is_none_or(|turn| turn <= origin.message) => {
-                        // Retained job provenance also identifies a call whose
-                        // assistant message is no longer in the retained history.
-                        let message = origin.message;
-                        pending.insert((origin.call_id.clone(), tool.clone()), message);
-                        turn = Some(message);
-                    }
-                    SessionEvent::MessageCommitted {
-                        message: Message::Tool(results),
-                    } => {
-                        for (index, result) in results.iter().enumerate() {
-                            if let Some(message) =
-                                pending.remove(&(result.call_id.clone(), result.name.clone()))
-                            {
-                                call_results.insert((message, result.call_id.clone()), result);
-                                matched_results.insert((record.sequence, index));
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            let mut entries = Vec::new();
-            let mut tool_groups = HashMap::new();
-            let agent_name = projection.agent_name(agent);
-            for record in &records {
-                let key = EntryKey::Record(record.sequence);
-                match &record.event {
-                    SessionEvent::ModelRequested { .. } => {
-                        let request = record.sequence.request();
-                        if let Some(entry) =
-                            super::retry::retry_entry(snapshot, projection, agent, request)
-                        {
-                            entries.push(entry);
-                        }
-                        // A settled response no commit replaced (an interrupted
-                        // attempt) stays at its journal position; a failure's is
-                        // part of its status card.
-                        let phase = projection.ledger.get(request).map(|record| &record.phase);
-                        if matches!(
-                            phase,
-                            Some(RequestPhase::Interrupted { .. } | RequestPhase::Completed { .. })
-                        ) && let Some(response) =
-                            snapshot.responses.get(&(agent.clone(), request))
-                            && response.settlement().is_some()
-                        {
-                            entries.extend(response_entries(request, response, view, agent_name));
-                        }
-                    }
-                    SessionEvent::MessageCommitted { message } => match message {
-                        Message::User(blocks) => {
-                            for (i, block) in blocks.iter().enumerate() {
-                                let (title, text, surface) = match block {
-                                    UserPart::Text { text } => (
-                                        if agent.path().is_empty() {
-                                            "You"
-                                        } else {
-                                            "Parent"
-                                        },
-                                        text.clone(),
-                                        Surface::User,
-                                    ),
-                                    UserPart::ParentInput { text } => {
-                                        ("Parent", text.clone(), Surface::User)
-                                    }
-                                    UserPart::Attachment { attachment } => {
-                                        ("Attachment", pretty(attachment), Surface::User)
-                                    }
-                                    UserPart::JobEvents { events } => {
-                                        for entry in job_event_entries(
-                                            record.sequence,
-                                            i,
-                                            events,
-                                            projection,
-                                            view,
-                                            all_details,
-                                        ) {
-                                            tool_groups.insert(
-                                                entry.key().clone(),
-                                                ToolGroup::Notification(record.sequence, i),
-                                            );
-                                            entries.push(entry);
-                                        }
-                                        continue;
-                                    }
-                                    // Persisted runtime state is model context, not conversation.
-                                    UserPart::State { .. } => continue,
-                                    UserPart::Compaction { text } => {
-                                        ("Compaction", text.clone(), Surface::Muted)
-                                    }
-                                };
-                                entries.push(Entry::titled(
-                                    EntryKey::UserBlock {
-                                        record: record.sequence,
-                                        index: i,
-                                    },
-                                    Title::plain(title),
-                                    text,
-                                    surface,
-                                ));
-                            }
-                        }
-                        Message::Assistant(items) => {
-                            let message = record.sequence.message();
-                            let response = projection
-                                .ledger
-                                .request_of(message)
-                                .map_or(ResponseRef::Message(message), ResponseRef::Request);
-                            let footer = projection
-                                .ledger
-                                .request_of(message)
-                                .and_then(|request| projection.ledger.get(request))
-                                .map(|request| request.profile.profile.model.clone());
-                            // The model footer sits under the last visible text of an
-                            // answer; a working turn (one with calls) has none.
-                            let final_text = (!items.iter().any(|item| item.call().is_some()))
-                                .then(|| {
-                                    items.iter().rev().find_map(|item| match item {
-                                        AssistantItem::Text { blocks, .. } => blocks
-                                            .iter()
-                                            .rfind(|block| !block.text.trim().is_empty()),
-                                        _ => None,
-                                    })
-                                })
-                                .flatten();
-                            for item in items {
-                                match item {
-                                    AssistantItem::Text { id, blocks, .. } => {
-                                        for block in blocks
-                                            .iter()
-                                            .filter(|block| !block.text.trim().is_empty())
-                                        {
-                                            let block_ref = BlockRef {
-                                                item: id.clone(),
-                                                block: block.id.clone(),
-                                            };
-                                            let mut entry = Entry::titled(
-                                                block_key(response, &block_ref),
-                                                Title::plain(agent_name),
-                                                block.text.clone(),
-                                                Surface::Agent,
-                                            );
-                                            if final_text
-                                                .is_some_and(|last| std::ptr::eq(last, block))
-                                            {
-                                                entry.footer.clone_from(&footer);
-                                            }
-                                            entries.push(entry);
-                                        }
-                                    }
-                                    AssistantItem::Reasoning { id, blocks, .. } => {
-                                        for block in blocks
-                                            .iter()
-                                            .filter(|block| !block.text.trim().is_empty())
-                                        {
-                                            let block_ref = BlockRef {
-                                                item: id.clone(),
-                                                block: block.id.clone(),
-                                            };
-                                            entries.push(reasoning_entry(
-                                                block_key(response, &block_ref),
-                                                &block.text,
-                                                view,
-                                                super::live::ReasoningStatus::Complete,
-                                            ));
-                                        }
-                                    }
-                                    AssistantItem::ToolCall { call, .. } => {
-                                        let exists = projection.tool_origins.contains(&(
-                                            agent.clone(),
-                                            message,
-                                            call.id().to_owned(),
-                                        ));
-                                        if !exists {
-                                            let call_key = EntryKey::ToolCall {
-                                                message,
-                                                call: call.id().to_owned(),
-                                            };
-                                            let e = call_entry(
-                                                call_key.clone(),
-                                                (
-                                                    call.name(),
-                                                    Some(call.arguments()),
-                                                    call_results
-                                                        .get(&(message, call.id().to_owned()))
-                                                        .copied(),
-                                                ),
-                                                agent,
-                                                projection,
-                                                view.is_expanded(&call_key, all_details),
-                                            );
-                                            tool_groups.insert(
-                                                e.key().clone(),
-                                                ToolGroup::Response(message),
-                                            );
-                                            entries.push(e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Message::Tool(results) => {
-                            for (index, result) in results.iter().enumerate() {
-                                if !matched_results.contains(&(record.sequence, index)) {
-                                    let result_key = EntryKey::ToolResult {
-                                        record: record.sequence,
-                                        call: result.call_id.clone(),
-                                    };
-                                    let open = view.is_expanded(&result_key, all_details);
-                                    entries.push(call_entry(
-                                        result_key,
-                                        (result.name.as_str(), None, Some(result)),
-                                        agent,
-                                        projection,
-                                        open,
-                                    ));
-                                }
-                            }
-                        }
-                    },
-                    SessionEvent::JobCreated { job, origin, .. } => {
-                        if let Some(job) = projection.jobs.get(job) {
-                            let entry = job_entry(job, projection, view, outputs, all_details);
-                            // Script children belong to their immediate script,
-                            // not to the model response that launched the script.
-                            let group = job
-                                .parent
-                                .and_then(|parent| projection.jobs.get(&parent))
-                                .filter(|parent| parent.role == skyhook::job::JobRole::Script)
-                                .map(|parent| ToolGroup::Script(parent.id))
-                                .or_else(|| {
-                                    origin
-                                        .as_ref()
-                                        .map(|origin| ToolGroup::Response(origin.message))
-                                });
-                            if let Some(group) = group {
-                                tool_groups.insert(entry.key().clone(), group);
-                            }
-                            entries.push(entry);
-                        }
-                    }
-                    SessionEvent::Compaction { checkpoint } => {
-                        let open = view.is_expanded(&key, false);
-                        let title = format!(
-                            "Context compacted · {} → {}",
-                            number(checkpoint.before_tokens),
-                            number(checkpoint.after_tokens),
-                        );
-                        let body = if open {
-                            format!("Summary and retained sources\n{}", pretty(checkpoint))
-                        } else {
-                            String::new()
-                        };
-                        let title = Title::disclosed(title, open);
-                        entries.push(Entry::titled(key, title, body, Surface::Muted));
-                    }
-                    SessionEvent::Status { message } => entries.push(Entry::new(
-                        key,
-                        format!("Status · {message}"),
-                        Surface::Status,
-                    )),
-                    SessionEvent::CompactionFailed { error, .. } => entries.push(Entry::new(
-                        key,
-                        format!("Compaction failed; previous context retained\n{error}"),
-                        Surface::Error,
-                    )),
-                    SessionEvent::CompactionSkipped { reason, .. } => entries.push(Entry::new(
-                        key,
-                        format!("Compaction skipped · {reason}"),
-                        Surface::Muted,
-                    )),
-                    _ => {}
-                }
-            }
-            // Store adjacency on the preceding entry so equality-based cache
-            // invalidation also relayouts it when a sibling arrives or disappears.
-            for index in 0..entries.len().saturating_sub(1) {
-                let next_group = tool_groups.get(entries[index + 1].key());
-                let script_child = entries[index]
-                    .job_id()
-                    .is_some_and(|job| next_group == Some(&ToolGroup::Script(job)));
-                entries[index].compact_after = script_child
-                    || tool_groups
-                        .get(entries[index].key())
-                        .is_some_and(|group| next_group == Some(group));
-            }
-            if !include_live {
-                return entries;
-            }
-            let responses = super::live::live_tail_responses(snapshot, projection, agent);
-            entries.extend(responses.into_iter().flat_map(|(request, response)| {
-                response_entries(request, response, view, agent_name)
-            }));
-            if let Some(entry) = working_entry(
-                snapshot,
-                projection,
-                agent,
-                entries.iter().any(|entry| entry.running),
-            ) {
-                entries.push(entry);
-            }
-            entries
-        }
+    let inputs = Inputs {
+        snapshot,
+        projection,
+        presentation,
+        outputs,
+    };
+    let (_, mut entries) = History::build(inputs);
+    if include_live && presentation.tab == Tab::Conversation {
+        let agent = presentation.agent;
+        let agent_name = projection.agent_name(agent);
+        let responses = live_tail_responses(snapshot, projection, agent);
+        entries.extend(responses.into_iter().flat_map(|(request, response)| {
+            response_entries(request, response, presentation.view, agent_name)
+        }));
+        let running = entries.iter().any(|entry| entry.running);
+        entries.extend(working_entry(snapshot, projection, agent, running));
     }
+    entries
 }
+
 #[cfg(test)]
 mod tests {
     use super::super::View;
