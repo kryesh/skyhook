@@ -1,4 +1,5 @@
 //! Conservative validation for strict Chat Structured Outputs.
+use crate::json_schema::{accepts, declared_types};
 use crate::provider::{ProviderError, backends::common::invalid};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -162,18 +163,7 @@ pub(crate) fn validate_schema(
             .filter(|values| !values.is_empty())
             .ok_or_else(|| invalid("Chat schema enum must be nonempty"))?;
         for variant in variants {
-            let matches_type = types.is_empty()
-                || types.iter().any(|kind| match *kind {
-                    "null" => variant.is_null(),
-                    "boolean" => variant.is_boolean(),
-                    "string" => variant.is_string(),
-                    "number" => variant.is_number(),
-                    "integer" => variant.is_i64() || variant.is_u64(),
-                    "object" => variant.is_object(),
-                    "array" => variant.is_array(),
-                    _ => false,
-                });
-            if !matches_type {
+            if declared_types(schema).is_some_and(|types| !accepts(types, variant)) {
                 return Err(invalid("Chat schema enum value does not match its type"));
             }
         }

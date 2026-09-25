@@ -3,16 +3,15 @@ use crate::remote::{ProtocolError, RemoteError};
 use crate::target::{TargetName, TargetRef};
 use crate::tool::policy::PermissionUse;
 
+/// A forwarded permission's proposed grant is derived from its resource, so
+/// rebasing the resource rebases the proposal with it.
 pub(super) fn rebase_remote_permissions(
     target: &TargetName,
     permissions: &mut [PermissionUse],
 ) -> Result<(), RemoteError> {
-    fn rebase_resource(
-        target: &TargetName,
-        resource: &mut crate::tool::policy::ResourceId,
-    ) -> Result<(), RemoteError> {
-        let Some(origin) = resource.execution_target_mut() else {
-            return Ok(());
+    for permission in permissions {
+        let Some(origin) = permission.resource.execution_target_mut() else {
+            continue;
         };
         if !matches!(origin.parse::<TargetRef>(), Ok(TargetRef::Root)) {
             return Err(RemoteError::Protocol(
@@ -20,14 +19,6 @@ pub(super) fn rebase_remote_permissions(
             ));
         }
         target.as_str().clone_into(origin);
-        Ok(())
-    }
-
-    for permission in permissions {
-        rebase_resource(target, &mut permission.resource)?;
-        if let Some(grant) = &mut permission.proposed_grant {
-            rebase_resource(target, &mut grant.resource)?;
-        }
     }
     Ok(())
 }
@@ -35,24 +26,26 @@ pub(super) fn rebase_remote_permissions(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::policy::{ApprovalGrant, Capability, ResourceId};
-    use std::path::Path;
+    use crate::tool::policy::{Capability, PathText, ResourceId};
 
     #[test]
     fn forwarded_permissions_and_grants_only_rebase_execution_targets() {
-        let (outside, workspace) = (Path::new("/outside"), Path::new("/workspace"));
+        let (outside, workspace) = (
+            PathText::new("/outside").unwrap(),
+            PathText::new("/workspace").unwrap(),
+        );
         let origin = "https://example.test:8443";
         let build: TargetName = "build".parse().unwrap();
         let mut cases = vec![
             (
                 Capability::Read,
-                ResourceId::path(&crate::target::TargetRef::Root, outside),
-                ResourceId::path(&"build".parse().unwrap(), outside),
+                ResourceId::path(&crate::target::TargetRef::Root, &outside),
+                ResourceId::path(&"build".parse().unwrap(), &outside),
             ),
             (
                 Capability::Write,
-                ResourceId::workspace(&crate::target::TargetRef::Root, workspace),
-                ResourceId::workspace(&"build".parse().unwrap(), workspace),
+                ResourceId::workspace(&crate::target::TargetRef::Root, &workspace),
+                ResourceId::workspace(&"build".parse().unwrap(), &workspace),
             ),
             (
                 Capability::Network,
@@ -72,32 +65,33 @@ mod tests {
             cases.push((capability, resource.clone(), resource));
         }
         for (capability, resource, expected) in cases {
-            let grant = ApprovalGrant::descendants(capability, resource.clone());
-            let mut permissions = vec![PermissionUse::new(capability, resource).with_grant(grant)];
+            let mut permissions = vec![PermissionUse::descendants(capability, resource)];
             rebase_remote_permissions(&build, &mut permissions).unwrap();
             assert_eq!(permissions[0].resource, expected);
-            let grant = permissions[0].proposed_grant.as_ref().unwrap();
+            let grant = permissions[0].proposed_grant().unwrap();
             assert_eq!(grant.resource, expected);
         }
     }
 
     #[test]
-    fn forwarded_permissions_and_grants_cannot_claim_another_target() {
+    fn forwarded_permissions_cannot_claim_another_target() {
         let build: TargetName = "build".parse().unwrap();
         for resource in [
-            ResourceId::path(&"other".parse().unwrap(), Path::new("/outside")),
-            ResourceId::workspace(&"other".parse().unwrap(), Path::new("/workspace")),
+            ResourceId::path(
+                &"other".parse().unwrap(),
+                &PathText::new("/outside").unwrap(),
+            ),
+            ResourceId::workspace(
+                &"other".parse().unwrap(),
+                &PathText::new("/workspace").unwrap(),
+            ),
             ResourceId::network(&"other".parse().unwrap(), "https://example.test"),
         ] {
-            let grant = ApprovalGrant::exact(Capability::Read, resource.clone());
-            let session = ResourceId::session("test");
-            for permission in [
-                PermissionUse::new(Capability::Read, resource),
-                PermissionUse::new(Capability::Read, session).with_grant(grant),
-            ] {
-                let result = rebase_remote_permissions(&build, &mut [permission]);
-                assert!(matches!(result, Err(RemoteError::Protocol(_))));
-            }
+            let result = rebase_remote_permissions(
+                &build,
+                &mut [PermissionUse::new(Capability::Read, resource)],
+            );
+            assert!(matches!(result, Err(RemoteError::Protocol(_))));
         }
     }
 }

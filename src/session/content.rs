@@ -486,7 +486,7 @@ mod content_free_tests {
             let item = AssistantItem::text("answer", 0, text);
             assert!(!Message::Assistant(vec![item]).is_content_free());
         }
-        let call = ToolCall::new("call", "shell", json!({})).unwrap();
+        let call = ToolCall::new("call", "exec", json!({})).unwrap();
         let non_final = vec![
             AssistantItem::text("answer", 0, ""),
             AssistantItem::tool_call("tool-1", 1, call),

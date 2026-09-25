@@ -97,6 +97,43 @@ impl RequestOutput {
         receipt.await.map_err(io::Error::other)?
     }
 
+    /// Stream a source file's contents to the host in flow-controlled chunks.
+    /// Every send happens on the calling task, so dropping it stops the stream
+    /// before the request's terminal result is sent.
+    pub(crate) async fn send_source(&self, file: std::fs::File) -> io::Result<()> {
+        use tokio::io::AsyncReadExt as _;
+        let mut file = tokio::fs::File::from_std(file);
+        self.send_payload(PayloadEvent::Open(PayloadOpen::Source))
+            .await?;
+        let mut buffer = vec![0; CHUNK_BYTES];
+        loop {
+            let read = file.read(&mut buffer).await?;
+            if read == 0 {
+                return self
+                    .send_payload(PayloadEvent::Finish {
+                        id: PayloadId::Source,
+                    })
+                    .await;
+            }
+            self.send_payload(PayloadEvent::Data {
+                id: PayloadId::Source,
+                data: buffer[..read].to_vec(),
+            })
+            .await?;
+        }
+    }
+
+    async fn send_payload(&self, event: PayloadEvent) -> io::Result<()> {
+        self.sender
+            .0
+            .send(Outgoing::Payload {
+                request_id: self.request_id,
+                event,
+            })
+            .await
+            .map_err(io::Error::other)
+    }
+
     fn payload(&self, event: PayloadEvent) -> io::Result<()> {
         self.sender
             .0

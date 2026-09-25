@@ -306,7 +306,7 @@ mod tests {
     async fn tool_job(manager: &JobManager, owner: &AgentId) -> JobId {
         let spec = JobSpec {
             background: true,
-            ..JobSpec::test(owner.clone(), "shell")
+            ..JobSpec::test(owner.clone(), "exec")
         };
         manager.test_running(spec).await.into_test_id()
     }

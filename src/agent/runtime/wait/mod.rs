@@ -647,7 +647,7 @@ mod tests {
     /// later `wait` resolves on an event while that call is still running.
     #[tokio::test]
     async fn waits_do_not_defer_to_work_inside_a_background_script() {
-        let sleeper = json!({"source":"await tool.exec({argv:['sleep','30']});", "bg":true});
+        let sleeper = json!({"source":"await tool.exec({command:['sleep','30']});", "bg":true});
         let tracking = tracking(vec![
             ("root", call("bg", "script", sleeper)),
             ("root", call("hold", "wait", json!({"timeout":null}))),

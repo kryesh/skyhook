@@ -11,7 +11,7 @@ updates.
 A retained child whose job is `completed`, `failed`, or `interrupted` resumes under the same
 job and agent identity, including after a session restart. New instructions are appended to its
 existing conversation. Explicitly `cancelled` children and non-agent jobs cannot be resumed.
-`job_output` then exposes the latest run's saved result, not an archive of earlier results;
+`jobs({job})` then exposes the latest run's saved result, not an archive of earlier results;
 the child conversation and messages already delivered to the parent remain intact.
 
 After a session interruption, retry resumes every retained failed/interrupted child without
@@ -27,7 +27,7 @@ survive session restart. Reading a background job's output does not consume its 
 
 Message delivery does not mean the child has finished: completion also requires its owned work
 and queued inputs to be resolved. A completed background child's notification references its
-`meta.last_message` instead of repeating the reply already delivered. Explicit `job_output`
+`meta.last_message` instead of repeating the reply already delivered. Explicit `jobs({job})`
 reads and script calls still expose the saved final result; progress text is not concatenated
 into it. A foreground child returns its final reply in the call's `.result`, with no progress
 or later message events. The parent cannot make another model request until its foreground
@@ -48,8 +48,8 @@ suggestion with a non-whitespace comment. A single question returns that value d
 a merged batch keeps each value under its question ID.
 Root-agent questions go to the host interface instead of a parent agent.
 `ask` also accepts optional `bg` (boolean, default `false`). With `bg: true`, the call returns
-job metadata immediately so the agent can continue independent work. Use `job_output` or
-`tool.job(id).output()` to inspect the pending question and eventual answer; the ask job also
+job metadata immediately so the agent can continue independent work. Use `jobs({job})` to
+inspect the pending question and eventual answer; the ask job also
 accepts `tool.job(id).send({value: answer})`. Omitting `bg` or passing `false` keeps the usual
 foreground wait. Multiple outstanding child question batches are combined on the stable agent
 job; parents may answer a subset keyed by question ID, and unanswered questions remain pending.
@@ -77,18 +77,18 @@ Background-capable tools accept an optional `bg` argument. Calls use the [common
 contract](../reference/javascript.md#jobview-response-contract); background launches have
 `result: null` and `has_result: false`, while loaded literal `null` results have `has_result: true`.
 Cancellation returns target-job metadata in `.result`. A child
-question has `state: "waiting_input"`; `job_output` returns its stable question IDs and text in
+question has `state: "waiting_input"`; `jobs({job})` returns its stable question IDs and text in
 `presentation.question`, regardless of its size.
 
 Jobs normally follow `queued → running → completed`, optionally cycling through
 `waiting_input → running`; `failed`, `cancelled`, and `interrupted` are terminal alternatives.
-`job_output` acknowledges a pending question or terminal result and suppresses duplicate automatic
-notification. Explicit reads remain repeatable, and `job_output` itself never waits; see
+A `jobs({job})` read acknowledges a pending question or terminal result and suppresses duplicate
+automatic notification. Explicit reads remain repeatable, and `jobs` itself never waits; see
 [waiting for background work](#waiting-for-background-work).
 Unanswered questions do not expire. Send answers to the stable child-agent job ID.
 
 Cancellation cascades through descendant jobs and agents and terminates managed command process
-groups locally and remotely. It is a request: use job_output to confirm termination. Deliberately
+groups locally and remotely. It is a request: use `jobs({job})` to confirm termination. Deliberately
 detached processes and unreachable remote hosts limit cleanup. Command timeouts are optional;
 omission or null means no deadline. Explicit timeouts of 1–3600 seconds terminate execution,
 retaining captured output. A nonzero command exit is a normal result; see
@@ -96,14 +96,14 @@ retaining captured output. A nonzero command exit is a normal result; see
 
 ## Job names
 
-`agent`, `exec`, `shell`, and `fetch` accept an optional `name` describing the work. Names must use
+`agent`, `exec`, and `fetch` accept an optional `name` describing the work. Names must use
 lowercase kebab-case: start with a letter, then use lowercase ASCII letters, digits, and single
 hyphens between nonempty words. Examples include `inspect-config`, `run-tests`, and `build-v2`.
 Names are descriptive labels and do not replace job IDs. Tool job names need not be unique;
 child-agent names must be unique within their caller's scope, as described above.
 
 ```js
-return tool.exec({argv: ["cargo", "test"], name: "run-tests", bg: true});
+return tool.exec({command: ["cargo", "test"], name: "run-tests", bg: true});
 ```
 
 Names appear in active-job state, job envelopes (including notifications and inspection), and
@@ -122,11 +122,11 @@ session. In headless mode,
 shutdown cancels and drains outstanding work, so workflows must await work they need completed.
 
 ```js
-const job = await tool.exec({argv: ["cargo", "test"], name: "run-tests", bg: true});
-let status = await tool.job(job.id).output();
+const job = await tool.exec({command: ["cargo", "test"], name: "run-tests", bg: true});
+let status = await tool.jobs({job: job.id});
 while (["queued", "running", "waiting_input"].includes(status.state)) {
   await tool.wait({timeout: 300});
-  status = await tool.job(job.id).output();
+  status = await tool.jobs({job: job.id});
 }
 return status;
 ```

@@ -1,6 +1,7 @@
 //! Prepare replayable uploads and dispatch authorized HTTP requests.
 use std::path::Path;
 
+use crate::fs::RegularFileError;
 use crate::tool::diagnostic::{Operation, Subject};
 
 use bytes::Bytes;
@@ -52,24 +53,15 @@ async fn snapshot_file(
     progress: &mut FetchProgress,
 ) -> Result<FileUpload, LocalError> {
     let sentinel = remaining + 1;
-    progress.local_io(Operation::Inspect, Subject::path(path));
-    if !tokio::fs::metadata(&path).await?.is_file() {
-        return Err(invalid("upload path must be a regular file"));
-    }
-    let mut options = tokio::fs::OpenOptions::new();
-    options.read(true);
-    // Avoid blocking if the path is swapped to a FIFO between metadata and open.
-    #[cfg(unix)]
-    options.custom_flags(libc::O_NONBLOCK);
     progress.local_io(Operation::Read, Subject::path(path));
-    let file = options.open(&path).await?;
-    let metadata = file.metadata().await?;
-    if !metadata.is_file() {
-        return Err(invalid("upload path must be a regular file"));
-    }
-    if metadata.len() > remaining {
-        return Err(invalid("upload exceeds 100 MiB limit"));
-    }
+    let file = crate::fs::open_regular(path, remaining)
+        .await
+        .map_err(|error| match error {
+            RegularFileError::NotRegular => invalid("upload path must be a regular file"),
+            RegularFileError::TooLarge { .. } => invalid("upload exceeds 100 MiB limit"),
+            RegularFileError::Io(error) => error.into(),
+        })?;
+    let file = tokio::fs::File::from_std(file);
     // Snapshot once, with a bounded streaming copy. Redirect replays reopen this
     // immutable private snapshot, not a potentially changed source file.
     progress.local_io(
@@ -442,7 +434,7 @@ mod tests {
             .err()
             .unwrap();
         let error = progress.failure(local_error(missing));
-        assert_eq!(error.diagnostic().context.operation, Operation::Inspect);
+        assert_eq!(error.diagnostic().context.operation, Operation::Read);
         assert_eq!(error.diagnostic().context.subject, Subject::path(&source));
         let (diagnostic, Some(output)) = error.into_parts() else {
             panic!("structured I/O failure")

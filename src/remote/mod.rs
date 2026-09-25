@@ -18,9 +18,7 @@ pub use artifact::{
     Arch, ArtifactError, EmbeddedShim, EmbeddedShimCatalog, Os, Platform, ShimProtocol,
 };
 #[cfg(test)]
-pub(crate) use backend::{ConnectionFactory, ConnectionRequest};
-#[cfg(test)]
-pub(crate) use client::test_transport;
+pub(crate) use backend::ConnectionFactory;
 pub(crate) use error::{DeploymentError, ProtocolError, SshError};
 pub(crate) use manager::RemoteError;
 #[cfg(test)]

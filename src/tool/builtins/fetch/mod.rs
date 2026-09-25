@@ -1,6 +1,5 @@
 //! Bounded HTTP requests. Redirects are deliberately handled here, never by reqwest.
 use crate::tool::ToolOptions;
-use crate::tool::diagnostic::deserialize_arguments;
 use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
 use std::collections::BTreeMap;
@@ -196,19 +195,12 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         "fetch",
         "HTTP(S) from the selected target. HTTP error statuses are normal results. Safe redirects follow GET/HEAD only; no HTTPS downgrade or retries.",
         ToolOptions::new(vec![Capability::Network])
-            .argument_validator(|arguments| {
-                let args: FetchArgs = deserialize_arguments(arguments.clone())?;
-                FetchPlan::try_from(args).map(drop)
-            })
-            // These callbacks still parse wire data to discover permissions and paths;
-            // they do not construct or discard the retained domain plan.
-            .argument_permissions(|location, arguments| {
-                let args: FetchArgs = deserialize_arguments(arguments.clone())?;
+            .argument_validator(|args: &FetchArgs| validation::check_request(args).map(drop))
+            .argument_permissions(|location, args| {
                 let url = HttpRequestUrl::parse(&args.url)?;
                 Ok(vec![PermissionUse::new(Capability::Network, ResourceId::network(&location.target, url.origin().as_str()))])
             })
-            .argument_paths(|arguments| {
-                let args: FetchArgs = deserialize_arguments(arguments.clone())?;
+            .argument_paths(|args| {
                 let mut paths = Vec::new();
                 if args.save_to.is_some() { paths.push(PathArgument::pointer("/save_to", PathAccess::Write, PathKind::Writable)); }
                 if matches!(args.body, Some(RequestBody::File { .. })) {

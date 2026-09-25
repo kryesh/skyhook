@@ -1,13 +1,10 @@
 //! Schema-guided repair of model tool arguments, such as `{"timeout": "30"}`
 //! for an integer. Only lossless conversions to a type the destination
 //! requires are tried, and a repair is kept only if the result validates.
+use crate::json_schema::{MAX_DEPTH, Node, Resolver, accepts, declared_types, value_type};
+use jsonschema::{JsonType, JsonTypeSet};
 use serde_json::{Map, Number, Value};
-use std::cell::Cell;
 
-/// Bound on nesting and `$ref` indirection along one path.
-const MAX_DEPTH: usize = 64;
-/// Bound on total schema nodes visited, against exponential unions.
-const MAX_STEPS: usize = 10_000;
 /// 2^53: larger floats cannot be converted to integers exactly.
 const MAX_EXACT_FLOAT_INTEGER: f64 = 9_007_199_254_740_992.0;
 
@@ -40,137 +37,36 @@ impl jsonschema::Retrieve for NoExternalSchemas {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Kind {
-    Null,
-    Boolean,
-    Integer,
-    Number,
-    String,
-    Array,
-    Object,
-}
-
-impl Kind {
-    fn parse(name: &str) -> Option<Self> {
-        Some(match name {
-            "null" => Self::Null,
-            "boolean" => Self::Boolean,
-            "integer" => Self::Integer,
-            "number" => Self::Number,
-            "string" => Self::String,
-            "array" => Self::Array,
-            "object" => Self::Object,
-            _ => return None,
-        })
-    }
-
-    fn of_value(value: &Value) -> Self {
-        match value {
-            Value::Null => Self::Null,
-            Value::Bool(_) => Self::Boolean,
-            Value::Number(number) if number.is_i64() || number.is_u64() => Self::Integer,
-            Value::Number(_) => Self::Number,
-            Value::String(_) => Self::String,
-            Value::Array(_) => Self::Array,
-            Value::Object(_) => Self::Object,
-        }
-    }
-
-    fn accepts(self, value: &Value) -> bool {
-        let actual = Self::of_value(value);
-        actual == self || (self == Self::Number && actual == Self::Integer)
-    }
-
-    const ALL: [Kind; 7] = [
-        Kind::Null,
-        Kind::Boolean,
-        Kind::Integer,
-        Kind::Number,
-        Kind::String,
-        Kind::Array,
-        Kind::Object,
-    ];
-}
-
-/// A set of declared types.
-#[derive(Clone, Copy, Default)]
-struct Kinds(u8);
-
-impl Kinds {
-    fn insert(&mut self, kind: Kind) {
-        self.0 |= 1 << kind as u8;
-    }
-
-    fn iter(self) -> impl Iterator<Item = Kind> {
-        Kind::ALL
-            .into_iter()
-            .filter(move |kind| self.0 & (1 << *kind as u8) != 0)
-    }
-
-    fn is_empty(self) -> bool {
-        self.0 == 0
-    }
-
-    fn accepts(self, value: &Value) -> bool {
-        self.iter().any(|kind| kind.accepts(value))
-    }
-}
-
 struct Walk<'a> {
-    root: &'a Value,
-    steps: Cell<usize>,
+    resolver: Resolver<'a>,
     integral_only: bool,
-}
-
-/// A schema node and the resource (`$id` scope) its local references use.
-#[derive(Clone, Copy)]
-struct Node<'a> {
-    schema: &'a Value,
-    base: &'a Value,
-}
-
-fn resource_id(schema: &Value) -> Option<&str> {
-    ["$id", "id"]
-        .iter()
-        .find_map(|key| schema.get(*key)?.as_str())
 }
 
 impl<'a> Walk<'a> {
     fn new(root: &'a Value, integral_only: bool) -> Self {
         Self {
-            root,
-            steps: Cell::new(MAX_STEPS),
+            resolver: Resolver::new(root),
             integral_only,
         }
     }
 
     fn coerce_root(&self, value: &mut Value) {
-        let root = Node {
-            schema: self.root,
-            base: self.root,
-        };
-        self.coerce(root, value, 0);
+        self.coerce(self.resolver.root(), value, 0);
     }
 
     /// Spend one step of the budget; false once it or the depth is exhausted.
     fn spend(&self, depth: usize) -> bool {
-        let remaining = self.steps.get();
-        if depth > MAX_DEPTH || remaining == 0 {
-            return false;
-        }
-        self.steps.set(remaining - 1);
-        true
+        depth <= MAX_DEPTH && self.resolver.spend()
     }
 
     /// Convert `value` only when the schema's declared types reject it, then
     /// repair its contents. An untyped schema accepts anything as it is.
     fn coerce(&self, node: Node<'a>, value: &mut Value, depth: usize) {
         if let Some(kinds) = self.kinds(node, depth)
-            && !kinds.accepts(value)
+            && !accepts(kinds, value)
         {
             let conversion = |kind| {
-                if self.integral_only && !(kind == Kind::Integer && value.is_f64()) {
+                if self.integral_only && !(kind == JsonType::Integer && value.is_f64()) {
                     None
                 } else {
                     convert(value, kind)
@@ -190,71 +86,18 @@ impl<'a> Walk<'a> {
         if !self.spend(depth) {
             return None;
         }
-        let base = if resource_id(node.schema).is_some() {
-            node.schema
-        } else {
-            node.base
-        };
-        let Some(reference) = node.schema.get("$ref").and_then(Value::as_str) else {
-            return Some(Node {
-                schema: node.schema,
-                base,
-            });
-        };
-        let (uri, fragment) = reference.split_once('#').unwrap_or((reference, ""));
-        let resource = if uri.is_empty() {
-            base
-        } else {
-            self.find_resource(self.root, uri, 0)?
-        };
-        let target = resource.pointer(fragment)?;
-        self.resolve(
-            Node {
-                schema: target,
-                base: resource,
-            },
-            depth + 1,
-        )
-    }
-
-    fn find_resource(&self, schema: &'a Value, uri: &str, depth: usize) -> Option<&'a Value> {
-        if !self.spend(depth) {
-            return None;
-        }
-        if resource_id(schema) == Some(uri) {
-            return Some(schema);
-        }
-        let children: Box<dyn Iterator<Item = &'a Value>> = match schema {
-            Value::Object(object) => Box::new(object.values()),
-            Value::Array(items) => Box::new(items.iter()),
-            _ => return None,
-        };
-        children
-            .filter(|child| child.is_object() || child.is_array())
-            .find_map(|child| self.find_resource(child, uri, depth + 1))
+        self.resolver.resolve(node)
     }
 
     /// The types a node declares, from its own `type`, `const` or `enum`, else
     /// from its `anyOf`/`oneOf` alternatives. `None` means untyped.
-    fn kinds(&self, node: Node<'a>, depth: usize) -> Option<Kinds> {
+    fn kinds(&self, node: Node<'a>, depth: usize) -> Option<JsonTypeSet> {
         let node = self.resolve(node, depth)?;
         let schema = node.schema;
-        let mut kinds = Kinds::default();
-        match schema.get("type") {
-            Some(Value::String(name)) => {
-                kinds.insert(Kind::parse(name)?);
-                return Some(kinds);
-            }
-            Some(Value::Array(names)) => {
-                names
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter_map(Kind::parse)
-                    .for_each(|kind| kinds.insert(kind));
-                return (!kinds.is_empty()).then_some(kinds);
-            }
-            _ => {}
+        if let Some(kinds) = declared_types(schema) {
+            return Some(kinds);
         }
+        let mut kinds = JsonTypeSet::empty();
         let values = schema.get("const").into_iter().chain(
             schema
                 .get("enum")
@@ -264,7 +107,7 @@ impl<'a> Walk<'a> {
         );
         let mut constrained = false;
         for value in values {
-            kinds.insert(Kind::of_value(value));
+            kinds = kinds.insert(value_type(value));
             constrained = true;
         }
         if constrained {
@@ -275,9 +118,7 @@ impl<'a> Walk<'a> {
         }
         // Any untyped alternative accepts every value.
         for branch in branches(node) {
-            self.kinds(branch, depth + 1)?
-                .iter()
-                .for_each(|kind| kinds.insert(kind));
+            kinds = kinds.union(self.kinds(branch, depth + 1)?);
         }
         Some(kinds)
     }
@@ -287,10 +128,7 @@ impl<'a> Walk<'a> {
             return;
         };
         let schema = node.schema;
-        let child = |schema: &'a Value| Node {
-            schema,
-            base: node.base,
-        };
+        let child = |schema| node.child(schema);
         match value {
             Value::Object(object) => {
                 let properties = schema.get("properties").and_then(Value::as_object);
@@ -336,7 +174,7 @@ impl<'a> Walk<'a> {
         if has_union(schema)
             && let Some(branch) = branches(node).into_iter().find(|branch| {
                 self.kinds(*branch, depth + 1)
-                    .is_none_or(|kinds| kinds.accepts(value))
+                    .is_none_or(|kinds| accepts(kinds, value))
                     && !self.contradicts(*branch, value, depth + 1)
             })
         {
@@ -356,13 +194,7 @@ impl<'a> Walk<'a> {
         properties.iter().any(|(key, property)| {
             let (Some(actual), Some(property)) = (
                 object.get(key),
-                self.resolve(
-                    Node {
-                        schema: property,
-                        base: node.base,
-                    },
-                    depth + 1,
-                ),
+                self.resolve(node.child(property), depth + 1),
             ) else {
                 return false;
             };
@@ -390,50 +222,47 @@ fn branches(node: Node<'_>) -> Vec<Node<'_>> {
         .iter()
         .filter_map(|key| node.schema.get(*key)?.as_array())
         .flatten()
-        .map(|schema| Node {
-            schema,
-            base: node.base,
-        })
+        .map(|schema| node.child(schema))
         .collect()
 }
 
-fn convert(value: &Value, kind: Kind) -> Option<Value> {
+fn convert(value: &Value, kind: JsonType) -> Option<Value> {
     match (value, kind) {
-        (Value::String(text), Kind::Integer) => {
+        (Value::String(text), JsonType::Integer) => {
             let text = text.trim();
             text.parse::<i64>()
                 .map(Value::from)
                 .or_else(|_| text.parse::<u64>().map(Value::from))
                 .ok()
         }
-        (Value::String(text), Kind::Number) => {
+        (Value::String(text), JsonType::Number) => {
             let number: Number = serde_json::from_str(text.trim()).ok()?;
             Some(Value::Number(number))
         }
-        (Value::Number(number), Kind::Integer) => {
+        (Value::Number(number), JsonType::Integer) => {
             let float = number.as_f64()?;
             (float.fract() == 0.0 && float.abs() < MAX_EXACT_FLOAT_INTEGER)
                 .then(|| Value::from(float as i64))
         }
-        (Value::String(text), Kind::Boolean) => match text.trim() {
+        (Value::String(text), JsonType::Boolean) => match text.trim() {
             "true" => Some(Value::Bool(true)),
             "false" => Some(Value::Bool(false)),
             _ => None,
         },
-        (Value::String(text), Kind::Null) => (text.trim() == "null").then_some(Value::Null),
-        (Value::String(text), Kind::Object) => {
+        (Value::String(text), JsonType::Null) => (text.trim() == "null").then_some(Value::Null),
+        (Value::String(text), JsonType::Object) => {
             serde_json::from_str::<Map<String, Value>>(text.trim())
                 .ok()
                 .map(Value::Object)
         }
-        (Value::String(text), Kind::Array) => serde_json::from_str::<Vec<Value>>(text.trim())
+        (Value::String(text), JsonType::Array) => serde_json::from_str::<Vec<Value>>(text.trim())
             .ok()
             .map(Value::Array),
         // Only integers: a float's spelling (`1.10` → `1.1`) is not preserved.
-        (Value::Number(number), Kind::String) if number.is_i64() || number.is_u64() => {
+        (Value::Number(number), JsonType::String) if number.is_i64() || number.is_u64() => {
             Some(Value::String(number.to_string()))
         }
-        (Value::Bool(flag), Kind::String) => Some(Value::String(flag.to_string())),
+        (Value::Bool(flag), JsonType::String) => Some(Value::String(flag.to_string())),
         _ => None,
     }
 }
@@ -528,7 +357,7 @@ mod tests {
         let steps_left = |schema: &Value, mut value: Value| {
             let walk = Walk::new(schema, false);
             walk.coerce_root(&mut value);
-            walk.steps.get()
+            walk.resolver.steps_left()
         };
         let schema = json!({"anyOf":[{"$ref":"#"},{"$ref":"#"}]});
         assert!(steps_left(&schema, json!({"x":"1"})) > 0, "depth-bounded");
@@ -545,29 +374,6 @@ mod tests {
         assert_eq!(steps_left(&chain, json!("1")), 0);
         let looping = json!({"$ref":"#/$defs/Loop", "$defs":{"Loop":{"$ref":"#/$defs/Loop"}}});
         assert!(steps_left(&looping, json!({"x":"1"})) > 0, "depth-bounded");
-    }
-
-    #[test]
-    fn references_resolve_within_embedded_resources() {
-        // An MCP schema embedded under an envelope keeps its own `$id` scope,
-        // so its fragment references refer to its own `$defs`.
-        let schema = json!({"type":"object", "required":["arguments"],
-        "properties":{"arguments":{
-            "$id":"urn:skyhook:mcp-schema:abc", "type":"object",
-            "properties":{"item":{"$ref":"#/$defs/Item"}},
-            "$defs":{"Item":{"type":"object", "properties":{"size":{"type":"integer"}}}}
-        }}});
-        assert_eq!(
-            coerced(schema.clone(), json!({"arguments":{"item":{"size":"4"}}})),
-            json!({"arguments":{"item":{"size":4}}})
-        );
-        let mut absolute = schema;
-        absolute["properties"]["arguments"]["properties"]["item"]["$ref"] =
-            json!("urn:skyhook:mcp-schema:abc#/$defs/Item");
-        assert_eq!(
-            coerced(absolute, json!({"arguments":{"item":{"size":"4"}}})),
-            json!({"arguments":{"item":{"size":4}}})
-        );
     }
 
     #[test]

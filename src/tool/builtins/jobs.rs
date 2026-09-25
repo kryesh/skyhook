@@ -4,10 +4,16 @@ use serde_json::Value;
 
 use crate::{
     identity::JobId,
-    job::{JobError, JobManager, presented_job_schema},
+    job::{
+        FieldPointer, JobError, JobManager, OutputPresentation,
+        output::{OutputArgs, OutputOptions},
+        presented_job_schema,
+    },
     tool::{
-        RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
-        diagnostic::{Effects, Operation, PartialContext, Subject},
+        AdmissionError, RegistryError, ToolContext, ToolError, ToolOptions, ToolOutput,
+        ToolRegistryBuilder,
+        diagnostic::{Effects, Operation, PartialContext, Subject, deserialize_arguments},
+        registry::{Invocation, input_schema},
     },
 };
 
@@ -15,69 +21,32 @@ pub(crate) fn register(
     builder: &mut ToolRegistryBuilder,
     jobs: JobManager,
 ) -> Result<(), RegistryError> {
-    let list = jobs.clone();
-    builder.register::<JobsArgs, Value, _, _>(
+    let admitted = jobs.clone();
+    builder.register_admission(
         "jobs",
-        "List this agent's active jobs, excluding this call and its containing script. Set `all` to include completed history.",
+        "Without `job`, list this agent's active jobs, excluding this call and its containing script; `all` adds finished jobs. With `job`, read or search that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; filtered or paginated reads return text in preview.lines without images.",
+        input_schema::<JobsArgs>()?,
         ToolOptions::default().generated_output_schema(|_| presented_job_schema(true)),
-        move |context, args| {
-            let jobs = list.clone();
-            async move {
-                let current = jobs
-                    .metadata(context.job())
+        move |arguments| {
+            let jobs = admitted.clone();
+            Ok(match JobsRequest::try_from(deserialize_arguments::<JobsArgs>(&arguments)?)? {
+                JobsRequest::List { all } => {
+                    Invocation::new(move |context| list(jobs, context, all))
+                }
+                JobsRequest::Output(args) => Invocation::job_view(move |context| async move {
+                    let job = args.job;
+                    jobs.present_output_with(
+                        args,
+                        context.cancellation_token(),
+                        context.diagnostic_viewer(),
+                        OutputOptions::Model {
+                            presentation: OutputPresentation::Full,
+                        },
+                    )
                     .await
-                    .map_err(|error| {
-                        job_failure(error, Operation::Inspect, context.job())
-                            .effects(Effects::Unchanged)
-                    })?;
-                let containing_script = if let Some(parent) = current.parent {
-                    let parent = jobs
-                        .metadata(parent)
-                        .await
-                        .map_err(|error| {
-                            job_failure(error, Operation::Inspect, parent)
-                                .effects(Effects::Unchanged)
-                        })?;
-                    (parent.role == crate::job::JobRole::Script).then_some(parent.id)
-                } else {
-                    None
-                };
-                let envelopes = jobs
-                    .list(context.agent())
-                    .await
-                    .into_iter()
-                    .filter(|job| job.id != context.job() && Some(job.id) != containing_script)
-                    .filter(|job| args.all || !job.state.is_terminal())
-                    .collect::<Vec<_>>();
-                Ok(Value::Array(
-                    envelopes
-                        .iter()
-                        .map(|job| job.metadata_view(context.diagnostic_viewer()).into_value())
-                        .collect(),
-                ))
-            }
-        },
-    )?;
-    let output = jobs.clone();
-    builder.register_presented::<crate::job::output::OutputArgs, _, _>(
-        "job_output",
-        "Read or search saved job output and status on job completion. Whole-output reads attach saved images; filtered or paginated reads return text in preview.lines without images.",
-        ToolOptions::default().job_method("output", "job"),
-        move |context, args| {
-            let jobs = output.clone();
-            async move {
-                let job = args.job;
-                jobs.present_output_with(
-                    args,
-                    context.cancellation_token(),
-                    context.diagnostic_viewer(),
-                    crate::job::output::OutputOptions::Model { presentation: crate::job::OutputPresentation::Full },
-                )
-                .await
-                .map_err(|error| {
-                    error.or(PartialContext::new(Operation::Read, Subject::Job(job)))
-                })
-            }
+                    .map_err(|error| error.or(PartialContext::new(Operation::Read, Subject::Job(job))))
+                }),
+            })
         },
     )?;
     let send = jobs.clone();
@@ -100,7 +69,7 @@ pub(crate) fn register(
     let cancel = jobs.clone();
     builder.register::<JobArgs, Value, _, _>(
         "job_cancel",
-        "Request cancellation of job/descendants; confirm terminal state with job_output.",
+        "Request cancellation of job/descendants; confirm terminal state with jobs.",
         ToolOptions::default()
             .generated_output_schema(|_| presented_job_schema(false))
             .script_only()
@@ -136,12 +105,101 @@ fn job_failure(error: JobError, operation: Operation, job: JobId) -> ToolError {
     }
 }
 
+async fn list(jobs: JobManager, context: ToolContext, all: bool) -> Result<ToolOutput, ToolError> {
+    let current = jobs.metadata(context.job()).await.map_err(|error| {
+        job_failure(error, Operation::Inspect, context.job()).effects(Effects::Unchanged)
+    })?;
+    let containing_script = if let Some(parent) = current.parent {
+        let parent = jobs.metadata(parent).await.map_err(|error| {
+            job_failure(error, Operation::Inspect, parent).effects(Effects::Unchanged)
+        })?;
+        (parent.role == crate::job::JobRole::Script).then_some(parent.id)
+    } else {
+        None
+    };
+    let listing = jobs
+        .list(context.agent())
+        .await
+        .into_iter()
+        .filter(|job| job.id != context.job() && Some(job.id) != containing_script)
+        .filter(|job| all || !job.state.is_terminal())
+        .map(|job| job.metadata_view(context.diagnostic_viewer()).into_value())
+        .collect();
+    Ok(ToolOutput::new(Value::Array(listing)))
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct JobsArgs {
-    /// Include terminal job history as well as active jobs.
+    /// Job whose saved output to read; omit to list jobs.
+    job: Option<JobId>,
+    /// Listing only: include finished jobs as well as active ones.
     #[serde(default)]
     all: bool,
+    /// JSON Pointer in saved content, e.g. /result/stdout, /result/content, /result/console.
+    field: Option<FieldPointer>,
+    /// One-based first source line; use returned next_start to continue.
+    #[schemars(range(min = 1), extend("default" = 1))]
+    start: Option<usize>,
+    /// Maximum returned lines, including match context.
+    #[schemars(range(min = 1, max = 1000), extend("default" = 100))]
+    limit: Option<usize>,
+    /// Case-sensitive line regex; use (?i) for case-insensitive matching.
+    pattern: Option<String>,
+    /// Surrounding lines per match.
+    #[schemars(range(min = 0, max = 20), extend("default" = 0))]
+    context: Option<usize>,
+    /// Zero-based UTF-8 byte offset within the starting line; use returned next_offset to continue.
+    #[schemars(range(min = 0), extend("default" = 0))]
+    offset: Option<usize>,
+}
+
+enum JobsRequest {
+    List { all: bool },
+    Output(OutputArgs),
+}
+
+impl TryFrom<JobsArgs> for JobsRequest {
+    type Error = AdmissionError;
+
+    fn try_from(args: JobsArgs) -> Result<Self, Self::Error> {
+        let JobsArgs {
+            job,
+            all,
+            field,
+            start,
+            limit,
+            pattern,
+            context,
+            offset,
+        } = args;
+        match job {
+            Some(_) if all => Err(AdmissionError::invalid_arguments(
+                "all lists jobs; omit it with job",
+            )),
+            Some(job) => Ok(Self::Output(OutputArgs {
+                job,
+                field,
+                start,
+                limit,
+                pattern,
+                context,
+                offset,
+            })),
+            None if field.is_some()
+                || start.is_some()
+                || limit.is_some()
+                || pattern.is_some()
+                || context.is_some()
+                || offset.is_some() =>
+            {
+                Err(AdmissionError::invalid_arguments(
+                    "output selection requires job",
+                ))
+            }
+            None => Ok(Self::List { all }),
+        }
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -191,6 +249,38 @@ mod tests {
     }
 
     #[test]
+    fn job_arguments_select_listing_or_output_but_never_mix_them() {
+        let request = |value: Value| {
+            serde_json::from_value::<JobsArgs>(value)
+                .map_err(AdmissionError::invalid_arguments)
+                .and_then(JobsRequest::try_from)
+        };
+        assert!(matches!(
+            request(json!({})),
+            Ok(JobsRequest::List { all: false })
+        ));
+        assert!(matches!(
+            request(json!({"all":true})),
+            Ok(JobsRequest::List { all: true })
+        ));
+        assert!(matches!(
+            request(json!({"job":3, "pattern":"x"})),
+            Ok(JobsRequest::Output(args)) if args.job.get() == 3 && args.pattern.as_deref() == Some("x")
+        ));
+        for value in [
+            json!({"job":3, "all":true}),
+            json!({"field":"/result"}),
+            json!({"limit":5}),
+        ] {
+            assert!(
+                matches!(request(value.clone()), Err(error)
+                    if matches!(error.diagnostic().cause, Cause::InvalidArguments(_))),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
     fn job_failure_retains_canonical_cause_and_boundary_mutation_evidence() {
         let job = JobId::new(42).unwrap();
         let session_error = || {
@@ -228,7 +318,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_output_failures_name_the_requested_job_on_the_host() {
+    async fn job_output_reads_name_the_requested_job_on_the_host() {
         let runtime = TestRuntime::new().await;
         let (executor, _slot) = executor(runtime.jobs.clone(), runtime.root.path());
         let unknown = JobId::new(999_999).unwrap();
@@ -245,7 +335,7 @@ mod tests {
             ),
         ] {
             let error = executor
-                .run_host(&runtime.agent, "job_output", query)
+                .run_host(&runtime.agent, "jobs", query)
                 .await
                 .unwrap_err();
             let context = error.diagnostic().context;
@@ -285,7 +375,7 @@ mod tests {
             .output
             .value;
         let output = executor
-            .run_host(agent, "job_output", json!({"job":pending}))
+            .run_host(agent, "jobs", json!({"job":pending}))
             .await;
         let output = output.unwrap().output.value;
         for (value, state) in [
@@ -368,7 +458,7 @@ mod tests {
         let mut request = ModelRequest {
             history: vec![Message::Tool(vec![ToolResult {
                 call_id: "output".into(),
-                name: "job_output".into(),
+                name: "jobs".into(),
                 result: json!({}),
                 images,
                 is_error: false,
@@ -424,7 +514,7 @@ mod tests {
         runtime.jobs.wait(launched.job, None, true).await.unwrap();
         for _ in 0..2 {
             let output = executor
-                .run_model(agent, "job_output", json!({"job":launched.job}))
+                .run_model(agent, "jobs", json!({"job":launched.job}))
                 .await;
             let output = output.unwrap().output;
             assert_eq!(output.value["state"], "completed");
@@ -435,7 +525,7 @@ mod tests {
             assert!(output.value.get("console").is_none());
             assert_loaded(&runtime.store, output.images).await;
         }
-        let source = format!("return await tool.job({}).output();", launched.job);
+        let source = format!("return await tool.jobs({{job:{}}});", launched.job);
         let output = script(&executor, agent, source.clone(), false).await.output;
         assert_eq!(output.value["result"]["console"], "");
         assert_eq!(output.value["result"]["value"]["id"], launched.job.get());
@@ -445,7 +535,7 @@ mod tests {
         let background = script(&executor, agent, source, true).await;
         runtime.jobs.wait(background.job, None, true).await.unwrap();
         let output = executor
-            .run_model(agent, "job_output", json!({"job":background.job}))
+            .run_model(agent, "jobs", json!({"job":background.job}))
             .await;
         let output = output.unwrap().output;
         assert_eq!(output.value["state"], "completed");
@@ -463,18 +553,13 @@ mod tests {
         assert_loaded(&runtime.store, read.output.images).await;
         // Selection semantics are tested with the output product; this proves
         // both entry points forward the selector.
-        let options = json!({"field":"/result"});
+        let query = json!({"job":read.job, "field":"/result"});
         let output = executor
-            .run_model(
-                agent,
-                "job_output",
-                json!({"job":read.job, "field":"/result"}),
-            )
+            .run_model(agent, "jobs", query.clone())
             .await
             .unwrap();
         assert!(output.output.images.is_empty());
-        // The job binding supplies the ID; the object form accepts only options.
-        let source = format!("return await tool.job({}).output({options});", read.job);
+        let source = format!("return await tool.jobs({query});");
         let output = script(&executor, agent, source, false).await;
         assert!(output.output.images.is_empty());
         for query in [
@@ -482,10 +567,7 @@ mod tests {
             json!({"job":read.job,"pattern":"["}),
             json!({"job":999999}),
         ] {
-            let response = executor
-                .run_model(agent, "job_output", query)
-                .await
-                .unwrap();
+            let response = executor.run_model(agent, "jobs", query).await.unwrap();
             assert_eq!(response.output.value["state"], "failed");
         }
         // A denied image-producing call never creates a retrievable attachment.
@@ -527,11 +609,11 @@ mod tests {
         let jobs = JobManager::restore(store.clone(), &records).await.unwrap();
         let agent = AgentId::root(id);
         let (executor, _slot) = executor(jobs, runtime.root.path());
-        let output = executor.run_model(&agent, "job_output", json!({"job":job}));
+        let output = executor.run_model(&agent, "jobs", json!({"job":job}));
         let output = output.await.unwrap().output;
         assert_eq!(output.value["state"], "failed");
         assert_loaded(&store, output.images).await;
-        let source = format!("return await tool.job({job}).output();");
+        let source = format!("return await tool.jobs({{job:{job}}});");
         let output = script(&executor, &agent, source, false).await;
         assert_loaded(&store, output.output.images).await;
     }

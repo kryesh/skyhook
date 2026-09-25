@@ -7,7 +7,6 @@ pub(crate) mod jobs;
 mod process;
 mod script;
 pub(crate) mod search;
-pub(crate) mod skill_transfer;
 mod skills;
 mod targets;
 pub(crate) mod workspace;
@@ -32,7 +31,7 @@ pub(crate) fn register_coding_tools(
 ) -> Result<(), RegistryError> {
     builder.register_local(register_local_tools)?;
     jobs::register(builder, jobs)?;
-    skills::register(builder, skills, store.clone(), router.clone())?;
+    skills::register(builder, skills, store.clone())?;
     targets::register(builder, store, router)?;
     Ok(())
 }

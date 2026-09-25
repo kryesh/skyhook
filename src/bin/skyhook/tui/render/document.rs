@@ -281,12 +281,12 @@ mod tests {
                 serde_json::json!({"source": source, "description": "prose next to source"}),
             ),
             (
-                "shell",
+                "exec",
                 serde_json::json!({"command": "  printf '%s  %s'  first second\t\n\n"}),
             ),
             (
                 "exec",
-                serde_json::json!({"argv": ["sh", "-c", "  echo long shell words  \n"], "nested": {"source": source}}),
+                serde_json::json!({"command": ["sh", "-c", "  echo long shell words  \n"], "nested": {"source": source}}),
             ),
             (
                 "write",

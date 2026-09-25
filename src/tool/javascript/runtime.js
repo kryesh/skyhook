@@ -133,7 +133,7 @@ function __unwrapResponse(response) {
     if (response.has_result !== true) {
       throw __jobResponseError(
         response,
-        `job ${response.id ?? "(unassigned)"} has no loaded result; inspect it with tool.job(id).output()`,
+        `job ${response.id ?? "(unassigned)"} has no loaded result; inspect it with tool.jobs({job: id})`,
       );
     }
     if (!Object.hasOwn(response, "result") || response.result === undefined) {

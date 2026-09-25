@@ -1,11 +1,19 @@
 //! Validate and authorize arguments, then select where an invocation runs.
 
 use super::*;
-use crate::tool::{
-    invocation::{
-        PathOutcome, PathPreflight, path_text, preflight_path_arguments, scope_capabilities,
+use crate::{
+    target::TargetPath,
+    tool::{
+        PathKind,
+        builtins::workspace::resolve_for_authorization,
+        diagnostic::PathRole,
+        invocation::{
+            PathOutcome, PathPreflight, assemble_permissions, preflight_path_arguments,
+            scope_capabilities,
+        },
+        policy::PathText,
+        registry::split_envelope,
     },
-    registry::split_envelope,
 };
 
 impl ToolExecutor {
@@ -20,49 +28,29 @@ impl ToolExecutor {
                 route: None,
             });
         }
-        if explicit.is_some() && !self.capabilities.contains(Capability::Targets) {
-            return Err(ToolError::invalid_arguments(
-                "target selection requires the targets capability",
-            )
-            .into());
-        }
-        let selected = explicit.as_ref().unwrap_or(&self.caller_location.target);
-        let TargetRef::Named(selected) = selected else {
-            return Ok(SelectedLocation {
-                location: ExecutionLocation::select(
-                    &self.caller_location,
-                    &self.shared.root_location.workspace,
-                    if explicit.is_some() {
-                        crate::execution::LocationSelection::Root
-                    } else {
-                        crate::execution::LocationSelection::Inherit
-                    },
-                ),
-                route: None,
-            });
-        };
-        let router = self.shared.router.as_ref().ok_or_else(|| {
-            ToolError::invalid_arguments("remote targets are unavailable in this tool runtime")
-        })?;
-        let route = router
-            .resolve(selected, &self.capabilities)
-            .await
-            .map_err(|error| ToolError::from(error.into_admission_error()))?;
-        let definition = route.destination();
+        self.select_location(explicit).await
+    }
+
+    async fn select_location(
+        &self,
+        explicit: Option<TargetRef>,
+    ) -> Result<SelectedLocation, ExecutionError> {
+        let router = self.shared.router.as_ref();
+        let selected = crate::target::select_location(
+            &self.caller_location,
+            &self.shared.root_location.workspace,
+            explicit.as_ref(),
+            &self.capabilities,
+            router,
+        )
+        .await?;
         Ok(SelectedLocation {
-            location: ExecutionLocation::select(
-                &self.caller_location,
-                &self.shared.root_location.workspace,
-                if explicit.is_some() {
-                    crate::execution::LocationSelection::Other(definition)
-                } else {
-                    crate::execution::LocationSelection::Inherit
-                },
-            ),
-            route: Some(PlannedRemote {
-                route,
-                router: router.clone(),
-            }),
+            location: selected.location,
+            // A route is only resolved through a router.
+            route: selected
+                .route
+                .zip(router.cloned())
+                .map(|(route, router)| PlannedRemote { route, router }),
         })
     }
 
@@ -80,7 +68,7 @@ impl ToolExecutor {
             .ok_or_else(|| ExecutionError::UnknownTool(name.to_owned()))?;
         let spec = tool
             .spec(&self.capabilities, agent)
-            .ok_or_else(|| ToolError::invalid_arguments(format!("tool `{name}` is unavailable")))?;
+            .ok_or_else(|| ToolError::unavailable(name))?;
         // Only model output is repaired; host and script callers must match exactly.
         if matches!(kind, InvocationKind::Model) {
             crate::tool::coerce::coerce_arguments(&spec.input_schema, &mut arguments);
@@ -98,6 +86,29 @@ impl ToolExecutor {
     }
 
     pub(super) async fn plan_registered(
+        &self,
+        kind: InvocationKind,
+        agent: AgentId,
+        name: &str,
+        arguments: Value,
+        parent: Option<JobId>,
+    ) -> Result<InvocationPlan, ExecutionError> {
+        let mut plan = self
+            .plan_invocation(kind, agent, name, arguments, parent)
+            .await?;
+        let source = plan
+            .tool
+            .source_argument()
+            .and_then(|name| plan.original_arguments.get(name))
+            .filter(|source| !source.is_null())
+            .cloned();
+        if let Some(source) = source {
+            self.plan_source(source, &mut plan).await?;
+        }
+        Ok(plan)
+    }
+
+    async fn plan_invocation(
         &self,
         kind: InvocationKind,
         agent: AgentId,
@@ -130,62 +141,42 @@ impl ToolExecutor {
                 &self.capabilities,
             )
         };
-        tool.validate_arguments(&arguments)
+        let checked = tool
+            .check_arguments(&selected.location, &arguments)
             .map_err(|error| invalid(error.into()))?;
-        let PathPreflight {
-            permissions: path_permissions,
-            outcome,
-            paths: path_facts,
-        } = if selected.route.is_none() {
+        // A remote destination resolves its own paths.
+        let path = if selected.route.is_none() {
             preflight_path_arguments(
                 &tool,
-                &selected.location.target,
-                &selected.location.workspace,
+                checked.paths,
+                &selected.location,
                 &self.shared.root_location.workspace,
                 &mut arguments,
             )
             .await
             .map_err(|error| invalid(error.into()))?
         } else {
+            // Remote location frames spell the workspace as text.
+            PathText::new(&selected.location.workspace)?;
             PathPreflight {
                 permissions: Vec::new(),
                 outcome: PathOutcome::Ready,
                 paths: Vec::new(),
             }
         };
-        // Remote location frames spell the workspace as text. Local handlers use
-        // the native path, and argument paths are checked where they are spelled.
-        if selected.route.is_some() {
-            path_text(&selected.location.workspace)?;
-        }
-        let argument_permissions = tool.argument_permissions(&selected.location, &arguments)?;
-        let mut capabilities = tool.capabilities();
-        for permission in &argument_permissions {
-            if !self.capabilities.contains(permission.capability) {
-                return Err(ExecutionError::UnavailableTool(name.to_owned()));
-            }
-            capabilities.retain(|candidate| *candidate != permission.capability);
-        }
-        // An unresolved read still requires the ordinary workspace authorization,
-        // as well as approval for the unresolved path below.
-        if matches!(outcome, PathOutcome::Ready) {
-            for permission in &path_permissions {
-                capabilities.retain(|candidate| *candidate != permission.capability);
-            }
-        }
-        let mut permissions =
-            scope_capabilities(capabilities, &selected.location, tool.permission_resource());
-        permissions.extend(path_permissions);
-        // Destination-derived permissions are approved once on the worker, which
-        // forwards them to the host with its actual target identity. This avoids
-        // duplicate network prompts while still authorizing before any request.
-        permissions.extend(argument_permissions.into_iter().filter(|permission| {
-            selected.route.is_none()
-                || !matches!(
-                    permission.resource,
-                    ResourceId::Path { .. } | ResourceId::Network { .. }
-                )
-        }));
+        let mut permissions = assemble_permissions(
+            &tool,
+            &selected.location,
+            &self.capabilities,
+            checked.permissions,
+            &path,
+            selected.route.is_some(),
+        )?;
+        let PathPreflight {
+            outcome,
+            paths: path_facts,
+            ..
+        } = path;
         let authorization_arguments = if let Some(route) = &selected.route {
             permissions.extend(route.route.permissions());
             serde_json::json!({
@@ -223,7 +214,79 @@ impl ToolExecutor {
             parent,
             launch,
             dispatch,
+            source: None,
         })
+    }
+
+    /// Plan a source argument's read where the file lives, authorized with the
+    /// call: local paths are resolved now, remote ones by their worker.
+    async fn plan_source(
+        &self,
+        source: Value,
+        plan: &mut InvocationPlan,
+    ) -> Result<(), ExecutionError> {
+        if !self.capabilities.contains(Capability::Read) {
+            return Err(ToolError::unavailable(plan.tool.name()).into());
+        }
+        let source: TargetPath = serde_json::from_value(source).map_err(|error| {
+            ToolError::invalid_arguments(format!("invalid source: {error}"))
+                .operation(Operation::Validate, Subject::argument(["source"]))
+        })?;
+        let SelectedLocation { location, route } =
+            self.select_location(source.target).await.map_err(|error| {
+                error.or(
+                    PartialContext::new(Operation::Lookup, Subject::argument(["source", "target"]))
+                        .at(FailureSite::Host),
+                    &self.capabilities,
+                )
+            })?;
+        let mut permissions = scope_capabilities(vec![Capability::Read], &location, None)?;
+        let mut authorization_arguments = serde_json::json!({
+            "path": source.path,
+            "target": location.target,
+        });
+        let source = match route {
+            None => {
+                let resolved = resolve_for_authorization(
+                    &location.workspace,
+                    &source.path,
+                    PathKind::Existing,
+                )
+                .await
+                .map_err(|error| {
+                    error.or(PartialContext::default()
+                        .at(FailureSite::Execution(location.clone()))
+                        .path(PathRole::Requested, &source.path))
+                })?;
+                let root = &self.shared.root_location.workspace;
+                permissions.extend(resolved.permission_outside(
+                    root,
+                    Capability::Read,
+                    &location.target,
+                ));
+                SourcePlan::Local {
+                    path: resolved.path.into(),
+                    location,
+                }
+            }
+            Some(remote) => {
+                permissions.extend(remote.route.permissions());
+                authorization_arguments["route"] = remote.route.authorization_arguments();
+                SourcePlan::Remote {
+                    remote,
+                    workspace: location.workspace,
+                    path: source.path,
+                }
+            }
+        };
+        plan.permissions.extend(permissions);
+        if !matches!(plan.dispatch, InvocationDispatch::Remote { .. }) {
+            plan.authorization_arguments =
+                serde_json::json!({"tool": plan.authorization_arguments});
+        }
+        plan.authorization_arguments["source"] = authorization_arguments;
+        plan.source = Some(source);
+        Ok(())
     }
 }
 
@@ -249,7 +312,7 @@ fn validate_invocation(
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+mod tests {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
@@ -259,7 +322,7 @@ pub(super) mod tests {
         tests::RecordingPolicy,
         tool::{
             ToolOptions, ToolRegistryBuilder,
-            policy::{AuthorizationRequest, PolicyDecision, PolicyFuture},
+            policy::{AuthorizationRequest, PathText, PolicyDecision, PolicyFuture, ResourceId},
         },
     };
 
@@ -291,24 +354,11 @@ pub(super) mod tests {
         _path: String,
     }
 
-    pub(in crate::tool::executor) fn router(
-        targets: TargetRegistry,
-        policy: Arc<dyn Policy>,
-    ) -> TargetRouter {
-        let authorization = AuthorizationCoordinator::new(policy);
-        let remote = crate::remote::RemoteManager::new(
-            crate::remote::EmbeddedShimCatalog::default(),
-            Arc::new(crate::remote::RejectSensitivePrompts),
-            authorization.clone(),
-        );
-        TargetRouter::new(targets, remote, authorization)
-    }
-
     fn network_builder() -> ToolRegistryBuilder {
         use crate::tool::{PathArgument, PathKind, policy::PathAccess};
         let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register_dynamic(
+        let register = |builder: &mut crate::tool::invocation::LocalCatalogBuilder| {
+            builder.register_dynamic(
                 "network_test",
                 "Exercise invocation-derived authorization",
                 serde_json::json!({"type":"object","properties":{
@@ -318,7 +368,7 @@ pub(super) mod tests {
                     .placement(ToolPlacement::TargetedWorkspace)
                     .background()
                     .named()
-                    .argument_validator(|arguments| {
+                    .argument_validator(|arguments: &Value| {
                         if arguments["url"] != "https://initial.test" {
                             return Err(crate::tool::AdmissionError::invalid_arguments(
                                 "invalid test URL",
@@ -350,14 +400,16 @@ pub(super) mod tests {
                         }
                         Ok(paths)
                     }),
-                |context, arguments| async move {
+                |context: crate::tool::invocation::LocalContext, arguments| async move {
                     if arguments["redirect"] == true {
                         context.authorize_network("https://redirect.test").await?;
                     }
-                    Ok(ToolOutput::new(arguments))
+                    Ok(crate::tool::output::ProducedOutput::new(arguments))
                 },
-            )
-            .unwrap();
+            )?;
+            Ok(())
+        };
+        builder.register_local(register).unwrap();
         builder
     }
 
@@ -451,7 +503,8 @@ pub(super) mod tests {
             runtime.root.path().join("download"),
         );
         for (capability, path) in [(Capability::Read, &upload), (Capability::Write, &download)] {
-            let resource = ResourceId::path(&crate::target::TargetRef::Root, path);
+            let path = PathText::new(path).unwrap();
+            let resource = ResourceId::path(&crate::target::TargetRef::Root, &path);
             assert!(
                 plan.permissions
                     .iter()
@@ -499,7 +552,7 @@ pub(super) mod tests {
         capabilities.insert(Capability::Targets);
         let executor = runtime
             .executor_with_policy(builder, policy.clone())
-            .with_target_router(router(targets, policy.clone()))
+            .with_target_router(TargetRouter::test(targets, policy.clone()))
             .with_capabilities(capabilities);
         let arguments = serde_json::json!({"url":"https://initial.test", "target":"build"});
         let network = plan(&executor, &runtime.agent, "network_test", arguments).await;
@@ -516,6 +569,93 @@ pub(super) mod tests {
         let arguments = serde_json::json!({"target":"build"});
         let command = plan(&executor, &runtime.agent, "dynamic_exec", arguments).await;
         assert!(command.permissions.contains(&exec));
+        assert!(policy.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn sources_plan_as_reads_on_their_own_target_under_the_same_approval() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let policy = RecordingPolicy::allowing();
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_local(crate::tool::builtins::register_local_tools)
+            .unwrap();
+        let targets =
+            TargetRegistry::from_definitions([TargetDefinition::test("build", "/build", None)])
+                .unwrap();
+        let executor = runtime
+            .executor_with_policy(builder, policy.clone())
+            .with_target_router(TargetRouter::test(targets, policy.clone()));
+        let mut capabilities = CapabilitySet::default();
+        capabilities.insert(Capability::Targets);
+        let targeted = executor.clone().with_capabilities(capabilities);
+        let agent = &runtime.agent;
+
+        let remote = serde_json::json!({"path":"copy.bin", "source":{"path":"/build/out.bin", "target":"build"}});
+        let plan_remote = plan(&targeted, agent, "write", remote.clone()).await;
+        assert!(matches!(
+            plan_remote.dispatch,
+            InvocationDispatch::Local(Ok(_))
+        ));
+        assert!(matches!(
+            plan_remote.source,
+            Some(SourcePlan::Remote { .. })
+        ));
+        assert!(
+            plan_remote
+                .permissions
+                .iter()
+                .any(|p| p.capability == Capability::Targets)
+        );
+        assert_eq!(
+            plan_remote.authorization_arguments["source"]["path"],
+            "/build/out.bin"
+        );
+
+        std::fs::write(runtime.root.path().join("local.bin"), b"bytes").unwrap();
+        let local = serde_json::json!({"path":"copy.bin", "source":{"path":"local.bin"}});
+        let plan_local = plan(&executor, agent, "write", local.clone()).await;
+        assert!(matches!(plan_local.source, Some(SourcePlan::Local { .. })));
+        // Reading the source needs Read even though the tool itself needs only Write.
+        let mut capabilities = CapabilitySet::default();
+        capabilities.remove(Capability::Read);
+        let error = (executor.clone().with_capabilities(capabilities))
+            .plan_registered(
+                InvocationKind::Host,
+                agent.clone(),
+                "write",
+                local.clone(),
+                None,
+            )
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.diagnostic().cause,
+            Cause::Message("tool `write` is unavailable in this context".into())
+        );
+
+        // Selecting a source target needs the targets capability, and a write
+        // takes exactly one of content or source.
+        for (executor, arguments) in [
+            (&executor, remote),
+            (&targeted, serde_json::json!({"path":"copy.bin"})),
+            (
+                &targeted,
+                serde_json::json!({"path":"copy.bin", "content":"x", "source":{"path":"local.bin"}}),
+            ),
+        ] {
+            let planned = executor
+                .plan_registered(
+                    InvocationKind::Host,
+                    agent.clone(),
+                    "write",
+                    arguments.clone(),
+                    None,
+                )
+                .await;
+            assert!(planned.is_err(), "{arguments}");
+        }
         assert!(policy.requests.lock().unwrap().is_empty());
     }
 
@@ -559,7 +699,7 @@ pub(super) mod tests {
         assert_eq!(all.len(), 4);
         for request in &all[..3] {
             assert_eq!(request.permissions, [network_use("https://initial.test")]);
-            assert!(request.permissions[0].proposed_grant.is_none());
+            assert!(request.permissions[0].proposed.is_none());
         }
         let requests = &all[2..];
         assert_eq!(
@@ -657,7 +797,7 @@ pub(super) mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn non_unicode_argument_paths_fail_but_path_free_tools_run_in_non_unicode_workspaces() {
+    async fn non_unicode_permission_paths_fail_but_path_free_tools_run_in_non_unicode_workspaces() {
         use std::os::unix::{ffi::OsStringExt, fs::symlink};
         let runtime = crate::tests::TestRuntime::new().await;
         let non_unicode = |name: &[u8]| {
@@ -673,32 +813,41 @@ pub(super) mod tests {
         std::fs::create_dir(&workspace).unwrap();
         std::fs::write(workspace.join("upload"), "data").unwrap();
         let executor = |workspace: std::path::PathBuf, policy| {
-            ToolExecutor::new(
-                network_builder().build(),
-                policy,
-                runtime.jobs.clone(),
-                workspace,
-            )
+            let mut builder = network_builder();
+            builder
+                .register_dynamic(
+                    "scoped",
+                    "workspace-scoped writes",
+                    serde_json::json!({"type":"object","properties":{}}),
+                    ToolOptions::new(vec![Capability::Write]),
+                    |_, _| async { Ok(ToolOutput::new(Value::Null)) },
+                )
+                .unwrap();
+            ToolExecutor::new(builder.build(), policy, runtime.jobs.clone(), workspace)
         };
-        // A canonical argument path is spelled in the string permission/resource
-        // boundary, so it fails before approval wherever its bytes come from.
-        for (workspace, arguments) in [
+        // Canonical argument paths and workspace scopes are spelled in the string
+        // permission/resource boundary, so they fail before approval wherever
+        // their bytes come from.
+        for (workspace, tool, arguments) in [
             (
                 runtime.root.path().to_owned(),
+                "network_test",
                 serde_json::json!({
                     "url": "https://initial.test", "body": {"kind": "file", "path": "unicode-alias"}
                 }),
             ),
             (
                 workspace.clone(),
+                "network_test",
                 serde_json::json!({
                     "url": "https://initial.test", "body": {"kind": "file", "path": "upload"}
                 }),
             ),
+            (workspace.clone(), "scoped", serde_json::json!({})),
         ] {
             let policy = RecordingPolicy::allowing();
             let result = executor(workspace, policy.clone())
-                .run_host(&runtime.agent, "network_test", arguments)
+                .run_host(&runtime.agent, tool, arguments)
                 .await;
             assert!(
                 matches!(result.unwrap_err().diagnostic().cause, Cause::InvalidArguments(message) if message.contains("losslessly"))
@@ -738,7 +887,7 @@ pub(super) mod tests {
         let policy = RecordingPolicy::allowing();
         let executor = runtime.executor_with_policy(builder, policy.clone());
         let expected = crate::tool::diagnostic::deserialize_arguments::<Count>(
-            serde_json::json!({"count": 300}),
+            &serde_json::json!({"count": 300}),
         )
         .err()
         .unwrap();

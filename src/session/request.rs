@@ -736,13 +736,13 @@ mod tests {
         let (store, agent) = (&session.store, &session.agent);
         let append = async |event| store.append(agent.clone(), event).await.map(|r| r.sequence);
         let call = |id: &str, position| {
-            let call = ToolCall::new(id, "shell", json!({})).unwrap();
+            let call = ToolCall::new(id, "exec", json!({})).unwrap();
             AssistantItem::tool_call(format!("item-{id}"), position, call)
         };
         let result = |id: &str| {
             Message::Tool(vec![ToolResult {
                 call_id: id.into(),
-                name: "shell".into(),
+                name: "exec".into(),
                 result: json!({}),
                 images: vec![],
                 is_error: false,

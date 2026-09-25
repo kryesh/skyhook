@@ -187,10 +187,7 @@ impl TodoStore {
                         .operation(Operation::Lookup, Subject::Job(job))
                         .effects(Effects::Unchanged)
                 })?;
-            if agent.session() != caller.session()
-                || agent.depth() <= caller.depth()
-                || !agent.path().starts_with(caller.path())
-            {
+            if agent == caller || !agent.is_within(caller) {
                 return Err(ToolError::invalid_arguments(
                     "todo inspection is limited to descendants",
                 )

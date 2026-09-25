@@ -23,7 +23,7 @@ use crate::{
             Cause, Effects, FailureSite, Operation, PartialContext, PartialDiagnostic, PathFact,
             Subject,
         },
-        policy::{Capability, CapabilitySet, PermissionUse, Policy, ResourceId},
+        policy::{Capability, CapabilitySet, PermissionUse, Policy},
         registry::{ExecutionEnvelope, JobLaunch, JobName},
     },
 };
@@ -57,6 +57,31 @@ struct InvocationPlan {
     parent: Option<JobId>,
     launch: JobLaunch,
     dispatch: InvocationDispatch<PlannedRemote>,
+    source: Option<SourcePlan<PlannedRemote>>,
+}
+
+/// The read of a tool's source argument, planned and authorized with the call it
+/// feeds. A remote path is resolved and checked by the worker that reads it.
+enum SourcePlan<R> {
+    Local {
+        path: PathBuf,
+        location: ExecutionLocation,
+    },
+    Remote {
+        remote: R,
+        workspace: PathBuf,
+        path: String,
+    },
+}
+
+impl InvocationPlan {
+    /// Only a locally admitted call can present another job's view.
+    fn result_policy(&self) -> super::ToolResultPolicy {
+        match &self.dispatch {
+            InvocationDispatch::Local(Ok(admitted)) => admitted.result_policy(),
+            _ => super::ToolResultPolicy::Value,
+        }
+    }
 }
 
 /// The remote payload is a planned route before authorization and a prepared
@@ -88,6 +113,10 @@ impl CreatedInvocation {
     /// The name the job was published under.
     pub(crate) fn job_name(&self) -> Option<&JobName> {
         self.plan.launch.name.as_ref()
+    }
+
+    pub(crate) fn result_policy(&self) -> super::ToolResultPolicy {
+        self.plan.result_policy()
     }
 }
 
@@ -308,7 +337,7 @@ impl ToolExecutor {
         created: CreatedInvocation,
     ) -> Result<ExecutionResult, ExecutionError> {
         let CreatedInvocation { kind, plan, lease } = created;
-        let result_policy = plan.tool.result_policy();
+        let result_policy = plan.result_policy();
         let fallback = prepare_fallback(&plan);
         let started = self
             .start(plan, lease)

@@ -542,7 +542,7 @@ mod tests {
         for request in requests.iter() {
             let system = &request.system[0].text;
             assert!(!system.contains("compaction"));
-            assert!(system.contains("use `job_output` for more output"));
+            assert!(system.contains("use `jobs` for more output"));
             assert!(!system.contains("Continue with the returned"));
         }
     }
@@ -889,7 +889,7 @@ mod tests {
             let send = format!("return tool.job({job}).send({{value:{value}}});");
             session.run_script(send).await.unwrap();
             jobs.wait(job, None, true).await.unwrap();
-            let output = format!("return tool.job({job}).output();");
+            let output = format!("return tool.jobs({{job:{job}}});");
             let sent = session.run_script(output).await.unwrap();
             assert_eq!(sent.value["value"]["id"], job.get());
             assert_eq!(sent.value["value"]["state"], "completed");

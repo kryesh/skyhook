@@ -319,7 +319,7 @@ mod tests {
     async fn restore_rejects_a_transition_the_phase_does_not_admit() {
         let (root, jobs, agent) = runtime().await;
         let lease = jobs
-            .test_running(JobSpec::test(agent.clone(), "shell"))
+            .test_running(JobSpec::test(agent.clone(), "exec"))
             .await;
         let regressed = SessionEvent::JobStateChanged {
             job: lease.id(),
@@ -375,7 +375,7 @@ mod tests {
         let (root, jobs, agent) = runtime().await;
         let capabilities = CapabilitySet::default();
         let job = jobs
-            .test_approving(JobSpec::test(agent, "shell"))
+            .test_approving(JobSpec::test(agent, "exec"))
             .await
             .into_test_id();
         let pending = jobs.snapshot(job).await.unwrap();
@@ -431,7 +431,7 @@ mod tests {
             let spec = JobSpec {
                 background: true,
                 location,
-                ..JobSpec::test(agent.clone(), "shell")
+                ..JobSpec::test(agent.clone(), "exec")
             };
             let lease = manager.test_running(spec).await;
             manager

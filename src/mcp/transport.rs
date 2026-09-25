@@ -91,10 +91,12 @@ impl<R: AsyncRead + Unpin> AsyncRead for BoundedLines<R> {
 
 /// Only processes created by this session enter this type. On Unix each command
 /// is the leader of a fresh process group, so shutdown also reaches descendants.
+/// Dropping it kills the group and the child; Tokio reaps a dropped child as a
+/// best-effort fallback for a cancelled owner future.
 pub(crate) struct OwnedProcess {
-    child: Child,
     #[cfg(unix)]
-    group: Option<i32>,
+    group: crate::process_group::ProcessGroup,
+    child: Child,
 }
 
 impl OwnedProcess {
@@ -114,38 +116,18 @@ impl OwnedProcess {
         #[cfg(unix)]
         command.process_group(0);
         let child = command.spawn().map_err(McpError::Io)?;
-        #[cfg(unix)]
-        let group = child.id().and_then(|id| i32::try_from(id).ok());
         Ok(Self {
-            child,
             #[cfg(unix)]
-            group,
+            group: crate::process_group::ProcessGroup::led_by(&child),
+            child,
         })
     }
 
-    fn kill_group(&mut self) {
-        #[cfg(unix)]
-        if let Some(group) = self.group.take() {
-            // SAFETY: group is the positive PID of our unreaped child, created
-            // with process_group(0). Negative PID targets only its process group.
-            unsafe {
-                libc::kill(-group, libc::SIGKILL);
-            }
-        }
-        let _ = self.child.start_kill();
-    }
-
     pub(crate) async fn shutdown(&mut self) {
-        self.kill_group();
+        #[cfg(unix)]
+        self.group.kill();
+        let _ = self.child.start_kill();
         let _ = self.child.wait().await;
-    }
-}
-
-impl Drop for OwnedProcess {
-    fn drop(&mut self) {
-        // Explicit manager shutdown awaits wait(). Tokio's Child drop performs
-        // best-effort reaping as a fallback for a cancelled owner future.
-        self.kill_group();
     }
 }
 

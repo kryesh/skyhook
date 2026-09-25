@@ -66,7 +66,7 @@ pub(super) struct AgentArgs {
     pub(super) mode: Option<String>,
     /// Execution target; defaults to the parent's.
     #[schemars(skip)]
-    pub(super) target: Option<String>,
+    pub(super) target: Option<crate::target::TargetRef>,
     /// Child workspace override: absolute, or relative to the workspace selected by target.
     pub(super) workspace: Option<PathBuf>,
 }
@@ -157,7 +157,7 @@ fn register_wait(
 ) -> Result<(), RegistryError> {
     builder.register::<super::wait::WaitArgs, super::wait::WaitOutput, _, _>(
         "wait",
-        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use job_output to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
+        "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
         ToolOptions::default(),
         move |context, args| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
@@ -175,7 +175,7 @@ fn register_ask(
 ) -> Result<(), RegistryError> {
     builder.register::<Question, Value, _, _>(
         "ask",
-        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with job_output.",
+        "Ask one structured question. Issue independent questions concurrently; the runtime merges calls that become ready together. Use bg:true to continue independent work while awaiting an answer; inspect the returned job with jobs.",
         ToolOptions::default().job_role(crate::job::JobRole::Question).background().input().requires_for_root(Capability::Interactive),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
@@ -206,14 +206,7 @@ fn register_child_agent(
         ToolOptions::default().job_role(crate::job::JobRole::Agent)
             .named()
             .requires(Capability::Agents)
-            .conditional_input(
-                "target",
-                Capability::Targets,
-                json!({
-                    "type": ["string", "null"],
-                    "description": "Child target; omitted inherits."
-                }),
-            )
+            .conditional_input("target", Capability::Targets, crate::target::TargetRef::schema())
             .computed_input("model", move |_| {
                 let choices: Vec<_> = models.iter().map(|(name, text)| (name.as_str(), text.clone())).collect();
                 choice_input("Model for the child; omitted inherits yours.", &choices)
@@ -278,28 +271,15 @@ fn register_child_agent(
                         .get(context.agent()).map(|agent| agent.model_profile.clone()))
                     .ok_or_else(|| ToolError::failed("parent agent is no longer running")
                         .operation(Operation::Lookup, Subject::Label(format!("parent agent {}", context.agent()))).effects(Effects::NotStarted))?;
-                let target_error = |error: crate::target::TargetError| ToolError::from(error.into_admission_error())
-                    .operation(Operation::Lookup, Subject::argument(["target"])).effects(Effects::NotStarted);
-                let target = match &input.target {
-                    Some(target) => target.parse::<crate::target::TargetRef>().map_err(target_error)?,
-                    None => context.caller_location().target.clone(),
-                };
-                let definition = match &target {
-                    crate::target::TargetRef::Root => None,
-                    crate::target::TargetRef::Named(name) => {
-                        let route = runtime.router.resolve(name, context.capabilities()).await;
-                        Some(route.map_err(target_error)?.destination().clone())
-                    }
-                };
-                let mut location = crate::execution::ExecutionLocation::select(
+                let mut location = crate::target::select_location(
                     context.caller_location(),
                     &runtime.harness.workspace,
-                    match (input.target.as_deref(), definition.as_ref()) {
-                        (None, _) => crate::execution::LocationSelection::Inherit,
-                        (Some(_), None) => crate::execution::LocationSelection::Root,
-                        (Some(_), Some(definition)) => crate::execution::LocationSelection::Other(definition),
-                    },
-                );
+                    input.target.as_ref(),
+                    context.capabilities(),
+                    Some(&runtime.router),
+                ).await.map_err(|error| error
+                    .operation(Operation::Lookup, Subject::argument(["target"])).effects(Effects::NotStarted))?
+                    .location;
                 if let Some(workspace) = input.workspace {
                     if workspace.as_os_str().is_empty() {
                         return Err(invalid_argument("workspace", "workspace cannot be empty"));

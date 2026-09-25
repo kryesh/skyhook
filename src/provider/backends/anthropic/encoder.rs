@@ -446,7 +446,7 @@ mod tests {
     fn blank_text_is_skipped_and_a_message_encoding_to_nothing_is_dropped() {
         let mut request = request();
         // A blank block is dropped, but its siblings still encode.
-        let call = ToolCall::new("call", "shell", json!({})).unwrap();
+        let call = ToolCall::new("call", "exec", json!({})).unwrap();
         request.history = continue_after_items(vec![
             AssistantItem::text("blank", 0, "   "),
             AssistantItem::tool_call("t", 1, call),

@@ -243,15 +243,24 @@ pub(super) struct FetchPlan {
     pub(super) body: Option<super::RequestBody>,
     pub(super) include_headers: bool,
 }
+/// Check everything a plan cannot take from its arguments unchanged: the URL,
+/// method and headers it returns, and the options.
+pub(super) fn check_request(
+    args: &FetchArgs,
+) -> Result<(HttpRequestUrl, Method, HeaderMap), AdmissionError> {
+    // Preserve the admission error ordering of URL, method, options and headers.
+    let url = HttpRequestUrl::parse(&args.url)?;
+    let method =
+        Method::from_bytes(args.method.as_bytes()).map_err(AdmissionError::invalid_arguments)?;
+    validate_options(args)?;
+    let headers = request_headers(args)?;
+    Ok((url, method, headers))
+}
+
 impl TryFrom<FetchArgs> for FetchPlan {
     type Error = AdmissionError;
     fn try_from(args: FetchArgs) -> Result<Self, AdmissionError> {
-        // Preserve the admission error ordering of URL, method, options and headers.
-        let mut url = HttpRequestUrl::parse(&args.url)?;
-        let method = Method::from_bytes(args.method.as_bytes())
-            .map_err(AdmissionError::invalid_arguments)?;
-        validate_options(&args)?;
-        let headers = request_headers(&args)?;
+        let (mut url, method, headers) = check_request(&args)?;
         url.append_query(&args.query);
         let output = match args.save_to {
             Some(destination) => OutputPlan::Download {

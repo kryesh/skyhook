@@ -187,8 +187,6 @@ pub enum ExecutionError {
     },
     #[error("unknown tool `{0}`")]
     UnknownTool(String),
-    #[error("tool `{0}` is unavailable in this context")]
-    UnavailableTool(String),
     #[error("tool `{0}` is not exposed for direct model calls")]
     ModelHidden(String),
     #[error("tool `{0}` is not available in scripts")]
@@ -369,9 +367,7 @@ mod tests {
                 let failure = call(kind, "payload", json!({"fail":true})).await.unwrap();
                 assert!(failure.is_error);
                 let target = failure.job;
-                let inspection = call(kind, "job_output", json!({"job":target}))
-                    .await
-                    .unwrap();
+                let inspection = call(kind, "jobs", json!({"job":target})).await.unwrap();
                 assert!(!inspection.is_error, "the inspection itself succeeded");
                 let expected_error = runtime
                     .jobs
@@ -391,9 +387,7 @@ mod tests {
                     assert_eq!(view["error"], expected_error);
                     assert_eq!(view["result"], partial);
                 }
-                let invalid = call(kind, "job_output", json!({"job":999999}))
-                    .await
-                    .unwrap();
+                let invalid = call(kind, "jobs", json!({"job":999999})).await.unwrap();
                 assert!(
                     invalid.is_error,
                     "an invalid inspection is an invocation failure"

@@ -31,7 +31,7 @@ pub(super) const TARGET_PROMPT: &str = r#"Tools default to the target and worksp
 Remote commands receive the SSH agent their target's connection forwards in SSH_AUTH_SOCK; Skyhook handles SSH authentication prompts."#;
 
 const WORKSPACE_PROMPT: &str = "Workspaces set the base directory; they do not isolate files. Agents on the same target share its filesystem. Paths/cwd may be absolute or relative (including `..`) on the selected machine. Relative child workspace overrides resolve against the selected base.";
-const LIFECYCLE_PROMPT: &str = "Write tool arguments with properties in schema order. Direct and JavaScript calls return the generated JobView envelope; native data is in `.result`, and `Result` in tool descriptions means that field. Follow the envelope's required fields; `presentation` carries previews, pages, captures, questions, and notices. JavaScript receives full data while model views may truncate annotated fields; use `job_output` for more output. Command timeouts terminate execution; omitted timeouts have no deadline. Nonzero exit_code is a normal result. Never circumvent a declined operation; use permitted alternatives or explain the limitation.";
+const LIFECYCLE_PROMPT: &str = "Write tool arguments with properties in schema order. Direct and JavaScript calls return the generated JobView envelope; native data is in `.result`, and `Result` in tool descriptions means that field. Follow the envelope's required fields; `presentation` carries previews, pages, captures, questions, and notices. JavaScript receives full data while model views may truncate annotated fields; use `jobs` for more output. Command timeouts terminate execution; omitted timeouts have no deadline. Nonzero exit_code is a normal result. Never circumvent a declined operation; use permitted alternatives or explain the limitation.";
 const AGENT_PROMPT: &str = "Children start without your conversation history. Supply their task, relevant context, and scope, and give each child a distinct responsibility.\n\nLet children continue working autonomously. Use job status and child messages to decide whether intervention is needed. Elapsed time, a wait timeout, or unchanged turn/tool-call counts alone do not establish that a child is stalled; it may be processing a request or awaiting a tool. When dependent on unfinished work, wait again. Send follow-ups to answer questions, resolve concrete blockers, correct a demonstrated misunderstanding, or communicate changed requirements. Resolve questions from children you supervise. Progress updates do not require a reply. When spawning a child, consider using todos to give it an initial checklist for multi-step work";
 
 const TODO_PROMPT: &str = "Use todo for multi-step work and account for unfinished items.";
@@ -78,9 +78,9 @@ pub(super) fn system_segment(inputs: &PromptInputs<'_>) -> SystemSegment {
     let context = SkyhookContext {
         workspace: &workspace,
         target: capabilities
-            .contains(Capability::Targets)
-            .then(|| TargetContext {
-                name: &location.target,
+            .visible_target(&location.target)
+            .map(|name| TargetContext {
+                name,
                 host: target.map_or("localhost", |target| &target.host),
                 via: target.and_then(|target| target.via.as_ref()),
                 origin: target.and_then(|target| target.origin.as_ref()),

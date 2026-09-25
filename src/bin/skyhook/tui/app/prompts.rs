@@ -213,11 +213,7 @@ fn approval_items(
         Item::new(ApprovalAction::Deny, "Deny", ""),
         Item::new(ApprovalAction::Details, "Details", ""),
     ];
-    if request
-        .permissions
-        .iter()
-        .any(|p| p.proposed_grant.is_some())
-    {
+    if request.permissions.iter().any(|p| p.proposed.is_some()) {
         items.push(Item::new(ApprovalAction::Grant, "Allow proposed scope", ""));
     }
     items
@@ -1049,19 +1045,16 @@ mod tests {
 
     #[tokio::test]
     async fn approval_dispatch_uses_checked_actions_and_only_offers_proposed_grants() {
-        use skyhook::tool::policy::ApprovalGrant;
+        use skyhook::tool::policy::ApprovalCoverage;
         let (_root, mut app) = draft_fixture().await;
         let original = crate::interaction::tests::approval_request().await;
         for proposed in [false, true] {
             let mut request = original.clone();
             for permission in &mut request.permissions {
-                permission.proposed_grant = None;
+                permission.proposed = None;
             }
             if proposed {
-                let permission = request.permissions.first_mut().unwrap();
-                let resource = permission.resource.clone();
-                permission.proposed_grant =
-                    Some(ApprovalGrant::exact(permission.capability, resource));
+                request.permissions[0].proposed = Some(ApprovalCoverage::Exact);
             }
             let (reply, mut response) = oneshot::channel();
             let kind = PromptKind::Approval { request, reply };

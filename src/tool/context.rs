@@ -8,7 +8,7 @@ use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, JobId},
     media::ImageRef,
-    tool::policy::{Capability, CapabilitySet, PermissionUse, ResourceId},
+    tool::policy::{CapabilitySet, PermissionUse},
 };
 
 #[derive(Clone)]
@@ -30,6 +30,8 @@ pub struct ToolContext {
     authority: Authority,
     input: Arc<Mutex<mpsc::Receiver<Value>>>,
     jobs: crate::job::JobManager,
+    /// The opened source argument, when the tool has one.
+    source: Option<crate::tool::source::Source>,
 }
 
 impl ToolContext {
@@ -53,7 +55,18 @@ impl ToolContext {
             authority: Authority::UnavailableForResume,
             input: Arc::new(Mutex::new(input)),
             jobs,
+            source: None,
         }
+    }
+
+    #[must_use]
+    pub(crate) fn with_source(mut self, source: Option<crate::tool::source::Source>) -> Self {
+        self.source = source;
+        self
+    }
+
+    pub(crate) fn source(&self) -> Option<&crate::tool::source::Source> {
+        self.source.as_ref()
     }
 
     /// Attach the invocation authority prepared by the executor.
@@ -150,28 +163,6 @@ impl ToolContext {
             .authorize(&self.subject, tool.to_owned(), permissions, arguments)
             .await
             .map_err(AdmissionError::from)
-    }
-
-    /// Approve a redirect destination before connecting to it. Callers must pass
-    /// the normalized HTTP(S) origin from their parsed URL, never a full URL.
-    /// No persistent grant is proposed; each invocation/destination is reviewed.
-    pub async fn authorize_network(&self, normalized_origin: &str) -> Result<(), ToolError> {
-        let mut arguments = self.invocation()?.2.clone();
-        if let Some(object) = arguments.as_object_mut() {
-            object.insert(
-                "network_origin".to_owned(),
-                Value::String(normalized_origin.to_owned()),
-            );
-        }
-        self.authorize(
-            vec![PermissionUse::new(
-                Capability::Network,
-                ResourceId::network(&self.execution_location.target, normalized_origin),
-            )],
-            arguments,
-        )
-        .await
-        .map_err(Into::into)
     }
 
     #[must_use]

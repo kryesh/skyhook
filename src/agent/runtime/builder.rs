@@ -265,9 +265,11 @@ impl HarnessBuilder {
         };
         let session_root = self
             .session_root
-            .unwrap_or_else(|| workspace.join(".skyhook/sessions"));
-        let mut instructions = load_agent_instructions(&workspace).await?;
+            .unwrap_or_else(|| crate::config::workspace_session_root(&workspace));
+        let (mut instructions, mut discovery_warnings) =
+            load_agent_instructions(&workspace).await?;
         let skills = HostSkills::discover(&workspace).await;
+        discovery_warnings.extend_from_slice(skills.warnings());
         let target_definitions = self.targets.definitions()?;
         TargetRegistry::from_definitions(target_definitions.clone())?;
         instructions.extend(self.instructions);
@@ -291,6 +293,7 @@ impl HarnessBuilder {
                 mcp: self.mcp,
                 instructions,
                 skills,
+                discovery_warnings,
                 max_child_depth: self.max_child_depth,
                 capabilities: self.capabilities,
                 modes: catalog.modes,
@@ -303,24 +306,6 @@ impl HarnessBuilder {
     }
 }
 const AGENT_INSTRUCTION_NAMES: [&str; 4] = ["AGENTS.md", "agents.md", "Agents.md", "AGENTS.MD"];
-
-// Instruction discovery deliberately does not depend on the selected YAML config.
-fn user_instruction_directories(
-    xdg_config_home: Option<std::ffi::OsString>,
-    home: Option<std::ffi::OsString>,
-) -> Vec<PathBuf> {
-    let mut directories = Vec::new();
-    if let Some(root) = xdg_config_home.filter(|root| !root.is_empty()) {
-        directories.push(PathBuf::from(root).join("skyhook"));
-    }
-    if let Some(home) = home.filter(|home| !home.is_empty()) {
-        let fallback = PathBuf::from(home).join(".config/skyhook");
-        if !directories.contains(&fallback) {
-            directories.push(fallback);
-        }
-    }
-    directories
-}
 
 struct AgentInstructionFile {
     canonical_path: PathBuf,
@@ -346,11 +331,16 @@ fn instruction_error(path: &Path, error: std::io::Error) -> std::io::Error {
     )
 }
 
+/// An instruction file that is too large or not a regular file is skipped with a
+/// warning; other failures stop startup.
+enum Discovered {
+    Loaded(AgentInstructionFile),
+    Skipped(String),
+}
+
 async fn read_instruction_directory(
     directory: &Path,
-) -> Result<Option<AgentInstructionFile>, std::io::Error> {
-    use tokio::io::AsyncReadExt as _;
-
+) -> Result<Option<Discovered>, std::io::Error> {
     for name in AGENT_INSTRUCTION_NAMES {
         let path = directory.join(name);
         // A dangling symlink is an existing candidate, not permission to try the
@@ -361,21 +351,40 @@ async fn read_instruction_directory(
             Err(error) => return Err(instruction_error(&path, error)),
         }
         let result = async {
-            let mut file = fs::File::open(&path).await?;
+            let io = |error| match error {
+                crate::fs::RegularFileError::Io(error) => error,
+                error => std::io::Error::other(error),
+            };
+            let limit = crate::media::MAX_TEXT_BYTES;
+            let file = match crate::fs::open_regular(&path, limit).await {
+                Ok(file) => file,
+                Err(
+                    error @ (crate::fs::RegularFileError::NotRegular
+                    | crate::fs::RegularFileError::TooLarge { .. }),
+                ) => {
+                    return Ok(Discovered::Skipped(format!(
+                        "AGENTS.md instruction file {} skipped: {error}",
+                        path.display()
+                    )));
+                }
+                Err(error) => return Err(io(error)),
+            };
+            // The identity comes from the handle that is read, not a later path lookup.
             #[cfg(unix)]
             let identity = {
                 use std::os::unix::fs::MetadataExt as _;
-                let metadata = file.metadata().await?;
+                let metadata = file.metadata()?;
                 (metadata.dev(), metadata.ino())
             };
-            let mut text = String::new();
-            file.read_to_string(&mut text).await?;
-            Ok(AgentInstructionFile {
+            let bytes = crate::fs::read_to_limit(file, limit).await.map_err(io)?;
+            let text = String::from_utf8(bytes)
+                .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+            Ok(Discovered::Loaded(AgentInstructionFile {
                 canonical_path: fs::canonicalize(&path).await?,
                 #[cfg(unix)]
                 identity,
                 text,
-            })
+            }))
         }
         .await;
         return result
@@ -387,11 +396,13 @@ async fn read_instruction_directory(
 
 async fn load_user_instructions(
     directories: &[PathBuf],
+    warnings: &mut Vec<String>,
 ) -> Result<Option<AgentInstructionFile>, std::io::Error> {
     let mut failures = Vec::new();
     for directory in directories {
         match read_instruction_directory(directory).await {
-            Ok(Some(file)) => return Ok(Some(file)),
+            Ok(Some(Discovered::Loaded(file))) => return Ok(Some(file)),
+            Ok(Some(Discovered::Skipped(warning))) => warnings.push(warning),
             Ok(None) => {}
             Err(error) => failures.push(error),
         }
@@ -411,21 +422,29 @@ async fn load_user_instructions(
     Ok(None)
 }
 
-async fn load_agent_instructions(workspace: &Path) -> Result<Vec<String>, std::io::Error> {
-    let directories = user_instruction_directories(
-        std::env::var_os("XDG_CONFIG_HOME"),
-        std::env::var_os("HOME"),
-    );
-    load_agent_instructions_from(workspace, &directories).await
+// Instruction discovery deliberately does not depend on the selected YAML config.
+/// Instruction texts, then warnings for skipped instruction files.
+async fn load_agent_instructions(
+    workspace: &Path,
+) -> Result<(Vec<String>, Vec<String>), std::io::Error> {
+    load_agent_instructions_from(workspace, &crate::config::user_config_directories()).await
 }
 
 async fn load_agent_instructions_from(
     workspace: &Path,
     user_directories: &[PathBuf],
-) -> Result<Vec<String>, std::io::Error> {
-    let user = load_user_instructions(user_directories).await?;
+) -> Result<(Vec<String>, Vec<String>), std::io::Error> {
+    let mut warnings = Vec::new();
+    let user = load_user_instructions(user_directories, &mut warnings).await?;
     // The builder supplies the resolved workspace. Never walk its ancestors.
-    let workspace = read_instruction_directory(workspace).await?;
+    let workspace = match read_instruction_directory(workspace).await? {
+        Some(Discovered::Loaded(file)) => Some(file),
+        Some(Discovered::Skipped(warning)) => {
+            warnings.push(warning);
+            None
+        }
+        None => None,
+    };
     let mut output = Vec::new();
     if let Some(user) = &user {
         output.push(format!("user AGENTS.md:\n{}", user.text));
@@ -436,7 +455,7 @@ async fn load_agent_instructions_from(
             output.push(format!("workspace AGENTS.md:\n{}", workspace.text));
         }
     }
-    Ok(output)
+    Ok((output, warnings))
 }
 
 #[cfg(test)]
@@ -534,21 +553,6 @@ mod tests {
         assert!(starting(built).is_none());
     }
 
-    #[test]
-    fn instruction_roots_are_ordered_and_independent_of_config() {
-        let xdg = PathBuf::from("xdg");
-        let home = PathBuf::from("home");
-        let directories = |xdg: &Path, home: &Path| {
-            user_instruction_directories(Some(xdg.into()), Some(home.into()))
-        };
-        let preferred = vec![xdg.join("skyhook"), home.join(".config/skyhook")];
-        assert_eq!(directories(&xdg, &home), preferred);
-        let fallback = vec![home.join(".config/skyhook")];
-        assert_eq!(directories(Path::new(""), &home), fallback);
-        assert_eq!(directories(&home.join(".config"), &home), fallback);
-        assert!(user_instruction_directories(None, Some("".into())).is_empty());
-    }
-
     #[tokio::test]
     async fn instructions_are_labeled_in_order_without_ancestors_or_duplicate_files() {
         // (files as (directory, name, content), user directories, expected)
@@ -634,7 +638,14 @@ mod tests {
             let loaded = load_agent_instructions_from(&workspace, &users)
                 .await
                 .unwrap();
-            assert_eq!(loaded, *expected, "{files:?}");
+            assert_eq!(
+                loaded,
+                (
+                    expected.iter().map(|text| text.to_string()).collect(),
+                    Vec::new()
+                ),
+                "{files:?}"
+            );
         }
     }
 
@@ -651,11 +662,11 @@ mod tests {
             }
             let users = std::slice::from_ref(&instructions);
             let user = load_agent_instructions_from(&empty, users).await.unwrap();
-            assert_eq!(user, vec![format!("user AGENTS.md:\n{name}")]);
+            assert_eq!(user.0, vec![format!("user AGENTS.md:\n{name}")]);
             let workspace = load_agent_instructions_from(&instructions, &[])
                 .await
                 .unwrap();
-            assert_eq!(workspace, vec![format!("workspace AGENTS.md:\n{name}")]);
+            assert_eq!(workspace.0, vec![format!("workspace AGENTS.md:\n{name}")]);
         }
     }
 
@@ -666,7 +677,6 @@ mod tests {
         // symlink is an existing candidate.
         for (case, kind) in [
             ("not-a-directory", None),
-            ("directory", None),
             ("utf8", Some(InvalidData)),
             #[cfg(unix)]
             ("dangling", Some(NotFound)),
@@ -676,7 +686,6 @@ mod tests {
             let broken = user.join("AGENTS.md");
             match case {
                 "not-a-directory" => std::fs::write(&user, "a file").unwrap(),
-                "directory" => std::fs::create_dir_all(&broken).unwrap(),
                 "utf8" => instruction_file(&user, "AGENTS.md", [0xff]),
                 _ => {
                     std::fs::create_dir(&user).unwrap();
@@ -691,17 +700,56 @@ mod tests {
             let error = load_agent_instructions_from(&user, &[]).await.unwrap_err();
             assert!(contains_path(&error, broken.clone()), "{case}: {error}");
             let users = [user, root.path().join("missing"), fallback.clone()];
-            let error = load_user_instructions(&users).await.err().unwrap();
+            let error = load_user_instructions(&users, &mut Vec::new())
+                .await
+                .err()
+                .unwrap();
             assert!(contains_path(&error, broken.clone()), "{case}: {error}");
             assert!(kind.is_none_or(|kind| kind == error.kind()), "{case}");
             // Every failing location is reported.
             instruction_file(&fallback, "Agents.md", [0xfe]);
-            let error = load_user_instructions(&users).await.err().unwrap();
+            let error = load_user_instructions(&users, &mut Vec::new())
+                .await
+                .err()
+                .unwrap();
             assert!(contains_path(&error, broken), "{case}: {error}");
             assert!(contains_path(&error, fallback.join("Agents.md")));
             instruction_file(&fallback, "AGENTS.md", "fallback");
-            let loaded = load_user_instructions(&users).await.unwrap();
+            let loaded = load_user_instructions(&users, &mut Vec::new())
+                .await
+                .unwrap();
             assert_eq!(loaded.unwrap().text, "fallback", "{case}");
+        }
+    }
+
+    /// An instruction file that is too large or not a regular file is skipped
+    /// with a warning naming it, and the next user location still loads.
+    #[tokio::test]
+    async fn unusable_instruction_files_are_skipped_with_warnings() {
+        for case in ["directory", "oversized"] {
+            let root = tempfile::tempdir().unwrap();
+            let (user, fallback) = (root.path().join("user"), root.path().join("fallback"));
+            let skipped = user.join("AGENTS.md");
+            match case {
+                "directory" => std::fs::create_dir_all(&skipped).unwrap(),
+                _ => instruction_file(
+                    &user,
+                    "AGENTS.md",
+                    vec![b'x'; crate::media::MAX_TEXT_BYTES as usize + 1],
+                ),
+            }
+            instruction_file(&fallback, "AGENTS.md", "fallback");
+            let (loaded, warnings) = load_agent_instructions_from(&user, &[user.clone(), fallback])
+                .await
+                .unwrap();
+            assert_eq!(loaded, vec!["user AGENTS.md:\nfallback"], "{case}");
+            assert_eq!(warnings.len(), 2, "{case}: {warnings:?}");
+            assert!(
+                warnings
+                    .iter()
+                    .all(|warning| warning.contains(&skipped.display().to_string())),
+                "{case}: {warnings:?}"
+            );
         }
     }
 
@@ -723,7 +771,7 @@ mod tests {
             let loaded = load_agent_instructions_from(&workspace, &[user])
                 .await
                 .unwrap();
-            assert_eq!(loaded, vec!["user AGENTS.md:\nshared"]);
+            assert_eq!(loaded.0, vec!["user AGENTS.md:\nshared"]);
         }
     }
 

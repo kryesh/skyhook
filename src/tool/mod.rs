@@ -9,6 +9,7 @@ pub mod executor;
 pub(crate) mod invocation;
 pub(crate) mod output;
 pub(crate) mod registry;
+pub(crate) mod source;
 
 pub mod builtins;
 pub mod javascript;
@@ -16,9 +17,8 @@ pub mod policy;
 
 pub use context::{DenialCode, ToolContext, ToolError, ToolOutput};
 pub use invocation::AdmissionError;
-pub(crate) use registry::job_view_type;
 pub use registry::{
     PathArgument, PathKind, RegisteredTool, RegistryError, ScriptBinding, ToolExposure,
-    ToolOptions, ToolPlacement, ToolRegistry, ToolRegistryBuilder, ToolResultPolicy, ToolSpec,
-    ToolSurface,
+    ToolOptions, ToolPlacement, ToolRegistry, ToolRegistryBuilder, ToolSpec, ToolSurface,
 };
+pub(crate) use registry::{ToolResultPolicy, job_view_type};

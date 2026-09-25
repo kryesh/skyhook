@@ -3,15 +3,17 @@ use std::{path::Path, sync::Arc};
 use tokio::sync::RwLock;
 
 use crate::{
+    execution::ExecutionLocation,
     remote::{PreparedConnection, RemoteError, RemoteManager},
     tool::{
+        ToolError,
         authorization::{AuthorizationCoordinator, AuthorizationSubject},
         diagnostic::{Effects, FailureSite, Operation, PartialContext, Subject},
-        policy::{ApprovalGrant, Capability, CapabilitySet, PermissionUse, ResourceId},
+        policy::{Capability, CapabilitySet, PermissionUse, ResourceId},
     },
 };
 
-use super::{TargetDefinition, TargetError, TargetName, TargetRegistry};
+use super::{TargetDefinition, TargetError, TargetName, TargetRef, TargetRegistry};
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RouteIdentity {
@@ -71,10 +73,7 @@ impl ResolvedRoute {
         [Capability::Targets]
             .into_iter()
             .chain(external.then_some(Capability::SshAgent))
-            .map(|capability| {
-                PermissionUse::new(capability, resource.clone())
-                    .with_grant(ApprovalGrant::exact(capability, resource.clone()))
-            })
+            .map(|capability| PermissionUse::exact(capability, resource.clone()))
             .collect()
     }
 
@@ -105,24 +104,6 @@ pub(crate) struct TargetRouter {
 }
 
 impl TargetRouter {
-    pub(crate) async fn authorize_transfer(
-        &self,
-        context: &crate::tool::ToolContext,
-        tool: &str,
-        permissions: Vec<PermissionUse>,
-        arguments: serde_json::Value,
-    ) -> Result<(), crate::tool::ToolError> {
-        self.authorization
-            .authorize(
-                context.invocation_subject()?,
-                tool.to_owned(),
-                permissions,
-                arguments,
-            )
-            .await
-            .map_err(|error| crate::tool::AdmissionError::from(error).into())
-    }
-
     pub fn new(
         targets: TargetRegistry,
         remote: RemoteManager,
@@ -306,6 +287,76 @@ fn registration_error(
 }
 
 #[cfg(test)]
+impl TargetRouter {
+    /// A router over `targets` whose connections use the default factory.
+    pub(crate) fn test(
+        targets: TargetRegistry,
+        policy: Arc<dyn crate::tool::policy::Policy>,
+    ) -> Self {
+        let authorization = AuthorizationCoordinator::new(policy);
+        let remote = RemoteManager::new(
+            crate::remote::EmbeddedShimCatalog::default(),
+            Arc::new(crate::remote::RejectSensitivePrompts),
+            authorization.clone(),
+        );
+        Self::new(targets, remote, authorization)
+    }
+}
+
+/// Where a target-relative operation runs, with the route to a named target
+/// as resolved for the selection. The route is a snapshot, not evidence of
+/// continued registry freshness.
+pub(crate) struct SelectedLocation {
+    pub(crate) location: ExecutionLocation,
+    pub(crate) route: Option<ResolvedRoute>,
+}
+
+/// Select where a target-relative operation runs: the caller's location, or
+/// an explicit target, which requires the targets capability. The root runs
+/// in the root workspace; another target in its configured workspace, but
+/// naming the caller's own target keeps the caller's workspace.
+pub(crate) async fn select_location(
+    caller: &ExecutionLocation,
+    root_workspace: &Path,
+    explicit: Option<&TargetRef>,
+    capabilities: &CapabilitySet,
+    router: Option<&TargetRouter>,
+) -> Result<SelectedLocation, ToolError> {
+    if explicit.is_some() && !capabilities.contains(Capability::Targets) {
+        return Err(ToolError::invalid_arguments(
+            "target selection requires the targets capability",
+        ));
+    }
+    let Some(name) = explicit.unwrap_or(&caller.target).name() else {
+        let location = match explicit {
+            Some(_) => ExecutionLocation::root(root_workspace.to_owned()),
+            None => caller.clone(),
+        };
+        return Ok(SelectedLocation {
+            location,
+            route: None,
+        });
+    };
+    let router = router.ok_or_else(|| {
+        ToolError::invalid_arguments("remote targets are unavailable in this tool runtime")
+    })?;
+    let route = router
+        .resolve(name, capabilities)
+        .await
+        .map_err(|error| ToolError::from(error.into_admission_error()))?;
+    let location = if caller.target.name() == Some(name) {
+        caller.clone()
+    } else {
+        let destination = route.destination();
+        ExecutionLocation::named(destination.name.clone(), destination.workspace.clone())
+    };
+    Ok(SelectedLocation {
+        location,
+        route: Some(route),
+    })
+}
+
+#[cfg(test)]
 mod tests {
     use std::{
         collections::VecDeque,
@@ -345,7 +396,7 @@ mod tests {
                 *grants = request
                     .permissions
                     .iter()
-                    .filter_map(|permission| permission.proposed_grant.clone())
+                    .filter_map(PermissionUse::proposed_grant)
                     .collect();
             }
             decision
@@ -385,10 +436,7 @@ mod tests {
         let hops = vec![("gateway".into(), 7), ("build".into(), 19)];
         assert_eq!(route.identity.hops, hops);
         let resource = ResourceId::route("build", hops);
-        let permission = |capability| {
-            PermissionUse::new(capability, resource.clone())
-                .with_grant(ApprovalGrant::exact(capability, resource.clone()))
-        };
+        let permission = |capability| PermissionUse::exact(capability, resource.clone());
         assert_eq!(route.permissions(), [permission(Capability::Targets)]);
         let arguments = route.authorization_arguments();
         assert_eq!(arguments["route"], serde_json::json!(["gateway", "build"]));
@@ -760,5 +808,66 @@ mod tests {
         assert_eq!(diagnostic.context.site, FailureSite::Host);
         assert_eq!(diagnostic.context.effects, Effects::Unchanged);
         assert_eq!(targets.definitions().await, before);
+    }
+
+    #[tokio::test]
+    async fn selection_resolves_inherit_root_and_other_targets() {
+        let root = Path::new("/root");
+        let build = ExecutionLocation::named("build".parse().unwrap(), "/caller-override".into());
+        let overridden = ExecutionLocation::root("/override".into());
+        let targets = TargetRegistry::from_definitions([
+            TargetDefinition::test("build", "/configured", None),
+            TargetDefinition::test("other", "relative directory/../project", None),
+        ])
+        .unwrap();
+        let router = TargetRouter::test(targets, crate::tests::RecordingPolicy::allowing());
+        let mut capabilities = CapabilitySet::default();
+        capabilities.insert(Capability::Targets);
+        let [root_target, current, other] =
+            ["root", "build", "other"].map(|name| name.parse::<TargetRef>().unwrap());
+        let select = |caller, explicit, capabilities| {
+            select_location(caller, root, explicit, capabilities, Some(&router))
+        };
+        for (caller, explicit, expected) in [
+            (&build, None, build.clone()),
+            (&overridden, None, overridden.clone()),
+            (
+                &build,
+                Some(&root_target),
+                ExecutionLocation::root("/root".into()),
+            ),
+            (
+                &overridden,
+                Some(&root_target),
+                ExecutionLocation::root("/root".into()),
+            ),
+            // An explicit current target keeps the caller's workspace override.
+            (&build, Some(&current), build.clone()),
+            (
+                &build,
+                Some(&other),
+                ExecutionLocation::named(
+                    "other".parse().unwrap(),
+                    "relative directory/../project".into(),
+                ),
+            ),
+        ] {
+            let selected = select(caller, explicit, &capabilities).await.unwrap();
+            assert_eq!(selected.location, expected);
+            assert_eq!(
+                selected.route.map(|route| route.destination().name.clone()),
+                expected.target.name().cloned()
+            );
+        }
+        // Naming any target needs the capability; inheriting one does not.
+        let without = CapabilitySet::default();
+        assert!(
+            select(&overridden, Some(&root_target), &without)
+                .await
+                .is_err()
+        );
+        assert!(select(&build, None, &without).await.is_ok());
+        let unknown = "missing".parse::<TargetRef>().unwrap();
+        assert!(select(&build, Some(&unknown), &capabilities).await.is_err());
     }
 }

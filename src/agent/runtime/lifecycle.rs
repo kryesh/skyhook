@@ -251,9 +251,7 @@ impl SessionRuntime {
         let mut targets = self
             .agents()
             .keys()
-            .filter(|agent| {
-                agent.session() == root.session() && agent.path().starts_with(root.path())
-            })
+            .filter(|agent| agent.is_within(root))
             .cloned()
             .collect::<Vec<_>>();
         targets.sort_by_key(AgentId::depth);
@@ -303,7 +301,7 @@ impl SessionRuntime {
         for holder in holders {
             let descendant_cancelled = cancelled
                 .iter()
-                .any(|agent| agent != &holder && agent.path().starts_with(holder.path()));
+                .any(|agent| agent != &holder && agent.is_within(&holder));
             if descendant_cancelled {
                 self.activity(&holder, AgentActivity::Stopped(TurnFailure::Interrupted));
                 interrupted += 1;
@@ -347,9 +345,7 @@ impl SessionRuntime {
         let targets = self
             .agents()
             .iter()
-            .filter(|(agent, _)| {
-                agent.session() == root.session() && agent.path().starts_with(root.path())
-            })
+            .filter(|(agent, _)| agent.is_within(root))
             .map(|(id, agent)| (id.clone(), agent.cancellation.clone()))
             .collect::<Vec<_>>();
         let mut cancelled = 0;

@@ -11,16 +11,20 @@ use crate::{
         diagnostic::{FailureSite, Operation, PartialContext, Subject},
         output::FieldPointer,
         output::{CaptureEvent, OutputEvent, OutputSink},
+        source::{Source, Spool},
     },
 };
-use tokio::{
-    io::{AsyncSeekExt as _, AsyncWriteExt as _},
-    sync::mpsc,
-    task::JoinSet,
-};
+use tokio::{sync::mpsc, task::JoinSet};
 
 #[derive(Debug)]
-pub(super) struct ReceivedResult(pub(super) Result<ToolOutput, RemoteError>);
+pub(super) struct ReceivedResult(pub(super) Result<Received, RemoteError>);
+
+/// A completed remote call, with the spooled contents of a source read.
+#[derive(Debug)]
+pub(super) struct Received {
+    pub(super) output: ToolOutput,
+    pub(super) source: Option<Source>,
+}
 
 enum Message {
     Payload(PayloadEvent, tokio::sync::OwnedSemaphorePermit),
@@ -147,13 +151,6 @@ fn protocol(message: &'static str) -> RemoteError {
     ProtocolError::Violation(message).into()
 }
 
-async fn temporary_file() -> Result<tokio::fs::File, RemoteError> {
-    let file = tokio::task::spawn_blocking(tempfile::tempfile)
-        .await
-        .map_err(|error| RemoteError::ConnectionTask(error.to_string()))??;
-    Ok(tokio::fs::File::from_std(file))
-}
-
 enum ImagePayload {
     Receiving {
         file: Option<String>,
@@ -167,13 +164,22 @@ enum ImagePayload {
 enum ResultPayload {
     #[default]
     Absent,
-    Receiving(tokio::fs::File),
+    Receiving(Spool),
     Finished(RemoteToolResult),
+}
+
+#[derive(Default)]
+enum SourcePayload {
+    #[default]
+    Absent,
+    Receiving(Spool),
+    Finished(Source),
 }
 
 struct Ingestion {
     captures: Arc<CaptureCollector>,
     images: HashMap<ImageId, ImagePayload>,
+    source: SourcePayload,
     result: ResultPayload,
 }
 
@@ -185,6 +191,7 @@ impl Ingestion {
                 context.job(),
             )),
             images: HashMap::new(),
+            source: SourcePayload::Absent,
             result: ResultPayload::Absent,
         }
     }
@@ -289,36 +296,66 @@ impl Ingestion {
                 };
                 self.images.insert(id, ImagePayload::Finished(image));
             }
+            PayloadEvent::Open(PayloadOpen::Source) => {
+                if !matches!(self.source, SourcePayload::Absent) {
+                    return Err(protocol("duplicate source payload"));
+                }
+                self.source = SourcePayload::Receiving(Spool::new().await?);
+            }
+            PayloadEvent::Data {
+                id: PayloadId::Source,
+                data,
+            } => {
+                let SourcePayload::Receiving(spool) = &mut self.source else {
+                    return Err(protocol("data for inactive source"));
+                };
+                spool
+                    .append(&data)
+                    .await
+                    .map_err(|error| host_output_error(error, Operation::Write))?;
+            }
+            PayloadEvent::Finish {
+                id: PayloadId::Source,
+            } => {
+                let SourcePayload::Receiving(spool) = std::mem::take(&mut self.source) else {
+                    return Err(protocol("finish for inactive source"));
+                };
+                let source = spool
+                    .finish()
+                    .await
+                    .map_err(|error| host_output_error(error, Operation::Write))?;
+                self.source = SourcePayload::Finished(source);
+            }
             PayloadEvent::Open(PayloadOpen::Result) => {
                 if !matches!(self.result, ResultPayload::Absent) {
                     return Err(protocol("duplicate result payload"));
                 }
-                self.result = ResultPayload::Receiving(temporary_file().await?);
+                self.result = ResultPayload::Receiving(Spool::new().await?);
             }
             PayloadEvent::Data {
                 id: PayloadId::Result,
                 data,
             } => {
-                let ResultPayload::Receiving(file) = &mut self.result else {
+                let ResultPayload::Receiving(spool) = &mut self.result else {
                     return Err(protocol("data for inactive result"));
                 };
-                file.write_all(&data)
+                spool
+                    .append(&data)
                     .await
                     .map_err(|error| host_output_error(error, Operation::WriteCapture))?;
             }
             PayloadEvent::Finish {
                 id: PayloadId::Result,
             } => {
-                let ResultPayload::Receiving(mut file) = std::mem::take(&mut self.result) else {
+                let ResultPayload::Receiving(spool) = std::mem::take(&mut self.result) else {
                     return Err(protocol("finish for inactive result"));
                 };
-                file.flush()
+                let file = spool
+                    .finish()
                     .await
-                    .map_err(|error| host_output_error(error, Operation::FinishCapture))?;
-                file.rewind()
-                    .await
+                    .map_err(|error| host_output_error(error, Operation::FinishCapture))?
+                    .reader()
                     .map_err(|error| host_output_error(error, Operation::ReadCapture))?;
-                let file = file.into_std().await;
                 let result = tokio::task::spawn_blocking(move || {
                     serde_json::from_reader(std::io::BufReader::new(file))
                 })
@@ -380,8 +417,19 @@ impl Ingestion {
                 "terminal response without completed result payload",
             ));
         };
+        // A failed read may stop its source mid-stream; the partial spool is discarded.
+        let source = match (std::mem::take(&mut self.source), result.is_ok()) {
+            (SourcePayload::Absent, _) | (SourcePayload::Receiving(_), false) => None,
+            (SourcePayload::Receiving(_), true) => {
+                return Err(protocol("terminal response before source completion"));
+            }
+            (SourcePayload::Finished(file), _) => Some(file),
+        };
         Ok(match result {
-            Ok(output) => ReceivedResult(Ok(self.output(output, location)?)),
+            Ok(output) => ReceivedResult(Ok(Received {
+                output: self.output(output, location)?,
+                source,
+            })),
             Err(mut error) => {
                 let error_output = error
                     .output
@@ -438,6 +486,49 @@ mod tests {
         })
     }
 
+    /// A failed source read may stop mid-stream: its partial spool is dropped
+    /// with the call, while a completed call must have finished its source.
+    #[tokio::test]
+    async fn partial_sources_are_discarded_only_with_failed_calls() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let context = fixture_context(&runtime);
+        for failed in [true, false] {
+            let mut ingest = Ingestion::new(&context);
+            for event in [
+                PayloadEvent::Open(PayloadOpen::Source),
+                PayloadEvent::Data {
+                    id: PayloadId::Source,
+                    data: b"partial".to_vec(),
+                },
+            ] {
+                ingest.receive(&context, event).await.unwrap();
+            }
+            let output = RemoteToolOutput {
+                diagnostic: None,
+                value: json!(null),
+                images: Vec::new(),
+                captures: Vec::new(),
+                streams: StreamEnd::Finished,
+            };
+            ingest.result = ResultPayload::Finished(if failed {
+                Err(crate::remote::worker::remote_error(
+                    crate::tool::invocation::LocalError::cancelled(),
+                ))
+            } else {
+                Ok(output)
+            });
+            let received = ingest.finish(context.execution_location());
+            if failed {
+                assert!(matches!(received, Ok(ReceivedResult(Err(_)))));
+            } else {
+                assert!(
+                    received.is_err(),
+                    "a completed call left its source unfinished"
+                );
+            }
+        }
+    }
+
     #[tokio::test]
     async fn wire_diagnostics_bind_only_to_the_trusted_invocation_location() {
         use crate::{
@@ -490,7 +581,7 @@ mod tests {
                     serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap(),
                 );
                 let output = match ingest.finish(&trusted).unwrap().0 {
-                    Ok(output) => output,
+                    Ok(received) => received.output,
                     Err(error) => {
                         let (diagnostic, output) = error.into_tool_error().into_parts();
                         assert_eq!(diagnostic.context.operation, Operation::Read);
@@ -665,7 +756,7 @@ mod tests {
                 continue;
             }
             let output = match received.unwrap().0 {
-                Ok(output) if !failed => output,
+                Ok(received) if !failed => received.output,
                 Err(RemoteError::Remote {
                     output: Some(output),
                     ..

@@ -1,8 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::{
-    io::Write,
-    path::{Path, PathBuf},
-};
+use skyhook::fs::{CommitMode, PermissionPolicy, StagedFile};
+use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
@@ -40,17 +38,6 @@ pub fn load(workspace: &Path) -> (SavedState, Option<String>) {
         ),
     }
 }
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    let parent = path
-        .parent()
-        .ok_or_else(|| std::io::Error::other("state path has no parent"))?;
-    std::fs::create_dir_all(parent)?;
-    let mut temp = tempfile::NamedTempFile::new_in(parent)?;
-    temp.write_all(bytes)?;
-    temp.as_file().sync_all()?;
-    temp.persist(path).map_err(|e| e.error)?;
-    Ok(())
-}
 /// Change saved settings without disturbing the others.
 pub fn update(workspace: &Path, change: impl FnOnce(&mut SavedState)) -> std::io::Result<()> {
     // Concurrent savers must not overwrite each other's setting.
@@ -60,21 +47,18 @@ pub fn update(workspace: &Path, change: impl FnOnce(&mut SavedState)) -> std::io
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let (mut state, _) = load(workspace);
     change(&mut state);
-    atomic_write(&state_path(workspace), &serde_json::to_vec(&state)?)
+    let path = state_path(workspace);
+    if let Some(directory) = path.parent() {
+        std::fs::create_dir_all(directory)?;
+    }
+    let mut staged = StagedFile::create(&path, PermissionPolicy::Private)?;
+    staged.write(&serde_json::to_vec(&state)?)?;
+    Ok(staged.commit(CommitMode::Replace)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn atomic_write_failure_preserves_existing_path() {
-        let root = tempfile::tempdir().unwrap();
-        let blocker = root.path().join("not-a-directory");
-        std::fs::write(&blocker, b"preserved").unwrap();
-        assert!(atomic_write(&blocker.join("state.json"), b"replacement").is_err());
-        assert_eq!(std::fs::read(blocker).unwrap(), b"preserved");
-    }
 
     #[test]
     fn updates_keep_other_settings_and_the_sidebar_defaults_on() {

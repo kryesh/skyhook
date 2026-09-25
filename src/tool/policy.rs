@@ -1,7 +1,7 @@
 use std::{
     collections::BTreeSet,
     future::Future,
-    path::{Component, Path},
+    path::{Path, PathBuf},
     pin::Pin,
 };
 
@@ -12,6 +12,10 @@ use crate::{
     identity::{AgentId, JobId},
     named_enum::named_enum,
     target::TargetRef,
+    tool::{
+        AdmissionError,
+        diagnostic::{Operation, Subject},
+    },
 };
 
 named_enum! {
@@ -64,6 +68,15 @@ impl CapabilitySet {
 
     pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
         self.0.iter().copied()
+    }
+
+    /// The target as a viewer holding these capabilities may see it: only one
+    /// that can select targets learns which target anything ran on.
+    pub(crate) fn visible_target<'a>(
+        &self,
+        target: &'a crate::target::TargetRef,
+    ) -> Option<&'a crate::target::TargetRef> {
+        self.contains(Capability::Targets).then_some(target)
     }
 }
 
@@ -174,26 +187,59 @@ struct ResourceWire {
     segments: Vec<String>,
 }
 
+/// A native path whose text spells it exactly. Permission resources and wire
+/// frames are text, so a non-Unicode path is refused rather than authorized as
+/// its replacement-character alias.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PathText(String);
+
+impl PathText {
+    pub fn new(path: impl Into<PathBuf>) -> Result<Self, AdmissionError> {
+        path.into()
+            .into_os_string()
+            .into_string()
+            .map(Self)
+            .map_err(|path| {
+                AdmissionError::invalid_arguments(
+                    "native path cannot be represented losslessly by the permission or wire format",
+                )
+                .operation(Operation::Validate, Subject::path(path))
+            })
+    }
+
+    #[must_use]
+    pub fn as_path(&self) -> &Path {
+        Path::new(&self.0)
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<PathText> for PathBuf {
+    fn from(path: PathText) -> Self {
+        path.0.into()
+    }
+}
+
 impl ResourceId {
     #[must_use]
-    pub fn workspace(target: &TargetRef, workspace: &Path) -> Self {
+    pub fn workspace(target: &TargetRef, workspace: &PathText) -> Self {
         Self::Workspace {
             target: target.to_string(),
-            path: workspace.to_string_lossy().into_owned(),
+            path: workspace.0.clone(),
         }
     }
 
     #[must_use]
-    pub fn path(target: &TargetRef, path: &Path) -> Self {
+    pub fn path(target: &TargetRef, path: &PathText) -> Self {
+        // Every component of Unicode text is itself Unicode, so this is lossless.
         let components = path
+            .as_path()
             .components()
-            .map(|component| match component {
-                Component::Prefix(prefix) => prefix.as_os_str().to_string_lossy().into_owned(),
-                Component::RootDir => "/".to_owned(),
-                Component::CurDir => ".".to_owned(),
-                Component::ParentDir => "..".to_owned(),
-                Component::Normal(value) => value.to_string_lossy().into_owned(),
-            })
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
             .collect();
         Self::Path {
             target: target.to_string(),
@@ -396,28 +442,55 @@ impl ApprovalGrant {
     }
 }
 
+/// A permission an invocation uses, and the coverage of the grant it proposes
+/// for it. The proposal is derived from this permission's own capability and
+/// resource, so it can never name a broader grant than the one shown.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PermissionUse {
     pub capability: Capability,
     pub resource: ResourceId,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub proposed_grant: Option<ApprovalGrant>,
+    pub proposed: Option<ApprovalCoverage>,
 }
 
 impl PermissionUse {
+    /// A permission reviewed each time, proposing no grant.
     #[must_use]
     pub const fn new(capability: Capability, resource: ResourceId) -> Self {
         Self {
             capability,
             resource,
-            proposed_grant: None,
+            proposed: None,
+        }
+    }
+
+    /// A permission proposing a grant for exactly its resource.
+    #[must_use]
+    pub const fn exact(capability: Capability, resource: ResourceId) -> Self {
+        Self {
+            capability,
+            resource,
+            proposed: Some(ApprovalCoverage::Exact),
+        }
+    }
+
+    /// A permission proposing a grant for its resource and its descendants.
+    #[must_use]
+    pub const fn descendants(capability: Capability, resource: ResourceId) -> Self {
+        Self {
+            capability,
+            resource,
+            proposed: Some(ApprovalCoverage::Descendants),
         }
     }
 
     #[must_use]
-    pub fn with_grant(mut self, grant: ApprovalGrant) -> Self {
-        self.proposed_grant = Some(grant);
-        self
+    pub fn proposed_grant(&self) -> Option<ApprovalGrant> {
+        self.proposed.map(|coverage| ApprovalGrant {
+            capability: self.capability,
+            resource: self.resource.clone(),
+            coverage,
+        })
     }
 }
 
@@ -529,17 +602,19 @@ mod tests {
 
     #[test]
     fn descendant_matching_preserves_vector_boundaries_and_route_identity() {
-        let parent = ResourceId::path(&crate::target::TargetRef::Root, Path::new("/a"));
-        let child = ResourceId::path(&crate::target::TargetRef::Root, Path::new("/a/b"));
+        let path = |path: &str| {
+            ResourceId::path(
+                &crate::target::TargetRef::Root,
+                &PathText::new(path).unwrap(),
+            )
+        };
+        let (parent, child) = (path("/a"), path("/a/b"));
         let exact = ApprovalGrant::exact(Capability::Read, parent.clone());
         let descendants = ApprovalGrant::descendants(Capability::Read, parent);
         assert!(!exact.covers(Capability::Read, &child));
         assert!(descendants.covers(Capability::Read, &child));
         assert!(!descendants.covers(Capability::Write, &child));
-        assert!(!descendants.covers(
-            Capability::Read,
-            &ResourceId::path(&crate::target::TargetRef::Root, Path::new("/ab"))
-        ));
+        assert!(!descendants.covers(Capability::Read, &path("/ab")));
         let hops = vec![("jump".into(), 1), ("build".into(), 2)];
         let route = ResourceId::route("build", hops.clone());
         let grant = ApprovalGrant::descendants(Capability::Targets, route.clone());

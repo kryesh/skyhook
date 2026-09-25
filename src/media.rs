@@ -18,6 +18,9 @@ use crate::named_enum::named_enum;
 pub const MAX_IMAGE_BYTES: u64 = 8 * 1024 * 1024;
 pub const MAX_IMAGES_PER_SUBMISSION: usize = 8;
 pub const MAX_IMAGE_BYTES_PER_SUBMISSION: u64 = 32 * 1024 * 1024;
+/// Largest text read whole into model context: prompt attachments, instruction
+/// files, and skill text.
+pub const MAX_TEXT_BYTES: u64 = 1024 * 1024;
 
 /// A blob identity, never a path supplied by the caller. Canonical lowercase
 /// matches the stored blob filenames.
@@ -163,6 +166,27 @@ impl Image {
     }
 }
 
+/// Whole file contents by presentation. NUL bytes mean binary, even in valid UTF-8.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Classified {
+    Image(Image),
+    Text(String),
+    Binary(Vec<u8>),
+}
+
+pub fn classify(bytes: Vec<u8>) -> Classified {
+    if let Some(format) = ImageFormat::sniff(&bytes) {
+        return Classified::Image(Image { format, bytes });
+    }
+    if bytes.contains(&0) {
+        return Classified::Binary(bytes);
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Classified::Text(text),
+        Err(error) => Classified::Binary(error.into_bytes()),
+    }
+}
+
 /// Content attached to a prompt before it is stored. `file` records where the
 /// content came from; pasted content has none.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -303,6 +327,21 @@ mod tests {
         provider::protocol::{Message, ModelRequest, ToolResult, UserContent},
         session::SessionStore,
     };
+
+    #[test]
+    fn classification_prefers_images_and_treats_nul_as_binary() {
+        assert!(matches!(
+            classify(crate::tests::png(b"\0").bytes().to_vec()),
+            Classified::Image(_)
+        ));
+        assert_eq!(classify(b"text".to_vec()), Classified::Text("text".into()));
+        for binary in [&b"text\0"[..], b"\xff"] {
+            assert_eq!(
+                classify(binary.to_vec()),
+                Classified::Binary(binary.to_vec())
+            );
+        }
+    }
 
     #[test]
     fn digest_strict_canonical_serde_and_path_rejection() {

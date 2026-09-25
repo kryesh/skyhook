@@ -15,7 +15,9 @@ The workspace is a base directory, not a security boundary. Filesystem path auth
 human approval are distinct: the default CLI read policy auto-allows reads even when their
 canonical paths are outside the workspace. Do not rely on a confirmation prompt to protect
 outside-workspace reads. Outside-workspace writes require confirmation, and remote access has
-its own approval requirements.
+its own approval requirements. Permissions name paths as text, so an operation whose permission
+names a path or workspace that is not valid Unicode is refused rather than approved under an
+approximate name.
 
 Choose **Allow once** to approve only the current operation. When offered, **Allow proposed
 scope** saves the displayed grant for later operations in the same session, including after
@@ -40,7 +42,7 @@ Capabilities are granted by the active [mode](#modes), or by a batch job's
 | --- | --- | --- |
 | `read` | File reads, searches, and skill reads | Enabled |
 | `write` | File creation, modification, removal, and related write access | Enabled |
-| `exec` | `exec` and `shell` | Enabled |
+| `exec` | `exec` | Enabled |
 | `network` | HTTP(S) `fetch` | Enabled |
 | `targets` | Target-management tools and target-selection inputs | Disabled |
 | `ssh_agent` | Targets using `ssh.external_agent`, which forward an SSH agent Skyhook does not own; without it they are hidden | Disabled |

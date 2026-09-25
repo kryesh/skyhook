@@ -258,13 +258,6 @@ async fn evaluate_inner(
                         serde_json::from_str(&request).map_err(|error| bridge_error(&error))?;
                     let response = match request {
                         HostRequest::Call { name, arguments } => {
-                            // A JobView-producing tool already owns the schema of its
-                            // returned view. Native schemas describe only envelope.result.
-                            let schema = surface.get(&name).and_then(|tool| {
-                                (tool.result_policy != crate::tool::ToolResultPolicy::JobView)
-                                    .then_some(tool.result_schema.as_ref())
-                                    .flatten()
-                            });
                             let parent = Some(host_context.job());
                             let requested = arguments.as_object().and_then(JobName::requested);
                             // Failures before and after the job exists are ordinary
@@ -277,6 +270,9 @@ async fn evaluate_inner(
                                     host_context.diagnostic_viewer(),
                                 )
                             };
+                            // A presented job view already carries its own annotations.
+                            // Native schemas describe only envelope.result.
+                            let mut native = true;
                             let output = match host_executor
                                 .create_script(
                                     host_context.agent().clone(),
@@ -288,6 +284,8 @@ async fn evaluate_inner(
                             {
                                 Ok(created) => {
                                     let job_name = created.job_name().cloned();
+                                    native = created.result_policy()
+                                        == crate::tool::ToolResultPolicy::Value;
                                     match host_executor.run(created).await {
                                         Ok(result) => result.output,
                                         Err(error) => failed(error, job_name),
@@ -295,6 +293,10 @@ async fn evaluate_inner(
                                 }
                                 Err(error) => failed(error, requested),
                             };
+                            let schema = surface
+                                .get(&name)
+                                .filter(|_| native)
+                                .and_then(|tool| tool.result_schema.as_ref());
                             let annotations = schema
                                 .and_then(|schema| output.value.get("result").map(|value| (schema, value)))
                                 .map(|(schema, value)| {
@@ -965,7 +967,6 @@ return {first, second, started};
     const BUILDERS: &str = r#"[
     {"binding":"top_level","name":"echo","properties":["value"],"required":["value"]},
     {"binding":"job_method","name":"job_send","method":"send","job_argument":"job","properties":["job","value"],"required":["value"]},
-    {"binding":"job_method","name":"job_output","method":"output","job_argument":"job","properties":["job","field"],"required":[]},
     {"binding":"job_method","name":"job_cancel","method":"cancel","job_argument":"job","properties":["job"],"required":[]}
 ]"#;
 
@@ -1151,7 +1152,7 @@ return {value:completed.unwrap(), literalNull:literalNull.unwrap(), errors};
                  "code":null, "executed":null},
                 {"message":"job 9 is not completed (state: running)", "sameResponse":true,
                  "output":null, "code":null, "executed":null},
-                {"message":"job 10 has no loaded result; inspect it with tool.job(id).output()",
+                {"message":"job 10 has no loaded result; inspect it with tool.jobs({job: id})",
                  "sameResponse":true, "output":null, "code":null, "executed":null},
                 {"message":"unwrap completed response requires a JSON result field (null is allowed)",
                  "sameResponse":false}
@@ -1170,7 +1171,6 @@ await first;
 await first; // The same operation executes only once.
 await second;
 await tool.job(8).send({value: "object"});
-await tool.job(9).output({field: "/result/value"});
 await tool.job(10).cancel();
 await tool.job(1).cancel();
 await tool.job(Number.MAX_SAFE_INTEGER).cancel();
@@ -1183,7 +1183,6 @@ return __testCalls;
                 {"type":"call", "name":"job_send", "arguments":{"job":7,"value":"first"}},
                 {"type":"call", "name":"job_send", "arguments":{"job":7,"value":"second"}},
                 {"type":"call", "name":"job_send", "arguments":{"job":8,"value":"object"}},
-                {"type":"call", "name":"job_output", "arguments":{"job":9,"field":"/result/value"}},
                 {"type":"call", "name":"job_cancel", "arguments":{"job":10}},
                 {"type":"call", "name":"job_cancel", "arguments":{"job":1}},
                 {"type":"call", "name":"job_cancel", "arguments":{"job":9_007_199_254_740_991_u64}}

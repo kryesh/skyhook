@@ -24,8 +24,9 @@ pub(crate) enum AuthorizationError {
     Cancelled,
     #[error("{0}")]
     InvalidGrant(String),
-    #[error("required capability is unavailable")]
-    Unavailable,
+    /// The named tool needs a capability its subject lacks.
+    #[error("tool `{0}` is unavailable in this context")]
+    Unavailable(String),
     /// The policy stopped before deciding; nothing was denied or allowed.
     #[error("authorization could not be decided")]
     PolicyFailed,
@@ -39,7 +40,7 @@ impl From<AuthorizationError> for AdmissionError {
         match error {
             AuthorizationError::Denied(reason) => Self::denied(reason),
             AuthorizationError::Cancelled => Self::cancelled(),
-            AuthorizationError::Unavailable => Self::denied(error.to_string()),
+            AuthorizationError::Unavailable(tool) => Self::unavailable(&tool),
             AuthorizationError::InvalidGrant(_) | AuthorizationError::PolicyFailed => {
                 Self::failed(error)
             }
@@ -150,7 +151,7 @@ impl AuthorizationCoordinator {
             .iter()
             .any(|use_| !subject.capabilities.contains(use_.capability))
         {
-            return Err(AuthorizationError::Unavailable);
+            return Err(AuthorizationError::Unavailable(tool));
         }
         let mut unique = Vec::with_capacity(permissions.len());
         for permission in permissions {
@@ -173,7 +174,7 @@ impl AuthorizationCoordinator {
 
             let proposals = permissions
                 .iter()
-                .filter_map(|use_| use_.proposed_grant.clone())
+                .filter_map(PermissionUse::proposed_grant)
                 .collect::<Vec<_>>();
             if let Some(pending) = proposals
                 .iter()
@@ -339,7 +340,7 @@ mod tests {
             let grants = request
                 .permissions
                 .into_iter()
-                .filter_map(|p| p.proposed_grant)
+                .filter_map(|p| p.proposed_grant())
                 .collect();
             Box::pin(async move {
                 if let Some(release) = release {
@@ -365,8 +366,7 @@ mod tests {
         subject: &AuthorizationSubject,
         resource: &ResourceId,
     ) -> Result<(), AuthorizationError> {
-        let permission = PermissionUse::new(Capability::Write, resource.clone())
-            .with_grant(ApprovalGrant::exact(Capability::Write, resource.clone()));
+        let permission = PermissionUse::exact(Capability::Write, resource.clone());
         let arguments = serde_json::Value::Null;
         coordinator
             .authorize(subject, "tool".to_owned(), vec![permission], arguments)

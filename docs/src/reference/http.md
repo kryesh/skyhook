@@ -76,7 +76,7 @@ character decoding and `base64` preserves response entity bytes. HTTP decompress
 these are not raw wire bytes. `save_to` saves the response to a file on success instead of
 embedding the payload. Errors or cancellation do not replace an existing destination.
 Automatic job presentation may shorten `body.text` and `body.data`, with continuation markers;
-retrieve the complete saved payload using `job_output` fields `/result/body/text` or
+retrieve the complete saved payload using `jobs({job})` fields `/result/body/text` or
 `/result/body/data`. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
 calls still receive the complete payload for processing.
 
@@ -97,7 +97,7 @@ The default total `timeout` is 30 seconds, `connect_timeout` is 10 seconds, and 
 Timeouts must be between 1 and 3600 seconds and `max_redirects` cannot exceed 20.
 Limits apply while streaming, including to decompressed data; exceeding a limit fails
 rather than reporting an incomplete body as successful. Model-visible preview truncation is
-independent: retrieve saved results with `job_output`. Cancellation and timeouts cannot undo
+independent: retrieve saved results with `jobs({job})`. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.
 
 Transport and processing failures remain failed jobs and failed JobViews (not rejected

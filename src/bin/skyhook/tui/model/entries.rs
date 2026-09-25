@@ -478,7 +478,7 @@ mod tests {
                 tool: "exec".into(),
                 role: skyhook::job::JobRole::Tool,
                 name: None,
-                arguments: serde_json::json!({"argv": ["echo"]}),
+                arguments: serde_json::json!({"command":["echo"]}),
                 output_schema: None,
                 accepts_input: false,
                 background: false,

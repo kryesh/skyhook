@@ -462,7 +462,7 @@ mod tests {
         }
 
         pub(super) async fn call_record(&mut self, agent: &AgentId, id: &str) -> MessageSeq {
-            let args = serde_json::json!({"argv": ["echo", "  original\ttext\n"]});
+            let args = serde_json::json!({"command":["echo", "  original\ttext\n"]});
             let call = ToolCall::new(id, "exec", args).unwrap();
             let message = Message::Assistant(vec![AssistantItem::tool_call("tool", 0, call)]);
             self.record(agent, SessionEvent::MessageCommitted { message })
@@ -559,7 +559,7 @@ mod tests {
             tool: "exec".into(),
             role,
             activity: projection::JobActivity::Work,
-            args: serde_json::json!({"argv": ["echo"]}),
+            args: serde_json::json!({"command":["echo"]}),
             parent: None,
             state,
             location: skyhook::execution::ExecutionLocation::root("/workspace".into()),

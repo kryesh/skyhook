@@ -119,6 +119,23 @@ where
                     return Err(ProtocolError::Violation("invalid stream credit").into());
                 }
             }
+            Response::SourceAck { request_id } => {
+                // Acknowledgements may trail a call that has already ended.
+                let invalid = state
+                    .lock()
+                    .await
+                    .pending
+                    .get(&request_id)
+                    .is_some_and(|pending| {
+                        pending
+                            .upload
+                            .as_ref()
+                            .is_none_or(|credits| credits.0.acknowledge().is_err())
+                    });
+                if invalid {
+                    return Err(ProtocolError::Violation("invalid source upload credit").into());
+                }
+            }
             Response::SensitivePrompt {
                 prompt_id,
                 mut prompt,
@@ -235,6 +252,7 @@ mod tests {
             sender,
             context: context.clone(),
             destination: context.execution_location().clone(),
+            upload: None,
         };
         state
             .lock()
@@ -298,7 +316,7 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(3), async {
             let outside = ResourceId::path(
                 &crate::target::TargetRef::Root,
-                std::path::Path::new("/outside"),
+                &crate::tool::policy::PathText::new("/outside").unwrap(),
             );
             let request = Response::Authorization {
                 request_id: RequestId::FIRST,
@@ -311,7 +329,7 @@ mod tests {
             entered.notified().await;
             write_result(&mut requests, RequestId::new(2).unwrap(), output("second")).await;
             let completed = receiver.await.unwrap().unwrap();
-            assert_eq!(completed.0.unwrap().value, "second");
+            assert_eq!(completed.0.unwrap().output.value, "second");
             write_frame(&mut requests, &prompt).await.unwrap();
             assert!(matches!(
                 control(&mut replies).await,

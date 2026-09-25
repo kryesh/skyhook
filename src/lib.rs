@@ -2,16 +2,18 @@
 //! available both as model tool calls and inside a sandboxed JavaScript runtime.
 
 pub mod agent;
-pub mod bounded_io;
 pub mod config;
 pub mod execution;
-mod fs;
+pub mod fs;
 pub mod identity;
 pub mod job;
+mod json_schema;
 pub mod mcp;
 pub mod media;
 mod named_enum;
 mod newtype;
+#[cfg(unix)]
+mod process_group;
 pub mod provider;
 pub mod remote;
 pub mod session;

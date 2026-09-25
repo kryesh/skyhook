@@ -1,6 +1,7 @@
 //! Bounded response streaming, atomic downloads, and response decoding.
 use std::{collections::BTreeMap, path::PathBuf};
 
+use crate::fs::{CommitMode, PermissionPolicy};
 use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -8,12 +9,13 @@ use futures_util::StreamExt;
 use reqwest::{Method, header::HeaderMap};
 use tokio::io::AsyncWriteExt;
 
+use super::super::workspace::atomic_write_context;
 use super::diagnostics::{
     DiagnosticMessage, FetchDiagnostic, FetchError, FetchErrorKind, FetchPhase,
 };
 use super::progress::FetchProgress;
 use super::validation::{HttpRequestUrl, InlineMode, OutputPlan};
-use super::{LocalContext, LocalError, ResponseBody, fetch_text, invalid};
+use super::{LocalContext, LocalError, ResponseBody, fetch_text};
 
 enum BodySink {
     Memory {
@@ -24,13 +26,13 @@ enum BodySink {
     Download(PendingDownload),
 }
 
-/// Owns the entire uncommitted download. Dropping it removes the temporary path.
-/// Declare the writer before the temporary file so ordinary drop closes it first.
+/// Owns the entire uncommitted download. Dropping it removes the staging file.
+/// Declare the writer before the staging file so ordinary drop closes it first.
 struct PendingDownload {
     writer: tokio::fs::File,
-    temp: tempfile::NamedTempFile,
+    staged: crate::fs::StagedFile,
     destination: PathBuf,
-    overwrite: bool,
+    commit: CommitMode,
 }
 
 impl PendingDownload {
@@ -40,21 +42,23 @@ impl PendingDownload {
         progress: &mut FetchProgress,
     ) -> Result<Self, FetchError> {
         progress.download_io(Operation::CreateCapture, &destination);
-        let temp = tempfile::NamedTempFile::new_in(destination.parent().ok_or_else(|| {
-            FetchError::from_tool_error(invalid("save_to has no parent"), FetchPhase::LocalIo)
-        })?)
-        .map_err(local_io)?;
-        let writer = tokio::fs::File::from_std(temp.as_file().try_clone().map_err(local_io)?);
+        let staged = crate::fs::StagedFile::create(&destination, PermissionPolicy::Inherit)
+            .map_err(|error| local_io(error.into()))?;
+        let writer = tokio::fs::File::from_std(staged.as_file().try_clone().map_err(local_io)?);
         Ok(Self {
             writer,
-            temp,
+            staged,
             destination,
-            overwrite,
+            commit: if overwrite {
+                CommitMode::Replace
+            } else {
+                CommitMode::NoClobber
+            },
         })
     }
 
     /// Consuming commit: flush and sync before closing the writer and publishing.
-    /// Cancellation before publication preserves the destination. Persist is
+    /// Cancellation before publication preserves the destination. The commit is
     /// synchronous: cancellation cannot undo a rename that has already completed.
     async fn finish(
         mut self,
@@ -63,10 +67,10 @@ impl PendingDownload {
     ) -> Result<ResponseBody, FetchError> {
         let path = self.destination.to_string_lossy().into_owned();
         // Keep the owner intact across every await: cancellation must drop its
-        // writer field before its temporary-file field, not reverse-order locals.
-        progress.download_io(Operation::FinishCapture, self.temp.path());
+        // writer field before its staging-file field, not reverse-order locals.
+        progress.download_io(Operation::FinishCapture, self.staged.path());
         self.writer.flush().await.map_err(local_io)?;
-        progress.download_io(Operation::SyncFile, self.temp.path());
+        progress.download_io(Operation::SyncFile, self.staged.path());
         self.writer.sync_all().await.map_err(local_io)?;
         if context.is_cancelled() {
             return Err(FetchError::from_tool_error(
@@ -77,18 +81,18 @@ impl PendingDownload {
         // No await follows this split. Close the writer before publication.
         let Self {
             writer,
-            temp,
+            staged,
             destination,
-            overwrite,
+            commit,
         } = self;
         drop(writer);
-        progress.local_io(Operation::Rename, Subject::path(&destination));
-        if overwrite {
-            temp.persist(&destination).map_err(|e| local_io(e.error))?;
-        } else {
-            temp.persist_noclobber(&destination)
-                .map_err(|e| local_io(e.error))?;
-        }
+        staged.commit(commit).map_err(|error| {
+            progress.operation(
+                FetchPhase::LocalIo,
+                atomic_write_context(&destination, error.stage),
+            );
+            local_io(error.source)
+        })?;
         Ok(ResponseBody::File {
             path,
             bytes: progress.received_bytes,
@@ -126,7 +130,7 @@ impl BodySink {
                 bytes.extend_from_slice(chunk);
             }
             Self::Download(download) => {
-                progress.download_io(Operation::WriteCapture, download.temp.path());
+                progress.download_io(Operation::WriteCapture, download.staged.path());
                 download.writer.write_all(chunk).await.map_err(local_io)?;
             }
         }

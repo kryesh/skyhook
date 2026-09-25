@@ -2,7 +2,6 @@
 
 use super::{
     cli::{StatsFormat, StatsRequest},
-    dump::diagnostic_text,
     tui::format::brief,
 };
 use chrono::{DateTime, Utc};
@@ -12,6 +11,7 @@ use skyhook::{
         SessionError, SessionStore,
         stats::{AgentStats, RequestStats, SessionStats, session_stats},
     },
+    tool::diagnostic::escape_controls,
 };
 use std::{
     fmt::Write as _,
@@ -26,7 +26,7 @@ pub(super) async fn run(request: StatsRequest) -> Result<(), Error> {
     let workspace = tokio::fs::canonicalize(&request.workspace)
         .await
         .map_err(|error| format!("workspace {}: {error}", request.workspace.display()))?;
-    let sessions = workspace.join(".skyhook/sessions");
+    let sessions = skyhook::config::workspace_session_root(&workspace);
     let mut stdout = io::stdout().lock();
     let Some(session) = request.session else {
         let listed = list(&sessions).await?;
@@ -81,7 +81,7 @@ async fn list(sessions: &Path) -> Result<Vec<SessionStats>, Error> {
             Ok(stats) => listed.push(stats),
             Err(SessionError::UnsupportedVersion(_)) => {}
             Err(SessionError::Io(io)) if io.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => eprintln!("skyhook stats: {session}: {}", diagnostic_text(error)),
+            Err(error) => eprintln!("skyhook stats: {session}: {}", escape_controls(error)),
         }
     }
     listed.sort_by_key(|stats| std::cmp::Reverse(stats.started));
@@ -119,7 +119,7 @@ fn duration(from: DateTime<Utc>, to: DateTime<Utc>) -> String {
 /// A prompt on one line: whitespace runs collapsed, other controls escaped, at most
 /// `limit` characters.
 fn one_line(text: &str, limit: usize) -> String {
-    diagnostic_text(brief(text, limit))
+    escape_controls(brief(text, limit))
 }
 
 /// Completed over requested model calls.
@@ -250,8 +250,8 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
             .iter()
             .map(|agent| {
                 vec![
-                    diagnostic_text(&agent.path),
-                    diagnostic_text(agent.model.as_deref().unwrap_or("—")),
+                    escape_controls(&agent.path),
+                    escape_controls(agent.model.as_deref().unwrap_or("—")),
                     ratio(&agent.requests),
                     number(tool_calls(agent)),
                     number(agent.usage.input_tokens),
@@ -284,7 +284,7 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
             .iter()
             .map(|(name, model)| {
                 vec![
-                    diagnostic_text(name),
+                    escape_controls(name),
                     ratio(&model.requests),
                     number(model.usage.input_tokens),
                     number(model.usage.cached_input_tokens),
@@ -301,7 +301,7 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
             .iter()
             .map(|(name, tool)| {
                 vec![
-                    diagnostic_text(name),
+                    escape_controls(name),
                     number(tool.calls),
                     number(tool.errors),
                     number(tool.unanswered),
@@ -325,7 +325,7 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
 
 fn describe(agent: &AgentStats) -> String {
     let model = agent.model.as_deref().map_or_else(String::new, |model| {
-        format!(" [{}]", diagnostic_text(model))
+        format!(" [{}]", escape_controls(model))
     });
     format!(
         "{}{} · {} calls · {} tools · in {} · cached {} · out {} · {}",

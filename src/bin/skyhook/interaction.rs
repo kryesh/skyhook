@@ -173,7 +173,7 @@ impl Policy for HostApprovalPolicy {
             let grants = request
                 .permissions
                 .iter()
-                .filter_map(|p| p.proposed_grant.clone())
+                .filter_map(PermissionUse::proposed_grant)
                 .collect();
             match ui
                 .request(|reply| PromptKind::Approval { request, reply })
@@ -251,7 +251,7 @@ pub(crate) mod tests {
         let operation = tokio::spawn({
             let session = session.clone();
             async move {
-                let script = "return await tool.exec({argv: ['true']});";
+                let script = "return await tool.exec({command:['true']});";
                 session.run_script(script).await
             }
         });
@@ -269,7 +269,8 @@ pub(crate) mod tests {
     }
 
     fn workspace(target: &str) -> ResourceId {
-        ResourceId::workspace(&target.parse().unwrap(), std::path::Path::new("item"))
+        let item = skyhook::tool::policy::PathText::new("item").unwrap();
+        ResourceId::workspace(&target.parse().unwrap(), &item)
     }
 
     fn mcp_item(target: &str) -> ResourceId {
@@ -413,8 +414,7 @@ pub(crate) mod tests {
         use skyhook::tool::policy::ApprovalGrant;
         let mut request = approval_request().await;
         let grant = ApprovalGrant::exact(Exec, workspace("root"));
-        request.permissions =
-            vec![PermissionUse::new(Exec, workspace("root")).with_grant(grant.clone())];
+        request.permissions = vec![PermissionUse::exact(Exec, workspace("root"))];
         let deny = |reason: &str| PolicyDecision::Deny {
             reason: reason.into(),
         };

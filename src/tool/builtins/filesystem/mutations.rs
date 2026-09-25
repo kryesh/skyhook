@@ -1,6 +1,6 @@
 //! Atomic writes, exact replacements, and removals.
 use crate::tool::ToolOptions;
-use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject, deserialize_arguments};
+use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
 use crate::tool::invocation::{AdmissionError, LocalCatalogBuilder, LocalError};
 
 use schemars::JsonSchema;
@@ -9,6 +9,7 @@ use std::path::Path;
 use tokio::fs;
 
 use super::super::workspace::{atomic_write, relative_path};
+use crate::fs::{Contents, FileKind};
 use crate::tool::{
     PathKind, RegistryError,
     policy::{Capability, PathAccess},
@@ -19,15 +20,12 @@ const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register::<WriteArgs, WriteOutput, _, _>(
         "write",
-        "Atomically create or replace a UTF-8 workspace file. Set create_parents to create missing parent directories recursively.",
+        "Atomically create or replace a workspace file with UTF-8 `content`, or copy the bytes of a `source` file. Set create_parents to create missing parent directories recursively.",
         ToolOptions::new(vec![Capability::Write])
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
-            .argument_validator(|arguments| {
-                let args: WriteArgs = deserialize_arguments(arguments.clone())?;
-                check_write_size(args.content.len(), &args.path)
-            })
-            .argument_paths(|arguments| {
-                let args: WriteArgs = deserialize_arguments(arguments.clone())?;
+            .source_argument("source")
+            .argument_validator(|args: &WriteArgs| args.data().map(drop))
+            .argument_paths(|args| {
                 Ok(vec![crate::tool::PathArgument::top_level(
                     "path", None, PathAccess::Write,
                     if args.create_parents { PathKind::WritableWithParents } else { PathKind::Writable },
@@ -35,6 +33,12 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
             }),
         |context, args| async move {
             let path = std::path::PathBuf::from(&args.path);
+            let contents = match args.data()? {
+                WriteData::Content(content) => Contents::Bytes(content.as_bytes().to_vec()),
+                WriteData::Source => Contents::File(context.source()?.reader().map_err(|error| {
+                    LocalError::io(error).operation(Operation::Read, Subject::argument(["source"]))
+                })?),
+            };
             if args.create_parents {
                 let parent = path
                     .parent()
@@ -44,14 +48,14 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                         .effects(Effects::PartialChange),
                 ))?;
             }
-            atomic_write(&path, args.content.as_bytes()).await.map_err(|error| {
+            let bytes = atomic_write(&path, contents).await.map_err(|error| {
                 if args.create_parents && error.diagnostic().context.effects != Effects::DestinationReplaced {
                     error.effects(Effects::PartialChange)
                 } else { error }
             })?;
             Ok(WriteOutput {
                 path: relative_path(&context.execution_location().workspace, &path),
-                bytes: args.content.len(),
+                bytes,
             })
         },
     )?;
@@ -61,8 +65,7 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         ToolOptions::new(vec![Capability::Write])
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
             .path_argument("path", PathAccess::Write, PathKind::Existing)
-            .argument_validator(|arguments| {
-                let args: ReplaceArgs = deserialize_arguments(arguments.clone())?;
+            .argument_validator(|args: &ReplaceArgs| {
                 // Reject invalid input before authorization, source reads, or allocation.
                 let input = args.old.len().saturating_add(args.new.len());
                 let invalid = if input > MAX_WRITE_BYTES {
@@ -79,9 +82,13 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
             }),
         |context, args| async move {
             let path = std::path::PathBuf::from(&args.path);
-            let text = fs::read_to_string(&path)
+            let bytes = crate::fs::read_regular(&path, MAX_WRITE_BYTES as u64)
                 .await
                 .map_err(AdmissionError::annotated(unchanged(Operation::Read, &path)))?;
+            let text = String::from_utf8(bytes).map_err(|error| {
+                AdmissionError::failed(error.utf8_error())
+                    .context(unchanged(Operation::Deserialize, &path))
+            })?;
             let replacements = text.matches(&args.old).count();
             if replacements != args.count {
                 return Err(LocalError::failed(format!(
@@ -98,11 +105,12 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 &path,
             )?;
             let output = text.replace(&args.old, &args.new);
-            atomic_write(&path, output.as_bytes()).await?;
+            let bytes = output.len();
+            atomic_write(&path, Contents::Bytes(output.into_bytes())).await?;
             Ok(EditOutput {
                 path: relative_path(&context.execution_location().workspace, &path),
                 replacements,
-                bytes: output.len(),
+                bytes,
             })
         },
     )?;
@@ -120,15 +128,14 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                     Operation::Inspect,
                     &path,
                 )))?;
-            let kind = if metadata.file_type().is_symlink() {
-                RemoveKind::Symlink
-            } else if metadata.is_file() {
-                RemoveKind::File
-            } else if metadata.is_dir() {
-                RemoveKind::Directory
-            } else {
-                return Err(LocalError::failed("unsupported filesystem entry")
-                    .context(unchanged(Operation::Remove, &path)));
+            let kind = match FileKind::from(metadata.file_type()) {
+                FileKind::Symlink => RemoveKind::Symlink,
+                FileKind::File => RemoveKind::File,
+                FileKind::Directory => RemoveKind::Directory,
+                FileKind::Other => {
+                    return Err(LocalError::failed("unsupported filesystem entry")
+                        .context(unchanged(Operation::Remove, &path)));
+                }
             };
             let failed =
                 |error| LocalError::io(error).operation(Operation::Remove, Subject::path(&path));
@@ -194,16 +201,40 @@ struct WriteArgs {
     /// File path.
     path: String,
     /// Complete replacement file contents.
-    content: String,
+    content: Option<String>,
+    /// File whose bytes to copy instead of `content`.
+    source: Option<crate::target::TargetPath>,
     /// Create missing parent directories recursively before writing.
     #[serde(default)]
     create_parents: bool,
 }
 
+enum WriteData<'a> {
+    Content(&'a str),
+    /// The executor loads the source's bytes into the call's context.
+    Source,
+}
+
+impl WriteArgs {
+    fn data(&self) -> Result<WriteData<'_>, AdmissionError> {
+        match (&self.content, &self.source) {
+            (Some(content), None) => {
+                check_write_size(content.len(), &self.path)?;
+                Ok(WriteData::Content(content))
+            }
+            (None, Some(_)) => Ok(WriteData::Source),
+            _ => Err(
+                AdmissionError::invalid_arguments("supply exactly one of content or source")
+                    .context(unchanged(Operation::Validate, &self.path)),
+            ),
+        }
+    }
+}
+
 #[derive(Serialize, JsonSchema)]
 struct WriteOutput {
     path: String,
-    bytes: usize,
+    bytes: u64,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -307,7 +338,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn replace_rejects_oversized_expansion_without_mutating() {
+    async fn replace_rejects_oversized_input_and_expansion_without_mutating() {
         let runtime = TestRuntime::new().await;
         let executor = runtime.executor(builder());
         let path = runtime.root.path().join("expand.txt");
@@ -318,7 +349,20 @@ mod tests {
             json!({"path":"expand.txt", "old":"x", "new":"y".repeat(MAX_WRITE_BYTES / 2 + 1), "count":2}),
         ).await;
         assert!(result.is_err());
-        assert_eq!(fs::read_to_string(path).await.unwrap(), "xx");
+        assert_eq!(fs::read_to_string(&path).await.unwrap(), "xx");
+        // The input is bounded even when the replacement would shrink it.
+        let oversized = "x".repeat(MAX_WRITE_BYTES + 1);
+        fs::write(&path, &oversized).await.unwrap();
+        let error = executor
+            .run_host(
+                &runtime.agent,
+                "replace",
+                json!({"path":"expand.txt", "old":"x", "new":"", "count":MAX_WRITE_BYTES + 1}),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.diagnostic().context.effects, Effects::Unchanged);
+        assert_eq!(fs::read_to_string(path).await.unwrap(), oversized);
     }
 
     #[tokio::test]
@@ -569,7 +613,7 @@ mod tests {
         );
         let resource = ResourceId::path(
             &crate::target::TargetRef::Root,
-            &outside.join("nested/file.txt"),
+            &crate::tool::policy::PathText::new(outside.join("nested/file.txt")).unwrap(),
         );
         let requests = policy.requests.lock().unwrap().clone();
         assert!(

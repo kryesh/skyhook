@@ -14,7 +14,7 @@ pub use config::{SshAuth, SshOptions, TargetAuth, TargetConfig, TargetsConfig, T
 pub use registry::{
     TargetDefinition, TargetEdge, TargetError, TargetRecord, TargetRegistry, TargetSource,
 };
-pub(crate) use router::{ResolvedRoute, RouteIdentity, TargetRouter};
+pub(crate) use router::{ResolvedRoute, RouteIdentity, TargetRouter, select_location};
 
 string_newtype! {
     /// The name of a configured or session-added target: 1 to 128 ASCII letters,
@@ -35,6 +35,35 @@ string_newtype! {
     };
 }
 
+/// A path on an execution target, as tool arguments and results name one. An
+/// omitted target is the caller's own location; a named one resolves with the
+/// same rules as a tool's `target` argument. The `target` property is offered
+/// only with target selection, so schemas add it where that capability applies.
+#[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct TargetPath {
+    /// File path.
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(skip)]
+    pub target: Option<TargetRef>,
+}
+
+impl TargetPath {
+    /// Where schemas define this type.
+    pub(crate) const SCHEMA: &'static str = "/$defs/TargetPath";
+
+    /// The `target` property schemas add where the caller can select targets.
+    /// It names the host holding a path, which need not be where the operation
+    /// runs, so its wording differs from [`TargetRef::schema`].
+    pub(crate) fn target_schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": ["string", "null"],
+            "description": "Target holding the path; omitted means your own."
+        })
+    }
+}
+
 /// An execution target: the session host running Skyhook, or a named target.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
 #[serde(try_from = "String", into = "String")]
@@ -46,6 +75,15 @@ pub enum TargetRef {
 impl TargetRef {
     /// The spelling of the session host wherever targets are named by text.
     const ROOT: &'static str = "root";
+
+    /// The `target` property through which a caller that can select targets
+    /// chooses where an operation runs; omitted, it runs where the caller does.
+    pub(crate) fn schema() -> serde_json::Value {
+        serde_json::json!({
+            "type": ["string", "null"],
+            "description": "Execution target."
+        })
+    }
 
     #[must_use]
     pub fn as_str(&self) -> &str {

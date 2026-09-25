@@ -1,11 +1,11 @@
 //! Shared execution-location identity.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-use crate::target::{TargetDefinition, TargetName, TargetRef};
+use crate::target::{TargetName, TargetRef};
 
 /// Canonical execution target and workspace.
 #[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq, Hash)]
@@ -68,34 +68,7 @@ pub(crate) mod native_path {
     }
 }
 
-/// A location choice whose named target and workspace come from one resolved definition.
-///
-/// Definition loading remains permissive; callers resolve/validate target existence before
-/// choosing `Other`. This is not evidence of continued registry freshness.
-pub(crate) enum LocationSelection<'a> {
-    Inherit,
-    Root,
-    Other(&'a TargetDefinition),
-}
-
 impl ExecutionLocation {
-    pub(crate) fn select(
-        caller: &Self,
-        root_workspace: &Path,
-        selection: LocationSelection<'_>,
-    ) -> Self {
-        match selection {
-            LocationSelection::Inherit => caller.clone(),
-            LocationSelection::Root => Self::root(root_workspace.to_owned()),
-            LocationSelection::Other(target) if caller.target.name() == Some(&target.name) => {
-                caller.clone()
-            }
-            LocationSelection::Other(target) => {
-                Self::named(target.name.clone(), target.workspace.clone())
-            }
-        }
-    }
-
     #[must_use]
     pub fn root(workspace: PathBuf) -> Self {
         Self {
@@ -122,47 +95,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn selection_resolves_inherit_root_and_other_targets() {
-        let root = Path::new("/root");
+    fn workspaces_journal_as_text_or_native_bytes() {
         let build = ExecutionLocation::named("build".parse().unwrap(), "/caller-override".into());
-        let overridden = ExecutionLocation::root("/override".into());
-        let current = TargetDefinition::test("build", "/configured", None);
-        let other = TargetDefinition::test("other", "relative directory/../project", None);
-        for (caller, selection, expected) in [
-            (&build, LocationSelection::Inherit, build.clone()),
-            (&overridden, LocationSelection::Inherit, overridden.clone()),
-            (
-                &build,
-                LocationSelection::Root,
-                ExecutionLocation::root("/root".into()),
-            ),
-            (
-                &overridden,
-                LocationSelection::Root,
-                ExecutionLocation::root("/root".into()),
-            ),
-            // An explicit current target keeps the caller's workspace override.
-            (&build, LocationSelection::Other(&current), build.clone()),
-            (
-                &build,
-                LocationSelection::Other(&other),
-                ExecutionLocation::named(
-                    "other".parse().unwrap(),
-                    "relative directory/../project".into(),
-                ),
-            ),
-        ] {
-            assert_eq!(ExecutionLocation::select(caller, root, selection), expected);
-        }
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStringExt;
             let workspace =
                 PathBuf::from(std::ffi::OsString::from_vec(b"/workspace/\xff".to_vec()));
-            let target = TargetDefinition::test("other", workspace.clone(), None);
-            let selected =
-                ExecutionLocation::select(&overridden, root, LocationSelection::Other(&target));
-            assert_eq!(selected.workspace, workspace);
+            let selected = ExecutionLocation::named("other".parse().unwrap(), workspace);
             let journaled = serde_json::to_value(&selected).unwrap();
             assert_eq!(
                 journaled["workspace"],

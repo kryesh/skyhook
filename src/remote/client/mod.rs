@@ -12,11 +12,13 @@ use crate::{
         ToolContext, ToolOutput,
         authorization::AuthorizationCoordinator,
         diagnostic::{Effects, FailureSite, Operation, PartialContext, Subject},
+        source::Source,
     },
 };
 
 use crate::remote::{
     ProtocolError,
+    flow::{CHUNK_BYTES, Credits},
     manager::RemoteError,
     protocol::{
         PromptId, RemoteToolResult, Request, RequestId, Response, read_frame, spawn_owned_write,
@@ -55,6 +57,17 @@ struct PendingCall {
     context: ToolContext,
     // Host-owned tools retain their ownership context while invoking a remote worker.
     destination: ExecutionLocation,
+    upload: Option<UploadCredits>,
+}
+
+/// Credits for a call's source upload, returned by the worker's `SourceAck`s.
+/// Dropping them with the call releases an upload waiting for credit.
+struct UploadCredits(Credits);
+
+impl Drop for UploadCredits {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 #[derive(Default)]
@@ -104,13 +117,7 @@ impl PooledConnection {
         writer: OwnedMutexGuard<RequestWriter>,
         request: Request,
     ) -> Result<(), RemoteError> {
-        let writer = OwnedMutexGuard::map(writer, |writer| &mut writer.input);
-        if let Err(error) = spawn_owned_write(writer, request).await {
-            let failure = transport_error(error, Operation::Send);
-            fail_connection(&self.state, failure.clone()).await;
-            return Err(failure.or(PartialContext::default().effects(Effects::MayHaveExecuted)));
-        }
-        Ok(())
+        write_request(writer, &self.state, request).await
     }
 
     pub(in crate::remote) async fn from_transport(
@@ -178,9 +185,37 @@ async fn call_tool(
     context: &ToolContext,
     destination: ExecutionLocation,
 ) -> Result<ToolOutput, RemoteError> {
+    let capabilities = context.capabilities().iter().collect();
+    let source = context.source().cloned();
+    let streams_source = source.is_some();
+    let request = move |request_id| Request::Tool {
+        request_id,
+        name,
+        arguments,
+        capabilities,
+        source: streams_source,
+    };
+    let received = call(connection, context, destination, request, source).await?;
+    if received.source.is_some() {
+        return Err(ProtocolError::Violation("source contents for a tool call").into());
+    }
+    Ok(received.output)
+}
+
+/// Submit one request, stream its source, and await its result, cancelling it
+/// with the call.
+async fn call(
+    connection: &PooledConnection,
+    context: &ToolContext,
+    destination: ExecutionLocation,
+    request: impl FnOnce(RequestId) -> Request + Send,
+    source: Option<Source>,
+) -> Result<results::Received, RemoteError> {
     if context.is_cancelled() {
         return Err(RemoteError::Cancelled);
     }
+    let credits = source.as_ref().map(|_| Credits::default());
+    let upload = credits.clone().map(UploadCredits);
     let (request_id, receiver) = connection
         .submit(move |request_id, state| {
             let (sender, receiver) = oneshot::channel();
@@ -190,19 +225,26 @@ async fn call_tool(
                     sender,
                     context: context.clone(),
                     destination,
+                    upload,
                 },
             );
-            (
-                Request::Tool {
-                    request_id,
-                    name,
-                    arguments,
-                    capabilities: context.capabilities().iter().collect(),
-                },
-                receiver,
-            )
+            (request(request_id), receiver)
         })
         .await?;
+    let mut unfinished = CancelOnDrop::new(connection, request_id);
+    if let Some((source, credits)) = source.zip(credits) {
+        let uploaded = tokio::select! {
+            result = send_source(connection, request_id, source, credits) => result,
+            () = context.cancelled() => Err(RemoteError::Cancelled),
+        };
+        // The worker holds the call until its source ends; release it. The
+        // upload's own failure is the one to report.
+        if let Err(failure) = uploaded {
+            unfinished.defuse();
+            let _ = send_cancel(connection, request_id).await;
+            return Err(failure);
+        }
+    }
     let received = async {
         receiver.await.map_err(|_| {
             transport_error(
@@ -214,13 +256,58 @@ async fn call_tool(
     };
     tokio::pin!(received);
     let result = tokio::select! {
-        result = &mut received => result?,
+        result = &mut received => {
+            unfinished.defuse();
+            result?
+        }
         () = context.cancelled() => {
+            unfinished.defuse();
             send_cancel(connection, request_id).await?;
             return Err(RemoteError::Cancelled);
         }
     };
     result.0
+}
+
+/// Send a source's contents in credited chunks; the worker starts the call at
+/// the end. Closed credits mean the call already ended, so its result follows.
+async fn send_source(
+    connection: &PooledConnection,
+    request_id: RequestId,
+    source: Source,
+    credits: Credits,
+) -> Result<(), RemoteError> {
+    use tokio::io::AsyncReadExt as _;
+    let mut reader = tokio::fs::File::from_std(source.reader().map_err(host_source_error)?);
+    let mut buffer = vec![0; CHUNK_BYTES];
+    loop {
+        let read = reader.read(&mut buffer).await.map_err(host_source_error)?;
+        if read > 0 && credits.take().await.is_err() {
+            return Ok(());
+        }
+        let request = if read == 0 {
+            Request::SourceEnd { request_id }
+        } else {
+            Request::SourceData {
+                request_id,
+                data: buffer[..read].to_vec(),
+            }
+        };
+        let writer = connection.writer.clone().lock_owned().await;
+        connection.write(writer, request).await?;
+        if read == 0 {
+            return Ok(());
+        }
+    }
+}
+
+fn host_source_error(error: std::io::Error) -> RemoteError {
+    RemoteError::from(error).or(PartialContext::new(
+        Operation::Read,
+        Subject::Label("source".into()),
+    )
+    .at(FailureSite::Host)
+    .effects(Effects::NotStarted))
 }
 
 async fn send_cancel(
@@ -249,6 +336,61 @@ fn transport_error(error: impl Into<RemoteError>, operation: Operation) -> Remot
         PartialContext::new(operation, Subject::Label("remote transport".into()))
             .at(FailureSite::Host),
     )
+}
+
+async fn write_request(
+    writer: OwnedMutexGuard<RequestWriter>,
+    state: &Mutex<ConnectionState>,
+    request: Request,
+) -> Result<(), RemoteError> {
+    let writer = OwnedMutexGuard::map(writer, |writer| &mut writer.input);
+    if let Err(error) = spawn_owned_write(writer, request).await {
+        let failure = transport_error(error, Operation::Send);
+        fail_connection(state, failure.clone()).await;
+        return Err(failure.or(PartialContext::default().effects(Effects::MayHaveExecuted)));
+    }
+    Ok(())
+}
+
+/// Cancels a submitted call that is dropped before its terminal result, so the
+/// worker always releases it (and any source upload it is holding).
+struct CancelOnDrop {
+    writer: Arc<Mutex<RequestWriter>>,
+    state: Arc<Mutex<ConnectionState>>,
+    request_id: Option<RequestId>,
+}
+
+impl CancelOnDrop {
+    fn new(connection: &PooledConnection, request_id: RequestId) -> Self {
+        Self {
+            writer: connection.writer.clone(),
+            state: connection.state.clone(),
+            request_id: Some(request_id),
+        }
+    }
+
+    /// The call reached its terminal result or sent its own Cancel.
+    fn defuse(&mut self) {
+        self.request_id = None;
+    }
+}
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        let (Some(request_id), Ok(runtime)) =
+            (self.request_id, tokio::runtime::Handle::try_current())
+        else {
+            return;
+        };
+        let (writer, state) = (self.writer.clone(), self.state.clone());
+        runtime.spawn(async move {
+            if state.lock().await.failure.is_some() {
+                return;
+            }
+            let writer = writer.lock_owned().await;
+            let _ = write_request(writer, &state, Request::Cancel { request_id }).await;
+        });
+    }
 }
 
 async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
@@ -282,6 +424,28 @@ impl PooledConnection {
     ) -> Result<ToolOutput, RemoteError> {
         call_tool(self, name, arguments, context, destination).await
     }
+
+    /// Read a source file on this connection's machine into a local spool.
+    pub(in crate::remote) async fn read_source(
+        &self,
+        tool: String,
+        path: String,
+        context: &ToolContext,
+        destination: ExecutionLocation,
+    ) -> Result<Source, RemoteError> {
+        let capabilities = context.capabilities().iter().collect();
+        let request = move |request_id| Request::ReadSource {
+            request_id,
+            tool,
+            path,
+            capabilities,
+        };
+        call(self, context, destination, request, None)
+            .await?
+            .source
+            .ok_or_else(|| ProtocolError::Violation("source read without contents").into())
+    }
+
     pub(in crate::remote) async fn open_ssh(
         self: Arc<Self>,
         route: Vec<TargetDefinition>,
@@ -379,6 +543,40 @@ pub(in crate::remote) mod tests {
         assert!(connection.state.lock().await.pending.is_empty());
         let next = connection.writer.lock().await.next_request_id;
         assert_eq!(next, Some(RequestId::FIRST));
+    }
+
+    /// A call dropped before its terminal result, without cancelling its
+    /// context, still tells the worker to release it.
+    #[tokio::test]
+    async fn dropped_calls_send_cancel() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let context = fixture_context(&runtime);
+        let (connection, mut peer) = wired_connection(4096).await;
+        let call = {
+            let (connection, context) = (connection.clone(), context.clone());
+            tokio::spawn(async move {
+                let destination = context.execution_location().clone();
+                connection
+                    .execute("read".into(), serde_json::json!({}), &context, destination)
+                    .await
+            })
+        };
+        let Some(Request::Tool { request_id, .. }) =
+            read_frame::<_, Request>(&mut peer).await.unwrap()
+        else {
+            panic!("expected the tool request");
+        };
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(!context.is_cancelled());
+        let cancel = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            read_frame::<_, Request>(&mut peer),
+        )
+        .await
+        .expect("dropped call sent no cancel")
+        .unwrap();
+        assert!(matches!(cancel, Some(Request::Cancel { request_id: id }) if id == request_id));
     }
 
     #[tokio::test]
@@ -498,7 +696,7 @@ pub(in crate::remote) mod tests {
             .collect();
         let context = fixture_context_with_capabilities(&runtime, capabilities);
         let (connection, mut peer) = wired_connection(4096).await;
-        let arguments = serde_json::json!({"argv":["true"]});
+        let arguments = serde_json::json!({"command":["true"]});
         let call = call_tool(
             &connection,
             "exec".into(),
@@ -535,6 +733,71 @@ pub(in crate::remote) mod tests {
             };
         let (result, ()) = tokio::join!(call, inspect);
         assert!(matches!(result, Err(RemoteError::Authorization(_))));
+    }
+
+    /// An upload sends one credit window ahead of the worker's acknowledgements,
+    /// and stops once its call has ended, returning that call's result.
+    #[tokio::test]
+    async fn uploads_wait_for_credit_and_stop_with_their_call() {
+        use crate::remote::flow::WINDOW;
+        let runtime = crate::tests::TestRuntime::new().await;
+        let context = fixture_context(&runtime);
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), vec![7; CHUNK_BYTES * (WINDOW + 2)]).unwrap();
+        let source = Source::open(file.path()).await.unwrap();
+        let (connection, mut peer) = wired_connection(4096).await;
+        let request = |request_id| Request::Tool {
+            request_id,
+            name: "write".into(),
+            arguments: serde_json::json!({}),
+            capabilities: Vec::new(),
+            source: true,
+        };
+        let destination = context.execution_location().clone();
+        let upload = call(&connection, &context, destination, request, Some(source));
+        let worker = async {
+            let Some(Request::Tool { request_id, .. }) = read_frame(&mut peer).await.unwrap()
+            else {
+                panic!("expected tool request")
+            };
+            let mut next_chunk = async || {
+                let frame = read_frame::<_, Request>(&mut peer).await.unwrap();
+                assert!(matches!(frame, Some(Request::SourceData { .. })));
+            };
+            for _ in 0..WINDOW {
+                next_chunk().await;
+            }
+            {
+                let state = connection.state.lock().await;
+                let credits = &state.pending[&request_id].upload.as_ref().unwrap().0;
+                credits.acknowledge().unwrap();
+            }
+            next_chunk().await;
+            let pending = connection
+                .state
+                .lock()
+                .await
+                .pending
+                .remove(&request_id)
+                .unwrap();
+            let output = ToolOutput::new(serde_json::json!("ended"));
+            let received = results::Received {
+                output,
+                source: None,
+            };
+            let _ = pending
+                .sender
+                .send(Ok(results::ReceivedResult(Ok(received))));
+        };
+        let (received, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(upload, worker)
+        })
+        .await
+        .unwrap();
+        assert_eq!(received.unwrap().output.value, "ended");
+        // The upload sent nothing more, not even its end.
+        drop(connection);
+        assert!(read_frame::<_, Request>(&mut peer).await.unwrap().is_none());
     }
 
     #[tokio::test]

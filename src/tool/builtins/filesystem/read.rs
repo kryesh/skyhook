@@ -8,9 +8,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-use super::super::workspace::relative_path;
+use super::super::workspace::{relative_path, source_file};
 use crate::{
-    bounded_io::{BoundedReadError, read_bounded},
+    fs::FileKind,
     media::{ImageRef, MAX_IMAGE_BYTES},
     tool::output::{FinishedOutput, TextCaptureField},
     tool::{
@@ -22,7 +22,7 @@ use crate::{
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_product::<ReadArgs, ReadOutput, _, _>(
         "read",
-        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use job_output to page or search the saved snapshot. Missing or OS-inaccessible paths return {kind:\"error\",path,error:{code:\"not_found\"|\"permission_denied\",message}} as a completed result; policy/approval denials remain denials.",
+        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use jobs to page or search the saved snapshot. Missing or OS-inaccessible paths return {kind:\"error\",path,error:{code:\"not_found\"|\"permission_denied\",message}} as a completed result; policy/approval denials remain denials.",
         ToolOptions::new(vec![Capability::Read])
             .read_error_output(read_error_output)
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
@@ -80,31 +80,15 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
             })?)
             .with_captures(vec![capture]));
         }
-        Ok(TextReadOutcome::NotUtf8) => {}
+        Ok(TextReadOutcome::NotText) => {}
         Err(error) => return Err(error),
     }
 
-    let metadata = fs::metadata(&path)
+    let bytes = crate::fs::read_regular(&path, MAX_IMAGE_BYTES)
         .await
-        .map_err(source(Operation::Inspect, &path))?;
-    if metadata.len() > MAX_IMAGE_BYTES {
-        return Err(LocalError::failed(format!(
-            "non-UTF-8 file is {} bytes, exceeding the {MAX_IMAGE_BYTES}-byte image limit",
-            metadata.len()
-        ))
-        .operation(Operation::Read, Subject::path(&path)));
-    }
-    let mut input = fs::File::open(&path)
-        .await
-        .map_err(source(Operation::Read, &path))?;
-    let bytes = read_bounded(&mut input, MAX_IMAGE_BYTES as usize)
-        .await
-        .map_err(|error| match error {
-            BoundedReadError::Io(error) => source(Operation::Read, &path)(error),
-            error => LocalError::failed(error).operation(Operation::Read, Subject::path(&path)),
-        })?;
+        .map_err(source_file(&path))?;
     let image = crate::media::Image::new(bytes).map_err(|_| {
-        LocalError::failed("file is neither UTF-8 nor a supported image")
+        LocalError::failed("file is neither UTF-8 text nor a supported image")
             .operation(Operation::Deserialize, Subject::path(&path))
     })?;
     let reference = context
@@ -129,7 +113,7 @@ fn source(
 
 enum TextReadOutcome {
     Captured(FinishedOutput),
-    NotUtf8,
+    NotText,
 }
 
 async fn read_text(
@@ -148,17 +132,18 @@ async fn read_text(
     // Reading, capture writes and finishing run in one blocking owner; an abandoned
     // capture discards itself.
     let completed = tokio::task::spawn_blocking(move || -> Result<_, LocalError> {
-        let mut input = std::fs::File::open(&path).map_err(source(Operation::Read, &path))?;
-        match copy_utf8(
+        let mut input =
+            crate::fs::open_regular_blocking(&path, u64::MAX).map_err(source_file(&path))?;
+        match copy_text(
             &path,
             &mut input,
             |text| capture.write_text(text),
             &cancellation,
         )? {
-            Utf8Read::Complete => Ok(Some(capture.finish().map_err(|error| {
+            TextRead::Complete => Ok(Some(capture.finish().map_err(|error| {
                 LocalError::io(error).operation(Operation::FinishCapture, Subject::path(&path))
             })?)),
-            Utf8Read::NotUtf8 => Ok(None),
+            TextRead::NotText => Ok(None),
         }
     })
     .await
@@ -170,22 +155,24 @@ async fn read_text(
     if let Some(completed) = completed {
         Ok(TextReadOutcome::Captured(completed))
     } else {
-        Ok(TextReadOutcome::NotUtf8)
+        Ok(TextReadOutcome::NotText)
     }
 }
 
 #[derive(Debug, PartialEq)]
-enum Utf8Read {
+enum TextRead {
     Complete,
-    NotUtf8,
+    NotText,
 }
 
-fn copy_utf8(
+/// Stream UTF-8 text without buffering the file. Like `media::classify`, a NUL
+/// byte means the file is not text.
+fn copy_text(
     path: &std::path::Path,
     input: &mut impl std::io::Read,
     mut output: impl FnMut(&str) -> std::io::Result<()>,
     cancellation: &tokio_util::sync::CancellationToken,
-) -> Result<Utf8Read, LocalError> {
+) -> Result<TextRead, LocalError> {
     let mut buffer = [0; 64 * 1024];
     let mut pending = Vec::new();
     let cancelled = || {
@@ -205,6 +192,9 @@ fn copy_utf8(
         if cancellation.is_cancelled() {
             return Err(cancelled());
         }
+        if buffer[..size].contains(&0) {
+            return Ok(TextRead::NotText);
+        }
         pending.extend_from_slice(&buffer[..size]);
         match std::str::from_utf8(&pending) {
             Ok(text) => {
@@ -217,13 +207,13 @@ fn copy_utf8(
                     .map_err(capture)?;
                 pending.drain(..valid);
             }
-            Err(_) => return Ok(Utf8Read::NotUtf8),
+            Err(_) => return Ok(TextRead::NotText),
         }
         if size == 0 {
             break;
         }
     }
-    Ok(Utf8Read::Complete)
+    Ok(TextRead::Complete)
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -310,17 +300,14 @@ enum DirectoryEntry {
 
 impl DirectoryEntry {
     fn from_metadata(name: String, metadata: &std::fs::Metadata) -> Self {
-        if metadata.file_type().is_symlink() {
-            Self::Symlink { name }
-        } else if metadata.is_dir() {
-            Self::Directory { name }
-        } else if metadata.is_file() {
-            Self::File {
+        match FileKind::from(metadata.file_type()) {
+            FileKind::File => Self::File {
                 name,
                 bytes: metadata.len(),
-            }
-        } else {
-            Self::Other { name }
+            },
+            FileKind::Directory => Self::Directory { name },
+            FileKind::Symlink => Self::Symlink { name },
+            FileKind::Other => Self::Other { name },
         }
     }
 
@@ -461,10 +448,10 @@ mod tests {
         }
     }
 
-    /// Invalid UTF-8 is not an IO error, real invalid data stays IO, and
-    /// cancellation before or during a read is typed.
+    /// Invalid UTF-8 and NUL bytes are not text rather than IO errors, real
+    /// invalid data stays IO, and cancellation before or during a read is typed.
     #[test]
-    fn text_copy_classifies_utf8_io_and_cancellation() {
+    fn text_copy_classifies_text_io_and_cancellation() {
         struct Reader(Option<CancellationToken>);
         impl std::io::Read for Reader {
             fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -481,14 +468,16 @@ mod tests {
         }
         let cancellation = CancellationToken::new();
         let copy = |mut reader: &mut dyn std::io::Read| {
-            copy_utf8(
+            copy_text(
                 std::path::Path::new("input.txt"),
                 &mut reader,
                 |_| Ok(()),
                 &cancellation,
             )
         };
-        assert_eq!(copy(&mut &b"valid\xff"[..]).unwrap(), Utf8Read::NotUtf8);
+        for input in [&b"valid\xff"[..], b"valid\0"] {
+            assert_eq!(copy(&mut &input[..]).unwrap(), TextRead::NotText);
+        }
         assert!(matches!(
             copy(&mut Reader(None)).unwrap_err().diagnostic().cause,
             Cause::Io {

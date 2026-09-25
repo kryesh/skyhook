@@ -392,7 +392,7 @@ impl Projection {
             .filter(|a| {
                 a.id.path().is_empty()
                     || !a.terminal()
-                    || selected.path().starts_with(a.id.path())
+                    || selected.is_within(&a.id)
                     || a.lifecycle.within_grace()
             })
             .cloned()

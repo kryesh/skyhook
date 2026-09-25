@@ -35,9 +35,10 @@ It does not transparently replay the failed tool operation.
 Once connected, request IDs associate output and cancellation with individual operations.
 SSH cancellation remains best-effort: the client does not await a terminal reply. Already captured
 output remains inspectable, but final worker diagnostics or structured results may be unavailable.
-Credit-based flow control bounds queued payload and relayed-stream data. A transport's lifetime
-owner retains its underlying process resources; dropping it tears those resources down. A relayed
-connection also retains its origin connection for the lifetime of the child stream.
+Credit-based flow control bounds queued payload, source-upload, and relayed-stream data. A
+transport's lifetime owner retains its underlying process resources; dropping it tears those
+resources down. A relayed connection also retains its origin connection for the lifetime of the
+child stream.
 
 Accepted-payload ingestion is tracked independently of pool membership and caller lifetime. Pool
 eviction does not abort the reader; dropping the last `PooledConnection` owner cancels routing

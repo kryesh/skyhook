@@ -84,13 +84,19 @@ async fn run(invocation: Invocation) {
     match invocation {
         Invocation::Inspect(request) => {
             if let Err(error) = dump::run(request).await {
-                eprintln!("skyhook dump: {}", dump::diagnostic_text(error));
+                eprintln!(
+                    "skyhook dump: {}",
+                    skyhook::tool::diagnostic::escape_controls(error)
+                );
                 std::process::exit(1);
             }
         }
         Invocation::Stats(request) => {
             if let Err(error) = stats::run(request).await {
-                eprintln!("skyhook stats: {}", dump::diagnostic_text(error));
+                eprintln!(
+                    "skyhook stats: {}",
+                    skyhook::tool::diagnostic::escape_controls(error)
+                );
                 std::process::exit(1);
             }
         }

@@ -5,10 +5,10 @@ use super::{
 };
 use skyhook::{
     agent::{HarnessError, SessionHandle},
-    bounded_io::BoundedReadError,
     config::{Config, ConfigError, ConfiguredModel, RuntimeConfig},
+    fs::RegularFileError,
     identity::SessionId,
-    media::{Attachment, Image, ImageFormat, MAX_IMAGE_BYTES},
+    media::{Attachment, Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, classify},
     remote::EmbeddedShimCatalog,
     session::{SessionError, SessionStore},
     tool::policy::{AllowAll, Capability, CapabilitySet, Policy},
@@ -17,9 +17,6 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-
-/// Largest text file attached to a prompt; larger files are for the agent to read.
-const MAX_TEXT_ATTACHMENT_BYTES: usize = 1_048_576;
 
 /// Read a workspace file as a prompt attachment: an image when its bytes are a
 /// supported image, otherwise UTF-8 text.
@@ -30,33 +27,31 @@ pub(crate) async fn read_attachment(workspace: &Path, path: &Path) -> Result<Att
     if !path.starts_with(workspace) {
         return Err("File reference leaves the workspace".into());
     }
-    let mut file = tokio::fs::File::open(&path)
-        .await
-        .map_err(|error| error.to_string())?;
-    let bytes = skyhook::bounded_io::read_bounded(&mut file, MAX_IMAGE_BYTES as usize)
+    let bytes = skyhook::fs::read_regular(&path, MAX_IMAGE_BYTES)
         .await
         .map_err(|error| match error {
-            BoundedReadError::TooLarge { .. } => {
+            RegularFileError::TooLarge { .. } => {
                 "File is too large to attach; ask the agent to read it instead".to_owned()
             }
-            error => error.to_string(),
+            error => format!("{}: {error}", path.display()),
         })?;
-    if ImageFormat::sniff(&bytes).is_some() {
-        let image = Image::new(bytes).map_err(|error| error.to_string())?;
-        return Ok(Attachment::Image {
+    match classify(bytes) {
+        Classified::Image(image) => Ok(Attachment::Image {
             file: Some(path),
             image,
-        });
+        }),
+        Classified::Text(content) if content.len() as u64 > MAX_TEXT_BYTES => {
+            Err("File is larger than 1 MiB; ask the agent to read it instead".into())
+        }
+        Classified::Text(content) => Ok(Attachment::Text {
+            file: Some(path),
+            content,
+        }),
+        Classified::Binary(_) => Err(format!(
+            "{} is neither a supported image nor UTF-8 text",
+            path.display()
+        )),
     }
-    if bytes.len() > MAX_TEXT_ATTACHMENT_BYTES {
-        return Err("File is larger than 1 MiB; ask the agent to read it instead".into());
-    }
-    let content =
-        String::from_utf8(bytes).map_err(|_| "stream did not contain valid UTF-8".to_owned())?;
-    Ok(Attachment::Text {
-        file: Some(path),
-        content,
-    })
 }
 
 /// Read the images named on the command line.
@@ -222,7 +217,7 @@ pub async fn load_config(
         for diagnostic in &resolved.report.diagnostics {
             eprintln!(
                 "skyhook config: {}",
-                super::dump::diagnostic_text(diagnostic)
+                skyhook::tool::diagnostic::escape_controls(diagnostic)
             );
         }
     }
@@ -256,7 +251,7 @@ impl Launch {
         let workspace = tokio::fs::canonicalize(&request.workspace).await?;
         // CLI history belongs only to the selected workspace, never to an
         // inherited/global session_root or an ancestor workspace's history.
-        let sessions = workspace.join(".skyhook/sessions");
+        let sessions = skyhook::config::workspace_session_root(&workspace);
         let approve_all = request.approve_all || model.config().config().approve_all;
         Ok(Self {
             model,

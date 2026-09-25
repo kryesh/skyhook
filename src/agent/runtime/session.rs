@@ -71,9 +71,10 @@ impl SessionHandle {
         Some(granted.for_agent(depth))
     }
 
-    /// Host skill diagnostics that must not write directly to a terminal.
+    /// Instruction and skill discovery diagnostics that must not write
+    /// directly to a terminal.
     pub fn warnings(&self) -> &[String] {
-        self.runtime.harness.skills.warnings()
+        &self.runtime.harness.discovery_warnings
     }
 
     pub fn directory(&self) -> &Path {
@@ -1475,7 +1476,7 @@ mod tests {
     for (const value of [{{text:"hello 🌏", nested:[1,true]}}, null, false]) {{
       accepted.push((await tool.job({id}).send({{value}})).result);
     }}
-    const pending = await tool.job({id}).output();
+    const pending = await tool.jobs({{job:{id}}});
     return {{accepted, state:pending.state}};
     "#
             ))
@@ -1487,7 +1488,7 @@ mod tests {
         let last = format!("return tool.job({id}).send({{value:\"last\"}});");
         session.run_script(last).await.unwrap();
         jobs.wait(running, None, true).await.unwrap();
-        let output = format!("return tool.job({id}).output();");
+        let output = format!("return tool.jobs({{job:{id}}});");
         let completed = session.run_script(output).await.unwrap();
         assert_eq!(completed.value["value"]["state"], "completed");
         assert_eq!(
@@ -1500,10 +1501,10 @@ mod tests {
 
         let waiting = background("return await receive();").await;
         let id = waiting.get();
-        let cancel = format!("await tool.job({id}).output(); return tool.job({id}).cancel();");
+        let cancel = format!("await tool.jobs({{job:{id}}}); return tool.job({id}).cancel();");
         session.run_script(cancel).await.unwrap();
         jobs.wait(waiting, None, true).await.unwrap();
-        let output = format!("return tool.job({id}).output();");
+        let output = format!("return tool.jobs({{job:{id}}});");
         let cancelled = session.run_script(output).await.unwrap();
         assert_eq!(cancelled.value["value"]["state"], "cancelled");
     }

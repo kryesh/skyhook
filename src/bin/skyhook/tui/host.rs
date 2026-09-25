@@ -457,7 +457,7 @@ mod tests {
         open(&mut host, second).await;
         let background = host.slots[0].app.session().unwrap().clone();
         let script = tokio::spawn(async move {
-            let script = "return await tool.exec({argv: ['true']});";
+            let script = "return await tool.exec({command:['true']});";
             background.run_script(script).await
         });
         let asked = |host: &Host| !host.slots[0].app.prompts.is_empty();

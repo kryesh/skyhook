@@ -1,6 +1,8 @@
+#[cfg(unix)]
+use crate::process_group::ProcessGroup;
 use crate::tool::ToolOptions;
 use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
-use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
+use crate::tool::invocation::{AdmissionError, LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
 use std::process::{ExitStatus, Stdio};
 use std::time::Duration;
@@ -25,45 +27,19 @@ use capture::Capture;
 const PROCESS_CHUNK: usize = 8 * 1024;
 
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
-    let options = || {
+    builder.register_product::<ExecArgs, ProcessOutput, _, _>(
+        "exec",
+        "Run a command. Stdin is closed.",
         ToolOptions::new(vec![Capability::Exec])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .target_authentication()
             .named()
             .background()
             .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing)
-    };
-    builder.register_product::<ExecArgs, ProcessOutput, _, _>(
-        "exec",
-        "Run an exact argument vector without shell parsing. Stdin is closed.",
-        options(),
+            .argument_validator(|args: &ExecArgs| args.command.process().map(drop)),
         move |context, args| async move {
-            let (program, arguments) = args.argv.split_first().ok_or_else(|| {
-                LocalError::invalid_arguments("argv cannot be empty")
-                    .operation(Operation::Validate, Subject::argument(["argv"]))
-                    .effects(Effects::NotStarted)
-            })?;
-            let cwd = working_directory(&args.cwd).await?;
-            let mut command = Command::new(program);
-            command.args(arguments).current_dir(cwd);
-            run_process(context, command, args.timeout)
-                .await
-                .map(ProcessResult::into_output)
-        },
-    )?;
-    builder.register_product::<ShellArgs, ProcessOutput, _, _>(
-        "shell",
-        "Run /bin/sh -lc in the workspace. Stdin is closed.",
-        options(),
-        move |context, args| async move {
-            if args.command.is_empty() {
-                return Err(LocalError::invalid_arguments("command cannot be empty")
-                    .operation(Operation::Validate, Subject::argument(["command"]))
-                    .effects(Effects::NotStarted));
-            }
-            let cwd = working_directory(&args.cwd).await?;
-            let mut command = Command::new("/bin/sh");
-            command.arg("-lc").arg(args.command).current_dir(cwd);
+            let mut command = args.command.process()?;
+            command.current_dir(working_directory(&args.cwd).await?);
             run_process(context, command, args.timeout)
                 .await
                 .map(ProcessResult::into_output)
@@ -159,12 +135,7 @@ async fn run_process(
             .effects(Effects::NotStarted)
     })?;
     #[cfg(unix)]
-    let group = ProcessGroup(
-        i32::try_from(child.id().expect("spawned process has an ID")).map_err(|_| {
-            LocalError::failed("process ID is out of range")
-                .context(started(Operation::Prepare, Subject::Process))
-        })?,
-    );
+    let mut group = ProcessGroup::led_by(&child);
     let pipe_unavailable = |pipe: &str| {
         LocalError::failed("pipe unavailable")
             .context(started(Operation::Prepare, Subject::Label(pipe.to_owned())))
@@ -272,24 +243,6 @@ enum ProcessCompletion {
     Cancelled,
 }
 
-#[cfg(unix)]
-struct ProcessGroup(i32);
-#[cfg(unix)]
-impl ProcessGroup {
-    fn kill(&self) {
-        // SAFETY: kill takes an integer process group ID and does not access memory.
-        unsafe {
-            libc::kill(-self.0, libc::SIGKILL);
-        }
-    }
-}
-#[cfg(unix)]
-impl Drop for ProcessGroup {
-    fn drop(&mut self) {
-        self.kill();
-    }
-}
-
 async fn capture_stream<R>(
     mut stream: R,
     capture: &mut Capture,
@@ -316,8 +269,7 @@ where
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct ExecArgs {
-    /// Program and arguments without shell parsing, for example `["cargo","test"]`.
-    argv: Vec<String>,
+    command: CommandLine,
     /// Working directory.
     #[serde(default = "super::default_dot")]
     cwd: String,
@@ -327,16 +279,41 @@ struct ExecArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
-#[serde(deny_unknown_fields)]
-struct ShellArgs {
-    /// Command interpreted by the execution environment's shell.
-    command: String,
-    /// Working directory.
-    #[serde(default = "super::default_dot")]
-    cwd: String,
-    /// Timeout seconds; omitted/null means no deadline.
-    #[schemars(range(min = 1, max = 3600))]
-    timeout: Option<u64>,
+#[serde(untagged)]
+#[schemars(inline)]
+enum CommandLine {
+    /// Run with /bin/sh -lc.
+    Shell(String),
+    /// Program and arguments without shell parsing, for example `["cargo","test"]`.
+    #[schemars(extend("minItems" = 1))]
+    Argv(Vec<String>),
+}
+
+impl CommandLine {
+    /// The process this command line runs, or why it names none.
+    fn process(&self) -> Result<Command, AdmissionError> {
+        let invalid = match self {
+            // A model sometimes encodes argv as a string; running it through the
+            // shell would execute a bracketed word rather than the intended program.
+            Self::Shell(text) if serde_json::from_str::<Vec<String>>(text).is_ok() => {
+                "`command` is a JSON array encoded as a string; send `command` as an array"
+            }
+            Self::Shell(text) if !text.is_empty() => {
+                let mut command = Command::new("/bin/sh");
+                command.arg("-lc").arg(text);
+                return Ok(command);
+            }
+            Self::Argv(argv) if !argv.is_empty() => {
+                let mut command = Command::new(&argv[0]);
+                command.args(&argv[1..]);
+                return Ok(command);
+            }
+            Self::Shell(_) | Self::Argv(_) => "command cannot be empty",
+        };
+        Err(AdmissionError::invalid_arguments(invalid)
+            .operation(Operation::Validate, Subject::argument(["command"]))
+            .effects(Effects::NotStarted))
+    }
 }
 
 /// Internal output retains completed field bindings until the canonical product handoff.
@@ -394,7 +371,7 @@ mod tests {
         job::{CancellationToken, JobState, output::OutputArgs},
         tests::TestRuntime,
         tool::{
-            diagnostic::{Cause, IoKind},
+            diagnostic::{Cause, Diagnostic, IoKind},
             executor::ToolExecutor,
             policy::CapabilitySet,
         },
@@ -439,11 +416,11 @@ mod tests {
         assert!(!allows_null(&schema["properties"]["stdout"]), "{schema}");
     }
 
-    /// `exec` and `shell` arguments running the same `/bin/sh` command.
+    /// Argv and shell-string `exec` arguments running the same `/bin/sh` command.
     #[cfg(unix)]
-    fn sh_args(tool: &str, command: &str, timeout: Option<u64>) -> Value {
-        let mut args = if tool == "exec" {
-            json!({"argv":["/bin/sh", "-c", command]})
+    fn sh_args(argv: bool, command: &str, timeout: Option<u64>) -> Value {
+        let mut args = if argv {
+            json!({"command":["/bin/sh", "-c", command]})
         } else {
             json!({"command":command})
         };
@@ -458,7 +435,7 @@ mod tests {
         let runtime = TestRuntime::new().await;
         let (agent, jobs) = (&runtime.agent, &runtime.jobs);
         let executor = executor(&runtime, true);
-        let shell = async |command: Value| executor.run_host(agent, "shell", command).await;
+        let shell = async |command: Value| executor.run_host(agent, "exec", command).await;
         // A signal exit has an unknown (null) exit code, while both observed
         // streams and the timeout flag still have concrete defaults.
         let signal = shell(json!({"command":"kill -TERM $$"})).await.unwrap();
@@ -542,12 +519,31 @@ mod tests {
                 Operation::Validate,
                 None,
             ),
+            (json!({"command":""}), Operation::Validate, None),
+            (json!({"command":[]}), Operation::Validate, None),
+            (
+                json!({"command":r#" ["touch", "started"] "#}),
+                Operation::Validate,
+                None,
+            ),
         ] {
+            let jobs = runtime.jobs.list(&runtime.agent).await.len();
             let error = executor
-                .run_host(&runtime.agent, "shell", arguments)
+                .run_host(&runtime.agent, "exec", arguments.clone())
                 .await
                 .unwrap_err();
-            let context = error.diagnostic().context;
+            let Diagnostic { cause, context } = error.diagnostic();
+            // Command-line validation fails at admission, before any job exists.
+            if context.subject == Subject::argument(["command"]) {
+                assert_eq!(runtime.jobs.list(&runtime.agent).await.len(), jobs);
+                let Cause::InvalidArguments(message) = cause else {
+                    panic!("{cause:?}")
+                };
+                let encoded = arguments["command"]
+                    .as_str()
+                    .is_some_and(|text| text.contains('['));
+                assert_eq!(message.contains("as an array"), encoded, "{message}");
+            }
             assert_eq!(context.operation, operation);
             assert_eq!(context.effects, Effects::NotStarted);
             match cwd {
@@ -555,7 +551,10 @@ mod tests {
                     matches!(&context.subject, Subject::WorkingDirectory(path) if path.ends_with(cwd)),
                     "{context:?}"
                 ),
-                None => assert_eq!(context.subject, Subject::argument(["timeout"])),
+                None if arguments.get("timeout").is_some() => {
+                    assert_eq!(context.subject, Subject::argument(["timeout"]));
+                }
+                None => assert_eq!(context.subject, Subject::argument(["command"])),
             }
         }
         // Spawn ENOENT can also mean a missing interpreter, so no path is the subject.
@@ -563,7 +562,7 @@ mod tests {
             .run_host(
                 &runtime.agent,
                 "exec",
-                json!({"argv":["/skyhook-test-missing-executable"]}),
+                json!({"command":["/skyhook-test-missing-executable"]}),
             )
             .await
             .unwrap_err();
@@ -695,7 +694,7 @@ mod tests {
             let command = "(sleep 0.3; printf escaped > escaped) & printf ready; exit 0";
             let arguments = json!({"command":command, "bg":true});
             let running = executor
-                .run_host(&runtime.agent, "shell", arguments)
+                .run_host(&runtime.agent, "exec", arguments)
                 .await
                 .unwrap();
             tokio::time::timeout(Duration::from_secs(2), async {
@@ -731,7 +730,7 @@ mod tests {
             let command = "(sleep 1.5; printf escaped > escaped) & printf ready; exit 0";
             let arguments = json!({"command":command, "timeout":1});
             let error = executor(&runtime, false)
-                .run_host(&runtime.agent, "shell", arguments)
+                .run_host(&runtime.agent, "exec", arguments)
                 .await;
             let error = error.expect_err("descendant-held pipes must time out");
             assert!(error.to_string().contains("timed out"), "{error}");
@@ -794,7 +793,7 @@ mod tests {
             });
         }
         let child = command.spawn().unwrap();
-        let _group = ProcessGroup(i32::try_from(child.id().unwrap()).unwrap());
+        let _group = ProcessGroup::led_by(&child);
         let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output());
         let output = output.await.expect("PTY executor helper hung").unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -854,9 +853,9 @@ mod tests {
                     // fail promptly instead of hanging the test suite.
                     ("if (: <> /dev/tty) 2>/dev/null; then exec 3<> /dev/tty; printf 'Password: ' >&3; read answer <&3; else printf isolated; fi", "isolated")
                 };
-                for tool in ["exec", "shell"] {
-                    let output = executor.run_host(&runtime.agent, tool, sh_args(tool, command, Some(2))).await
-                        .unwrap_or_else(|error| panic!("{tool} interactive={interactive}: {error}"));
+                for argv in [false, true] {
+                    let output = executor.run_host(&runtime.agent, "exec", sh_args(argv, command, Some(2))).await
+                        .unwrap_or_else(|error| panic!("argv={argv} interactive={interactive}: {error}"));
                     assert_eq!(output.output.value["exit_code"], 0);
                     assert_eq!(output.output.value["stdout"], expected);
                 }
@@ -887,10 +886,10 @@ mod tests {
             if interactive {
                 capabilities.insert(Capability::Interactive);
             }
-            for tool in ["exec", "shell"] {
+            for argv in [false, true] {
                 let sink = Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
                 let producer = crate::tool::output::OutputContext::new(sink.clone());
-                let arguments = sh_args(tool, command, None);
+                let arguments = sh_args(argv, command, None);
                 let context = crate::tool::invocation::LocalContext::new(
                     crate::execution::ExecutionLocation::root(root.path().to_owned()),
                     capabilities.clone(),
@@ -901,7 +900,7 @@ mod tests {
                     arguments.clone(),
                 );
                 let output = catalog
-                    .run(tool, arguments, context, root.path())
+                    .run("exec", arguments, context, root.path())
                     .await
                     .unwrap()
                     .value;

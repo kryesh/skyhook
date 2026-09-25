@@ -536,7 +536,7 @@ mod tests {
         app.launch.approve_all = true;
         let session = app.launch.create(None).await.unwrap();
         attach(&mut app, session.clone()).await;
-        let launched = session.run_script(format!("return await tool.shell({});", json!({
+        let launched = session.run_script(format!("return await tool.exec({});", json!({
             "command": "printf 'live stdout\\n'; printf 'live stderr\\n' >&2; while [ ! -e release ]; do sleep 0.01; done; exit 1",
             "timeout": 10,
             "bg": true,
@@ -737,7 +737,7 @@ mod tests {
             let cards = entries.filter(|entry| entry.surface == model::Surface::Tool);
             cards.cloned().collect::<Vec<_>>()
         };
-        let call = ToolCall::new("denied-call", "exec", json!({"argv": ["cargo", "test"]}));
+        let call = ToolCall::new("denied-call", "exec", json!({"command":["cargo", "test"]}));
         let call = AssistantItem::tool_call("call-item", 0, call.unwrap());
         commit(&mut app, Message::Assistant(vec![call])).await;
         draw(&mut app);

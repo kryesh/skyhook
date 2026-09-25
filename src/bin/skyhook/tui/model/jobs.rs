@@ -123,18 +123,15 @@ pub(super) fn job_entry(
     let key = EntryKey::Job(job.id);
     let open = view.is_expanded(&key, all);
     let detail = match job.tool.as_str() {
-        "exec" => job
-            .args
-            .get("argv")
-            .and_then(Value::as_array)
-            .map(|a| {
-                a.iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ")
-            })
-            .unwrap_or_default(),
-        "shell" => job.args["command"].as_str().unwrap_or_default().into(),
+        "exec" => match &job.args["command"] {
+            Value::String(command) => command.clone(),
+            Value::Array(argv) => argv
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(" "),
+            _ => String::new(),
+        },
         "script" => "JavaScript workflow".into(),
         _ => job
             .args
@@ -279,7 +276,7 @@ mod tests {
         for (state, symbol, name, role) in states {
             for target in ["root", "build-host"] {
                 let job = JobInfo {
-                    args: serde_json::json!({"argv": ["echo", "Failed @fake Completed"]}),
+                    args: serde_json::json!({"command":["echo", "Failed @fake Completed"]}),
                     location: ExecutionLocation {
                         target: target.parse().unwrap(),
                         workspace: "/workspace".into(),

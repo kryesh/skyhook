@@ -1,33 +1,20 @@
 //! Read-only CLI inspection, deliberately independent of harness/session startup.
 
 use super::{cli::Inspection, launch};
+use skyhook::tool::diagnostic::escape_controls;
 use std::io::{self, Write};
-
-/// Diagnostics can contain repository-controlled paths and parser messages.
-/// Keep terminal controls visible as escapes rather than executing them.
-pub(super) fn diagnostic_text(value: impl std::fmt::Display) -> String {
-    let mut output = String::new();
-    for character in value.to_string().chars() {
-        if character.is_control() {
-            output.extend(character.escape_default());
-        } else {
-            output.push(character);
-        }
-    }
-    output
-}
 
 pub(super) async fn run(request: Inspection) -> Result<(), Box<dyn std::error::Error>> {
     match request {
         Inspection::Config(request) => {
             let resolved = launch::resolve_config(&request).await?;
             for diagnostic in &resolved.report.diagnostics {
-                eprintln!("skyhook config: {}", diagnostic_text(diagnostic));
+                eprintln!("skyhook config: {}", escape_controls(diagnostic));
             }
             for source in &resolved.report.sources {
                 eprintln!(
                     "skyhook config: loaded {}",
-                    diagnostic_text(source.display())
+                    escape_controls(source.display())
                 );
             }
             resolved.config.clone().into_runtime()?;
@@ -46,7 +33,7 @@ pub(super) async fn run(request: Inspection) -> Result<(), Box<dyn std::error::E
                 .describe()
                 .await;
             for error in &errors {
-                eprintln!("skyhook skills: {}", diagnostic_text(error));
+                eprintln!("skyhook skills: {}", escape_controls(error));
             }
             io::stdout().lock().write_all(text.as_bytes())?;
             if !errors.is_empty() {

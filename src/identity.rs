@@ -152,6 +152,12 @@ impl AgentId {
     pub fn path(&self) -> &[u32] {
         &self.path
     }
+
+    /// Whether this agent is `root` or one of its descendants.
+    #[must_use]
+    pub fn is_within(&self, root: &Self) -> bool {
+        self.session == root.session && self.path.starts_with(&root.path)
+    }
 }
 
 impl fmt::Display for AgentId {
@@ -218,6 +224,22 @@ mod tests {
         );
         assert!("0".parse::<EventId>().is_err());
         assert!("z".repeat(32).parse::<EventId>().is_err());
+    }
+
+    #[test]
+    fn subtrees_include_their_root_and_stay_in_one_session() {
+        let root = AgentId::root(SessionId::from_bytes([1; 16]));
+        let child = root.child(1);
+        let grandchild = child.child(2);
+        assert!(root.is_within(&root));
+        assert!(grandchild.is_within(&root) && grandchild.is_within(&child));
+        assert!(!child.is_within(&grandchild));
+        assert!(!root.child(2).is_within(&child));
+        assert!(
+            !AgentId::root(SessionId::from_bytes([2; 16]))
+                .child(1)
+                .is_within(&root)
+        );
     }
 
     #[test]

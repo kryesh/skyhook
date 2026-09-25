@@ -56,7 +56,7 @@ for display, not the automatic compaction trigger. Configure
 
 Compaction does not execute tools. It can retain selected job results as well as recent
 conversation; full saved results remain accessible through
-[`job_output`](../reference/job-output.md). Older details depend on the summary: original
+[`jobs`](../reference/job-output.md). Older details depend on the summary: original
 messages remain in the session log, but there is no agent-callable history tool. A validated
 summary can still be incomplete or inaccurate.
 

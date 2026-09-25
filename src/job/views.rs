@@ -274,8 +274,8 @@ impl JobEnvelope {
                     tool: Some(self.tool.clone()),
                     name: self.name.clone(),
                     target: capabilities
-                        .contains(Capability::Targets)
-                        .then(|| self.location.target.to_string()),
+                        .visible_target(&self.location.target)
+                        .map(ToString::to_string),
                     workspace: Some(self.location.workspace.to_string_lossy().into_owned()),
                     last_message: None,
                     code: None,
@@ -747,7 +747,7 @@ mod tests {
         );
         let child = jobs.test_lease(script).await;
         let shell = jobs
-            .test_lease(spec(&child_agent, "shell", Some(child.id()), None))
+            .test_lease(spec(&child_agent, "exec", Some(child.id()), None))
             .await;
         assert_eq!(
             jobs.active_launches(&agent).await,

@@ -26,9 +26,9 @@ Run the skill tests with:
 cargo nextest run tool::builtins::skills::tests
 ```
 
-Remote skill-transfer tests verify caller-workspace routing, host-owned reads, and
-write authorization without requiring SSH:
+Copying an asset uses `write` with a source; the source tests cover remote
+workers and planning without requiring SSH:
 
 ```sh
-cargo nextest run tool::builtins::skill_transfer::tests
+cargo nextest run -E 'test(sources_)'
 ```

@@ -75,8 +75,6 @@ pub(super) fn active_job(
     now_millis: i64,
     path: &mut std::collections::HashSet<JobId>,
 ) -> StateJob {
-    use crate::tool::policy::Capability;
-
     let entry = &jobs[&id];
     let is_agent = entry.child().is_some();
     let mut children = Vec::new();
@@ -118,9 +116,7 @@ pub(super) fn active_job(
         },
         name: entry.name.clone().map(String::from),
         state: entry.state().presented(),
-        target: capabilities
-            .contains(Capability::Targets)
-            .then(|| entry.location.target.clone()),
+        target: capabilities.visible_target(&entry.location.target).cloned(),
         workspace: entry.location.workspace.clone(),
         age_seconds: u64::try_from(now_millis.saturating_sub(entry.created_at_millis)).unwrap_or(0)
             / 1_000,
@@ -133,6 +129,7 @@ mod tests {
     use crate::job::*;
     use crate::provider::protocol::AssistantItem;
     use crate::session::{Message, StateJob, StateJobKind};
+    use crate::tool::policy::Capability;
 
     fn progress_of(job: &StateJob) -> Option<AgentProgress> {
         match job.kind {

@@ -1,5 +1,6 @@
 //! Only schema-annotated fields may be shortened in automatic result presentation.
 use super::*;
+use crate::json_schema::{Node, Resolver, accepts, declared_types};
 
 pub(super) const FIELD_BYTES: usize = CONTENT_BYTES;
 pub(super) const FIELD_LINES: usize = 100;
@@ -32,7 +33,7 @@ pub(super) fn project(
     projection.visit(
         &mut document["result"],
         &FieldPointer::result(),
-        &[schema],
+        &[Node::root(schema)],
         schema,
     )?;
     Ok(Projected {
@@ -54,7 +55,7 @@ impl Projection<'_> {
         &mut self,
         value: &mut Value,
         field: &FieldPointer,
-        schemas: &[&Value],
+        schemas: &[Node<'_>],
         root: &Value,
     ) -> Result<(), ToolError> {
         if self.cancellation.is_cancelled() {
@@ -123,7 +124,7 @@ pub(crate) fn annotated_fields(value: &Value, schema: &Value) -> BTreeSet<FieldP
     fn visit(
         value: &Value,
         field: &FieldPointer,
-        schemas: &[&Value],
+        schemas: &[Node<'_>],
         root: &Value,
         fields: &mut BTreeSet<FieldPointer>,
     ) {
@@ -149,42 +150,49 @@ pub(crate) fn annotated_fields(value: &Value, schema: &Value) -> BTreeSet<FieldP
         }
     }
     let mut fields = BTreeSet::new();
-    visit(value, &FieldPointer::root(), &[schema], schema, &mut fields);
+    visit(
+        value,
+        &FieldPointer::root(),
+        &[Node::root(schema)],
+        schema,
+        &mut fields,
+    );
     fields
 }
 
 // Share schema navigation, not value traversal: projection hydrates stored values
 // and stops at shortened parents, while JS discovery must retain descendants.
-struct ApplicableSchemas<'a>(Vec<&'a Value>);
+struct ApplicableSchemas<'a>(Vec<Node<'a>>);
 
 impl<'a> ApplicableSchemas<'a> {
-    fn new(schemas: &[&'a Value], root: &'a Value, value: &Value) -> Self {
+    fn new(schemas: &[Node<'a>], root: &'a Value, value: &Value) -> Self {
+        let resolver = Resolver::new(root);
         let mut applicable = Vec::new();
         for schema in schemas {
-            expand(schema, root, value, &mut applicable, &mut Vec::new());
+            expand(&resolver, *schema, value, &mut applicable, &mut Vec::new());
         }
         Self(applicable)
     }
 
     fn is_annotated(&self) -> bool {
-        self.0.iter().any(|schema| schema[ANNOTATION] == true)
+        self.0.iter().any(|node| node.schema[ANNOTATION] == true)
     }
 
-    fn property(&self, key: &str) -> Vec<&'a Value> {
+    fn property(&self, key: &str) -> Vec<Node<'a>> {
         self.0
             .iter()
-            .filter_map(|schema| schema.get("properties")?.get(key))
+            .filter_map(|node| Some(node.child(node.schema.get("properties")?.get(key)?)))
             .collect()
     }
 
-    fn item(&self, index: usize) -> Vec<&'a Value> {
+    fn item(&self, index: usize) -> Vec<Node<'a>> {
         self.0
             .iter()
-            .filter_map(|schema| {
-                schema
-                    .get("prefixItems")
-                    .and_then(|items| items.get(index))
-                    .or_else(|| schema.get("items"))
+            .filter_map(|node| {
+                let schema = node.schema;
+                let item = (schema.get("prefixItems").and_then(|items| items.get(index)))
+                    .or_else(|| schema.get("items"))?;
+                Some(node.child(item))
             })
             .collect()
     }
@@ -342,44 +350,48 @@ fn object_prefix(bytes: &[u8]) -> Result<(Value, usize, bool), ToolError> {
 // Follow schema references and applicable enum/union branches without making a
 // blanket rule for similarly named fields in other variants.
 fn expand<'a>(
-    schema: &'a Value,
-    root: &'a Value,
+    resolver: &Resolver<'a>,
+    node: Node<'a>,
     value: &Value,
-    out: &mut Vec<&'a Value>,
-    refs: &mut Vec<&'a str>,
+    out: &mut Vec<Node<'a>>,
+    refs: &mut Vec<Node<'a>>,
 ) {
     // A partial result may omit required siblings. Their absence must not disable
     // annotations on fields that were successfully captured.
-    out.push(schema);
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
-        && !refs.contains(&reference)
-        && let Some(target) = reference.strip_prefix('#').and_then(|p| root.pointer(p))
+    out.push(node);
+    if let Some(target) = resolver.target(node)
+        && !refs.iter().any(|active| active.is(target))
     {
-        refs.push(reference);
-        expand(target, root, value, out, refs);
+        refs.push(target);
+        expand(resolver, target, value, out, refs);
         refs.pop();
     }
     for key in ["anyOf", "oneOf", "allOf"] {
-        if let Some(branches) = schema.get(key).and_then(Value::as_array) {
-            for branch in branches {
-                if key == "allOf" || matches(branch, root, value, &mut Vec::new()) {
-                    expand(branch, root, value, out, refs);
+        if let Some(branches) = node.schema.get(key).and_then(Value::as_array) {
+            for branch in branches.iter().map(|branch| node.child(branch)) {
+                if key == "allOf" || matches(resolver, branch, value, &mut Vec::new()) {
+                    expand(resolver, branch, value, out, refs);
                 }
             }
         }
     }
 }
 
-fn matches<'a>(schema: &'a Value, root: &'a Value, value: &Value, refs: &mut Vec<&'a str>) -> bool {
+fn matches<'a>(
+    resolver: &Resolver<'a>,
+    node: Node<'a>,
+    value: &Value,
+    refs: &mut Vec<Node<'a>>,
+) -> bool {
+    let schema = node.schema;
     if schema == &Value::Bool(false) {
         return false;
     }
-    if let Some(reference) = schema.get("$ref").and_then(Value::as_str)
-        && !refs.contains(&reference)
-        && let Some(target) = reference.strip_prefix('#').and_then(|p| root.pointer(p))
+    if let Some(target) = resolver.target(node)
+        && !refs.iter().any(|active| active.is(target))
     {
-        refs.push(reference);
-        let applies = matches(target, root, value, refs);
+        refs.push(target);
+        let applies = matches(resolver, target, value, refs);
         refs.pop();
         if !applies {
             return false;
@@ -395,19 +407,8 @@ fn matches<'a>(schema: &'a Value, root: &'a Value, value: &Value, refs: &mut Vec
     {
         return false;
     }
-    if let Some(kind) = schema.get("type").and_then(Value::as_str) {
-        let valid = match kind {
-            "object" => value.is_object(),
-            "array" => value.is_array(),
-            "string" => value.is_string(),
-            "null" => value.is_null(),
-            "boolean" => value.is_boolean(),
-            "number" | "integer" => value.is_number(),
-            _ => true,
-        };
-        if !valid {
-            return false;
-        }
+    if declared_types(schema).is_some_and(|types| !accepts(types, value)) {
+        return false;
     }
     if let Some(required) = schema.get("required").and_then(Value::as_array)
         && required
@@ -420,7 +421,7 @@ fn matches<'a>(schema: &'a Value, root: &'a Value, value: &Value, refs: &mut Vec
     if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
         for (key, property) in properties {
             if let Some(child) = value.get(key)
-                && !matches(property, root, child, refs)
+                && !matches(resolver, node.child(property), child, refs)
             {
                 return false;
             }

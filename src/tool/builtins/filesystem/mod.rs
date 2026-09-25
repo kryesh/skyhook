@@ -19,7 +19,7 @@ mod tests {
         tests::RecordingPolicy,
         tool::{
             executor::ToolExecutor,
-            policy::{Capability, ResourceId},
+            policy::{Capability, PathText, ResourceId},
         },
     };
     use serde_json::json;
@@ -58,7 +58,10 @@ mod tests {
         assert_eq!(permission.capability, Capability::Read);
         assert_eq!(
             permission.resource,
-            ResourceId::path(&crate::target::TargetRef::Root, &outside)
+            ResourceId::path(
+                &crate::target::TargetRef::Root,
+                &PathText::new(&outside).unwrap()
+            )
         );
 
         let destination = root.join("new-outside.txt");
@@ -78,7 +81,7 @@ mod tests {
         assert_eq!(read.output.value["path"], "input.txt");
         let expected = ResourceId::path(
             &crate::target::TargetRef::Root,
-            &child_workspace.join("input.txt"),
+            &PathText::new(child_workspace.join("input.txt")).unwrap(),
         );
         let requests = policy.requests.lock().unwrap();
         let permissions = &requests.last().unwrap().permissions;

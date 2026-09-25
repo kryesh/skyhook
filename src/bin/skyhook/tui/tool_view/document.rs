@@ -537,7 +537,7 @@ fn file_language(args: &Value) -> String {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ArgumentPolicy {
     Prose,
-    /// `block` renders a string value as a labelled code block; argv/commands
+    /// `block` renders a string value as a labelled code block; argument-vector
     /// strings stay inline like other scalars.
     Literal {
         language: Option<String>,
@@ -548,12 +548,12 @@ enum ArgumentPolicy {
 fn argument_policy(tool: &str, field: &str, args: &Value) -> Option<ArgumentPolicy> {
     let language = match (tool, field) {
         ("script", "source") => Some("js".into()),
-        ("shell", "command") => Some("sh".into()),
+        ("exec", "command") if args["command"].is_string() => Some("sh".into()),
         ("write", "content") | ("replace", "old" | "new") => {
             let language = file_language(args);
             (!language.is_empty()).then_some(language)
         }
-        (_, "argv" | "commands") => {
+        ("exec", "command") | (_, "commands") => {
             return Some(ArgumentPolicy::Literal {
                 language: None,
                 block: false,
@@ -667,7 +667,7 @@ mod tests {
             json!({
                 "prompt": "Keep **literal** Markdown.\n\n  Next paragraph  ",
                 "nested": {"text": "Nested prose", "items": ["array prose"]},
-                "argv": ["printf", "  %s\t%s\n"],
+                "command": ["printf", "  %s\t%s\n"],
                 "commands": [{"value": "  raw command  "}],
                 "raw": {"source": "  let value = 42;\n"},
                 "content": "  file contents  \n\n"
@@ -692,7 +692,6 @@ mod tests {
                 "content": "literal unknown syntax\n",
                 "prompt": "prose remains prose",
                 "commands": [{"nested": ["literal descendant", 42, true]}],
-                "argv": {"nested": {"value": "literal argv descendant"}},
             }),
         );
         assert!(document.sections.iter().any(|section| matches!(section,
@@ -703,7 +702,6 @@ mod tests {
             ("literal unknown syntax", Wrap::Hard),
             ("prose remains prose", Wrap::Words),
             ("literal descendant", Wrap::Hard),
-            ("literal argv descendant", Wrap::Hard),
             ("42", Wrap::Hard),
             ("true", Wrap::Hard),
         ] {

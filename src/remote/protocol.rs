@@ -77,6 +77,25 @@ pub(crate) enum Request {
         name: String,
         arguments: Value,
         capabilities: Vec<Capability>,
+        /// The call has a source argument, whose contents follow as
+        /// `SourceData` frames ending with `SourceEnd` before the call starts.
+        source: bool,
+    },
+    /// At most one flow-control window of chunks is unacknowledged by `SourceAck`.
+    SourceData {
+        request_id: RequestId,
+        data: Vec<u8>,
+    },
+    SourceEnd {
+        request_id: RequestId,
+    },
+    /// Read a source file's bytes on this machine for a call running elsewhere.
+    ReadSource {
+        request_id: RequestId,
+        /// The consuming tool, which the read is authorized and reported as.
+        tool: String,
+        path: String,
+        capabilities: Vec<Capability>,
     },
     // Best effort only: the protocol has no cancel acknowledgment. The host keeps the
     // request registered for late payloads until its terminal Tool reply
@@ -98,7 +117,7 @@ pub(crate) enum AuthorizationDecision {
     Denied(String),
     InvalidGrant(String),
     Cancelled,
-    Unavailable,
+    Unavailable(String),
     /// The host policy stopped before deciding.
     Failed,
 }
@@ -110,7 +129,7 @@ impl From<Result<(), AuthorizationError>> for AuthorizationDecision {
             Err(AuthorizationError::Denied(reason)) => Self::Denied(reason),
             Err(AuthorizationError::InvalidGrant(reason)) => Self::InvalidGrant(reason),
             Err(AuthorizationError::Cancelled) => Self::Cancelled,
-            Err(AuthorizationError::Unavailable) => Self::Unavailable,
+            Err(AuthorizationError::Unavailable(tool)) => Self::Unavailable(tool),
             Err(AuthorizationError::PolicyFailed) => Self::Failed,
         }
     }
@@ -123,7 +142,7 @@ impl AuthorizationDecision {
             Self::Denied(reason) => Err(AuthorizationError::Denied(reason)),
             Self::InvalidGrant(reason) => Err(AuthorizationError::InvalidGrant(reason)),
             Self::Cancelled => Err(AuthorizationError::Cancelled),
-            Self::Unavailable => Err(AuthorizationError::Unavailable),
+            Self::Unavailable(tool) => Err(AuthorizationError::Unavailable(tool)),
             Self::Failed => Err(AuthorizationError::PolicyFailed),
         }
     }
@@ -150,6 +169,10 @@ pub(crate) enum Response {
     StreamAck {
         channel: RequestId,
     },
+    /// The worker spooled one `SourceData` chunk of this request's upload.
+    SourceAck {
+        request_id: RequestId,
+    },
     SensitivePrompt {
         prompt_id: PromptId,
         prompt: super::SensitivePrompt,
@@ -174,12 +197,15 @@ pub(crate) struct ImageId(pub NonZeroU64);
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 pub(crate) enum PayloadId {
     Image(ImageId),
+    /// The contents of a `ReadSource` request's file.
+    Source,
     Result,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
 pub(crate) enum PayloadOpen {
     Image { id: ImageId, file: Option<String> },
+    Source,
     Result,
 }
 
@@ -308,8 +334,8 @@ mod tests {
                 Cause::Message("unproposed".into()),
             ),
             (
-                AuthorizationError::Unavailable,
-                Cause::Denied("required capability is unavailable".into()),
+                AuthorizationError::Unavailable("tool".into()),
+                Cause::Message("tool `tool` is unavailable in this context".into()),
             ),
             (
                 AuthorizationError::PolicyFailed,

@@ -41,7 +41,7 @@ pub(crate) async fn open(
         .kill_on_drop(true);
     command.process_group(0);
     let mut child = command.spawn().map_err(RemoteError::start)?;
-    let process_group = child.id().and_then(|id| i32::try_from(id).ok());
+    let mut group = crate::process_group::ProcessGroup::led_by(&child);
     let input = child.stdin.take().expect("stdin was requested as a pipe");
     let output = child.stdout.take().expect("stdout was requested as a pipe");
     let mut stderr = child.stderr.take().expect("stderr was requested as a pipe");
@@ -62,14 +62,17 @@ pub(crate) async fn open(
             diagnostics
         };
         let process = async {
+            // Only cancellation stops the group; an SSH that exits by itself
+            // leaves its group alone.
             tokio::select! {
-                status = child.wait() => status,
+                status = child.wait() => {
+                    group.release();
+                    status
+                }
                 () = cancelled.cancelled() => {
-                    if let Some(group) = process_group {
-                        // SAFETY: this SSH process was launched into its own process group.
-                        unsafe { libc::kill(-group, libc::SIGKILL); }
-                    }
-                    let _ = child.kill().await; child.wait().await
+                    group.kill();
+                    let _ = child.kill().await;
+                    child.wait().await
                 }
             }
         };

@@ -1375,7 +1375,7 @@ mod tests {
         one!(SessionEvent::TargetsUpserted {
             targets: vec![TargetDefinition::test("build", "/srv", None)],
         });
-        let path = std::path::Path::new("/srv/a b/../c");
+        let path = &crate::tool::policy::PathText::new("/srv/a b/../c").unwrap();
         for (capability, resource) in [
             (Capability::Mcp, ResourceId::mcp("server", "tool")),
             (Capability::Read, ResourceId::session("scratch")),

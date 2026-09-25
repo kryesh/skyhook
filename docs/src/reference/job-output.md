@@ -47,7 +47,7 @@ while a retrieved execution error retains the original operation's context.
 
 Structured job diagnostics and explicitly registered diagnostic result fields are rendered for the
 viewing agent, exposing target aliases only when that viewer's capabilities permit them. This is
-not a general redaction guarantee for saved output. A `job_output` call made with broader
+not a general redaction guarantee for saved output. A `jobs` output read made with broader
 capabilities saves its already-rendered view as ordinary JSON. Later reads of that saved snapshot
 with narrower capabilities retain the earlier JSON unchanged, as do reads of script results that
 copy it. Arbitrary returned JSON is not inspected for diagnostics or target aliases, and
@@ -86,7 +86,7 @@ notice. These rules also apply after session resume and to completed remote jobs
 
 The enclosing script's `.result` is `{value, console, failure}`; silent scripts retain
 `console: ""`. Ordinary tools have no console field. Existing JobViews such as
-`tool.job(id).output()` are not wrapped again.
+`tool.jobs({job})` reads are not wrapped again.
 
 Presentation never changes the full saved return value. Default script output retrieval returns
 the composed script payload; explicit field selections read saved script data. Logging and
@@ -94,16 +94,16 @@ returning the same data explicitly produces both outputs.
 
 ## Paging and searching
 
-Explicit `job_output` selections return a view whose `presentation.preview` defaults to
+Explicit `jobs({job})` selections return a view whose `presentation.preview` defaults to
 100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is always returned in full.
 
 ```js
 // Read a selected part of a saved result.
-job_output({job:42, field:"/result/stdout", start:300, limit:80})
+jobs({job:42, field:"/result/stdout", start:300, limit:80})
 // Search stored text, with surrounding context.
-job_output({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
+jobs({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
 // Continue at the returned source line and UTF-8 byte offset.
-job_output({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
+jobs({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
 ```
 
 `field` is a JSON Pointer: `/result/content` selects a file snapshot, `/result/stdout` and

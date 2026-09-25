@@ -122,8 +122,9 @@ Target-aware tools, including `agent`, use these rules:
   calling agent's current named target retains that agent's workspace override.
 
 Workspace-inheriting tools such as `write`, `replace`, and `remove` use the calling agent's
-target and workspace without accepting a target selector. Host/session tools such as `jobs`,
-`job_output`, `todo`, `wait`, and `targets` still run on the session host. `agent` selects a
+target and workspace without accepting a target selector; a `write` source names its own target,
+so a file can be copied between machines. Host/session tools such as `jobs`,
+`todo`, `wait`, and `targets` still run on the session host. `agent` selects a
 child's future execution location; launching the child and running its provider remain host
 operations. An explicit `agent.workspace` takes precedence over the selected base; relative
 overrides resolve against that base.

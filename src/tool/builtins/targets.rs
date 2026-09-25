@@ -8,7 +8,7 @@ use crate::{
     },
     tool::{
         RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
-        diagnostic::{Effects, deserialize_arguments},
+        diagnostic::Effects,
         policy::{Capability, PermissionUse, ResourceId},
     },
 };
@@ -176,13 +176,7 @@ ssh.options can run commands, so it also requires exec."#,
                     "description": "Authenticate with, and forward, the agent the origin inherited in SSH_AUTH_SOCK instead of Skyhook's private agent; keys are never added to it. Adding the target and later connecting to it are approved separately."
                 }),
             )
-            .argument_permissions(|_, arguments| {
-                let args: TargetAddArgs =
-                    deserialize_arguments(arguments.clone()).map_err(|error| {
-                        error.effects(Effects::Unchanged)
-                    })?;
-                Ok(add_permissions(&args.config.ssh))
-            }),
+            .argument_permissions(|_, args: &TargetAddArgs| Ok(add_permissions(&args.config.ssh))),
         move |context, args| {
             let router = router.clone();
             let store = store.clone();

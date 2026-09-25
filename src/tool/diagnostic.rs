@@ -11,11 +11,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    execution::ExecutionLocation,
-    identity::JobId,
-    named_enum::named_enum,
-    target::TargetRef,
-    tool::policy::{Capability, CapabilitySet},
+    execution::ExecutionLocation, identity::JobId, named_enum::named_enum, target::TargetRef,
+    tool::policy::CapabilitySet,
 };
 
 named_enum! {
@@ -514,10 +511,11 @@ impl Diagnostic {
                 }
             }
             FailureSite::Execution(location) => {
-                if capabilities.contains(Capability::Targets) {
-                    text.push_str(&format!(" on target {}", quoted(location.target.as_str())));
-                } else {
-                    text.push_str(" in execution workspace");
+                match capabilities.visible_target(&location.target) {
+                    Some(target) => {
+                        text.push_str(&format!(" on target {}", quoted(target.as_str())))
+                    }
+                    None => text.push_str(" in execution workspace"),
                 }
                 // The workspace is relevant even for an absolute requested path: cwd
                 // can fail before that requested operation starts.
@@ -589,6 +587,20 @@ pub(crate) fn opaque_io(error: impl std::borrow::Borrow<io::Error>) -> io::Error
     }
 }
 
+/// Show control characters as escapes, so untrusted names and messages can
+/// neither drive a terminal nor fake line structure.
+pub fn escape_controls(value: impl std::fmt::Display) -> String {
+    let mut output = String::new();
+    for character in value.to_string().chars() {
+        if character.is_control() {
+            output.extend(character.escape_default());
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
 /// Bound externally opaque text and remove terminal controls and URL credentials.
 /// This is presentation sanitization, never failure classification.
 pub(crate) fn safe_text(value: &str) -> String {
@@ -657,9 +669,9 @@ fn quoted(value: &str) -> String {
 /// Deserialize once at the argument boundary. Only rejected inputs need schema
 /// diagnostics; serde's errors may echo credentials or user-provided content.
 pub(crate) fn deserialize_arguments<T: serde::de::DeserializeOwned + JsonSchema>(
-    value: serde_json::Value,
+    value: &serde_json::Value,
 ) -> Result<T, super::AdmissionError> {
-    serde_path_to_error::deserialize(&value).map_err(|error| {
+    serde_path_to_error::deserialize(value).map_err(|error| {
         let schema =
             serde_json::to_value(schemars::schema_for!(T)).expect("generated schema serializes");
         let (path, expectation) = jsonschema::options()
@@ -668,9 +680,9 @@ pub(crate) fn deserialize_arguments<T: serde::de::DeserializeOwned + JsonSchema>
             .ok()
             .and_then(|validator| {
                 validator
-                    .validate(&value)
+                    .validate(value)
                     .err()
-                    .map(|error| schema_argument_failure(&schema, &value, &error))
+                    .map(|error| schema_argument_failure(&schema, value, &error))
             })
             .unwrap_or_else(|| {
                 // Custom deserializers may reject values the schema accepts.
@@ -877,24 +889,28 @@ fn argument_location<'schema, 'path>(
     schema: &'schema serde_json::Value,
     path: impl IntoIterator<Item = ArgumentPathSegment<'path>>,
 ) -> (String, Option<&'schema serde_json::Value>) {
-    let mut node = Some(schema);
+    let resolver = crate::json_schema::Resolver::new(schema);
+    let mut node = Some(resolver.root());
     let mut rendered = String::new();
+    // Follow references without selecting alternative branches.
     for segment in path {
-        node = node.and_then(|node| resolve_schema(schema, node));
+        node = node.and_then(|node| resolver.resolve(node));
         rendered.push('/');
         node = match segment {
             ArgumentPathSegment::Property(key) => {
-                let property = node.and_then(|node| node.get("properties")?.get(key));
+                let property = node.and_then(|node| node.schema.get("properties")?.get(key));
                 if property.is_some() {
                     rendered.push_str(&pointer_segment(key));
                 } else {
                     rendered.push('*');
                 }
-                property.or_else(|| node?.get("additionalProperties"))
+                node.and_then(|node| {
+                    Some(node.child(property.or_else(|| node.schema.get("additionalProperties"))?))
+                })
             }
             ArgumentPathSegment::Index(index) => {
                 rendered.push_str(&index.to_string());
-                node.and_then(|node| node.get("items"))
+                node.and_then(|node| Some(node.child(node.schema.get("items")?)))
             }
             ArgumentPathSegment::Unknown => {
                 rendered.push('*');
@@ -902,21 +918,8 @@ fn argument_location<'schema, 'path>(
             }
         };
     }
-    (rendered, node.and_then(|node| resolve_schema(schema, node)))
-}
-
-fn resolve_schema<'a>(
-    root: &'a serde_json::Value,
-    mut node: &'a serde_json::Value,
-) -> Option<&'a serde_json::Value> {
-    // Bound cycles and pathological chains without selecting alternative branches.
-    for _ in 0..32 {
-        let Some(reference) = node.get("$ref") else {
-            return Some(node);
-        };
-        node = root.pointer(reference.as_str()?.strip_prefix('#')?)?;
-    }
-    None
+    let leaf = node.and_then(|node| resolver.resolve(node));
+    (rendered, leaf.map(|node| node.schema))
 }
 
 /// Read expectations from the same trusted leaf used for path privacy, never
@@ -1031,7 +1034,7 @@ mod tests {
                 vec!["expected one of", "fast", "safe"],
             ),
         ] {
-            let error = deserialize_arguments::<Input>(value).unwrap_err();
+            let error = deserialize_arguments::<Input>(&value).unwrap_err();
             let diagnostic = error.diagnostic();
             assert_eq!(diagnostic.context.subject, Subject::Argument(path.into()));
             let text = diagnostic.render(&CapabilitySet::default());

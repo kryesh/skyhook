@@ -762,7 +762,7 @@ mod tests {
     fn shell_response() -> Vec<ResponseEvent> {
         let command = "printf 'executed\\n' >> executions; printf retained-result";
         let arguments = json!({ "command": command });
-        response(vec![tool_call(0, "append-once", "shell", arguments)])
+        response(vec![tool_call(0, "append-once", "exec", arguments)])
     }
 
     async fn session_with_max_output(
@@ -861,7 +861,7 @@ mod tests {
             let shell = response(vec![tool_call(
                 0,
                 "first",
-                "shell",
+                "exec",
                 json!({"command": "true"}),
             )]);
             let provider = scripted_provider(&requests, [shell, answer("done")]);
@@ -893,7 +893,7 @@ mod tests {
     #[tokio::test]
     async fn only_compaction_summaries_end_their_history() {
         use crate::provider::protocol::HistoryLifetime::*;
-        let shell = |id| response(vec![tool_call(0, id, "shell", json!({"command": "true"}))]);
+        let shell = |id| response(vec![tool_call(0, id, "exec", json!({"command": "true"}))]);
         let (_root, _requests, session) = scripted_session([
             shell("first"),
             with_usage(shell("second"), &[threshold_usage()]),

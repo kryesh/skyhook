@@ -125,7 +125,7 @@ mod tests {
     use crate::tests::TestRuntime;
     use crate::tool::{
         ToolError, ToolOptions, ToolRegistryBuilder,
-        policy::{AuthorizationRequest, Policy, PolicyFuture},
+        policy::{AuthorizationRequest, Capability, Policy, PolicyFuture},
     };
     use std::sync::atomic::AtomicBool;
 
@@ -298,7 +298,7 @@ mod tests {
             .test_lease(child(parent.id(), agent.child(1), "agent"))
             .await;
         let grandchild = jobs
-            .test_lease(child(child_lease.id(), agent.child(1), "shell"))
+            .test_lease(child(child_lease.id(), agent.child(1), "exec"))
             .await;
         jobs.test_finish(parent.id(), serde_json::Value::Null).await;
         jobs.cancel(parent.id()).await.unwrap();

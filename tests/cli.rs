@@ -254,7 +254,7 @@ mod dotenv {
     fn observed(f: &Fixture, expansion: &str, inherited: Option<&OsString>) -> Vec<u8> {
         let command = format!("printf '%s' \"{expansion}\" > env.out");
         f.write("invocation/run.js", &format!(
-            "const result = (await tool.exec({{argv: ['sh', '-c', {}]}})).unwrap(); if (result.exit_code !== 0) throw new Error('command failed'); return result;",
+            "const result = (await tool.exec({{command:['sh', '-c', {}]}})).unwrap(); if (result.exit_code !== 0) throw new Error('command failed'); return result;",
             serde_json::to_string(&command).unwrap()
         ));
         let mut command = f.batch();
@@ -620,7 +620,7 @@ mod headless {
         "return (await tool.read({path:'config/skyhook/config.yaml'})).unwrap();";
 
     /// Leaves a background job running, having recorded its PID in `started`.
-    const BACKGROUND: &str = "await tool.exec({argv:['sh','-c','echo $$ > started; sleep 60'],bg:true}); (await tool.exec({argv:['sh','-c','until [ -s started ]; do sleep 0.01; done']})).unwrap();";
+    const BACKGROUND: &str = "await tool.exec({command:['sh','-c','echo $$ > started; sleep 60'],bg:true}); (await tool.exec({command:['sh','-c','until [ -s started ]; do sleep 0.01; done']})).unwrap();";
 
     /// Root completion is not enough: the run must also have ended `BACKGROUND`.
     fn assert_drained(f: &Fixture, log: &str) {
@@ -743,7 +743,7 @@ mod headless {
         );
         f.config("http://127.0.0.1:1/v1", "");
         let unapproved =
-            "return (await tool.exec({argv:['sh','-c','echo not-approved']})).unwrap();";
+            "return (await tool.exec({command:['sh','-c','echo not-approved']})).unwrap();";
         for (source, args) in [
             (READ_CONFIG, &["--capabilities="][..]),
             (unapproved, &["--capabilities", "exec"]),
@@ -752,7 +752,7 @@ mod headless {
             assert!(!out.status.success());
             f.journal(&out);
         }
-        let approved = f.script("return (await tool.exec({argv:['sh','-c','echo approved-output; echo approved-stderr >&2']})).unwrap();", &["--capabilities", "exec", "--approve-all"]);
+        let approved = f.script("return (await tool.exec({command:['sh','-c','echo approved-output; echo approved-stderr >&2']})).unwrap();", &["--capabilities", "exec", "--approve-all"]);
         assert!(approved.status.success());
         f.journal(&approved);
         let artifacts = f.artifacts(&approved);
@@ -860,7 +860,7 @@ mod headless {
             "$SSH_ASKPASS" 'Password:' > helper-stdout 2> helper-stderr
             printf '%s' "$?" > helper-status
         "#;
-        let argv = serde_json::json!({"argv":["/bin/sh", "-c", command]});
+        let argv = serde_json::json!({"command":["/bin/sh", "-c", command]});
         f.write(
             "run.js",
             &format!("return (await tool.exec({argv})).unwrap();"),

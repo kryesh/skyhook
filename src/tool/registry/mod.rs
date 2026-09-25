@@ -9,7 +9,7 @@ pub(crate) use envelope::split_envelope;
 pub use envelope::{ExecutionEnvelope, JobLaunch, JobName};
 use schema::{
     add_nested_schema_property, add_schema_property, ensure_no_target, tags_first,
-    target_property_schema, validate_object_schema, validate_output_schema, validate_schema,
+    validate_object_schema, validate_output_schema, validate_schema,
 };
 
 use std::{
@@ -62,34 +62,126 @@ pub struct CatalogEntry<C, O: OutputValue> {
 /// The closure erases the input type without a downcast or a mismatched tool/input pair.
 type InvocationFuture<O> = BoxFuture<'static, Result<O, OperationError<O>>>;
 
-pub(crate) struct Invocation<C, O>(Box<dyn FnOnce(C) -> InvocationFuture<O> + Send>);
+pub(crate) struct Invocation<C, O> {
+    run: Box<dyn FnOnce(C) -> InvocationFuture<O> + Send>,
+    result_policy: ToolResultPolicy,
+}
 
 impl<C, O> Invocation<C, O> {
     pub(crate) fn new<Fut>(run: impl FnOnce(C) -> Fut + Send + 'static) -> Self
     where
         Fut: Future<Output = Result<O, OperationError<O>>> + Send + 'static,
     {
-        Self(Box::new(move |context| Box::pin(run(context))))
+        Self {
+            run: Box::new(move |context| Box::pin(run(context))),
+            result_policy: ToolResultPolicy::Value,
+        }
+    }
+
+    pub(crate) const fn result_policy(&self) -> ToolResultPolicy {
+        self.result_policy
     }
 
     pub(crate) fn call(self, context: C) -> InvocationFuture<O> {
-        (self.0)(context)
+        (self.run)(context)
+    }
+}
+
+impl AdmittedInvocation {
+    /// An invocation whose response is another job's presented view rather than
+    /// a native value wrapped in this call's own envelope.
+    pub(crate) fn job_view<Fut>(run: impl FnOnce(ToolContext) -> Fut + Send + 'static) -> Self
+    where
+        Fut: Future<Output = Result<crate::job::output::PresentedOutput, ToolError>>
+            + Send
+            + 'static,
+    {
+        Self {
+            result_policy: ToolResultPolicy::JobView,
+            ..Self::new(move |context| async move {
+                let (_, view, images) = run(context).await?.into_parts();
+                Ok(ToolOutput::new(view).with_images(images))
+            })
+        }
     }
 }
 
 type ArgumentAdmission<C, O> =
     Arc<dyn Fn(Value) -> Result<Invocation<C, O>, AdmissionError> + Send + Sync>;
-type ArgumentPermissions = Arc<
-    dyn Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, AdmissionError> + Send + Sync,
+type ArgumentValidator<I> = Arc<dyn Fn(&I) -> Result<(), AdmissionError> + Send + Sync>;
+type ArgumentPaths<I> = Arc<dyn Fn(&I) -> Result<Vec<PathArgument>, AdmissionError> + Send + Sync>;
+type ArgumentPermissions<I> =
+    Arc<dyn Fn(&ExecutionLocation, &I) -> Result<Vec<PermissionUse>, AdmissionError> + Send + Sync>;
+type ArgumentCheck = Arc<
+    dyn Fn(&ExecutionLocation, &Value) -> Result<CheckedArguments, AdmissionError> + Send + Sync,
 >;
-type ArgumentPaths = Arc<dyn Fn(&Value) -> Result<Vec<PathArgument>, AdmissionError> + Send + Sync>;
-type ArgumentValidator = Arc<dyn Fn(&Value) -> Result<(), AdmissionError> + Send + Sync>;
+
+/// Tool-specific checks over a tool's parsed input, run before authorization.
+struct ArgumentHooks<I> {
+    validator: Option<ArgumentValidator<I>>,
+    paths: Option<ArgumentPaths<I>>,
+    permissions: Option<ArgumentPermissions<I>>,
+}
+
+impl<I> Clone for ArgumentHooks<I> {
+    fn clone(&self) -> Self {
+        Self {
+            validator: self.validator.clone(),
+            paths: self.paths.clone(),
+            permissions: self.permissions.clone(),
+        }
+    }
+}
+
+impl<I> Default for ArgumentHooks<I> {
+    fn default() -> Self {
+        Self {
+            validator: None,
+            paths: None,
+            permissions: None,
+        }
+    }
+}
+
+impl<I: DeserializeOwned + JsonSchema + 'static> ArgumentHooks<I> {
+    /// One check that parses the arguments once for every hook. A tool without
+    /// hooks parses nothing before admission.
+    fn check(self) -> Option<ArgumentCheck> {
+        let Self {
+            validator,
+            paths,
+            permissions,
+        } = self;
+        if validator.is_none() && paths.is_none() && permissions.is_none() {
+            return None;
+        }
+        Some(Arc::new(move |location, arguments| {
+            let input = super::diagnostic::deserialize_arguments::<I>(arguments)?;
+            if let Some(validate) = &validator {
+                validate(&input)?;
+            }
+            Ok(CheckedArguments {
+                paths: paths
+                    .as_ref()
+                    .map_or(Ok(Vec::new()), |paths| paths(&input))?,
+                permissions: (permissions.as_ref())
+                    .map_or(Ok(Vec::new()), |permissions| permissions(location, &input))?,
+            })
+        }))
+    }
+}
+
+/// What a tool's checks derived from one invocation's arguments.
+pub(crate) struct CheckedArguments {
+    /// Filesystem inputs/outputs, resolved and rewritten before authorization.
+    pub(crate) paths: Vec<PathArgument>,
+    pub(crate) permissions: Vec<PermissionUse>,
+}
 
 #[derive(Clone, Debug)]
 pub struct ToolSpec {
     pub supports_background: bool,
     pub job_role: crate::job::JobRole,
-    pub result_policy: ToolResultPolicy,
     pub name: String,
     pub description: String,
     pub input_schema: Value,
@@ -159,11 +251,10 @@ pub enum ScriptBinding {
     Unavailable,
 }
 
-/// Whether a handler returns a native value or a manager-produced job view.
-/// Only `register_presented` selects `JobView`.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// Whether an admitted call returns a native value or a manager-produced job view.
+/// Only `Invocation::job_view` selects `JobView`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolResultPolicy {
-    #[default]
     Value,
     JobView,
 }
@@ -282,9 +373,11 @@ impl PathArgument {
     }
 }
 
-#[derive(Clone)]
-pub struct ToolOptions {
+/// Registration options for a tool whose handler input is `I`; dynamic tools
+/// take their arguments as JSON.
+pub struct ToolOptions<I = Value> {
     execution: ToolExecution,
+    hooks: ArgumentHooks<I>,
     pub supports_background: bool,
     preserve_required: bool,
     preserve_schema_dialect: bool,
@@ -292,17 +385,71 @@ pub struct ToolOptions {
     script_binding: ScriptBinding,
     required: BTreeSet<Capability>,
     root_required: BTreeSet<Capability>,
-    /// (object pointer, property name, the property's schema under an agent's capabilities)
-    conditional_inputs: Vec<(String, String, ComputedInput)>,
+    conditional_inputs: Vec<ConditionalProperty>,
+    /// Like `conditional_inputs`, for properties of the result schema.
+    conditional_outputs: Vec<ConditionalProperty>,
     output_schema: Option<OutputSchema>,
 }
 
-type ComputedInput = Arc<dyn Fn(&CapabilitySet) -> Option<Value> + Send + Sync>;
+impl<I> Clone for ToolOptions<I> {
+    fn clone(&self) -> Self {
+        Self {
+            execution: self.execution.clone(),
+            hooks: self.hooks.clone(),
+            supports_background: self.supports_background,
+            preserve_required: self.preserve_required,
+            preserve_schema_dialect: self.preserve_schema_dialect,
+            exposure: self.exposure,
+            script_binding: self.script_binding.clone(),
+            required: self.required.clone(),
+            root_required: self.root_required.clone(),
+            conditional_inputs: self.conditional_inputs.clone(),
+            conditional_outputs: self.conditional_outputs.clone(),
+            output_schema: self.output_schema.clone(),
+        }
+    }
+}
+
+/// (object pointer, property name, the property's schema under an agent's capabilities)
+type ConditionalProperty = (String, String, ComputedProperty);
+type ComputedProperty = Arc<dyn Fn(&CapabilitySet) -> Option<Value> + Send + Sync>;
+
+fn gated(capability: Capability, schema: Value) -> ComputedProperty {
+    Arc::new(move |capabilities: &CapabilitySet| {
+        capabilities.contains(capability).then(|| schema.clone())
+    })
+}
+
+fn check_conditional(
+    schema: &Value,
+    properties: &[ConditionalProperty],
+    kind: &str,
+) -> Result<(), RegistryError> {
+    match (properties.iter())
+        .find(|(pointer, ..)| !schema.pointer(pointer).is_some_and(Value::is_object))
+    {
+        Some((pointer, ..)) => Err(RegistryError::Schema(format!(
+            "conditional {kind} location `{pointer}` is not an object schema"
+        ))),
+        None => Ok(()),
+    }
+}
+
+fn add_conditional(
+    schema: &mut Value,
+    properties: &[ConditionalProperty],
+    capabilities: &CapabilitySet,
+) {
+    for (pointer, name, property) in properties {
+        if let Some(property) = property(capabilities) {
+            add_nested_schema_property(schema, pointer, name, property);
+        }
+    }
+}
 
 #[derive(Clone, Default)]
 struct ToolExecution {
     job_role: crate::job::JobRole,
-    result_policy: ToolResultPolicy,
     pub capabilities: Vec<Capability>,
     pub accepts_input: bool,
     supports_name: bool,
@@ -311,12 +458,12 @@ struct ToolExecution {
     path_arguments: Vec<PathArgument>,
     read_error_output: Option<fn(&str, &super::diagnostic::Diagnostic) -> Option<Value>>,
     target_authentication: bool,
-    validator: Option<ArgumentValidator>,
-    permissions: Option<ArgumentPermissions>,
-    paths: Option<ArgumentPaths>,
+    /// An argument naming a file, on any target, whose bytes the handler consumes.
+    source_argument: Option<String>,
+    check: Option<ArgumentCheck>,
 }
 
-impl ToolOptions {
+impl<I> ToolOptions<I> {
     #[must_use]
     pub const fn job_role(mut self, role: crate::job::JobRole) -> Self {
         self.execution.job_role = role;
@@ -345,6 +492,20 @@ impl ToolOptions {
         self
     }
 
+    /// The `{path, target?}` argument `name` is a source file. The executor
+    /// authorizes and loads it with the call, and the handler reads its bytes
+    /// from the context. Its `target` follows the tool-level target rules.
+    #[must_use]
+    pub(crate) fn source_argument(mut self, name: &str) -> Self {
+        self.execution.source_argument = Some(name.to_owned());
+        self.conditional_nested_input(
+            crate::target::TargetPath::SCHEMA,
+            "target",
+            Capability::Targets,
+            crate::target::TargetPath::target_schema(),
+        )
+    }
+
     /// The handler spawns processes that may authenticate to configured targets.
     #[must_use]
     pub(crate) const fn target_authentication(mut self) -> Self {
@@ -363,11 +524,13 @@ impl ToolOptions {
                 capabilities,
                 ..ToolExecution::default()
             },
+            hooks: ArgumentHooks::default(),
             exposure: ToolExposure::ModelVisible,
             script_binding: ScriptBinding::TopLevel,
             required,
             root_required: BTreeSet::new(),
             conditional_inputs: Vec::new(),
+            conditional_outputs: Vec::new(),
             output_schema: None,
         }
     }
@@ -441,11 +604,23 @@ impl ToolOptions {
         capability: Capability,
         schema: Value,
     ) -> Self {
-        let schema = move |capabilities: &CapabilitySet| {
-            capabilities.contains(capability).then(|| schema.clone())
-        };
         self.conditional_inputs
-            .push((pointer.into(), name.into(), Arc::new(schema)));
+            .push((pointer.into(), name.into(), gated(capability, schema)));
+        self
+    }
+
+    /// A result property present only with `capability`, at the object schema
+    /// at `pointer`, such as a nested definition (`/$defs/Options`).
+    #[must_use]
+    pub(crate) fn conditional_output(
+        mut self,
+        pointer: impl Into<String>,
+        name: impl Into<String>,
+        capability: Capability,
+        schema: Value,
+    ) -> Self {
+        self.conditional_outputs
+            .push((pointer.into(), name.into(), gated(capability, schema)));
         self
     }
 
@@ -510,19 +685,19 @@ impl ToolOptions {
         self
     }
 
-    /// Extract invocation-specific permissions after tool argument validation.
-    /// These replace static permissions of the same capability. Remote path and
+    /// Derive invocation-specific permissions from the validated input as
+    /// submitted. These replace static permissions of the same capability. Remote path and
     /// network permissions are forwarded from the destination for host approval;
     /// other namespaces are authorized by the host before dispatch.
     #[must_use]
     pub fn argument_permissions(
         mut self,
-        extract: impl Fn(&ExecutionLocation, &Value) -> Result<Vec<PermissionUse>, AdmissionError>
+        extract: impl Fn(&ExecutionLocation, &I) -> Result<Vec<PermissionUse>, AdmissionError>
         + Send
         + Sync
         + 'static,
     ) -> Self {
-        self.execution.permissions = Some(Arc::new(extract));
+        self.hooks.permissions = Some(Arc::new(extract));
         self
     }
 
@@ -532,9 +707,9 @@ impl ToolOptions {
     #[must_use]
     pub fn argument_paths(
         mut self,
-        extract: impl Fn(&Value) -> Result<Vec<PathArgument>, AdmissionError> + Send + Sync + 'static,
+        extract: impl Fn(&I) -> Result<Vec<PathArgument>, AdmissionError> + Send + Sync + 'static,
     ) -> Self {
-        self.execution.paths = Some(Arc::new(extract));
+        self.hooks.paths = Some(Arc::new(extract));
         self
     }
 
@@ -542,9 +717,9 @@ impl ToolOptions {
     #[must_use]
     pub fn argument_validator(
         mut self,
-        validate: impl Fn(&Value) -> Result<(), AdmissionError> + Send + Sync + 'static,
+        validate: impl Fn(&I) -> Result<(), AdmissionError> + Send + Sync + 'static,
     ) -> Self {
-        self.execution.validator = Some(Arc::new(validate));
+        self.hooks.validator = Some(Arc::new(validate));
         self
     }
 
@@ -570,7 +745,7 @@ impl ToolOptions {
     }
 }
 
-impl Default for ToolOptions {
+impl<I> Default for ToolOptions<I> {
     fn default() -> Self {
         Self::new(Vec::new())
     }
@@ -582,23 +757,11 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
         self.execution.job_role
     }
 
-    #[must_use]
-    pub const fn result_policy(&self) -> ToolResultPolicy {
-        self.execution.result_policy
-    }
-
     pub(crate) fn output_schema(&self, capabilities: &CapabilitySet) -> Option<Value> {
         self.definition
             .output_schema
             .as_ref()
             .map(|schema| schema.generate(capabilities))
-    }
-
-    pub async fn call(&self, context: C, arguments: Value) -> Result<O, OperationError<O>> {
-        self.validate_arguments(&arguments)?;
-        self.admit(arguments.clone(), &arguments)?
-            .call(context)
-            .await
     }
 
     /// Admit handler input before allocating a job or requesting approval.
@@ -622,9 +785,10 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
             Some((path, convert))
         });
         let admitted = (self.admit)(arguments)?;
-        Ok(Invocation::new(move |context| async move {
-            match admitted.call(context).await {
-                Err(error) => {
+        Ok(Invocation {
+            result_policy: admitted.result_policy(),
+            ..Invocation::new(move |context| async move {
+                admitted.call(context).await.or_else(|error| {
                     let output = convert.and_then(|(path, convert)| {
                         error
                             .is_source_filesystem_io()
@@ -637,17 +801,31 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
                         }
                         None => Err(error),
                     }
-                }
-                result => result,
-            }
-        }))
+                })
+            })
+        })
     }
 
-    pub(crate) fn validate_arguments(&self, arguments: &Value) -> Result<(), AdmissionError> {
-        if let Some(validate) = &self.execution.validator {
-            validate(arguments)?;
-        }
-        Ok(())
+    /// Validate the submitted arguments and derive their path arguments
+    /// (declared ones first) and permissions, before authorization.
+    pub(crate) fn check_arguments(
+        &self,
+        location: &ExecutionLocation,
+        arguments: &Value,
+    ) -> Result<CheckedArguments, AdmissionError> {
+        let checked = match &self.execution.check {
+            Some(check) => check(location, arguments)?,
+            None => CheckedArguments {
+                paths: Vec::new(),
+                permissions: Vec::new(),
+            },
+        };
+        Ok(CheckedArguments {
+            paths: (self.execution.path_arguments.iter().cloned())
+                .chain(checked.paths)
+                .collect(),
+            ..checked
+        })
     }
 
     pub(crate) fn capabilities(&self) -> Vec<Capability> {
@@ -684,28 +862,6 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
         self.execution.read_error_output?(path, diagnostic)
     }
 
-    pub(crate) fn path_arguments(
-        &self,
-        arguments: &Value,
-    ) -> Result<Vec<PathArgument>, AdmissionError> {
-        let mut paths = self.execution.path_arguments.clone();
-        if let Some(extract) = &self.execution.paths {
-            paths.extend(extract(arguments)?);
-        }
-        Ok(paths)
-    }
-
-    pub(crate) fn argument_permissions(
-        &self,
-        location: &ExecutionLocation,
-        arguments: &Value,
-    ) -> Result<Vec<PermissionUse>, AdmissionError> {
-        self.execution
-            .permissions
-            .as_ref()
-            .map_or_else(|| Ok(Vec::new()), |extract| extract(location, arguments))
-    }
-
     pub(crate) const fn accepts_input(&self) -> bool {
         self.execution.accepts_input
     }
@@ -717,13 +873,17 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
     pub(crate) const fn target_authentication(&self) -> bool {
         self.execution.target_authentication
     }
+
+    pub(crate) fn source_argument(&self) -> Option<&str> {
+        self.execution.source_argument.as_deref()
+    }
 }
 
 #[derive(Clone, Default)]
 pub struct ToolSurface {
     tools: BTreeMap<String, ToolSpec>,
-    /// The presented job schema that direct tool results and job methods share.
-    job_envelope: Value,
+    /// Result schemas documented by name, since the prompt defines `JobView` once.
+    job_views: docs::JobViewSchemas,
 }
 
 impl ToolSurface {
@@ -733,9 +893,9 @@ impl ToolSurface {
     }
 
     pub fn validate_arguments(&self, name: &str, arguments: &Value) -> Result<(), AdmissionError> {
-        let tool = self.get(name).ok_or_else(|| {
-            AdmissionError::invalid_arguments(format!("tool `{name}` is unavailable"))
-        })?;
+        let tool = self
+            .get(name)
+            .ok_or_else(|| AdmissionError::unavailable(name))?;
         tool.validate_arguments(arguments)
     }
 
@@ -806,7 +966,7 @@ impl<C: Send + 'static, O: OutputValue> Catalog<C, O> {
             .collect();
         ToolSurface {
             tools,
-            job_envelope: crate::job::presented_job_schema(false),
+            job_views: docs::JobViewSchemas::new(),
         }
     }
 }
@@ -853,15 +1013,29 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
+        input_schema: Value,
+        options: ToolOptions,
+        admit: impl Fn(Value) -> Result<Invocation<C, P>, AdmissionError> + Send + Sync + 'static,
+    ) -> Result<&mut Self, RegistryError> {
+        self.register_checked(name, description, input_schema, options, admit)
+    }
+
+    fn register_checked<I: DeserializeOwned + JsonSchema + 'static>(
+        &mut self,
+        name: impl Into<String>,
+        description: impl Into<String>,
         mut input_schema: Value,
-        mut options: ToolOptions,
+        mut options: ToolOptions<I>,
         admit: impl Fn(Value) -> Result<Invocation<C, P>, AdmissionError> + Send + Sync + 'static,
     ) -> Result<&mut Self, RegistryError> {
         tags_first(&mut input_schema);
         if options.execution.placement == ToolPlacement::TargetedWorkspace {
             ensure_no_target(&input_schema)?;
-            options =
-                options.conditional_input("target", Capability::Targets, target_property_schema());
+            options = options.conditional_input(
+                "target",
+                Capability::Targets,
+                crate::target::TargetRef::schema(),
+            );
         }
         let name = name.into();
         validate_name(&name)?;
@@ -869,15 +1043,11 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             return Err(RegistryError::ReservedScriptName(name));
         }
         validate_schema(&input_schema)?;
-        if let Some((pointer, ..)) = (options.conditional_inputs.iter())
-            .find(|(pointer, ..)| !input_schema.pointer(pointer).is_some_and(Value::is_object))
-        {
-            return Err(RegistryError::Schema(format!(
-                "conditional input location `{pointer}` is not an object schema"
-            )));
-        }
+        check_conditional(&input_schema, &options.conditional_inputs, "input")?;
+        let all: CapabilitySet = Capability::ALL.into_iter().collect();
         let ToolOptions {
-            execution,
+            mut execution,
+            hooks,
             supports_background,
             preserve_required,
             preserve_schema_dialect,
@@ -886,8 +1056,21 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             required,
             root_required,
             conditional_inputs,
+            conditional_outputs,
             output_schema,
         } = options;
+        let output_schema = match output_schema {
+            Some(base) if !conditional_outputs.is_empty() => {
+                check_conditional(&base.generate(&all), &conditional_outputs, "output")?;
+                Some(OutputSchema::Generated(Arc::new(move |capabilities| {
+                    let mut schema = base.generate(capabilities);
+                    add_conditional(&mut schema, &conditional_outputs, capabilities);
+                    schema
+                })))
+            }
+            output_schema => output_schema,
+        };
+        execution.check = hooks.check();
         let supports_name = execution.supports_name;
         if supports_name && input_schema["properties"].get("name").is_some() {
             return Err(RegistryError::Schema(
@@ -907,11 +1090,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
                     }),
                 );
             }
-            for (pointer, name, property) in &conditional_inputs {
-                if let Some(property) = property(capabilities) {
-                    add_nested_schema_property(&mut schema, pointer, name, property);
-                }
-            }
+            add_conditional(&mut schema, &conditional_inputs, capabilities);
             schema
         };
         let definition = GeneratedToolDefinition {
@@ -931,11 +1110,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             return Err(RegistryError::Duplicate(definition.name));
         }
         // Schema roots do not vary with capabilities; validate the full surface once.
-        let mut capabilities = CapabilitySet::empty();
-        Capability::ALL
-            .iter()
-            .for_each(|capability| capabilities.insert(*capability));
-        if let Some(spec) = definition.generate_scoped(&capabilities, &execution, false) {
+        if let Some(spec) = definition.generate_scoped(&all, &execution, false) {
             validate_object_schema(&spec.input_schema)?;
             if let Some(schema) = &spec.output_schema {
                 validate_output_schema(schema)?;
@@ -956,7 +1131,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        options: ToolOptions,
+        options: ToolOptions<I>,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -982,7 +1157,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        mut options: ToolOptions,
+        mut options: ToolOptions<I>,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -1011,7 +1186,7 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         &mut self,
         name: impl Into<String>,
         description: impl Into<String>,
-        options: ToolOptions,
+        options: ToolOptions<I>,
         handler: F,
     ) -> Result<&mut Self, RegistryError>
     where
@@ -1019,19 +1194,10 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
         F: Fn(C, I) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<P, OperationError<P>>> + Send + 'static,
     {
-        // Typed arguments keep the deserialization contract: defaults and
-        // `Option` fields remain omissible even when the output type would emit
-        // the same fields.
-        let input_schema = serde_json::to_value(
-            SchemaSettings::default()
-                .for_deserialize()
-                .into_generator()
-                .into_root_schema_for::<I>(),
-        )
-        .map_err(|error| RegistryError::Schema(error.to_string()))?;
         let handler = Arc::new(handler);
-        self.register_admission(name, description, input_schema, options, move |arguments| {
-            let input = super::diagnostic::deserialize_arguments::<I>(arguments)?;
+        let input_schema = input_schema::<I>()?;
+        self.register_checked(name, description, input_schema, options, move |arguments| {
+            let input = super::diagnostic::deserialize_arguments::<I>(&arguments)?;
             let handler = handler.clone();
             Ok(Invocation::new(move |context| handler(context, input)))
         })
@@ -1044,47 +1210,16 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
     }
 }
 
-impl ToolRegistryBuilder {
-    /// Register the concrete manager-produced presentation product. This
-    /// derives JobView presentation and the canonical capability-scoped schema;
-    /// an options policy/schema cannot override the product's contract. Images
-    /// remain attached to the same projection. Native/dynamic registrations and
-    /// their legacy JobView presentation policy do not acquire this provenance.
-    /// Only host execution is supported: workspace placement (which can route to
-    /// remote JSON dispatch) and synthetic read-error outputs would bypass this
-    /// typed producer, so either is rejected with `RegistryError::PresentedPlacement`.
-    /// This proves successful output only; ToolError partial outputs stay raw.
-    ///
-    /// Arbitrary JSON (even a job-shaped object) cannot enter this adapter.
-    pub fn register_presented<I, F, Fut>(
-        &mut self,
-        name: impl Into<String>,
-        description: impl Into<String>,
-        mut options: ToolOptions,
-        handler: F,
-    ) -> Result<&mut Self, RegistryError>
-    where
-        I: DeserializeOwned + JsonSchema + Send + 'static,
-        F: Fn(ToolContext, I) -> Fut + Send + Sync + 'static,
-        Fut: Future<Output = Result<crate::job::output::PresentedOutput, ToolError>>
-            + Send
-            + 'static,
-    {
-        if options.execution.placement != ToolPlacement::Host
-            || options.execution.read_error_output.is_some()
-        {
-            return Err(RegistryError::PresentedPlacement(name.into()));
-        }
-        options.execution.result_policy = ToolResultPolicy::JobView;
-        options = options.generated_output_schema(|_| crate::job::presented_job_schema(false));
-        self.register_typed::<I, _, _>(name, description, options, move |context, input| {
-            let future = handler(context, input);
-            async move {
-                let (_, view, images) = future.await?.into_parts();
-                Ok(ToolOutput::new(view).with_images(images))
-            }
-        })
-    }
+/// Typed arguments keep the deserialization contract: defaults and `Option`
+/// fields remain omissible even when the output type would emit the same fields.
+pub(crate) fn input_schema<I: JsonSchema>() -> Result<Value, RegistryError> {
+    serde_json::to_value(
+        SchemaSettings::default()
+            .for_deserialize()
+            .into_generator()
+            .into_root_schema_for::<I>(),
+    )
+    .map_err(|error| RegistryError::Schema(error.to_string()))
 }
 
 fn validate_name(name: &str) -> Result<(), RegistryError> {
@@ -1116,8 +1251,6 @@ pub enum RegistryError {
     ReservedBackground,
     #[error("`target` is reserved for structurally targeted tools")]
     ReservedTarget,
-    #[error("presented tool `{0}` must run on the host without read-error outputs")]
-    PresentedPlacement(String),
 }
 
 struct HostAuthorizer(ToolContext);
@@ -1164,9 +1297,10 @@ impl ToolRegistryBuilder {
                             context.process_environment.clone(),
                             context.cancellation_token(),
                             output.context(),
-                            Arc::new(HostAuthorizer(context)),
+                            Arc::new(HostAuthorizer(context.clone())),
                             arguments,
-                        );
+                        )
+                        .with_source(context.source().cloned());
                         let result = admitted.call(local).await;
                         output.context().settle().await?;
                         match result {
@@ -1185,7 +1319,7 @@ impl ToolRegistryBuilder {
 #[cfg(test)]
 mod admission_tests {
     use super::*;
-    use crate::job::{JobOutcome, JobSpec, output};
+    use crate::job::JobSpec;
     use std::io::Write as _;
 
     #[derive(serde::Deserialize, JsonSchema)]
@@ -1389,7 +1523,8 @@ mod admission_tests {
             "string"
         );
         let arguments = serde_json::json!({"content":"native evidence"});
-        let mut output = tool.call(context, arguments).await.unwrap();
+        let admitted = tool.admit(arguments.clone(), &arguments).unwrap();
+        let mut output = admitted.call(context).await.unwrap();
         assert_eq!(output.value, serde_json::json!({}));
         let captures = output.take_captures();
         assert_eq!(captures.len(), 1);
@@ -1485,74 +1620,5 @@ mod admission_tests {
             .unwrap();
         let keys: Vec<_> = key["properties"].as_object().unwrap().keys().collect();
         assert_eq!(keys, ["kind", "path"]);
-    }
-
-    #[tokio::test]
-    async fn presented_registration_derives_contract_and_projection() {
-        let runtime = crate::tests::TestRuntime::new().await;
-        let source = runtime
-            .jobs
-            .create(JobSpec::test(runtime.agent.clone(), "source"));
-        let source = source.await.unwrap().into_test_id();
-        let result = ToolOutput::new(serde_json::json!({"text":"source result"}));
-        runtime
-            .jobs
-            .finish(source, JobOutcome::Completed(result))
-            .await
-            .unwrap();
-        let options = output::OutputOptions::Model {
-            presentation: crate::job::OutputPresentation::Automatic,
-        };
-        let args = output::OutputArgs::new(source);
-        let capabilities = CapabilitySet::default();
-        let projected =
-            runtime
-                .jobs
-                .present_output_with(args, Default::default(), &capabilities, options);
-        let projected = projected.await.unwrap();
-        let expected = projected.view();
-        let mut builder = ToolRegistryBuilder::default();
-        builder
-            .register_presented::<Empty, _, _>(
-                "inspect_source",
-                "Canonical projection independent of tool name",
-                ToolOptions::default(),
-                move |_, _| {
-                    let projected = projected.clone();
-                    async move { Ok(projected) }
-                },
-            )
-            .unwrap();
-        let executor = runtime.executor(builder);
-        let tool = executor.registry().get("inspect_source").unwrap();
-        assert_eq!(tool.result_policy(), ToolResultPolicy::JobView);
-        assert_eq!(
-            tool.output_schema(&capabilities),
-            Some(crate::job::presented_job_schema(false))
-        );
-        let model = executor.run_model(&runtime.agent, "inspect_source", serde_json::json!({}));
-        assert_eq!(model.await.unwrap().output.value, expected);
-    }
-
-    #[test]
-    fn presented_registration_rejects_workspace_placement_and_read_error_outputs() {
-        for options in [
-            ToolOptions::default().placement(ToolPlacement::InheritWorkspace),
-            ToolOptions::default().placement(ToolPlacement::TargetedWorkspace),
-            ToolOptions::default().read_error_output(|_, _| None),
-        ] {
-            let mut builder = ToolRegistryBuilder::default();
-            let result = builder.register_presented::<Empty, _, _>(
-                "presented",
-                "rejected",
-                options,
-                |_, _| async { Err(ToolError::cancelled()) },
-            );
-            assert!(matches!(
-                result,
-                Err(RegistryError::PresentedPlacement(name)) if name == "presented"
-            ));
-            assert!(builder.build().get("presented").is_none());
-        }
     }
 }

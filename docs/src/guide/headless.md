@@ -34,7 +34,7 @@ ordinary automatically allowed operations still work. `--approve-all` (or config
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.
 
-`exec` and `shell` never have stdin connected; without `interactive` they also have no
+`exec` never has stdin connected; without `interactive` it also has no
 controlling terminal, so
 ordinary `/dev/tty` prompts cannot stop the job waiting for terminal input. SSH authentication
 prompts are rejected even when inherited `SSH_ASKPASS` settings request another prompt helper

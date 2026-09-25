@@ -1,5 +1,6 @@
 //! Private atomic credential persistence and cross-process refresh/login coordination.
 use super::{AuthError, AuthManager, AuthStatus, MAX_BODY, blocking, error, random_string};
+use crate::fs::{AtomicWriteStage, CommitMode, PermissionPolicy, StagedFile, sync_directory};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -51,7 +52,7 @@ impl AuthManager {
                 .and_then(|_| lock.sync_all())
                 .map_err(|_| error("Cannot invalidate in-progress Codex login"))?;
             match fs::remove_file(directory.join("codex-oauth.json")) {
-                Ok(()) => sync_directory(&directory),
+                Ok(()) => sync_directory(&directory).map_err(|_| directory_sync_error()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(_) => Err(error("Cannot remove Skyhook Codex credentials")),
             }
@@ -148,10 +149,8 @@ fn private_open(path: &Path, create: bool) -> std::io::Result<File> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
     }
     let file = options.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err(std::io::ErrorKind::PermissionDenied.into());
-    }
+    let metadata = crate::fs::admit_regular(&file, u64::MAX)
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::PermissionDenied))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -199,26 +198,25 @@ pub(super) fn write_store(directory: &Path, stored: &Stored) -> Result<(), AuthE
         serde_json::to_vec(stored)
             .map_err(|_| error("Cannot serialize Skyhook Codex credentials"))?,
     );
-    let mut temp = tempfile::NamedTempFile::new_in(directory)
-        .map_err(|_| error("Cannot create private Skyhook credential file"))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        temp.as_file()
-            .set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|_| error("Cannot make Skyhook credentials private"))?;
-    }
-    temp.write_all(&bytes)
-        .and_then(|_| temp.as_file().sync_all())
+    let mut staged = StagedFile::create(
+        &directory.join("codex-oauth.json"),
+        PermissionPolicy::Private,
+    )
+    .map_err(|_| error("Cannot create private Skyhook credential file"))?;
+    staged
+        .write(&bytes)
         .map_err(|_| error("Cannot write Skyhook Codex credentials"))?;
-    temp.persist(directory.join("codex-oauth.json"))
-        .map_err(|_| error("Cannot atomically save Skyhook Codex credentials"))?;
-    sync_directory(directory)
+    staged
+        .commit(CommitMode::Replace)
+        .map_err(|failure| match failure.stage {
+            AtomicWriteStage::OpenDirectory | AtomicWriteStage::SyncDirectory => {
+                directory_sync_error()
+            }
+            _ => error("Cannot atomically save Skyhook Codex credentials"),
+        })
 }
-fn sync_directory(directory: &Path) -> Result<(), AuthError> {
-    File::open(directory)
-        .and_then(|f| f.sync_all())
-        .map_err(|_| error("Cannot sync Skyhook credential directory"))
+fn directory_sync_error() -> AuthError {
+    error("Cannot sync Skyhook credential directory")
 }
 pub(super) fn read_epoch(mut lock: &File) -> Result<Vec<u8>, AuthError> {
     lock.seek(SeekFrom::Start(0))

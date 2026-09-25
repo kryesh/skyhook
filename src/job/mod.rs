@@ -28,7 +28,7 @@ use crate::{
     tool::{
         ToolError, ToolOutput,
         diagnostic::{Diagnostic, PartialDiagnostic},
-        policy::{Capability, CapabilitySet},
+        policy::CapabilitySet,
         registry::JobName,
     },
 };

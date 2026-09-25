@@ -23,7 +23,8 @@ pub use providers::{ProviderConfig, RawProviderConfig};
 pub use runtime::{ConfiguredModel, RuntimeConfig};
 
 pub use loader::{ConfigDiagnostic, ConfigReport, ResolvedConfig};
-pub(crate) use paths::user_config_directory;
+pub use paths::workspace_session_root;
+pub(crate) use paths::{user_config_directories, user_config_directory};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]

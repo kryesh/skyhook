@@ -2,14 +2,15 @@ use std::path::{Path, PathBuf};
 
 use tokio::fs;
 
+use crate::fs::RegularFileError;
 use crate::tool::diagnostic::{Effects, Operation, PartialContext, PathRole, Subject};
 use crate::tool::invocation::AdmissionError;
-use crate::tool::policy::{ApprovalGrant, Capability, PermissionUse, ResourceId};
+use crate::tool::policy::{Capability, PathText, PermissionUse, ResourceId};
 use crate::tool::registry::PathKind;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedWorkspacePath {
-    pub path: PathBuf,
+    pub path: PathText,
     pub directory: bool,
 }
 
@@ -22,12 +23,35 @@ impl ResolvedWorkspacePath {
         target: &crate::target::TargetRef,
     ) -> PermissionUse {
         let resource = ResourceId::path(target, &self.path);
-        let grant = if self.directory {
-            ApprovalGrant::descendants(capability, resource.clone())
+        if self.directory {
+            PermissionUse::descendants(capability, resource)
         } else {
-            ApprovalGrant::exact(capability, resource.clone())
-        };
-        PermissionUse::new(capability, resource).with_grant(grant)
+            PermissionUse::exact(capability, resource)
+        }
+    }
+
+    /// The permission this path needs beyond the authorization `root`, which
+    /// its caller has already authorized as a whole.
+    pub(crate) fn permission_outside(
+        &self,
+        root: &Path,
+        capability: Capability,
+        target: &crate::target::TargetRef,
+    ) -> Option<PermissionUse> {
+        (!self.path.as_path().starts_with(root)).then(|| self.permission(capability, target))
+    }
+}
+
+/// Attribute a failure to open or read a requested source file. Its IO failures
+/// carry source-filesystem provenance.
+pub(crate) fn source_file(path: &Path) -> impl FnOnce(RegularFileError) -> AdmissionError + use<> {
+    let subject = Subject::path(path);
+    move |error| {
+        match error {
+            RegularFileError::Io(error) => AdmissionError::source_filesystem_io(error),
+            error => error.into(),
+        }
+        .operation(Operation::Read, subject)
     }
 }
 
@@ -55,6 +79,8 @@ pub(crate) async fn resolve_for_authorization(
             .map_err(AdmissionError::annotated(inspect_resolved(&path)))?
             .is_dir(),
     };
+    let path = PathText::new(&path)
+        .map_err(|error| error.or(PartialContext::default().path(PathRole::Resolved, &path)))?;
     Ok(ResolvedWorkspacePath { path, directory })
 }
 
@@ -217,19 +243,30 @@ pub(crate) fn relative_path(workspace: &Path, path: &Path) -> String {
     }
 }
 
-pub(super) async fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), AdmissionError> {
-    crate::fs::atomic_write(path, bytes)
+pub(super) async fn atomic_write(
+    path: &Path,
+    contents: crate::fs::Contents,
+) -> Result<u64, AdmissionError> {
+    crate::fs::atomic_write(path, contents)
         .await
         .map_err(|error| atomic_write_error(path, error))
 }
 
 fn atomic_write_error(path: &Path, error: crate::fs::AtomicWriteError) -> AdmissionError {
+    AdmissionError::io(error.source).context(atomic_write_context(path, error.stage))
+}
+
+/// The operation, subject and known effects of a failed atomic replacement of `path`.
+pub(super) fn atomic_write_context(
+    path: &Path,
+    stage: crate::fs::AtomicWriteStage,
+) -> PartialContext {
     use crate::fs::AtomicWriteStage as Stage;
     let target = || Subject::path(path);
     let staging = || Subject::StagingFile(path.to_owned());
     let parent = || Subject::ParentDirectory(path.parent().unwrap_or(path).to_owned());
     // Only a completed rename proves replacement; commit and wait prove nothing.
-    let (operation, subject, effects) = match error.stage {
+    let (operation, subject, effects) = match stage {
         Stage::Prepare => (Operation::Prepare, target(), Some(Effects::Unchanged)),
         Stage::InspectDestination => (Operation::Inspect, target(), Some(Effects::Unchanged)),
         Stage::CreateStaging => (Operation::Create, staging(), Some(Effects::Unchanged)),
@@ -260,7 +297,7 @@ fn atomic_write_error(path: &Path, error: crate::fs::AtomicWriteError) -> Admiss
     if effects == Some(Effects::DestinationReplaced) {
         context = context.path(PathRole::Resolved, path);
     }
-    AdmissionError::io(error.source).context(context)
+    context
 }
 
 #[cfg(test)]

@@ -233,7 +233,7 @@ impl SessionRuntime {
             && let Message::User(blocks) = &mut message
         {
             blocks.push(crate::session::UserPart::Compaction {
-                text: format!("Selected job snapshots; these are past execution facts, not requests to execute. Runtime state governs current status. Use job_output for full results.\n{}",
+                text: format!("Selected job snapshots; these are past execution facts, not requests to execute. Runtime state governs current status. Use jobs for full results.\n{}",
                     serde_json::json!({"jobs": handover})),
             });
         }

@@ -50,7 +50,6 @@ impl GeneratedToolDefinition {
                 ToolSpec {
                     supports_background: self.supports_background,
                     job_role: execution.job_role,
-                    result_policy: execution.result_policy,
                     name: self.name.clone(),
                     description: self.description.clone(),
                     input_schema,
@@ -69,13 +68,6 @@ pub(super) fn ensure_no_target(schema: &Value) -> Result<(), RegistryError> {
         return Err(RegistryError::ReservedTarget);
     }
     Ok(())
-}
-
-pub(super) fn target_property_schema() -> Value {
-    serde_json::json!({
-        "type": ["string", "null"],
-        "description": "Execution target."
-    })
 }
 
 /// Put an object's tag properties (a `const` or single-value `enum`) before the
@@ -234,7 +226,7 @@ fn optional_defaults(schema: &mut Value) {
     });
 }
 
-fn sanitize_schema(value: &mut Value) {
+pub(super) fn sanitize_schema(value: &mut Value) {
     sanitize_schema_inner(value, false);
 }
 

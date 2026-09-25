@@ -36,8 +36,8 @@ return results;
 
 ## Saved output and serialization
 
-Read or search saved command output with `tool.job(commandJobId).output({field:"/result/stdout"})`.
-`job.output()` returns the existing JobView for that job; it does not add another wrapper.
+Read or search saved command output with `tool.jobs({job: commandJobId, field: "/result/stdout"})`.
+A `jobs` read returns the existing JobView for that job; it does not add another wrapper.
 Field-selected output is a job view, not a raw string: available text is in
 `presentation.preview.lines`, with pagination metadata alongside it. Field, pagination, and
 search selections omit image attachments; whole-output reads can attach saved images.
@@ -75,7 +75,7 @@ Truncation entries keep their source paths rooted at `/result/...`.
 JavaScript receives complete data; model views may shorten fields as described in
 [saved job output](job-output.md#automatic-previews).
 Tool descriptions' `Result` refers to the envelope's `.result`, not a separate wrapper. A successful
-`job_output` call on a failed target is still a successful tool invocation returning that failed
+`jobs({job})` read of a failed target is still a successful tool invocation returning that failed
 `JobView`; `response.unwrap()` checks the observed job state and can therefore throw for that view.
 
 ## `response.unwrap()` and native results
@@ -93,7 +93,7 @@ thrown error has `error.response` containing the envelope and `error.output` equ
 logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
 `receive()` values are not decorated, and there is no built-in `tool.unwrap` helper.
 
-`job.output()` and output selections already return views, so inspect their `presentation.preview`,
+`jobs({job})` reads already return views, so inspect their `presentation.preview`,
 `presentation.captures`, or pagination rather than unwrapping them. Operational tool failures are
 failed views rather than JavaScript throws; programmer, serialization, `receive`, and sleep errors
 still throw.
@@ -110,8 +110,8 @@ is `null` on success. In a script JobView, the payload is at `/result` and its r
 `/result/value`; logs are at `/result/console`.
 
 `console.log(...values)` captures space-separated text, formatting objects as JSON. A running
-script's captured text can be inspected at `/result/console` with `job_output` or
-`tool.job(scriptJobId).output({field: "/result/console"})`. These inspections read the currently
+script's captured text can be inspected with
+`tool.jobs({job: scriptJobId, field: "/result/console"})`. These inspections read the currently
 available output; they do not subscribe to future writes or wait for script completion.
 
 There is no fixed console-capture size cap. Disk capacity and I/O failures still apply.

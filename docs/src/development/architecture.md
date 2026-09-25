@@ -135,11 +135,19 @@ for the durable reference contract.
 input and output schemas; registry metadata also supplies compact result documentation to the
 model and JavaScript runtime. Both call paths use the same executor, capability checks,
 authorization coordinator, and job supervision rather than separate tool implementations.
+A tool's argument checks (validation, path arguments, derived permissions) receive its parsed
+input and run before authorization. The host planner and a remote worker assemble an
+invocation's permissions by one rule, and a capability the caller lacks makes the tool
+unavailable rather than denied.
 
 The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
 (queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
 are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
-its startup stage carries a job from creation to its running worker. The local invocation layer
+its startup stage carries a job from creation to its running worker. A tool may declare a source argument, a
+`TargetPath` on any target: the executor selects its location like a tool target, authorizes the
+read with the call, and opens it for the call's context. Remote contents stream in chunks through the
+host, spooled to anonymous files: a remote file through its worker's source request, which the
+worker authorizes and reports as the consuming tool, and to a remote handler before its call starts. The local invocation layer
 admits typed arguments and runs operations without requiring a session database. The SSH shim reuses that layer
 for remote built-ins while the host retains job ownership, policy decisions, and saved output.
 This separation keeps remote workers from becoming second agent runtimes.
@@ -166,7 +174,7 @@ than shared render caches, keeping captured output out of memory without reusing
 renderings for those diagnostic slots.
 
 This rendering boundary does not guarantee that target aliases never appear in a restricted view.
-A privileged `job_output` call saves its rendered view as an ordinary JSON snapshot. Later
+A privileged `jobs` output read saves its rendered view as an ordinary JSON snapshot. Later
 restricted views of that saved result, or script results that copy it, retain the earlier rendered
 JSON unchanged. Already-committed model messages are not rewritten. Arbitrary returned JSON is not
 inspected for diagnostics or target aliases, and copied data does not acquire diagnostic provenance.

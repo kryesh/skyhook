@@ -43,6 +43,14 @@ impl<O> From<io::Error> for OperationError<O> {
         Self::io(error)
     }
 }
+impl<O> From<crate::fs::RegularFileError> for OperationError<O> {
+    fn from(error: crate::fs::RegularFileError) -> Self {
+        match error {
+            crate::fs::RegularFileError::Io(error) => Self::io(error),
+            error => Self::failed(error),
+        }
+    }
+}
 impl<O> From<crate::session::SessionError> for OperationError<O> {
     fn from(error: crate::session::SessionError) -> Self {
         Self::from_facts(PartialDiagnostic::session(&error), None)
@@ -88,6 +96,11 @@ impl<O> OperationError<O> {
     }
     pub fn denied(reason: impl Into<String>) -> Self {
         Self::cause(Cause::Denied(reason.into()))
+    }
+    /// The tool needs a capability this context lacks: it is unavailable here,
+    /// which is not a policy denial.
+    pub(crate) fn unavailable(tool: &str) -> Self {
+        Self::failed(format!("tool `{tool}` is unavailable in this context"))
     }
     pub fn invalid_arguments(message: impl std::fmt::Display) -> Self {
         Self::cause(Cause::InvalidArguments(safe_text(&message.to_string())))
@@ -234,8 +247,8 @@ use super::output::{
 use crate::{
     execution::ExecutionLocation,
     tool::{
-        policy::{ApprovalGrant, Capability, CapabilitySet, PermissionUse, ResourceId},
-        registry::{Catalog, CatalogBuilder, CatalogEntry, OutputValue},
+        policy::{Capability, CapabilitySet, PathText, PermissionUse, ResourceId},
+        registry::{Catalog, CatalogBuilder, CatalogEntry, OutputValue, PathArgument},
     },
 };
 use futures_util::future::BoxFuture;
@@ -272,6 +285,7 @@ pub(crate) struct LocalContext {
     output: OutputContext,
     authorizer: Arc<dyn LocalAuthorizer>,
     arguments: Arc<Value>,
+    source: Option<crate::tool::source::Source>,
 }
 
 impl LocalContext {
@@ -292,7 +306,21 @@ impl LocalContext {
             output,
             authorizer,
             arguments: Arc::new(arguments),
+            source: None,
         }
+    }
+
+    /// Attach the opened source argument.
+    pub(crate) fn with_source(mut self, source: Option<crate::tool::source::Source>) -> Self {
+        self.source = source;
+        self
+    }
+
+    /// The source argument; the executor opens it for every call naming one.
+    pub(crate) fn source(&self) -> Result<&crate::tool::source::Source, LocalError> {
+        self.source
+            .as_ref()
+            .ok_or_else(|| LocalError::failed("source was not opened"))
     }
 
     pub(crate) fn with_arguments(mut self, arguments: Value) -> Self {
@@ -335,6 +363,18 @@ impl LocalContext {
     ) -> Result<crate::media::ImageRef, LocalError> {
         Ok(self.output.store_image(path, image).await?)
     }
+
+    /// Authorize permissions this machine derived while running the call.
+    pub(crate) async fn authorize(
+        &self,
+        permissions: Vec<PermissionUse>,
+    ) -> Result<(), LocalError> {
+        self.authorizer
+            .authorize(permissions, (*self.arguments).clone())
+            .await
+            .map_err(Into::into)
+    }
+
     pub(crate) async fn authorize_network(
         &self,
         normalized_origin: &str,
@@ -363,7 +403,6 @@ impl LocalCatalog {
     pub(crate) fn builtins() -> Result<Self, crate::tool::RegistryError> {
         let mut builder = LocalCatalogBuilder::default();
         crate::tool::builtins::register_local_tools(&mut builder)?;
-        crate::tool::builtins::skill_transfer::register_worker(&mut builder)?;
         Ok(builder.build())
     }
 
@@ -399,41 +438,26 @@ impl LocalCatalog {
         let surface = self.surface(context.capabilities());
         let spec = surface
             .get(name)
-            .ok_or_else(|| LocalError::denied(format!("tool `{name}` is unavailable")))?;
+            .ok_or_else(|| LocalError::unavailable(name))?;
         spec.validate_arguments(&arguments)?;
         let original_arguments = arguments.clone();
-        tool.validate_arguments(&arguments)?;
+        let checked = tool.check_arguments(&context.location, &arguments)?;
         let path = preflight_path_arguments(
             &tool,
-            &context.location.target,
-            &context.location.workspace,
+            checked.paths,
+            &context.location,
             authorization_root,
             &mut arguments,
         )
         .await?;
-        let argument_permissions = tool.argument_permissions(&context.location, &arguments)?;
-        let mut capabilities = tool.capabilities();
-        for permission in &argument_permissions {
-            if !context.capabilities.contains(permission.capability) {
-                return Err(LocalError::denied("required capability is unavailable"));
-            }
-            capabilities.retain(|candidate| *candidate != permission.capability);
-        }
-        if matches!(path.outcome, PathOutcome::Ready) {
-            for permission in &path.permissions {
-                capabilities.retain(|candidate| *candidate != permission.capability);
-            }
-        }
-        let mut permissions =
-            scope_capabilities(capabilities, &context.location, tool.permission_resource());
-        permissions.extend(path.permissions);
-        permissions.extend(argument_permissions);
-        if permissions
-            .iter()
-            .any(|permission| !context.capabilities.contains(permission.capability))
-        {
-            return Err(LocalError::denied("required capability is unavailable"));
-        }
+        let permissions = assemble_permissions(
+            &tool,
+            &context.location,
+            &context.capabilities,
+            checked.permissions,
+            &path,
+            false,
+        )?;
         context
             .authorizer
             .authorize(permissions, original_arguments.clone())
@@ -460,6 +484,48 @@ impl LocalCatalog {
     }
 }
 
+/// The permissions an invocation needs, wherever it is planned. Permissions its
+/// arguments derive replace their capabilities' static scope, as do its path
+/// permissions once every path resolved (an unresolved read still needs the
+/// workspace scope); the capabilities left are scoped to the tool's resource or
+/// workspace. A `forwarded` invocation's destination authorizes its own path
+/// and network permissions and forwards them, so they are not asked for twice.
+/// A capability this context lacks makes the tool unavailable, not denied.
+pub(crate) fn assemble_permissions<C: Send + 'static, O: OutputValue>(
+    tool: &CatalogEntry<C, O>,
+    location: &ExecutionLocation,
+    available: &CapabilitySet,
+    arguments: Vec<PermissionUse>,
+    path: &PathPreflight,
+    forwarded: bool,
+) -> Result<Vec<PermissionUse>, AdmissionError> {
+    let mut covered = arguments.iter().collect::<Vec<_>>();
+    if matches!(path.outcome, PathOutcome::Ready) {
+        covered.extend(&path.permissions);
+    }
+    let mut capabilities = tool.capabilities();
+    capabilities.retain(|capability| {
+        !covered
+            .iter()
+            .any(|permission| permission.capability == *capability)
+    });
+    let mut permissions = scope_capabilities(capabilities, location, tool.permission_resource())?;
+    permissions.extend(path.permissions.iter().cloned());
+    permissions.extend(arguments);
+    if (permissions.iter()).any(|permission| !available.contains(permission.capability)) {
+        return Err(AdmissionError::unavailable(tool.name()));
+    }
+    if forwarded {
+        permissions.retain(|permission| {
+            !matches!(
+                permission.resource,
+                ResourceId::Path { .. } | ResourceId::Network { .. }
+            )
+        });
+    }
+    Ok(permissions)
+}
+
 pub(crate) struct PathPreflight {
     pub(crate) permissions: Vec<PermissionUse>,
     pub(crate) outcome: PathOutcome,
@@ -476,38 +542,38 @@ pub(crate) enum PathOutcome {
 
 use crate::tool::builtins::workspace::{lexical_path, resolve_for_authorization};
 
+/// Resolve each path argument where the invocation runs and rewrite it to its
+/// resolved spelling. A top-level path needs permission outside the
+/// authorization root; a nested one always does.
 pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
     tool: &CatalogEntry<C, O>,
-    target: &crate::target::TargetRef,
-    workspace: &std::path::Path,
-    authorization_root: &std::path::Path,
+    specs: Vec<PathArgument>,
+    location: &ExecutionLocation,
+    authorization_root: &Path,
     arguments: &mut Value,
 ) -> Result<PathPreflight, AdmissionError> {
     if !arguments.is_object() {
         return Err(AdmissionError::arguments_must_be_object());
     }
+    let ExecutionLocation { target, workspace } = location;
     let mut permissions = Vec::new();
     let mut paths = Vec::new();
     let mut outcome = PathOutcome::Ready;
-    for spec in tool.path_arguments(arguments)? {
+    for spec in specs {
         let Some(input) = spec.input(arguments)?.map(str::to_owned) else {
             continue;
         };
+        let capability = spec.access.capability();
         let resolved = match resolve_for_authorization(workspace, &input, spec.kind).await {
             Ok(resolved) => resolved,
             Err(error) => {
-                // The site is known here; workspace resolution chose the rest.
-                let site = FailureSite::Execution(ExecutionLocation {
-                    target: target.clone(),
-                    workspace: workspace.to_owned(),
-                });
                 // Preflight adds what it knows to the resolver's facts; nothing is
                 // resolved here, so the tool's own fallback still fills the rest.
                 let mut facts = error
                     .facts()
                     .context
                     .clone()
-                    .at(site)
+                    .at(FailureSite::Execution(location.clone()))
                     .path(PathRole::Requested, &input);
                 if spec.name() == "cwd" {
                     facts = facts
@@ -523,14 +589,11 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
                 // the authorization root. Require exact path authorization even for
                 // apparently local paths, then return the captured failure without
                 // retrying the handler (which could now access a changed target).
-                let path = lexical_path(workspace, &input)?;
-                let capability = spec.access.capability();
-                path_text(&path)?;
-                let resource = ResourceId::path(target, &path);
-                permissions.push(
-                    PermissionUse::new(capability, resource.clone())
-                        .with_grant(ApprovalGrant::exact(capability, resource)),
-                );
+                let path = PathText::new(lexical_path(workspace, &input)?)?;
+                permissions.push(PermissionUse::exact(
+                    capability,
+                    ResourceId::path(target, &path),
+                ));
                 outcome = PathOutcome::ReadError {
                     value: output,
                     diagnostic: Box::new(error.into_facts().0),
@@ -538,33 +601,23 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
                 continue;
             }
         };
-        // Both the existing handler JSON and permission resource are Unicode
-        // boundaries. Never authorize a replacement-character alias.
-        let value = Value::String(
-            path_text(&resolved.path)
-                .map_err(|error| {
-                    error.context(
-                        PartialContext::new(Operation::Validate, Subject::path(&resolved.path))
-                            .path(PathRole::Requested, &input)
-                            .path(PathRole::Resolved, &resolved.path),
-                    )
-                })?
-                .to_owned(),
-        );
+        spec.rewrite(arguments, Value::String(resolved.path.as_str().to_owned()))?;
         paths.push(PathFact {
             role: PathRole::Requested,
             path: input.into(),
         });
         paths.push(PathFact {
             role: PathRole::Resolved,
-            path: resolved.path.clone(),
+            path: resolved.path.as_path().to_owned(),
         });
-        spec.rewrite(arguments, value)?;
-        if matches!(spec.binding, crate::tool::registry::PathBinding::Pointer(_))
-            || !resolved.path.starts_with(authorization_root)
-        {
-            permissions.push(resolved.permission(spec.access.capability(), target));
-        }
+        permissions.extend(match spec.binding {
+            crate::tool::registry::PathBinding::Pointer(_) => {
+                Some(resolved.permission(capability, target))
+            }
+            crate::tool::registry::PathBinding::TopLevel { .. } => {
+                resolved.permission_outside(authorization_root, capability, target)
+            }
+        });
     }
     Ok(PathPreflight {
         permissions,
@@ -573,29 +626,24 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
     })
 }
 
-/// Validate the existing string-only permission/wire boundary without changing
-/// native path identity. Lossless byte-path protocols are a separate migration.
-pub(crate) fn path_text(path: &std::path::Path) -> Result<&str, AdmissionError> {
-    path.to_str().ok_or_else(|| {
-        AdmissionError::invalid_arguments(
-            "native path cannot be represented losslessly by the permission or wire format"
-                .to_owned(),
-        )
-    })
-}
-
+/// Scope capabilities to `resource`, or else the workspace, which is spelled
+/// only when a capability needs it.
 pub(crate) fn scope_capabilities(
     capabilities: Vec<Capability>,
     location: &ExecutionLocation,
-    override_resource: Option<&ResourceId>,
-) -> Vec<PermissionUse> {
-    let resource = override_resource
-        .cloned()
-        .unwrap_or_else(|| ResourceId::workspace(&location.target, &location.workspace));
-    capabilities
+    resource: Option<&ResourceId>,
+) -> Result<Vec<PermissionUse>, AdmissionError> {
+    if capabilities.is_empty() {
+        return Ok(Vec::new());
+    }
+    let resource = match resource {
+        Some(resource) => resource.clone(),
+        None => ResourceId::workspace(&location.target, &PathText::new(&location.workspace)?),
+    };
+    Ok(capabilities
         .into_iter()
         .map(|capability| PermissionUse::new(capability, resource.clone()))
-        .collect()
+        .collect())
 }
 
 #[cfg(test)]
@@ -699,15 +747,20 @@ pub(crate) mod tests {
                     .any(|permission| matches!(permission.resource, ResourceId::Path { .. }))
             );
         }
-        let denied = catalog
+        // A missing capability makes the tool unavailable; it is not a denial.
+        let unavailable = catalog
             .run(
                 "write",
                 serde_json::json!({"path":"missing","content":"denied"}),
                 context,
                 root.path(),
             )
-            .await;
-        assert!(denied.is_err_and(|error| error.diagnostic().is_denial()));
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unavailable.diagnostic().cause,
+            LocalError::unavailable("write").diagnostic().cause
+        );
         assert!(!root.path().join("missing").exists());
         assert_eq!(authorizations.0.lock().unwrap().len(), 1);
         output.settle().await.unwrap();

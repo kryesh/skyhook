@@ -1,6 +1,9 @@
 //! Start local or remote jobs after planning and authorization.
 
+use futures_util::future::{BoxFuture, OptionFuture};
+
 use super::*;
+use crate::{remote::PreparedConnection, tool::source::Source};
 
 impl ToolExecutor {
     pub(super) fn job_spec(&self, plan: &InvocationPlan) -> JobSpec {
@@ -12,7 +15,12 @@ impl ToolExecutor {
             tool: plan.tool.name().to_owned(),
             name: plan.launch.name.clone(),
             arguments: plan.original_arguments.clone(),
-            output_schema: plan.tool.output_schema(&self.capabilities),
+            output_schema: match plan.result_policy() {
+                crate::tool::ToolResultPolicy::Value => plan.tool.output_schema(&self.capabilities),
+                crate::tool::ToolResultPolicy::JobView => {
+                    Some(crate::job::presented_job_schema(false))
+                }
+            },
             accepts_input: plan.tool.accepts_input(),
             background: plan.launch.background,
             location: plan.execution_location.clone(),
@@ -50,14 +58,10 @@ impl ToolExecutor {
             )
             .await
         {
-            let error = match error {
-                AuthorizationError::Cancelled => return Err(self.cancelled(lease).await),
-                AuthorizationError::Unavailable => {
-                    ExecutionError::UnavailableTool(plan.tool.name().to_owned())
-                }
-                error => crate::tool::AdmissionError::from(error).into(),
+            if let AuthorizationError::Cancelled = error {
+                return Err(self.cancelled(lease).await);
             }
-            .or(
+            let error = ExecutionError::from(crate::tool::AdmissionError::from(error)).or(
                 PartialContext::new(
                     Operation::Authorize,
                     Subject::Tool(plan.tool.name().to_owned()),
@@ -72,32 +76,30 @@ impl ToolExecutor {
         // admission snapshot under the router mutation gate. No gate is held
         // across physical tool IO or promises execution-time freshness.
         let lease = lease.run().await?;
-        let dispatch = match plan.dispatch {
-            InvocationDispatch::Local(admitted) => InvocationDispatch::Local(admitted),
-            InvocationDispatch::ReadError(output) => InvocationDispatch::ReadError(output),
-            InvocationDispatch::Remote { remote, arguments } => {
-                match remote
-                    .router
-                    .prepare(remote.route, &plan.execution_location.workspace, &subject)
+        // A failed source connection stops before the tool's own connection opens.
+        let connected =
+            match OptionFuture::from(plan.source.map(|source| connect_source(source, &subject)))
+                .await
+                .transpose()
+            {
+                Ok(source) => connect(plan.dispatch, &plan.execution_location.workspace, &subject)
                     .await
-                {
-                    Ok(connection) => InvocationDispatch::Remote {
-                        remote: connection,
-                        arguments,
-                    },
-                    Err(RemoteError::Cancelled) => return Err(self.cancelled(lease).await),
-                    Err(error) => {
-                        let error = ExecutionError::Tool(error.into_tool_error()).or(
-                            PartialContext::new(
-                                Operation::Connect,
-                                Subject::Tool(plan.tool.name().to_owned()),
-                            )
-                            .at(FailureSite::Host),
-                            &self.capabilities,
-                        );
-                        return Err(self.fail_start(lease, error).await);
-                    }
-                }
+                    .map(|dispatch| (dispatch, source)),
+                Err(error) => Err(error),
+            };
+        let (dispatch, source) = match connected {
+            Ok(connected) => connected,
+            Err(RemoteError::Cancelled) => return Err(self.cancelled(lease).await),
+            Err(error) => {
+                let error = ExecutionError::Tool(error.into_tool_error()).or(
+                    PartialContext::new(
+                        Operation::Connect,
+                        Subject::Tool(plan.tool.name().to_owned()),
+                    )
+                    .at(FailureSite::Host),
+                    &self.capabilities,
+                );
+                return Err(self.fail_start(lease, error).await);
             }
         };
         if lease.cancellation_token().is_cancelled() {
@@ -148,20 +150,8 @@ impl ToolExecutor {
                     if context.is_cancelled() {
                         return Err(ToolError::cancelled().effects(Effects::NotStarted));
                     }
-                    match dispatch {
-                        InvocationDispatch::Local(admitted) => match admitted {
-                            Ok(admitted) => admitted.call(context).await,
-                            Err(error) => Err(error.into()),
-                        },
-                        InvocationDispatch::ReadError(output) => Ok(*output),
-                        InvocationDispatch::Remote {
-                            remote: connection,
-                            arguments,
-                        } => connection
-                            .execute(tool.name().to_owned(), arguments, &context)
-                            .await
-                            .map_err(crate::remote::RemoteError::into_tool_error),
-                    }
+                    let source = open_source(source, tool.name(), &context).await?;
+                    run(dispatch, tool.name(), context.with_source(source)).await
                 }
                 .await;
                 let result = result.map(|mut output| {
@@ -193,6 +183,91 @@ impl ToolExecutor {
             .await;
         error
     }
+}
+
+async fn connect(
+    dispatch: InvocationDispatch<PlannedRemote>,
+    workspace: &std::path::Path,
+    subject: &AuthorizationSubject,
+) -> Result<InvocationDispatch<PreparedConnection>, RemoteError> {
+    Ok(match dispatch {
+        InvocationDispatch::Local(admitted) => InvocationDispatch::Local(admitted),
+        InvocationDispatch::ReadError(output) => InvocationDispatch::ReadError(output),
+        InvocationDispatch::Remote { remote, arguments } => InvocationDispatch::Remote {
+            remote: remote
+                .router
+                .prepare(remote.route, workspace, subject)
+                .await?,
+            arguments,
+        },
+    })
+}
+
+async fn connect_source(
+    source: SourcePlan<PlannedRemote>,
+    subject: &AuthorizationSubject,
+) -> Result<SourcePlan<PreparedConnection>, RemoteError> {
+    Ok(match source {
+        SourcePlan::Local { path, location } => SourcePlan::Local { path, location },
+        SourcePlan::Remote {
+            remote,
+            workspace,
+            path,
+        } => SourcePlan::Remote {
+            remote: remote
+                .router
+                .prepare(remote.route, &workspace, subject)
+                .await?,
+            workspace,
+            path,
+        },
+    })
+}
+
+/// Boxed, like `run`, to keep the executor's future types shallow.
+fn open_source<'a>(
+    source: Option<SourcePlan<PreparedConnection>>,
+    tool: &str,
+    context: &'a ToolContext,
+) -> BoxFuture<'a, Result<Option<Source>, ToolError>> {
+    let tool = tool.to_owned();
+    Box::pin(async move {
+        Ok(Some(match source {
+            None => return Ok(None),
+            Some(SourcePlan::Local { path, location }) => {
+                Source::open(&path).await.map_err(|error| {
+                    ToolError::from(error)
+                        .or(PartialContext::default().at(FailureSite::Execution(location)))
+                })?
+            }
+            Some(SourcePlan::Remote { remote, path, .. }) => remote
+                .read_source(tool, path, context)
+                .await
+                .map_err(RemoteError::into_tool_error)?,
+        }))
+    })
+}
+
+/// Boxed so the executor's future types stay shallow enough for Send inference.
+fn run(
+    dispatch: InvocationDispatch<PreparedConnection>,
+    tool: &str,
+    context: ToolContext,
+) -> BoxFuture<'static, Result<ToolOutput, ToolError>> {
+    let tool = tool.to_owned();
+    Box::pin(async move {
+        match dispatch {
+            InvocationDispatch::Local(admitted) => admitted?.call(context).await,
+            InvocationDispatch::ReadError(output) => Ok(*output),
+            InvocationDispatch::Remote {
+                remote: connection,
+                arguments,
+            } => connection
+                .execute(tool, arguments, &context)
+                .await
+                .map_err(RemoteError::into_tool_error),
+        }
+    })
 }
 
 /// Cancellation determines the outcome, not whether already observed effects or
@@ -228,7 +303,6 @@ fn cancellation_result(
 
 #[cfg(test)]
 mod tests {
-    use super::super::planning::tests::router;
     use super::*;
     use crate::{
         target::{TargetDefinition, TargetRegistry},
@@ -252,7 +326,7 @@ mod tests {
             let grants = request
                 .permissions
                 .iter()
-                .filter_map(|p| p.proposed_grant.clone())
+                .filter_map(PermissionUse::proposed_grant)
                 .collect();
             self.requests.lock().unwrap().push(request);
             Box::pin(async move {
@@ -443,7 +517,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         let executor = runtime.executor_with_policy(remote_tool(Vec::new()), policy.clone());
-        let executor = remote_executor(executor, router(targets(), policy.clone()));
+        let executor = remote_executor(executor, TargetRouter::test(targets(), policy.clone()));
         let running = spawn_remote(&executor, &runtime.agent);
         while policy.requests.lock().unwrap().is_empty() {
             tokio::task::yield_now().await;

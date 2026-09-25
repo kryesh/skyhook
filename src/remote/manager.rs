@@ -58,19 +58,41 @@ impl PreparedConnection {
         arguments: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolOutput, RemoteError> {
-        let destination = ExecutionLocation::named(
-            self.key.route.destination().clone(),
-            self.key.workspace.clone(),
-        );
         let result = self
             .connection
-            .execute(name, arguments, context, destination)
+            .execute(name, arguments, context, self.destination())
             .await;
-        // Worker I/O failures do not imply that the pooled transport failed.
-        if self.connection.is_failed().await {
-            self.manager.discard(&self).await;
-        }
+        self.release().await;
         result
+    }
+
+    /// Read a source file for `tool` on the connected machine into a local spool.
+    pub(crate) async fn read_source(
+        self,
+        tool: String,
+        path: String,
+        context: &ToolContext,
+    ) -> Result<crate::tool::source::Source, RemoteError> {
+        let result = self
+            .connection
+            .read_source(tool, path, context, self.destination())
+            .await;
+        self.release().await;
+        result
+    }
+
+    fn destination(&self) -> ExecutionLocation {
+        ExecutionLocation::named(
+            self.key.route.destination().clone(),
+            self.key.workspace.clone(),
+        )
+    }
+
+    /// Worker I/O failures do not imply that the pooled transport failed.
+    async fn release(&self) {
+        if self.connection.is_failed().await {
+            self.manager.discard(self).await;
+        }
     }
 }
 

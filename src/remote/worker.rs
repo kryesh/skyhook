@@ -8,12 +8,13 @@ use futures_util::future::BoxFuture;
 use serde_json::Value;
 use tokio::{
     io::{AsyncRead, AsyncWrite},
-    sync::{Mutex, oneshot},
+    sync::{Mutex, mpsc, oneshot},
     task::JoinSet,
 };
-use tokio_util::sync::CancellationToken;
+use tokio_util::{sync::CancellationToken, task::AbortOnDropHandle};
 
 use super::{
+    flow::{CHUNK_BYTES, WINDOW},
     payload::PayloadSender,
     protocol::{
         AuthorizationId, RemoteToolError, Request, RequestId, Response, read_frame,
@@ -21,10 +22,13 @@ use super::{
     },
 };
 use crate::tool::{
+    diagnostic::{Operation, Subject},
     invocation::{
         AdmissionError, CANCELLATION_GRACE, LocalAuthorizer, LocalCatalog, LocalContext, LocalError,
     },
+    output::ProducedOutput,
     policy::{Capability, PermissionUse, ResourceId},
+    source::{Source, Spool, open_on_worker},
 };
 
 type WorkerResult = Result<(), Box<dyn std::error::Error + Send + Sync>>;
@@ -69,6 +73,7 @@ where
         credits,
         tasks,
         active: HashMap::new(),
+        uploads: HashMap::new(),
     };
     let result = async {
         loop {
@@ -111,7 +116,20 @@ struct Worker<W> {
     credits: super::flow::Credits,
     tasks: JoinSet<(WorkerTask, std::io::Result<()>)>,
     active: HashMap<RequestId, ActiveRequest>,
+    /// Calls whose source is still arriving; each starts at its `SourceEnd`.
+    uploads: HashMap<RequestId, Upload>,
 }
+
+struct Upload {
+    capabilities: Vec<Capability>,
+    name: String,
+    arguments: Value,
+    chunks: mpsc::Sender<Vec<u8>>,
+    /// Spools the chunks off the request loop; dropping the upload stops it.
+    spooled: Spooled,
+}
+
+type Spooled = AbortOnDropHandle<std::io::Result<Source>>;
 
 impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
     async fn handle(&mut self, request: Request) -> WorkerResult {
@@ -121,12 +139,80 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
                 name,
                 arguments,
                 capabilities,
+                source,
             } => {
-                self.start(request_id, name, arguments, capabilities)?;
+                if !source {
+                    let work = Work::Tool {
+                        name,
+                        arguments,
+                        source: None,
+                    };
+                    return self.start(request_id, capabilities, work);
+                }
+                self.ensure_new(request_id)?;
+                let (chunks, received) = mpsc::channel(WINDOW);
+                let spool = spool_upload(request_id, received, self.output.clone());
+                let upload = Upload {
+                    capabilities,
+                    name,
+                    arguments,
+                    chunks,
+                    spooled: AbortOnDropHandle::new(tokio::spawn(spool)),
+                };
+                self.uploads.insert(request_id, upload);
             }
+            Request::SourceData { request_id, data } => {
+                if data.len() > CHUNK_BYTES {
+                    return Err("oversized source chunk".into());
+                }
+                let upload = self
+                    .uploads
+                    .get(&request_id)
+                    .ok_or("source data for an unknown request")?;
+                // A closed spool has already failed; the call reports it when it starts.
+                if let Err(mpsc::error::TrySendError::Full(_)) = upload.chunks.try_send(data) {
+                    return Err("source upload flow-control overflow".into());
+                }
+            }
+            Request::SourceEnd { request_id } => {
+                let Upload {
+                    capabilities,
+                    name,
+                    arguments,
+                    chunks,
+                    spooled,
+                } = self
+                    .uploads
+                    .remove(&request_id)
+                    .ok_or("source end for an unknown request")?;
+                // Closing the channel lets the spool finish after its queued chunks.
+                drop(chunks);
+                self.start(
+                    request_id,
+                    capabilities,
+                    Work::Tool {
+                        name,
+                        arguments,
+                        source: Some(spooled),
+                    },
+                )?;
+            }
+            Request::ReadSource {
+                request_id,
+                tool,
+                path,
+                capabilities,
+            } => self.start(request_id, capabilities, Work::ReadSource { tool, path })?,
             Request::Cancel { request_id } => {
                 if let Some(request) = self.active.get(&request_id) {
                     request.cancellation.cancel();
+                } else if self.uploads.remove(&request_id).is_some() {
+                    // The call never started; it still owes the host a terminal result.
+                    let sender = self.payloads.request(request_id);
+                    self.tasks.spawn(async move {
+                        let result = Err(remote_error(LocalError::cancelled()));
+                        (WorkerTask::Request(request_id), sender.finish(result).await)
+                    });
                 }
             }
             Request::PayloadAck => self.credits.acknowledge()?,
@@ -158,16 +244,15 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
         Ok(())
     }
 
-    fn start(
-        &mut self,
-        id: RequestId,
-        name: String,
-        arguments: Value,
-        capabilities: Vec<Capability>,
-    ) -> WorkerResult {
-        if self.active.contains_key(&id) {
+    fn ensure_new(&self, id: RequestId) -> WorkerResult {
+        if self.active.contains_key(&id) || self.uploads.contains_key(&id) {
             return Err(format!("duplicate request ID {}", id.get()).into());
         }
+        Ok(())
+    }
+
+    fn start(&mut self, id: RequestId, capabilities: Vec<Capability>, work: Work) -> WorkerResult {
+        self.ensure_new(id)?;
         let sender = self.payloads.request(id);
         let produced = sender.context();
         let cancellation = CancellationToken::new();
@@ -180,12 +265,12 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
             produced.clone(),
             Arc::new(ForwardAuthorization {
                 request_id: id,
-                tool: name.clone(),
+                tool: work.name().to_owned(),
                 output: self.output.clone(),
                 pending: authorizations.clone(),
                 next: StdMutex::new(Some(AuthorizationId(0))),
             }),
-            arguments.clone(),
+            work.arguments(),
         );
         self.active.insert(
             id,
@@ -196,9 +281,38 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
         );
         let catalog = self.catalog.clone();
         let root = self.authorization_root.clone();
+        let source_output = sender.clone();
         self.tasks.spawn(async move {
             let execution = async {
-                let call = catalog.run(&name, arguments, context, &root);
+                let call: BoxFuture<'_, _> = match work {
+                    Work::Tool {
+                        name,
+                        arguments,
+                        source,
+                    } => Box::pin(async move {
+                        let source = match source {
+                            Some(spooled) => Some(
+                                spooled
+                                    .await
+                                    .map_err(std::io::Error::other)
+                                    .and_then(|spooled| spooled)
+                                    .map_err(source_error(Operation::Receive))?,
+                            ),
+                            None => None,
+                        };
+                        catalog
+                            .run(&name, arguments, context.with_source(source), &root)
+                            .await
+                    }),
+                    Work::ReadSource { tool, path } => Box::pin(async move {
+                        let file = open_on_worker(&tool, &path, &context, &root).await?;
+                        source_output
+                            .send_source(file)
+                            .await
+                            .map_err(source_error(Operation::Send))?;
+                        Ok(ProducedOutput::new(Value::Null))
+                    }),
+                };
                 tokio::pin!(call);
                 let result = tokio::select! {
                     result = &mut call => result,
@@ -221,6 +335,62 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
             (WorkerTask::Request(id), sender.finish(result).await)
         });
         Ok(())
+    }
+}
+
+/// Spool an upload's chunks, acknowledging each so the host may send another.
+/// A spool failure is reported when the call starts; later chunks are still
+/// acknowledged so the upload reaches its end.
+async fn spool_upload<W: AsyncWrite + Unpin + Send + 'static>(
+    request_id: RequestId,
+    mut chunks: mpsc::Receiver<Vec<u8>>,
+    output: Arc<Mutex<W>>,
+) -> std::io::Result<Source> {
+    let mut spool = Spool::new().await;
+    while let Some(data) = chunks.recv().await {
+        if let Ok(file) = &mut spool
+            && let Err(error) = file.append(&data).await
+        {
+            spool = Err(error);
+        }
+        let acknowledgement = Response::SourceAck { request_id };
+        spawn_owned_write(output.clone().lock_owned().await, acknowledgement).await?;
+    }
+    spool?.finish().await
+}
+
+fn source_error(operation: Operation) -> impl FnOnce(std::io::Error) -> LocalError {
+    move |error| LocalError::io(error).operation(operation, Subject::Label("source".into()))
+}
+
+/// What a request asks the worker to run.
+enum Work {
+    Tool {
+        name: String,
+        arguments: Value,
+        /// A source still being received.
+        source: Option<Spooled>,
+    },
+    ReadSource {
+        /// The tool consuming the source on another machine.
+        tool: String,
+        path: String,
+    },
+}
+
+impl Work {
+    /// The operation named in forwarded authorization requests.
+    fn name(&self) -> &str {
+        match self {
+            Self::Tool { name, .. } | Self::ReadSource { tool: name, .. } => name,
+        }
+    }
+
+    fn arguments(&self) -> Value {
+        match self {
+            Self::Tool { arguments, .. } => arguments.clone(),
+            Self::ReadSource { path, .. } => serde_json::json!({ "path": path }),
+        }
     }
 }
 
@@ -348,10 +518,12 @@ mod tests {
         execution::ExecutionLocation,
         identity::JobId,
         job::{JobEnvelope, JobSpec, JobState},
-        remote::{RejectSensitivePrompts, client::PooledConnection, transport::Transport},
+        remote::{
+            RejectSensitivePrompts, RemoteError, client::PooledConnection, transport::Transport,
+        },
         tests::{RecordingPolicy, TestRuntime},
         tool::{
-            ToolContext,
+            ToolContext, ToolOutput,
             authorization::{AuthorizationCoordinator, AuthorizationSubject},
             policy::{AuthorizationRequest, CapabilitySet, Policy, PolicyDecision, PolicyFuture},
         },
@@ -407,6 +579,67 @@ mod tests {
         }
 
         async fn tool(&self, capabilities: CapabilitySet, name: &str, arguments: Value) -> JobId {
+            self.tool_with_source(capabilities, name, arguments, None)
+                .await
+        }
+
+        async fn tool_with_source(
+            &self,
+            capabilities: CapabilitySet,
+            name: &str,
+            arguments: Value,
+            source: Option<Source>,
+        ) -> JobId {
+            let tool = name.to_owned();
+            let call_arguments = arguments.clone();
+            self.job(
+                capabilities,
+                name,
+                arguments,
+                source,
+                move |connection, context| async move {
+                    let destination = context.execution_location().clone();
+                    connection
+                        .execute(tool, call_arguments, &context, destination)
+                        .await
+                },
+            )
+            .await
+        }
+
+        async fn read_source(&self, capabilities: CapabilitySet, path: String) -> JobId {
+            let arguments = serde_json::json!({"path": path});
+            self.job(
+                capabilities,
+                "write",
+                arguments,
+                None,
+                move |connection, context| async move {
+                    let destination = context.execution_location().clone();
+                    let source =
+                        (connection.read_source("write".to_owned(), path, &context, destination))
+                            .await?;
+                    let mut bytes = Vec::new();
+                    std::io::Read::read_to_end(&mut source.reader().unwrap(), &mut bytes).unwrap();
+                    Ok(ToolOutput::new(serde_json::json!(bytes)))
+                },
+            )
+            .await
+        }
+
+        /// Run one remote call as a job, recording its result like the executor.
+        async fn job<F, Fut>(
+            &self,
+            capabilities: CapabilitySet,
+            name: &str,
+            arguments: Value,
+            source: Option<Source>,
+            call: F,
+        ) -> JobId
+        where
+            F: FnOnce(Arc<PooledConnection>, ToolContext) -> Fut + Send + 'static,
+            Fut: Future<Output = Result<ToolOutput, RemoteError>> + Send,
+        {
             let mut spec = JobSpec::test(self.runtime.agent.clone(), name);
             spec.arguments = arguments.clone();
             spec.location = ExecutionLocation {
@@ -432,27 +665,16 @@ mod tests {
                 input,
                 self.runtime.jobs.clone(),
             )
-            .with_invocation_authority(
-                self.authorization.clone(),
-                name.to_owned(),
-                arguments.clone(),
-            );
+            .with_invocation_authority(self.authorization.clone(), name.to_owned(), arguments)
+            .with_source(source);
             let connection = self.connection.clone();
-            let name = name.to_owned();
             worker
                 .start_supervised(async move {
-                    let result = connection
-                        .execute(
-                            name,
-                            arguments,
-                            &context,
-                            context.execution_location().clone(),
-                        )
-                        .await;
+                    let result = call(connection, context.clone()).await;
                     if context.is_cancelled() {
                         Err(crate::tool::ToolError::cancelled())
                     } else {
-                        result.map_err(crate::remote::RemoteError::into_tool_error)
+                        result.map_err(RemoteError::into_tool_error)
                     }
                 })
                 .await
@@ -477,6 +699,197 @@ mod tests {
         }
     }
 
+    /// A call cancelled while its source is still arriving never starts, still
+    /// answers with a terminal result, and releases its upload.
+    #[tokio::test]
+    async fn cancelled_uploads_finish_without_starting_the_call() {
+        use crate::remote::protocol::{PayloadEvent, PayloadId, Response, read_frame, write_frame};
+        let root = tempfile::tempdir().unwrap();
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut responses, mut requests) = tokio::io::split(client);
+        let (server_input, server_output) = tokio::io::split(server);
+        let root_path = root.path().to_owned();
+        let worker = tokio::spawn(serve_io_at(server_input, server_output, root_path.clone()));
+        let id = RequestId::FIRST;
+        let destination = root_path.join("never-written");
+        for request in [
+            Request::Hello,
+            Request::Tool {
+                request_id: id,
+                name: "write".into(),
+                arguments: serde_json::json!({"path": destination, "source": {"path": "x"}}),
+                capabilities: vec![Capability::Write],
+                source: true,
+            },
+            Request::SourceData {
+                request_id: id,
+                data: b"partial".to_vec(),
+            },
+            Request::Cancel { request_id: id },
+        ] {
+            write_frame(&mut requests, &request).await.unwrap();
+        }
+        let mut result = Vec::new();
+        loop {
+            match bounded(read_frame::<_, Response>(&mut responses))
+                .await
+                .unwrap()
+            {
+                Some(Response::Payload { event, .. }) => {
+                    if let PayloadEvent::Data {
+                        id: PayloadId::Result,
+                        data,
+                    } = event
+                    {
+                        result.extend(data);
+                    }
+                    write_frame(&mut requests, &Request::PayloadAck)
+                        .await
+                        .unwrap();
+                }
+                Some(Response::Tool { request_id }) if request_id == id => break,
+                Some(_) => {}
+                None => panic!("worker closed before the terminal result"),
+            }
+        }
+        let result: crate::remote::protocol::RemoteToolResult =
+            serde_json::from_slice(&result).unwrap();
+        assert!(result.is_err());
+        assert!(!destination.exists());
+        drop((requests, responses));
+        bounded(worker).await.unwrap().unwrap();
+    }
+
+    /// Spooling an upload never holds up the request loop: while the upload's
+    /// acknowledgements are stuck behind an unread output, the worker still
+    /// starts other calls, and a Cancel stops the upload before its call starts.
+    #[tokio::test]
+    async fn requests_are_served_while_an_upload_is_stalled() {
+        use crate::remote::protocol::{PayloadEvent, PayloadId, RemoteToolResult};
+        let root = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        // Room for a few acknowledgements only: the rest wait for the host to read.
+        let (client, server) = tokio::io::duplex(256);
+        let (mut responses, mut requests) = tokio::io::split(client);
+        let (server_input, server_output) = tokio::io::split(server);
+        let worker = tokio::spawn(serve_io_at(server_input, server_output, root_path.clone()));
+        write_frame(&mut requests, &Request::Hello).await.unwrap();
+        assert!(matches!(
+            bounded(read_frame(&mut responses)).await.unwrap(),
+            Some(Response::Ready)
+        ));
+        let (upload, sibling) = (RequestId::FIRST, RequestId::FIRST.next().unwrap());
+        let never_written = root_path.join("never-written");
+        let written = root_path.join("sibling");
+        let chunks = (0..WINDOW).map(|_| Request::SourceData {
+            request_id: upload,
+            data: b"chunk".to_vec(),
+        });
+        let requests_in_order = std::iter::once(Request::Tool {
+            request_id: upload,
+            name: "write".into(),
+            arguments: serde_json::json!({"path": never_written, "source": {"path": "x"}}),
+            capabilities: vec![Capability::Write],
+            source: true,
+        })
+        .chain(chunks)
+        .chain(std::iter::once(Request::Tool {
+            request_id: sibling,
+            name: "write".into(),
+            arguments: serde_json::json!({"path": written, "content": "sibling"}),
+            capabilities: vec![Capability::Write],
+            source: false,
+        }));
+        bounded(async {
+            for request in requests_in_order {
+                write_frame(&mut requests, &request).await.unwrap();
+            }
+            while !written.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        write_frame(&mut requests, &Request::Cancel { request_id: upload })
+            .await
+            .unwrap();
+        let mut results = HashMap::<RequestId, Vec<u8>>::new();
+        let (mut acknowledged, mut finished) = (0, 0);
+        while finished < 2 {
+            match bounded(read_frame::<_, Response>(&mut responses))
+                .await
+                .unwrap()
+                .expect("worker closed before the terminal results")
+            {
+                Response::Payload { request_id, event } => {
+                    if let PayloadEvent::Data {
+                        id: PayloadId::Result,
+                        data,
+                    } = event
+                    {
+                        results.entry(request_id).or_default().extend(data);
+                    }
+                    write_frame(&mut requests, &Request::PayloadAck)
+                        .await
+                        .unwrap();
+                }
+                Response::SourceAck { request_id } if request_id == upload => acknowledged += 1,
+                Response::Tool { .. } => finished += 1,
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+        let result = |id| serde_json::from_slice::<RemoteToolResult>(&results[&id]).unwrap();
+        assert!(result(upload).is_err());
+        assert!(result(sibling).is_ok());
+        assert!(acknowledged <= WINDOW);
+        assert!(!never_written.exists());
+        drop((requests, responses));
+        bounded(worker).await.unwrap().unwrap();
+    }
+
+    /// Sources stream across the protocol in both directions, in more chunks
+    /// than one credit window: read on the machine holding the file, and
+    /// delivered with the call that consumes them.
+    #[tokio::test]
+    async fn sources_are_read_on_the_worker_and_delivered_with_calls() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = std::fs::canonicalize(root.path()).unwrap();
+        let binary: Vec<u8> = (0..CHUNK_BYTES * (WINDOW + 2) + 11)
+            .map(|index| (index % 253) as u8)
+            .collect();
+        std::fs::write(root_path.join("asset.bin"), &binary).unwrap();
+        let worker = Harness::start(root_path.clone(), RecordingPolicy::allowing()).await;
+        let read = [Capability::Read].into_iter().collect::<CapabilitySet>();
+        let asset = root_path.join("asset.bin").to_str().unwrap().to_owned();
+        let job = worker.read_source(read, asset.clone()).await;
+        let output = worker.result(job).await.output.unwrap();
+        assert_eq!(serde_json::from_value::<Vec<u8>>(output).unwrap(), binary);
+        // Without the read capability the worker refuses the source as the consuming tool.
+        let job = worker.read_source(CapabilitySet::empty(), asset).await;
+        let refused = worker.result(job).await;
+        assert_eq!(refused.state, JobState::Failed);
+        assert_eq!(
+            refused.diagnostic.unwrap().cause,
+            crate::tool::diagnostic::Cause::Message(
+                "tool `write` is unavailable in this context".into()
+            )
+        );
+
+        let write = [Capability::Write].into_iter().collect::<CapabilitySet>();
+        let arguments = serde_json::json!({
+            "path": root_path.join("copy.bin"),
+            "source": {"path": "held-by-another-machine"},
+        });
+        let host = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(host.path(), &binary).unwrap();
+        let source = Source::open(host.path()).await.unwrap();
+        let job = worker
+            .tool_with_source(write, "write", arguments, Some(source))
+            .await;
+        assert_eq!(worker.result(job).await.state, JobState::Completed);
+        assert_eq!(std::fs::read(root_path.join("copy.bin")).unwrap(), binary);
+        worker.finish().await;
+    }
+
     #[tokio::test]
     async fn worker_enforces_exact_capabilities_and_noninteractive_exec_sessions() {
         let worker = Harness::start(
@@ -495,7 +908,7 @@ mod tests {
                 .tool(
                     capabilities.into_iter().collect(),
                     "exec",
-                    serde_json::json!({"argv":["/bin/sh", "-c", "printf exact"]}),
+                    serde_json::json!({"command":["/bin/sh", "-c", "printf exact"]}),
                 )
                 .await;
             let result = worker.result(job).await;
@@ -515,7 +928,7 @@ mod tests {
                 .tool(
                     capabilities,
                     "exec",
-                    serde_json::json!({"argv":["/bin/sh", "-c", stat]}),
+                    serde_json::json!({"command":["/bin/sh", "-c", stat]}),
                 )
                 .await;
             let result = worker.result(job).await.output.unwrap();
@@ -560,7 +973,10 @@ mod tests {
                 .unwrap(),
             text.as_bytes()
         );
-        let expected = ResourceId::path(&"remote".parse().unwrap(), &path);
+        let expected = ResourceId::path(
+            &"remote".parse().unwrap(),
+            &crate::tool::policy::PathText::new(&path).unwrap(),
+        );
         assert!(
             policy
                 .requests
@@ -657,13 +1073,16 @@ mod tests {
                 .permissions
                 .iter()
                 .any(|permission| permission.resource
-                    == ResourceId::path(&"remote".parse().unwrap(), file.path()))
+                    == ResourceId::path(
+                        &"remote".parse().unwrap(),
+                        &crate::tool::policy::PathText::new(file.path()).unwrap(),
+                    ))
         );
         let sibling = worker
             .tool(
                 CapabilitySet::default(),
                 "exec",
-                serde_json::json!({"argv":["/bin/sh", "-c", "printf sibling"]}),
+                serde_json::json!({"command":["/bin/sh", "-c", "printf sibling"]}),
             )
             .await;
         assert_eq!(
@@ -677,7 +1096,7 @@ mod tests {
             .tool(
                 CapabilitySet::default(),
                 "exec",
-                serde_json::json!({"argv":["/bin/sh", "-c", "printf reusable"]}),
+                serde_json::json!({"command":["/bin/sh", "-c", "printf reusable"]}),
             )
             .await;
         assert_eq!(
@@ -702,7 +1121,7 @@ mod tests {
             .tool(
                 CapabilitySet::default(),
                 "exec",
-                serde_json::json!({"argv":["/bin/sh", "-c", "printf before; sleep 3600"]}),
+                serde_json::json!({"command":["/bin/sh", "-c", "printf before; sleep 3600"]}),
             )
             .await;
         bounded(async {
@@ -733,7 +1152,7 @@ mod tests {
         );
         worker.runtime.jobs.cancel(job).await.unwrap();
         assert_eq!(worker.result(job).await.state, JobState::Cancelled);
-        let job = worker.tool(CapabilitySet::default(), "exec", serde_json::json!({"argv":["/bin/sh", "-c", "printf before; sleep 30"], "timeout":1})).await;
+        let job = worker.tool(CapabilitySet::default(), "exec", serde_json::json!({"command":["/bin/sh", "-c", "printf before; sleep 30"], "timeout":1})).await;
         let result = worker.result(job).await;
         assert_eq!(result.state, JobState::Failed);
         assert_eq!(result.output.unwrap()["timed_out"], true);

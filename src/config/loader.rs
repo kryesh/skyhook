@@ -127,7 +127,7 @@ async fn resolve_paths(
             diagnostic(workspace, error.to_string()),
         )
     })?;
-    let workspace_path = workspace.join(".skyhook/config.yaml");
+    let workspace_path = super::paths::workspace_config_path(&workspace);
     match read_layer(&workspace_path).await {
         Ok(value) => {
             merge(&mut merged, value, &mut Vec::new());
