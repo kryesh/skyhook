@@ -73,14 +73,14 @@ grep-regex = "0.1.14"
 grep-searcher = "0.1.17"
 http = "1.5.0"
 httpdate = "1.0.3"
-hyper-util = { version = "0.1.20", default-features = false, features = [
+hyper-util = { version = "0.1", default-features = false, features = [
     "client-legacy",
     "client-proxy",
     "tokio",
 ] }
 ignore = "0.4.31"
 indexmap = { version = "2", features = ["serde"] }
-jsonschema = { version = "0.56", default-features = false }
+jsonschema = { version = "0.57", default-features = false }
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 mimalloc = { version = "0.1", features = ["override"] }
 reqwest = { version = "0.13.4", default-features = false, features = [
@@ -94,7 +94,7 @@ reqwest = { version = "0.13.4", default-features = false, features = [
     "zstd",
     "http2",
 ] }
-rmcp = { version = "3.2.0", default-features = false, features = [
+rmcp = { version = "3", default-features = false, features = [
     "client",
     "transport-async-rw",
     "transport-streamable-http-client-reqwest",
@@ -114,7 +114,7 @@ sha2 = "0.11"
 # Must match rmcp's sse-stream minor version: its transport API exposes these types.
 sse-stream = "0.2.6"
 tempfile = "3.24.0"
-thiserror = "2.0.20"
+thiserror = "2"
 tokio = { version = "1.53.1", features = [
     "fs",
     "io-std",
