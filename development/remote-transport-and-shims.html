@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -212,9 +212,10 @@ It does not transparently replay the failed tool operation.</p>
 <p>Once connected, request IDs associate output and cancellation with individual operations.
 SSH cancellation remains best-effort: the client does not await a terminal reply. Already captured
 output remains inspectable, but final worker diagnostics or structured results may be unavailable.
-Credit-based flow control bounds queued payload and relayed-stream data. A transport’s lifetime
-owner retains its underlying process resources; dropping it tears those resources down. A relayed
-connection also retains its origin connection for the lifetime of the child stream.</p>
+Credit-based flow control bounds queued payload, source-upload, and relayed-stream data. A
+transport’s lifetime owner retains its underlying process resources; dropping it tears those
+resources down. A relayed connection also retains its origin connection for the lifetime of the
+child stream.</p>
 <p>Accepted-payload ingestion is tracked independently of pool membership and caller lifetime. Pool
 eviction does not abort the reader; dropping the last <code>PooledConnection</code> owner cancels routing
 instead. When routing ends through cancellation or failure, the reader releases the transport
@@ -247,9 +248,11 @@ targets use the origin’s inherited agent socket instead. Ordinary processes
 started by a remote worker receive OpenSSH’s forwarded <code>SSH_AUTH_SOCK</code>; no second forwarding
 listener is needed.</p>
 <p>SSH authentication prompts use <code>SensitivePromptHandler</code>, separate from model questions and tool
-output. Remote prompts and answers travel as private control messages, not session events or
-saved results. OpenSSH is given an explicit askpass helper so the host can handle passwords,
-passphrases, and confirmations without exposing them to the agent transcript.</p>
+output. Remote prompts and their typed answers (a secret, a confirmation or a rejection) travel as
+private control messages, not session events or saved results. OpenSSH is given an explicit askpass
+helper so the host can handle passwords, passphrases, and confirmations without exposing them to
+the agent transcript; the helper prints a secret, answers <code>yes</code> to a confirmed host key, and exits
+nonzero for a rejection.</p>
 <p>Each askpass server keeps its helper and socket in a private temporary directory and accepts
 only peers running as its own user. This prevents other local users from injecting
 prompts or obtaining answers through the socket; it is not an isolation boundary against other
@@ -278,8 +281,9 @@ produced them. Debug builds (<code>just build</code>) read the directory live, s
 CLI rebuild. Release builds (<code>just build-release</code>) include bytes at compile time and are
 self-contained. That recipe touches the embedding module first because <code>rust-embed</code> cannot detect
 newly added files. Debug shim artifacts are substantially larger than release artifacts.</p>
-<p>A missing or empty staging directory yields an empty catalog; SSH then reports an explicit
-missing-shim error. Library hosts inject their own <a href="embedding.html#embedded-shim-catalog">embedded catalog</a>
+<p>Artifact names outside this table are rejected when the catalog is built. A missing or empty
+staging directory yields an empty catalog; SSH then reports an explicit missing-shim error, distinct
+from an unsupported remote platform. Library hosts inject their own <a href="embedding.html#embedded-shim-catalog">embedded catalog</a>
 rather than inheriting the CLI catalog.</p>
 <p>Git contains source only, not prebuilt shim binaries. To build a native Linux SSH shim without
 Zig or UI dependencies:</p>

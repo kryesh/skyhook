@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -195,7 +195,7 @@ instruction discovery.</p>
 </ol>
 <p>The first existing filename is selected. If reading it fails, Skyhook does not try a lower-priority
 spelling in the same directory. A readable empty file counts as selected, so it does not trigger
-fallback either.</p>
+fallback either. An instruction file must be a regular UTF-8 file of at most 1 MiB; a larger file or one that is not a regular file is skipped with a startup warning, and other read failures stop startup.</p>
 <p>For user instructions, Skyhook first checks <code>$XDG_CONFIG_HOME/skyhook</code>, then falls back to
 <code>$HOME/.config/skyhook</code> if the first location is absent or fails. It never loads both user files.
 If no fallback succeeds, all non-missing user-file errors are reported. Missing optional files
@@ -211,7 +211,8 @@ $HOME/.config/skyhook/AGENTS.md     # Not loaded when the XDG selection is reada
 If both locations select the same file, it is loaded only once. Root and child agents share
 these instructions.</p>
 <h2 id="host-owned-skills"><a class="header" href="#host-owned-skills">Host-owned skills</a></h2>
-<p>Host-owned skills are exposed through <code>skills</code> and <code>skill</code>. Unlike instructions, skill discovery
+<p>Host-owned skills are exposed through the <code>skill</code> tool, which is offered only when at least one
+skill was discovered. Unlike instructions, skill discovery
 reads <code>~/.agents/skills</code> and <code>.agents/skills</code> directories along the workspace ancestry, with the
 nearest workspace definition winning when names collide. Discovery happens at startup;
 restart Skyhook to discover newly added skills. A skill directory contains <code>SKILL.md</code> and optional supporting
@@ -232,32 +233,39 @@ and aliases are supported with bounded expansion. A <code>description</code> mus
 any other non-null description is skipped with a warning.</p>
 <h2 id="loading-and-copying-assets"><a class="header" href="#loading-and-copying-assets">Loading and copying assets</a></h2>
 <p>The examples below assume the <code>release</code> skill layout shown above.</p>
-<p>Only <code>name</code> is required by the <code>skill</code> input schema. <code>path</code> and <code>to</code> are optional and nullable;
-native calls supplying <code>null</code> behave like calls omitting those fields.</p>
-<pre><code class="language-js">await tool.skill({ name: "release" }); // Complete SKILL.md plus recursive assets tree
+<p>All <code>skill</code> arguments are optional and nullable; native calls supplying <code>null</code> behave like calls
+omitting those fields. Without <code>name</code>, the call lists available skills; <code>path</code> requires <code>name</code>.</p>
+<pre><code class="language-js">await tool.skill(); // {kind: "list", skills: [{name, description}]}
+await tool.skill({ name: "release" }); // Complete SKILL.md, assets tree, and location
 await tool.skill({ name: "release", path: "references" }); // Directory subtree
 await tool.skill({ name: "release", path: "references/template.md" }); // Original text
 await tool.skill({ name: "release", path: "assets/logo.png" }); // Attached image
-await tool.skill({ name: "release", path: "assets/logo.png", to: "tmp/logo.png" }); // Copy
 </code></pre>
-<p>Results have a <code>kind</code> discriminator: <code>skill</code>, <code>directory</code>, <code>text</code>, <code>image</code>, <code>binary</code>, or <code>copied</code>.
-Base skill results contain <code>name</code>, <code>description</code>, complete <code>content</code>, and an <code>assets</code> text tree
-that includes nested files but excludes the already-loaded root <code>SKILL.md</code>. Directory results
-use the same tree format, rooted at the selected path. Trees mark symlinks without descending
-through them. Long trees and asset text are saved in full and can be paged using <code>job_output</code>.</p>
+<p>Results have a <code>kind</code> discriminator: <code>list</code>, <code>skill</code>, <code>directory</code>, <code>text</code>, <code>image</code>, or <code>binary</code>.
+Base skill results contain <code>name</code>, <code>description</code>, <code>location</code>, complete <code>content</code>, and an <code>assets</code>
+text tree that includes nested files but excludes the already-loaded root <code>SKILL.md</code>. Directory
+results use the same tree format, rooted at the selected path. Trees mark symlinks without
+descending through them. Long trees and asset text are saved in full and can be paged using <code>jobs</code>.</p>
 <p>Text assets (including JSON, YAML, source code, and SVG) are returned unchanged, never executed.
-Supported raster images are attached with metadata. Other binary files return metadata and
-a suggestion to supply <code>to</code>, rather than raw binary or base64 content. Copies return destination,
-byte count, and SHA-256, and require write authorization. <code>to</code> is resolved in the <strong>calling agent’s
-target and workspace</strong>: a remote agent receives host-owned asset bytes on its remote target,
-not in a similarly named directory on the host. Skill discovery, instructions, and asset reads
-remain host-owned. Remote copies require route and destination write authorization, including
-path approval when the destination is outside the authorized workspace. <code>to</code> requires a file
-<code>path</code>; paths inside a skill must be relative and cannot escape its root. Use <code>path: "."</code> to
-browse the root.</p>
+Supported raster images are attached with metadata. Other binary files return metadata rather
+than raw binary or base64 content. Paths inside a skill must be relative and cannot escape its
+root. Use <code>path: "."</code> to browse the root.</p>
+<p>Skills live on the session host. <code>location</code> is <code>{path, target: "root"}</code>, the skill directory’s
+absolute path there, so ordinary tools can reach its files. <code>target</code> is included only for agents
+with the <code>targets</code> capability; an agent on a remote target without it cannot reach the session
+host, so its results have no <code>location</code>. Copy an asset with
+<a href="../reference/tools.html#creating-files-with-write"><code>write</code>’s <code>source</code></a>, which also delivers it to
+an agent working on a remote target:</p>
+<pre><code class="language-js">const { location } = (await tool.skill({ name: "release" })).unwrap();
+await tool.write({
+  path: "tmp/release.py",
+  source: { path: `${location.path}/scripts/release.py`, target: "root" },
+});
+</code></pre>
+<p>An agent on the session host can omit <code>target</code>.</p>
 <p>A <a href="https://github.com/kryesh/skyhook/tree/main/tests/fixtures/skill-workspace">mixed-file test workspace</a> includes its hidden
 <code>.agents/skills/mixed-assets/</code> directory. Its tests exercise native calls, explicit nulls,
-asset discovery, UTF-8 and binary files, image attachments, copying, and path containment.</p>
+asset discovery, UTF-8 and binary files, image attachments, and path containment.</p>
 
                     </main>
 

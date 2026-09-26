@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -194,7 +194,9 @@ The workspace is a base directory, not a security boundary. Filesystem path auth
 human approval are distinct: the default CLI read policy auto-allows reads even when their
 canonical paths are outside the workspace. Do not rely on a confirmation prompt to protect
 outside-workspace reads. Outside-workspace writes require confirmation, and remote access has
-its own approval requirements.</p>
+its own approval requirements. Permissions name paths as text, so an operation whose permission
+names a path or workspace that is not valid Unicode is refused rather than approved under an
+approximate name.</p>
 <p>Choose <strong>Allow once</strong> to approve only the current operation. When offered, <strong>Allow proposed
 scope</strong> saves the displayed grant for later operations in the same session, including after
 resume; inspect <strong>Details</strong> before granting it. Path grants apply only to the approved target
@@ -218,7 +220,7 @@ handling, see the <a href="../reference/javascript.html#responseunwrap-and-nativ
 <tbody>
 <tr><td><code>read</code></td><td>File reads, searches, and skill reads</td><td>Enabled</td></tr>
 <tr><td><code>write</code></td><td>File creation, modification, removal, and related write access</td><td>Enabled</td></tr>
-<tr><td><code>exec</code></td><td><code>exec</code> and <code>shell</code></td><td>Enabled</td></tr>
+<tr><td><code>exec</code></td><td><code>exec</code></td><td>Enabled</td></tr>
 <tr><td><code>network</code></td><td>HTTP(S) <code>fetch</code></td><td>Enabled</td></tr>
 <tr><td><code>targets</code></td><td>Target-management tools and target-selection inputs</td><td>Disabled</td></tr>
 <tr><td><code>ssh_agent</code></td><td>Targets using <code>ssh.external_agent</code>, which forward an SSH agent Skyhook does not own; without it they are hidden</td><td>Disabled</td></tr>

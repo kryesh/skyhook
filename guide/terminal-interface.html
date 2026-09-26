@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -218,8 +218,9 @@ successful replies have no retry labels. Retries continue until success or cance
 <a href="../configuration/providers-and-models.html#model-failure-recovery">transient model failures</a>.</p>
 <p>The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
 tab, while reading positions and expanded rows remain separate for each agent. Requests include
-compaction requests and token summaries; transient retries appear under the same request. Full request
-bodies are available in the session log, not rendered in the UI. Status messages, including
+compaction requests and token summaries; transient retries appear under the same request, which
+reads <strong>Retrying</strong> while the next attempt is pending. Full request bodies are available in the
+session log, not rendered in the UI. Status messages, including
 skill warnings, interruptions, and errors, appear in the conversation and are saved with the
 session, but are not sent to the model. Connection and MCP startup warnings describe this
 installation rather than the session, so they are shown but not saved.</p>
@@ -235,8 +236,9 @@ it, including after resuming a session. Single-line reasoning stays inline witho
 expand/collapse control and is not selectable, even when it wraps in a narrow terminal.
 Spinners indicate that a request is still active.</p>
 <h2 id="model-selection-and-ui-state"><a class="header" href="#model-selection-and-ui-state">Model selection and UI state</a></h2>
-<p>Models are listed in configuration declaration order. For a new session, selection uses
-<code>--model</code>, then the most recently submitted configured model, then the first model in the list.
+<p>Models are named <code>provider/model</code> and listed in configuration declaration order. For a new
+session, selection uses <code>--model</code>, then the most recently submitted configured model, then
+<code>default_model</code>, else the first model of the first provider.
 The starting <a href="permissions.html#modes">mode</a> is chosen the same way: <code>--mode</code>, then the mode of the
 most recently submitted message if it is still configured, then <code>default_mode</code>. Batch jobs
 ignore the remembered mode.
@@ -249,7 +251,7 @@ The batch cannot be split across requests; the last message’s captured model i
 Tool follow-ups, retries, compaction, and <code>/retry</code> retain the active turn’s model. The bottom bar
 shows the choice for the next message; reply footers identify the model that actually answered.
 Resumed sessions retain their last applied model. <code>/models</code> remains an alias for <code>/model</code>.
-Restore a missing recorded model profile before resuming rather than substituting another model.</p>
+Restore a missing recorded model before resuming rather than substituting another model.</p>
 <p>The interface stores the last submitted model and mode and the sidebar setting in the workspace’s
 <code>.skyhook/state.json</code>, beside its sessions, without changing the model configuration.
 Session titles are saved with their history.</p>

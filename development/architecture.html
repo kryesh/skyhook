@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -195,7 +195,7 @@ local or remote execution meet at shared runtime boundaries.</p>
 </thead>
 <tbody>
 <tr><td><code>config::RuntimeConfig</code></td><td>An admitted, immutable configuration generation. A selected model retains the configuration that admitted it.</td></tr>
-<tr><td><code>agent::Harness</code></td><td>Shared provider factories, model profiles, policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions.</td></tr>
+<tr><td><code>agent::Harness</code></td><td>Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions.</td></tr>
 <tr><td><code>agent::SessionHandle</code> / session runtime</td><td>One agent tree, its registry and jobs, target routing, MCP connections, observation stream, and session store.</td></tr>
 <tr><td><code>AgentContext</code></td><td>One agent loop’s projected history, request template, model profile, token calibration, and owned provider context.</td></tr>
 <tr><td><code>provider::ProviderContext</code></td><td>Conversation-scoped provider resources and one-attempt model invocations, not authoritative conversation history or retry policy.</td></tr>
@@ -207,19 +207,31 @@ local or remote execution meet at shared runtime boundaries.</p>
 <p>A session’s isolated runtime state does not imply filesystem isolation. Execution locations
 select machines and workspaces; tools still operate on those machines’ files.</p>
 <h2 id="provider-boundary-and-lifetime"><a class="header" href="#provider-boundary-and-lifetime">Provider boundary and lifetime</a></h2>
-<p><code>provider::Provider</code> is a shared factory. <code>open_context(correlation)</code> creates an independently
-owned <code>ProviderContext</code> without making a model request; <code>invoke(&amp;mut self, request)</code> returns
-owned startup work and then an owned asynchronous response stream. Neither borrows the context.
-The request’s correlation must match the context’s identity. Custom providers implement both
-traits; native adapters and codecs live under <code>provider::backends</code>, while shared request,
-message, and response types live under <code>provider::protocol</code>.</p>
+<p><code>provider::Provider</code> is a shared factory. <code>open_context(id)</code> creates an independently owned
+<code>ProviderContext</code> for one conversation without making a model request; <code>invoke(&amp;mut self, request)</code> returns an owned asynchronous response stream that does not borrow the context. A
+startup failure is the stream’s first and only item. Providers may send the context identity as
+cache-affinity metadata. Custom providers implement both traits. The three inference API
+families live under <code>provider::codec</code>: each codec encodes requests and decodes native streams
+under a typed dialect that names the conventions varying between servers of that family (field
+placements, tool-name rules, schema constraint, replay spelling, terminal-event shape), while the
+codec keeps the correctness rules and reads error bodies with its API’s own codes. Vendor modules
+under <code>provider::dialect</code> own an entry’s configuration, the codecs they speak and the dialect
+presets for each, credentials, and the transport conventions (fixed headers, per-turn session
+headers, and rules and typed readers that map their servers’ own error codes and wording onto
+error kinds); every configured provider runs as the one <code>provider::http::HttpProvider</code>. Shared
+request, message, and response types live under <code>provider::protocol</code>.</p>
 <p>The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context
-for later input; resources are released when that loop exits. A model-profile change prepares
+for later input; resources are released when that loop exits. A model change prepares
 its replacement before committing the selection, preserves journal history, and resets token
-calibration. Equivalent profiles keep the current context. A mode change also replaces the
-prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
-context under the same agent correlation identity.</p>
+calibration. Reselecting the current model keeps the current context. A mode change also replaces
+the prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
+context under the same context identity.</p>
+<p>The session owns the durable conversation (<code>session::Message</code>): user text and attachments, the
+agent’s state (date, live jobs, todos), job events (child replies and presented job views),
+parent input and compaction summaries. Providers receive it rendered: state and job events
+become runtime text that joins the final turn, so the provider layer knows nothing about jobs
+or todos, and those renderers are part of the session format.</p>
 <p>Providers receive complete provider-neutral requests; they do not privately replay failed
 submissions. A <code>response_schema</code> must be transmitted as a structured-output constraint or
 rejected with <code>InvalidRequest</code>, not silently ignored or replaced with prompting. Input images
@@ -233,18 +245,15 @@ under the same context settings until compaction replaces it; the tail is rebuil
 cacheable. A profile’s <code>state_mode</code> puts runtime state in the tail (<code>dynamic</code>), commits it to
 history (<code>persist</code>), or omits it (<code>none</code>). Persisted state lets later requests extend an unchanged
 conversation, which matters for reasoning bound to that conversation.</p>
-<p><code>history_lifetime</code> communicates cache reuse without prescribing a backend implementation:</p>
+<p><code>history_lifetime</code> communicates cache reuse without prescribing a provider implementation:</p>
 <ul>
-<li><code>continuing</code> is the default: later requests extend this history.</li>
-<li><code>ending</code> marks history expected to be replaced after the request; the runtime sets it when
-the request estimate reaches the compaction threshold. It is a cache hint, not the decision
-to compact.</li>
+<li><code>extends</code> is the default: later requests extend this history.</li>
 <li><code>detached</code> marks one-off settings, such as a compaction summary request, with no reusable
 history prefix under those settings.</li>
 </ul>
-<p>Anthropic marks the last history block as a cache breakpoint except for detached requests.
-Ending history still needs that breakpoint to read an existing cache entry. OpenAI protocols
-use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
+<p>Messages, and Chat dialects that select content-part breakpoints, mark the last history block as a
+cache breakpoint except for detached requests.
+OpenAI protocols use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
 to the final tool output or user message instead of introducing a separate user turn, which
 would look like the user speaking again after every tool call.</p>
 <h2 id="request-response-and-recovery-lifecycle"><a class="header" href="#request-response-and-recovery-lifecycle">Request, response, and recovery lifecycle</a></h2>
@@ -253,10 +262,13 @@ would look like the user speaking again after every tool call.</p>
 history from the journal, and builds the request. Shared settings are recorded in
 <code>model_context</code>; <code>model_requested</code> freezes the exact history references and inline tail.</li>
 <li>Each provider invocation gets a <code>model_attempt_started</code> record for that logical request.
-<code>ResponseEvent</code>s describe ordered items and blocks: start, typed deltas, authoritative final
-block content, item completion or discard, usage snapshots, and a terminal stop reason.
-<code>ResponseAssembler</code> validates this lifecycle and supplies the same snapshot semantics to
-the runtime and observers. Usage snapshots replace earlier values; they are not increments.</li>
+The stream carries display-only <code>Delta</code>s for blocks, cumulative <code>Usage</code> snapshots, and one
+terminal <code>End</code> holding the <code>Completion</code>: the complete items in position order and how the
+response ended (an answer, tool use, or a cut). Only a completion built for tool use carries
+tool calls, so nothing else can authorize execution. <code>LiveResponse</code> gives the runtime and
+observers the same provisional view of the deltas until the end arrives. Observers then see
+each response settle as committed, committed-but-aborted, or failed, keyed by the journal
+sequence it produced.</li>
 <li>Only an accepted response becomes model-visible history. Its message, usage, and outcome
 commit together before tool dispatch. Each tool result commits as its call finishes; request
 projection merges results back into the original call order. This preserves completed work
@@ -264,18 +276,27 @@ after a crash without making completion order part of the next model request.</l
 <li>Once a tool exchange is closed, the runtime can compact history or build the next request.
 An agent with no further work returns to its idle loop rather than discarding its context.</li>
 </ol>
+<p>Hosts fold these records into one <code>RequestPhase</code> per request in <code>session::RequestLedger</code>;
+session statistics and the terminal interface read request outcomes, retry state, and
+message attribution from that fold rather than deriving them from live activity. Folding a
+record reports the requests it changed, so a host can refresh just those.</p>
 <p>Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized <code>ProviderErrorKind</code> values rather than error-message text: rate limits, timeouts,
-transport failures, and retryable response failures repeat the frozen logical request. Input
+transport failures, and unavailable servers repeat the frozen logical request. Input
 and selection changes wait for the next request boundary. The failed stream is dropped before
 backoff; server retry hints take precedence over capped exponential delays. Recovery remains
 cancellable and continues until success or interruption.</p>
-<p>A retry starts a fresh live assembler while retaining the attempt audit records and any reported
-usage. Partial failed responses never authorize tool execution, and transient recovery does
-not rerun completed tools. Authentication, invalid requests, and protocol errors do not enter
-this retry loop. Context-window recovery and invalid compaction summaries have their own bounded
-recovery path. Refusals fail without committing the refused message; a provider abort can retain
-completed safe content but still fails the turn and never executes its tool calls.</p>
+<p>A retry starts a fresh live response while retaining the attempt audit records and any reported
+usage. A stream that fails or closes before its end never authorizes tool execution, and
+transient recovery does not rerun completed tools. An expired command-sourced credential is
+transient: the provider discards it on a 401 and the retry fetches a fresh one. Other
+authentication failures, invalid requests, and protocol errors do not enter this retry loop.
+Context-window recovery and invalid compaction summaries have their own bounded recovery path.</p>
+<p>A refusal cut fails without committing the refused message; an abort cut can retain completed
+safe content but still fails the turn. Any other response with neither nonblank text nor a tool
+call fails with nothing committed: <code>OutputLimit</code> when cut at the output limit, <code>Empty</code> otherwise.
+A truncated or incomplete cut with content commits it as a completed response with that outcome.
+Empty text is never committed, even beside a tool call.</p>
 <h2 id="compaction-and-context-accounting"><a class="header" href="#compaction-and-context-accounting">Compaction and context accounting</a></h2>
 <p>The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a successful response’s reported occupancy (uncached input,
@@ -292,9 +313,20 @@ for the durable reference contract.</p>
 <p><code>ToolRegistryBuilder</code> supports typed and JSON-based registrations. Typed registrations generate
 input and output schemas; registry metadata also supplies compact result documentation to the
 model and JavaScript runtime. Both call paths use the same executor, capability checks,
-authorization coordinator, and job supervision rather than separate tool implementations.</p>
-<p>The executor coordinates host-owned jobs and persistence. The local invocation layer admits typed
-arguments and runs operations without requiring a session database. The SSH shim reuses that layer
+authorization coordinator, and job supervision rather than separate tool implementations.
+A tool’s argument checks (validation, path arguments, derived permissions) receive its parsed
+input and run before authorization. The host planner and a remote worker assemble an
+invocation’s permissions by one rule, and a capability the caller lacks makes the tool
+unavailable rather than denied.</p>
+<p>The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
+(queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
+are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
+its startup stage carries a job from creation to its running worker. A tool may declare a source argument, a
+<code>TargetPath</code> on any target: the executor selects its location like a tool target, authorizes the
+read with the call, and opens it for the call’s context. Remote contents stream in chunks through the
+host, spooled to anonymous files: a remote file through its worker’s source request, which the
+worker authorizes and reports as the consuming tool, and to a remote handler before its call starts. The local invocation layer
+admits typed arguments and runs operations without requiring a session database. The SSH shim reuses that layer
 for remote built-ins while the host retains job ownership, policy decisions, and saved output.
 This separation keeps remote workers from becoming second agent runtimes.</p>
 <p>The host tracks remote readers and accepted-payload ingestion independently of callers and
@@ -305,8 +337,9 @@ cleanup. See <a href="remote-transport-and-shims.html#connection-and-request-lif
 <p>Tool failures are structured diagnostics: a typed cause plus the operation, subject, site, and
 known effects. Tools annotate facts; <code>tool::diagnostic</code> owns the one renderer. Facts chosen nearest
 the failure win, and each boundary (planning, dispatch, remote result ingestion) only fills what is
-missing. A worker’s reported site is always rebound to the destination of the connection it arrived
-on.</p>
+still unset: a failure carries a partial context in process and is resolved once, when it is
+persisted, sent over the wire, or rendered. A worker’s reported site is always rebound to the
+destination of the connection it arrived on.</p>
 <p>Diagnostics are persisted with the job and rendered per viewer. Target aliases in structured job
 diagnostics and result slots registered by their producer, such as an expected <code>read</code> failure, are
 rendered only when the viewer’s capabilities permit exposing them. Host-site wording is relative
@@ -315,7 +348,7 @@ viewers. Capability-sensitive enclosing output pages use private file-backed ren
 than shared render caches, keeping captured output out of memory without reusing privileged
 renderings for those diagnostic slots.</p>
 <p>This rendering boundary does not guarantee that target aliases never appear in a restricted view.
-A privileged <code>job_output</code> call saves its rendered view as an ordinary JSON snapshot. Later
+A privileged <code>jobs</code> output read saves its rendered view as an ordinary JSON snapshot. Later
 restricted views of that saved result, or script results that copy it, retain the earlier rendered
 JSON unchanged. Already-committed model messages are not rewritten. Arbitrary returned JSON is not
 inspected for diagnostics or target aliases, and copied data does not acquire diagnostic provenance.</p>
@@ -336,8 +369,11 @@ management is enabled. SSH’s host-mediated prompt channel is described under
 <a href="remote-transport-and-shims.html#authentication-and-prompt-isolation">authentication and prompt isolation</a>.</p>
 <h2 id="durability-and-resume"><a class="header" href="#durability-and-resume">Durability and resume</a></h2>
 <p>Each durable session uses one SQLite database, <code>session.db</code>. The event ledger is append-only and
-normalized; blobs, job output documents, and line-addressable captures share the database rather
-than separate transcript or output files. Related state transitions are appended transactionally
+normalized; blobs, job results, and line-addressable captures share the database rather than
+separate transcript or output files. Only shapes that a model, a tool’s own schema or a provider
+defines are stored as JSON text: tool-call arguments and results, job arguments and output
+schemas, tool and response schemas, reasoning replay payloads, saved job results and the
+results and pages a job event presented. Related state transitions are appended transactionally
 before their in-memory projections are published. Accepted writer work is owned independently
 of the caller, so dropping an await does not cancel a commit already in progress.</p>
 <p>A writer lock excludes competing session owners, not read-only snapshot inspection. If a write’s

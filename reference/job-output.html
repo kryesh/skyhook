@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -220,7 +220,7 @@ Inspecting a remote job’s saved output does not connect to that machine: a ret
 while a retrieved execution error retains the original operation’s context.</p>
 <p>Structured job diagnostics and explicitly registered diagnostic result fields are rendered for the
 viewing agent, exposing target aliases only when that viewer’s capabilities permit them. This is
-not a general redaction guarantee for saved output. A <code>job_output</code> call made with broader
+not a general redaction guarantee for saved output. A <code>jobs</code> output read made with broader
 capabilities saves its already-rendered view as ordinary JSON. Later reads of that saved snapshot
 with narrower capabilities retain the earlier JSON unchanged, as do reads of script results that
 copy it. Arbitrary returned JSON is not inspected for diagnostics or target aliases, and
@@ -251,24 +251,25 @@ notice. These rules also apply after session resume and to completed remote jobs
 <h2 id="script-result-presentation"><a class="header" href="#script-result-presentation">Script result presentation</a></h2>
 <p>The enclosing script’s <code>.result</code> is <code>{value, console, failure}</code>; silent scripts retain
 <code>console: ""</code>. Ordinary tools have no console field. Existing JobViews such as
-<code>tool.job(id).output()</code> are not wrapped again.</p>
+<code>tool.jobs({job})</code> reads are not wrapped again.</p>
 <p>Presentation never changes the full saved return value. Default script output retrieval returns
 the composed script payload; explicit field selections read saved script data. Logging and
 returning the same data explicitly produces both outputs.</p>
 <h2 id="paging-and-searching"><a class="header" href="#paging-and-searching">Paging and searching</a></h2>
-<p>Explicit <code>job_output</code> selections return a view whose <code>presentation.preview</code> defaults to
+<p>Explicit <code>jobs({job})</code> selections return a view whose <code>presentation.preview</code> defaults to
 100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is always returned in full.</p>
 <pre><code class="language-js">// Read a selected part of a saved result.
-job_output({job:42, field:"/result/stdout", start:300, limit:80})
+jobs({job:42, field:"/result/stdout", start:300, limit:80})
 // Search stored text, with surrounding context.
-job_output({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
+jobs({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
 // Continue at the returned source line and UTF-8 byte offset.
-job_output({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
+jobs({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
 </code></pre>
 <p><code>field</code> is a JSON Pointer: <code>/result/content</code> selects a file snapshot, <code>/result/stdout</code> and
 <code>/result/stderr</code> select process streams. For scripts, <code>/result/console</code> selects captured console
 text and <code>/result/value</code> selects the JavaScript return (append pointer segments for nested data,
-for example <code>/result/value/items</code>). Objects and
+for example <code>/result/value/items</code>). The empty pointer <code>""</code> selects the whole saved output, a
+page of <code>{"result": ...}</code>. Objects and
 arrays have deterministic JSON text views. Long lines are split into UTF-8-safe fragments;
 the next position identifies where to continue. Regex matching is case-sensitive unless inline
 flags override it. Matching supports lines up to 4 MiB and reports an explicit resource error

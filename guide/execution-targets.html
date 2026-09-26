@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -219,9 +219,9 @@ required settings in the replacement entry.</p>
       # Reach the host through a gateway using the deploy user's own SSH key on build.
       options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 </code></pre>
-<p>Targets have an explicit <code>type</code>. The built-in <code>root</code> is <code>local</code>, meaning the session host—the machine
-running the main Skyhook process. It always identifies that machine, including when an agent’s
-current target is remote. Named target configuration and <code>target_add</code> accept only <code>type: "ssh"</code>.</p>
+<p>The built-in <code>root</code> is the session host—the machine running the main Skyhook process. It is not
+configured as a target and always identifies that machine, including when an agent’s current
+target is remote. Named targets declare their transport with <code>type</code>; <code>"ssh"</code> is the only transport.</p>
 <h2 id="routing-origin-and-via"><a class="header" href="#routing-origin-and-via">Routing: <code>origin</code> and <code>via</code></a></h2>
 <ul>
 <li><code>origin</code> names the target that starts the SSH connection; it defaults to <code>root</code>.
@@ -289,8 +289,9 @@ Registering a target does not change the agent’s location.</p>
 calling agent’s current named target retains that agent’s workspace override.</li>
 </ul>
 <p>Workspace-inheriting tools such as <code>write</code>, <code>replace</code>, and <code>remove</code> use the calling agent’s
-target and workspace without accepting a target selector. Host/session tools such as <code>jobs</code>,
-<code>job_output</code>, <code>todo</code>, <code>wait</code>, and <code>targets</code> still run on the session host. <code>agent</code> selects a
+target and workspace without accepting a target selector; a <code>write</code> source names its own target,
+so a file can be copied between machines. Host/session tools such as <code>jobs</code>,
+<code>todo</code>, <code>wait</code>, and <code>targets</code> still run on the session host. <code>agent</code> selects a
 child’s future execution location; launching the child and running its provider remain host
 operations. An explicit <code>agent.workspace</code> takes precedence over the selected base; relative
 overrides resolve against that base.</p>

@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -232,17 +232,16 @@ mkdir -p "$config_dir"
 <p>Create <code>config.yaml</code> in that directory with a provider and model you can access. For example:</p>
 <pre><code class="language-yaml">providers:
   openai:
-    kind: "openai"
+    codec: "responses"
+    dialect: "openai"
     base_url: "https://api.openai.com/v1"
-    api: "responses"
-    api_key_env: "OPENAI_API_KEY"
-
-models:
-  default:
-    provider: "openai"
-    model: "gpt-5.6"
-    max_context: 1050000
-    max_output: 128000
+    api_key:
+      env: "OPENAI_API_KEY"
+    models:
+      default:
+        model: "gpt-5.6"
+        max_context: 1050000
+        max_output: 128000
 </code></pre>
 <p>Use a model identifier supported by your account and set its token limits explicitly; Skyhook
 does not detect them automatically. You can choose smaller budgets. For model limits, other
@@ -323,8 +322,9 @@ successful replies have no retry labels. Retries continue until success or cance
 <a href="#model-failure-recovery">transient model failures</a>.</p>
 <p>The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
 tab, while reading positions and expanded rows remain separate for each agent. Requests include
-compaction requests and token summaries; transient retries appear under the same request. Full request
-bodies are available in the session log, not rendered in the UI. Status messages, including
+compaction requests and token summaries; transient retries appear under the same request, which
+reads <strong>Retrying</strong> while the next attempt is pending. Full request bodies are available in the
+session log, not rendered in the UI. Status messages, including
 skill warnings, interruptions, and errors, appear in the conversation and are saved with the
 session, but are not sent to the model. Connection and MCP startup warnings describe this
 installation rather than the session, so they are shown but not saved.</p>
@@ -340,8 +340,9 @@ it, including after resuming a session. Single-line reasoning stays inline witho
 expand/collapse control and is not selectable, even when it wraps in a narrow terminal.
 Spinners indicate that a request is still active.</p>
 <h2 id="model-selection-and-ui-state"><a class="header" href="#model-selection-and-ui-state">Model selection and UI state</a></h2>
-<p>Models are listed in configuration declaration order. For a new session, selection uses
-<code>--model</code>, then the most recently submitted configured model, then the first model in the list.
+<p>Models are named <code>provider/model</code> and listed in configuration declaration order. For a new
+session, selection uses <code>--model</code>, then the most recently submitted configured model, then
+<code>default_model</code>, else the first model of the first provider.
 The starting <a href="#modes">mode</a> is chosen the same way: <code>--mode</code>, then the mode of the
 most recently submitted message if it is still configured, then <code>default_mode</code>. Batch jobs
 ignore the remembered mode.
@@ -354,7 +355,7 @@ The batch cannot be split across requests; the last message’s captured model i
 Tool follow-ups, retries, compaction, and <code>/retry</code> retain the active turn’s model. The bottom bar
 shows the choice for the next message; reply footers identify the model that actually answered.
 Resumed sessions retain their last applied model. <code>/models</code> remains an alias for <code>/model</code>.
-Restore a missing recorded model profile before resuming rather than substituting another model.</p>
+Restore a missing recorded model before resuming rather than substituting another model.</p>
 <p>The interface stores the last submitted model and mode and the sidebar setting in the workspace’s
 <code>.skyhook/state.json</code>, beside its sessions, without changing the model configuration.
 Session titles are saved with their history.</p>
@@ -485,7 +486,7 @@ can still ask their owning parent agent. Operations requiring human approval fai
 ordinary automatically allowed operations still work. <code>--approve-all</code> (or config <code>approve_all: true</code>)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.</p>
-<p><code>exec</code> and <code>shell</code> never have stdin connected; without <code>interactive</code> they also have no
+<p><code>exec</code> never has stdin connected; without <code>interactive</code> it also has no
 controlling terminal, so
 ordinary <code>/dev/tty</code> prompts cannot stop the job waiting for terminal input. SSH authentication
 prompts are rejected even when inherited <code>SSH_ASKPASS</code> settings request another prompt helper
@@ -543,7 +544,7 @@ for display, not the automatic compaction trigger. Configure
 <a href="#providers-and-models">model limits</a> to match the endpoint you use.</p>
 <p>Compaction does not execute tools. It can retain selected job results as well as recent
 conversation; full saved results remain accessible through
-<a href="#saved-job-output"><code>job_output</code></a>. Older details depend on the summary: original
+<a href="#saved-job-output"><code>jobs</code></a>. Older details depend on the summary: original
 messages remain in the session log, but there is no agent-callable history tool. A validated
 summary can still be incomplete or inaccurate.</p>
 <p>Invalid, truncated, cancelled, or unsaved summaries leave the preceding context and todos
@@ -570,7 +571,9 @@ The workspace is a base directory, not a security boundary. Filesystem path auth
 human approval are distinct: the default CLI read policy auto-allows reads even when their
 canonical paths are outside the workspace. Do not rely on a confirmation prompt to protect
 outside-workspace reads. Outside-workspace writes require confirmation, and remote access has
-its own approval requirements.</p>
+its own approval requirements. Permissions name paths as text, so an operation whose permission
+names a path or workspace that is not valid Unicode is refused rather than approved under an
+approximate name.</p>
 <p>Choose <strong>Allow once</strong> to approve only the current operation. When offered, <strong>Allow proposed
 scope</strong> saves the displayed grant for later operations in the same session, including after
 resume; inspect <strong>Details</strong> before granting it. Path grants apply only to the approved target
@@ -594,7 +597,7 @@ handling, see the <a href="#responseunwrap-and-native-results">JavaScript respon
 <tbody>
 <tr><td><code>read</code></td><td>File reads, searches, and skill reads</td><td>Enabled</td></tr>
 <tr><td><code>write</code></td><td>File creation, modification, removal, and related write access</td><td>Enabled</td></tr>
-<tr><td><code>exec</code></td><td><code>exec</code> and <code>shell</code></td><td>Enabled</td></tr>
+<tr><td><code>exec</code></td><td><code>exec</code></td><td>Enabled</td></tr>
 <tr><td><code>network</code></td><td>HTTP(S) <code>fetch</code></td><td>Enabled</td></tr>
 <tr><td><code>targets</code></td><td>Target-management tools and target-selection inputs</td><td>Disabled</td></tr>
 <tr><td><code>ssh_agent</code></td><td>Targets using <code>ssh.external_agent</code>, which forward an SSH agent Skyhook does not own; without it they are hidden</td><td>Disabled</td></tr>
@@ -696,9 +699,9 @@ required settings in the replacement entry.</p>
       # Reach the host through a gateway using the deploy user's own SSH key on build.
       options: { ProxyCommand: "sudo -n -u deploy ssh -W %h:%p gateway.internal" }
 </code></pre>
-<p>Targets have an explicit <code>type</code>. The built-in <code>root</code> is <code>local</code>, meaning the session host—the machine
-running the main Skyhook process. It always identifies that machine, including when an agent’s
-current target is remote. Named target configuration and <code>target_add</code> accept only <code>type: "ssh"</code>.</p>
+<p>The built-in <code>root</code> is the session host—the machine running the main Skyhook process. It is not
+configured as a target and always identifies that machine, including when an agent’s current
+target is remote. Named targets declare their transport with <code>type</code>; <code>"ssh"</code> is the only transport.</p>
 <h2 id="routing-origin-and-via"><a class="header" href="#routing-origin-and-via">Routing: <code>origin</code> and <code>via</code></a></h2>
 <ul>
 <li><code>origin</code> names the target that starts the SSH connection; it defaults to <code>root</code>.
@@ -766,8 +769,9 @@ Registering a target does not change the agent’s location.</p>
 calling agent’s current named target retains that agent’s workspace override.</li>
 </ul>
 <p>Workspace-inheriting tools such as <code>write</code>, <code>replace</code>, and <code>remove</code> use the calling agent’s
-target and workspace without accepting a target selector. Host/session tools such as <code>jobs</code>,
-<code>job_output</code>, <code>todo</code>, <code>wait</code>, and <code>targets</code> still run on the session host. <code>agent</code> selects a
+target and workspace without accepting a target selector; a <code>write</code> source names its own target,
+so a file can be copied between machines. Host/session tools such as <code>jobs</code>,
+<code>todo</code>, <code>wait</code>, and <code>targets</code> still run on the session host. <code>agent</code> selects a
 child’s future execution location; launching the child and running its provider remain host
 operations. An explicit <code>agent.workspace</code> takes precedence over the selected base; relative
 overrides resolve against that base.</p>
@@ -800,7 +804,7 @@ instruction discovery.</p>
 </ol>
 <p>The first existing filename is selected. If reading it fails, Skyhook does not try a lower-priority
 spelling in the same directory. A readable empty file counts as selected, so it does not trigger
-fallback either.</p>
+fallback either. An instruction file must be a regular UTF-8 file of at most 1 MiB; a larger file or one that is not a regular file is skipped with a startup warning, and other read failures stop startup.</p>
 <p>For user instructions, Skyhook first checks <code>$XDG_CONFIG_HOME/skyhook</code>, then falls back to
 <code>$HOME/.config/skyhook</code> if the first location is absent or fails. It never loads both user files.
 If no fallback succeeds, all non-missing user-file errors are reported. Missing optional files
@@ -816,7 +820,8 @@ $HOME/.config/skyhook/AGENTS.md     # Not loaded when the XDG selection is reada
 If both locations select the same file, it is loaded only once. Root and child agents share
 these instructions.</p>
 <h2 id="host-owned-skills"><a class="header" href="#host-owned-skills">Host-owned skills</a></h2>
-<p>Host-owned skills are exposed through <code>skills</code> and <code>skill</code>. Unlike instructions, skill discovery
+<p>Host-owned skills are exposed through the <code>skill</code> tool, which is offered only when at least one
+skill was discovered. Unlike instructions, skill discovery
 reads <code>~/.agents/skills</code> and <code>.agents/skills</code> directories along the workspace ancestry, with the
 nearest workspace definition winning when names collide. Discovery happens at startup;
 restart Skyhook to discover newly added skills. A skill directory contains <code>SKILL.md</code> and optional supporting
@@ -837,32 +842,39 @@ and aliases are supported with bounded expansion. A <code>description</code> mus
 any other non-null description is skipped with a warning.</p>
 <h2 id="loading-and-copying-assets"><a class="header" href="#loading-and-copying-assets">Loading and copying assets</a></h2>
 <p>The examples below assume the <code>release</code> skill layout shown above.</p>
-<p>Only <code>name</code> is required by the <code>skill</code> input schema. <code>path</code> and <code>to</code> are optional and nullable;
-native calls supplying <code>null</code> behave like calls omitting those fields.</p>
-<pre><code class="language-js">await tool.skill({ name: "release" }); // Complete SKILL.md plus recursive assets tree
+<p>All <code>skill</code> arguments are optional and nullable; native calls supplying <code>null</code> behave like calls
+omitting those fields. Without <code>name</code>, the call lists available skills; <code>path</code> requires <code>name</code>.</p>
+<pre><code class="language-js">await tool.skill(); // {kind: "list", skills: [{name, description}]}
+await tool.skill({ name: "release" }); // Complete SKILL.md, assets tree, and location
 await tool.skill({ name: "release", path: "references" }); // Directory subtree
 await tool.skill({ name: "release", path: "references/template.md" }); // Original text
 await tool.skill({ name: "release", path: "assets/logo.png" }); // Attached image
-await tool.skill({ name: "release", path: "assets/logo.png", to: "tmp/logo.png" }); // Copy
 </code></pre>
-<p>Results have a <code>kind</code> discriminator: <code>skill</code>, <code>directory</code>, <code>text</code>, <code>image</code>, <code>binary</code>, or <code>copied</code>.
-Base skill results contain <code>name</code>, <code>description</code>, complete <code>content</code>, and an <code>assets</code> text tree
-that includes nested files but excludes the already-loaded root <code>SKILL.md</code>. Directory results
-use the same tree format, rooted at the selected path. Trees mark symlinks without descending
-through them. Long trees and asset text are saved in full and can be paged using <code>job_output</code>.</p>
+<p>Results have a <code>kind</code> discriminator: <code>list</code>, <code>skill</code>, <code>directory</code>, <code>text</code>, <code>image</code>, or <code>binary</code>.
+Base skill results contain <code>name</code>, <code>description</code>, <code>location</code>, complete <code>content</code>, and an <code>assets</code>
+text tree that includes nested files but excludes the already-loaded root <code>SKILL.md</code>. Directory
+results use the same tree format, rooted at the selected path. Trees mark symlinks without
+descending through them. Long trees and asset text are saved in full and can be paged using <code>jobs</code>.</p>
 <p>Text assets (including JSON, YAML, source code, and SVG) are returned unchanged, never executed.
-Supported raster images are attached with metadata. Other binary files return metadata and
-a suggestion to supply <code>to</code>, rather than raw binary or base64 content. Copies return destination,
-byte count, and SHA-256, and require write authorization. <code>to</code> is resolved in the <strong>calling agent’s
-target and workspace</strong>: a remote agent receives host-owned asset bytes on its remote target,
-not in a similarly named directory on the host. Skill discovery, instructions, and asset reads
-remain host-owned. Remote copies require route and destination write authorization, including
-path approval when the destination is outside the authorized workspace. <code>to</code> requires a file
-<code>path</code>; paths inside a skill must be relative and cannot escape its root. Use <code>path: "."</code> to
-browse the root.</p>
+Supported raster images are attached with metadata. Other binary files return metadata rather
+than raw binary or base64 content. Paths inside a skill must be relative and cannot escape its
+root. Use <code>path: "."</code> to browse the root.</p>
+<p>Skills live on the session host. <code>location</code> is <code>{path, target: "root"}</code>, the skill directory’s
+absolute path there, so ordinary tools can reach its files. <code>target</code> is included only for agents
+with the <code>targets</code> capability; an agent on a remote target without it cannot reach the session
+host, so its results have no <code>location</code>. Copy an asset with
+<a href="#creating-files-with-write"><code>write</code>’s <code>source</code></a>, which also delivers it to
+an agent working on a remote target:</p>
+<pre><code class="language-js">const { location } = (await tool.skill({ name: "release" })).unwrap();
+await tool.write({
+  path: "tmp/release.py",
+  source: { path: `${location.path}/scripts/release.py`, target: "root" },
+});
+</code></pre>
+<p>An agent on the session host can omit <code>target</code>.</p>
 <p>A <a href="https://github.com/kryesh/skyhook/tree/main/tests/fixtures/skill-workspace">mixed-file test workspace</a> includes its hidden
 <code>.agents/skills/mixed-assets/</code> directory. Its tests exercise native calls, explicit nulls,
-asset discovery, UTF-8 and binary files, image attachments, copying, and path containment.</p>
+asset discovery, UTF-8 and binary files, image attachments, and path containment.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="configuration-overview"><a class="header" href="#configuration-overview">Configuration overview</a></h1>
 <p>Skyhook uses YAML configuration. The files are not rewritten when the terminal remembers a
@@ -890,23 +902,29 @@ configuration must be valid; defaults are applied <strong>after merging</strong>
 entry of the same name, without inheriting omitted fields. For example, <code>targets.build</code>
 replaces that target’s SSH, authentication, workspace, and routing settings; <code>modes.general</code>
 replaces that mode’s capabilities, instructions, and hint. Other named entries remain available.
-An explicit <code>null</code> replaces the earlier value: it clears an optional field, but is not a deletion
-operator for map entries. Required fields and named entries must still have valid values.</p>
+A provider entry that changes <code>dialect</code> likewise replaces the earlier provider’s settings, which
+belong to the other dialect, while the models declared under it still merge by name. Within a
+provider, a later layer replaces <code>api_key</code> and each <code>headers</code> value whole, and likewise each
+convention choice (<code>cache_key</code>, <code>output_limit</code>, <code>reasoning_effort</code>, <code>reasoning_replay</code>,
+<code>tool_stream</code>, <code>user_id</code>) at entry level or under a model’s <code>overrides</code>: a workspace
+<code>api_key: {command: ...}</code> or <code>cache_key: {body: ...}</code> takes the place of a user <code>{env: ...}</code> or
+<code>{header: ...}</code> rather than combining with it. An explicit <code>null</code> replaces the earlier value: it
+clears an optional field, but is not a deletion operator for map entries. Required fields and named
+entries must still have valid values.</p>
 <h3 id="example-user-models-workspace-targets"><a class="header" href="#example-user-models-workspace-targets">Example: user models, workspace targets</a></h3>
-<p>Keep provider/model definitions in the selected user <code>config.yaml</code>:</p>
+<p>Keep providers, with their models, in the selected user <code>config.yaml</code>:</p>
 <pre><code class="language-yaml">providers:
   openai:
-    kind: "openai"
+    codec: "responses"
+    dialect: "openai"
     base_url: "https://api.openai.com/v1"
-    api: "responses"
-    api_key_env: "OPENAI_API_KEY"
-
-models:
-  default:
-    provider: "openai"
-    model: "gpt-5.6"
-    max_context: 1050000
-    max_output: 128000
+    api_key:
+      env: "OPENAI_API_KEY"
+    models:
+      default:
+        model: "gpt-5.6"
+        max_context: 1050000
+        max_output: 128000
 
 targets:
   bastion:
@@ -1007,10 +1025,13 @@ and authentication.</li>
 <h2 id="complete-example"><a class="header" href="#complete-example">Complete example</a></h2>
 <p>This is included from the repository’s single maintained
 <a href="https://github.com/kryesh/skyhook/blob/main/config.example.yaml"><code>config.example.yaml</code></a>.
-It demonstrates multiple providers; remove unused profiles or supply their credentials before
-running a session. For a minimal configuration, follow <a href="#your-first-session">your first session</a>.</p>
+It demonstrates multiple providers; remove unused providers and models or supply their credentials
+before running a session. For a minimal configuration, follow
+<a href="#your-first-session">your first session</a>.</p>
 <pre><code class="language-yaml"># The interface remembers the most recently selected model.
-# With no saved selection, the first declared model below is used.
+# With no saved selection, default_model (as "provider/model") is used, else the
+# first model of the first provider declared below.
+# default_model: "openai/openai"
 # Set to true to skip interactive approval for every tool call.
 approve_all: false
 # The mode a new session starts in: the built-in general, or one declared below.
@@ -1035,88 +1056,149 @@ approve_all: false
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.
 # Host environment and .env values are not forwarded to remote targets.
+# Each entry names a dialect (the vendor's conventions) and a codec (the API family).
+# A model is selected as provider/model, e.g. openai/openai.
 providers:
   openai:
-    kind: "openai"
+    codec: "responses"
+    dialect: "openai"
     base_url: "https://api.openai.com/v1"
-    api: "responses"
-    api_key_env: "OPENAI_API_KEY"
+    api_key:
+      env: "OPENAI_API_KEY"
+    # Reasoning summaries need a verified OpenAI organisation:
+    # reasoning_summary: false
+    # Published model limits; smaller budgets can be chosen for cost/latency.
+    models:
+      # https://developers.openai.com/api/docs/models/gpt-5.6-sol
+      openai:
+        model: "gpt-5.6-sol"
+        reasoning: "high"
+        max_context: 1050000
+        max_output: 128000
+        supports_images: true
 
   anthropic:
-    kind: "anthropic"
+    codec: "messages"
+    dialect: "anthropic"
     base_url: "https://api.anthropic.com/v1"
-    api_key_env: "ANTHROPIC_API_KEY"
-    # Alternatively, remove api_key_env and retrieve a key lazily on the first request:
-    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
-    # Runs via /bin/sh -c on the host; trimmed stdout is cached for this provider.
-    # Also supported by OpenAI-compatible providers; cannot be combined with api_key_env.
+    # Any value that may hold a secret (api_key or a header) takes one of
+    # three forms: written literally, read from the environment when the provider is
+    # built, or produced by a command run via /bin/sh -c on the first request (trimmed
+    # stdout, cached for this provider and run again after the server refuses it).
+    # A literal secret sits in this file in plain text and `skyhook dump config`
+    # prints it; prefer env or command.
+    api_key:
+      env: "ANTHROPIC_API_KEY"
+    # api_key: "sk-ant-..."
+    # api_key:
+    #   command: "op read 'op://Private/Anthropic/api-key'"
+    # Cache breakpoints default to five minutes; the hour costs more to write:
+    # cache_ttl: "1h"
+    models:
+      # https://platform.claude.com/docs/en/models/sonnet-4-6/overview
+      sonnet:
+        model: "claude-sonnet-4-6"
+        reasoning: "high"
+        max_context: 1000000
+        max_output: 128000
+        supports_images: true
 
   # Run `skyhook auth login` (or `skyhook auth login --headless`) first.
   # Credentials belong to Skyhook; official Codex client credentials are never accessed.
   codex:
-    kind: "codex"
+    codec: "responses"
+    dialect: "codex"
+    # The service and its OAuth issuer default to OpenAI's; name them only for a mirror:
+    # base_url: "https://chatgpt.com/backend-api/codex"
+    # auth_url: "https://auth.openai.com"
+    # Stored credentials are bound to the auth_url; changing it requires a new login.
+    models:
+      # Codex's catalog advertises a maximum context of 872000 (default: 272000).
+      # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
+      # max_output is required profile metadata, but is not sent to the Codex endpoint.
+      # It does not control the 80%-of-context compaction threshold.
+      codex:
+        model: "gpt-5.6-sol"
+        reasoning: "high"
+        max_context: 872000
+        max_output: 128000
+        supports_images: true
+
+  # OpenRouter routes an alias across providers; routing preferences are optional.
+  # openrouter:
+  #   codec: "chat_completions"
+  #   dialect: "openrouter"
+  #   base_url: "https://openrouter.ai/api/v1"
+  #   api_key:
+  #     env: "OPENROUTER_API_KEY"
+  #   routing:
+  #     order: ["anthropic"]
+  #     allow_fallbacks: false
+  #   cache_ttl: "1h"
+  #   models:
+  #     sonnet:
+  #       model: "anthropic/claude-sonnet-4.5"
+  #       reasoning: "high"
+  #       max_context: 200000
+  #       max_output: 64000
+  #       supports_images: true
+
+  # A LiteLLM proxy speaks every codec; the upstream family behind an alias is
+  # hidden from clients, so the entry names it.
+  # proxy:
+  #   codec: "chat_completions"
+  #   dialect: "litellm"
+  #   base_url: "https://litellm.example.com/v1"
+  #   api_key:
+  #     env: "LITELLM_API_KEY"
+  #   upstream: "anthropic"       # or "openai", "bedrock"
+  #   tags: ["skyhook"]           # sent as x-litellm-tags
+  #   models:
+  #     claude:
+  #       model: "claude-alias"
+  #       reasoning: "high"
+  #       max_context: 200000
+  #       max_output: 64000
 
   # Keyless local llama.cpp endpoint; the model alias matches --alias below.
   # Example text-only server (requires enough memory for the configured context):
   # llama-server --model /path/to/Qwen3.8-27B.gguf --alias qwen3.8-27b \
   #   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 --n-predict 131072
   local:
-    kind: "openai"
+    # Standards-following servers need only an endpoint.
+    codec: "chat_completions"
+    dialect: "compatible"
     base_url: "http://127.0.0.1:8080/v1"
-    api: "chat_completions"
-    # Chat-only, per-provider. Default "reasoning_content" replays returned reasoning.
-    # Use "reasoning" for that wire convention, or "unsupported" to keep it local only.
-    # Other protocols replay native reasoning automatically and do not accept this option.
-    # chat_reasoning_replay: "reasoning_content"
+    # A compatible entry may still place each dimension itself, for example a server
+    # that spells the reasoning replay field differently or ignores max_completion_tokens:
+    # reasoning_replay:
+    #   field: "reasoning"
+    # output_limit:
+    #   field: "max_tokens"
+    # Fixed request headers apply to every dialect (proxies, attribution); each value
+    # takes the same three forms as api_key:
+    # headers:
+    #   x-title: "skyhook"
+    #   x-proxy-token:
+    #     env: "PROXY_TOKEN"
+    #   x-proxy-user:
+    #     command: "id -un"
     # Defaults allow long local-model prefills. Startup applies to EACH HTTP attempt.
     # startup_timeout_secs: 600
     # read_idle_timeout_secs: 600
-
-# Published model limits; smaller budgets can be chosen for cost/latency.
-models:
-  # https://developers.openai.com/api/docs/models/gpt-5.6-sol
-  openai:
-    provider: "openai"
-    model: "gpt-5.6"
-    reasoning: "high"
-    max_context: 1050000
-    max_output: 128000
-    supports_images: true
-
-  # https://platform.claude.com/docs/en/models/sonnet-4-6/overview
-  sonnet:
-    provider: "anthropic"
-    model: "claude-sonnet-4-6"
-    reasoning: "high"
-    max_context: 1000000
-    max_output: 128000
-    supports_images: true
-
-  # Codex's catalog advertises a maximum context of 872000 (default: 272000).
-  # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
-  # max_output is required profile metadata, but is not sent to the Codex endpoint.
-  # It does not control the 80%-of-context compaction threshold.
-  codex:
-    provider: "codex"
-    model: "gpt-5.6-sol"
-    reasoning: "high"
-    max_context: 872000
-    max_output: 128000
-    supports_images: true
-
-  # https://huggingface.co/Qwen/Qwen3.8-27B
-  local:
-    provider: "local"
-    model: "qwen3.8-27b"
-    # Native context; match the llama-server per-slot context, not extended-context claims.
-    max_context: 262144
-    # Chosen total-generation cap matching --n-predict, NOT a published hard model limit.
-    # Reasoning and final text share this allowance and the overall context window.
-    max_output: 131072
-    # The text-only server above has no multimodal projector configured.
-    supports_images: false
-    # Adding a hint makes the model available to be used for delegation by other agents
-    hint: "Local model, good at exploration and logic but not writing"
+    models:
+      # https://huggingface.co/Qwen/Qwen3.8-27B
+      local:
+        model: "qwen3.8-27b"
+        # Native context; match the llama-server per-slot context, not extended-context claims.
+        max_context: 262144
+        # Chosen total-generation cap matching --n-predict, NOT a published hard model limit.
+        # Reasoning and final text share this allowance and the overall context window.
+        max_output: 131072
+        # The text-only server above has no multimodal projector configured.
+        supports_images: false
+        # Adding a hint makes the model available to be used for delegation by other agents
+        hint: "Local model, good at exploration and logic but not writing"
 
 # Targets are defined only here or by target_add; SSH configuration files are never read.
 
@@ -1186,14 +1268,70 @@ models:
 </code></pre>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="providers-and-models"><a class="header" href="#providers-and-models">Providers and models</a></h1>
-<p>Providers and models are separate named profiles. API secrets can be read from environment variables
-or retrieved lazily by a command; no literal API-key field is supported in YAML. <code>openai</code> requires
-an explicit <code>base_url</code> and <code>api</code> (<code>chat_completions</code> or <code>responses</code>); <code>anthropic</code> requires an explicit
-<code>base_url</code>. Both accept either <code>api_key_env</code> or <code>api_key_command</code>, or neither for a keyless endpoint.
-URLs name the API root: Skyhook appends
-<code>/chat/completions</code>, <code>/responses</code>, or <code>/messages</code>. For the official services use
-<code>https://api.openai.com/v1</code> or <code>https://api.anthropic.com/v1</code>. There are no vendor presets, model
-aliases, or automatic vendor detection. Use full model identifiers.</p>
+<p>A provider entry names an endpoint and the models served through it, under <code>models</code>. Everywhere a
+model is chosen or recorded—<code>--model</code>, the <code>/model</code> picker, the <code>agent</code> tool, <code>default_model</code>,
+session history and <code>skyhook stats</code>—it is named <code>provider/model</code> from the two keys, so neither key
+may contain <code>/</code>. The <code>model</code> field inside a profile is the identifier sent on the wire and stays
+free-form. <code>default_model</code> selects the model a new session starts with when neither <code>--model</code> nor
+the model last submitted in the workspace chooses one; without it, the first model of the first
+provider is used.</p>
+<p>Every entry names a <strong>dialect</strong> and a <strong>codec</strong>. The codec is the API family the endpoint speaks:
+<code>chat_completions</code>, <code>responses</code>, or <code>messages</code>; <code>base_url</code> names the API root and Skyhook appends
+<code>/chat/completions</code>, <code>/responses</code>, or <code>/messages</code>. The dialect is the set of wire conventions the
+server follows:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Dialect</th><th>Codecs</th><th>Use for</th></tr>
+</thead>
+<tbody>
+<tr><td><code>compatible</code></td><td>any</td><td>Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only <code>base_url</code>. A key is sent as each API specifies: a bearer token, or <code>x-api-key</code> on <code>messages</code>.</td></tr>
+<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary: false</code> for an unverified organisation (Responses only), <code>organization</code>, <code>project</code>.</td></tr>
+<tr><td><code>anthropic</code></td><td><code>messages</code></td><td><code>https://api.anthropic.com/v1</code>. Extra fields: <code>workspace_id</code>, <code>cache_ttl: "5m"</code> or <code>"1h"</code>.</td></tr>
+<tr><td><code>codex</code></td><td><code>responses</code></td><td>The ChatGPT subscription service; no <code>api_key</code>—run <code>skyhook auth login</code>. <code>base_url</code> defaults to <code>https://chatgpt.com/backend-api/codex</code> and the extra field <code>auth_url</code> to <code>https://auth.openai.com</code>; set them only for a mirror.</td></tr>
+<tr><td><code>openrouter</code></td><td>any</td><td><code>https://openrouter.ai/api/v1</code>. Reasoning effort and returned reasoning follow OpenRouter’s conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: <code>routing</code> (Chat only: <code>order</code>, <code>allow_fallbacks</code>, <code>require_parameters</code>, <code>data_collection: "allow"</code> or <code>"deny"</code>, <code>quantizations</code>, <code>zdr</code>, <code>fallback_models</code>) and <code>cache_ttl: "5m"</code> or <code>"1h"</code>. A response schema always sets <code>require_parameters</code>.</td></tr>
+<tr><td><code>litellm</code></td><td>any</td><td>A LiteLLM proxy; <code>api_key</code> is the virtual key. Required <code>upstream: "openai"</code>, <code>"anthropic"</code> or <code>"bedrock"</code> names the family behind the alias, which the proxy hides: Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; <code>messages</code> behind an OpenAI upstream goes through the proxy’s translation, which drops reasoning. Optional <code>tags</code> select LiteLLM’s tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session.</td></tr>
+</tbody>
+</table>
+</div>
+<p>Every dialect but <code>codex</code> accepts <code>api_key</code> (see <a href="#authentication">authentication</a>); every
+dialect accepts fixed request <code>headers</code> for proxies or attribution, the
+<a href="#connection-timeouts">connection timeouts</a>, and <code>models</code>. On <code>messages</code>, a configured
+<code>anthropic-beta</code> adds to the betas Skyhook announces rather than replacing them. The credential
+header and header placements (<code>cache_key: {header: …}</code>, or a dialect’s own) in turn replace an
+entry header of the same name, whose command then never runs; so does <code>Accept</code>, which is always
+<code>text/event-stream</code>. Unknown fields, and a codec the dialect does not speak, are rejected. There
+are no model aliases or automatic vendor detection: <code>model</code> is the identifier sent on the wire.</p>
+<p>A <code>compatible</code> entry may place each convention itself when a server deviates, and any model may
+carry the same selections under <code>overrides</code> to differ from its provider:</p>
+<pre><code class="language-yaml">providers:
+  local:
+    codec: "chat_completions"
+    dialect: "compatible"
+    base_url: "http://127.0.0.1:8000/v1"
+    output_limit:                                # or: omitted
+      field: "max_tokens"
+    reasoning_replay:                            # the assistant-message key; or: omitted
+      field: "reasoning"
+    cache_key:                                   # or `header: "x-session-id"`, or: omitted
+      body: "cache_salt"
+    models:
+      thinker:
+        model: "served-name"
+        max_context: 131072
+        max_output: 32768
+        overrides:
+          reasoning_effort: "reasoning_effort"
+</code></pre>
+<p>The selectable dimensions are <code>output_limit</code>, <code>reasoning_effort</code> (a field path), <code>reasoning_replay</code>
+and <code>tool_stream</code> (Chat Completions only), <code>cache_key</code>, and <code>user_id</code>. A field path is
+dot-separated (<code>metadata.user_id</code>); <code>cache_key</code> and <code>user_id</code> carry the conversation identity.
+Paths must not name a field the codec writes itself (such as <code>model</code> or <code>messages</code>), and no two may
+overlap, including one inside another (<code>reasoning</code> and <code>reasoning.effort</code>). A <code>cache_key</code> header
+must not be <code>accept</code>, <code>content-type</code>, or a header the codec sends itself (such as
+<code>anthropic-version</code> on <code>messages</code>). A <code>reasoning_replay</code>
+field moves the provider’s replay to another key in the same form. Messages requires an output
+limit, so <code>output_limit: omitted</code> is refused there.</p>
 <h2 id="context-and-output-budgets"><a class="header" href="#context-and-output-budgets">Context and output budgets</a></h2>
 <p>Every model profile requires <code>max_context</code> and <code>max_output</code>. Both must be positive, and
 <code>max_output</code> must be smaller than <code>max_context</code>. Prompt/history, reasoning, and generated
@@ -1213,7 +1351,7 @@ for what the model receives.</p>
 <div class="table-wrapper">
 <table>
 <thead>
-<tr><th>Profile</th><th style="text-align: right">Context</th><th style="text-align: right">Output</th><th>Source</th></tr>
+<tr><th>Model</th><th style="text-align: right">Context</th><th style="text-align: right">Output</th><th>Source</th></tr>
 </thead>
 <tbody>
 <tr><td>GPT-5.6 / GPT-5.6 Sol, OpenAI API</td><td style="text-align: right">1,050,000</td><td style="text-align: right">128,000</td><td><a href="https://developers.openai.com/api/docs/models/gpt-5.6-sol">Model documentation</a></td></tr>
@@ -1237,34 +1375,32 @@ Use a compatible llama.cpp build and GGUF, and configure one server slot explici
   --alias qwen3.8-27b \
   --host 127.0.0.1 --port 8080 \
   --ctx-size 262144 --parallel 1 \
-  --n-predict 131072 \
-  --jinja --reasoning-format deepseek
+  --n-predict 131072
 </code></pre>
 <p>Then configure Skyhook to match:</p>
 <pre><code class="language-yaml">approve_all: false
 
 providers:
   local:
-    kind: "openai"
+    codec: "chat_completions"
+    dialect: "compatible"
     base_url: "http://127.0.0.1:8080/v1"
-    api: "chat_completions"
-
-models:
-  local:
-    provider: "local"
-    model: "qwen3.8-27b"
-    max_context: 262144
-    max_output: 131072
-    supports_images: false
+    models:
+      qwen:
+        model: "qwen3.8-27b"
+        max_context: 262144
+        max_output: 131072
+        supports_images: false
 </code></pre>
+<p>Select it as <code>local/qwen</code>.</p>
 <p>Here <strong>131,072 is a chosen total-generation cap</strong>, matching <code>--n-predict</code>, not a published
 hard output limit of Qwen3.8-27B. Qwen recommends separate reasoning and final-response budgets
 for some extended-context deployments; this example instead shares one allowance between
 reasoning and final text. The complete prompt and generated output must still fit the context.</p>
-<p>The <code>model</code> value matches the server’s <code>--alias</code>. <code>--reasoning-format deepseek</code> returns
-reasoning in <code>reasoning_content</code>, matching Skyhook’s default replay convention. The command
-is text-only, so <code>supports_images</code> stays false; image input needs a compatible multimodal
-projector and a tested server configuration.</p>
+<p>The <code>model</code> value matches the server’s <code>--alias</code>. Current llama.cpp builds render chat templates
+and split reasoning into <code>reasoning_content</code> by default, matching Skyhook’s default replay
+convention. The command is text-only, so <code>supports_images</code> stays false; image input needs a
+compatible multimodal projector and a tested server configuration.</p>
 <p>Verify the server’s allocated context in its startup logs. If memory requires a smaller context,
 reduce both the server setting and Skyhook’s budget; with multiple slots, use the actual per-slot
 capacity, not an assumed aggregate. See the
@@ -1273,8 +1409,12 @@ for server options.</p>
 <h2 id="model-failure-recovery"><a class="header" href="#model-failure-recovery">Model failure recovery</a></h2>
 <p>For every provider, <strong>transient/network failures retry until success or cancellation</strong>,
 with no attempt limit. This includes connection failures, interrupted streams, timeouts,
-rate limits, and temporary server errors. Authentication, invalid-request, and malformed-response
-errors stop the request instead of retrying.</p>
+rate limits, temporary server errors, and an expired command-sourced credential
+(<a href="#api-keys-and-environment-files">authentication</a>). Other authentication,
+billing (exhausted quota, credit, or spend limit, however the service reports it),
+invalid-request, and malformed-response errors stop the request instead of retrying. So does a
+response with neither visible text nor a tool call, such as reasoning alone; cut off at
+<code>max_output</code>, it reports that the output limit was reached.</p>
 <p>A valid server <code>Retry-After</code> hint—delay-seconds or an HTTP-date—sets the delay,
 even when it exceeds 30 seconds. Past dates mean no delay; malformed or ambiguous
 headers fall back to the default backoff.
@@ -1301,71 +1441,85 @@ with <code>reasoning</code> unset, the model’s default applies and may omit th
 Skyhook displays only the reasoning text or summaries the service returns, not otherwise-private
 reasoning. Support varies by provider, model, and compatible server.</p>
 <p>Skyhook saves returned reasoning and automatically reuses it when compatible with the selected
-provider, endpoint, API, and model. Switching to an incompatible profile omits that reasoning from
+provider, endpoint, API, and model. Switching to an incompatible model omits that reasoning from
 requests without deleting the saved history. Signed thinking cannot be reused across compaction
-or mode switches. Visible summaries cannot replace private reasoning state the service requires.</p>
+or mode switches. Visible summaries cannot replace private reasoning state the service requires.
+Messages servers that do not sign thinking still get it replayed, until a signed block appears in
+the context; from then on only signed blocks are sent.</p>
 <p>Standard Chat Completions has no portable request-side reasoning field. Compatible Chat providers
-replay their returned reasoning using <strong><code>reasoning_content</code> by default</strong>: this is consumed by
-llama.cpp and SGLang, and accepted as an alias by current vLLM. Ordinary Chat responses without
-reasoning do not acquire an invented reasoning field. Configure a different spelling or disable
-request replay on the <strong>provider</strong>, not individual model profiles:</p>
-<pre><code class="language-yaml">providers:
-  local:
-    kind: "openai"
-    base_url: "http://127.0.0.1:8080/v1"
-    api: "chat_completions"
-    # Optional; this is the default:
-    chat_reasoning_replay: "reasoning_content"
-    # Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
-</code></pre>
-<p>This option belongs only to OpenAI-compatible Chat Completions. Anthropic and Codex reject it as an
-unknown setting; configuring it with <code>api: "responses"</code> is also rejected. Their native reasoning
-replay remains automatic and independent of this option. All models using a provider share its
-Chat convention; use separate provider entries if a proxy routes to incompatible conventions.</p>
-<p>Reasoning is replayed with its owning assistant turn, including tool calls and reasoning-only turns;
+replay their returned reasoning under <strong><code>reasoning_content</code> by default</strong>. Ordinary Chat responses
+without reasoning do not acquire an invented reasoning field.
+A server that spells the key differently selects it with <code>reasoning_replay</code> set to
+<code>field: "reasoning"</code>; <code>reasoning_replay: omitted</code> keeps reasoning local. The <code>openai</code> dialect never
+replays on Chat, since the official API rejects unknown message keys; <code>litellm</code> with a Claude
+upstream replays the signed thinking blocks the proxy returns, and <code>openrouter</code> replays its
+<code>reasoning_details</code>; both are bound to the exact conversation like Messages thinking. As on
+Messages, unsigned reasoning is replayed until signed reasoning appears in the context. From then
+on, only signed thinking blocks are sent, and a turn’s <code>reasoning_details</code> are sent whole, in
+order, only if one of them is signed. Responses and Messages replay native reasoning automatically.</p>
+<p>Reasoning is replayed with its owning assistant turn, including turns that only call tools;
 it is never merged into answer text or fabricated <code>&lt;think&gt;</code> tags. Server-side tool and reasoning
 parsers/templates must be configured appropriately; Skyhook does not infer them from model names.
-Chat requests send <code>max_output</code> as <code>max_completion_tokens</code> without renaming, so a server that only
-honours <code>max_tokens</code> ignores the limit.</p>
+Chat requests send <code>max_output</code> as <code>max_completion_tokens</code>; a server that only honours
+<code>max_tokens</code> sets <code>output_limit</code> to <code>field: "max_tokens"</code>.</p>
 <h2 id="connection-timeouts"><a class="header" href="#connection-timeouts">Connection timeouts</a></h2>
-<p>OpenAI-compatible and Anthropic providers also accept positive <code>startup_timeout_secs</code> and
-<code>read_idle_timeout_secs</code> settings (both default to 600 seconds). Startup is a deadline for each HTTP
-attempt, while read-idle resets after each response-body chunk. For example:</p>
+<p>Every provider accepts positive <code>startup_timeout_secs</code> and <code>read_idle_timeout_secs</code> settings
+(both default to 600 seconds). Startup is a deadline for each HTTP attempt, while read-idle resets
+after each response-body chunk. For example:</p>
 <pre><code class="language-yaml">providers:
   local:
-    kind: "openai"
+    codec: "chat_completions"
+    dialect: "compatible"
     base_url: "http://127.0.0.1:8080/v1"
-    api: "chat_completions"
     startup_timeout_secs: 600
     read_idle_timeout_secs: 600
 </code></pre>
 <p>Each retry gets fresh deadlines, so these settings do not limit the total time spent on a
 response. Cancel the request to stop waiting; the server may continue processing if it does not
 honor disconnects. See <a href="#model-failure-recovery">model failure recovery</a> for retry behavior.</p>
+<p><code>skyhook dump config</code> writes the resolved timeouts, so a dump shows the defaults an entry left
+implicit.</p>
 <p>See <a href="#authentication">authentication</a> for API-key and Codex login setup,
 and <a href="#conversation-compaction">sessions and context</a> for
 context budgeting and compaction.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="authentication"><a class="header" href="#authentication">Authentication</a></h1>
 <h2 id="api-keys-and-environment-files"><a class="header" href="#api-keys-and-environment-files">API keys and environment files</a></h2>
-<p>Reference an environment variable with <code>api_key_env</code>, or use a command to retrieve the key:</p>
+<p>Any configured value that may hold a secret—<code>api_key</code> and an entry’s fixed <code>headers</code>—takes one
+of three forms: a literal, <code>env: NAME</code> to read an environment variable, or <code>command: "..."</code> to
+run a command:</p>
 <pre><code class="language-yaml">providers:
   anthropic:
-    kind: "anthropic"
+    codec: "messages"
+    dialect: "anthropic"
     base_url: "https://api.anthropic.com/v1"
-    api_key_env: "ANTHROPIC_API_KEY"
-    # Alternatively, remove api_key_env and use:
-    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
+    api_key:
+      env: "ANTHROPIC_API_KEY"
+    # Alternatively:
+    # api_key: "sk-ant-..."
+    # api_key:
+    #   command: "op read 'op://Private/Anthropic/api-key'"
+    headers:
+      x-title: "skyhook"
+      x-proxy-token:
+        env: "PROXY_TOKEN"
 </code></pre>
-<p><code>api_key_env</code> and <code>api_key_command</code> are mutually exclusive. Environment-variable keys are resolved
-when the provider is built and must be present and nonblank. Commands are run only on the provider’s
-first model request, not when configuration is loaded or a conversation is opened. A successful
-command’s stdout is decoded as UTF-8 and trimmed of leading/trailing whitespace and newlines, then
-cached in memory for that provider instance. Concurrent requests and child conversations share the
-cache; a new process or provider instance resolves the key again. Failed commands are not cached
-and may be retried on a subsequent request. Empty output, invalid UTF-8, invalid credential headers,
-and nonzero exits fail the request without including command output in the error. Stdout is limited
-to 64 KiB. Commands run before the HTTP startup timeout; there is no separate command timeout.
+<p>A literal secret is stored in plain text in the configuration file, and <code>skyhook dump config</code>
+prints it. Prefer <code>env</code> or <code>command</code> for secrets.</p>
+<p>Environment-variable values the provider sends are resolved when it is built and must be present
+and nonblank. They are used as they are, not trimmed: a value with a trailing newline fails,
+naming the provider and field. A command runs only on the first model request that sends its value, not when
+configuration is loaded or a conversation is opened. A successful command’s stdout is decoded as
+UTF-8 and trimmed of leading/trailing whitespace and newlines, then cached in memory for that
+provider instance. Concurrent requests and child conversations share the cache; a new process or
+provider instance resolves the value again. Failed commands are not cached and may be retried on a
+subsequent request. When the server refuses a cached value with HTTP 401, the value is discarded
+and the next request runs the command again. If the refused value had been accepted before, as
+when a short-lived token expires, the model request is retried automatically; a value refused on
+its first use fails the request. Empty output, invalid UTF-8, output that is not a valid header
+value, and nonzero exits fail the request without including command output in the error. Stdout
+is limited to 64 KiB. Commands run before the HTTP startup timeout; there is no separate command
+timeout.
 Cancelling the invocation terminates the command’s immediate child process, but does not guarantee
 termination of any descendants it launched.</p>
 <p>Commands are trusted host configuration, executed with <code>/bin/sh -c</code>, inheriting Skyhook’s process
@@ -1376,11 +1530,11 @@ strings or commit them to configuration files.</p>
 <p>At CLI startup, Skyhook loads <strong><code>.env</code> in the invocation directory</strong> before constructing providers.
 Existing process environment variables take precedence. A missing file is ignored; Skyhook does
 not search parent directories, the <code>--workspace</code> directory, or the configuration file’s directory.
-Loaded variables are also inherited by API-key commands and other <strong>local</strong> child processes. Neither
-inherited host environment variables nor <code>.env</code> values are automatically forwarded into remote target
-processes; remote commands use the remote machine’s environment. Managed SSH routes disable <code>SendEnv</code>,
-<code>SetEnv</code>, and X11 forwarding. Local SSH authentication/proxy helpers still use the host environment;
-Skyhook’s <a href="#agents">SSH-agent forwarding</a> is
+Loaded variables are also inherited by credential commands and other <strong>local</strong> child processes.
+Neither inherited host environment variables nor <code>.env</code> values are automatically forwarded into
+remote target processes; remote commands use the remote machine’s environment. Managed SSH routes
+disable <code>SendEnv</code>, <code>SetEnv</code>, and X11 forwarding. Local SSH authentication/proxy helpers still use
+the host environment; Skyhook’s <a href="#agents">SSH-agent forwarding</a> is
 configured separately.</p>
 <p>For example, in the directory from which you run <code>skyhook</code>:</p>
 <pre><code class="language-dotenv">ANTHROPIC_API_KEY="your-key"
@@ -1391,10 +1545,18 @@ fails startup without printing its contents.</p>
 <h2 id="codex-subscription-login"><a class="header" href="#codex-subscription-login">Codex subscription login</a></h2>
 <p>The <code>codex</code> provider uses <strong>Skyhook-owned</strong> OAuth credentials. Run <code>skyhook auth login</code> for browser
 authorization or <code>skyhook auth login --headless</code> for device authorization. <code>skyhook auth status</code>
-reports local login status and <code>skyhook auth logout</code> removes Skyhook’s credentials. Login does not
-require a model configuration. Skyhook never imports, reads, or modifies the official Codex client’s
-credential files. Secure Codex credential storage currently requires Unix; other platforms fail
-explicitly rather than writing tokens without private file permissions.</p>
+reports local login status for the configured issuer and <code>skyhook auth logout</code> removes Skyhook’s
+credentials. Login does not require a model configuration; when the discovered config has a
+<code>codex</code> provider with <code>auth_url</code>, login and token refresh use that issuer instead of
+<code>https://auth.openai.com</code>, and <code>base_url</code> likewise replaces <code>https://chatgpt.com/backend-api/codex</code>
+for requests. <code>auth_url</code> must use HTTPS (HTTP only on a loopback host) and carry no credentials,
+query, or fragment; a path prefix is kept. A configuration whose <code>codex</code> providers name different
+issuers is refused: one login serves one issuer. Skyhook never imports, reads, or modifies the
+official Codex client’s credential files. Secure Codex credential storage currently requires Unix;
+other platforms fail explicitly rather than writing tokens without private file permissions.</p>
+<p>Stored credentials are bound to the issuer that granted them. When a provider’s issuer differs, or
+the credentials were saved by an older Skyhook, requests fail without sending them and ask you to
+run <code>skyhook auth login codex</code> again.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="mcp-servers"><a class="header" href="#mcp-servers">MCP servers</a></h1>
 <p>Configure Model Context Protocol servers in the top-level <strong><code>mcp</code></strong> mapping, with one named
@@ -1512,7 +1674,7 @@ updates.</p>
 <p>A retained child whose job is <code>completed</code>, <code>failed</code>, or <code>interrupted</code> resumes under the same
 job and agent identity, including after a session restart. New instructions are appended to its
 existing conversation. Explicitly <code>cancelled</code> children and non-agent jobs cannot be resumed.
-<code>job_output</code> then exposes the latest run’s saved result, not an archive of earlier results;
+<code>jobs({job})</code> then exposes the latest run’s saved result, not an archive of earlier results;
 the child conversation and messages already delivered to the parent remain intact.</p>
 <p>After a session interruption, retry resumes every retained failed/interrupted child without
 selecting them individually. A child-only retry leaves a parent waiting on work untouched and
@@ -1525,7 +1687,7 @@ parent at a model-request boundary, not by interrupting an in-flight request. Pe
 survive session restart. Reading a background job’s output does not consume its message events.</p>
 <p>Message delivery does not mean the child has finished: completion also requires its owned work
 and queued inputs to be resolved. A completed background child’s notification references its
-<code>meta.last_message</code> instead of repeating the reply already delivered. Explicit <code>job_output</code>
+<code>meta.last_message</code> instead of repeating the reply already delivered. Explicit <code>jobs({job})</code>
 reads and script calls still expose the saved final result; progress text is not concatenated
 into it. A foreground child returns its final reply in the call’s <code>.result</code>, with no progress
 or later message events. The parent cannot make another model request until its foreground
@@ -1544,8 +1706,8 @@ suggestion with a non-whitespace comment. A single question returns that value d
 a merged batch keeps each value under its question ID.
 Root-agent questions go to the host interface instead of a parent agent.
 <code>ask</code> also accepts optional <code>bg</code> (boolean, default <code>false</code>). With <code>bg: true</code>, the call returns
-job metadata immediately so the agent can continue independent work. Use <code>job_output</code> or
-<code>tool.job(id).output()</code> to inspect the pending question and eventual answer; the ask job also
+job metadata immediately so the agent can continue independent work. Use <code>jobs({job})</code> to
+inspect the pending question and eventual answer; the ask job also
 accepts <code>tool.job(id).send({value: answer})</code>. Omitting <code>bg</code> or passing <code>false</code> keeps the usual
 foreground wait. Multiple outstanding child question batches are combined on the stable agent
 job; parents may answer a subset keyed by question ID, and unanswered questions remain pending.
@@ -1570,27 +1732,27 @@ may leave background services running after answering.</p>
 contract</a>; background launches have
 <code>result: null</code> and <code>has_result: false</code>, while loaded literal <code>null</code> results have <code>has_result: true</code>.
 Cancellation returns target-job metadata in <code>.result</code>. A child
-question has <code>state: "waiting_input"</code>; <code>job_output</code> returns its stable question IDs and text in
+question has <code>state: "waiting_input"</code>; <code>jobs({job})</code> returns its stable question IDs and text in
 <code>presentation.question</code>, regardless of its size.</p>
 <p>Jobs normally follow <code>queued → running → completed</code>, optionally cycling through
 <code>waiting_input → running</code>; <code>failed</code>, <code>cancelled</code>, and <code>interrupted</code> are terminal alternatives.
-<code>job_output</code> acknowledges a pending question or terminal result and suppresses duplicate automatic
-notification. Explicit reads remain repeatable, and <code>job_output</code> itself never waits; see
+A <code>jobs({job})</code> read acknowledges a pending question or terminal result and suppresses duplicate
+automatic notification. Explicit reads remain repeatable, and <code>jobs</code> itself never waits; see
 <a href="#waiting-for-background-work">waiting for background work</a>.
 Unanswered questions do not expire. Send answers to the stable child-agent job ID.</p>
 <p>Cancellation cascades through descendant jobs and agents and terminates managed command process
-groups locally and remotely. It is a request: use job_output to confirm termination. Deliberately
+groups locally and remotely. It is a request: use <code>jobs({job})</code> to confirm termination. Deliberately
 detached processes and unreachable remote hosts limit cleanup. Command timeouts are optional;
 omission or null means no deadline. Explicit timeouts of 1–3600 seconds terminate execution,
 retaining captured output. A nonzero command exit is a normal result; see
 <a href="#tool-result-shapes">tool result shapes</a> for process payloads.</p>
 <h2 id="job-names"><a class="header" href="#job-names">Job names</a></h2>
-<p><code>agent</code>, <code>exec</code>, <code>shell</code>, and <code>fetch</code> accept an optional <code>name</code> describing the work. Names must use
+<p><code>agent</code>, <code>exec</code>, and <code>fetch</code> accept an optional <code>name</code> describing the work. Names must use
 lowercase kebab-case: start with a letter, then use lowercase ASCII letters, digits, and single
 hyphens between nonempty words. Examples include <code>inspect-config</code>, <code>run-tests</code>, and <code>build-v2</code>.
 Names are descriptive labels and do not replace job IDs. Tool job names need not be unique;
 child-agent names must be unique within their caller’s scope, as described above.</p>
-<pre><code class="language-js">return tool.exec({argv: ["cargo", "test"], name: "run-tests", bg: true});
+<pre><code class="language-js">return tool.exec({command: ["cargo", "test"], name: "run-tests", bg: true});
 </code></pre>
 <p>Names appear in active-job state, job envelopes (including notifications and inspection), and
 durable job records. They survive session resume. Omitted or null names leave jobs unnamed;
@@ -1604,11 +1766,11 @@ accumulated events together. A wait timeout ends the wait, not the job. A child 
 cancel all owned work before it can finish; root background services remain managed by the live
 session. In headless mode,
 shutdown cancels and drains outstanding work, so workflows must await work they need completed.</p>
-<pre><code class="language-js">const job = await tool.exec({argv: ["cargo", "test"], name: "run-tests", bg: true});
-let status = await tool.job(job.id).output();
+<pre><code class="language-js">const job = await tool.exec({command: ["cargo", "test"], name: "run-tests", bg: true});
+let status = await tool.jobs({job: job.id});
 while (["queued", "running", "waiting_input"].includes(status.state)) {
   await tool.wait({timeout: 300});
-  status = await tool.job(job.id).output();
+  status = await tool.jobs({job: job.id});
 }
 return status;
 </code></pre>
@@ -1637,7 +1799,7 @@ binary’s command help. <code>skyhook</code> itself requires an interactive ter
 <tr><td><code>-c, --config PATH</code></td><td>Use only this file (YAML regardless of suffix); disable user/workspace config searching and merging.</td></tr>
 <tr><td><code>-w, --workspace PATH</code></td><td>Set the workspace base directory (default <code>.</code>).</td></tr>
 <tr><td><code>--resume SESSION_ID</code></td><td>Reopen a saved session.</td></tr>
-<tr><td><code>-m, --model PROFILE</code></td><td>Choose a configured model profile for a new session. Resumed sessions retain their recorded model.</td></tr>
+<tr><td><code>-m, --model PROVIDER/MODEL</code></td><td>Choose a configured model for a new session, named by its provider and model keys. Resumed sessions retain their recorded model.</td></tr>
 <tr><td><code>-p, --prompt TEXT</code></td><td>Submit an initial user message.</td></tr>
 <tr><td><code>-s, --script PATH</code></td><td>Run a JavaScript workflow. Mutually exclusive with <code>--prompt</code>.</td></tr>
 <tr><td><code>--image PATH</code></td><td>Attach an image to the initial prompt; repeat for multiple images. Requires <code>--prompt</code>, conflicts with <code>--script</code>.</td></tr>
@@ -1703,10 +1865,10 @@ including explicit-file-only behavior for <code>--config</code>, and includes de
 built-in <code>general</code> mode) plus any <code>--approve-all</code> override. Source paths and diagnostics go to <strong>stderr</strong>,
 so redirected stdout remains YAML. It exits with status <strong>0</strong> when a valid config can be produced,
 and <strong>nonzero</strong> otherwise; it does not require provider credentials to validate configuration.</p>
-<p>The dump includes literal values stored in configuration, such as MCP environment entries;
-treat its output as potentially sensitive. Environment-backed API keys are not expanded and
-credential commands are not executed. Diagnostic control characters are escaped for safe
-terminal display.</p>
+<p>The dump includes literal values stored in configuration, such as a literal <code>api_key</code> or header
+value and MCP environment entries; treat its output as potentially sensitive. Environment-backed
+values are not expanded and credential commands are not executed. Diagnostic control characters
+are escaped for safe terminal display.</p>
 <h3 id="skills-dump"><a class="header" href="#skills-dump">Skills dump</a></h3>
 <p>The skills dump uses the same skill discovery as a session, independently of model configuration.
 It works without a model config or API credentials. The output is a tree of
@@ -1743,8 +1905,8 @@ skyhook stats --list
 </code></pre>
 <p>Without <code>--format</code>, the report is a session header (initial prompt, start time, duration, request and
 token totals) followed by aligned tables: one row per agent (path, model, completed/requested
-model calls, tool calls, input, cached, and output tokens, duration) with a total row, then
-totals per model profile and per tool.</p>
+model calls, tool calls, input, cached, cache-written, and output tokens, duration) with a total
+row, then totals per model and per tool.</p>
 <ul>
 <li><strong><code>markdown</code></strong> prints that document as Markdown headings and tables.</li>
 <li><strong><code>tree</code></strong> lists the agents as <code>tree</code> would, each line carrying that agent’s figures, followed
@@ -1771,7 +1933,10 @@ skyhook auth logout
 </code></pre>
 <p>The optional provider argument currently accepts only <code>codex</code>, which is the default.
 <code>auth login --headless</code> selects device authorization rather than a browser; it is separate
-from <code>skyhook batch</code>. Login does not require model configuration.
+from <code>skyhook batch</code>. Login needs no configuration file; when one exists it must load, and login
+signs in to the <code>auth_url</code> its <code>codex</code> providers share (entries naming different ones are refused),
+or OpenAI’s issuer when none names one. <code>auth status</code> checks the stored credentials against that
+issuer; <code>auth logout</code> reads no configuration.
 See <a href="#authentication">authentication</a> for credential ownership and storage.</p>
 <h2 id="related-settings"><a class="header" href="#related-settings">Related settings</a></h2>
 <p>The <a href="#configuration-overview">configuration overview</a> describes configuration paths
@@ -1811,8 +1976,8 @@ for await (const {index, value} of new WorkPool(2).run([
 return results;
 </code></pre>
 <h2 id="saved-output-and-serialization"><a class="header" href="#saved-output-and-serialization">Saved output and serialization</a></h2>
-<p>Read or search saved command output with <code>tool.job(commandJobId).output({field:"/result/stdout"})</code>.
-<code>job.output()</code> returns the existing JobView for that job; it does not add another wrapper.
+<p>Read or search saved command output with <code>tool.jobs({job: commandJobId, field: "/result/stdout"})</code>.
+A <code>jobs</code> read returns the existing JobView for that job; it does not add another wrapper.
 Field-selected output is a job view, not a raw string: available text is in
 <code>presentation.preview.lines</code>, with pagination metadata alongside it. Field, pagination, and
 search selections omit image attachments; whole-output reads can attach saved images.</p>
@@ -1832,7 +1997,9 @@ whether that payload is available. <code>meta</code> is <code>null</code> on an 
 when no full metadata is needed. Background, status, inspection, and failure responses carry
 <code>meta</code> when available. It has nullable <code>parent</code>, <code>tool</code>, <code>name</code>, <code>target</code>, <code>workspace</code>,
 <code>last_message</code>, <code>code</code>, and <code>executed</code> fields. <code>target</code> is <code>null</code> when target capabilities are
-unavailable. A pre-admission failure can have <code>id: null</code>.</p>
+unavailable. A pre-admission failure can have <code>id: null</code>, as can a call the runtime could not
+make at all: a tool that is no longer available, or a call interrupted while the session was not
+running, is answered with this same failure shape.</p>
 <p><code>presentation</code> is <code>null</code> when a successful foreground response has no truncation, page, capture,
 question, or notice. When present, it groups <code>preview</code>, <code>truncated</code>, <code>captures</code>, <code>question</code>, and
 <code>notice</code>; empty or absent members use their nullable/empty defaults. Read a page as
@@ -1841,7 +2008,7 @@ Truncation entries keep their source paths rooted at <code>/result/...</code>.</
 <p>JavaScript receives complete data; model views may shorten fields as described in
 <a href="#automatic-previews">saved job output</a>.
 Tool descriptions’ <code>Result</code> refers to the envelope’s <code>.result</code>, not a separate wrapper. A successful
-<code>job_output</code> call on a failed target is still a successful tool invocation returning that failed
+<code>jobs({job})</code> read of a failed target is still a successful tool invocation returning that failed
 <code>JobView</code>; <code>response.unwrap()</code> checks the observed job state and can therefore throw for that view.</p>
 <h2 id="responseunwrap-and-native-results"><a class="header" href="#responseunwrap-and-native-results"><code>response.unwrap()</code> and native results</a></h2>
 <p>Use <code>response.unwrap()</code> synchronously when a completed native payload is needed:</p>
@@ -1853,7 +2020,7 @@ thrown error has <code>error.response</code> containing the envelope and <code>e
 <code>.result</code>. The method is non-enumerable and runtime-only: <code>Object.keys</code>, JSON serialization,
 logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
 <code>receive()</code> values are not decorated, and there is no built-in <code>tool.unwrap</code> helper.</p>
-<p><code>job.output()</code> and output selections already return views, so inspect their <code>presentation.preview</code>,
+<p><code>jobs({job})</code> reads already return views, so inspect their <code>presentation.preview</code>,
 <code>presentation.captures</code>, or pagination rather than unwrapping them. Operational tool failures are
 failed views rather than JavaScript throws; programmer, serialization, <code>receive</code>, and sleep errors
 still throw.</p>
@@ -1866,8 +2033,8 @@ including silent scripts (<code>console: ""</code>) and scripts without a return
 is <code>null</code> on success. In a script JobView, the payload is at <code>/result</code> and its return is at
 <code>/result/value</code>; logs are at <code>/result/console</code>.</p>
 <p><code>console.log(...values)</code> captures space-separated text, formatting objects as JSON. A running
-script’s captured text can be inspected at <code>/result/console</code> with <code>job_output</code> or
-<code>tool.job(scriptJobId).output({field: "/result/console"})</code>. These inspections read the currently
+script’s captured text can be inspected with
+<code>tool.jobs({job: scriptJobId, field: "/result/console"})</code>. These inspections read the currently
 available output; they do not subscribe to future writes or wait for script completion.</p>
 <p>There is no fixed console-capture size cap. Disk capacity and I/O failures still apply.
 Automatic previews can truncate displayed text without discarding captured output; use
@@ -1898,14 +2065,19 @@ serialization errors are not operational tool failures and still reject/throw.</
 <a href="#jobs-and-agents">jobs and agents</a> for background work and child input.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="built-in-tools"><a class="header" href="#built-in-tools">Built-in tools</a></h1>
-<p><code>read</code>, <code>search</code>, <code>glob</code>, <code>exec</code>, <code>shell</code>, <code>fetch</code>, <code>write</code>, <code>replace</code>, <code>remove</code>, <code>script</code>, <code>targets</code>,
-<code>target_add</code>, <code>skills</code>, <code>skill</code>, <code>jobs</code>, <code>job_output</code>, <code>wait</code>, <code>ask</code>, <code>todo</code>, and <code>agent</code>. Calls use the
+<p><code>read</code>, <code>search</code>, <code>glob</code>, <code>exec</code>, <code>fetch</code>, <code>write</code>, <code>replace</code>, <code>remove</code>, <code>script</code>, <code>targets</code>,
+<code>target_add</code>, <code>skill</code>, <code>jobs</code>, <code>wait</code>, <code>ask</code>, <code>todo</code>, and <code>agent</code>. Calls use the
 <a href="#jobview-response-contract">common JobView envelope</a>; native payloads are in <code>.result</code>.
-<code>jobs()</code> lists the current agent’s active jobs, excluding the listing call and its containing script.
-<code>jobs({all:true})</code> includes completed history, and the listing payload is in the envelope’s <code>.result</code>.</p>
-<p><code>job_output</code> reads saved output and status immediately; it never waits for new output or completion.
-<code>tool.job(id).output(...)</code> returns the existing queried view, not another wrapper. Scripts use
-<code>tool.job(id).output(...)</code>, <code>.send({value})</code>, and <code>.cancel()</code>.</p>
+<code>skill</code> is offered only when skills were discovered.</p>
+<p><code>exec({command})</code> runs a string with <code>/bin/sh -lc</code>, or an array as a program and arguments without
+shell parsing: <code>exec({command: "cargo test 2&gt;&amp;1 | tail"})</code> or <code>exec({command: ["cargo", "test"]})</code>.</p>
+<p><code>jobs()</code> lists the current agent’s active jobs, excluding the listing call and its containing script.
+<code>jobs({all:true})</code> includes completed history, and the listing payload is in the envelope’s <code>.result</code>.
+<code>jobs({job})</code> reads that job’s saved output and status immediately; it never waits for new output or
+completion. It returns the existing queried view, not another wrapper, and accepts the
+<a href="#saved-job-output">output selections</a> <code>field</code>, <code>start</code>, <code>limit</code>, <code>pattern</code>, <code>context</code>, and <code>offset</code>.
+<code>all</code> cannot be combined with <code>job</code>, and selections require <code>job</code>. Scripts also control jobs with
+<code>tool.job(id).send({value})</code> and <code>.cancel()</code>.</p>
 <p>Use <code>wait({timeout?: seconds})</code> (or <code>await tool.wait(...)</code> in scripts) to yield until an agent
 event or a timeout, then inspect the relevant jobs. The returned view’s <code>.result</code> is
 <code>{reason:"event"}</code> or <code>{reason:"timeout"}</code>. Omitted or null <code>timeout</code> waits indefinitely;
@@ -1915,13 +2087,28 @@ particular job has completed; inspect its current status. See
 when a wait resolves.</p>
 <p>See the <a href="#responseunwrap-and-native-results">JavaScript response contract</a> for
 <code>response.unwrap()</code>, serialization, and operational-failure behavior. In this reference,
-<code>tool.job(id).output(...)</code> and other inspection calls return views for reading their
+<code>tool.jobs({job})</code> and other inspection calls return views for reading their
 <code>presentation</code> fields; use the task-specific contracts below for their payloads.</p>
+<h2 id="reading-and-replacing-text"><a class="header" href="#reading-and-replacing-text">Reading and replacing text</a></h2>
+<p><code>read({path})</code> reads only regular files. A file is text when it is valid UTF-8 without NUL bytes;
+any other file is attached if it is a supported image and rejected otherwise.
+<code>replace({path, old, new, count?})</code> edits files of at most 4 MiB, both before and after the
+replacement.</p>
 <h2 id="creating-files-with-write"><a class="header" href="#creating-files-with-write">Creating files with <code>write</code></a></h2>
 <p><code>write({path, content})</code> atomically creates or replaces a UTF-8 file. Set the optional
 <code>create_parents: true</code> to create missing parent directories recursively before writing, for example
 <code>write({path: "reports/run/summary.md", content: "...", create_parents: true})</code>.
 It defaults to <code>false</code>, so a missing parent directory causes the call to fail.</p>
+<p><code>write({path, source: {path, target?}})</code> copies another file’s bytes exactly, including binary
+files of any size. Supply exactly one of <code>content</code> or <code>source</code>. The destination is always in the
+caller’s target and workspace. The source is read on its own target: the caller’s when <code>target</code>
+is omitted, or the named one, which requires the <code>targets</code> capability and follows the same
+workspace rules as any target selection. One approval covers reading the source, connecting to
+its target, and writing the destination, except that a remote source path outside that target’s
+authorization root is approved separately when its target requests it. Contents stream in chunks, through the session host when
+either end is remote, and the destination is replaced only once the whole copy has arrived.
+For example, an agent on a remote target can copy a file from the session host with
+<code>write({path: "tool.bin", source: {path: "/srv/tools/tool.bin", target: "root"}})</code>.</p>
 <h2 id="further-contracts"><a class="header" href="#further-contracts">Further contracts</a></h2>
 <ul>
 <li><a href="#javascript-runtime">JavaScript runtime</a>: fluent builders and native/script result shapes.</li>
@@ -2006,7 +2193,7 @@ character decoding and <code>base64</code> preserves response entity bytes. HTTP
 these are not raw wire bytes. <code>save_to</code> saves the response to a file on success instead of
 embedding the payload. Errors or cancellation do not replace an existing destination.
 Automatic job presentation may shorten <code>body.text</code> and <code>body.data</code>, with continuation markers;
-retrieve the complete saved payload using <code>job_output</code> fields <code>/result/body/text</code> or
+retrieve the complete saved payload using <code>jobs({job})</code> fields <code>/result/body/text</code> or
 <code>/result/body/data</code>. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
 calls still receive the complete payload for processing.</p>
 <p><code>text:true</code> is separate from <code>response_format:"text"</code>: it extracts readable article content from
@@ -2024,7 +2211,7 @@ honors BOMs, HTTP charsets, and HTML meta charsets where applicable.</p>
 Timeouts must be between 1 and 3600 seconds and <code>max_redirects</code> cannot exceed 20.
 Limits apply while streaming, including to decompressed data; exceeding a limit fails
 rather than reporting an incomplete body as successful. Model-visible preview truncation is
-independent: retrieve saved results with <code>job_output</code>. Cancellation and timeouts cannot undo
+independent: retrieve saved results with <code>jobs({job})</code>. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.</p>
 <p>Transport and processing failures remain failed jobs and failed JobViews (not rejected
 operational script calls), but include a structured failure result. It contains <code>method</code>, a safe
@@ -2124,7 +2311,7 @@ Inspecting a remote job’s saved output does not connect to that machine: a ret
 while a retrieved execution error retains the original operation’s context.</p>
 <p>Structured job diagnostics and explicitly registered diagnostic result fields are rendered for the
 viewing agent, exposing target aliases only when that viewer’s capabilities permit them. This is
-not a general redaction guarantee for saved output. A <code>job_output</code> call made with broader
+not a general redaction guarantee for saved output. A <code>jobs</code> output read made with broader
 capabilities saves its already-rendered view as ordinary JSON. Later reads of that saved snapshot
 with narrower capabilities retain the earlier JSON unchanged, as do reads of script results that
 copy it. Arbitrary returned JSON is not inspected for diagnostics or target aliases, and
@@ -2155,24 +2342,25 @@ notice. These rules also apply after session resume and to completed remote jobs
 <h2 id="script-result-presentation"><a class="header" href="#script-result-presentation">Script result presentation</a></h2>
 <p>The enclosing script’s <code>.result</code> is <code>{value, console, failure}</code>; silent scripts retain
 <code>console: ""</code>. Ordinary tools have no console field. Existing JobViews such as
-<code>tool.job(id).output()</code> are not wrapped again.</p>
+<code>tool.jobs({job})</code> reads are not wrapped again.</p>
 <p>Presentation never changes the full saved return value. Default script output retrieval returns
 the composed script payload; explicit field selections read saved script data. Logging and
 returning the same data explicitly produces both outputs.</p>
 <h2 id="paging-and-searching"><a class="header" href="#paging-and-searching">Paging and searching</a></h2>
-<p>Explicit <code>job_output</code> selections return a view whose <code>presentation.preview</code> defaults to
+<p>Explicit <code>jobs({job})</code> selections return a view whose <code>presentation.preview</code> defaults to
 100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is always returned in full.</p>
 <pre><code class="language-js">// Read a selected part of a saved result.
-job_output({job:42, field:"/result/stdout", start:300, limit:80})
+jobs({job:42, field:"/result/stdout", start:300, limit:80})
 // Search stored text, with surrounding context.
-job_output({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
+jobs({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
 // Continue at the returned source line and UTF-8 byte offset.
-job_output({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
+jobs({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
 </code></pre>
 <p><code>field</code> is a JSON Pointer: <code>/result/content</code> selects a file snapshot, <code>/result/stdout</code> and
 <code>/result/stderr</code> select process streams. For scripts, <code>/result/console</code> selects captured console
 text and <code>/result/value</code> selects the JavaScript return (append pointer segments for nested data,
-for example <code>/result/value/items</code>). Objects and
+for example <code>/result/value/items</code>). The empty pointer <code>""</code> selects the whole saved output, a
+page of <code>{"result": ...}</code>. Objects and
 arrays have deterministic JSON text views. Long lines are split into UTF-8-safe fragments;
 the next position identifies where to continue. Regex matching is case-sensitive unless inline
 flags override it. Matching supports lines up to 4 MiB and reports an explicit resource error
@@ -2420,7 +2608,7 @@ local or remote execution meet at shared runtime boundaries.</p>
 </thead>
 <tbody>
 <tr><td><code>config::RuntimeConfig</code></td><td>An admitted, immutable configuration generation. A selected model retains the configuration that admitted it.</td></tr>
-<tr><td><code>agent::Harness</code></td><td>Shared provider factories, model profiles, policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions.</td></tr>
+<tr><td><code>agent::Harness</code></td><td>Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions.</td></tr>
 <tr><td><code>agent::SessionHandle</code> / session runtime</td><td>One agent tree, its registry and jobs, target routing, MCP connections, observation stream, and session store.</td></tr>
 <tr><td><code>AgentContext</code></td><td>One agent loop’s projected history, request template, model profile, token calibration, and owned provider context.</td></tr>
 <tr><td><code>provider::ProviderContext</code></td><td>Conversation-scoped provider resources and one-attempt model invocations, not authoritative conversation history or retry policy.</td></tr>
@@ -2432,19 +2620,31 @@ local or remote execution meet at shared runtime boundaries.</p>
 <p>A session’s isolated runtime state does not imply filesystem isolation. Execution locations
 select machines and workspaces; tools still operate on those machines’ files.</p>
 <h2 id="provider-boundary-and-lifetime"><a class="header" href="#provider-boundary-and-lifetime">Provider boundary and lifetime</a></h2>
-<p><code>provider::Provider</code> is a shared factory. <code>open_context(correlation)</code> creates an independently
-owned <code>ProviderContext</code> without making a model request; <code>invoke(&amp;mut self, request)</code> returns
-owned startup work and then an owned asynchronous response stream. Neither borrows the context.
-The request’s correlation must match the context’s identity. Custom providers implement both
-traits; native adapters and codecs live under <code>provider::backends</code>, while shared request,
-message, and response types live under <code>provider::protocol</code>.</p>
+<p><code>provider::Provider</code> is a shared factory. <code>open_context(id)</code> creates an independently owned
+<code>ProviderContext</code> for one conversation without making a model request; <code>invoke(&amp;mut self, request)</code> returns an owned asynchronous response stream that does not borrow the context. A
+startup failure is the stream’s first and only item. Providers may send the context identity as
+cache-affinity metadata. Custom providers implement both traits. The three inference API
+families live under <code>provider::codec</code>: each codec encodes requests and decodes native streams
+under a typed dialect that names the conventions varying between servers of that family (field
+placements, tool-name rules, schema constraint, replay spelling, terminal-event shape), while the
+codec keeps the correctness rules and reads error bodies with its API’s own codes. Vendor modules
+under <code>provider::dialect</code> own an entry’s configuration, the codecs they speak and the dialect
+presets for each, credentials, and the transport conventions (fixed headers, per-turn session
+headers, and rules and typed readers that map their servers’ own error codes and wording onto
+error kinds); every configured provider runs as the one <code>provider::http::HttpProvider</code>. Shared
+request, message, and response types live under <code>provider::protocol</code>.</p>
 <p>The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context
-for later input; resources are released when that loop exits. A model-profile change prepares
+for later input; resources are released when that loop exits. A model change prepares
 its replacement before committing the selection, preserves journal history, and resets token
-calibration. Equivalent profiles keep the current context. A mode change also replaces the
-prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
-context under the same agent correlation identity.</p>
+calibration. Reselecting the current model keeps the current context. A mode change also replaces
+the prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
+context under the same context identity.</p>
+<p>The session owns the durable conversation (<code>session::Message</code>): user text and attachments, the
+agent’s state (date, live jobs, todos), job events (child replies and presented job views),
+parent input and compaction summaries. Providers receive it rendered: state and job events
+become runtime text that joins the final turn, so the provider layer knows nothing about jobs
+or todos, and those renderers are part of the session format.</p>
 <p>Providers receive complete provider-neutral requests; they do not privately replay failed
 submissions. A <code>response_schema</code> must be transmitted as a structured-output constraint or
 rejected with <code>InvalidRequest</code>, not silently ignored or replaced with prompting. Input images
@@ -2458,18 +2658,15 @@ under the same context settings until compaction replaces it; the tail is rebuil
 cacheable. A profile’s <code>state_mode</code> puts runtime state in the tail (<code>dynamic</code>), commits it to
 history (<code>persist</code>), or omits it (<code>none</code>). Persisted state lets later requests extend an unchanged
 conversation, which matters for reasoning bound to that conversation.</p>
-<p><code>history_lifetime</code> communicates cache reuse without prescribing a backend implementation:</p>
+<p><code>history_lifetime</code> communicates cache reuse without prescribing a provider implementation:</p>
 <ul>
-<li><code>continuing</code> is the default: later requests extend this history.</li>
-<li><code>ending</code> marks history expected to be replaced after the request; the runtime sets it when
-the request estimate reaches the compaction threshold. It is a cache hint, not the decision
-to compact.</li>
+<li><code>extends</code> is the default: later requests extend this history.</li>
 <li><code>detached</code> marks one-off settings, such as a compaction summary request, with no reusable
 history prefix under those settings.</li>
 </ul>
-<p>Anthropic marks the last history block as a cache breakpoint except for detached requests.
-Ending history still needs that breakpoint to read an existing cache entry. OpenAI protocols
-use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
+<p>Messages, and Chat dialects that select content-part breakpoints, mark the last history block as a
+cache breakpoint except for detached requests.
+OpenAI protocols use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
 to the final tool output or user message instead of introducing a separate user turn, which
 would look like the user speaking again after every tool call.</p>
 <h2 id="request-response-and-recovery-lifecycle"><a class="header" href="#request-response-and-recovery-lifecycle">Request, response, and recovery lifecycle</a></h2>
@@ -2478,10 +2675,13 @@ would look like the user speaking again after every tool call.</p>
 history from the journal, and builds the request. Shared settings are recorded in
 <code>model_context</code>; <code>model_requested</code> freezes the exact history references and inline tail.</li>
 <li>Each provider invocation gets a <code>model_attempt_started</code> record for that logical request.
-<code>ResponseEvent</code>s describe ordered items and blocks: start, typed deltas, authoritative final
-block content, item completion or discard, usage snapshots, and a terminal stop reason.
-<code>ResponseAssembler</code> validates this lifecycle and supplies the same snapshot semantics to
-the runtime and observers. Usage snapshots replace earlier values; they are not increments.</li>
+The stream carries display-only <code>Delta</code>s for blocks, cumulative <code>Usage</code> snapshots, and one
+terminal <code>End</code> holding the <code>Completion</code>: the complete items in position order and how the
+response ended (an answer, tool use, or a cut). Only a completion built for tool use carries
+tool calls, so nothing else can authorize execution. <code>LiveResponse</code> gives the runtime and
+observers the same provisional view of the deltas until the end arrives. Observers then see
+each response settle as committed, committed-but-aborted, or failed, keyed by the journal
+sequence it produced.</li>
 <li>Only an accepted response becomes model-visible history. Its message, usage, and outcome
 commit together before tool dispatch. Each tool result commits as its call finishes; request
 projection merges results back into the original call order. This preserves completed work
@@ -2489,18 +2689,27 @@ after a crash without making completion order part of the next model request.</l
 <li>Once a tool exchange is closed, the runtime can compact history or build the next request.
 An agent with no further work returns to its idle loop rather than discarding its context.</li>
 </ol>
+<p>Hosts fold these records into one <code>RequestPhase</code> per request in <code>session::RequestLedger</code>;
+session statistics and the terminal interface read request outcomes, retry state, and
+message attribution from that fold rather than deriving them from live activity. Folding a
+record reports the requests it changed, so a host can refresh just those.</p>
 <p>Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized <code>ProviderErrorKind</code> values rather than error-message text: rate limits, timeouts,
-transport failures, and retryable response failures repeat the frozen logical request. Input
+transport failures, and unavailable servers repeat the frozen logical request. Input
 and selection changes wait for the next request boundary. The failed stream is dropped before
 backoff; server retry hints take precedence over capped exponential delays. Recovery remains
 cancellable and continues until success or interruption.</p>
-<p>A retry starts a fresh live assembler while retaining the attempt audit records and any reported
-usage. Partial failed responses never authorize tool execution, and transient recovery does
-not rerun completed tools. Authentication, invalid requests, and protocol errors do not enter
-this retry loop. Context-window recovery and invalid compaction summaries have their own bounded
-recovery path. Refusals fail without committing the refused message; a provider abort can retain
-completed safe content but still fails the turn and never executes its tool calls.</p>
+<p>A retry starts a fresh live response while retaining the attempt audit records and any reported
+usage. A stream that fails or closes before its end never authorizes tool execution, and
+transient recovery does not rerun completed tools. An expired command-sourced credential is
+transient: the provider discards it on a 401 and the retry fetches a fresh one. Other
+authentication failures, invalid requests, and protocol errors do not enter this retry loop.
+Context-window recovery and invalid compaction summaries have their own bounded recovery path.</p>
+<p>A refusal cut fails without committing the refused message; an abort cut can retain completed
+safe content but still fails the turn. Any other response with neither nonblank text nor a tool
+call fails with nothing committed: <code>OutputLimit</code> when cut at the output limit, <code>Empty</code> otherwise.
+A truncated or incomplete cut with content commits it as a completed response with that outcome.
+Empty text is never committed, even beside a tool call.</p>
 <h2 id="compaction-and-context-accounting"><a class="header" href="#compaction-and-context-accounting">Compaction and context accounting</a></h2>
 <p>The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a successful response’s reported occupancy (uncached input,
@@ -2517,9 +2726,20 @@ for the durable reference contract.</p>
 <p><code>ToolRegistryBuilder</code> supports typed and JSON-based registrations. Typed registrations generate
 input and output schemas; registry metadata also supplies compact result documentation to the
 model and JavaScript runtime. Both call paths use the same executor, capability checks,
-authorization coordinator, and job supervision rather than separate tool implementations.</p>
-<p>The executor coordinates host-owned jobs and persistence. The local invocation layer admits typed
-arguments and runs operations without requiring a session database. The SSH shim reuses that layer
+authorization coordinator, and job supervision rather than separate tool implementations.
+A tool’s argument checks (validation, path arguments, derived permissions) receive its parsed
+input and run before authorization. The host planner and a remote worker assemble an
+invocation’s permissions by one rule, and a capability the caller lacks makes the tool
+unavailable rather than denied.</p>
+<p>The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
+(queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
+are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
+its startup stage carries a job from creation to its running worker. A tool may declare a source argument, a
+<code>TargetPath</code> on any target: the executor selects its location like a tool target, authorizes the
+read with the call, and opens it for the call’s context. Remote contents stream in chunks through the
+host, spooled to anonymous files: a remote file through its worker’s source request, which the
+worker authorizes and reports as the consuming tool, and to a remote handler before its call starts. The local invocation layer
+admits typed arguments and runs operations without requiring a session database. The SSH shim reuses that layer
 for remote built-ins while the host retains job ownership, policy decisions, and saved output.
 This separation keeps remote workers from becoming second agent runtimes.</p>
 <p>The host tracks remote readers and accepted-payload ingestion independently of callers and
@@ -2530,8 +2750,9 @@ cleanup. See <a href="#connection-and-request-lifecycle">connection and request 
 <p>Tool failures are structured diagnostics: a typed cause plus the operation, subject, site, and
 known effects. Tools annotate facts; <code>tool::diagnostic</code> owns the one renderer. Facts chosen nearest
 the failure win, and each boundary (planning, dispatch, remote result ingestion) only fills what is
-missing. A worker’s reported site is always rebound to the destination of the connection it arrived
-on.</p>
+still unset: a failure carries a partial context in process and is resolved once, when it is
+persisted, sent over the wire, or rendered. A worker’s reported site is always rebound to the
+destination of the connection it arrived on.</p>
 <p>Diagnostics are persisted with the job and rendered per viewer. Target aliases in structured job
 diagnostics and result slots registered by their producer, such as an expected <code>read</code> failure, are
 rendered only when the viewer’s capabilities permit exposing them. Host-site wording is relative
@@ -2540,7 +2761,7 @@ viewers. Capability-sensitive enclosing output pages use private file-backed ren
 than shared render caches, keeping captured output out of memory without reusing privileged
 renderings for those diagnostic slots.</p>
 <p>This rendering boundary does not guarantee that target aliases never appear in a restricted view.
-A privileged <code>job_output</code> call saves its rendered view as an ordinary JSON snapshot. Later
+A privileged <code>jobs</code> output read saves its rendered view as an ordinary JSON snapshot. Later
 restricted views of that saved result, or script results that copy it, retain the earlier rendered
 JSON unchanged. Already-committed model messages are not rewritten. Arbitrary returned JSON is not
 inspected for diagnostics or target aliases, and copied data does not acquire diagnostic provenance.</p>
@@ -2561,8 +2782,11 @@ management is enabled. SSH’s host-mediated prompt channel is described under
 <a href="#authentication-and-prompt-isolation">authentication and prompt isolation</a>.</p>
 <h2 id="durability-and-resume"><a class="header" href="#durability-and-resume">Durability and resume</a></h2>
 <p>Each durable session uses one SQLite database, <code>session.db</code>. The event ledger is append-only and
-normalized; blobs, job output documents, and line-addressable captures share the database rather
-than separate transcript or output files. Related state transitions are appended transactionally
+normalized; blobs, job results, and line-addressable captures share the database rather than
+separate transcript or output files. Only shapes that a model, a tool’s own schema or a provider
+defines are stored as JSON text: tool-call arguments and results, job arguments and output
+schemas, tool and response schemas, reasoning replay payloads, saved job results and the
+results and pages a job event presented. Related state transitions are appended transactionally
 before their in-memory projections are published. Accepted writer work is owned independently
 of the caller, so dropping an await does not cancel a commit already in progress.</p>
 <p>A writer lock excludes competing session owners, not read-only snapshot inspection. If a write’s
@@ -2586,25 +2810,32 @@ request lifecycle.</p>
 <p>The configuration-backed entry point is:</p>
 <pre><code class="language-rust ignore">let harness = config
     .into_runtime()?
-    .select_model(name)?
+    .select_model(&amp;name)?
     .harness_builder(workspace)?
     .build()
     .await?;
 let session = harness.new_session().await?;</code></pre>
-<p><code>into_runtime()</code> admits an immutable configuration generation; <code>select_model(name)</code> binds the
-host’s explicit choice to that generation. Admission and selection precede provider construction,
+<p><code>into_runtime()</code> admits an immutable configuration generation, including any edits the host made
+to the <code>Config</code>; <code>select_model(&amp;name)</code> binds the host’s explicit choice, a <code>ModelRef</code> parsed from
+<code>provider/model</code>, to that generation. Admission and selection precede provider construction,
 credential lookup, and workspace access. <code>harness_builder(workspace)</code> returns a <code>HarnessBuilder</code>
 that can be customized before <code>build().await</code>; hosts supplying their own providers and model
 profiles can instead start with <code>HarnessBuilder::new(workspace)</code>.</p>
 <p>The configuration-backed builder carries the configured modes and selects the configured default.
-<code>mode(name)</code> selects another, and <code>capabilities(set)</code> limits what modes can grant. A builder without
-modes gives the root agent that capability set directly. <code>PromptOptions::model</code> and
-<code>PromptOptions::mode</code> carry selections with a submitted message; omitted selections retain the
-active model and mode. A mode change applies to the root agent from the boundary that consumes
-it, not retroactively to children it already started. A session pins each mode’s definition on
-first use and cannot outgrow its original capability ceiling.</p>
+<code>mode(name)</code> selects another, and <code>capabilities(set)</code> limits what modes can grant; <code>build()</code> rejects
+a selected mode the modes do not declare, whichever was set first. A builder without modes gives the
+root agent that capability set directly, and no mode applies.
+<code>SessionHandle::selection(model, mode)</code> issues the <code>Selection</code> a submitted message or a continued
+turn carries, rejecting a <code>provider/model</code> or mode the session does not have; omitted selections
+retain the active model and mode. A mode change applies to the root agent from the boundary that
+consumes it, not retroactively to children it already started. A session pins each mode’s
+definition on first use and cannot outgrow its original capability ceiling.</p>
 <p>Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
-and an embedded shim catalog. Core <code>Config</code> loading does not load <code>.env</code>; environment setup belongs
+and an embedded shim catalog. A <code>SensitivePromptHandler</code> answers each <code>SensitivePrompt</code> with a
+<code>PromptAnswer</code>: <code>Secret</code> for passwords, passphrases and keyboard-interactive prompts, and
+<code>Confirmed</code> or <code>Rejected</code> for the confirmation kinds (<code>SensitivePromptKind::is_confirmation</code>), which
+cover host keys and agent key use. A handler error means no answer could be obtained; <code>Rejected</code> is a
+decision, and so is an answer of the wrong shape for the prompt’s kind. Core <code>Config</code> loading does not load <code>.env</code>; environment setup belongs
 to the host (the CLI performs its own startup loading).</p>
 <p>The builder defaults to <code>&lt;workspace&gt;/.skyhook/sessions</code>. <code>HarnessBuilder::session_root</code>, including
 an override supplied by <code>Config::session_root</code>, is passed through unchanged: a relative path is
@@ -2616,7 +2847,8 @@ boundary. Apply updates to the snapshot in revision order with <code>Observation
 It contains:</p>
 <ul>
 <li>Durable records keyed by their original journal sequence.</li>
-<li>Request-scoped live responses keyed by agent and logical request, with assembler snapshots.</li>
+<li>Request-scoped live responses keyed by agent and logical request: their streamed blocks in
+arrival order, then the authoritative blocks once the response has ended.</li>
 <li>Current agent activity and context-usage estimates.</li>
 </ul>
 <p>Live response deltas are provisional, not additional committed messages. A new attempt of the
@@ -2645,9 +2877,9 @@ the root answer, or an empty string when there is none.</p>
 before starting agents and opens fresh provider contexts; it does not reuse old network resources.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.</p>
-<p>Session databases now use format 10 for structured diagnostics. Format 9 databases are not
-migrated and cannot be resumed with this version; retain a compatible Skyhook version to inspect
-or resume those sessions, or start a new session.</p>
+<p>Session databases use format 14. Earlier formats are not migrated and cannot be resumed with
+this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
+new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
 producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
 remains available so the host can append a final status after observing shutdown errors; await
@@ -2668,38 +2900,42 @@ archive inspection neither takes ownership nor resumes unfinished work.</p>
 <p>The SQLite layout is versioned by <code>session::SESSION_FORMAT_VERSION</code>. Opening a database validates
 its identity and version; there is no migration or compatibility layer for earlier layouts.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
-<p>The journal records inputs at the shared <code>Provider</code> boundary, not backend-specific request bodies
+<p>The journal records inputs at the shared <code>Provider</code> boundary, not codec-specific request bodies
 or authentication headers:</p>
 <ul>
 <li><code>model_context</code> stores a <code>ModelContext</code>: the purpose, named model-profile snapshot, assembled
 system segments (including harness instructions and location), tool descriptions and schemas,
-and optional response schema. Its <code>template(agent)</code> derives the history-free <code>ModelRequest</code>,
-including the model ID, reasoning setting, output limit, and agent correlation identity. Context
-records describe request settings, not the lifetime of a <code>ProviderContext</code> resource.</li>
+and optional response schema. Its <code>template()</code> derives the history-free <code>ModelRequest</code>,
+including the model ID, reasoning setting, and output limit. Context records describe request
+settings, not the lifetime of a <code>ProviderContext</code> resource.</li>
 <li><code>model_requested</code> identifies one frozen logical request before its first invocation. It references
-the context record and stores <code>history</code> as ordered source-event sequences, <code>tail</code> as exact inline
-messages, <code>history_lifetime</code>, and purpose. Retries refer back to this request using
-<code>model_attempt_started</code>, with separate failure/interruption or completion outcomes. Ordinary
-requests reuse a context record while their settings remain applicable; summarization has a
-separate context with its structured response schema.</li>
+the context record and stores the checkpoint it opens with, <code>history</code> as ordered source-event
+sequences, <code>tail</code> as exact inline messages, and <code>history_lifetime</code>. Retries refer back to this
+request using <code>model_attempt_started</code>, with separate failure/interruption or completion outcomes.
+Ordinary requests reuse a context record while their settings remain applicable; summarization
+has a separate context with its structured response schema.</li>
 <li><code>compaction</code> stores the exact replacement message, retained original message references, covered
-frontier, previous checkpoint, summary request and attempt, token estimates, schema version,
-and reconciled owner todos. History and todos become active together after persistence.</li>
+frontier, the summary attempt that produced it, token estimates, and reconciled owner todos.
+History and todos become active together after persistence.</li>
+<li>Runtime state and job-event content are stored structurally and rendered for the model on
+reconstruction, so a request replays the text the model was sent.</li>
 <li>Reconstruction resolves those references and inline values. It does not consult current
-configuration, prompt code, live jobs, or the current compaction renderer. Failed and interrupted
+configuration, live jobs, or the current compaction renderer. Runtime state and job events are
+rendered by the current state renderer and job-view serialization, which are therefore part of
+the session format: a change to either is a database version bump. Failed and interrupted
 requests keep their recorded inputs; usage identifies the originating request, including summary
 requests and failed attempts.</li>
 </ul>
-<p><code>session::reconstruct_model_request(&amp;records, sequence)</code> returns the configured provider name and
-reconstructed <code>ModelRequest</code> for a <code>model_requested</code> sequence, using sequence-ordered records from
-<code>SessionStore</code>. Attachments and tool images reference content-addressed blobs by SHA-256;
-<code>load_blobs(&amp;mut request).await</code> on an owning <code>SessionStore</code> loads their contents for provider
-encoding; unlike <code>read_records</code>, opening a store acquires the session’s writer lock. Reconstruction
-reproduces Skyhook’s provider-neutral input, not an API-specific wire encoding or a replay of the
-external call.</p>
+<p><code>session::reconstruct_model_request(&amp;records, sequence)</code> returns the <code>provider/model</code> name the
+request was issued under and the reconstructed <code>ModelRequest</code> for a <code>model_requested</code> sequence,
+using sequence-ordered records from <code>SessionStore</code>. Attachments and tool images reference
+content-addressed blobs by SHA-256; <code>load_blobs(&amp;mut request).await</code> on an owning <code>SessionStore</code>
+loads their contents for provider encoding; unlike <code>read_records</code>, opening a store acquires the
+session’s writer lock. Reconstruction reproduces Skyhook’s provider-neutral input, not an
+API-specific wire encoding or a replay of the external call.</p>
 <p>The <code>ModelRequest</code> contract preserves the history/tail split and <code>history_lifetime</code> cache hints.
 See <a href="#history-transient-state-and-caching">history, transient state, and caching</a>
-for their semantics and backend rationale.</p>
+for their semantics and provider rationale.</p>
 <p>Source: <a href="https://github.com/kryesh/skyhook/blob/main/src/config/runtime.rs">configuration admission</a>,
 <a href="https://github.com/kryesh/skyhook/blob/main/src/agent/runtime/session.rs">session handle</a>,
 <a href="https://github.com/kryesh/skyhook/blob/main/src/agent/observation.rs">observation</a>, and
@@ -2737,9 +2973,10 @@ It does not transparently replay the failed tool operation.</p>
 <p>Once connected, request IDs associate output and cancellation with individual operations.
 SSH cancellation remains best-effort: the client does not await a terminal reply. Already captured
 output remains inspectable, but final worker diagnostics or structured results may be unavailable.
-Credit-based flow control bounds queued payload and relayed-stream data. A transport’s lifetime
-owner retains its underlying process resources; dropping it tears those resources down. A relayed
-connection also retains its origin connection for the lifetime of the child stream.</p>
+Credit-based flow control bounds queued payload, source-upload, and relayed-stream data. A
+transport’s lifetime owner retains its underlying process resources; dropping it tears those
+resources down. A relayed connection also retains its origin connection for the lifetime of the
+child stream.</p>
 <p>Accepted-payload ingestion is tracked independently of pool membership and caller lifetime. Pool
 eviction does not abort the reader; dropping the last <code>PooledConnection</code> owner cancels routing
 instead. When routing ends through cancellation or failure, the reader releases the transport
@@ -2772,9 +3009,11 @@ targets use the origin’s inherited agent socket instead. Ordinary processes
 started by a remote worker receive OpenSSH’s forwarded <code>SSH_AUTH_SOCK</code>; no second forwarding
 listener is needed.</p>
 <p>SSH authentication prompts use <code>SensitivePromptHandler</code>, separate from model questions and tool
-output. Remote prompts and answers travel as private control messages, not session events or
-saved results. OpenSSH is given an explicit askpass helper so the host can handle passwords,
-passphrases, and confirmations without exposing them to the agent transcript.</p>
+output. Remote prompts and their typed answers (a secret, a confirmation or a rejection) travel as
+private control messages, not session events or saved results. OpenSSH is given an explicit askpass
+helper so the host can handle passwords, passphrases, and confirmations without exposing them to
+the agent transcript; the helper prints a secret, answers <code>yes</code> to a confirmed host key, and exits
+nonzero for a rejection.</p>
 <p>Each askpass server keeps its helper and socket in a private temporary directory and accepts
 only peers running as its own user. This prevents other local users from injecting
 prompts or obtaining answers through the socket; it is not an isolation boundary against other
@@ -2803,8 +3042,9 @@ produced them. Debug builds (<code>just build</code>) read the directory live, s
 CLI rebuild. Release builds (<code>just build-release</code>) include bytes at compile time and are
 self-contained. That recipe touches the embedding module first because <code>rust-embed</code> cannot detect
 newly added files. Debug shim artifacts are substantially larger than release artifacts.</p>
-<p>A missing or empty staging directory yields an empty catalog; SSH then reports an explicit
-missing-shim error. Library hosts inject their own <a href="#embedded-shim-catalog">embedded catalog</a>
+<p>Artifact names outside this table are rejected when the catalog is built. A missing or empty
+staging directory yields an empty catalog; SSH then reports an explicit missing-shim error, distinct
+from an unsupported remote platform. Library hosts inject their own <a href="#embedded-shim-catalog">embedded catalog</a>
 rather than inheriting the CLI catalog.</p>
 <p>Git contains source only, not prebuilt shim binaries. To build a native Linux SSH shim without
 Zig or UI dependencies:</p>

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -250,7 +250,7 @@ character decoding and <code>base64</code> preserves response entity bytes. HTTP
 these are not raw wire bytes. <code>save_to</code> saves the response to a file on success instead of
 embedding the payload. Errors or cancellation do not replace an existing destination.
 Automatic job presentation may shorten <code>body.text</code> and <code>body.data</code>, with continuation markers;
-retrieve the complete saved payload using <code>job_output</code> fields <code>/result/body/text</code> or
+retrieve the complete saved payload using <code>jobs({job})</code> fields <code>/result/body/text</code> or
 <code>/result/body/data</code>. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
 calls still receive the complete payload for processing.</p>
 <p><code>text:true</code> is separate from <code>response_format:"text"</code>: it extracts readable article content from
@@ -268,7 +268,7 @@ honors BOMs, HTTP charsets, and HTML meta charsets where applicable.</p>
 Timeouts must be between 1 and 3600 seconds and <code>max_redirects</code> cannot exceed 20.
 Limits apply while streaming, including to decompressed data; exceeding a limit fails
 rather than reporting an incomplete body as successful. Model-visible preview truncation is
-independent: retrieve saved results with <code>job_output</code>. Cancellation and timeouts cannot undo
+independent: retrieve saved results with <code>jobs({job})</code>. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.</p>
 <p>Transport and processing failures remain failed jobs and failed JobViews (not rejected
 operational script calls), but include a structured failure result. It contains <code>method</code>, a safe

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -200,7 +200,7 @@ binary’s command help. <code>skyhook</code> itself requires an interactive ter
 <tr><td><code>-c, --config PATH</code></td><td>Use only this file (YAML regardless of suffix); disable user/workspace config searching and merging.</td></tr>
 <tr><td><code>-w, --workspace PATH</code></td><td>Set the workspace base directory (default <code>.</code>).</td></tr>
 <tr><td><code>--resume SESSION_ID</code></td><td>Reopen a saved session.</td></tr>
-<tr><td><code>-m, --model PROFILE</code></td><td>Choose a configured model profile for a new session. Resumed sessions retain their recorded model.</td></tr>
+<tr><td><code>-m, --model PROVIDER/MODEL</code></td><td>Choose a configured model for a new session, named by its provider and model keys. Resumed sessions retain their recorded model.</td></tr>
 <tr><td><code>-p, --prompt TEXT</code></td><td>Submit an initial user message.</td></tr>
 <tr><td><code>-s, --script PATH</code></td><td>Run a JavaScript workflow. Mutually exclusive with <code>--prompt</code>.</td></tr>
 <tr><td><code>--image PATH</code></td><td>Attach an image to the initial prompt; repeat for multiple images. Requires <code>--prompt</code>, conflicts with <code>--script</code>.</td></tr>
@@ -266,10 +266,10 @@ including explicit-file-only behavior for <code>--config</code>, and includes de
 built-in <code>general</code> mode) plus any <code>--approve-all</code> override. Source paths and diagnostics go to <strong>stderr</strong>,
 so redirected stdout remains YAML. It exits with status <strong>0</strong> when a valid config can be produced,
 and <strong>nonzero</strong> otherwise; it does not require provider credentials to validate configuration.</p>
-<p>The dump includes literal values stored in configuration, such as MCP environment entries;
-treat its output as potentially sensitive. Environment-backed API keys are not expanded and
-credential commands are not executed. Diagnostic control characters are escaped for safe
-terminal display.</p>
+<p>The dump includes literal values stored in configuration, such as a literal <code>api_key</code> or header
+value and MCP environment entries; treat its output as potentially sensitive. Environment-backed
+values are not expanded and credential commands are not executed. Diagnostic control characters
+are escaped for safe terminal display.</p>
 <h3 id="skills-dump"><a class="header" href="#skills-dump">Skills dump</a></h3>
 <p>The skills dump uses the same skill discovery as a session, independently of model configuration.
 It works without a model config or API credentials. The output is a tree of
@@ -306,8 +306,8 @@ skyhook stats --list
 </code></pre>
 <p>Without <code>--format</code>, the report is a session header (initial prompt, start time, duration, request and
 token totals) followed by aligned tables: one row per agent (path, model, completed/requested
-model calls, tool calls, input, cached, and output tokens, duration) with a total row, then
-totals per model profile and per tool.</p>
+model calls, tool calls, input, cached, cache-written, and output tokens, duration) with a total
+row, then totals per model and per tool.</p>
 <ul>
 <li><strong><code>markdown</code></strong> prints that document as Markdown headings and tables.</li>
 <li><strong><code>tree</code></strong> lists the agents as <code>tree</code> would, each line carrying that agent’s figures, followed
@@ -334,7 +334,10 @@ skyhook auth logout
 </code></pre>
 <p>The optional provider argument currently accepts only <code>codex</code>, which is the default.
 <code>auth login --headless</code> selects device authorization rather than a browser; it is separate
-from <code>skyhook batch</code>. Login does not require model configuration.
+from <code>skyhook batch</code>. Login needs no configuration file; when one exists it must load, and login
+signs in to the <code>auth_url</code> its <code>codex</code> providers share (entries naming different ones are refused),
+or OpenAI’s issuer when none names one. <code>auth status</code> checks the stored credentials against that
+issuer; <code>auth logout</code> reads no configuration.
 See <a href="../configuration/authentication.html">authentication</a> for credential ownership and storage.</p>
 <h2 id="related-settings"><a class="header" href="#related-settings">Related settings</a></h2>
 <p>The <a href="../configuration/overview.html">configuration overview</a> describes configuration paths

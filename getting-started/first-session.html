@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -189,17 +189,16 @@ mkdir -p "$config_dir"
 <p>Create <code>config.yaml</code> in that directory with a provider and model you can access. For example:</p>
 <pre><code class="language-yaml">providers:
   openai:
-    kind: "openai"
+    codec: "responses"
+    dialect: "openai"
     base_url: "https://api.openai.com/v1"
-    api: "responses"
-    api_key_env: "OPENAI_API_KEY"
-
-models:
-  default:
-    provider: "openai"
-    model: "gpt-5.6"
-    max_context: 1050000
-    max_output: 128000
+    api_key:
+      env: "OPENAI_API_KEY"
+    models:
+      default:
+        model: "gpt-5.6"
+        max_context: 1050000
+        max_output: 128000
 </code></pre>
 <p>Use a model identifier supported by your account and set its token limits explicitly; Skyhook
 does not detect them automatically. You can choose smaller budgets. For model limits, other

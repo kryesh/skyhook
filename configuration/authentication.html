@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-393d7e39.js";
+            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -182,24 +182,41 @@
                     <main>
                         <h1 id="authentication"><a class="header" href="#authentication">Authentication</a></h1>
 <h2 id="api-keys-and-environment-files"><a class="header" href="#api-keys-and-environment-files">API keys and environment files</a></h2>
-<p>Reference an environment variable with <code>api_key_env</code>, or use a command to retrieve the key:</p>
+<p>Any configured value that may hold a secret—<code>api_key</code> and an entry’s fixed <code>headers</code>—takes one
+of three forms: a literal, <code>env: NAME</code> to read an environment variable, or <code>command: "..."</code> to
+run a command:</p>
 <pre><code class="language-yaml">providers:
   anthropic:
-    kind: "anthropic"
+    codec: "messages"
+    dialect: "anthropic"
     base_url: "https://api.anthropic.com/v1"
-    api_key_env: "ANTHROPIC_API_KEY"
-    # Alternatively, remove api_key_env and use:
-    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
+    api_key:
+      env: "ANTHROPIC_API_KEY"
+    # Alternatively:
+    # api_key: "sk-ant-..."
+    # api_key:
+    #   command: "op read 'op://Private/Anthropic/api-key'"
+    headers:
+      x-title: "skyhook"
+      x-proxy-token:
+        env: "PROXY_TOKEN"
 </code></pre>
-<p><code>api_key_env</code> and <code>api_key_command</code> are mutually exclusive. Environment-variable keys are resolved
-when the provider is built and must be present and nonblank. Commands are run only on the provider’s
-first model request, not when configuration is loaded or a conversation is opened. A successful
-command’s stdout is decoded as UTF-8 and trimmed of leading/trailing whitespace and newlines, then
-cached in memory for that provider instance. Concurrent requests and child conversations share the
-cache; a new process or provider instance resolves the key again. Failed commands are not cached
-and may be retried on a subsequent request. Empty output, invalid UTF-8, invalid credential headers,
-and nonzero exits fail the request without including command output in the error. Stdout is limited
-to 64 KiB. Commands run before the HTTP startup timeout; there is no separate command timeout.
+<p>A literal secret is stored in plain text in the configuration file, and <code>skyhook dump config</code>
+prints it. Prefer <code>env</code> or <code>command</code> for secrets.</p>
+<p>Environment-variable values the provider sends are resolved when it is built and must be present
+and nonblank. They are used as they are, not trimmed: a value with a trailing newline fails,
+naming the provider and field. A command runs only on the first model request that sends its value, not when
+configuration is loaded or a conversation is opened. A successful command’s stdout is decoded as
+UTF-8 and trimmed of leading/trailing whitespace and newlines, then cached in memory for that
+provider instance. Concurrent requests and child conversations share the cache; a new process or
+provider instance resolves the value again. Failed commands are not cached and may be retried on a
+subsequent request. When the server refuses a cached value with HTTP 401, the value is discarded
+and the next request runs the command again. If the refused value had been accepted before, as
+when a short-lived token expires, the model request is retried automatically; a value refused on
+its first use fails the request. Empty output, invalid UTF-8, output that is not a valid header
+value, and nonzero exits fail the request without including command output in the error. Stdout
+is limited to 64 KiB. Commands run before the HTTP startup timeout; there is no separate command
+timeout.
 Cancelling the invocation terminates the command’s immediate child process, but does not guarantee
 termination of any descendants it launched.</p>
 <p>Commands are trusted host configuration, executed with <code>/bin/sh -c</code>, inheriting Skyhook’s process
@@ -210,11 +227,11 @@ strings or commit them to configuration files.</p>
 <p>At CLI startup, Skyhook loads <strong><code>.env</code> in the invocation directory</strong> before constructing providers.
 Existing process environment variables take precedence. A missing file is ignored; Skyhook does
 not search parent directories, the <code>--workspace</code> directory, or the configuration file’s directory.
-Loaded variables are also inherited by API-key commands and other <strong>local</strong> child processes. Neither
-inherited host environment variables nor <code>.env</code> values are automatically forwarded into remote target
-processes; remote commands use the remote machine’s environment. Managed SSH routes disable <code>SendEnv</code>,
-<code>SetEnv</code>, and X11 forwarding. Local SSH authentication/proxy helpers still use the host environment;
-Skyhook’s <a href="../guide/execution-targets.html#agents">SSH-agent forwarding</a> is
+Loaded variables are also inherited by credential commands and other <strong>local</strong> child processes.
+Neither inherited host environment variables nor <code>.env</code> values are automatically forwarded into
+remote target processes; remote commands use the remote machine’s environment. Managed SSH routes
+disable <code>SendEnv</code>, <code>SetEnv</code>, and X11 forwarding. Local SSH authentication/proxy helpers still use
+the host environment; Skyhook’s <a href="../guide/execution-targets.html#agents">SSH-agent forwarding</a> is
 configured separately.</p>
 <p>For example, in the directory from which you run <code>skyhook</code>:</p>
 <pre><code class="language-dotenv">ANTHROPIC_API_KEY="your-key"
@@ -225,10 +242,18 @@ fails startup without printing its contents.</p>
 <h2 id="codex-subscription-login"><a class="header" href="#codex-subscription-login">Codex subscription login</a></h2>
 <p>The <code>codex</code> provider uses <strong>Skyhook-owned</strong> OAuth credentials. Run <code>skyhook auth login</code> for browser
 authorization or <code>skyhook auth login --headless</code> for device authorization. <code>skyhook auth status</code>
-reports local login status and <code>skyhook auth logout</code> removes Skyhook’s credentials. Login does not
-require a model configuration. Skyhook never imports, reads, or modifies the official Codex client’s
-credential files. Secure Codex credential storage currently requires Unix; other platforms fail
-explicitly rather than writing tokens without private file permissions.</p>
+reports local login status for the configured issuer and <code>skyhook auth logout</code> removes Skyhook’s
+credentials. Login does not require a model configuration; when the discovered config has a
+<code>codex</code> provider with <code>auth_url</code>, login and token refresh use that issuer instead of
+<code>https://auth.openai.com</code>, and <code>base_url</code> likewise replaces <code>https://chatgpt.com/backend-api/codex</code>
+for requests. <code>auth_url</code> must use HTTPS (HTTP only on a loopback host) and carry no credentials,
+query, or fragment; a path prefix is kept. A configuration whose <code>codex</code> providers name different
+issuers is refused: one login serves one issuer. Skyhook never imports, reads, or modifies the
+official Codex client’s credential files. Secure Codex credential storage currently requires Unix;
+other platforms fail explicitly rather than writing tokens without private file permissions.</p>
+<p>Stored credentials are bound to the issuer that granted them. When a provider’s issuer differs, or
+the credentials were saved by an older Skyhook, requests fail without sending them and ask you to
+run <code>skyhook auth login codex</code> again.</p>
 
                     </main>
 
