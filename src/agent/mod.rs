@@ -21,4 +21,4 @@ pub use runtime::{
 pub use todo::{TodoItem, TodoSnapshot, TodoStatus};
 
 pub(crate) use interaction::QuestionOutput;
-pub(crate) use runtime::Catalog;
+pub(crate) use runtime::{Catalog, ModelEntry};

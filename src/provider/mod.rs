@@ -4,7 +4,9 @@ use thiserror::Error;
 
 use crate::provider::protocol::{ContextId, ModelRequest, ResponseEvent};
 
-pub mod backends;
+pub mod codec;
+pub mod dialect;
+pub mod http;
 pub mod profile;
 pub mod protocol;
 
@@ -33,6 +35,11 @@ pub trait ProviderContext: Send {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderErrorKind {
     Authentication,
+    /// A command-sourced value the server accepted before was refused with
+    /// HTTP 401 and discarded: a retry runs the command again.
+    CredentialExpired,
+    /// Quota, credit, or spend limit exhausted: never retried.
+    Billing,
     InvalidRequest,
     ContextWindowExceeded,
     Protocol,
@@ -51,6 +58,8 @@ impl fmt::Display for ProviderErrorKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
             Self::Authentication => "Authentication",
+            Self::CredentialExpired => "CredentialExpired",
+            Self::Billing => "Billing",
             Self::InvalidRequest => "InvalidRequest",
             Self::ContextWindowExceeded => "ContextWindowExceeded",
             Self::Protocol => "Protocol",
@@ -75,7 +84,8 @@ impl ProviderError {
     pub fn is_retryable(&self) -> bool {
         matches!(
             self.kind,
-            ProviderErrorKind::RateLimited { .. }
+            ProviderErrorKind::CredentialExpired
+                | ProviderErrorKind::RateLimited { .. }
                 | ProviderErrorKind::Timeout
                 | ProviderErrorKind::Transport
                 | ProviderErrorKind::Unavailable { .. }

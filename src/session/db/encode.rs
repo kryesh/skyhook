@@ -300,12 +300,13 @@ impl Encoder {
             SessionEvent::Usage { request, usage } => {
                 db.execute(
                     "INSERT INTO usage (entry, request, input_tokens, cached_input_tokens, \
-                     output_tokens) VALUES (?1, ?2, ?3, ?4, ?5)",
+                     cache_write_input_tokens, output_tokens) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                     params![
                         seq,
                         *request,
                         usage.input_tokens,
                         usage.cached_input_tokens,
+                        usage.cache_write_input_tokens,
                         usage.output_tokens
                     ],
                 )?;
@@ -723,8 +724,8 @@ impl Encoder {
              max_output, supports_images, state_mode, hint, digest) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10) ON CONFLICT (digest) DO NOTHING",
             params![
-                &snapshot.name,
-                &profile.provider,
+                snapshot.name.model.as_str(),
+                snapshot.name.provider.as_str(),
                 &profile.model,
                 profile.reasoning.clone(),
                 profile.max_context,
@@ -912,11 +913,11 @@ fn assistant_item(db: &Db, message: i64, item: &AssistantItem) -> DbResult<()> {
     )?;
     if let Some(replay) = item.replay() {
         db.execute(
-            "INSERT INTO reasoning_replay (item, protocol, model, scope, payload, binding) \
+            "INSERT INTO reasoning_replay (item, format, model, scope, payload, binding) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 id,
-                &replay.provenance.protocol,
+                replay.provenance.format,
                 &replay.provenance.model,
                 replay.provenance.scope.as_str(),
                 json(&replay.payload)?,
@@ -1135,16 +1136,17 @@ mod tests {
         job::JobView,
         job::{JobEnd, JobRole, JobState, JobTransition},
         media::{AttachmentRef, ImageFormat, ImageRef, TextRef},
+        provider::codec::common::tests::envelope,
         provider::protocol::{
-            AssistantItem, Binding, HistoryLifetime, Provenance, Replay, ResponseSchema, Scope,
-            SystemSegment, ToolCall, ToolDefinition, Usage,
+            AssistantItem, Binding, HistoryLifetime, ReplayFormat, ResponseSchema, SystemSegment,
+            ToolCall, ToolDefinition, Usage,
         },
         session::{
             AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, JobEvent,
             Message, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose, RecordSeq,
             RuntimeState, SessionEvent, StateJob, StateJobKind, Truncation, UserPart,
             db::tests::{Fixture, result, user},
-            fixture::{child_started, profile},
+            tests::{child_started, profile},
         },
         target::TargetDefinition,
         target::TargetRef,
@@ -1296,15 +1298,13 @@ mod tests {
             delay_millis: 1000,
         });
         one!(SessionEvent::ModelAttemptStarted(attempt(2)));
-        let replay = Replay {
-            provenance: Provenance {
-                protocol: "responses".into(),
-                model: "model".into(),
-                scope: Scope::try_from("reasoning".to_owned()).unwrap(),
-            },
-            payload: json!({"encrypted": "opaque"}),
-            binding: Binding::Conversation,
-        };
+        let payload = json!({"encrypted": "opaque"});
+        let replay = envelope(
+            ReplayFormat::Responses,
+            "model",
+            payload,
+            Binding::Conversation,
+        );
         let assistant = one!(SessionEvent::MessageCommitted {
             message: Message::Assistant(vec![
                 AssistantItem::reasoning("reason", 0, "thinking", Some(replay)),
@@ -1326,6 +1326,7 @@ mod tests {
             usage: Usage {
                 input_tokens: 10,
                 cached_input_tokens: 2,
+                cache_write_input_tokens: 1,
                 output_tokens: 3,
             },
         });

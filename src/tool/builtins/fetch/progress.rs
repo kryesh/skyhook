@@ -240,7 +240,6 @@ mod tests {
     use crate::tool::diagnostic::{Cause, FailureSite, PartialDiagnostic};
     use serde_json::{Value, json};
     use std::time::Duration;
-    use tokio::net::TcpListener;
 
     fn with_headers(mut arguments: Value, include_headers: Option<bool>) -> Value {
         if let Some(include) = include_headers {
@@ -319,9 +318,9 @@ mod tests {
     async fn transport_failures_and_body_deadlines_report_headers_only_when_received() {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let refused = format!("http://{}", listener.local_addr().unwrap());
-        drop(listener);
+        // A dropped listener's port can be rebound by another test's server
+        // before the connect; the privileged port is never listened on.
+        let refused = "http://127.0.0.1:1";
         // Each case waits out a one-second body deadline, so they run together.
         let case = async |include_headers: Option<bool>| {
             let arguments = with_headers(json!({"url":refused}), include_headers);

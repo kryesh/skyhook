@@ -498,7 +498,7 @@ mod tests {
     }
 
     async fn ephemeral_store() -> (tempfile::TempDir, SessionStore) {
-        let session = crate::session::fixture::MemorySession::new().await;
+        let session = crate::session::tests::MemorySession::new().await;
         (session.root, session.store)
     }
 

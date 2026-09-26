@@ -23,6 +23,16 @@ pub enum ResponseEvent {
     End(Completion),
 }
 
+impl ResponseEvent {
+    /// The event, with a usage snapshot checked by [`Usage::check`].
+    pub fn checked(self) -> Result<Self, UsageError> {
+        match self {
+            Self::Usage(usage) => usage.check().map(Self::Usage),
+            event => Ok(event),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BlockRef {
     pub item: ItemId,
@@ -197,15 +207,45 @@ pub struct Usage {
     pub input_tokens: u64,
     /// Cache-read input tokens, excluded from `input_tokens`.
     pub cached_input_tokens: u64,
+    /// The part of `input_tokens` written to the provider's cache, when reported.
+    pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
 }
 
+/// A usage report claiming more cache writes than the input they are part of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("usage reports {cache_writes} cache-write tokens, more than its {input} input tokens")]
+pub struct UsageError {
+    pub cache_writes: u64,
+    pub input: u64,
+}
+
+impl From<UsageError> for ProviderError {
+    fn from(error: UsageError) -> Self {
+        Self::protocol(error.to_string())
+    }
+}
+
 impl Usage {
+    /// Cache writes are part of input, so a report claiming more is invalid.
+    pub fn check(self) -> Result<Self, UsageError> {
+        if self.cache_write_input_tokens > self.input_tokens {
+            return Err(UsageError {
+                cache_writes: self.cache_write_input_tokens,
+                input: self.input_tokens,
+            });
+        }
+        Ok(self)
+    }
+
     pub fn accumulate(&mut self, usage: Self) {
         self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
         self.cached_input_tokens = self
             .cached_input_tokens
             .saturating_add(usage.cached_input_tokens);
+        self.cache_write_input_tokens = self
+            .cache_write_input_tokens
+            .saturating_add(usage.cache_write_input_tokens);
         self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
     }
 }
@@ -278,12 +318,6 @@ impl LiveResponse {
     #[must_use]
     pub fn usage(&self) -> Usage {
         self.usage
-    }
-
-    /// Whether any content has streamed; usage alone is not content.
-    #[must_use]
-    pub fn saw_content(&self) -> bool {
-        !self.blocks.is_empty()
     }
 
     /// The block still being streamed: the one the latest delta extended.
@@ -402,18 +436,41 @@ mod tests {
     }
 
     #[test]
+    fn cache_writes_may_equal_input_but_never_exceed_it() {
+        let valid = Usage {
+            input_tokens: 100,
+            cache_write_input_tokens: 100,
+            ..Usage::default()
+        };
+        assert_eq!(
+            ResponseEvent::Usage(valid).checked(),
+            Ok(ResponseEvent::Usage(valid))
+        );
+        let invalid = Usage {
+            cache_write_input_tokens: 101,
+            ..valid
+        };
+        let error = ResponseEvent::Usage(invalid).checked().unwrap_err();
+        assert_eq!(
+            ProviderError::from(error).kind,
+            crate::provider::ProviderErrorKind::Protocol
+        );
+    }
+
+    #[test]
     fn live_view_keeps_arrival_order_tracks_the_current_block_and_replaces_usage() {
         let usage = |input_tokens, cached_input_tokens, output_tokens| Usage {
             input_tokens,
             cached_input_tokens,
+            cache_write_input_tokens: 0,
             output_tokens,
         };
         let live = LiveResponse::default();
-        assert!(!live.saw_content() && live.current().is_none());
+        assert!(live.blocks().is_empty() && live.current().is_none());
         let Step::Open(live) = live.push(ResponseEvent::Usage(usage(100, 50, 3))) else {
             panic!("usage keeps the response open")
         };
-        assert!(!live.saw_content());
+        assert!(live.blocks().is_empty());
         let events = [
             delta("later", "b", ItemKind::Text, "B"),
             delta("reason", "s", ItemKind::Reasoning, "think"),
@@ -426,7 +483,6 @@ mod tests {
                 Step::Open(live) => live,
                 Step::Ended { .. } => panic!("deltas keep the response open"),
             });
-        assert!(live.saw_content());
         assert_eq!(live.current(), Some(&block("later", "b")));
         let texts: Vec<_> = live
             .blocks()

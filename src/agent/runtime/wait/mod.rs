@@ -29,6 +29,10 @@ const COALESCE_QUIET_WINDOW: Duration = Duration::from_millis(100);
 /// open window) must stay bounded regardless of activity.
 const COALESCE_MAX_WINDOW: Duration = Duration::from_millis(500);
 
+/// The receiving agent loop has exited; the command was not delivered.
+#[derive(Debug)]
+pub(super) struct AgentGone;
+
 /// Input and background notifications use the same per-agent delivery gate.
 #[derive(Clone)]
 pub(super) struct AgentSender {
@@ -78,14 +82,11 @@ impl AgentSender {
         }
     }
 
-    pub(super) async fn send(
-        &self,
-        command: AgentCommand,
-    ) -> Result<(), mpsc::error::SendError<AgentCommand>> {
+    /// Deliver a command; `Err` means the agent loop has exited.
+    pub(super) async fn send(&self, command: AgentCommand) -> Result<(), AgentGone> {
         let notify = !matches!(command, AgentCommand::JobsReady);
-        let permit = match self.sender.reserve().await {
-            Ok(permit) => permit,
-            Err(_) => return Err(mpsc::error::SendError(command)),
+        let Ok(permit) = self.sender.reserve().await else {
+            return Err(AgentGone);
         };
         // Schedule before publication; no await separates these operations.
         if notify {
@@ -317,8 +318,8 @@ mod tests {
     use super::super::*;
     use super::{COALESCE_MAX_WINDOW, COALESCE_QUIET_WINDOW};
     pub(super) use crate::agent::runtime::tests::{
-        AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, poll, rendered,
-        response,
+        AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, models, poll,
+        provider_name, rendered, response,
     };
     pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
     use crate::{
@@ -355,14 +356,16 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let profile = |model: &str| ModelProfile {
             hint: Some(model.to_owned()),
-            ..ModelProfile::new("wait-test", model, None, 128_000, 4096, true)
+            ..ModelProfile::new(model, None, 128_000, 4096, true)
         };
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
-            .provider("wait-test", tracking.clone())
-            .model_profile("root", profile("root"))
-            .model_profile("child", profile("child"))
-            .default_model_profile("root")
+            .provider(
+                provider_name("wait-test"),
+                tracking.clone(),
+                models([("root", profile("root")), ("child", profile("child"))]),
+            )
+            .default_model("wait-test/root".parse().unwrap())
             .build()
             .await
             .unwrap();
@@ -888,7 +891,7 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn parent_input_wakes_wait_and_is_in_the_next_model_request() {
-        let launch = json!({"prompt":"child task", "model":"child", "bg":true});
+        let launch = json!({"prompt":"child task", "model":"wait-test/child", "bg":true});
         let tracking = tracking(vec![
             ("root", call("child", "agent", launch)),
             ("child", call("child-wait", "wait", json!({}))),
@@ -1010,7 +1013,7 @@ mod tests {
     /// is cancelled. (A child the script launched would die with it.)
     #[tokio::test(start_paused = true)]
     async fn interrupt_cancels_blocking_tools_and_retains_delegated_children() {
-        let delegate = json!({"prompt":"work", "model":"child", "name":"kid"});
+        let delegate = json!({"prompt":"work", "model":"wait-test/child", "name":"kid"});
         let blocked = json!({"source":"await tool.wait({timeout:30});"});
         let tracking = tracking_all(vec![
             (

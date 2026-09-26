@@ -217,7 +217,8 @@ mod tests {
     #[test]
     fn response_schema_is_a_strict_chat_schema() {
         let schema = response_schema();
-        crate::provider::backends::validate_chat_schema(&schema, &schema, 0).unwrap();
+        crate::provider::codec::chat_completions::schema::validate_schema(&schema, &schema, 0)
+            .unwrap();
     }
 
     fn text(message: &Message) -> &str {
@@ -335,8 +336,9 @@ mod tests {
 
     #[test]
     fn estimate_counts_sent_blocks_and_replay_for_its_own_model_once_per_item() {
+        use crate::provider::codec::common::tests::envelope;
         use crate::provider::protocol::{
-            AssistantItem, Binding, BlockId, ItemId, Provenance, Replay, Scope, TextBlock, ToolCall,
+            AssistantItem, Binding, BlockId, ItemId, ReplayFormat, TextBlock, ToolCall,
         };
         let payload = json!({"encrypted_content": "opaque".repeat(100)});
         // The final reasoning item has replay but no visible blocks.
@@ -353,15 +355,12 @@ mod tests {
                         text: "visible summary".into(),
                     })
                     .collect(),
-                replay: Some(Replay {
-                    provenance: Provenance {
-                        protocol: "responses".into(),
-                        model: "model".into(),
-                        scope: Scope::try_from("reasoning".to_owned()).unwrap(),
-                    },
-                    payload: payload.clone(),
-                    binding: Binding::Free,
-                }),
+                replay: Some(envelope(
+                    ReplayFormat::Responses,
+                    "model",
+                    payload.clone(),
+                    Binding::Free,
+                )),
             })
             .collect();
         // Visible reasoning is never sent; only the replay is.

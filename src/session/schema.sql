@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 12). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 14). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 --
@@ -350,10 +350,15 @@ CREATE TABLE assistant_item (
 CREATE TABLE replay_binding (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 INSERT INTO replay_binding (name) VALUES ('free'),('conversation');
 
+-- The native shape of a replay payload.
+CREATE TABLE replay_format (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+INSERT INTO replay_format (name) VALUES
+  ('chat_text'),('chat_thinking_block'),('chat_reasoning_detail'),('responses'),('messages');
+
 CREATE TABLE reasoning_replay (
   item INTEGER PRIMARY KEY,
   item_kind TEXT NOT NULL DEFAULT 'reasoning' CHECK (item_kind = 'reasoning'),
-  protocol TEXT NOT NULL,
+  format TEXT NOT NULL REFERENCES replay_format(name),
   model TEXT NOT NULL,
   scope TEXT NOT NULL CHECK (trim(scope) <> ''),
   payload TEXT NOT NULL CHECK (json_valid(payload)),
@@ -516,8 +521,10 @@ CREATE TABLE usage (
   request INTEGER NOT NULL REFERENCES model_request(entry),
   input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
   cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
+  cache_write_input_tokens INTEGER NOT NULL CHECK (cache_write_input_tokens >= 0),
   output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
+  CHECK (cache_write_input_tokens <= input_tokens)
 ) STRICT;
 
 -- The summary attempt is the entry's attempt_outcome.
@@ -883,10 +890,10 @@ SELECT
    ORDER BY mc.entry, p.position LIMIT 1) AS preview,
   (SELECT max(created_millis) FROM entry) AS last_millis,
   (SELECT count(*) FROM entry) AS entries,
-  (SELECT p.name FROM model_profile p WHERE p.id = coalesce(
+  coalesce(
      (SELECT ms.profile FROM model_selection ms JOIN entry x ON x.seq = ms.entry
        JOIN agent a ON a.id = x.agent AND a.parent IS NULL ORDER BY ms.entry DESC LIMIT 1),
      (SELECT s.profile FROM agent_start s JOIN entry x ON x.seq = s.entry
-       JOIN agent a ON a.id = x.agent AND a.parent IS NULL))) AS model,
+       JOIN agent a ON a.id = x.agent AND a.parent IS NULL)) AS profile,
   (SELECT m.name FROM agent_mode am JOIN mode m ON m.id = am.mode JOIN entry x ON x.seq = am.entry
      JOIN agent a ON a.id = x.agent AND a.parent IS NULL ORDER BY am.entry DESC LIMIT 1) AS mode;

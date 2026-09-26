@@ -8,6 +8,7 @@ use std::{
 use tokio::fs;
 
 use super::{Config, ConfigError};
+use crate::provider::dialect::OverrideKey;
 
 #[derive(Debug, thiserror::Error)]
 enum LayerError {
@@ -48,12 +49,26 @@ impl fmt::Display for ConfigReport {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ResolvedConfig {
     pub config: Config,
     /// Snapshot at resolution time. Use `config.to_yaml()` after caller overrides.
     pub normalized_yaml: String,
     pub report: ConfigReport,
+}
+
+/// The YAML may hold literal secrets; only its length is shown.
+impl fmt::Debug for ResolvedConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("ResolvedConfig")
+            .field("config", &self.config)
+            .field(
+                "normalized_yaml",
+                &format_args!("<{} bytes>", self.normalized_yaml.len()),
+            )
+            .field("report", &self.report)
+            .finish()
+    }
 }
 
 pub(super) async fn resolve(
@@ -94,6 +109,8 @@ async fn resolve_paths(
 
     let mut merged = serde_json::Value::Object(serde_json::Map::new());
     let mut seen = Vec::new();
+    // Whether a candidate exists but was refused, as opposed to none existing.
+    let mut rejected = false;
     for path in candidates {
         // Compare absolute paths as well, so relative/absolute identical candidates
         // cannot result in duplicate attempts or duplicate diagnostics.
@@ -106,6 +123,11 @@ async fn resolve_paths(
             Ok(value) => deserialize(&value)
                 .map(|_| value)
                 .map_err(|message| diagnostic(&path, message)),
+            Err(LayerError::Missing) => {
+                let missing = LayerError::Missing.to_string();
+                report.diagnostics.push(diagnostic(&path, missing));
+                continue;
+            }
             Err(error) => Err(diagnostic(&path, error.to_string())),
         };
         match loaded {
@@ -116,7 +138,10 @@ async fn resolve_paths(
                 report.sources.push(path);
                 break;
             }
-            Err(diagnostic) => report.diagnostics.push(diagnostic),
+            Err(diagnostic) => {
+                rejected = true;
+                report.diagnostics.push(diagnostic);
+            }
         }
     }
 
@@ -143,9 +168,13 @@ async fn resolve_paths(
         }
     }
     if report.sources.is_empty() {
-        return Err(ConfigError::Resolution {
-            message: ConfigError::Missing.to_string(),
-            report,
+        return Err(if rejected {
+            ConfigError::Resolution {
+                message: "no usable Skyhook config found".to_owned(),
+                report,
+            }
+        } else {
+            ConfigError::Missing(report)
         });
     }
     let config = deserialize(&merged).map_err(|message| {
@@ -190,12 +219,7 @@ fn deserialize(value: &serde_json::Value) -> Result<Config, String> {
     if value.as_object().is_none_or(serde_json::Map::is_empty) {
         return Err("configuration is empty".to_owned());
     }
-    let config =
-        Config::from_value(value).map_err(|error| format!("invalid configuration: {error}"))?;
-    config
-        .validate_structure()
-        .map_err(|error| error.to_string())?;
-    Ok(config)
+    Config::from_value(value).map_err(|error| error.to_string())
 }
 
 async fn read_layer(path: &Path) -> Result<serde_json::Value, LayerError> {
@@ -246,6 +270,15 @@ async fn read_layer(path: &Path) -> Result<serde_json::Value, LayerError> {
 
 fn merge(base: &mut serde_json::Value, overlay: serde_json::Value, path: &mut Vec<String>) {
     match (base, overlay) {
+        // Header names ignore case: a later layer's header replaces an earlier
+        // one's however either spells it.
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay))
+            if matches!(path.as_slice(), [providers, _, headers]
+                if providers == "providers" && headers == "headers") =>
+        {
+            base.retain(|name, _| !overlay.keys().any(|key| key.eq_ignore_ascii_case(name)));
+            base.extend(overlay);
+        }
         (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
             for (key, value) in overlay {
                 // A target's or mode's omitted fields must never leak in from another layer.
@@ -253,7 +286,15 @@ fn merge(base: &mut serde_json::Value, overlay: serde_json::Value, path: &mut Ve
                     base.insert(key, value);
                 } else if let Some(previous) = base.get_mut(&key) {
                     path.push(key);
-                    merge(previous, value, path);
+                    if matches!(path.as_slice(), [table, _] if table == "providers")
+                        && changes_kind(previous, &value)
+                    {
+                        replace_provider(previous, value, path);
+                    } else if is_choice(path) {
+                        *previous = value;
+                    } else {
+                        merge(previous, value, path);
+                    }
                     path.pop();
                 } else {
                     base.insert(key, value);
@@ -264,6 +305,51 @@ fn merge(base: &mut serde_json::Value, overlay: serde_json::Value, path: &mut Ve
     }
 }
 
+/// A position whose value is one of several shapes, chosen whole rather than
+/// merged into: a source (`{env: …}`, `{command: …}`) or a placement
+/// (`{header: …}`, `{body: …}`, `{field: …}`), at the entry level or under a
+/// model's `overrides`.
+fn is_choice(path: &[String]) -> bool {
+    let placement = |key: &str| key.parse::<OverrideKey>().is_ok();
+    match path {
+        [providers, _, rest @ ..] if providers == "providers" => match rest {
+            [field] => field == "api_key" || placement(field),
+            [headers, _] => headers == "headers",
+            [models, _, overrides, key] => {
+                models == "models" && overrides == "overrides" && placement(key)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether an overlay names a dialect other than the base entry's.
+fn changes_kind(base: &serde_json::Value, overlay: &serde_json::Value) -> bool {
+    overlay
+        .get("dialect")
+        .is_some_and(|dialect| base.get("dialect") != Some(dialect))
+}
+
+/// A provider entry of another dialect keeps none of the earlier settings, which
+/// belong to that dialect, but its models still merge.
+fn replace_provider(
+    base: &mut serde_json::Value,
+    overlay: serde_json::Value,
+    path: &mut Vec<String>,
+) {
+    let models = base.get_mut("models").map(std::mem::take);
+    *base = overlay;
+    if let (Some(mut models), Some(base)) = (models, base.as_object_mut()) {
+        if let Some(overlay) = base.remove("models") {
+            path.push("models".into());
+            merge(&mut models, overlay, path);
+            path.pop();
+        }
+        base.insert("models".into(), models);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     // Loader tests use injected candidate paths rather than mutating process environment.
@@ -271,8 +357,8 @@ mod tests {
     use super::*;
     use crate::target::TargetAuth;
 
-    const MODEL: &str = "models:\n  main:\n    provider: local\n    model: test\n    max_context: 4096\n    max_output: 512\n";
-    const PROVIDER: &str = "providers:\n  local:\n    kind: openai\n    base_url: https://example.com/v1\n    api: chat_completions\n";
+    const PROVIDER: &str = "providers:\n  local:\n    dialect: compatible\n    base_url: https://example.com/v1\n    codec: chat_completions\n";
+    const CONFIG: &str = "providers:\n  local:\n    dialect: compatible\n    base_url: https://example.com/v1\n    codec: chat_completions\n    models:\n      main:\n        model: test\n        max_context: 4096\n        max_output: 512\n";
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -318,16 +404,19 @@ mod tests {
     #[tokio::test]
     async fn xdg_wins_without_even_reading_home_and_workspace_merges() {
         let f = Fixture::new();
-        write(&f.xdg, format!("approve_all: true\n{MODEL}{PROVIDER}"));
+        write(&f.xdg, format!("approve_all: true\n{CONFIG}"));
         std::fs::create_dir(&f.home).unwrap(); // Would be a read error if probed.
-        write(&f.local, "models:\n  main:\n    model: workspace-model\n");
+        write(
+            &f.local,
+            "providers:\n  local:\n    models:\n      main:\n        model: workspace-model\n",
+        );
         let resolved = f.resolve().await.unwrap();
         assert_eq!(resolved.report.sources, [f.xdg.clone(), f.local.clone()]);
         assert!(resolved.report.diagnostics.is_empty());
         assert!(resolved.config.approve_all);
-        let main = &resolved.config.models["main"];
+        let main = &resolved.config.providers["local"].common.models["main"];
         assert_eq!(
-            (main.model.as_str(), main.max_output),
+            (main.profile.model.as_str(), main.profile.max_output),
             ("workspace-model", 512)
         );
     }
@@ -343,14 +432,15 @@ mod tests {
         Some(b"approve_all: true\nunrecognized: 1"), // serde unknown field
         Some(b"approve_all: false\n!!binary YXBwcm92ZV9hbGw=: true"), // coerced key collision
         Some(b"approve_all: true\nmodes:\n  bad:\n    capabilities: [interactive]"),
-        Some(b"approve_all: true\nmodels:\n  bad:\n    provider: local\n    model: bad\n    max_context: 10\n    max_output: 10"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: codex\n    codec: responses\n    models:\n      bad:\n        model: bad\n        max_context: 10\n        max_output: 10"),
         Some(b"approve_all: true\ntargets:\n  bad:\n    type: ssh\n    host: bad host"),
         Some(b"approve_all: true\nmcp:\n  bad:\n    transport: stdio\n    start_command: []"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: anthropic\n    base_url: https://example.com\n    api_key_env: 'KEY'\n    api_key_command: 'echo key'"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: anthropic\n    base_url: https://example.com\n    startup_timeout_secs: 0"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: anthropic\n    base_url: relative"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: anthropic\n    base_url: https://example.com\n    api_key_command: '  '"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    kind: openai\n    base_url: https://example.com\n    api: responses\n    chat_reasoning_replay: reasoning"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: https://example.com\n    api_key: {env: ''}"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: https://example.com\n    startup_timeout_secs: 0"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: relative"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: https://example.com\n    api_key: {command: '  '}"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: openai\n    codec: responses\n    base_url: https://example.com\n    reasoning_summary: maybe"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: responses\n    base_url: https://example.com"),
         Some(b"approve_all: true\ntargets:\n  a:\n    type: ssh\n    host: a\n    via: b\n  b:\n    type: ssh\n    host: b\n    via: a"), // route cycle
         Some(b""),
     ];
@@ -361,7 +451,7 @@ mod tests {
                 Some(bytes) => write(&f.xdg, bytes),
                 None => {}
             }
-            write(&f.home, MODEL);
+            write(&f.home, CONFIG);
             let resolved = f
                 .resolve()
                 .await
@@ -373,7 +463,13 @@ mod tests {
                 !resolved.config.approve_all,
                 "rejected candidate leaked fields: {bytes:?}"
             );
-            assert!(resolved.config.providers.is_empty());
+            let providers: Vec<_> = resolved
+                .config
+                .providers
+                .keys()
+                .map(ToString::to_string)
+                .collect();
+            assert_eq!(providers, ["local"], "{bytes:?}");
             assert!(resolved.config.targets.entries.is_empty(), "{bytes:?}");
             // The diagnostic names the actual cause, shown here for the route cycle.
             let cyclic = bytes.is_some_and(|bytes| bytes.ends_with(b"via: a"));
@@ -388,6 +484,7 @@ mod tests {
         write(&f.xdg, "approve_all: not-a-bool");
         write(&f.home, "[broken");
         let error = f.resolve().await.unwrap_err();
+        assert!(matches!(error, ConfigError::Resolution { .. }));
         assert_eq!(error.report().unwrap().diagnostics.len(), 2);
         let message = error.to_string();
         assert!(message.contains(f.xdg.to_str().unwrap()));
@@ -402,11 +499,11 @@ mod tests {
             if invalid_user {
                 write(&f.xdg, "[bad");
             }
-            write(&f.local, format!("{MODEL}{PROVIDER}"));
+            write(&f.local, CONFIG);
             let resolved = f.resolve().await.unwrap();
             assert_eq!(resolved.report.sources, std::slice::from_ref(&f.local));
             assert_eq!(resolved.report.diagnostics.len(), 2);
-            assert_eq!(resolved.config.models.len(), 1);
+            assert_eq!(resolved.config.providers["local"].common.models.len(), 1);
         }
     }
 
@@ -416,11 +513,11 @@ mod tests {
             b"[invalid".as_slice(),
             b"\xff",
             b"max_child_depth: wrong",
-            b"models:\n  main:\n    max_output: 0",
+            b"providers:\n  local:\n    models:\n      main:\n        max_output: 0",
             b"targets:\n  bad:\n    type: ssh", // Atomic/incomplete target.
         ] {
             let f = Fixture::new();
-            write(&f.home, MODEL);
+            write(&f.home, CONFIG);
             write(&f.local, bytes);
             let error = f.resolve().await.unwrap_err();
             assert_eq!(error.report().unwrap().diagnostics.len(), 2);
@@ -428,7 +525,7 @@ mod tests {
             assert!(error.to_string().contains(f.xdg.to_str().unwrap()));
         }
         let f = Fixture::new();
-        write(&f.home, MODEL);
+        write(&f.home, CONFIG);
         std::fs::create_dir(&f.local).unwrap();
         assert!(f.resolve().await.is_err());
     }
@@ -438,13 +535,13 @@ mod tests {
         let f = Fixture::new();
         write(&f.xdg, "[broken");
         write(&f.local, "[broken");
-        write(&f.home, MODEL);
+        write(&f.home, CONFIG);
         let resolved = Config::resolve(&f.workspace.join("does-not-exist"), Some(&f.home))
             .await
             .unwrap();
         assert_eq!(resolved.report.sources, std::slice::from_ref(&f.home));
         assert!(resolved.report.diagnostics.is_empty());
-        assert_eq!(resolved.config.models.len(), 1);
+        assert_eq!(resolved.config.providers["local"].common.models.len(), 1);
         write(&f.home, "[broken");
         let error = f.resolve().await.unwrap_err();
         assert!(error.to_string().contains(f.local.to_str().unwrap()));
@@ -463,7 +560,7 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "{MODEL}\ntargets:\n  changed:\n    type: ssh\n    host: old\n    workspace: /old\n    via: retained\n    ssh:\n      user: old-user\n      port: 2222\n      auth: {{kind: key, path: /old-key}}\n  retained:\n    type: ssh\n    host: other\n"
+                "{CONFIG}\ntargets:\n  changed:\n    type: ssh\n    host: old\n    workspace: /old\n    via: retained\n    ssh:\n      user: old-user\n      port: 2222\n      auth: {{kind: key, path: /old-key}}\n  retained:\n    type: ssh\n    host: other\n"
             ),
         );
         write(
@@ -494,7 +591,7 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "{MODEL}\nmodes:\n  changed:\n    capabilities: [read, exec]\n    instructions: old\n  retained:\n    capabilities: [read]\n"
+                "{CONFIG}\nmodes:\n  changed:\n    capabilities: [read, exec]\n    instructions: old\n  retained:\n    capabilities: [read]\n"
             ),
         );
         write(
@@ -522,7 +619,7 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "max_child_depth: 8\n{MODEL}\nmcp:\n  test:\n    transport: stdio\n    start_command: [old, arg]\n    capabilities: [read]\n    startup_timeout_secs: 77\n    env: {{A: a, B: b}}\n"
+                "max_child_depth: 8\n{CONFIG}\nmcp:\n  test:\n    transport: stdio\n    start_command: [old, arg]\n    capabilities: [read]\n    startup_timeout_secs: 77\n    env: {{A: a, B: b}}\n"
             ),
         );
         write(
@@ -556,7 +653,7 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "session_root: sessions\n{MODEL}\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  changed:\n    transport: stdio\n    start_command: [old]\n    cwd: old-work\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      auth: {{kind: key, path: origin-key}}\n"
+                "session_root: sessions\n{CONFIG}\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  changed:\n    transport: stdio\n    start_command: [old]\n    cwd: old-work\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      auth: {{kind: key, path: origin-key}}\n"
             ),
         );
         write(
@@ -585,19 +682,19 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "{MODEL}{PROVIDER}    api_key_env: SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY\n  command:\n    kind: anthropic\n    base_url: https://example.com\n    api_key_command: 'touch {}'\n  subscription:\n    kind: codex\n",
+                "{CONFIG}    api_key: {{env: SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY}}\n  command:\n    dialect: anthropic\n    codec: messages\n    base_url: https://example.com\n    api_key: {{command: 'touch {}'}}\n  subscription:\n    dialect: codex\n    codec: responses\n",
                 marker.display()
             ),
         );
         let mut resolved = f.resolve().await.unwrap();
         assert!(resolved.report.diagnostics.is_empty());
-        assert!(resolved.normalized_yaml.contains("api_key_env"));
+        assert!(
+            resolved
+                .normalized_yaml
+                .contains("env: SKYHOOK_NONEXISTENT_TEST_RESOLUTION_KEY")
+        );
         // Resolved provider defaults are written back, like MCP timeouts.
-        for resolved_default in [
-            "startup_timeout_secs: 600",
-            "read_idle_timeout_secs: 600",
-            "chat_reasoning_replay: reasoning_content",
-        ] {
+        for resolved_default in ["startup_timeout_secs: 600", "read_idle_timeout_secs: 600"] {
             assert!(resolved.normalized_yaml.contains(resolved_default));
         }
         resolved.config.approve_all = true;
@@ -609,24 +706,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn debug_omits_literal_secrets() {
+        let f = Fixture::new();
+        write(&f.xdg, format!("{CONFIG}    api_key: sk-literal-secret\n"));
+        let resolved = f.resolve().await.unwrap();
+        assert!(resolved.normalized_yaml.contains("sk-literal-secret"));
+        assert!(!format!("{resolved:?}").contains("sk-literal-secret"));
+    }
+
+    #[tokio::test]
     async fn model_order_survives_merging_dumping_and_runtime_admission() {
         let f = Fixture::new();
-        let models = "models:\n  'true': &profile\n    provider: local\n    model: '42'\n    max_context: 4096\n    max_output: 512\n  '42': *profile\n";
+        let models = "    models:\n      'true': &profile\n        model: '42'\n        max_context: 4096\n        max_output: 512\n      '42': *profile\n";
         write(&f.xdg, format!("{PROVIDER}{models}"));
         write(
             &f.local,
-            "models:\n  'true':\n    max_output: 256\n  'null':\n    provider: local\n    model: 'true'\n    max_context: 4096\n    max_output: 512\n",
+            "providers:\n  local:\n    models:\n      'true':\n        max_output: 256\n      'null':\n        model: 'true'\n        max_context: 4096\n        max_output: 512\n",
         );
         let resolved = f.resolve().await.unwrap();
         let config = Config::from_yaml(&resolved.normalized_yaml).unwrap();
+        let models = &config.providers["local"].common.models;
+        assert_eq!(models["true"].profile.max_output, 256);
+        assert_eq!(models["true"].profile.model, "42");
+        assert_eq!(models["null"].profile.model, "true");
+        let runtime = config.into_runtime().unwrap();
         assert_eq!(
-            config.models.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["true", "42", "null"]
+            runtime
+                .models()
+                .map(|(name, _)| name.to_string())
+                .collect::<Vec<_>>(),
+            ["local/true", "local/42", "local/null"]
         );
-        assert_eq!(config.models["true"].max_output, 256);
-        assert_eq!(config.models["true"].model, "42");
-        assert_eq!(config.models["null"].model, "true");
-        assert_eq!(config.into_runtime().unwrap().first_model().name(), "true");
+        assert_eq!(runtime.default_model().name().to_string(), "local/true");
+    }
+
+    #[tokio::test]
+    async fn a_provider_of_another_dialect_replaces_settings_but_merges_models() {
+        let f = Fixture::new();
+        write(&f.xdg, format!("{CONFIG}    api_key: {{env: USER_KEY}}\n"));
+        // Same dialect: settings and models merge field by field.
+        write(
+            &f.local,
+            "providers:\n  local:\n    dialect: compatible\n    base_url: https://other.example/v1\n    models:\n      extra:\n        model: extra\n        max_context: 4096\n        max_output: 512\n",
+        );
+        let config = f.resolve().await.unwrap().config;
+        assert!(config.to_yaml().unwrap().contains("USER_KEY"));
+        assert_eq!(config.providers["local"].common.models.len(), 2);
+        // Another dialect: the earlier settings belong to it, so only models carry over.
+        write(
+            &f.local,
+            "providers:\n  local:\n    dialect: codex\n    codec: responses\n    models:\n      extra:\n        model: extra\n        max_context: 4096\n        max_output: 512\n      main:\n        max_output: 256\n",
+        );
+        let config = f.resolve().await.unwrap().config;
+        let models = &config.providers["local"].common.models;
+        assert!(!config.to_yaml().unwrap().contains("USER_KEY"));
+        assert_eq!(
+            models.keys().map(ToString::to_string).collect::<Vec<_>>(),
+            ["main", "extra"]
+        );
+        assert_eq!(
+            (
+                models["main"].profile.model.as_str(),
+                models["main"].profile.max_output
+            ),
+            ("test", 256)
+        );
     }
 
     #[tokio::test]
@@ -634,31 +778,27 @@ mod tests {
         let f = Fixture::new();
         write(
             &f.xdg,
-            format!("{MODEL}{PROVIDER}    api_key_env: UNUSED_KEY\n    startup_timeout_secs: 5\n"),
+            format!("{CONFIG}    api_key: {{env: UNUSED_KEY}}\n    startup_timeout_secs: 5\n"),
         );
         write(
             &f.local,
-            "providers:\n  local:\n    api_key_env: null\n    api_key_command: echo unused\n    startup_timeout_secs: null\n",
+            "providers:\n  local:\n    api_key: {command: echo unused}\n    startup_timeout_secs: null\n",
         );
-        let config = f.resolve().await.unwrap().config;
-        let crate::config::RawProviderConfig::Openai {
-            api_key_env,
-            api_key_command,
-            startup_timeout_secs,
-            ..
-        } = crate::config::RawProviderConfig::from(config.providers["local"].clone())
-        else {
-            panic!("expected OpenAI provider");
-        };
-        assert!(api_key_env.is_none());
-        assert_eq!(api_key_command.as_deref(), Some("echo unused"));
-        let default_startup = crate::provider::backends::ProviderTimeouts::default().startup;
-        assert_eq!(startup_timeout_secs, Some(default_startup.as_secs()));
+        let resolved = f.resolve().await.unwrap();
+        assert_eq!(
+            resolved.config.providers["local"].common.api_key,
+            Some(crate::provider::dialect::Sourced::Command {
+                command: "echo unused".into()
+            })
+        );
+        let default_startup = crate::provider::http::Timeouts::default().startup;
+        let startup = format!("startup_timeout_secs: {}", default_startup.as_secs());
+        assert!(resolved.normalized_yaml.contains(&startup));
 
         for overlay in [
             "approve_all: null",
-            "models: null",
-            "models: {main: null}",
+            "providers: {local: {models: null}}",
+            "providers: {local: {models: {main: null}}}",
             "modes: null",
             "providers: {local: null}",
         ] {
@@ -668,9 +808,78 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn choices_are_replaced_whole_only_where_a_choice_is_accepted() {
+        use crate::provider::{
+            codec::{CacheKey, path},
+            dialect::{DialectSettings, Sourced},
+        };
+        let f = Fixture::new();
+        let env = "      env:\n        model: env-model\n        max_context: 4096\n        max_output: 512\n        overrides:\n          cache_key: {header: x-model}\n";
+        write(
+            &f.xdg,
+            format!(
+                "{CONFIG}{env}    api_key: {{env: USER_KEY}}\n    headers: {{X-Token: {{command: user}}}}\n    cache_key: {{header: x-entry}}\n"
+            ),
+        );
+        // A model named `env` is a model, not a source.
+        write(
+            &f.local,
+            "providers:\n  local:\n    api_key: {command: workspace}\n    headers: {x-token: {env: WORKSPACE}}\n    cache_key: {body: entry_key}\n    models:\n      env:\n        max_output: 256\n        overrides:\n          cache_key: {body: model_key}\n",
+        );
+        let config = f.resolve().await.unwrap().config;
+        let entry = &config.providers["local"];
+        let local = &entry.common;
+        assert_eq!(
+            local.api_key,
+            Some(Sourced::Command {
+                command: "workspace".into()
+            })
+        );
+        // Header names ignore case across layers too.
+        assert_eq!(
+            local.headers.iter().collect::<Vec<_>>(),
+            [(
+                &"x-token".to_owned(),
+                &Sourced::Env {
+                    env: "WORKSPACE".into()
+                }
+            )]
+        );
+        let DialectSettings::Compatible(settings) = &entry.settings else {
+            panic!("{:?}", entry.settings)
+        };
+        assert_eq!(
+            settings.0.cache_key,
+            Some(CacheKey::Body(path("entry_key")))
+        );
+        let env = &local.models["env"];
+        assert_eq!(local.models.len(), 2);
+        assert_eq!(
+            (env.profile.model.as_str(), env.profile.max_output),
+            ("env-model", 256)
+        );
+        assert_eq!(
+            env.overrides.cache_key,
+            Some(CacheKey::Body(path("model_key")))
+        );
+        // A layer that changes the dialect still replaces its models' choices whole.
+        write(
+            &f.local,
+            "providers:\n  local:\n    dialect: openai\n    codec: responses\n    base_url: https://example.com/v1\n    models:\n      env:\n        overrides:\n          cache_key: {body: model_key}\n",
+        );
+        let config = f.resolve().await.unwrap().config;
+        assert_eq!(
+            config.providers["local"].common.models["env"]
+                .overrides
+                .cache_key,
+            Some(CacheKey::Body(path("model_key")))
+        );
+    }
+
+    #[tokio::test]
     async fn each_layer_requires_a_mapping_and_the_effective_config_must_not_be_empty() {
         let f = Fixture::new();
-        write(&f.xdg, MODEL);
+        write(&f.xdg, CONFIG);
         for document in ["", "# comment only", "null", "scalar", "[one, two]"] {
             write(&f.local, document);
             assert!(
@@ -691,8 +900,11 @@ mod tests {
     async fn candidate_list_edge_cases() {
         let f = Fixture::new();
         // No roots or files is missing config, but a workspace needs no roots.
-        assert!(resolve_paths(&f.workspace, None, vec![]).await.is_err());
-        write(&f.local, MODEL);
+        let missing = resolve_paths(&f.workspace, None, vec![f.xdg.clone()]).await;
+        assert!(
+            matches!(missing, Err(ConfigError::Missing(report)) if report.diagnostics.len() == 1)
+        );
+        write(&f.local, CONFIG);
         let config = resolve_paths(&f.workspace, None, vec![]).await.unwrap();
         assert!(config.report.diagnostics.is_empty());
         // Duplicate candidates are attempted once.
@@ -724,7 +936,7 @@ mod tests {
         ] {
             let f = Fixture::new();
             write(&f.xdg, config);
-            write(&f.home, MODEL);
+            write(&f.home, CONFIG);
             let error = Config::resolve(&f.workspace, Some(&f.xdg))
                 .await
                 .unwrap_err();

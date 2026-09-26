@@ -28,7 +28,7 @@ pub use state::SessionSummary;
 pub(super) use state::{interrupted_work, summary};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 13;
+pub(super) const USER_VERSION: i64 = 14;
 const SCHEMA: &str = include_str!("../schema.sql");
 /// Payload tables outside the append-only ledger: blob writes and output upserts.
 const MUTABLE_TABLES: [&str; 6] = [
@@ -407,7 +407,7 @@ mod tests {
         provider::protocol::{AssistantItem, ToolCall, ToolResult},
         session::{
             EventRecord, Message, ModelCallOrigin, RecordSeq, SessionEvent, UserPart,
-            fixture::{child_started, start_events},
+            tests::{child_started, start_events},
         },
     };
 
@@ -630,7 +630,7 @@ mod tests {
             named_enum::NamedEnum,
             provider::{
                 profile::StateMode,
-                protocol::{Binding, HistoryLifetime, ItemKind},
+                protocol::{Binding, HistoryLifetime, ItemKind, ReplayFormat},
             },
             session::{EntryKind, ModelFailureKind, ModelPurpose, Truncation},
             target::{SshAuth, TargetSource},
@@ -657,6 +657,7 @@ mod tests {
             ("user_part_kind", spellings::<super::UserPartKind>()),
             ("item_kind", spellings::<ItemKind>()),
             ("replay_binding", spellings::<Binding>()),
+            ("replay_format", spellings::<ReplayFormat>()),
             ("todo_status", spellings::<crate::agent::TodoStatus>()),
             ("history_lifetime", spellings::<HistoryLifetime>()),
             ("model_failure_kind", spellings::<ModelFailureKind>()),

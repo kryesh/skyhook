@@ -19,7 +19,7 @@ binary's command help. `skyhook` itself requires an interactive terminal; `batch
 | `-c, --config PATH` | Use only this file (YAML regardless of suffix); disable user/workspace config searching and merging. |
 | `-w, --workspace PATH` | Set the workspace base directory (default `.`). |
 | `--resume SESSION_ID` | Reopen a saved session. |
-| `-m, --model PROFILE` | Choose a configured model profile for a new session. Resumed sessions retain their recorded model. |
+| `-m, --model PROVIDER/MODEL` | Choose a configured model for a new session, named by its provider and model keys. Resumed sessions retain their recorded model. |
 | `-p, --prompt TEXT` | Submit an initial user message. |
 | `-s, --script PATH` | Run a JavaScript workflow. Mutually exclusive with `--prompt`. |
 | `--image PATH` | Attach an image to the initial prompt; repeat for multiple images. Requires `--prompt`, conflicts with `--script`. |
@@ -83,10 +83,10 @@ built-in `general` mode) plus any `--approve-all` override. Source paths and dia
 so redirected stdout remains YAML. It exits with status **0** when a valid config can be produced,
 and **nonzero** otherwise; it does not require provider credentials to validate configuration.
 
-The dump includes literal values stored in configuration, such as MCP environment entries;
-treat its output as potentially sensitive. Environment-backed API keys are not expanded and
-credential commands are not executed. Diagnostic control characters are escaped for safe
-terminal display.
+The dump includes literal values stored in configuration, such as a literal `api_key` or header
+value and MCP environment entries; treat its output as potentially sensitive. Environment-backed
+values are not expanded and credential commands are not executed. Diagnostic control characters
+are escaped for safe terminal display.
 
 ### Skills dump
 
@@ -125,8 +125,8 @@ skyhook stats --list
 
 Without `--format`, the report is a session header (initial prompt, start time, duration, request and
 token totals) followed by aligned tables: one row per agent (path, model, completed/requested
-model calls, tool calls, input, cached, and output tokens, duration) with a total row, then
-totals per model profile and per tool.
+model calls, tool calls, input, cached, cache-written, and output tokens, duration) with a total
+row, then totals per model and per tool.
 
 - **`markdown`** prints that document as Markdown headings and tables.
 - **`tree`** lists the agents as `tree` would, each line carrying that agent's figures, followed
@@ -158,7 +158,10 @@ skyhook auth logout
 
 The optional provider argument currently accepts only `codex`, which is the default.
 `auth login --headless` selects device authorization rather than a browser; it is separate
-from `skyhook batch`. Login does not require model configuration.
+from `skyhook batch`. Login needs no configuration file; when one exists it must load, and login
+signs in to the `auth_url` its `codex` providers share (entries naming different ones are refused),
+or OpenAI's issuer when none names one. `auth status` checks the stored credentials against that
+issuer; `auth logout` reads no configuration.
 See [authentication](../configuration/authentication.md) for credential ownership and storage.
 
 ## Related settings

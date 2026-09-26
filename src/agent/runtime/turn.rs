@@ -1,6 +1,7 @@
 //! Provider turn execution and terminal response handling.
 
 use super::*;
+use crate::provider::protocol::ResponseEvent;
 use crate::session::UserPart;
 
 impl SessionRuntime {
@@ -45,7 +46,7 @@ impl SessionRuntime {
             {
                 pending.commit(Message::User(content)).await?;
             }
-            let profile = agent_context.profile.clone();
+            let profile = agent_context.profile.profile.clone();
             if !profile.supports_images && agent_context.contains_images() {
                 return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
             }
@@ -55,10 +56,7 @@ impl SessionRuntime {
                 None => {
                     let context = crate::session::ModelContext {
                         purpose: crate::session::ModelPurpose::Agent,
-                        profile: crate::session::ProfileSnapshot {
-                            name: settings.model_profile.clone(),
-                            profile: profile.clone(),
-                        },
+                        profile: agent_context.profile.clone(),
                         system: template.system.clone(),
                         tools: template.tools.clone(),
                         response_schema: template.response_schema.clone(),
@@ -159,15 +157,17 @@ impl SessionRuntime {
                                         return Err(HarnessError::Interrupted);
                                     },
                                 };
-                        let event = match event {
+                        // An invalid usage snapshot ends the response before it is
+                        // forwarded or accumulated; the attempt keeps the last valid one.
+                        let checked =
+                            |event: ResponseEvent| event.checked().map_err(ProviderError::from);
+                        let event = match event.map(|event| event.and_then(checked)) {
                             Some(Ok(event)) => event,
-                            Some(Err(error)) => {
-                                break 'stream Err((error, live.usage(), live.saw_content()));
-                            }
+                            Some(Err(error)) => break 'stream Err((error, live.usage())),
                             None => {
                                 let error =
                                     ProviderError::protocol("stream ended without completion");
-                                break 'stream Err((error, live.usage(), live.saw_content()));
+                                break 'stream Err((error, live.usage()));
                             }
                         };
                         self.events.send(RuntimeEvent::ResponseEvent {
@@ -186,7 +186,7 @@ impl SessionRuntime {
                 // Nothing from a failed attempt is committed or executed.
                 let (completion, usage) = match streamed {
                     Ok(streamed) => streamed,
-                    Err((error, usage, saw_content)) => {
+                    Err((error, usage)) => {
                         let attempt = (attempt, &mut transient_attempt);
                         let Some(error) = self
                             .recover_model_failure(&turn, attempt, usage, error)
@@ -194,10 +194,9 @@ impl SessionRuntime {
                         else {
                             continue 'attempts;
                         };
-                        if !saw_content
-                            && error.kind
-                                == crate::provider::ProviderErrorKind::ContextWindowExceeded
-                        {
+                        // Streamed output is discarded with the attempt, so an overflow
+                        // compacts wherever the stream stopped.
+                        if error.kind == crate::provider::ProviderErrorKind::ContextWindowExceeded {
                             context_failures += 1;
                             if context_failures < compact::MAX_COMPACTION_ATTEMPTS {
                                 force_compaction = true;
@@ -216,7 +215,18 @@ impl SessionRuntime {
             let aborted = outcome == Outcome::Cut(CutReason::Aborted);
             let text = visible_text(completion.items());
             let calls: Vec<ToolCall> = completion.calls().cloned().collect();
-            let assistant = Message::Assistant(completion.into_items());
+            // Empty text is not history, even beside an action: a service may add an
+            // empty message only in its terminal output. Whitespace is text and is kept.
+            let assistant = Message::Assistant(
+                completion
+                    .into_items()
+                    .into_iter()
+                    .filter(|item| {
+                        !matches!(item, crate::provider::protocol::AssistantItem::Text { blocks, .. }
+                            if blocks.iter().all(|block| block.text.is_empty()))
+                    })
+                    .collect(),
+            );
             // A refusal is never history and never retried here: it is deterministic
             // for a given request. A content-free message would make every later
             // request unencodable. Either fails the turn with nothing committed.
@@ -227,6 +237,8 @@ impl SessionRuntime {
                 None
             } else if aborted {
                 Some((TurnFailure::Aborted, ModelFailureKind::Error))
+            } else if outcome == Outcome::Cut(CutReason::MaxTokens) {
+                Some((TurnFailure::OutputLimit, ModelFailureKind::Error))
             } else {
                 Some((TurnFailure::Empty, ModelFailureKind::Error))
             };
@@ -504,6 +516,7 @@ mod tests {
             ItemKind::Text,
             "must not persist",
         )];
+        let text = |text| AssistantItem::text("answer", 0, text);
         let cases = [
             // A refusing provider streams nothing, or only an unusable reasoning stub.
             (refusal(Vec::new()), "content filter", Refusal),
@@ -516,7 +529,7 @@ mod tests {
             // A cut keeps no tool calls, which can leave nothing at all.
             (
                 cut(Vec::new(), CutReason::MaxTokens),
-                "no assistant content",
+                "output limit was reached",
                 Error,
             ),
             (
@@ -524,7 +537,18 @@ mod tests {
                 "provider aborted",
                 Error,
             ),
+            // A turn stands on nonblank text or a tool call: nothing, empty or
+            // whitespace text, or reasoning alone says nothing and takes no action.
             (response(Vec::new()), "no assistant content", Error),
+            (response(vec![text("")]), "no assistant content", Error),
+            (response(vec![text("   ")]), "no assistant content", Error),
+            (
+                response(vec![AssistantItem::reasoning(
+                    "thought", 0, "private", None,
+                )]),
+                "no assistant content",
+                Error,
+            ),
             (incomplete, "stream ended without completion", Error),
         ];
         for (events, expected, kind) in cases {
@@ -623,21 +647,33 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn blank_text_responses_are_committed_and_complete_the_turn() {
-        // Some providers return empty or whitespace text on a non-final turn. That
-        // is ordinary content: it encodes and must stay in history, so it must not be
-        // treated as a failure. It is not an answer, though: the projection
-        // (`provider::protocol::visible_text`) normalizes blank text away, so the turn
-        // completes with no text rather than with the blank string itself.
-        for text in ["", "   "] {
-            let (_root, _requests, session) =
-                scripted_session([response(vec![AssistantItem::text("answer", 0, text)])]).await;
-            assert_eq!(session.prompt("hello").await.unwrap(), "");
-            let records = session.runtime.store.records().await;
-            assert_eq!(assistant_commits(&records), 1);
-            assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), 0);
-            assert_eq!(count!(&records, SessionEvent::AgentFailed { .. }), 0);
-        }
+    async fn whitespace_text_is_answered_committed_and_replayed() {
+        let items = vec![
+            AssistantItem::text("first", 0, "alpha"),
+            AssistantItem::text("space", 1, " "),
+            AssistantItem::text("second", 2, "beta"),
+        ];
+        let (_root, requests, session) =
+            scripted_session([response(items.clone()), answer("done")]).await;
+        assert_eq!(session.prompt("hello").await.unwrap(), "alpha beta");
+        let records = session.runtime.store.records().await;
+        let committed = events!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(content) } => content.clone());
+        assert_eq!(committed, vec![items.clone()]);
+        assert_eq!(session.prompt("again").await.unwrap(), "done");
+        let captured = requests.lock().unwrap();
+        assert!(captured[1].messages().any(|message| matches!(message,
+            Sent::Assistant(sent) if *sent == items)));
+    }
+
+    #[tokio::test]
+    async fn empty_text_beside_a_call_is_not_committed() {
+        let call = tool_call(1, "call", "missing", serde_json::json!({}));
+        let first = response(vec![AssistantItem::text("blank", 0, ""), call.clone()]);
+        let (_root, requests, session) = scripted_session([first, answer("done")]).await;
+        assert_eq!(session.prompt("hello").await.unwrap(), "done");
+        let captured = requests.lock().unwrap();
+        assert!(captured[1].messages().any(|message| matches!(message,
+            Sent::Assistant(items) if *items == vec![call.clone()])));
     }
 
     #[tokio::test]
@@ -654,15 +690,8 @@ mod tests {
 
     #[tokio::test]
     async fn aborted_response_preserves_visible_content_and_usage_but_fails() {
-        let replay = Replay {
-            provenance: Provenance {
-                protocol: "responses".into(),
-                model: "native".into(),
-                scope: Scope::try_from("reasoning".to_owned()).unwrap(),
-            },
-            payload: json!({"encrypted_content":"retained"}),
-            binding: Binding::Free,
-        };
+        let payload = json!({"encrypted_content":"retained"});
+        let replay = envelope(ReplayFormat::Responses, "native", payload, Binding::Free);
         let retained = vec![
             AssistantItem::reasoning("reason", 0, "completed reasoning", Some(replay)),
             AssistantItem::text("answer", 1, "partial visible answer"),
@@ -772,9 +801,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
         let provider = scripted_provider(&requests, responses);
-        let profile = ModelProfile::new("test", "test", None, 128_000, max_output, false);
-        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
-            .model_profile("test", profile)
+        let profile = ModelProfile::new("test", None, 128_000, max_output, false);
+        let harness = serving(root.path(), provider, [("test", profile)])
             .build()
             .await
             .unwrap();
@@ -865,10 +893,9 @@ mod tests {
                 json!({"command": "true"}),
             )]);
             let provider = scripted_provider(&requests, [shell, answer("done")]);
-            let mut profile = ModelProfile::new("test", "test", None, 128_000, 4096, false);
+            let mut profile = ModelProfile::new("test", None, 128_000, 4096, false);
             profile.state_mode = mode;
-            let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
-                .model_profile("test", profile)
+            let harness = serving(root.path(), provider, [("test", profile)])
                 .build()
                 .await
                 .unwrap();
@@ -1005,6 +1032,66 @@ mod tests {
             assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
             let estimate = super::super::compaction::estimate_request(&requests.lock().unwrap()[0]);
             assert!(estimate > 128_000);
+            shutdown_session(session).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn usage_with_cache_writes_above_input_fails_the_response_with_the_last_valid_usage() {
+        // Cache writes may equal input, never exceed it.
+        let valid = Usage {
+            cache_write_input_tokens: 100,
+            ..usage(100, 0, 5)
+        };
+        let invalid = Usage {
+            cache_write_input_tokens: 101,
+            ..valid
+        };
+        let rejected = |events| with_usage(events, &[valid, invalid]);
+        for compaction in [false, true] {
+            let responses = if compaction {
+                // The answer commits; the summary its usage asks for is rejected.
+                let summary = rejected(answer(summary_json().to_string()));
+                vec![with_usage(answer("final"), &[threshold_usage()]), summary]
+            } else {
+                vec![rejected(shell_response())]
+            };
+            let (root, requests, session) = scripted_session(responses).await;
+            if compaction {
+                seed_history(&session, 6_000).await;
+            }
+            let mut observed = session.runtime.events.observe().updates;
+            assert!(session.prompt("Finish.").await.is_err());
+            assert_eq!(requests.lock().unwrap().len(), 1 + usize::from(compaction));
+            let records = session.runtime.store.records().await;
+            let expected = if compaction {
+                vec![ModelPurpose::Agent, ModelPurpose::Compaction]
+            } else {
+                vec![ModelPurpose::Agent]
+            };
+            assert_eq!(purposes(&records), expected);
+            let request = records
+                .iter()
+                .rfind(|record| matches!(record.event, SessionEvent::ModelRequested { .. }))
+                .unwrap()
+                .sequence
+                .request();
+            let journaled = events!(&records, SessionEvent::Usage { request: at, usage } if *at == request => *usage);
+            assert_eq!(journaled, vec![valid]);
+            let failed = count!(&records, SessionEvent::ModelFailed { attempt, error, .. }
+                if attempt.request == request && error.starts_with("Protocol"));
+            assert_eq!(failed, 1);
+            let completed = count!(&records, SessionEvent::ResponseCompleted { attempt, .. }
+                if attempt.request == request);
+            assert_eq!(completed, 0);
+            assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
+            assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
+            assert!(!root.path().join("executions").exists());
+            while let Ok(event) = observed.try_recv() {
+                assert!(!matches!(event.event, RuntimeEvent::ResponseEvent {
+                    event: ResponseEvent::Usage(usage), ..
+                } if usage == invalid));
+            }
             shutdown_session(session).await;
         }
     }

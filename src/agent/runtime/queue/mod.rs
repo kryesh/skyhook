@@ -228,8 +228,8 @@ mod tests {
 
     use super::super::*;
     pub(super) use crate::agent::runtime::tests::{
-        AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, events,
-        quiet_root, response,
+        AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, events, models,
+        provider_name, quiet_root, response,
     };
     pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
 
@@ -237,7 +237,8 @@ mod tests {
         script.requests.lock().unwrap().len()
     }
 
-    /// A session with "first" (default), "second" and "third" model profiles.
+    /// A session on provider "queue-test" with models "first" (default), "second",
+    /// "third" and the text-only "blind".
     pub(super) async fn start(
         first_calls_tool: bool,
     ) -> (tempfile::TempDir, Arc<Script>, Arc<SessionHandle>) {
@@ -258,22 +259,26 @@ mod tests {
             .into_iter()
             .chain((2..6).map(|index| Step::new(answer(index))));
         let tracking = Script::new(steps, &Default::default());
-        let profile =
-            |model: &str| ModelProfile::new("queue-test", model, None, 128_000, 4096, true);
+        let profile = |model: &str| ModelProfile::new(model, None, 128_000, 4096, true);
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
-            .provider("queue-test", tracking.clone())
-            .model_profile("first", profile("first-model"))
-            .model_profile("second", profile("second-model"))
-            .model_profile("third", profile("third-model"))
-            .model_profile(
-                "blind",
-                ModelProfile {
-                    supports_images: false,
-                    ..profile("blind-model")
-                },
+            .provider(
+                provider_name("queue-test"),
+                tracking.clone(),
+                models([
+                    ("first", profile("first-model")),
+                    ("second", profile("second-model")),
+                    ("third", profile("third-model")),
+                    (
+                        "blind",
+                        ModelProfile {
+                            supports_images: false,
+                            ..profile("blind-model")
+                        },
+                    ),
+                ]),
             )
-            .default_model_profile("first")
+            .default_model("queue-test/first".parse().unwrap())
             .build()
             .await
             .unwrap();
@@ -361,7 +366,7 @@ mod tests {
 
     pub(super) async fn model_changes(session: &SessionHandle) -> Vec<String> {
         let records = session.runtime.store.records().await;
-        events!(records, SessionEvent::ModelChanged { profile } => profile.name.clone())
+        events!(records, SessionEvent::ModelChanged { profile } => profile.name.to_string())
     }
 
     pub(super) async fn stop(session: &SessionHandle) {
@@ -387,7 +392,9 @@ mod tests {
         QueuedPrompt {
             text: text.into(),
             attachments,
-            options: session.selection(model, None).unwrap(),
+            options: session
+                .selection(model.map(|model| model.parse().unwrap()).as_ref(), None)
+                .unwrap(),
             cancellation: QueuedPromptCancellation::default(),
         }
     }
@@ -402,9 +409,9 @@ mod tests {
             image: png.clone(),
         };
         let inputs = vec![
-            queued(&session, "test:first", vec![], Some("second")),
+            queued(&session, "test:first", vec![], Some("queue-test/second")),
             queued(&session, "test:image", vec![image], None),
-            queued(&session, "test:last", vec![], Some("third")),
+            queued(&session, "test:last", vec![], Some("queue-test/third")),
         ];
         let tokens = inputs.iter().map(|input| input.cancellation.clone());
         let tokens = tokens.collect::<Vec<_>>();
@@ -445,17 +452,17 @@ mod tests {
             image: crate::tests::png(&vec![0; MAX_IMAGE_BYTES as usize]),
         };
         let inputs = vec![
-            queued(&session, "test:one", vec![], Some("second")),
+            queued(&session, "test:one", vec![], Some("queue-test/second")),
             QueuedPrompt {
                 cancellation: canceled.clone(),
-                ..queued(&session, "test:canceled", vec![], Some("third"))
+                ..queued(&session, "test:canceled", vec![], Some("queue-test/third"))
             },
             queued(&session, "test:two", vec![], None),
             queued(
                 &session,
                 "test:oversized-image",
                 vec![oversized],
-                Some("third"),
+                Some("queue-test/third"),
             ),
             queued(&session, "test:behind", vec![], None),
         ];
@@ -492,7 +499,7 @@ mod tests {
             tracking.request(0).await;
             let inputs = vec![
                 queued(&session, "test:one", vec![], None),
-                queued(&session, "test:two", vec![], Some("second")),
+                queued(&session, "test:two", vec![], Some("queue-test/second")),
             ];
             let enqueue = enqueue_batch(&session, inputs);
             buffered(&session, 1).await;
@@ -515,7 +522,12 @@ mod tests {
     #[tokio::test]
     async fn idle_batch_of_a_canceled_input_starts_no_turn_and_journals_nothing() {
         let (_root, tracking, session) = start(false).await;
-        let input = queued(&session, "test:already-canceled", vec![], Some("second"));
+        let input = queued(
+            &session,
+            "test:already-canceled",
+            vec![],
+            Some("queue-test/second"),
+        );
         assert!(input.cancellation.cancel());
         let results = bounded(enqueue_prompts(&session, vec![input])).await;
         assert!(matches!(results[..], [Err(HarnessError::Interrupted)]));
@@ -533,7 +545,12 @@ mod tests {
             image: crate::tests::png(b"unsupported"),
         };
         let inputs = vec![
-            queued(&session, "test:image", vec![image], Some("blind")),
+            queued(
+                &session,
+                "test:image",
+                vec![image],
+                Some("queue-test/blind"),
+            ),
             queued(&session, "test:behind", vec![], None),
         ];
         let results = bounded(enqueue_prompts(&session, inputs)).await;
@@ -560,7 +577,12 @@ mod tests {
             &session,
             vec![
                 queued(&session, "test:before", vec![], None),
-                queued(&session, "test:image", vec![image], Some("blind")),
+                queued(
+                    &session,
+                    "test:image",
+                    vec![image],
+                    Some("queue-test/blind"),
+                ),
             ],
         );
         buffered(&session, 1).await;
@@ -584,7 +606,7 @@ mod tests {
         let (_root, tracking, session) = start(false).await;
         let turn = prompt(&session, "test:initial");
         tracking.request(0).await;
-        let (waiter, _) = enqueue(&session, "test:dropped", vec![], Some("second"));
+        let (waiter, _) = enqueue(&session, "test:dropped", vec![], Some("queue-test/second"));
         buffered(&session, 1).await;
         waiter.abort();
         assert!(waiter.await.unwrap_err().is_cancelled());
@@ -606,8 +628,8 @@ mod tests {
             let turn = prompt(&session, "test:initial");
             tracking.request(0).await;
             let inputs = vec![
-                queued(&session, "test:one", vec![], Some("second")),
-                queued(&session, "test:two", vec![], Some("third")),
+                queued(&session, "test:one", vec![], Some("queue-test/second")),
+                queued(&session, "test:two", vec![], Some("queue-test/third")),
             ];
             let claim = inputs[0].cancellation.clone();
             let enqueue = enqueue_batch(&session, inputs);

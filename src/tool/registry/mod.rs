@@ -1317,7 +1317,7 @@ impl ToolRegistryBuilder {
 }
 
 #[cfg(test)]
-mod admission_tests {
+mod tests {
     use super::*;
     use crate::job::JobSpec;
     use std::io::Write as _;

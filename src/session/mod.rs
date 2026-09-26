@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::{
     identity::{AgentId, EventId, SessionId},
-    provider::protocol::ModelRequest,
+    provider::{profile::ModelRef, protocol::ModelRequest},
 };
 
 mod content;
@@ -45,7 +45,7 @@ const DATABASE_FILE: &str = "session.db";
 const LOCK_FILE: &str = "lock";
 
 /// Restore the agent's last applied model.
-pub fn agent_selection(records: &[EventRecord], agent: &AgentId) -> Option<String> {
+pub fn agent_selection(records: &[EventRecord], agent: &AgentId) -> Option<ModelRef> {
     let mut selection = None;
     for record in records.iter().filter(|record| &record.agent == agent) {
         match &record.event {
@@ -980,17 +980,16 @@ impl From<DbError> for SessionError {
 }
 
 #[cfg(test)]
-pub(crate) mod fixture {
-    // Reusable session fixtures. Every journaled entry references a started agent, so
-    // tests start the agents they write for, usually in an in-memory database.
+pub(crate) mod tests {
+    //! Session tests, and fixtures other modules reuse: every journaled entry references a
+    //! started agent, so tests start the agents they write for, usually in an in-memory
+    //! database.
 
-    use std::path::Path;
-
-    use super::{ProfileSnapshot, SessionEvent, SessionStore};
+    use super::*;
     use crate::{
         execution::ExecutionLocation,
-        identity::{AgentId, JobId},
-        provider::profile::ModelProfile,
+        identity::JobId,
+        provider::{profile::ModelProfile, protocol::Usage},
         tool::policy::Capability,
     };
 
@@ -1071,11 +1070,20 @@ pub(crate) mod fixture {
 
     pub(crate) fn profile() -> ProfileSnapshot {
         ProfileSnapshot {
-            name: "test".into(),
+            name: "test/test".parse().unwrap(),
             profile: ModelProfile {
                 hint: Some("Test model.".into()),
-                ..ModelProfile::new("test", "test", None, 128_000, 4096, false)
+                ..ModelProfile::new("test", None, 128_000, 4096, false)
             },
+        }
+    }
+
+    pub(crate) fn usage(input: u64, cached: u64, output: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            cache_write_input_tokens: 0,
+            output_tokens: output,
         }
     }
 
@@ -1097,14 +1105,9 @@ pub(crate) mod fixture {
             location,
         }
     }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{fixture::started, *};
 
     async fn fresh() -> (tempfile::TempDir, SessionStore, SessionId, AgentId) {
-        let (root, store, agent) = fixture::on_disk().await;
+        let (root, store, agent) = on_disk().await;
         let id = store.id();
         (root, store, id, agent)
     }

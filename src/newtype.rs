@@ -59,6 +59,12 @@ macro_rules! string_newtype {
             }
         }
 
+        impl ::std::borrow::Borrow<str> for $name {
+            fn borrow(&self) -> &str {
+                &self.0
+            }
+        }
+
         impl ::std::fmt::Display for $name {
             fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
                 formatter.write_str(&self.0)

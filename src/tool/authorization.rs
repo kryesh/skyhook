@@ -376,7 +376,7 @@ mod tests {
 
     #[tokio::test]
     async fn journaled_grants_survive_a_resumed_coordinator_until_revoked() {
-        let session = crate::session::fixture::MemorySession::new().await;
+        let session = crate::session::tests::MemorySession::new().await;
         let jobs = crate::job::JobManager::new(session.store.clone());
         let spec = crate::job::JobSpec::test(session.agent.clone(), "tool");
         let job = jobs.create(spec).await.unwrap();

@@ -11,24 +11,43 @@ use cli::{AuthCommand, AuthProvider, Invocation};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
-async fn run_auth(
-    command: AuthCommand,
-) -> Result<(), skyhook::provider::backends::codex::auth::AuthError> {
-    use skyhook::provider::backends::codex::auth;
+/// Why an `auth` command failed.
+#[derive(Debug, thiserror::Error)]
+enum AuthError {
+    #[error(transparent)]
+    Config(#[from] skyhook::config::ConfigError),
+    #[error(transparent)]
+    Codex(#[from] skyhook::provider::ProviderError),
+}
+
+/// The issuer the admitted codex entries share; without a config, OpenAI's.
+fn codex_issuer(
+    config: Result<skyhook::config::Config, skyhook::config::ConfigError>,
+) -> Result<skyhook::provider::dialect::codex::auth::Issuer, AuthError> {
+    use skyhook::config::ConfigError;
+    match config {
+        Ok(config) => Ok(config.codex_issuer()?),
+        Err(ConfigError::Missing(_)) => Ok(Default::default()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn run_auth(command: AuthCommand) -> Result<(), AuthError> {
+    use skyhook::{config::Config, provider::dialect::codex::auth};
+    let issuer =
+        async || codex_issuer(Config::load_for_workspace(std::path::Path::new("."), None).await);
     match command {
         AuthCommand::Login {
             provider: AuthProvider::Codex,
             headless,
         } => {
-            auth::login(headless).await?;
+            auth::login(issuer().await?, headless).await?;
             println!("Signed in to Codex for Skyhook.");
         }
         AuthCommand::Status {
             provider: AuthProvider::Codex,
-        } => match auth::status().await? {
-            auth::AuthStatus::LoggedOut => {
-                println!("Codex: not signed in to Skyhook. Run skyhook auth login.")
-            }
+        } => match auth::status(issuer().await?).await? {
+            auth::AuthStatus::LoginRequired(required) => println!("{required}."),
             auth::AuthStatus::LoggedIn { expires_at, .. } => println!(
                 "Codex: Skyhook credentials present (access token expires at Unix time {expires_at}; refreshed automatically when needed)."
             ),
@@ -119,5 +138,20 @@ async fn run(invocation: Invocation) {
                 std::process::exit(1);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use skyhook::config::ConfigError;
+
+    #[test]
+    fn login_issuer_defaults_without_config_and_propagates_config_errors() {
+        let issuer = |config| codex_issuer(config).map(|issuer| issuer.to_string());
+        let missing = ConfigError::Missing(Default::default());
+        assert_eq!(issuer(Err(missing)).unwrap(), "https://auth.openai.com/");
+        let other = ConfigError::Structure("broken".into());
+        assert!(matches!(issuer(Err(other)), Err(AuthError::Config(_))));
     }
 }

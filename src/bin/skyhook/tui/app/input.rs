@@ -568,7 +568,7 @@ mod tests {
         )
         .unwrap()
         .modes;
-        app.launch.model = config.into_runtime().unwrap().first_model();
+        app.launch.model = config.into_runtime().unwrap().default_model();
         // A session offers the modes it was opened with.
         let session = app.launch.create(None).await.unwrap();
         attach(&mut app, session).await;

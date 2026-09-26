@@ -18,12 +18,18 @@ pub struct HarnessBuilder {
     sensitive_prompts: Arc<dyn SensitivePromptHandler>,
 }
 
-/// The providers, model profiles and modes a harness serves, with what a new
-/// session starts from. Every profile names a provider and the defaults are members.
+/// A configured model: its profile and the provider that serves it.
+#[derive(Clone)]
+pub(crate) struct ModelEntry {
+    pub profile: ModelProfile,
+    pub provider: Arc<dyn Provider>,
+}
+
+/// The models and modes a harness serves, with what a new session starts from.
+/// The defaults are members.
 pub(crate) struct Catalog {
-    pub(crate) providers: BTreeMap<String, Arc<dyn Provider>>,
-    pub(crate) model_profiles: BTreeMap<String, ModelProfile>,
-    pub(crate) default_model_profile: String,
+    pub(crate) models: indexmap::IndexMap<ModelRef, ModelEntry>,
+    pub(crate) default_model: ModelRef,
     pub(crate) modes: indexmap::IndexMap<String, Mode>,
     /// The mode a new session starts in; none without modes.
     pub(crate) mode: Option<String>,
@@ -46,9 +52,8 @@ impl CatalogSource {
     fn assembled(self) -> Assembled {
         match self {
             Self::Admitted(catalog) => Assembled {
-                providers: catalog.providers,
-                model_profiles: catalog.model_profiles,
-                default_model_profile: Some(catalog.default_model_profile),
+                models: catalog.models,
+                default_model: Some(catalog.default_model),
                 modes: catalog.modes,
                 mode: catalog.mode,
             },
@@ -59,31 +64,28 @@ impl CatalogSource {
 
 #[derive(Default)]
 struct Assembled {
-    providers: BTreeMap<String, Arc<dyn Provider>>,
-    model_profiles: BTreeMap<String, ModelProfile>,
-    default_model_profile: Option<String>,
+    models: indexmap::IndexMap<ModelRef, ModelEntry>,
+    default_model: Option<ModelRef>,
     modes: indexmap::IndexMap<String, Mode>,
     mode: Option<String>,
 }
 
 impl Assembled {
     fn check(self) -> Result<Catalog, HarnessError> {
-        let default_model_profile = self
-            .default_model_profile
-            .ok_or(HarnessError::MissingDefaultModelProfile)?;
-        if !self.model_profiles.contains_key(&default_model_profile) {
-            return Err(HarnessError::UnknownModelProfile(default_model_profile));
+        let default_model = self
+            .default_model
+            .ok_or(HarnessError::MissingDefaultModel)?;
+        if !self.models.contains_key(&default_model) {
+            return Err(HarnessError::UnknownModel(default_model));
         }
-        for (name, profile) in &self.model_profiles {
-            profile.validate_limits().map_err(|error| {
-                HarnessError::InvalidProfile(format!("model profile `{name}`: {error}"))
-            })?;
-            if !self.providers.contains_key(&profile.provider) {
-                return Err(HarnessError::InvalidProfile(format!(
-                    "model profile `{name}` uses unknown provider `{}`",
-                    profile.provider
-                )));
-            }
+        for (name, entry) in &self.models {
+            entry
+                .profile
+                .validate_limits()
+                .map_err(|error| HarnessError::InvalidModel {
+                    model: name.clone(),
+                    error,
+                })?;
         }
         // Without modes the root agent holds the ceiling itself and no mode applies.
         let mode = match self.mode {
@@ -95,9 +97,8 @@ impl Assembled {
             None => self.modes.keys().next().cloned(),
         };
         Ok(Catalog {
-            providers: self.providers,
-            model_profiles: self.model_profiles,
-            default_model_profile,
+            models: self.models,
+            default_model,
             modes: self.modes,
             mode,
         })
@@ -158,23 +159,31 @@ impl HarnessBuilder {
         self
     }
 
+    /// A provider and the models it serves, each named `provider/model`. A later
+    /// call for the same provider name adds or replaces models.
     #[must_use]
-    pub fn provider(self, name: impl Into<String>, provider: Arc<dyn Provider>) -> Self {
+    pub fn provider(
+        self,
+        name: ProviderName,
+        provider: Arc<dyn Provider>,
+        models: impl IntoIterator<Item = (ModelName, ModelProfile)>,
+    ) -> Self {
         self.assemble(|catalog| {
-            catalog.providers.insert(name.into(), provider);
+            for (model, profile) in models {
+                let entry = ModelEntry {
+                    profile,
+                    provider: provider.clone(),
+                };
+                catalog
+                    .models
+                    .insert(ModelRef::new(name.clone(), model), entry);
+            }
         })
     }
 
     #[must_use]
-    pub fn model_profile(self, name: impl Into<String>, profile: ModelProfile) -> Self {
-        self.assemble(|catalog| {
-            catalog.model_profiles.insert(name.into(), profile);
-        })
-    }
-
-    #[must_use]
-    pub fn default_model_profile(self, name: impl Into<String>) -> Self {
-        self.assemble(|catalog| catalog.default_model_profile = Some(name.into()))
+    pub fn default_model(self, model: ModelRef) -> Self {
+        self.assemble(|catalog| catalog.default_model = Some(model))
     }
 
     #[must_use]
@@ -284,9 +293,8 @@ impl HarnessBuilder {
             inner: Arc::new(HarnessInner {
                 workspace,
                 session_root,
-                providers: catalog.providers,
-                model_profiles: catalog.model_profiles,
-                default_model_profile: catalog.default_model_profile,
+                models: catalog.models,
+                default_model: catalog.default_model,
                 policy: self.policy,
                 questions: self.questions,
                 extra_tools: self.extra_tools,
@@ -461,7 +469,7 @@ async fn load_agent_instructions_from(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::runtime::tests::*;
+    use crate::{agent::runtime::tests::*, provider::profile::LimitsError};
 
     fn instruction_file(directory: &Path, name: &str, content: impl AsRef<[u8]>) {
         std::fs::create_dir_all(directory).unwrap();
@@ -477,39 +485,34 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let base = || test_builder(root.path(), &sessions, Arc::new(HangingProvider), false);
-        let profile = |provider, context, output| {
-            ModelProfile::new(provider, "model", None, context, output, false)
+        let profile = |context, output| ModelProfile::new("model", None, context, output, false);
+        let bad = |profile| {
+            base().provider(
+                "test".parse().unwrap(),
+                Arc::new(HangingProvider),
+                [("bad".parse().unwrap(), profile)],
+            )
         };
         let cases = [
-            ("missing default", base().default_model_profile("absent")),
             (
-                "zero context",
-                base().model_profile("bad", profile("test", 0, 1)),
+                "missing default",
+                base().default_model("test/absent".parse().unwrap()),
             ),
-            (
-                "output limit",
-                base().model_profile("bad", profile("test", 8, 8)),
-            ),
-            (
-                "provider",
-                base().model_profile("bad", profile("absent", 16, 8)),
-            ),
+            ("zero context", bad(profile(0, 1))),
+            ("output limit", bad(profile(8, 8))),
         ];
         for (case, builder) in cases {
-            let message = match builder.build().await {
-                Err(HarnessError::UnknownModelProfile(name)) => name,
-                Err(HarnessError::InvalidProfile(message)) => message,
+            let (model, error) = match builder.build().await {
+                Err(HarnessError::UnknownModel(model)) => (model, None),
+                Err(HarnessError::InvalidModel { model, error }) => (model, Some(error)),
                 other => panic!("{case}: expected a profile error, got {:?}", other.err()),
             };
             let expected = match case {
-                "missing default" => "absent",
-                "zero context" => "model profile `bad`: max_context must be positive",
-                "output limit" => {
-                    "model profile `bad`: max_output must be smaller than max_context"
-                }
-                _ => "model profile `bad` uses unknown provider `absent`",
+                "missing default" => ("test/absent", None),
+                "zero context" => ("test/bad", Some(LimitsError::Context)),
+                _ => ("test/bad", Some(LimitsError::OutputExceedsContext)),
             };
-            assert_eq!(message, expected, "{case}");
+            assert_eq!((model.to_string().as_str(), error), expected, "{case}");
         }
         assert!(base().build().await.is_ok());
     }

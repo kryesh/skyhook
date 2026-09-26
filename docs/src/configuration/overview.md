@@ -30,27 +30,33 @@ Mappings merge recursively; sequences and scalar values replace the earlier valu
 entry of the same name, without inheriting omitted fields. For example, `targets.build`
 replaces that target's SSH, authentication, workspace, and routing settings; `modes.general`
 replaces that mode's capabilities, instructions, and hint. Other named entries remain available.
-An explicit `null` replaces the earlier value: it clears an optional field, but is not a deletion
-operator for map entries. Required fields and named entries must still have valid values.
+A provider entry that changes `dialect` likewise replaces the earlier provider's settings, which
+belong to the other dialect, while the models declared under it still merge by name. Within a
+provider, a later layer replaces `api_key` and each `headers` value whole, and likewise each
+convention choice (`cache_key`, `output_limit`, `reasoning_effort`, `reasoning_replay`,
+`tool_stream`, `user_id`) at entry level or under a model's `overrides`: a workspace
+`api_key: {command: ...}` or `cache_key: {body: ...}` takes the place of a user `{env: ...}` or
+`{header: ...}` rather than combining with it. An explicit `null` replaces the earlier value: it
+clears an optional field, but is not a deletion operator for map entries. Required fields and named
+entries must still have valid values.
 
 ### Example: user models, workspace targets
 
-Keep provider/model definitions in the selected user `config.yaml`:
+Keep providers, with their models, in the selected user `config.yaml`:
 
 ```yaml
 providers:
   openai:
-    kind: "openai"
+    codec: "responses"
+    dialect: "openai"
     base_url: "https://api.openai.com/v1"
-    api: "responses"
-    api_key_env: "OPENAI_API_KEY"
-
-models:
-  default:
-    provider: "openai"
-    model: "gpt-5.6"
-    max_context: 1050000
-    max_output: 128000
+    api_key:
+      env: "OPENAI_API_KEY"
+    models:
+      default:
+        model: "gpt-5.6"
+        max_context: 1050000
+        max_output: 128000
 
 targets:
   bastion:
@@ -176,8 +182,9 @@ for selectors and incompatible options.
 
 This is included from the repository's single maintained
 [`config.example.yaml`](https://github.com/kryesh/skyhook/blob/main/config.example.yaml).
-It demonstrates multiple providers; remove unused profiles or supply their credentials before
-running a session. For a minimal configuration, follow [your first session](../getting-started/first-session.md).
+It demonstrates multiple providers; remove unused providers and models or supply their credentials
+before running a session. For a minimal configuration, follow
+[your first session](../getting-started/first-session.md).
 
 ```yaml
 {{#include ../../../config.example.yaml}}

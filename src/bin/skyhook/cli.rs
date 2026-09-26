@@ -1,6 +1,6 @@
 //! Syntax-only CLI admission. Paths and inputs remain unread until their host starts.
 use clap::{Parser, Subcommand, ValueEnum};
-use skyhook::{identity::SessionId, tool::policy::Capability};
+use skyhook::{identity::SessionId, provider::profile::ModelRef, tool::policy::Capability};
 use std::path::PathBuf;
 
 /// Session options belong to session execution only: a subcommand takes just its own.
@@ -31,8 +31,8 @@ struct SessionArgs {
     #[arg(long)]
     resume: Option<SessionId>,
     /// Select and remember the root model for a new session.
-    #[arg(short = 'm', long = "model")]
-    model: Option<String>,
+    #[arg(short = 'm', long = "model", value_name = "PROVIDER/MODEL")]
+    model: Option<ModelRef>,
     /// Attach images to the first prompt.
     #[arg(long = "image", requires = "prompt", conflicts_with = "script")]
     images: Vec<PathBuf>,
@@ -191,7 +191,7 @@ pub(super) enum PermissionArgs {
 pub(super) struct ExecutionRequest {
     pub(super) config: ConfigRequest,
     pub(super) resume: Option<SessionId>,
-    pub(super) model: Option<String>,
+    pub(super) model: Option<ModelRef>,
 }
 
 pub(super) struct BatchRequest {
@@ -401,6 +401,20 @@ mod tests {
             parse_from(["skyhook", "--mode", "m"]),
             Ok(Invocation::Interactive(request, _)) if request.mode.as_deref() == Some("m")
         ));
+        // A model is named where it is given: an unqualified name says how.
+        assert!(matches!(
+            parse_from(["skyhook", "-m", "local/first"]),
+            Ok(Invocation::Interactive(request, _))
+                if request.execution.model.as_ref().is_some_and(|model| model.to_string() == "local/first")
+        ));
+        let Err(unqualified) = parse_from(["skyhook", "batch", "-p", "x", "-m", "first"]) else {
+            panic!("an unqualified model is rejected");
+        };
+        let unqualified = unqualified.to_string();
+        assert!(
+            unqualified.contains("a model is named provider/model"),
+            "{unqualified}"
+        );
     }
 
     #[test]
@@ -419,7 +433,7 @@ mod tests {
         for extra in [
             &["--prompt", "hello"][..],
             &["--script", "run.js"],
-            &["--model", "first"],
+            &["--model", "local/first"],
             &["--resume", "00000000000000000000000000000001"],
             &["auth", "status"],
         ] {

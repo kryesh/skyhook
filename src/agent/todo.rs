@@ -223,7 +223,7 @@ mod tests {
             Subject::Label("todo item at index 1".into())
         );
 
-        let fixture = crate::session::fixture::MemorySession::new().await;
+        let fixture = crate::session::tests::MemorySession::new().await;
         let todos = TodoStore::restore(fixture.store, &[]);
         let job = JobId::new(17).unwrap();
         let missing = todos.inspect(&fixture.agent, Some(job)).await.unwrap_err();

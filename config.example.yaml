@@ -1,5 +1,7 @@
 # The interface remembers the most recently selected model.
-# With no saved selection, the first declared model below is used.
+# With no saved selection, default_model (as "provider/model") is used, else the
+# first model of the first provider declared below.
+# default_model: "openai/openai"
 # Set to true to skip interactive approval for every tool call.
 approve_all: false
 # The mode a new session starts in: the built-in general, or one declared below.
@@ -24,88 +26,149 @@ approve_all: false
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.
 # Host environment and .env values are not forwarded to remote targets.
+# Each entry names a dialect (the vendor's conventions) and a codec (the API family).
+# A model is selected as provider/model, e.g. openai/openai.
 providers:
   openai:
-    kind: "openai"
+    codec: "responses"
+    dialect: "openai"
     base_url: "https://api.openai.com/v1"
-    api: "responses"
-    api_key_env: "OPENAI_API_KEY"
+    api_key:
+      env: "OPENAI_API_KEY"
+    # Reasoning summaries need a verified OpenAI organisation:
+    # reasoning_summary: false
+    # Published model limits; smaller budgets can be chosen for cost/latency.
+    models:
+      # https://developers.openai.com/api/docs/models/gpt-5.6-sol
+      openai:
+        model: "gpt-5.6-sol"
+        reasoning: "high"
+        max_context: 1050000
+        max_output: 128000
+        supports_images: true
 
   anthropic:
-    kind: "anthropic"
+    codec: "messages"
+    dialect: "anthropic"
     base_url: "https://api.anthropic.com/v1"
-    api_key_env: "ANTHROPIC_API_KEY"
-    # Alternatively, remove api_key_env and retrieve a key lazily on the first request:
-    # api_key_command: "op read 'op://Private/Anthropic/api-key'"
-    # Runs via /bin/sh -c on the host; trimmed stdout is cached for this provider.
-    # Also supported by OpenAI-compatible providers; cannot be combined with api_key_env.
+    # Any value that may hold a secret (api_key or a header) takes one of
+    # three forms: written literally, read from the environment when the provider is
+    # built, or produced by a command run via /bin/sh -c on the first request (trimmed
+    # stdout, cached for this provider and run again after the server refuses it).
+    # A literal secret sits in this file in plain text and `skyhook dump config`
+    # prints it; prefer env or command.
+    api_key:
+      env: "ANTHROPIC_API_KEY"
+    # api_key: "sk-ant-..."
+    # api_key:
+    #   command: "op read 'op://Private/Anthropic/api-key'"
+    # Cache breakpoints default to five minutes; the hour costs more to write:
+    # cache_ttl: "1h"
+    models:
+      # https://platform.claude.com/docs/en/models/sonnet-4-6/overview
+      sonnet:
+        model: "claude-sonnet-4-6"
+        reasoning: "high"
+        max_context: 1000000
+        max_output: 128000
+        supports_images: true
 
   # Run `skyhook auth login` (or `skyhook auth login --headless`) first.
   # Credentials belong to Skyhook; official Codex client credentials are never accessed.
   codex:
-    kind: "codex"
+    codec: "responses"
+    dialect: "codex"
+    # The service and its OAuth issuer default to OpenAI's; name them only for a mirror:
+    # base_url: "https://chatgpt.com/backend-api/codex"
+    # auth_url: "https://auth.openai.com"
+    # Stored credentials are bound to the auth_url; changing it requires a new login.
+    models:
+      # Codex's catalog advertises a maximum context of 872000 (default: 272000).
+      # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
+      # max_output is required profile metadata, but is not sent to the Codex endpoint.
+      # It does not control the 80%-of-context compaction threshold.
+      codex:
+        model: "gpt-5.6-sol"
+        reasoning: "high"
+        max_context: 872000
+        max_output: 128000
+        supports_images: true
+
+  # OpenRouter routes an alias across providers; routing preferences are optional.
+  # openrouter:
+  #   codec: "chat_completions"
+  #   dialect: "openrouter"
+  #   base_url: "https://openrouter.ai/api/v1"
+  #   api_key:
+  #     env: "OPENROUTER_API_KEY"
+  #   routing:
+  #     order: ["anthropic"]
+  #     allow_fallbacks: false
+  #   cache_ttl: "1h"
+  #   models:
+  #     sonnet:
+  #       model: "anthropic/claude-sonnet-4.5"
+  #       reasoning: "high"
+  #       max_context: 200000
+  #       max_output: 64000
+  #       supports_images: true
+
+  # A LiteLLM proxy speaks every codec; the upstream family behind an alias is
+  # hidden from clients, so the entry names it.
+  # proxy:
+  #   codec: "chat_completions"
+  #   dialect: "litellm"
+  #   base_url: "https://litellm.example.com/v1"
+  #   api_key:
+  #     env: "LITELLM_API_KEY"
+  #   upstream: "anthropic"       # or "openai", "bedrock"
+  #   tags: ["skyhook"]           # sent as x-litellm-tags
+  #   models:
+  #     claude:
+  #       model: "claude-alias"
+  #       reasoning: "high"
+  #       max_context: 200000
+  #       max_output: 64000
 
   # Keyless local llama.cpp endpoint; the model alias matches --alias below.
   # Example text-only server (requires enough memory for the configured context):
   # llama-server --model /path/to/Qwen3.8-27B.gguf --alias qwen3.8-27b \
   #   --host 127.0.0.1 --port 8080 --ctx-size 262144 --parallel 1 --n-predict 131072
   local:
-    kind: "openai"
+    # Standards-following servers need only an endpoint.
+    codec: "chat_completions"
+    dialect: "compatible"
     base_url: "http://127.0.0.1:8080/v1"
-    api: "chat_completions"
-    # Chat-only, per-provider. Default "reasoning_content" replays returned reasoning.
-    # Use "reasoning" for that wire convention, or "unsupported" to keep it local only.
-    # Other protocols replay native reasoning automatically and do not accept this option.
-    # chat_reasoning_replay: "reasoning_content"
+    # A compatible entry may still place each dimension itself, for example a server
+    # that spells the reasoning replay field differently or ignores max_completion_tokens:
+    # reasoning_replay:
+    #   field: "reasoning"
+    # output_limit:
+    #   field: "max_tokens"
+    # Fixed request headers apply to every dialect (proxies, attribution); each value
+    # takes the same three forms as api_key:
+    # headers:
+    #   x-title: "skyhook"
+    #   x-proxy-token:
+    #     env: "PROXY_TOKEN"
+    #   x-proxy-user:
+    #     command: "id -un"
     # Defaults allow long local-model prefills. Startup applies to EACH HTTP attempt.
     # startup_timeout_secs: 600
     # read_idle_timeout_secs: 600
-
-# Published model limits; smaller budgets can be chosen for cost/latency.
-models:
-  # https://developers.openai.com/api/docs/models/gpt-5.6-sol
-  openai:
-    provider: "openai"
-    model: "gpt-5.6"
-    reasoning: "high"
-    max_context: 1050000
-    max_output: 128000
-    supports_images: true
-
-  # https://platform.claude.com/docs/en/models/sonnet-4-6/overview
-  sonnet:
-    provider: "anthropic"
-    model: "claude-sonnet-4-6"
-    reasoning: "high"
-    max_context: 1000000
-    max_output: 128000
-    supports_images: true
-
-  # Codex's catalog advertises a maximum context of 872000 (default: 272000).
-  # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
-  # max_output is required profile metadata, but is not sent to the Codex endpoint.
-  # It does not control the 80%-of-context compaction threshold.
-  codex:
-    provider: "codex"
-    model: "gpt-5.6-sol"
-    reasoning: "high"
-    max_context: 872000
-    max_output: 128000
-    supports_images: true
-
-  # https://huggingface.co/Qwen/Qwen3.8-27B
-  local:
-    provider: "local"
-    model: "qwen3.8-27b"
-    # Native context; match the llama-server per-slot context, not extended-context claims.
-    max_context: 262144
-    # Chosen total-generation cap matching --n-predict, NOT a published hard model limit.
-    # Reasoning and final text share this allowance and the overall context window.
-    max_output: 131072
-    # The text-only server above has no multimodal projector configured.
-    supports_images: false
-    # Adding a hint makes the model available to be used for delegation by other agents
-    hint: "Local model, good at exploration and logic but not writing"
+    models:
+      # https://huggingface.co/Qwen/Qwen3.8-27B
+      local:
+        model: "qwen3.8-27b"
+        # Native context; match the llama-server per-slot context, not extended-context claims.
+        max_context: 262144
+        # Chosen total-generation cap matching --n-predict, NOT a published hard model limit.
+        # Reasoning and final text share this allowance and the overall context window.
+        max_output: 131072
+        # The text-only server above has no multimodal projector configured.
+        supports_images: false
+        # Adding a hint makes the model available to be used for delegation by other agents
+        hint: "Local model, good at exploration and logic but not writing"
 
 # Targets are defined only here or by target_add; SSH configuration files are never read.
 

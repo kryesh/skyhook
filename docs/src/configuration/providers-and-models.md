@@ -1,13 +1,69 @@
 # Providers and models
 
-Providers and models are separate named profiles. API secrets can be read from environment variables
-or retrieved lazily by a command; no literal API-key field is supported in YAML. `openai` requires
-an explicit `base_url` and `api` (`chat_completions` or `responses`); `anthropic` requires an explicit
-`base_url`. Both accept either `api_key_env` or `api_key_command`, or neither for a keyless endpoint.
-URLs name the API root: Skyhook appends
-`/chat/completions`, `/responses`, or `/messages`. For the official services use
-`https://api.openai.com/v1` or `https://api.anthropic.com/v1`. There are no vendor presets, model
-aliases, or automatic vendor detection. Use full model identifiers.
+A provider entry names an endpoint and the models served through it, under `models`. Everywhere a
+model is chosen or recorded—`--model`, the `/model` picker, the `agent` tool, `default_model`,
+session history and `skyhook stats`—it is named `provider/model` from the two keys, so neither key
+may contain `/`. The `model` field inside a profile is the identifier sent on the wire and stays
+free-form. `default_model` selects the model a new session starts with when neither `--model` nor
+the model last submitted in the workspace chooses one; without it, the first model of the first
+provider is used.
+
+Every entry names a **dialect** and a **codec**. The codec is the API family the endpoint speaks:
+`chat_completions`, `responses`, or `messages`; `base_url` names the API root and Skyhook appends
+`/chat/completions`, `/responses`, or `/messages`. The dialect is the set of wire conventions the
+server follows:
+
+| Dialect | Codecs | Use for |
+| --- | --- | --- |
+| `compatible` | any | Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only `base_url`. A key is sent as each API specifies: a bearer token, or `x-api-key` on `messages`. |
+| `openai` | `chat_completions`, `responses` | `https://api.openai.com/v1`. Response schemas must fit OpenAI's strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: `reasoning_summary: false` for an unverified organisation (Responses only), `organization`, `project`. |
+| `anthropic` | `messages` | `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`. |
+| `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login`. `base_url` defaults to `https://chatgpt.com/backend-api/codex` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. |
+| `openrouter` | any | `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: `routing` (Chat only: `order`, `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, `fallback_models`) and `cache_ttl: "5m"` or `"1h"`. A response schema always sets `require_parameters`. |
+| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key. Required `upstream: "openai"`, `"anthropic"` or `"bedrock"` names the family behind the alias, which the proxy hides: Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; `messages` behind an OpenAI upstream goes through the proxy's translation, which drops reasoning. Optional `tags` select LiteLLM's tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session. |
+
+Every dialect but `codex` accepts `api_key` (see [authentication](authentication.md)); every
+dialect accepts fixed request `headers` for proxies or attribution, the
+[connection timeouts](#connection-timeouts), and `models`. On `messages`, a configured
+`anthropic-beta` adds to the betas Skyhook announces rather than replacing them. The credential
+header and header placements (`cache_key: {header: …}`, or a dialect's own) in turn replace an
+entry header of the same name, whose command then never runs; so does `Accept`, which is always
+`text/event-stream`. Unknown fields, and a codec the dialect does not speak, are rejected. There
+are no model aliases or automatic vendor detection: `model` is the identifier sent on the wire.
+
+A `compatible` entry may place each convention itself when a server deviates, and any model may
+carry the same selections under `overrides` to differ from its provider:
+
+```yaml
+providers:
+  local:
+    codec: "chat_completions"
+    dialect: "compatible"
+    base_url: "http://127.0.0.1:8000/v1"
+    output_limit:                                # or: omitted
+      field: "max_tokens"
+    reasoning_replay:                            # the assistant-message key; or: omitted
+      field: "reasoning"
+    cache_key:                                   # or `header: "x-session-id"`, or: omitted
+      body: "cache_salt"
+    models:
+      thinker:
+        model: "served-name"
+        max_context: 131072
+        max_output: 32768
+        overrides:
+          reasoning_effort: "reasoning_effort"
+```
+
+The selectable dimensions are `output_limit`, `reasoning_effort` (a field path), `reasoning_replay`
+and `tool_stream` (Chat Completions only), `cache_key`, and `user_id`. A field path is
+dot-separated (`metadata.user_id`); `cache_key` and `user_id` carry the conversation identity.
+Paths must not name a field the codec writes itself (such as `model` or `messages`), and no two may
+overlap, including one inside another (`reasoning` and `reasoning.effort`). A `cache_key` header
+must not be `accept`, `content-type`, or a header the codec sends itself (such as
+`anthropic-version` on `messages`). A `reasoning_replay`
+field moves the provider's replay to another key in the same form. Messages requires an output
+limit, so `output_limit: omitted` is refused there.
 
 ## Context and output budgets
 
@@ -29,7 +85,7 @@ for what the model receives.
 
 The [complete example](overview.md#complete-example) uses published hosted-model limits:
 
-| Profile | Context | Output | Source |
+| Model | Context | Output | Source |
 | --- | ---: | ---: | --- |
 | GPT-5.6 / GPT-5.6 Sol, OpenAI API | 1,050,000 | 128,000 | [Model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
 | Claude Sonnet 4.6 | 1,000,000 | 128,000 | [Model documentation](https://platform.claude.com/docs/en/models/sonnet-4-6/overview) |
@@ -54,8 +110,7 @@ llama-server \
   --alias qwen3.8-27b \
   --host 127.0.0.1 --port 8080 \
   --ctx-size 262144 --parallel 1 \
-  --n-predict 131072 \
-  --jinja --reasoning-format deepseek
+  --n-predict 131072
 ```
 
 Then configure Skyhook to match:
@@ -65,28 +120,28 @@ approve_all: false
 
 providers:
   local:
-    kind: "openai"
+    codec: "chat_completions"
+    dialect: "compatible"
     base_url: "http://127.0.0.1:8080/v1"
-    api: "chat_completions"
-
-models:
-  local:
-    provider: "local"
-    model: "qwen3.8-27b"
-    max_context: 262144
-    max_output: 131072
-    supports_images: false
+    models:
+      qwen:
+        model: "qwen3.8-27b"
+        max_context: 262144
+        max_output: 131072
+        supports_images: false
 ```
+
+Select it as `local/qwen`.
 
 Here **131,072 is a chosen total-generation cap**, matching `--n-predict`, not a published
 hard output limit of Qwen3.8-27B. Qwen recommends separate reasoning and final-response budgets
 for some extended-context deployments; this example instead shares one allowance between
 reasoning and final text. The complete prompt and generated output must still fit the context.
 
-The `model` value matches the server's `--alias`. `--reasoning-format deepseek` returns
-reasoning in `reasoning_content`, matching Skyhook's default replay convention. The command
-is text-only, so `supports_images` stays false; image input needs a compatible multimodal
-projector and a tested server configuration.
+The `model` value matches the server's `--alias`. Current llama.cpp builds render chat templates
+and split reasoning into `reasoning_content` by default, matching Skyhook's default replay
+convention. The command is text-only, so `supports_images` stays false; image input needs a
+compatible multimodal projector and a tested server configuration.
 
 Verify the server's allocated context in its startup logs. If memory requires a smaller context,
 reduce both the server setting and Skyhook's budget; with multiple slots, use the actual per-slot
@@ -98,8 +153,12 @@ for server options.
 
 For every provider, **transient/network failures retry until success or cancellation**,
 with no attempt limit. This includes connection failures, interrupted streams, timeouts,
-rate limits, and temporary server errors. Authentication, invalid-request, and malformed-response
-errors stop the request instead of retrying.
+rate limits, temporary server errors, and an expired command-sourced credential
+([authentication](authentication.md#api-keys-and-environment-files)). Other authentication,
+billing (exhausted quota, credit, or spend limit, however the service reports it),
+invalid-request, and malformed-response errors stop the request instead of retrying. So does a
+response with neither visible text nor a tool call, such as reasoning alone; cut off at
+`max_output`, it reports that the output limit was reached.
 
 A valid server `Retry-After` hint—delay-seconds or an HTTP-date—sets the delay,
 even when it exceeds 30 seconds. Past dates mean no delay; malformed or ambiguous
@@ -133,50 +192,42 @@ Skyhook displays only the reasoning text or summaries the service returns, not o
 reasoning. Support varies by provider, model, and compatible server.
 
 Skyhook saves returned reasoning and automatically reuses it when compatible with the selected
-provider, endpoint, API, and model. Switching to an incompatible profile omits that reasoning from
+provider, endpoint, API, and model. Switching to an incompatible model omits that reasoning from
 requests without deleting the saved history. Signed thinking cannot be reused across compaction
 or mode switches. Visible summaries cannot replace private reasoning state the service requires.
+Messages servers that do not sign thinking still get it replayed, until a signed block appears in
+the context; from then on only signed blocks are sent.
 
 Standard Chat Completions has no portable request-side reasoning field. Compatible Chat providers
-replay their returned reasoning using **`reasoning_content` by default**: this is consumed by
-llama.cpp and SGLang, and accepted as an alias by current vLLM. Ordinary Chat responses without
-reasoning do not acquire an invented reasoning field. Configure a different spelling or disable
-request replay on the **provider**, not individual model profiles:
+replay their returned reasoning under **`reasoning_content` by default**. Ordinary Chat responses
+without reasoning do not acquire an invented reasoning field.
+A server that spells the key differently selects it with `reasoning_replay` set to
+`field: "reasoning"`; `reasoning_replay: omitted` keeps reasoning local. The `openai` dialect never
+replays on Chat, since the official API rejects unknown message keys; `litellm` with a Claude
+upstream replays the signed thinking blocks the proxy returns, and `openrouter` replays its
+`reasoning_details`; both are bound to the exact conversation like Messages thinking. As on
+Messages, unsigned reasoning is replayed until signed reasoning appears in the context. From then
+on, only signed thinking blocks are sent, and a turn's `reasoning_details` are sent whole, in
+order, only if one of them is signed. Responses and Messages replay native reasoning automatically.
 
-```yaml
-providers:
-  local:
-    kind: "openai"
-    base_url: "http://127.0.0.1:8080/v1"
-    api: "chat_completions"
-    # Optional; this is the default:
-    chat_reasoning_replay: "reasoning_content"
-    # Alternatives: "reasoning", or "unsupported" to keep reasoning locally only.
-```
-
-This option belongs only to OpenAI-compatible Chat Completions. Anthropic and Codex reject it as an
-unknown setting; configuring it with `api: "responses"` is also rejected. Their native reasoning
-replay remains automatic and independent of this option. All models using a provider share its
-Chat convention; use separate provider entries if a proxy routes to incompatible conventions.
-
-Reasoning is replayed with its owning assistant turn, including tool calls and reasoning-only turns;
+Reasoning is replayed with its owning assistant turn, including turns that only call tools;
 it is never merged into answer text or fabricated `<think>` tags. Server-side tool and reasoning
 parsers/templates must be configured appropriately; Skyhook does not infer them from model names.
-Chat requests send `max_output` as `max_completion_tokens` without renaming, so a server that only
-honours `max_tokens` ignores the limit.
+Chat requests send `max_output` as `max_completion_tokens`; a server that only honours
+`max_tokens` sets `output_limit` to `field: "max_tokens"`.
 
 ## Connection timeouts
 
-OpenAI-compatible and Anthropic providers also accept positive `startup_timeout_secs` and
-`read_idle_timeout_secs` settings (both default to 600 seconds). Startup is a deadline for each HTTP
-attempt, while read-idle resets after each response-body chunk. For example:
+Every provider accepts positive `startup_timeout_secs` and `read_idle_timeout_secs` settings
+(both default to 600 seconds). Startup is a deadline for each HTTP attempt, while read-idle resets
+after each response-body chunk. For example:
 
 ```yaml
 providers:
   local:
-    kind: "openai"
+    codec: "chat_completions"
+    dialect: "compatible"
     base_url: "http://127.0.0.1:8080/v1"
-    api: "chat_completions"
     startup_timeout_secs: 600
     read_idle_timeout_secs: 600
 ```
@@ -185,8 +236,8 @@ Each retry gets fresh deadlines, so these settings do not limit the total time s
 response. Cancel the request to stop waiting; the server may continue processing if it does not
 honor disconnects. See [model failure recovery](#model-failure-recovery) for retry behavior.
 
-`skyhook dump config` writes the resolved timeouts and, for Chat Completions, the resolved
-`chat_reasoning_replay`, so a dump shows the defaults an entry left implicit.
+`skyhook dump config` writes the resolved timeouts, so a dump shows the defaults an entry left
+implicit.
 
 See [authentication](authentication.md) for API-key and Codex login setup,
 and [sessions and context](../guide/sessions-and-context.md#conversation-compaction) for

@@ -5,6 +5,7 @@ pub use menus::{ConfirmAction, Item, ItemRef, Menu, MenuId, MenuKind, SessionRef
 use prompts::UiPrompt;
 use queue::QueueDelivery;
 pub use queue::{QueuedInput, QueuedInputId};
+use skyhook::provider::profile::ModelRef;
 mod events;
 mod input;
 mod lifecycle;
@@ -122,10 +123,10 @@ pub struct App {
     phase: Phase,
     pub launch: Launch,
     /// UI-only choice, captured by each submitted user message.
-    pub model: String,
+    pub model: ModelRef,
     /// UI-only choice like `model`; a new session starts in it.
     pub mode: String,
-    remembered_model: Option<String>,
+    remembered_model: Option<ModelRef>,
     remembered_mode: Option<String>,
     pub sidebar: bool,
     pub snapshot: ObservationSnapshot,
@@ -256,7 +257,7 @@ impl App {
             Phase::Open { observation, .. } => observation.session.root_agent().clone(),
         };
         let mut app = Self {
-            model: launch.model.name().to_owned(),
+            model: launch.model.name(),
             mode,
             remembered_model: saved.model,
             remembered_mode: saved.mode,
@@ -358,7 +359,7 @@ pub(super) mod tests {
             model: config
                 .into_runtime()
                 .unwrap()
-                .select_model("first")
+                .select_model(&"test/first".parse().unwrap())
                 .unwrap(),
             permissions: crate::launch::Permissions::Mode("general".into()),
             workspace: root.path().to_path_buf(),
@@ -370,7 +371,7 @@ pub(super) mod tests {
         let (tx, _) = mpsc::unbounded_channel();
         let mut app = App::new(None, launch, "general".into(), Default::default(), tx);
         // Unit fixtures must not change the user's global model preference.
-        app.remembered_model = Some("first".into());
+        app.remembered_model = Some("test/first".parse().unwrap());
         app.remembered_mode = Some("general".into());
         (root, app)
     }
@@ -425,7 +426,11 @@ pub(super) mod tests {
             .model
             .harness_builder(&app.launch.workspace)
             .unwrap()
-            .provider("test", Arc::new(Rejected))
+            .provider(
+                "test".parse().unwrap(),
+                Arc::new(Rejected),
+                [("first".parse().unwrap(), app.launch.model.profile().clone())],
+            )
             .session_root(&app.launch.sessions)
             .shim_catalog(app.launch.catalog.clone())
             .build()
@@ -622,7 +627,9 @@ pub(super) mod tests {
         .unwrap()
         .mcp;
         let runtime = config.into_runtime().unwrap();
-        draft.launch.model = runtime.select_model("first").unwrap();
+        draft.launch.model = runtime
+            .select_model(&"test/first".parse().unwrap())
+            .unwrap();
         let session = draft.launch.create(None).await.unwrap();
         let id = session.id();
         let (tx, _) = mpsc::unbounded_channel();

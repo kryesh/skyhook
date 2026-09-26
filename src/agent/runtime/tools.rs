@@ -1,6 +1,5 @@
 //! Agent-specific tools layered on top of the general coding tool set.
 use std::{
-    collections::BTreeMap,
     path::PathBuf,
     sync::{Arc, OnceLock, Weak},
 };
@@ -11,8 +10,8 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{Question, TodoItem, todo::TodoStore},
-    provider::profile::ModelProfile,
+    agent::{ModelEntry, Question, TodoItem, todo::TodoStore},
+    provider::profile::ModelRef,
     session::UserPart,
     tool::{
         RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
@@ -81,7 +80,7 @@ enum TodoOutput {
 pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
-    models: &BTreeMap<String, ModelProfile>,
+    models: &indexmap::IndexMap<ModelRef, ModelEntry>,
     modes: &indexmap::IndexMap<String, Mode>,
 ) -> Result<(), RegistryError> {
     register_wait(builder, runtime_slot.clone())?;
@@ -191,12 +190,12 @@ fn register_ask(
 fn register_child_agent(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
-    models: &BTreeMap<String, ModelProfile>,
+    models: &indexmap::IndexMap<ModelRef, ModelEntry>,
     modes: &indexmap::IndexMap<String, Mode>,
 ) -> Result<(), RegistryError> {
-    let hinted = |(name, profile): (&String, &ModelProfile)| {
-        let hint = profile.hint.as_ref()?;
-        Some((name.clone(), format!(": {hint}")))
+    let hinted = |(name, entry): (&ModelRef, &ModelEntry)| {
+        let hint = entry.profile.hint.as_ref()?;
+        Some((name.to_string(), format!(": {hint}")))
     };
     let models: Vec<_> = models.iter().filter_map(hinted).collect();
     let modes = modes.clone();
@@ -229,10 +228,15 @@ fn register_child_agent(
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                let hinted = |name: &String| runtime.harness.model_profiles.get(name).is_some_and(|profile| profile.hint.is_some());
-                if let Some(name) = input.model.as_ref().filter(|name| !hinted(name)) {
-                    return Err(invalid_argument("model", format!("unknown model `{name}`")));
-                }
+                // Only hinted models were offered; anything else is unknown to the caller.
+                let model = match input.model {
+                    Some(name) => {
+                        let hinted = |model: &ModelRef| runtime.harness.models.get(model).is_some_and(|entry| entry.profile.hint.is_some());
+                        let model = name.parse::<ModelRef>().ok().filter(hinted);
+                        Some(model.ok_or_else(|| invalid_argument("model", format!("unknown model `{name}`")))?)
+                    }
+                    None => None,
+                };
                 let capabilities = match &input.mode {
                     None => context.capabilities().clone(),
                     Some(name) => {
@@ -266,9 +270,9 @@ fn register_child_agent(
                     )).operation(Operation::Validate, Subject::Job(id)).effects(Effects::NotStarted));
                 }
                 let child = runtime.next_child(context.agent()).await;
-                let model = input.model
+                let model = model
                     .or_else(|| runtime.agents()
-                        .get(context.agent()).map(|agent| agent.model_profile.clone()))
+                        .get(context.agent()).map(|agent| agent.model.clone()))
                     .ok_or_else(|| ToolError::failed("parent agent is no longer running")
                         .operation(Operation::Lookup, Subject::Label(format!("parent agent {}", context.agent()))).effects(Effects::NotStarted))?;
                 let mut location = crate::target::select_location(
@@ -289,7 +293,7 @@ fn register_child_agent(
                 let sender = runtime.spawn_agent(AgentLaunch {
                     id: child.clone(),
                     owner_job: Some(context.job()),
-                    model_profile: model,
+                    model: Some(model),
                     todos,
                     available_depth: input.depth,
                     location,
@@ -357,8 +361,8 @@ pub(super) fn child_resume_handler(
                     .spawn_agent(AgentLaunch {
                         id: child.clone(),
                         owner_job: Some(authorization.job),
-                        // The journaled contract supplies the profile, depth and location.
-                        model_profile: String::new(),
+                        // The journaled contract supplies the model, depth and location.
+                        model: None,
                         todos: None,
                         available_depth: 0,
                         location: execution_location.clone(),
@@ -743,12 +747,12 @@ for line in sys.stdin:
         ];
         let cheap = ModelProfile {
             hint: Some("Cheap".into()),
-            ..ModelProfile::new("test", "cheap", None, 128_000, 4096, false)
+            ..ModelProfile::new("cheap", None, 128_000, 4096, false)
         };
         let provider = scripted_provider(&requests, (0..3).map(|_| answer("done")));
-        let harness = test_builder(root.path(), &root.path().join("hinted"), provider, false)
+        let harness = serving(root.path(), provider, [("cheap", cheap)])
+            .session_root(root.path().join("hinted"))
             .max_child_depth(2)
-            .model_profile("cheap", cheap)
             .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).into())
             .build()
             .await
@@ -756,7 +760,7 @@ for line in sys.stdin:
         let session = harness.new_session().await.unwrap();
         session.prompt("root request").await.unwrap();
         // `work` holds no network, and `secret` has no hint.
-        assert_eq!(agent_input(0, "model")["enum"], json!(["cheap", null]));
+        assert_eq!(agent_input(0, "model")["enum"], json!(["test/cheap", null]));
         let offered = agent_input(0, "mode");
         assert_eq!(offered["enum"], json!(["work", "scout", "idle", null]));
         let description = offered["description"].as_str().unwrap();
@@ -775,7 +779,8 @@ for line in sys.stdin:
             let error = session.run_script(script).await.unwrap_err().to_string();
             assert!(error.contains(reason), "{refused}: {error}");
         }
-        let child = "return await tool.agent({prompt:'go', depth:1, mode:'scout', model:'cheap'});";
+        let child =
+            "return await tool.agent({prompt:'go', depth:1, mode:'scout', model:'test/cheap'});";
         assert_eq!(
             session.run_script(child).await.unwrap().value["value"]["result"],
             "done"

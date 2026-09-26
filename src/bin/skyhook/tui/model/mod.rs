@@ -359,7 +359,7 @@ mod tests {
     use skyhook::job::{JobRole, JobState};
     use skyhook::provider::protocol::{
         AssistantItem, Binding, BlockId, BlockRef, ItemId, ItemKind, Provenance, Replay,
-        ResponseEvent, Scope, ToolCall, ToolResult,
+        ReplayFormat, ResponseEvent, Scope, ToolCall, ToolResult,
     };
     use skyhook::session::{
         Message, MessageSeq, ModelPurpose, RecordSeq, RequestSeq, SessionEvent, UserPart,
@@ -498,9 +498,8 @@ mod tests {
                 Some(context) => context,
                 None => {
                     let profile = skyhook::session::ProfileSnapshot {
-                        name: "fixture".into(),
+                        name: "test/fixture".parse().unwrap(),
                         profile: skyhook::provider::profile::ModelProfile::new(
-                            "fixture",
                             "fixture-model",
                             None,
                             128_000,
@@ -542,7 +541,7 @@ mod tests {
     pub(super) fn replay() -> Replay {
         Replay {
             provenance: Provenance {
-                protocol: "fixture".into(),
+                format: ReplayFormat::Messages,
                 model: "fixture".into(),
                 scope: Scope::try_from("reasoning".to_owned()).unwrap(),
             },

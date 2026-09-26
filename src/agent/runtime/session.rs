@@ -173,7 +173,7 @@ impl SessionHandle {
     }
 
     /// Continue a failed or interrupted turn without duplicating its input,
-    /// optionally on another model profile (a refusal is deterministic for a given
+    /// optionally on another model (a refusal is deterministic for a given
     /// request). Retained interrupted children restart first; a root still waiting
     /// on them is left alone and woken by their ordinary completion.
     pub async fn continue_turn_with(
@@ -287,23 +287,23 @@ impl SessionHandle {
         Ok(content)
     }
 
-    /// The selection a message or continued turn can carry: a model profile the
+    /// The selection a message or continued turn can carry: a `provider/model` the
     /// harness has and one of this session's modes, each omitted to retain the
     /// active one. Rejected here, before anything is stored.
     pub fn selection(
         &self,
-        model: Option<&str>,
+        model: Option<&ModelRef>,
         mode: Option<&str>,
     ) -> Result<Selection, HarnessError> {
         let runtime = self.runtime.instance;
         let model = match model {
-            Some(name) if self.runtime.harness.model_profiles.contains_key(name) => {
-                Some(SessionModel {
-                    runtime,
-                    name: name.to_owned(),
-                })
+            Some(name) if !self.runtime.harness.models.contains_key(name) => {
+                return Err(HarnessError::UnknownModel(name.clone()));
             }
-            Some(name) => return Err(HarnessError::UnknownModelProfile(name.to_owned())),
+            Some(name) => Some(SessionModel {
+                runtime,
+                name: name.clone(),
+            }),
             None => None,
         };
         let mode = match mode {
@@ -324,7 +324,7 @@ impl SessionHandle {
         if let Some(model) = &options.model
             && model.runtime != runtime
         {
-            return Err(HarnessError::UnknownModelProfile(model.name.clone()));
+            return Err(HarnessError::UnknownModel(model.name.clone()));
         }
         if let Some(mode) = &options.mode
             && mode.runtime != runtime
@@ -585,13 +585,13 @@ mod tests {
         let provider = scripted_provider(&requests, [answer("first"), answer("second")]);
         let harness = test_harness(root.path(), &sessions, provider).await;
         let session = harness.new_session().await.unwrap();
-        let model = session.runtime.harness.default_model_profile.clone();
+        let model = session.runtime.harness.default_model.clone();
         let stale = session.selection(Some(&model), None).unwrap();
         let id = session.id();
         shutdown_session(session).await;
         let resumed = harness.resume_session(id).await.unwrap();
         let rejected = resumed.prompt_with_options("hello", &[], stale).await;
-        assert!(matches!(rejected, Err(HarnessError::UnknownModelProfile(name)) if name == model));
+        assert!(matches!(rejected, Err(HarnessError::UnknownModel(name)) if name == model));
         let fresh = resumed.selection(Some(&model), None).unwrap();
         let answered = resumed.prompt_with_options("hello", &[], fresh).await;
         assert_eq!(answered.unwrap(), "first");
@@ -705,17 +705,16 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(session.prompt("delegate").await.unwrap(), "first");
-        let signed = Replay {
-            provenance: Provenance {
-                protocol: "test".into(),
-                model: "test".into(),
-                scope: Scope::try_from("scope".to_owned()).unwrap(),
-            },
-            payload: json!({"signature": "bound to the look conversation"}),
-            binding: Binding::Conversation,
-        };
+        let payload = json!({"signature": "bound to the look conversation"});
+        let signed = envelope(
+            ReplayFormat::Messages,
+            "test",
+            payload,
+            Binding::Conversation,
+        );
+        // Reasoning rides a turn that says something; alone it would be no turn.
         let signed = AssistantItem::reasoning("signed", 0, "visible", Some(signed));
-        let signed = Message::Assistant(vec![signed]);
+        let signed = Message::Assistant(vec![signed, AssistantItem::text("t", 1, "noted")]);
         session.runtime.commit(&session.root, signed).await.unwrap();
         let work = session.selection(None, Some("work")).unwrap();
         let prompt = session.prompt_with_options("write", &[], work.clone());
@@ -823,7 +822,7 @@ mod tests {
             response(vec![AssistantItem::tool_call(id, 0, call)])
         };
         let write = |path: &str| json!({"path": path, "content": "written"});
-        let launch = json!({"prompt": "child task", "model": "child", "bg": true});
+        let launch = json!({"prompt": "child task", "model": "test/child", "bg": true});
         let done = || Step::new(answer("done")).model("root");
         let tracking = Script::new(
             [
@@ -852,14 +851,16 @@ mod tests {
         let work = mode(&[Capability::Read, Capability::Write, Capability::Agents]);
         let profile = |model: &str| ModelProfile {
             hint: Some(model.to_owned()),
-            ..ModelProfile::new("test", model, None, 128_000, 4096, false)
+            ..ModelProfile::new(model, None, 128_000, 4096, false)
         };
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
-            .provider("test", tracking.clone())
-            .model_profile("root", profile("root"))
-            .model_profile("child", profile("child"))
-            .default_model_profile("root")
+            .provider(
+                provider_name("test"),
+                tracking.clone(),
+                models([("root", profile("root")), ("child", profile("child"))]),
+            )
+            .default_model(model_ref("root"))
             .modes(
                 [
                     ("work".to_owned(), work),
@@ -1128,7 +1129,7 @@ mod tests {
             ),
         ];
         store.append_all(events).await.unwrap();
-        let started = crate::session::fixture::child_started(Some(job), location);
+        let started = crate::session::tests::child_started(Some(job), location);
         store.append(root_agent.child(1), started).await.unwrap();
         if answered {
             // A second crash: the first resume answered the call and retry restarted
@@ -1214,7 +1215,7 @@ mod tests {
             summary.preview.as_deref(),
             Some("list me by my first prompt")
         );
-        assert_eq!(summary.model.as_deref(), Some("test"));
+        assert_eq!(summary.model, Some(model_ref("test")));
         session.set_title("first title".into()).await.unwrap();
         session.set_title("second title".into()).await.unwrap();
         let summary = SessionStore::summary(&sessions, session.id())
@@ -1246,9 +1247,8 @@ mod tests {
         completed.insert(completed.len() - 1, ResponseEvent::Usage(usage));
         let responses = [completed, answer(summary.to_string()), answer("resumed")];
         let provider = scripted_provider(&requests, responses);
-        let profile = ModelProfile::new("test", "test", None, 64_000, 4096, false);
-        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
-            .model_profile("test", profile)
+        let profile = ModelProfile::new("test", None, 64_000, 4096, false);
+        let harness = serving(root.path(), provider, [("test", profile)])
             .build()
             .await
             .unwrap();
@@ -1320,31 +1320,35 @@ mod tests {
         let requests = Requests::default();
         let responses = [answer("Image received"), answer("Image still present")];
         let provider = scripted_provider(&requests, responses);
-        let vision = ModelProfile::new("test", "vision-model", None, 128_000, 4096, true);
-        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
-            .model_profile("vision", vision)
+        let vision = ModelProfile::new("vision-model", None, 128_000, 4096, true);
+        let harness = serving(root.path(), provider, [("vision", vision)])
             .build()
             .await
             .unwrap();
         let session = harness.new_session().await.unwrap();
-        let model = |name: &str| session.selection(Some(name), None).unwrap();
+        let model = |name: &str| {
+            session
+                .selection(Some(&name.parse().unwrap()), None)
+                .unwrap()
+        };
         let before = session.runtime.store.records().await.len();
         let oversized = crate::media::Attachment::Image {
             file: None,
             image: crate::tests::png(&vec![0; MAX_IMAGE_BYTES as usize]),
         };
         let oversized = [oversized];
-        let rejected = session.prompt_with_options("Oversized image", &oversized, model("vision"));
+        let rejected =
+            session.prompt_with_options("Oversized image", &oversized, model("test/vision"));
         assert!(matches!(rejected.await, Err(HarnessError::ImageLimit)));
         assert_eq!(session.runtime.store.records().await.len(), before);
         let images = [image];
-        let with_image = session.prompt_with_options("Look at this", &images, model("vision"));
+        let with_image = session.prompt_with_options("Look at this", &images, model("test/vision"));
         with_image.await.unwrap();
-        let error = session.prompt_with_options("Go on", &[], model("test"));
+        let error = session.prompt_with_options("Go on", &[], model("test/test"));
         let error = error.await.unwrap_err().to_string();
         assert!(error.contains("does not support image"), "{error}");
         assert_eq!(requests.lock().unwrap().len(), 1);
-        let again = session.prompt_with_options("Use vision again", &[], model("vision"));
+        let again = session.prompt_with_options("Use vision again", &[], model("test/vision"));
         again.await.unwrap();
         assert!(
             requests.lock().unwrap()[1]

@@ -514,25 +514,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     fill(frame, r(0, fy, width, footer_height), p.base);
     let agent = app.projection.agents.iter().find(|a| a.id == app.selected);
     let model = if app.selected.path().is_empty() {
-        app.model.as_str()
+        Some(&app.model)
     } else {
-        agent.map_or(app.model.as_str(), |a| a.model.as_deref().unwrap_or("-"))
+        agent.map_or(Some(&app.model), |a| a.model.as_ref())
     };
-    let model = app
-        .launch
-        .model
-        .config()
-        .config()
-        .models
-        .get(model)
-        .map_or(model, |profile| profile.model.as_str());
+    let config = app.launch.model.config();
+    let model = model.map_or_else(
+        || "-".to_owned(),
+        |name| {
+            config
+                .model(name)
+                .map_or_else(|| name.to_string(), |profile| profile.model.clone())
+        },
+    );
     // The root composer's next message goes out in this mode; a child's is fixed.
-    let root_label = format!("{} · {model}", app.mode);
     let model = if app.selected.path().is_empty() {
-        &root_label
+        format!("{} · {model}", app.mode)
     } else {
         model
     };
+    let model = model.as_str();
     let session = app.session().as_ref().map_or_else(
         || "new session".to_owned(),
         |session| session.id().to_string(),
@@ -724,7 +725,7 @@ mod tests {
         let context = skyhook::session::ModelContext {
             purpose: skyhook::session::ModelPurpose::Agent,
             profile: skyhook::session::ProfileSnapshot {
-                name: "fixture".into(),
+                name: app.launch.model.name(),
                 profile,
             },
             system: Vec::new(),

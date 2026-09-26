@@ -3,7 +3,7 @@
 use super::{HarnessError, SessionRuntime, TurnContext, compaction};
 use crate::provider::{
     ProviderContext, ProviderError,
-    protocol::{LiveResponse, ModelRequest, Outcome, Step as LiveStep, Usage},
+    protocol::{LiveResponse, ModelRequest, Outcome, ResponseEvent, Step as LiveStep, Usage},
 };
 use crate::session::RequestSeq;
 use futures_util::StreamExt;
@@ -75,7 +75,8 @@ impl SessionRuntime {
                     return Err(HarnessError::Interrupted);
                 },
             };
-            let event = match event {
+            let checked = |event: ResponseEvent| event.checked().map_err(ProviderError::from);
+            let event = match event.map(|event| event.and_then(checked)) {
                 Some(Ok(event)) => event,
                 Some(Err(error)) => {
                     if live.usage() != Usage::default() {

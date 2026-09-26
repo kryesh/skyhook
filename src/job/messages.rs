@@ -269,7 +269,7 @@ mod tests {
     async fn child_job(
         background: bool,
     ) -> (tempfile::TempDir, JobManager, AgentId, AgentId, JobId) {
-        let session = crate::session::fixture::MemorySession::new().await;
+        let session = crate::session::tests::MemorySession::new().await;
         let owner = session.agent.clone();
         let manager = JobManager::new(session.store.clone());
         let (child, job) = agent_job(&session, &manager, &owner, 1, background).await;
@@ -277,8 +277,8 @@ mod tests {
     }
 
     /// Session, manager and owner without any job, so a test controls job IDs.
-    async fn owner_session() -> (crate::session::fixture::MemorySession, JobManager, AgentId) {
-        let session = crate::session::fixture::MemorySession::new().await;
+    async fn owner_session() -> (crate::session::tests::MemorySession, JobManager, AgentId) {
+        let session = crate::session::tests::MemorySession::new().await;
         let owner = session.agent.clone();
         let manager = JobManager::new(session.store.clone());
         (session, manager, owner)
@@ -286,7 +286,7 @@ mod tests {
 
     /// A running child-agent job and its child agent.
     async fn agent_job(
-        session: &crate::session::fixture::MemorySession,
+        session: &crate::session::tests::MemorySession,
         manager: &JobManager,
         owner: &AgentId,
         index: u32,

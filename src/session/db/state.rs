@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use super::{Db, DbResult, corrupt};
 use crate::identity::{AgentId, SessionId};
+use crate::provider::profile::ModelRef;
 use crate::session::RequestSeq;
 
 /// A session list row, read without decoding the session.
@@ -14,24 +15,29 @@ pub struct SessionSummary {
     pub preview: Option<String>,
     pub last_millis: i64,
     pub entries: u64,
-    /// The root agent's applied model profile.
-    pub model: Option<String>,
+    /// The root agent's applied model.
+    pub model: Option<ModelRef>,
     /// The root agent's applied mode.
     pub mode: Option<String>,
 }
 
 pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
     db.query_row(
-        "SELECT title, preview, coalesce(last_millis, 0), entries, model, mode FROM session_summary",
+        "SELECT title, preview, coalesce(last_millis, 0), entries, p.provider, p.name, mode \
+         FROM session_summary s LEFT JOIN model_profile p ON p.id = s.profile",
         Vec::new(),
         |row| {
+            let model = match (row.get::<Option<String>>(4)?, row.get::<Option<String>>(5)?) {
+                (Some(provider), Some(name)) => Some(super::decode::model_ref(&provider, &name)?),
+                _ => None,
+            };
             Ok(SessionSummary {
                 title: row.get(0)?,
                 preview: row.get(1)?,
                 last_millis: row.get(2)?,
                 entries: row.get(3)?,
-                model: row.get(4)?,
-                mode: row.get(5)?,
+                model,
+                mode: row.get(6)?,
             })
         },
     )?

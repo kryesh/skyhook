@@ -106,8 +106,8 @@ impl AgentLifecycle {
 pub struct AgentInfo {
     pub id: AgentId,
     pub name: String,
-    /// The model profile the agent runs on; none for a tool-only agent.
-    pub model: Option<String>,
+    /// The model the agent runs on; none for a tool-only agent.
+    pub model: Option<skyhook::provider::profile::ModelRef>,
     /// The root agent's applied mode.
     pub mode: Option<String>,
     pub capabilities: Vec<skyhook::tool::policy::Capability>,
@@ -344,11 +344,11 @@ impl Projection {
                     }
                 }
                 SessionEvent::Usage { usage, .. } => {
-                    add_usage(&mut self.usage, *usage);
-                    add_usage(
-                        self.agent_usage.entry(record.agent.clone()).or_default(),
-                        *usage,
-                    );
+                    self.usage.accumulate(*usage);
+                    self.agent_usage
+                        .entry(record.agent.clone())
+                        .or_default()
+                        .accumulate(*usage);
                 }
                 SessionEvent::TodosReplaced { items } => {
                     self.todos.insert(record.agent.clone(), items.clone());
@@ -470,13 +470,7 @@ impl Projection {
         }
     }
 }
-fn add_usage(sum: &mut Usage, value: Usage) {
-    sum.input_tokens = sum.input_tokens.saturating_add(value.input_tokens);
-    sum.cached_input_tokens = sum
-        .cached_input_tokens
-        .saturating_add(value.cached_input_tokens);
-    sum.output_tokens = sum.output_tokens.saturating_add(value.output_tokens);
-}
+
 pub fn agent_footer(
     snapshot: &ObservationSnapshot,
     projection: &Projection,
@@ -512,7 +506,7 @@ mod tests {
         AgentInfo {
             id: AgentId::root(SessionId::from_bytes([1; 16])),
             name: "Failed Waiting for permission".into(),
-            model: Some("test".into()),
+            model: Some("test/test".parse().unwrap()),
             mode: None,
             capabilities: Vec::new(),
             target: "root".into(),

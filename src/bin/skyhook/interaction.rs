@@ -226,7 +226,7 @@ pub(crate) mod tests {
     use Capability::*;
 
     pub(crate) fn test_config() -> skyhook::config::Config {
-        skyhook::config::Config::from_yaml("providers:\n  test:\n    kind: openai\n    api: chat_completions\n    base_url: http://127.0.0.1:1\nmodels:\n  first:\n    provider: test\n    model: fixture\n    max_context: 128000\n    max_output: 4096\n").unwrap()
+        skyhook::config::Config::from_yaml("providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n").unwrap()
     }
 
     // AuthorizationRequest contains core-private provenance. Capture a real
@@ -238,7 +238,7 @@ pub(crate) mod tests {
         let harness = config
             .into_runtime()
             .unwrap()
-            .select_model("first")
+            .select_model(&"test/first".parse().unwrap())
             .unwrap()
             .harness_builder(root.path())
             .unwrap()

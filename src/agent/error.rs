@@ -26,16 +26,19 @@ pub enum HarnessError {
     Execution(#[from] ExecutionError),
     #[error(transparent)]
     Job(#[from] JobError),
-    #[error("a default model profile is required")]
-    MissingDefaultModelProfile,
-    #[error("unknown provider `{0}`")]
-    UnknownProvider(String),
-    #[error("unknown model profile `{0}`")]
-    UnknownModelProfile(String),
+    #[error("a default model is required")]
+    MissingDefaultModel,
+    #[error("unknown model `{0}`")]
+    UnknownModel(crate::provider::profile::ModelRef),
+    #[error("agent `{0}` has no journaled model to resume under")]
+    NoRecordedModel(crate::identity::AgentId),
     #[error("unknown mode `{0}`")]
     UnknownMode(String),
-    #[error("invalid profile: {0}")]
-    InvalidProfile(String),
+    #[error("invalid model `{model}`: {error}")]
+    InvalidModel {
+        model: crate::provider::profile::ModelRef,
+        error: crate::provider::profile::LimitsError,
+    },
     #[error("compaction failed: {0}")]
     Compaction(String),
     #[error("agent stopped before completing the request")]
@@ -44,6 +47,8 @@ pub enum HarnessError {
     Agent(String),
     #[error("provider returned no assistant content")]
     EmptyResponse,
+    #[error("the output limit was reached before any answer or tool call")]
+    OutputLimit,
     /// The model declined to answer. Deterministic for a given request, so the
     /// runtime never retries it: only a parent agent or a human may retry,
     /// optionally on another model.
@@ -75,6 +80,8 @@ pub enum TurnFailure {
     Aborted,
     #[error("provider returned no assistant content")]
     Empty,
+    #[error("the output limit was reached before any answer or tool call")]
+    OutputLimit,
     #[error("{0}")]
     Other(String),
 }
@@ -86,6 +93,7 @@ impl From<&HarnessError> for TurnFailure {
             HarnessError::Refused(detail) => Self::Refused(detail.clone()),
             HarnessError::ProviderAborted => Self::Aborted,
             HarnessError::EmptyResponse => Self::Empty,
+            HarnessError::OutputLimit => Self::OutputLimit,
             error => Self::Other(error.to_string()),
         }
     }
@@ -98,6 +106,7 @@ impl From<TurnFailure> for HarnessError {
             TurnFailure::Refused(detail) => Self::Refused(detail),
             TurnFailure::Aborted => Self::ProviderAborted,
             TurnFailure::Empty => Self::EmptyResponse,
+            TurnFailure::OutputLimit => Self::OutputLimit,
             TurnFailure::Other(message) => Self::Agent(message),
         }
     }

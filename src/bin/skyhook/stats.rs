@@ -7,6 +7,7 @@ use super::{
 use chrono::{DateTime, Utc};
 use skyhook::{
     identity::SessionId,
+    provider::protocol::Usage,
     session::{
         SessionError, SessionStore,
         stats::{AgentStats, RequestStats, SessionStats, session_stats},
@@ -122,6 +123,17 @@ fn one_line(text: &str, limit: usize) -> String {
     escape_controls(brief(text, limit))
 }
 
+/// Input, cached, written and output token counts.
+fn usage_cells(usage: &Usage) -> [String; 4] {
+    [
+        usage.input_tokens,
+        usage.cached_input_tokens,
+        usage.cache_write_input_tokens,
+        usage.output_tokens,
+    ]
+    .map(number)
+}
+
 /// Completed over requested model calls.
 fn ratio(requests: &RequestStats) -> String {
     format!("{}/{}", requests.completed, requests.requested)
@@ -231,38 +243,36 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
             .saturating_sub(totals.requests.requested),
         totals.compactions.completed,
     );
+    let [input, cached, written, out] = usage_cells(&totals.usage);
     let _ = writeln!(
         output,
-        "{bullet}Tokens: {} input, {} cached, {} output · Tool calls: {} ({} errors)",
-        number(totals.usage.input_tokens),
-        number(totals.usage.cached_input_tokens),
-        number(totals.usage.output_tokens),
+        "{bullet}Tokens: {input} input, {cached} cached, {written} written, {out} output · Tool calls: {} ({} errors)",
         number(totals.tool_calls.calls),
         number(totals.tool_calls.errors),
     );
     let mut agents = Table {
         header: &[
-            "Path", "Model", "Calls", "Tools", "Input", "Cached", "Output", "Duration",
+            "Path", "Model", "Calls", "Tools", "Input", "Cached", "Written", "Output", "Duration",
         ],
         numeric_from: 2,
         rows: stats
             .agents
             .iter()
             .map(|agent| {
-                vec![
+                let model = agent.model.as_ref();
+                let mut row = vec![
                     escape_controls(&agent.path),
-                    escape_controls(agent.model.as_deref().unwrap_or("—")),
+                    model.map_or_else(|| "—".into(), escape_controls),
                     ratio(&agent.requests),
                     number(tool_calls(agent)),
-                    number(agent.usage.input_tokens),
-                    number(agent.usage.cached_input_tokens),
-                    number(agent.usage.output_tokens),
-                    elapsed(agent),
-                ]
+                ];
+                row.extend(usage_cells(&agent.usage));
+                row.push(elapsed(agent));
+                row
             })
             .collect(),
     };
-    agents.rows.push(vec![
+    let mut total = vec![
         format!(
             "{} ({} agents)",
             if markdown { "**Total**" } else { "Total" },
@@ -271,25 +281,20 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
         String::new(),
         ratio(&stats.totals.requests),
         number(totals.tool_calls.calls),
-        number(totals.usage.input_tokens),
-        number(totals.usage.cached_input_tokens),
-        number(totals.usage.output_tokens),
-        duration(stats.started, stats.finished),
-    ]);
+    ];
+    total.extend(usage_cells(&totals.usage));
+    total.push(duration(stats.started, stats.finished));
+    agents.rows.push(total);
     let models = Table {
-        header: &["Model", "Calls", "Input", "Cached", "Output"],
+        header: &["Model", "Calls", "Input", "Cached", "Written", "Output"],
         numeric_from: 1,
         rows: stats
             .models
             .iter()
             .map(|(name, model)| {
-                vec![
-                    escape_controls(name),
-                    ratio(&model.requests),
-                    number(model.usage.input_tokens),
-                    number(model.usage.cached_input_tokens),
-                    number(model.usage.output_tokens),
-                ]
+                let mut row = vec![escape_controls(name), ratio(&model.requests)];
+                row.extend(usage_cells(&model.usage));
+                row
             })
             .collect(),
     };
@@ -324,18 +329,16 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
 }
 
 fn describe(agent: &AgentStats) -> String {
-    let model = agent.model.as_deref().map_or_else(String::new, |model| {
+    let model = agent.model.as_ref().map_or_else(String::new, |model| {
         format!(" [{}]", escape_controls(model))
     });
+    let [input, cached, written, out] = usage_cells(&agent.usage);
     format!(
-        "{}{} · {} calls · {} tools · in {} · cached {} · out {} · {}",
+        "{}{} · {} calls · {} tools · in {input} · cached {cached} · written {written} · out {out} · {}",
         if agent.depth == 0 { "/" } else { &agent.name },
         model,
         ratio(&agent.requests),
         number(tool_calls(agent)),
-        number(agent.usage.input_tokens),
-        number(agent.usage.cached_input_tokens),
-        number(agent.usage.output_tokens),
         elapsed(agent),
     )
 }
@@ -344,27 +347,24 @@ fn listing(sessions: &[SessionStats]) -> String {
     let table = Table {
         header: &[
             "Session", "Started", "Prompt", "Agents", "Calls", "Tools", "Input", "Cached",
-            "Output", "Duration",
+            "Written", "Output", "Duration",
         ],
         numeric_from: 3,
         rows: sessions
             .iter()
             .map(|stats| {
-                vec![
+                let prompt = stats.initial_prompt.as_deref();
+                let mut row = vec![
                     stats.session.to_string(),
                     timestamp(stats.started),
-                    stats
-                        .initial_prompt
-                        .as_deref()
-                        .map_or_else(|| "—".into(), |prompt| one_line(prompt, 60)),
+                    prompt.map_or_else(|| "—".into(), |prompt| one_line(prompt, 60)),
                     number(stats.totals.agents),
                     ratio(&stats.totals.requests),
                     number(stats.totals.tool_calls.calls),
-                    number(stats.totals.usage.input_tokens),
-                    number(stats.totals.usage.cached_input_tokens),
-                    number(stats.totals.usage.output_tokens),
-                    duration(stats.started, stats.finished),
-                ]
+                ];
+                row.extend(usage_cells(&stats.totals.usage));
+                row.push(duration(stats.started, stats.finished));
+                row
             })
             .collect(),
     };
@@ -401,15 +401,13 @@ fn tree(stats: &SessionStats) -> String {
         let _ = writeln!(output, "{line}{}", describe(agent));
     }
     let totals = &stats.totals;
+    let [input, cached, written, out] = usage_cells(&totals.usage);
     let _ = writeln!(
         output,
-        "\n{} agents, {} calls, {} tool calls, in {}, cached {}, out {}, {}",
+        "\n{} agents, {} calls, {} tool calls, in {input}, cached {cached}, written {written}, out {out}, {}",
         totals.agents,
         ratio(&totals.requests),
         number(totals.tool_calls.calls),
-        number(totals.usage.input_tokens),
-        number(totals.usage.cached_input_tokens),
-        number(totals.usage.output_tokens),
         duration(stats.started, stats.finished),
     );
     output

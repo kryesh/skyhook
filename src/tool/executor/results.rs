@@ -466,7 +466,7 @@ mod tests {
                 ..JobSpec::test(runtime.agent.clone(), "delegate")
             };
             let job = runtime.jobs.test_running(spec).await.into_test_id();
-            let started = crate::session::fixture::child_started(
+            let started = crate::session::tests::child_started(
                 Some(job),
                 ExecutionLocation::root(runtime.root.path().to_owned()),
             );

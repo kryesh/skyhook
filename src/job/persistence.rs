@@ -169,7 +169,7 @@ mod tests {
 
     /// An on-disk runtime, so `reopen` can replay its journal.
     async fn runtime() -> (tempfile::TempDir, JobManager, crate::identity::AgentId) {
-        let (root, store, agent) = crate::session::fixture::on_disk().await;
+        let (root, store, agent) = crate::session::tests::on_disk().await;
         (root, JobManager::new(store), agent)
     }
 
@@ -336,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_recovers_creation_committed_before_map_publication() {
-        let (root, store, agent) = crate::session::fixture::on_disk().await;
+        let (root, store, agent) = crate::session::tests::on_disk().await;
         let job = JobId::new(7).unwrap();
         let created = SessionEvent::JobCreated {
             origin: None,

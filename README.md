@@ -14,7 +14,7 @@ workflows, or embed its Rust core in your own application.
   model tool calls and as lazy JavaScript builders. Scripts can batch independent
   work and coordinate more involved workflows through the same policy and job system.
 - **Provider-neutral by design.** OpenAI Chat Completions and Responses, Anthropic
-  Messages, and Codex/ChatGPT subscription backends share a common runtime API,
+  Messages, and Codex/ChatGPT subscription providers share a common runtime API,
   including support for compatible local model endpoints.
 - **Supervised jobs and agents.** Delegate to child agents, follow up on their work,
   and inspect saved results. Sessions retain conversations, job output, and model
@@ -45,7 +45,7 @@ config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/skyhook"
 mkdir -p "$config_dir"
 curl -fsSL https://raw.githubusercontent.com/kryesh/skyhook/main/config.example.yaml \
   -o "$config_dir/config.yaml"
-# Edit config.yaml: remove unused providers AND their model profiles.
+# Edit config.yaml: remove unused providers along with the models under them.
 # Set credentials for every remaining provider; for OpenAI:
 export OPENAI_API_KEY=...
 ./target/release/skyhook --prompt "inspect this repository"

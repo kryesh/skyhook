@@ -239,12 +239,12 @@ mod tests {
         std::fs::write(&app.launch.sessions, "not a directory").unwrap();
     }
 
-    fn queued(app: &App) -> Vec<(&str, &str, &[Attachment])> {
+    fn queued(app: &App) -> Vec<(&str, String, &[Attachment])> {
         let rows = app.queue.iter();
         rows.map(|row| {
             (
                 &*row.submission.text,
-                &*row.model,
+                row.model.to_string(),
                 &row.submission.attachments[..],
             )
         })
@@ -263,7 +263,7 @@ mod tests {
         assert!(app.session().is_none() && !app.launch.sessions.exists());
         app.submit("first input".into());
         assert!(app.start.is_creating() && app.session().is_none());
-        app.model = "second".into();
+        app.model = "test/second".parse().unwrap();
         let attachments = vec![png_attachment("queued.png")];
         app.submit(Submission {
             text: "second input".into(),
@@ -276,9 +276,12 @@ mod tests {
         app.session_started(PreparedObservation::subscribe(session).await);
         assert!(!app.start.is_creating() && app.operation);
         assert_eq!(app.history, ["first input"]);
-        assert_eq!(app.model, "second");
+        assert_eq!(app.model.to_string(), "test/second");
         let image = [png_attachment("queued.png")];
-        assert_eq!(queued(&app), [("second input", "second", &image[..])]);
+        assert_eq!(
+            queued(&app),
+            [("second input", "test/second".to_owned(), &image[..])]
+        );
         assert_eq!(
             app.editor.expanded_text(),
             "still composingunsent attachment"
@@ -308,7 +311,7 @@ mod tests {
             text: "first".into(),
             attachments,
         });
-        app.model = "second".into();
+        app.model = "test/second".parse().unwrap();
         app.submit("second".into());
         app.editor.set("new draft".into());
         fail_creation(&mut app, &mut rx).await;
@@ -316,7 +319,10 @@ mod tests {
         let image = [png_attachment("first.png")];
         assert_eq!(
             queued(&app),
-            [("first", "first", &image[..]), ("second", "second", &[])]
+            [
+                ("first", "test/first".to_owned(), &image[..]),
+                ("second", "test/second".to_owned(), &[])
+            ]
         );
         assert_eq!(app.editor.text(), "new draft");
         std::fs::remove_file(&app.launch.sessions).unwrap();

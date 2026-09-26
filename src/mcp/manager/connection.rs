@@ -220,7 +220,7 @@ server.serve_forever()
 
     #[tokio::test]
     async fn reachable_http_errors_never_launch_a_configured_command() {
-        use crate::provider::backends::transport::tests::{read_request, reply};
+        use crate::provider::http::transport::tests::{read_request, reply};
         use tokio::io::AsyncWriteExt;
 
         let Some(fixture) = Fixture::new() else {

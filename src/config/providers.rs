@@ -1,430 +1,575 @@
-//! Provider admission at the YAML boundary and live construction. Model names
-//! are passed through unchanged.
+//! Provider entries: the YAML shape a configuration holds and callers edit, and
+//! the admitted form a runtime configuration builds providers from. An entry
+//! names its dialect and codec; the dialect owns the fields beside the common ones.
 
-use std::{env, sync::Arc, time::Duration};
+use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
+use indexmap::IndexMap;
+use serde::{
+    Deserialize, Deserializer, Serialize, Serializer,
+    de::{self, MapAccess},
+};
+use serde_json::{Map, Value};
 
 use super::ConfigError;
-use crate::provider::{
-    Provider,
-    backends::{
-        ChatReasoningReplay, NativeSettings, OpenAiApi, Protocol, ProviderTimeouts,
-        codex::CodexProvider,
+use crate::{
+    agent::ModelEntry,
+    provider::{
+        codec::{Codec, CodecName},
+        dialect::{
+            AdmissionError, Common, Connection, Dialect, DialectSettings, Profile,
+            codex::auth::Issuer,
+        },
+        profile::{ModelName, ModelProfile, ProviderName},
     },
 };
 
-/// An admitted provider: settings whose syntax and applicability are proven, with
-/// exactly one credential source. Deserializing admits the editable
-/// [`RawProviderConfig`]; serializing writes it back with resolved defaults.
-/// Environment lookup and command execution happen at construction, never here.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(try_from = "RawProviderConfig", into = "RawProviderConfig")]
-pub struct ProviderConfig(Admitted);
-
+/// A provider entry as configured. Admission happens when a runtime
+/// configuration is sealed, so edits here are checked there.
 #[derive(Clone, Debug)]
-enum Admitted {
-    Native {
-        /// As written, so a dump reproduces the spelling the URL parser normalizes.
-        base_url: String,
-        settings: NativeSettings,
-        auth: AuthSource,
-    },
-    /// ChatGPT subscription using Skyhook-owned OAuth credentials.
-    Codex,
+pub struct RawProviderConfig {
+    pub settings: DialectSettings,
+    pub codec: CodecName,
+    pub common: Common,
 }
 
-#[derive(Clone, Debug)]
-enum AuthSource {
-    None,
-    Environment(String),
-    Command(String),
-}
+/// The common fields are read in place, so their errors carry their path; the
+/// rest belong to the dialect, which is parsed once it is known.
+impl<'de> Deserialize<'de> for RawProviderConfig {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        #[derive(Default)]
+        struct Rest {
+            dialect: Option<Dialect>,
+            codec: Option<CodecName>,
+            fields: Map<String, Value>,
+        }
 
-/// The YAML shape of a provider entry.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
-pub enum RawProviderConfig {
-    /// Standard OpenAI wire protocols, without endpoint or model presets.
-    Openai {
-        base_url: String,
-        api: OpenAiApi,
-        /// Chat-only request field; absence uses the shared reasoning_content default.
-        chat_reasoning_replay: Option<ChatReasoningReplay>,
-        api_key_env: Option<String>,
-        /// Shell command run on first provider request; trimmed stdout is cached as the key.
-        /// Mutually exclusive with api_key_env.
-        api_key_command: Option<String>,
-        /// Time to receive HTTP response headers per attempt; absent or null
-        /// takes the default.
-        startup_timeout_secs: Option<u64>,
-        /// Maximum interval between HTTP response body reads; absent or null
-        /// takes the default.
-        read_idle_timeout_secs: Option<u64>,
-    },
-    Anthropic {
-        base_url: String,
-        api_key_env: Option<String>,
-        /// Shell command run on first provider request; trimmed stdout is cached as the key.
-        /// Mutually exclusive with api_key_env.
-        api_key_command: Option<String>,
-        /// Time to receive HTTP response headers per attempt; absent or null
-        /// takes the default.
-        startup_timeout_secs: Option<u64>,
-        /// Maximum interval between HTTP response body reads; absent or null
-        /// takes the default.
-        read_idle_timeout_secs: Option<u64>,
-    },
-    /// ChatGPT subscription using Skyhook-owned OAuth credentials.
-    Codex {},
-}
-
-impl TryFrom<RawProviderConfig> for ProviderConfig {
-    type Error = String;
-
-    fn try_from(raw: RawProviderConfig) -> Result<Self, String> {
-        let (base_url, protocol, environment, command, startup, idle) = match raw {
-            RawProviderConfig::Openai {
-                base_url,
-                api,
-                chat_reasoning_replay,
-                api_key_env,
-                api_key_command,
-                startup_timeout_secs,
-                read_idle_timeout_secs,
-            } => {
-                let protocol = match api {
-                    OpenAiApi::ChatCompletions => Protocol::Chat {
-                        reasoning_replay: chat_reasoning_replay.unwrap_or_default(),
-                    },
-                    OpenAiApi::Responses => {
-                        if chat_reasoning_replay.is_some() {
-                            return Err("chat_reasoning_replay applies only to Chat Completions; Responses replays native reasoning automatically".into());
-                        }
-                        Protocol::Responses
+        impl<'de> crate::yaml::Rest<'de> for Rest {
+            fn read<A: MapAccess<'de>>(
+                &mut self,
+                key: String,
+                map: &mut A,
+            ) -> Result<(), A::Error> {
+                match key.as_str() {
+                    "dialect" => self.dialect = Some(map.next_value()?),
+                    "codec" => self.codec = Some(map.next_value()?),
+                    _ => {
+                        self.fields.insert(key, map.next_value()?);
                     }
-                };
-                (
-                    base_url,
-                    protocol,
-                    api_key_env,
-                    api_key_command,
-                    startup_timeout_secs,
-                    read_idle_timeout_secs,
-                )
+                }
+                Ok(())
             }
-            RawProviderConfig::Anthropic {
-                base_url,
-                api_key_env,
-                api_key_command,
-                startup_timeout_secs,
-                read_idle_timeout_secs,
-            } => (
-                base_url,
-                Protocol::Anthropic,
-                api_key_env,
-                api_key_command,
-                startup_timeout_secs,
-                read_idle_timeout_secs,
-            ),
-            RawProviderConfig::Codex {} => return Ok(Self(Admitted::Codex)),
-        };
-        let auth = match (environment, command) {
-            (Some(_), Some(_)) => {
-                return Err("api_key_env and api_key_command are mutually exclusive".into());
-            }
-            (_, Some(command)) if command.trim().is_empty() => {
-                return Err("api_key_command must not be blank".into());
-            }
-            (Some(environment), _)
-                if environment.trim().is_empty() || environment.contains(['=', '\0']) =>
-            {
-                return Err("api_key_env must name a nonempty environment variable".into());
-            }
-            (Some(environment), None) => AuthSource::Environment(environment),
-            (None, Some(command)) => AuthSource::Command(command),
-            (None, None) => AuthSource::None,
-        };
-        let defaults = ProviderTimeouts::default();
-        let timeouts = ProviderTimeouts {
-            startup: startup.map_or(defaults.startup, Duration::from_secs),
-            read_idle: idle.map_or(defaults.read_idle, Duration::from_secs),
-        };
-        let settings =
-            NativeSettings::new(&base_url, protocol, timeouts).map_err(|error| error.message)?;
-        Ok(Self(Admitted::Native {
-            base_url,
+        }
+
+        let mut rest = Rest::default();
+        let common = crate::yaml::split(deserializer, &mut rest)?;
+        let dialect = rest
+            .dialect
+            .ok_or_else(|| de::Error::missing_field("dialect"))?;
+        let settings = DialectSettings::parse(dialect, Value::Object(rest.fields))
+            .map_err(|error| de::Error::custom(format_args!("{dialect}: {error}")))?;
+        Ok(Self {
             settings,
-            auth,
-        }))
+            codec: rest
+                .codec
+                .ok_or_else(|| de::Error::missing_field("codec"))?,
+            common,
+        })
     }
 }
 
-impl From<ProviderConfig> for RawProviderConfig {
-    fn from(config: ProviderConfig) -> Self {
-        let Admitted::Native {
-            base_url,
-            settings,
-            auth,
-        } = config.0
-        else {
-            return Self::Codex {};
-        };
-        let (api_key_env, api_key_command) = match auth {
-            AuthSource::None => (None, None),
-            AuthSource::Environment(variable) => (Some(variable), None),
-            AuthSource::Command(command) => (None, Some(command)),
-        };
-        let timeouts = settings.timeouts();
-        let startup_timeout_secs = Some(timeouts.startup.as_secs());
-        let read_idle_timeout_secs = Some(timeouts.read_idle.as_secs());
-        match settings.protocol() {
-            Protocol::Anthropic => Self::Anthropic {
-                base_url,
-                api_key_env,
-                api_key_command,
-                startup_timeout_secs,
-                read_idle_timeout_secs,
-            },
-            protocol => {
-                let (api, chat_reasoning_replay) = match protocol {
-                    Protocol::Chat { reasoning_replay } => {
-                        (OpenAiApi::ChatCompletions, Some(reasoning_replay))
-                    }
-                    _ => (OpenAiApi::Responses, None),
-                };
-                Self::Openai {
-                    base_url,
-                    api,
-                    chat_reasoning_replay,
-                    api_key_env,
-                    api_key_command,
-                    startup_timeout_secs,
-                    read_idle_timeout_secs,
-                }
-            }
+/// `dump config` writes the entry with its defaults resolved.
+impl Serialize for RawProviderConfig {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        #[derive(Serialize)]
+        struct Written {
+            dialect: Dialect,
+            codec: CodecName,
+            #[serde(flatten)]
+            common: Common,
+            #[serde(flatten)]
+            settings: Map<String, Value>,
         }
+        Written {
+            dialect: self.settings.dialect(),
+            codec: self.codec,
+            common: self.common.clone().with_resolved_defaults(),
+            settings: self.settings.fields(),
+        }
+        .serialize(serializer)
+    }
+}
+
+impl RawProviderConfig {
+    /// The dialect proves it speaks the codec and fixes its conventions, the
+    /// common fields are typed, and each model's conventions are derived from
+    /// the entry's. Nothing is read from the environment and no command runs.
+    pub(crate) fn admit(&self) -> Result<ProviderConfig, AdmissionError> {
+        let profile = self.settings.admit(&self.common, self.codec)?;
+        let connection = self.common.admit(profile.base_url, self.codec)?;
+        let models = self
+            .common
+            .models
+            .iter()
+            .map(|(name, spec)| {
+                let codec = spec
+                    .admit(&profile.codec)
+                    .map_err(|error| AdmissionError::Model {
+                        model: name.clone(),
+                        error,
+                    })?;
+                let model = AdmittedModel {
+                    profile: spec.profile.clone(),
+                    codec,
+                };
+                Ok((name.clone(), model))
+            })
+            .collect::<Result<_, AdmissionError>>()?;
+        Ok(ProviderConfig {
+            settings: self.settings.clone(),
+            profile,
+            connection,
+            models,
+        })
+    }
+}
+
+/// A provider entry refused on admission, located by its key.
+#[derive(Debug, thiserror::Error)]
+#[error("`providers.{provider}`: {error}")]
+pub struct EntryError {
+    pub provider: ProviderName,
+    pub error: AdmissionError,
+}
+
+/// Admit every entry, in declaration order. Every codex entry names one
+/// issuer, since one credential store serves one.
+pub(super) fn admit(
+    providers: &IndexMap<ProviderName, RawProviderConfig>,
+) -> Result<IndexMap<ProviderName, ProviderConfig>, ConfigError> {
+    let admitted = providers
+        .iter()
+        .map(|(name, entry)| {
+            let admitted = entry.admit().map_err(|error| EntryError {
+                provider: name.clone(),
+                error,
+            })?;
+            Ok((name.clone(), admitted))
+        })
+        .collect::<Result<IndexMap<_, _>, EntryError>>()?;
+    let mut issuers = admitted
+        .iter()
+        .filter_map(|(name, entry)| Some((name, entry.codex_issuer()?)));
+    if let Some((first, issuer)) = issuers.next()
+        && let Some((second, _)) = issuers.find(|(_, other)| *other != issuer)
+    {
+        return Err(ConfigError::CodexIssuers {
+            first: first.clone(),
+            second: second.clone(),
+        });
+    }
+    Ok(admitted)
+}
+
+/// An admitted provider entry. Environment values are read when it is built.
+pub(crate) struct ProviderConfig {
+    settings: DialectSettings,
+    profile: Profile,
+    connection: Connection,
+    models: IndexMap<ModelName, AdmittedModel>,
+}
+
+/// A model and the conventions it is served with.
+pub(crate) struct AdmittedModel {
+    profile: ModelProfile,
+    codec: Codec,
+}
+
+impl AdmittedModel {
+    pub(crate) fn profile(&self) -> &ModelProfile {
+        &self.profile
     }
 }
 
 impl ProviderConfig {
-    /// Environment credentials are read here; commands stay lazy until the first
-    /// request. Codex keeps its existing auth/context lifecycle.
-    pub(super) fn build(self, name: &str) -> Result<Arc<dyn Provider>, ConfigError> {
-        let error = |error: crate::provider::ProviderError| {
-            ConfigError::Provider(name.into(), error.to_string())
-        };
-        match self.0 {
-            Admitted::Native { settings, auth, .. } => {
-                let key = match &auth {
-                    AuthSource::Environment(variable) => Some(required_env(variable)?),
-                    AuthSource::None | AuthSource::Command(_) => None,
+    /// The models this entry serves, in declaration order.
+    pub(crate) fn models(&self) -> &IndexMap<ModelName, AdmittedModel> {
+        &self.models
+    }
+
+    /// The issuer of a codex entry.
+    pub(super) fn codex_issuer(&self) -> Option<Issuer> {
+        match &self.settings {
+            DialectSettings::Codex(codex) => Some(codex.issuer()),
+            _ => None,
+        }
+    }
+
+    /// Construct the provider and specialise it for each model's conventions.
+    /// Environment values are read here; a command runs on the first request
+    /// that sends its value.
+    pub(super) fn build(
+        &self,
+        name: &ProviderName,
+    ) -> Result<Vec<(ModelName, ModelEntry)>, ConfigError> {
+        let provider = self
+            .settings
+            .provider(name.as_str(), self.profile.clone(), &self.connection)
+            .map_err(|error| ConfigError::Provider {
+                provider: name.clone(),
+                error,
+            })?;
+        Ok(self
+            .models
+            .iter()
+            .map(|(model, admitted)| {
+                let entry = ModelEntry {
+                    profile: admitted.profile.clone(),
+                    provider: Arc::new(provider.with_codec(admitted.codec.clone())),
                 };
-                let mut provider = settings.build(name, key).map_err(error)?;
-                if let AuthSource::Command(command) = auth {
-                    provider = provider.with_api_key_command(command).map_err(error)?;
-                }
-                Ok(Arc::new(provider))
-            }
-            Admitted::Codex => Ok(Arc::new(
-                CodexProvider::new().map_err(error)?.with_name(name),
-            )),
-        }
+                (model.clone(), entry)
+            })
+            .collect())
     }
-
-    #[cfg(test)]
-    pub(super) fn timeouts(&self) -> Option<ProviderTimeouts> {
-        match &self.0 {
-            Admitted::Native { settings, .. } => Some(settings.timeouts()),
-            Admitted::Codex => None,
-        }
-    }
-}
-
-fn required_env(name: &str) -> Result<String, ConfigError> {
-    env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| ConfigError::MissingEnvironment(name.to_owned()))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Config;
+    use crate::{config::Config, provider::dialect::Sourced};
 
     const LOCAL: &str = r#"
 providers:
   local:
-    kind: openai
+    dialect: compatible
+    codec: chat_completions
     base_url: http://127.0.0.1:11434/v1
-    api: chat_completions
-models:
-  local:
-    provider: local
-    model: local-model
-    max_context: 4096
-    max_output: 512
+    models:
+      local:
+        model: local-model
+        max_context: 4096
+        max_output: 512
 "#;
-
-    fn with_replay(value: &str) -> String {
-        let replay = format!("    chat_reasoning_replay: {value}\nmodels:");
-        LOCAL.replace("models:", &replay)
-    }
 
     fn builds(text: &str) -> bool {
         let config = Config::from_yaml(text).unwrap();
         config
             .into_runtime()
-            .and_then(|runtime| runtime.select_model("local")?.harness_builder("."))
+            .and_then(|runtime| {
+                runtime
+                    .select_model(&"local/local".parse().unwrap())?
+                    .harness_builder(".")
+            })
             .is_ok()
     }
 
-    fn chat_replay(text: &str) -> Option<ChatReasoningReplay> {
-        assert!(builds(text));
-        let config = Config::from_yaml(text).unwrap();
-        let RawProviderConfig::Openai {
-            chat_reasoning_replay,
-            ..
-        } = RawProviderConfig::from(config.providers["local"].clone())
-        else {
-            panic!("expected OpenAI provider");
-        };
-        chat_reasoning_replay
+    fn with(text: &str, extra: &str) -> String {
+        text.replace("    models:", &format!("{extra}\n    models:"))
+    }
+
+    fn admits(text: &str) -> bool {
+        crate::yaml::parse::<RawProviderConfig>(text)
+            .ok()
+            .and_then(|entry| entry.admit().ok())
+            .is_some()
+    }
+
+    fn error(text: &str) -> String {
+        Config::from_yaml(text).unwrap_err().to_string()
     }
 
     #[test]
-    fn provider_replay_defaults_to_reasoning_content_and_can_override_or_disable() {
-        // The admitted default is written back on dump.
+    fn entries_are_dialect_tagged_and_dump_with_resolved_defaults() {
+        assert!(builds(LOCAL));
+        let config = Config::from_yaml(LOCAL).unwrap();
+        let entry = &config.providers["local"];
         assert_eq!(
-            chat_replay(LOCAL),
-            Some(ChatReasoningReplay::ReasoningContent)
+            (entry.settings.dialect(), entry.codec),
+            (Dialect::Compatible, CodecName::ChatCompletions)
         );
-        for (value, expected) in [
-            ("reasoning_content", ChatReasoningReplay::ReasoningContent),
-            ("reasoning", ChatReasoningReplay::Reasoning),
-            ("unsupported", ChatReasoningReplay::Unsupported),
+        let dumped = config.to_yaml().unwrap();
+        for resolved in [
+            "dialect: compatible",
+            "codec: chat_completions",
+            "startup_timeout_secs: 600",
+            "read_idle_timeout_secs: 600",
         ] {
-            assert_eq!(chat_replay(&with_replay(value)), Some(expected));
+            assert!(dumped.contains(resolved), "{dumped}");
         }
+        assert!(!dumped.contains("api_key"));
+        let reparsed = Config::from_yaml(&dumped).unwrap();
+        assert_eq!(
+            serde_json::to_value(&reparsed.providers["local"]).unwrap(),
+            serde_json::to_value(&config.providers["local"]).unwrap()
+        );
+        // A setting at its default is not written.
+        let openai = LOCAL.replace("dialect: compatible", "dialect: openai");
+        let dumped = Config::from_yaml(&openai).unwrap().to_yaml().unwrap();
+        assert!(!dumped.contains("reasoning_summary"), "{dumped}");
     }
 
     #[test]
-    fn replay_is_provider_scoped_and_only_configurable_for_chat() {
-        assert!(Config::from_yaml(&with_replay("guess")).is_err());
-        let on_model = format!("{LOCAL}    chat_reasoning_replay: reasoning\n");
-        assert!(
-            Config::from_yaml(&on_model).is_err(),
-            "model-level policy must not be silently ignored"
+    fn edits_are_admitted_when_the_runtime_is_sealed() {
+        let mut config = Config::from_yaml(LOCAL).unwrap();
+        let entry = config.providers.get_index_mut(0).unwrap().1;
+        entry.codec = CodecName::Messages;
+        assert_eq!(
+            entry.admit().unwrap().profile.codec.name(),
+            CodecName::Messages
         );
-        let responses = |text: &str| text.replace("api: chat_completions", "api: responses");
-        let error = Config::from_yaml(&responses(&with_replay("reasoning"))).unwrap_err();
+        let base_url = entry.common.base_url.replace("relative".into());
+        assert!(matches!(entry.admit(), Err(AdmissionError::Endpoint(_))));
+        entry.common.base_url = base_url;
+        entry
+            .common
+            .headers
+            .insert("bad header".into(), Sourced::Literal("x".into()));
+        let error = config.into_runtime().err().unwrap().to_string();
         assert!(
-            error
-                .to_string()
-                .contains("`providers.local`: chat_reasoning_replay applies only"),
+            error.contains("`providers.local`: headers: `bad header`"),
             "{error}"
         );
-        assert!(builds(&responses(LOCAL)));
-        for provider in [
-            "    kind: anthropic\n    base_url: https://api.anthropic.com/v1",
-            "    kind: codex",
+    }
+
+    #[test]
+    fn refusals_name_the_entry_and_field() {
+        for (field, expected) in [
+            (
+                "    api_key: |\n      sk-key\n",
+                "`providers.local`: api_key: must be a valid header value",
+            ),
+            (
+                "    headers: {x-title: \"a\\nb\"}\n",
+                "`providers.local`: headers.x-title: must be a valid header value",
+            ),
+            (
+                "    headers: {x-count: 1}\n",
+                "`providers.local.headers.x-count`",
+            ),
+            ("    api_key: 1\n", "`providers.local.api_key`"),
+            (
+                "    headers: {X-Title: a, x-title: b}\n",
+                "`providers.local`: headers: `x-title` is named twice",
+            ),
+            (
+                "    startup_timeout_secs: soon\n",
+                "`providers.local.startup_timeout_secs`",
+            ),
+            (
+                "    reasoning_summary: false",
+                "`providers.local`: compatible: reasoning_summary: unknown field",
+            ),
         ] {
-            let text = format!(
-                "providers:\n  native:\n{provider}\n    chat_reasoning_replay: reasoning\n"
-            );
-            assert!(
-                Config::from_yaml(&text).is_err(),
-                "unrelated provider accepted Chat-specific config"
-            );
+            let refused = error(&with(LOCAL, field.trim_end()));
+            assert!(refused.contains(expected), "{field}: {refused}");
         }
-    }
-
-    fn native_configs(
-        authentication: &str,
-    ) -> impl Iterator<Item = Result<ProviderConfig, String>> + '_ {
-        [
-            "kind: openai\napi: chat_completions",
-            "kind: openai\napi: responses",
-            "kind: anthropic",
-        ]
-        .into_iter()
-        .map(move |kind| {
-            crate::yaml::parse(&format!(
-                "{kind}\nbase_url: https://example.com/v1\n{authentication}"
-            ))
-        })
-    }
-
-    #[test]
-    fn command_credentials_are_not_executed_by_build_or_open_context() {
-        let directory = tempfile::tempdir().unwrap();
-        let marker = directory.path().join("executed");
-        let command = format!("printf key > '{}'", marker.display());
-        let authentication = format!(
-            "api_key_command: {}",
-            serde_json::to_string(&command).unwrap()
+        let located = error(&LOCAL.replace("max_context: 4096", "max_context: large"));
+        assert!(
+            located.contains("`providers.local.models.local.max_context`"),
+            "{located}"
         );
-        for config in native_configs(&authentication) {
-            let provider = config.unwrap().build("test").unwrap();
-            let _first = provider.open_context("first".parse().unwrap()).unwrap();
-            let _second = provider.open_context("second".parse().unwrap()).unwrap();
+        // Both limits are required, and the output fits inside the context.
+        let limits = "max_context: 4096\n        max_output: 512";
+        for (replacement, expected) in [
+            ("max_output: 512", "max_context"),
+            ("max_context: 4096", "max_output"),
+            (
+                "max_context: 0\n        max_output: 1",
+                "max_context must be positive",
+            ),
+            (
+                "max_context: 4096\n        max_output: 0",
+                "max_output must be positive",
+            ),
+            (
+                "max_context: 4096\n        max_output: 4096",
+                "max_output must be smaller",
+            ),
+            (
+                "max_context: 4096\n        max_output: 4097",
+                "max_output must be smaller",
+            ),
+        ] {
+            let refused = error(&LOCAL.replace(limits, replacement));
             assert!(
-                !marker.exists(),
-                "credentials must be resolved only on first request"
+                refused.contains("providers.local") && refused.contains(expected),
+                "{replacement}: {refused}"
             );
         }
+        // A model's reasoning level is one its conventions accept.
+        let adaptive = LOCAL
+            .replace("dialect: compatible", "dialect: openai")
+            .replace("codec: chat_completions", "codec: responses")
+            .replace(
+                "max_output: 512",
+                "max_output: 512\n        reasoning: adaptive",
+            );
+        let refused = error(&adaptive);
+        assert!(
+            refused.contains("`providers.local`: models.local: reasoning `adaptive` is not one of"),
+            "{refused}"
+        );
+        assert!(builds(&adaptive.replace("adaptive", "high")));
+        // A model's placements stay clear of the codec's own fields.
+        let placed = LOCAL.replace(
+            "max_output: 512",
+            "max_output: 512\n        overrides:\n          reasoning_effort: messages",
+        );
+        let refused = error(&placed);
+        assert!(
+            refused.contains(
+                "`providers.local`: models.local: reasoning_effort `messages` is a field the chat_completions codec writes"
+            ),
+            "{refused}"
+        );
     }
 
+    /// A value missing when the provider is built is reported with its provider
+    /// and field.
     #[test]
-    fn credential_sources_are_exclusive_blank_commands_rejected_and_kept_out_of_errors() {
-        let exclusive = "api_key_env: SKYHOOK_TEST_MISSING_API_KEY\napi_key_command: secret-marker";
-        for config in native_configs(exclusive) {
-            let error = config.err().unwrap();
-            assert!(error.contains("mutually exclusive"), "{error}");
-            assert!(!error.contains("secret-marker"));
-        }
-        for config in native_configs("api_key_command: '   '") {
-            let error = config.err().unwrap();
-            assert!(error.contains("must not be blank"), "{error}");
+    fn build_errors_name_the_provider_and_field() {
+        for (field, expected) in [
+            (
+                "    api_key: {env: SKYHOOK_TEST_UNSET_API_KEY}",
+                "provider `local` could not be initialized: api_key: environment variable `SKYHOOK_TEST_UNSET_API_KEY` is required",
+            ),
+            (
+                "    headers: {x-token: {env: SKYHOOK_TEST_UNSET_HEADER}}",
+                "provider `local` could not be initialized: headers.x-token: environment variable `SKYHOOK_TEST_UNSET_HEADER` is required",
+            ),
+        ] {
+            let error = Config::from_yaml(&with(LOCAL, field))
+                .unwrap()
+                .into_runtime()
+                .and_then(|runtime| {
+                    runtime
+                        .select_model(&"local/local".parse().unwrap())?
+                        .harness_builder(".")
+                })
+                .err()
+                .unwrap()
+                .to_string();
+            assert!(error.contains(expected), "{error}");
         }
     }
 
+    /// One credential store serves one issuer, so every codex entry names the
+    /// same one; the default counts as OpenAI's.
     #[test]
-    fn commands_do_not_change_keyless_or_required_environment_behavior() {
-        for config in native_configs("") {
-            assert!(config.unwrap().build("test").is_ok());
-        }
-        // No mutation of process-wide environment in concurrent tests.
-        for config in native_configs("api_key_env: SKYHOOK_TEST_MISSING_API_KEY") {
-            assert!(matches!(
-                config.unwrap().build("test"),
-                Err(ConfigError::MissingEnvironment(_))
-            ));
-        }
-        let codex = "kind: codex\napi_key_command: echo key";
-        assert!(crate::yaml::parse::<ProviderConfig>(codex).is_err());
-    }
-
-    #[test]
-    fn timeout_defaults_overrides_and_validation() {
-        // Admission alone: no client is created and no credential resolved.
-        let timeouts = |startup: Option<u64>, read_idle: Option<u64>| {
-            let mut text = "kind: anthropic\nbase_url: https://example.com/v1\n".to_owned();
-            if let Some(startup) = startup {
-                text.push_str(&format!("startup_timeout_secs: {startup}\n"));
-            }
-            if let Some(read_idle) = read_idle {
-                text.push_str(&format!("read_idle_timeout_secs: {read_idle}\n"));
-            }
-            let config: ProviderConfig = crate::yaml::parse(&text)?;
-            let timeouts = config.timeouts().unwrap();
-            Ok::<_, String>((timeouts.startup.as_secs(), timeouts.read_idle.as_secs()))
+    fn codex_entries_share_one_issuer() {
+        let entry = |name: &str, auth_url: &str| {
+            format!("  {name}:\n    dialect: codex\n    codec: responses\n{auth_url}")
         };
-        assert_eq!(timeouts(None, None).unwrap(), (600, 600));
-        assert_eq!(timeouts(Some(180), Some(300)).unwrap(), (180, 300));
-        for (startup, read_idle) in [(Some(0), None), (None, Some(0)), (Some(u64::MAX), None)] {
-            assert!(timeouts(startup, read_idle).is_err());
+        let mirror = "    auth_url: https://auth.example/tenant\n";
+        for second in ["    auth_url: https://auth.example/other\n", ""] {
+            let text = format!("providers:\n{}{}", entry("a", mirror), entry("b", second));
+            let refused = error(&text);
+            assert!(
+                refused.contains("codex providers `a` and `b` name different auth_url issuers"),
+                "{refused}"
+            );
         }
+        let same = "    auth_url: https://auth.example/tenant/\n";
+        let text = format!("providers:\n{}{}", entry("a", mirror), entry("b", same));
+        let issuer = Config::from_yaml(&text).unwrap().codex_issuer().unwrap();
+        assert_eq!(issuer.as_str(), "https://auth.example/tenant/");
+    }
+
+    #[test]
+    fn entries_name_a_known_dialect_and_codec_and_an_endpoint_it_needs() {
+        let root = "base_url: https://example.com/v1";
+        for text in [
+            format!("codec: responses\n{root}"),
+            format!("dialect: openai\n{root}"),
+            format!("dialect: claude\ncodec: messages\n{root}"),
+            format!("dialect: compatible\ncodec: completions\n{root}"),
+            "dialect: openai\ncodec: responses".to_owned(),
+        ] {
+            assert!(!admits(&text), "{text}");
+        }
+        assert!(admits(&format!(
+            "dialect: openai\ncodec: responses\n{root}"
+        )));
+    }
+
+    /// Each model is served with its own overrides: one caps output under
+    /// `max_tokens` and replays no reasoning, the other keeps the entry's.
+    #[tokio::test]
+    async fn model_overrides_specialise_the_provider_per_model() {
+        use crate::provider::{
+            codec::common::tests::chat_request,
+            http::tests::{complete, serve},
+            protocol::{Message, ToolResult, UserContent},
+        };
+        use serde_json::json;
+        let first = vec![
+            json!({"choices":[{"index":0,"delta":{"reasoning_content":"plan","tool_calls":[
+                {"index":0,"id":"call_a","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]}}]}),
+            json!({"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}),
+        ];
+        let answer = vec![
+            json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
+        ];
+        let (root, server) = serve(vec![first.clone(), answer.clone(), first, answer]).await;
+        let text = LOCAL
+            .replace("http://127.0.0.1:11434/v1", &root)
+            .replace(
+                "        max_output: 512\n",
+                "        max_output: 512\n      strict:\n        model: strict-model\n        max_context: 4096\n        max_output: 512\n        overrides:\n          reasoning_replay: omitted\n          output_limit: {field: max_tokens}\n",
+            );
+        let config = Config::from_yaml(&text).unwrap();
+        let models = config.providers["local"]
+            .admit()
+            .unwrap()
+            .build(&"local".parse().unwrap())
+            .unwrap();
+        for (_, entry) in &models {
+            let mut context = entry.provider.open_context("c".parse().unwrap()).unwrap();
+            let user = Message::User(vec![UserContent::Text {
+                text: "find".into(),
+            }]);
+            let model = &entry.profile.model;
+            let reduced = complete(&mut *context, chat_request(model, vec![user.clone()])).await;
+            let result = Message::Tool(vec![ToolResult {
+                call_id: "call_a".into(),
+                name: "lookup".into(),
+                result: json!({}),
+                is_error: false,
+                images: Vec::new(),
+            }]);
+            let assistant = Message::Assistant(reduced.items().to_vec());
+            complete(
+                &mut *context,
+                chat_request(model, vec![user, assistant, result]),
+            )
+            .await;
+        }
+        let requests: Vec<Value> = server
+            .finish()
+            .await
+            .iter()
+            .map(|request| serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap())
+            .collect();
+        let sent = |request: &Value, field: &str| request.get(field).is_some();
+        let replayed = |request: &Value| sent(&request["messages"][1], "reasoning_content");
+        let [local, local_replay, strict, strict_replay] = &requests[..] else {
+            panic!("{requests:?}")
+        };
+        assert_eq!(
+            (&local["model"], &strict["model"]),
+            (&json!("local-model"), &json!("strict-model"))
+        );
+        assert!(sent(local, "max_completion_tokens") && !sent(local, "max_tokens"));
+        assert!(sent(strict, "max_tokens") && !sent(strict, "max_completion_tokens"));
+        assert!(replayed(local_replay) && !replayed(strict_replay));
+        let foreign = text
+            .replace("codec: chat_completions", "codec: responses")
+            .replace("          output_limit: {field: max_tokens}\n", "");
+        let refused = error(&foreign);
+        assert!(
+            refused.contains("reasoning_replay is not a responses setting"),
+            "{refused}"
+        );
     }
 }

@@ -16,7 +16,7 @@ use crate::{
     job::{AgentMessage, AgentProgress},
     media::{AttachmentRef, BlobDigest, BlobRef, ImageFormat, ImageRef, TextRef},
     provider::{
-        profile::ModelProfile,
+        profile::{ModelProfile, ModelRef},
         protocol::{
             AssistantItem, ItemId, ItemKind, Position, Provenance, Replay, ResponseSchema,
             SystemSegment, TextBlock, ToolCall, ToolDefinition, ToolResult, Usage,
@@ -286,11 +286,11 @@ impl Messages {
             )?,
             replays: keyed(
                 db,
-                "SELECT item, protocol, model, scope, payload, binding FROM reasoning_replay",
+                "SELECT item, format, model, scope, payload, binding FROM reasoning_replay",
                 |row| {
                     Ok(Replay {
                         provenance: Provenance {
-                            protocol: row.get(1)?,
+                            format: enum_column(row, 1)?,
                             model: row.get(2)?,
                             scope: parsed(row.get(3)?)?,
                         },
@@ -460,9 +460,8 @@ fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
          state_mode, hint FROM model_profile",
         |row| {
             Ok(ProfileSnapshot {
-                name: row.get(1)?,
+                name: model_ref(&row.get::<String>(2)?, &row.get::<String>(1)?)?,
                 profile: ModelProfile {
-                    provider: row.get(2)?,
                     model: row.get(3)?,
                     reasoning: row.get(4)?,
                     max_context: row.get(5)?,
@@ -474,6 +473,16 @@ fn profiles(db: &Db) -> DbResult<HashMap<i64, ProfileSnapshot>> {
             })
         },
     )
+}
+
+/// A profile's qualified name, validated when it was written.
+pub(super) fn model_ref(provider: &str, name: &str) -> DbResult<ModelRef> {
+    let invalid =
+        |error: crate::provider::profile::NameError| corrupt(format!("model_profile: {error}"));
+    Ok(ModelRef::new(
+        provider.parse().map_err(invalid)?,
+        name.parse().map_err(invalid)?,
+    ))
 }
 
 /// Journaled target names were validated when written; anything else is corruption.
@@ -905,13 +914,15 @@ pub(in crate::session) fn decode_records(
         }
     );
     load!(
-        "SELECT entry, request, input_tokens, cached_input_tokens, output_tokens FROM usage",
+        "SELECT entry, request, input_tokens, cached_input_tokens, cache_write_input_tokens, \
+         output_tokens FROM usage",
         |row| SessionEvent::Usage {
             request: sequence(row.get(1)?).request(),
             usage: Usage {
                 input_tokens: row.get(2)?,
                 cached_input_tokens: row.get(3)?,
-                output_tokens: row.get(4)?,
+                cache_write_input_tokens: row.get(4)?,
+                output_tokens: row.get(5)?,
             },
         }
     );

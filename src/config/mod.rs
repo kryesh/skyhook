@@ -7,7 +7,7 @@ use std::{
 
 use crate::{
     mcp::config::McpServerConfig,
-    provider::profile::ModelProfile,
+    provider::profile::{ModelRef, ProviderName},
     target::TargetsConfig,
     tool::policy::{Capability, CapabilitySet, Mode},
 };
@@ -19,8 +19,8 @@ mod paths;
 mod providers;
 mod runtime;
 
-pub use providers::{ProviderConfig, RawProviderConfig};
-pub use runtime::{ConfiguredModel, RuntimeConfig};
+pub use providers::{EntryError, RawProviderConfig};
+pub use runtime::{ConfiguredModel, RuntimeConfig, SelectionError};
 
 pub use loader::{ConfigDiagnostic, ConfigReport, ResolvedConfig};
 pub use paths::workspace_session_root;
@@ -44,10 +44,13 @@ pub struct Config {
     /// unless that name is declared.
     #[serde(default = "default_modes", deserialize_with = "deserialize_modes")]
     pub modes: indexmap::IndexMap<String, Mode>,
+    /// Providers in declaration order, each with the models served through it.
     #[serde(default)]
-    pub providers: BTreeMap<String, ProviderConfig>,
-    #[serde(default)]
-    pub models: indexmap::IndexMap<String, ModelProfile>,
+    pub providers: indexmap::IndexMap<ProviderName, RawProviderConfig>,
+    /// The model a new session starts with, as `provider/model`; without it, the first
+    /// model of the first provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_model: Option<ModelRef>,
     #[serde(default)]
     pub targets: TargetsConfig,
     /// Named, trusted MCP server connections. Empty by default.
@@ -124,46 +127,37 @@ impl Config {
         crate::yaml::to_string(self).map_err(ConfigError::Serialize)
     }
 
-    /// Parse a single YAML document without discovery, merging, or admission.
+    /// Parse and admit a single YAML document, as a loaded layer is, without
+    /// discovery or merging.
     pub fn from_yaml(text: &str) -> Result<Self, ConfigError> {
         let value = crate::yaml::from_str(text)
             .map_err(|error| ConfigError::Structure(format!("invalid YAML: {error}")))?;
-        Self::from_value(&value).map_err(ConfigError::Structure)
+        Self::from_value(&value)
     }
 
-    /// Typed extraction naming the offending entry, so a rejected provider or
-    /// server reads `` `providers.local`: ... ``.
-    fn from_value(value: &serde_json::Value) -> Result<Self, String> {
-        serde_path_to_error::deserialize(value).map_err(|error| {
+    /// Typed extraction naming the offending field, so a rejected value reads
+    /// `` `providers.local.models.main.max_context`: ... ``, then admission.
+    fn from_value(value: &serde_json::Value) -> Result<Self, ConfigError> {
+        let config: Self = serde_path_to_error::deserialize(value).map_err(|error| {
             let path = error.path().to_string();
             let inner = error.into_inner();
-            if path == "." {
+            ConfigError::Structure(if path == "." {
                 inner.to_string()
             } else {
                 format!("`{path}`: {inner}")
-            }
-        })
+            })
+        })?;
+        config.admit()?;
+        Ok(config)
     }
 
-    /// Check targets, then model limits and mode text, without model selection or
-    /// external resources. Providers were admitted when they were deserialized.
-    fn validate_structure(&self) -> Result<(), ConfigError> {
+    /// Admit targets, mode text and every provider entry, without model
+    /// selection or external resources. Loading checks each layer and the
+    /// merged result with this; sealing keeps the admitted entries.
+    fn admit(
+        &self,
+    ) -> Result<indexmap::IndexMap<ProviderName, providers::ProviderConfig>, ConfigError> {
         self.targets.validate_structure()?;
-        for (name, profile) in &self.models {
-            profile
-                .validate_limits()
-                .map_err(|message| ConfigError::Model(name.clone(), message.to_owned()))?;
-            if profile
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.trim().is_empty())
-            {
-                return Err(ConfigError::Model(
-                    name.clone(),
-                    "hint must not be empty".into(),
-                ));
-            }
-        }
         for (name, mode) in &self.modes {
             for (field, text) in [("instructions", &mode.instructions), ("hint", &mode.hint)] {
                 if text.as_deref().is_some_and(|text| text.trim().is_empty()) {
@@ -174,7 +168,19 @@ impl Config {
                 }
             }
         }
-        Ok(())
+        providers::admit(&self.providers)
+    }
+
+    /// The OAuth issuer every codex entry shares, as admission proves; OpenAI's
+    /// when no entry names one.
+    pub fn codex_issuer(
+        &self,
+    ) -> Result<crate::provider::dialect::codex::auth::Issuer, ConfigError> {
+        let providers = self.admit()?;
+        Ok(providers
+            .values()
+            .find_map(providers::ProviderConfig::codex_issuer)
+            .unwrap_or_default())
     }
 }
 
@@ -190,19 +196,36 @@ pub enum ConfigError {
     #[error("invalid configuration: {0}")]
     Structure(String),
     #[error("invalid configuration: {0}")]
+    Admission(#[from] EntryError),
+    #[error("invalid configuration: {0}")]
     Targets(#[from] crate::target::TargetError),
-    #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.yaml")]
-    Missing,
-    #[error("environment variable `{0}` is required and must not be empty")]
-    MissingEnvironment(String),
-    #[error("provider `{0}` could not be initialized: {1}")]
-    Provider(String, String),
-    #[error("No model profiles configured. Add a named entry under models in your config.")]
+    #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.yaml{0}")]
+    Missing(ConfigReport),
+    #[error(
+        "invalid configuration: codex providers `{first}` and `{second}` name different auth_url \
+         issuers, but Skyhook keeps one Codex login; give them the same auth_url"
+    )]
+    CodexIssuers {
+        first: ProviderName,
+        second: ProviderName,
+    },
+    #[error("provider `{provider}` could not be initialized: {error}")]
+    Provider {
+        provider: ProviderName,
+        error: crate::provider::dialect::BuildError,
+    },
+    #[error("No models configured. Add a named entry under a provider's models in your config.")]
     NoModels,
-    #[error("Model profile {model} references unknown provider {provider}.")]
-    UnknownModelProvider { model: String, provider: String },
-    #[error("invalid model profile `{0}`: {1}")]
-    Model(String, String),
+    #[error("invalid model `{name}`: {error}")]
+    Model {
+        name: ModelRef,
+        error: SelectionError,
+    },
+    #[error("invalid default_model `{model}`: {error}")]
+    DefaultModel {
+        model: ModelRef,
+        error: SelectionError,
+    },
     #[error("invalid mode `{0}`: {1}")]
     Mode(String, String),
 }
@@ -211,7 +234,7 @@ impl ConfigError {
     /// Candidate diagnostics are retained when no effective config is available.
     pub fn report(&self) -> Option<&ConfigReport> {
         match self {
-            Self::Resolution { report, .. } => Some(report),
+            Self::Resolution { report, .. } | Self::Missing(report) => Some(report),
             _ => None,
         }
     }
@@ -224,9 +247,10 @@ mod tests {
     const ANTHROPIC_MISSING_KEY: &str = r#"
 providers:
   test:
-    kind: anthropic
+    dialect: anthropic
+    codec: messages
     base_url: https://api.anthropic.com/v1
-    api_key_env: SKYHOOK_TEST_MISSING_API_KEY
+    api_key: {env: SKYHOOK_TEST_MISSING_API_KEY}
 "#;
 
     fn parse(text: &str) -> Result<Config, ConfigError> {
@@ -238,17 +262,25 @@ providers:
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("explicit.yaml");
         let text = r#"
-models:
+providers:
   local:
-    provider: local
-    model: test
-    max_context: 128000
-    max_output: 16384
-    supports_images: false
+    dialect: codex
+    codec: responses
+    models:
+      local:
+        model: test
+        max_context: 128000
+        max_output: 16384
+        supports_images: false
 "#;
         tokio::fs::write(&path, text).await.unwrap();
         let config = Config::load(Some(&path)).await.unwrap();
-        assert_eq!(config.models.first().unwrap().0, "local");
+        assert!(
+            config.providers["local"]
+                .common
+                .models
+                .contains_key("local")
+        );
         assert!(!config.approve_all);
         assert_eq!(config.modes, default_modes());
         assert!(config.mcp.is_empty());
@@ -291,90 +323,10 @@ models:
     }
 
     #[test]
-    fn model_limits_are_required_and_validated_before_credentials_are_loaded() {
-        for limits in ["", "    max_context: 128000\n", "    max_output: 16384\n"] {
-            let text = format!("models:\n  test:\n    provider: test\n    model: test\n{limits}");
-            assert!(parse(&text).is_err(), "{text}");
-        }
-        for (max_context, max_output, expected) in [
-            (0, 1, "max_context must be positive"),
-            (128000, 0, "max_output must be positive"),
-            (128000, 128000, "max_output must be smaller"),
-            (128000, 128001, "max_output must be smaller"),
-        ] {
-            let config = parse(&format!(
-                "{ANTHROPIC_MISSING_KEY}models:\n  test:\n    provider: test\n    model: test\n    max_context: {max_context}\n    max_output: {max_output}\n"
-            )).unwrap();
-            let Err(ConfigError::Model(name, message)) = config.into_runtime() else {
-                panic!("expected limit validation before credential loading");
-            };
-            assert_eq!(name, "test");
-            assert!(message.contains(expected), "{message}");
-        }
-    }
-
-    #[test]
     fn example_config_stays_valid() {
         let config = parse(include_str!("../../config.example.yaml")).unwrap();
         assert!(config.providers.contains_key("codex"));
-        assert!(!config.models.is_empty());
         config.into_runtime().unwrap();
-    }
-
-    #[test]
-    fn native_protocols_require_explicit_configuration_and_pass_model_identifiers_through() {
-        for (text, valid) in [
-            ("kind: openai\napi: responses", false),
-            ("kind: openai\nbase_url: https://example.com/v1", false),
-            ("kind: anthropic", false),
-            ("kind: claude", false),
-            (
-                "kind: openai_compatible\nbase_url: https://example.com/v1\napi: responses",
-                false,
-            ),
-            (
-                "kind: openai\nbase_url: https://example.com/custom/v1\napi: responses",
-                true,
-            ),
-            (
-                "kind: openai\nbase_url: http://localhost:8080/v1\napi: chat_completions",
-                true,
-            ),
-            ("kind: anthropic\nbase_url: https://example.com/v1", true),
-            ("kind: codex", true),
-        ] {
-            assert_eq!(
-                crate::yaml::parse::<ProviderConfig>(text).is_ok(),
-                valid,
-                "{text}"
-            );
-        }
-        let config = parse(
-            r#"
-providers:
-  local:
-    kind: openai
-    base_url: http://localhost:8080/v1
-    api: responses
-models:
-  local:
-    provider: local
-    model: exact-model-id
-    max_context: 128000
-    max_output: 16384
-"#,
-        )
-        .unwrap();
-        assert_eq!(config.models["local"].model, "exact-model-id");
-        // Provider construction must not connect to an endpoint or require a key.
-        let runtime = config.into_runtime().unwrap();
-        assert!(
-            runtime
-                .select_model("local")
-                .unwrap()
-                .harness_builder(".")
-                .is_ok()
-        );
     }
 
     #[test]
@@ -425,8 +377,9 @@ models:
         let hinted = mode("capabilities: []\nhint: Thinks").unwrap();
         assert_eq!(hinted.modes["m"].hint.as_deref(), Some("Thinks"));
         for blank in ["instructions", "hint"] {
-            let error = mode(&format!("capabilities: []\n{blank}: ' '")).unwrap();
-            let error = error.into_runtime().err().unwrap().to_string();
+            let error = mode(&format!("capabilities: []\n{blank}: ' '"))
+                .unwrap_err()
+                .to_string();
             assert!(
                 error.contains(&format!("{blank} must not be empty")),
                 "{error}"
@@ -461,20 +414,17 @@ models:
         const BASE: &str = r#"
 providers:
   p:
-    kind: openai
-    api: chat_completions
+    dialect: compatible
+    codec: chat_completions
     base_url: http://127.0.0.1:1/v1
-models:
-  m:
-    provider: p
-    model: x
-    max_context: 128000
-    max_output: 4096
+    models:
+      m:
+        model: x
+        max_context: 128000
+        max_output: 4096
 "#;
         let runtime = |top: &str, modes: &str| {
-            parse(&format!("{top}\n{BASE}{modes}"))
-                .unwrap()
-                .into_runtime()
+            parse(&format!("{top}\n{BASE}{modes}")).and_then(Config::into_runtime)
         };
         let two = "modes:\n  first:\n    capabilities: []\n  second:\n    capabilities: [read]\n";
         let config = runtime("default_mode: second", two).unwrap();

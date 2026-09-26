@@ -729,7 +729,7 @@ mod tests {
             .await;
         let store = jobs.store();
         let child_agent =
-            crate::session::fixture::start_child(store, &agent, 1, Some(owner.id()), root.path())
+            crate::session::tests::start_child(store, &agent, 1, Some(owner.id()), root.path())
                 .await;
         let child_origin = call(&child_agent, "child-script").await;
         let host = jobs

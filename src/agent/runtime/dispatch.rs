@@ -26,7 +26,7 @@ impl PreparedAgentLaunch {
         let AgentLaunch {
             id,
             owner_job,
-            mut model_profile,
+            model,
             todos,
             mut available_depth,
             mut location,
@@ -48,8 +48,12 @@ impl PreparedAgentLaunch {
             // A lowered live limit narrows a resumed agent rather than refusing it.
             available_depth = recorded.available_depth.min(remaining_depth);
             location.clone_from(&recorded.location);
-            model_profile.clone_from(&recorded.profile.name);
         }
+        let model = match (&recorded, model) {
+            (Some(recorded), _) => recorded.profile.name.clone(),
+            (None, Some(model)) => model,
+            (None, None) => return Err(HarnessError::NoRecordedModel(id)),
+        };
         if available_depth > remaining_depth {
             return Err(HarnessError::ChildDepth);
         }
@@ -71,17 +75,25 @@ impl PreparedAgentLaunch {
                 .collect(),
             None => allowed,
         };
+        // A journaled profile is applied as recorded; the live catalog supplies only
+        // the provider that serves it.
         let (profile, system, tools) = match recorded {
             Some(RecordedContract {
                 profile,
                 system: Some(system),
                 tools,
                 ..
-            }) => (profile.profile, system, tools),
+            }) => (profile, system, tools),
             recorded => {
-                let (live, system) = runtime
-                    .resolve_agent(
-                        &model_profile,
+                let profile = match recorded {
+                    Some(recorded) => recorded.profile,
+                    None => crate::session::ProfileSnapshot {
+                        profile: runtime.model_entry(&model)?.profile,
+                        name: model,
+                    },
+                };
+                let system = runtime
+                    .system_prompt(
                         &id,
                         &location,
                         available_depth,
@@ -89,7 +101,6 @@ impl PreparedAgentLaunch {
                         &capabilities,
                     )
                     .await?;
-                let profile = recorded.map_or(live, |recorded| recorded.profile.profile);
                 (profile, system, None)
             }
         };
@@ -106,11 +117,7 @@ impl PreparedAgentLaunch {
                 owner_job,
                 context,
                 location,
-                settings: AgentSettings {
-                    model_profile,
-                    mode,
-                    capabilities,
-                },
+                settings: AgentSettings { mode, capabilities },
                 rx,
             },
             sender,
@@ -134,10 +141,7 @@ impl PreparedAgentLaunch {
         if !resumed {
             let started = SessionEvent::AgentStarted {
                 owner_job: agent_loop.owner_job,
-                profile: Some(crate::session::ProfileSnapshot {
-                    name: agent_loop.settings.model_profile.clone(),
-                    profile: agent_loop.context.profile.clone(),
-                }),
+                profile: Some(agent_loop.context.profile.clone()),
                 available_depth: u32::try_from(available_depth).unwrap_or(u32::MAX),
                 mode: (agent_loop.settings.mode.as_deref())
                     .map(|mode| runtime.mode_selection(mode)),
@@ -176,7 +180,7 @@ impl PreparedAgentLaunch {
             agents.insert(
                 agent_loop.id.clone(),
                 LiveAgent {
-                    model_profile: agent_loop.settings.model_profile.clone(),
+                    model: agent_loop.context.profile.name.clone(),
                     capabilities: agent_loop.settings.capabilities.clone(),
                     sender: sender.clone(),
                     cancellation: CancellationToken::new(),
@@ -308,25 +312,14 @@ fn failed_result(
 }
 
 impl SessionRuntime {
-    pub(super) async fn resolve_agent(
-        &self,
-        model_profile: &str,
-        agent: &AgentId,
-        location: &crate::execution::ExecutionLocation,
-        available_depth: usize,
-        mode: Option<&str>,
-        capabilities: &CapabilitySet,
-    ) -> Result<(ModelProfile, Vec<SystemSegment>), HarnessError> {
-        let profile = self
-            .harness
-            .model_profiles
-            .get(model_profile)
+    /// A model this runtime's catalog serves. Journaled names are checked here on
+    /// resume, since the catalog may have changed since they were recorded.
+    pub(super) fn model_entry(&self, model: &ModelRef) -> Result<ModelEntry, HarnessError> {
+        self.harness
+            .models
+            .get(model)
             .cloned()
-            .ok_or_else(|| HarnessError::UnknownModelProfile(model_profile.to_owned()))?;
-        let system = self
-            .system_prompt(agent, location, available_depth, mode, capabilities)
-            .await?;
-        Ok((profile, system))
+            .ok_or_else(|| HarnessError::UnknownModel(model.clone()))
     }
 
     /// The journal form of a mode about to be applied. The session keeps the
@@ -362,23 +355,20 @@ impl SessionRuntime {
         Ok(system)
     }
 
-    /// Open a context offering the live tool surface, or `pinned` tools journaled
-    /// earlier. A pinned tool whose live definition differs or is gone stays
-    /// visible to the model but is unavailable to call.
+    /// Open a context for `profile` on the live provider of its model, offering the
+    /// live tool surface, or `pinned` tools journaled earlier. A pinned tool whose
+    /// live definition differs or is gone stays visible to the model but is
+    /// unavailable to call.
     pub(super) async fn open_agent_context(
         &self,
         agent: &AgentId,
-        profile: ModelProfile,
+        profile: crate::session::ProfileSnapshot,
         system: Vec<SystemSegment>,
         capabilities: &CapabilitySet,
         pinned: Option<Vec<crate::provider::protocol::ToolDefinition>>,
         restore_meter: bool,
     ) -> Result<AgentContext, HarnessError> {
-        let factory = self
-            .harness
-            .providers
-            .get(&profile.provider)
-            .ok_or_else(|| HarnessError::UnknownProvider(profile.provider.clone()))?;
+        let provider = self.model_entry(&profile.name)?.provider;
         let live = self
             .executor
             .clone()
@@ -399,22 +389,22 @@ impl SessionRuntime {
             None => (live, Default::default()),
         };
         let template = ModelRequest {
-            model: profile.model.clone(),
+            model: profile.profile.model.clone(),
             system,
             history: Vec::new(),
             tail: Vec::new(),
             history_lifetime: Default::default(),
             tools,
-            reasoning: profile.reasoning.clone(),
+            reasoning: profile.profile.reasoning.clone(),
             response_schema: None,
-            max_output_tokens: Some(profile.max_output),
+            max_output_tokens: Some(profile.profile.max_output),
             blobs: Default::default(),
         };
         let mut context = AgentContext::open(
             agent,
             profile,
             template.try_into()?,
-            factory.as_ref(),
+            provider.as_ref(),
             &self.store.records().await,
             restore_meter,
         )?;

@@ -17,7 +17,7 @@ pub async fn run(
     let config = launch::load_config(&request.config, false).await?;
     // Model memory is shared with terminal launches, but UI settings are never read.
     let (saved, state_warning) = super::tui::state::load(&request.config.workspace);
-    let model = launch::select_model(&config, request.model.as_deref(), saved.model.as_deref())?;
+    let model = launch::select_model(&config, request.model.as_ref(), saved.model.as_ref())?;
     // A named mode also applies to a resumed session, from this prompt on.
     let mode = match &permissions {
         PermissionArgs::Mode(Some(mode)) => Some(mode.clone()),
@@ -59,10 +59,11 @@ pub async fn run(
                     .await
                     .map_err(|error| error.to_string())?;
             }
+            let model = launch.model.name();
             if request.resume.is_none()
-                && saved.model.as_deref() != Some(launch.model.name())
+                && saved.model.as_ref() != Some(&model)
                 && let Err(error) = super::tui::state::update(&launch.workspace, |state| {
-                    state.model = Some(launch.model.name().to_owned());
+                    state.model = Some(model);
                 })
             {
                 session

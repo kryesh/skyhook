@@ -345,7 +345,10 @@ mod tests {
     use crate::{
         identity::{EventId, SessionId},
         provider::protocol::{AssistantItem, HistoryLifetime},
-        session::{AttemptRef, CompactionCheckpoint, CompletedOutcome, ModelContext, fixture},
+        session::{
+            AttemptRef, CompactionCheckpoint, CompletedOutcome, ModelContext,
+            tests::{self, usage},
+        },
     };
 
     /// Appends records for one agent, stamped `at(sequence)`.
@@ -384,7 +387,7 @@ mod tests {
         /// A request against a fresh context for `purpose`.
         fn request(&mut self, purpose: ModelPurpose) -> RequestSeq {
             let context = self.record(SessionEvent::ModelContext {
-                context: ModelContext::test(purpose, fixture::profile()),
+                context: ModelContext::test(purpose, tests::profile()),
             });
             self.record(SessionEvent::ModelRequested {
                 context,
@@ -467,14 +470,6 @@ mod tests {
 
     fn attempt_ref(request: RequestSeq, attempt: u64) -> AttemptRef {
         AttemptRef { request, attempt }
-    }
-
-    fn usage(input: u64, cached: u64, output: u64) -> Usage {
-        Usage {
-            input_tokens: input,
-            cached_input_tokens: cached,
-            output_tokens: output,
-        }
     }
 
     fn open(attempt: u64, message: Option<MessageSeq>) -> RequestPhase {

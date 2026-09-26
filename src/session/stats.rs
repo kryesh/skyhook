@@ -11,7 +11,7 @@ use serde::Serialize;
 use crate::{
     identity::{AgentId, JobId, SessionId},
     job::JobRole,
-    provider::protocol::Usage,
+    provider::{profile::ModelRef, protocol::Usage},
     session::{
         EventRecord, Message, ModelPurpose, RecordSeq, RequestLedger, RequestPhase, SessionEvent,
         UserPart,
@@ -28,8 +28,7 @@ pub struct SessionStats {
     pub finished: DateTime<Utc>,
     /// Sorted by path, root first.
     pub agents: Vec<AgentStats>,
-    /// Keyed by model profile name.
-    pub models: BTreeMap<String, ModelStats>,
+    pub models: BTreeMap<ModelRef, ModelStats>,
     /// Keyed by tool name, summed over every agent.
     pub tools: BTreeMap<String, ToolStats>,
     pub totals: Totals,
@@ -42,8 +41,8 @@ pub struct AgentStats {
     pub path: String,
     pub name: String,
     pub depth: usize,
-    /// The last applied model profile; none for a tool-only agent.
-    pub model: Option<String>,
+    /// The last applied model; none for a tool-only agent.
+    pub model: Option<ModelRef>,
     pub parent: Option<String>,
     pub owner_job: Option<JobId>,
     /// The agent's final completion, interruption, or failure, with its time. A later
@@ -211,7 +210,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     let mut job_names: HashMap<JobId, String> = HashMap::new();
     // Tool calls without a result yet, per agent: call id to tool name.
     let mut open_calls: HashMap<AgentId, HashMap<String, String>> = HashMap::new();
-    let mut models: BTreeMap<String, ModelStats> = BTreeMap::new();
+    let mut models: BTreeMap<ModelRef, ModelStats> = BTreeMap::new();
     // Agents inside a turn: from a model request until a response ends it or the
     // agent completes or fails.
     let mut in_turn: HashSet<AgentId> = HashSet::new();
@@ -475,22 +474,15 @@ mod tests {
         provider::protocol::{AssistantItem, HistoryLifetime, ToolCall, ToolResult},
         session::{
             AttemptRef, CompletedOutcome, MessageSeq, ModelContext, ModelFailureKind, ModelPurpose,
-            RequestSeq, SessionEvent, fixture, fixture::MemorySession,
+            RequestSeq, SessionEvent,
+            tests::{self, MemorySession, usage},
         },
     };
     use serde_json::json;
 
-    fn usage(input: u64, cached: u64, output: u64) -> Usage {
-        Usage {
-            input_tokens: input,
-            cached_input_tokens: cached,
-            output_tokens: output,
-        }
-    }
-
     fn context_event(name: &str) -> SessionEvent {
-        let mut profile = fixture::profile();
-        profile.name = name.into();
+        let mut profile = tests::profile();
+        profile.name = format!("test/{name}").parse().unwrap();
         SessionEvent::ModelContext {
             context: ModelContext::test(ModelPurpose::Agent, profile),
         }
@@ -779,7 +771,9 @@ mod tests {
         assert_eq!((root_stats.depth, child_stats.depth), (0, 1));
         assert_eq!(child_stats.owner_job, Some(job));
         assert_eq!(root_stats.children, 1);
-        assert_eq!(root_stats.model.as_deref(), Some("test"));
+        let (current, big): (ModelRef, ModelRef) =
+            ("test/test".parse().unwrap(), "test/big".parse().unwrap());
+        assert_eq!(root_stats.model.as_ref(), Some(&current));
         assert!(matches!(root_stats.outcome, AgentOutcome::Completed { .. }));
         assert!(matches!(child_stats.outcome, AgentOutcome::Interrupted { at } if at >= completed));
         assert!(child_stats.started >= stats.started && stats.finished >= root_stats.started);
@@ -801,7 +795,7 @@ mod tests {
             ),
             (2, 2)
         );
-        assert_eq!(stats.models["big"].requests.requested, 4);
+        assert_eq!(stats.models[&big].requests.requested, 4);
         assert_eq!(root_stats.usage, usage(100, 40, 7));
         assert_eq!(root_stats.jobs.agents, 1);
         let read = root_stats.tools["read"];
@@ -809,10 +803,10 @@ mod tests {
         assert_eq!((read.calls, read.errors, read.unanswered), (1, 1, 0));
         assert_eq!((exec.calls, exec.errors, exec.unanswered), (1, 0, 1));
         // The request's context names the profile, not the agent's current selection.
-        assert_eq!(stats.models["big"].usage, usage(105, 40, 8));
-        assert_eq!(stats.models["big"].requests.completed, 2);
-        assert_eq!(stats.models["big"].requests.attempts, 4);
-        assert!(!stats.models.contains_key("test"));
+        assert_eq!(stats.models.keys().collect::<Vec<_>>(), [&big]);
+        assert_eq!(stats.models[&big].usage, usage(105, 40, 8));
+        assert_eq!(stats.models[&big].requests.completed, 2);
+        assert_eq!(stats.models[&big].requests.attempts, 4);
         assert_eq!(stats.totals.usage, usage(105, 40, 8));
         assert_eq!(stats.totals.tool_calls.calls, 2);
         assert_eq!(stats.tools.len(), 2);

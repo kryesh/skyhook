@@ -108,7 +108,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn shutdown_stops_before_a_pending_child_reply_starts_another_turn() {
         const REPLY: &str = "pending-child-reply";
-        let launch = json!({"prompt":"child task", "model":"child", "bg":true});
+        let launch = json!({"prompt":"child task", "model":"wait-test/child", "bg":true});
         let tracking = tracking_all(vec![
             (
                 "root",
@@ -175,7 +175,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn script_foreground_child_leaves_no_pending_reply() {
         const FINAL: &str = "readme-first-lines";
-        let source = "const answer = await tool.agent({prompt:'read', model:'child', name:'read-readme'}); \
+        let source = "const answer = await tool.agent({prompt:'read', model:'wait-test/child', name:'read-readme'}); \
             const first = (await tool.wait({timeout:1})).result; \
             const second = (await tool.wait({timeout:1})).result; \
             return [first, second];";
@@ -219,7 +219,7 @@ mod tests {
     async fn outstanding_foreground_work_defers_wait_resolution() {
         const PROGRESS: &str = "foreground-progress";
         const FINAL: &str = "foreground-final";
-        let delegate = json!({"prompt":"work", "model":"child", "name":"kid"});
+        let delegate = json!({"prompt":"work", "model":"wait-test/child", "name":"kid"});
         let waiting = ToolCall::new("waiting", "wait", json!({"timeout":30})).unwrap();
         let hold = ToolCall::new("child-hold", "wait", json!({"timeout":1})).unwrap();
         let tracking = tracking_all(vec![
@@ -271,7 +271,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn terminal_child_reply_and_completion_reach_the_owner_in_one_batch() {
         const FINAL: &str = "merged-child-final-answer";
-        let launch = json!({"prompt":"report", "model":"child", "name":"merged", "bg":true});
+        let launch =
+            json!({"prompt":"report", "model":"wait-test/child", "name":"merged", "bg":true});
         let tracking = tracking_all(vec![
             ("root", vec![call("launch", "agent", launch)]),
             ("child", vec![AssistantItem::text("final", 0, FINAL)]),
@@ -323,7 +324,8 @@ mod tests {
     async fn answering_child_with_live_work_wakes_its_owner_before_completing() {
         const PROGRESS: &str = "child-answer-with-live-work";
         const FINAL: &str = "child-answer-after-live-work";
-        let launch = json!({"prompt":"report", "model":"child", "name":"worker", "bg":true});
+        let launch =
+            json!({"prompt":"report", "model":"wait-test/child", "name":"worker", "bg":true});
         let work = json!({"source":"return await receive();", "bg":true});
         let tracking = tracking_all(vec![
             ("root", vec![call("launch", "agent", launch)]),
@@ -392,7 +394,8 @@ mod tests {
     async fn no_tool_child_reports(parent_already_waiting: bool, pending_runtime_event: bool) {
         const A: &str = "child-report-A";
         const B: &str = "child-addendum-B";
-        let launch = json!({"prompt":"report", "model":"child", "name":"reporter", "bg":true});
+        let launch =
+            json!({"prompt":"report", "model":"wait-test/child", "name":"reporter", "bg":true});
         let tracking = tracking(vec![
             ("root", call("launch", "agent", launch)),
             ("child", AssistantItem::text("report", 0, A)),
@@ -500,7 +503,8 @@ mod tests {
             AssistantItem::text("blank", 1, "\n\n"),
             child_tool,
         ];
-        let launch = json!({"prompt":"child task", "model":"child", "name":"blank", "bg":true});
+        let launch =
+            json!({"prompt":"child task", "model":"wait-test/child", "name":"blank", "bg":true});
         let tracking = tracking_all(vec![
             ("root", vec![call("launch", "agent", launch)]),
             ("child", blank.clone()),
@@ -534,12 +538,12 @@ mod tests {
             "the owner left its wait for a blank turn"
         );
         let records = runtime.store.records().await;
-        // The blank block is still committed to the child's own history for replay.
+        // The child's turn commits whole: the separator is history, though not a reply.
         let committed = records
             .iter()
             .filter(|record| record.agent == child)
             .filter(|record| {
-                matches!(&record.event, SessionEvent::MessageCommitted { message: Message::Assistant(content) } if content == &blank)
+                matches!(&record.event, SessionEvent::MessageCommitted { message: Message::Assistant(content) } if *content == blank)
             });
         assert_eq!(committed.count(), 1);
         let delivered = |records: &[crate::session::EventRecord]| {
@@ -582,8 +586,7 @@ mod tests {
             json!({"source":"return 42;"}),
         );
         let reply = vec![AssistantItem::text("child-reply", 0, REPLY), child_tool];
-        let launch =
-            json!({"prompt":"child task", "model":"child", "name":"child-replier", "bg":true});
+        let launch = json!({"prompt":"child task", "model":"wait-test/child", "name":"child-replier", "bg":true});
         let final_reply = vec![AssistantItem::text("child-final", 0, FINAL)];
         let after_final = vec![call("after-final", "wait", json!({"timeout":1}))];
         let tracking = tracking_all(vec![
@@ -688,7 +691,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn intermediate_child_replies_outlive_a_full_parent_mailbox() {
         let reply_count = AGENT_CHANNEL_CAPACITY + 1;
-        let launch = json!({"prompt":"child task", "model":"child", "bg":true});
+        let launch = json!({"prompt":"child task", "model":"wait-test/child", "bg":true});
         let mut steps = vec![
             ("root", vec![call("child", "agent", launch)]),
             // Unlike wait, this response has no tool call and can end the parent turn.
@@ -802,7 +805,7 @@ mod tests {
         };
         let id = runtime.jobs.test_running(spec).await.into_test_id();
         let child = session.root.child(123);
-        let started = crate::session::fixture::child_started(
+        let started = crate::session::tests::child_started(
             Some(id),
             crate::execution::ExecutionLocation::root(root.to_path_buf()),
         );

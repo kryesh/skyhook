@@ -181,7 +181,7 @@ impl From<(Line<'static>, bool)> for LayoutLine {
 }
 
 #[cfg(test)]
-mod geometry_tests {
+mod tests {
     use super::*;
     #[test]
     fn code_geometry_validates_zero_narrow_and_extreme_containers() {

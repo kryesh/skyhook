@@ -59,7 +59,7 @@ pub enum OutputAction {
 #[derive(Clone)]
 pub enum MenuKind {
     Commands(Vec<Item<Command>>),
-    Models(Vec<Item<String>>),
+    Models(Vec<Item<ModelRef>>),
     Modes(Vec<Item<String>>),
     Agents(Vec<Item<AgentId>>),
     Sessions(Vec<Item<SessionRef>>),
@@ -394,8 +394,8 @@ impl App {
             Command::Model => {
                 self.open(
                 "Model", MenuKind::Models(
-                self.launch.model.config().config().models.iter().map(|(name, profile)| {
-                    Item::new(name.clone(), name, format!("{} · {}", profile.provider, profile.model))
+                self.launch.model.config().models().map(|(name, profile)| {
+                    Item::new(name.clone(), name.to_string(), profile.model.clone())
                 }).collect()),
                 );
                 if let Some(menu) = &mut self.menu
@@ -467,7 +467,7 @@ impl App {
                 notices.send("Continue requested");
                 let requested = model.is_some() || mode.is_some();
                 tokio::spawn(async move {
-                    let outcome = match session.selection(model.as_deref(), mode.as_deref()) {
+                    let outcome = match session.selection(model.as_ref(), mode.as_deref()) {
                         Ok(selection) => session.continue_turn_with(selection).await,
                         Err(error) => Err(error),
                     };
@@ -685,7 +685,7 @@ impl App {
                 if let Some(index) = selected {
                     match self.launch.model.config().select_model(&items[index].value) {
                         Ok(model) => {
-                            self.model = model.name().to_owned();
+                            self.model = model.name();
                             self.launch.model = model;
                         }
                         Err(error) => self.notice(error.to_string()),
@@ -1293,18 +1293,18 @@ mod tests {
         let (_root, mut app) = fixture().await;
         // The palette's selected value must belong to the admitted catalog.
         let mut config = app.launch.model.config().config().clone();
+        let models = &mut config.providers["test"].common.models;
         for name in ["second", "third"] {
-            config
-                .models
-                .insert(name.into(), config.models["first"].clone());
+            let first = models["first"].clone();
+            models.insert(name.parse().unwrap(), first);
         }
         app.launch.model = config
             .into_runtime()
             .unwrap()
-            .select_model("first")
+            .select_model(&"test/first".parse().unwrap())
             .unwrap();
         let models = |labels: [(&str, &str); 3]| {
-            let items = labels.map(|(value, label)| Item::new(value.into(), label, ""));
+            let items = labels.map(|(value, label)| Item::new(value.parse().unwrap(), label, ""));
             MenuKind::Models(items.into())
         };
         let row = |app: &mut App, index| {
@@ -1315,7 +1315,11 @@ mod tests {
         };
         app.open(
             "Models",
-            models([("first", "First"), ("second", "Second"), ("third", "Third")]),
+            models([
+                ("test/first", "First"),
+                ("test/second", "Second"),
+                ("test/third", "Third"),
+            ]),
         );
         let second = row(&mut app, 1);
         let selected = |app: &App| app.menu.as_ref().unwrap().selected;
@@ -1343,17 +1347,17 @@ mod tests {
         assert!(!app.dirty);
         key(&mut app, KeyCode::Enter, M::NONE);
         assert!(app.menu.is_none());
-        assert_eq!(app.model, "second");
+        assert_eq!(app.model.to_string(), "test/second");
         let filtered = [
-            ("hidden", "Hidden"),
-            ("first", "Visible first"),
-            ("second", "Visible second"),
+            ("test/hidden", "Hidden"),
+            ("test/first", "Visible first"),
+            ("test/second", "Visible second"),
         ];
         app.open("Models", models(filtered));
         app.menu.as_mut().unwrap().input.set("Visible".into());
         let visible_second = row(&mut app, 1);
         mouse(&mut app, visible_second, MouseEventKind::Moved);
         key(&mut app, KeyCode::Enter, M::NONE);
-        assert_eq!(app.model, "second");
+        assert_eq!(app.model.to_string(), "test/second");
     }
 }

@@ -9,6 +9,7 @@ use skyhook::{
     fs::RegularFileError,
     identity::SessionId,
     media::{Attachment, Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, classify},
+    provider::profile::ModelRef,
     remote::EmbeddedShimCatalog,
     session::{SessionError, SessionStore},
     tool::policy::{AllowAll, Capability, CapabilitySet, Policy},
@@ -103,10 +104,8 @@ impl Permissions {
 pub enum LaunchError {
     #[error(transparent)]
     Session(#[from] SessionError),
-    #[error("Model profile {0} is missing. Restore it in the configuration before resuming.")]
-    MissingProfile(String),
-    #[error("Unknown model profile: {0}")]
-    UnknownProfile(String),
+    #[error("Model {0} is missing. Restore it in the configuration before resuming.")]
+    MissingModel(ModelRef),
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error(transparent)]
@@ -133,7 +132,7 @@ impl Launch {
                     .model
                     .config()
                     .select_model(&name)
-                    .map_err(|_| LaunchError::MissingProfile(name))?;
+                    .map_err(|_| LaunchError::MissingModel(name))?;
             }
         }
         let capabilities = self.ceiling(model.config().config(), resume.is_some());
@@ -224,20 +223,18 @@ pub async fn load_config(
     Ok(resolved.config.into_runtime()?)
 }
 
-/// Select the explicit model, remembered model, or first configured model for both hosts.
+/// Select the explicit model, remembered model, or configured default for both hosts.
 pub fn select_model(
     config: &RuntimeConfig,
-    explicit: Option<&str>,
-    saved: Option<&str>,
+    explicit: Option<&ModelRef>,
+    saved: Option<&ModelRef>,
 ) -> Result<ConfiguredModel, LaunchError> {
     if let Some(name) = explicit {
-        return config
-            .select_model(name)
-            .map_err(|_| LaunchError::UnknownProfile(name.to_owned()));
+        return Ok(config.select_model(name)?);
     }
     Ok(saved
         .and_then(|name| config.select_model(name).ok())
-        .unwrap_or_else(|| config.first_model()))
+        .unwrap_or_else(|| config.default_model()))
 }
 
 impl Launch {
@@ -271,7 +268,7 @@ mod tests {
     use crate::cli::{self, Invocation};
 
     fn history_config(root: Option<PathBuf>) -> RuntimeConfig {
-        let mut config = Config::from_yaml("providers:\n  test:\n    kind: openai\n    api: chat_completions\n    base_url: http://127.0.0.1:1/v1\nmodels:\n  test:\n    provider: test\n    model: fixture\n    max_context: 128000\n    max_output: 4096\n").unwrap();
+        let mut config = Config::from_yaml("providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1/v1\n    models:\n      test:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n").unwrap();
         config.session_root = root;
         config.into_runtime().unwrap()
     }
@@ -283,7 +280,7 @@ mod tests {
             panic!("interactive request")
         };
         let mode = Permissions::Mode(config.default_mode().to_owned());
-        Launch::from_request(&request.execution, config.first_model(), mode, None)
+        Launch::from_request(&request.execution, config.default_model(), mode, None)
             .await
             .unwrap()
     }
@@ -292,37 +289,44 @@ mod tests {
     fn selection_precedence_and_stale_memory_preserve_the_runtime_owner() {
         let original = history_config(None);
         let mut config = original.config().clone();
-        let mut second = config.models["test"].clone();
-        second.model = "second-fixture".into();
-        config.models.insert("another".into(), second);
+        let models = &mut config.providers["test"].common.models;
+        let mut second = models["test"].clone();
+        second.profile.model = "second-fixture".into();
+        models.insert("another".parse().unwrap(), second);
         let config = config.into_runtime().unwrap();
+        let name = |name: &str| name.parse::<ModelRef>().unwrap();
         for (explicit, saved, expected) in [
-            (Some("test"), Some("another"), "test"),
-            (None, Some("another"), "another"),
-            (None, Some("removed"), "test"),
-            (None, None, "test"),
+            (Some("test/test"), Some("test/another"), "test/test"),
+            (None, Some("test/another"), "test/another"),
+            (None, Some("test/removed"), "test/test"),
+            (None, None, "test/test"),
         ] {
-            let model = select_model(&config, explicit, saved).unwrap();
-            assert_eq!(model.name(), expected);
+            let (explicit, saved) = (explicit.map(name), saved.map(name));
+            let model = select_model(&config, explicit.as_ref(), saved.as_ref()).unwrap();
+            assert_eq!(model.name(), name(expected));
             assert!(std::ptr::eq(model.config().config(), config.config()));
-            assert!(std::ptr::eq(
-                model.profile(),
-                &config.config().models[expected]
-            ));
+            let profile = config.model(&name(expected)).unwrap();
+            assert!(std::ptr::eq(model.profile(), profile));
         }
-        let Err(unknown) = select_model(&config, Some("removed"), Some("another")) else {
-            panic!("an explicit unknown profile is rejected");
+        let explicit = name("test/removed");
+        let saved = name("test/another");
+        let Err(unknown) = select_model(&config, Some(&explicit), Some(&saved)) else {
+            panic!("an explicit unknown model is rejected");
         };
-        assert!(matches!(&unknown, LaunchError::UnknownProfile(name) if name == "removed"));
-        assert_eq!(unknown.to_string(), "Unknown model profile: removed");
+        assert_eq!(
+            unknown.to_string(),
+            "invalid model `test/removed`: model is not configured"
+        );
 
         // Persist names, not handles: the same name after reload belongs to the
         // newly admitted generation, even while an earlier selection is alive.
         let old = select_model(&original, None, None).unwrap();
         let mut reloaded = original.config().clone();
-        reloaded.models["test"].model = "reloaded-fixture".into();
+        reloaded.providers["test"].common.models["test"]
+            .profile
+            .model = "reloaded-fixture".into();
         let reloaded = reloaded.into_runtime().unwrap();
-        let rebound = select_model(&reloaded, None, Some(old.name())).unwrap();
+        let rebound = select_model(&reloaded, None, Some(&old.name())).unwrap();
         assert_eq!(old.profile().model, "fixture");
         assert_eq!(rebound.profile().model, "reloaded-fixture");
         assert!(!std::ptr::eq(
@@ -345,16 +349,19 @@ mod tests {
         drop(session);
 
         let mut reloaded = config.config().clone();
-        let profile = reloaded.models.shift_remove("test").unwrap();
-        reloaded.models.insert("replacement".into(), profile);
+        let models = &mut reloaded.providers["test"].common.models;
+        let profile = models.shift_remove("test").unwrap();
+        models.insert("replacement".parse().unwrap(), profile);
         let launch = launch(root.path(), &reloaded.into_runtime().unwrap()).await;
         let Err(missing) = launch.create(Some(id)).await else {
-            panic!("a missing recorded profile is reported");
+            panic!("a missing recorded model is reported");
         };
-        assert!(matches!(&missing, LaunchError::MissingProfile(name) if name == "test"));
+        assert!(
+            matches!(&missing, LaunchError::MissingModel(name) if name.to_string() == "test/test")
+        );
         assert_eq!(
             missing.to_string(),
-            "Model profile test is missing. Restore it in the configuration before resuming."
+            "Model test/test is missing. Restore it in the configuration before resuming."
         );
         // A valid new selection remains usable; stale history is not silently
         // rebound to that unrelated model.
@@ -392,7 +399,7 @@ mod tests {
             root.path().join("other/.skyhook/sessions"),
         ] {
             // Seed valid, resumable history, not merely empty session directories.
-            let model = history_config(None).first_model();
+            let model = history_config(None).default_model();
             let builder = model
                 .harness_builder(&workspace)
                 .unwrap()

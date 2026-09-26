@@ -11,17 +11,18 @@ use crate::{
     identity::AgentId,
     provider::{
         Provider, ProviderContext,
-        profile::{ModelProfile, StateMode},
+        profile::StateMode,
         protocol::{ContextId, HistoryLifetime, ModelRequest, Usage},
     },
     session::{
-        EventRecord, Message, ModelRequestTemplate, Projection, RecordSeq, SessionEvent, UserPart,
-        project_history,
+        EventRecord, Message, ModelRequestTemplate, ProfileSnapshot, Projection, RecordSeq,
+        SessionEvent, UserPart, project_history,
     },
 };
 
 pub(super) struct AgentContext {
-    pub profile: ModelProfile,
+    /// The profile this context was opened for; a different selection reopens it.
+    pub profile: ProfileSnapshot,
     pub template: ModelRequestTemplate,
     pub projected: Projection,
     pub meter: TokenMeter,
@@ -39,7 +40,7 @@ pub(super) struct AgentContext {
 impl AgentContext {
     pub fn open(
         agent: &AgentId,
-        profile: ModelProfile,
+        profile: ProfileSnapshot,
         template: ModelRequestTemplate,
         factory: &dyn Provider,
         records: &[EventRecord],
@@ -105,11 +106,10 @@ impl AgentContext {
         let suffix = &self.projected.messages[self.prefix..];
         let known: std::collections::HashSet<_> =
             suffix.iter().map(|(sequence, _)| *sequence).collect();
-        for (sequence, message) in committed {
-            if !known.contains(&sequence) && !message.is_content_free() {
-                self.projected.messages.push((sequence, message));
-            }
-        }
+        let unseen = committed
+            .into_iter()
+            .filter(|(sequence, _)| !known.contains(sequence));
+        self.projected.messages.extend(unseen);
         self.projected.messages[self.prefix..].sort_by_key(|(sequence, _)| *sequence);
         self.through = through;
         Ok(())
@@ -118,7 +118,7 @@ impl AgentContext {
     /// The request's tail: the runtime state, unless the profile's state mode omits
     /// it. A persisting profile commits it to history instead, before the request.
     pub fn tail(&self, runtime: UserPart) -> Option<Message> {
-        match self.profile.state_mode {
+        match self.profile.profile.state_mode {
             StateMode::None => None,
             StateMode::Dynamic | StateMode::Persist => Some(Message::User(vec![runtime])),
         }
@@ -140,7 +140,7 @@ impl AgentContext {
         // A summary that could not shrink this context is not worth repeating until
         // there is another retained tail's worth of history to fold into it.
         let grown = self.skipped_at.is_none_or(|skipped| {
-            tokens >= skipped.saturating_add(retention_budget(self.profile.max_context))
+            tokens >= skipped.saturating_add(retention_budget(self.profile.profile.max_context))
         });
         grown && self.reaches_compaction(tokens)
     }
@@ -155,12 +155,12 @@ impl AgentContext {
         let later = self.projected.messages.split_off(self.prefix);
         let kept = later
             .into_iter()
-            .filter_map(|(sequence, message)| Some((sequence, message.without_bound_reasoning()?)));
+            .map(|(sequence, message)| (sequence, message.without_bound_reasoning()));
         self.projected.messages.extend(kept);
     }
 
     fn reaches_compaction(&self, tokens: u64) -> bool {
-        u128::from(tokens) * 5 >= u128::from(self.profile.max_context) * 4
+        u128::from(tokens) * 5 >= u128::from(self.profile.profile.max_context) * 4
     }
 
     pub fn contains_images(&self) -> bool {
@@ -266,6 +266,7 @@ mod tests {
     use tokio::sync::Notify;
 
     use super::super::*;
+    use crate::agent::runtime::tests::{model_ref, models, provider_name};
     use crate::provider::{
         ProviderContext, ProviderError, ResponseStream,
         protocol::{AssistantItem, Completion, ContextId, ResponseEvent},
@@ -340,7 +341,7 @@ mod tests {
     }
 
     fn test_context(capacity: u64, max_output: u64) -> super::AgentContext {
-        let profile = ModelProfile::new("test", "test", None, capacity, max_output, false);
+        let profile = ModelProfile::new("test", None, capacity, max_output, false);
         let request = ModelRequest {
             max_output_tokens: Some(max_output),
             ..ModelRequest::test(&profile.model)
@@ -350,7 +351,10 @@ mod tests {
             id: 0,
         });
         super::AgentContext {
-            profile,
+            profile: crate::session::ProfileSnapshot {
+                name: model_ref("test"),
+                profile,
+            },
             template: request.try_into().unwrap(),
             projected: crate::session::Projection::default(),
             meter: super::TokenMeter::default(),
@@ -412,6 +416,7 @@ mod tests {
                 let total = |tokens: u64| Usage {
                     input_tokens: tokens / 3,
                     cached_input_tokens: tokens / 3,
+                    cache_write_input_tokens: 0,
                     output_tokens: tokens - 2 * (tokens / 3),
                 };
                 assert!(!context.needs_compaction(Usage::default()));
@@ -435,12 +440,15 @@ mod tests {
     async fn cancelled_children_release_but_failed_children_retain_their_context() {
         let root = tempfile::tempdir().unwrap();
         let tracking = Arc::new(Tracking::default());
-        let profile = ModelProfile::new("test", "first", None, 128_000, 16_384, false);
+        let profile = ModelProfile::new("first", None, 128_000, 16_384, false);
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
-            .provider("test", Arc::new(Factory(tracking.clone())))
-            .model_profile("first", profile)
-            .default_model_profile("first")
+            .provider(
+                provider_name("test"),
+                Arc::new(Factory(tracking.clone())),
+                models([("first", profile)]),
+            )
+            .default_model(model_ref("first"))
             .build()
             .await
             .unwrap();

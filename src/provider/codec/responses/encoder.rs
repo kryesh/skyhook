@@ -1,0 +1,442 @@
+//! Encode conversation history and request options as native Responses input.
+use super::*;
+use crate::provider::codec::{
+    CodecName,
+    common::{
+        attach_runtime_tail, check_tool, image_url, invalid, own_replay, system_text, tool_text,
+        user_parts,
+    },
+};
+use crate::provider::protocol::{AssistantItem, Message, ModelRequest, Replay, ReplayFormat};
+use serde_json::Map;
+
+/// The body fields this codec writes.
+pub(crate) const BODY_FIELDS: &[&str] = &[
+    "model",
+    "input",
+    "stream",
+    "store",
+    "include",
+    "reasoning.summary",
+    "instructions",
+    "tools",
+    "text",
+];
+
+pub(crate) fn encode(
+    request: &ModelRequest,
+    dialect: &Dialect,
+) -> Result<Map<String, Value>, ProviderError> {
+    if request.model.trim().is_empty() {
+        return Err(invalid("Responses requires a nonempty model"));
+    }
+    // History precedes the per-request tail so the tail never breaks a cached
+    // history prefix. Runtime state joins the final history turn, so only that
+    // turn is re-read.
+    let mut input = Vec::new();
+    for (index, message) in request.messages().enumerate() {
+        if index >= request.history.len()
+            && attach_runtime_tail(&mut input, message, "input_text", |item| {
+                (item["type"] == "function_call_output").then(|| &mut item["output"])
+            })
+        {
+            continue;
+        }
+        match message {
+            Message::User(parts) => {
+                let content = user_parts(request, parts, "input_text", |image| {
+                    Ok(json!({"type":"input_image", "image_url":image_url(request, image)?}))
+                })?;
+                input.push(json!({"type":"message", "role":"user", "content":content}));
+            }
+            Message::Assistant(items) => {
+                for item in items {
+                    match item {
+                        // Private replay belongs to the item, never to each display summary.
+                        AssistantItem::Reasoning { replay, .. } => {
+                            if let Some(Replay {
+                                payload: native, ..
+                            }) =
+                                own_replay(replay.as_ref(), ReplayFormat::Responses, &request.model)
+                            {
+                                if kind(native).map_err(|error| invalid(error.message))?
+                                    != ItemKind::Reasoning
+                                {
+                                    return Err(invalid(
+                                        "Responses reasoning envelope contains a non-reasoning item",
+                                    ));
+                                }
+                                final_parts(native).map_err(|error| invalid(error.message))?;
+                                input.push(native.clone());
+                            }
+                        }
+                        // `type` is optional in the spec, but some servers
+                        // cannot identify an assistant item without it.
+                        AssistantItem::Text { blocks, .. } => {
+                            for block in blocks {
+                                input.push(json!({
+                                    "type":"message", "role":"assistant",
+                                    "content":[{"type":"output_text", "text":block.text}]
+                                }));
+                            }
+                        }
+                        AssistantItem::ToolCall { call, .. } => {
+                            input.push(json!({"type":"function_call", "call_id":call.id(),
+                                "name":call.name(), "arguments":serde_json::to_string(call.arguments()).expect("JSON object serialization cannot fail")}));
+                        }
+                    }
+                }
+            }
+            Message::Tool(results) => {
+                for result in results {
+                    if result.call_id.is_empty() {
+                        return Err(invalid("Responses tool output requires a call ID"));
+                    }
+                    input.push(
+                        json!({"type":"function_call_output", "call_id":result.call_id,
+                        "output":tool_text(result)}),
+                    );
+                    if !result.images.is_empty() {
+                        let mut content = vec![json!({"type":"input_text", "text":format!(
+                            "Images from tool {} (call_id: {}):", result.name, result.call_id)})];
+                        for image in &result.images {
+                            content
+                                .push(json!({"type":"input_image", "image_url":image_url(request, image)?}));
+                        }
+                        input.push(json!({"type":"message", "role":"user", "content":content}));
+                    }
+                }
+            }
+        }
+    }
+    let mut settings = serde_json::Map::from_iter([
+        ("model".into(), json!(request.model)),
+        ("stream".into(), json!(true)),
+        ("store".into(), json!(false)),
+        ("include".into(), json!(["reasoning.encrypted_content"])),
+    ]);
+    if dialect.reasoning_summary == ReasoningSummary::Requested {
+        settings.insert("reasoning".into(), json!({"summary":"auto"}));
+    }
+    match (system_text(request), dialect.instructions) {
+        (Some(system), _) => {
+            settings.insert("instructions".into(), Value::String(system));
+        }
+        (None, Instructions::RequiredEvenWhenEmpty) => {
+            settings.insert("instructions".into(), Value::String(String::new()));
+        }
+        (None, Instructions::WhenPresent) => {}
+    }
+    if !request.tools.is_empty() {
+        let mut tools = Vec::new();
+        for tool in &request.tools {
+            check_tool(tool, dialect.tool_names, CodecName::Responses)?;
+            tools.push(json!({"type":"function", "name":tool.name,
+                "description":tool.description, "parameters":tool.input_schema, "strict":false}));
+        }
+        settings.insert("tools".into(), Value::Array(tools));
+    }
+    if let Some(schema) = &request.response_schema {
+        if schema.name.is_empty() || !schema.schema.is_object() {
+            return Err(invalid(
+                "Responses structured output requires a name and object JSON Schema",
+            ));
+        }
+        settings.insert(
+            "text".into(),
+            json!({"format":{"type":"json_schema", "name":schema.name,
+            "schema":schema.schema, "strict":true}}),
+        );
+    }
+    if let Some(effort) = &request.reasoning {
+        dialect.effort.place(&mut settings, effort)?;
+    }
+    if let Some(max) = request.max_output_tokens {
+        if max == 0 {
+            return Err(invalid("Responses max_output_tokens must be positive"));
+        }
+        if let Some(path) = &dialect.output_limit {
+            path.set(&mut settings, json!(max))?;
+        }
+    }
+    // Input is always an explicit array, even for an empty conversation.
+    settings.shift_insert(1, "input".into(), Value::Array(input));
+    Ok(settings)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::tests::{assemble_with, call_item, completed, reasoning_item};
+    use super::*;
+
+    use crate::provider::codec::common::tests::{envelope, image, notes, request, scope};
+    use crate::{
+        media::{AttachmentRef, ImageRef},
+        provider::protocol::{
+            Binding, Outcome, ResponseSchema, SystemSegment, ToolDefinition, ToolResult,
+            UserContent,
+        },
+    };
+
+    fn assemble(output: Vec<Value>) -> Vec<AssistantItem> {
+        let decoder = Decoder::new(
+            "gpt-5".into(),
+            scope(),
+            &Dialect::stateless(),
+            ErrorSignals::NONE,
+        );
+        assemble_with(decoder, vec![completed(output)])
+            .unwrap()
+            .completion
+            .items()
+            .to_vec()
+    }
+
+    fn text_item(id: &str, text: &str) -> Value {
+        json!({"type":"message", "id":id, "role":"assistant",
+            "content":[{"type":"output_text", "text":text}]})
+    }
+
+    fn user(text: &str) -> Message {
+        Message::User(vec![UserContent::Text { text: text.into() }])
+    }
+
+    fn tool_result(result: Value, images: Vec<ImageRef>, is_error: bool) -> Message {
+        Message::Tool(vec![ToolResult {
+            call_id: "call_1".into(),
+            name: "search".into(),
+            result,
+            images,
+            is_error,
+        }])
+    }
+
+    #[test]
+    fn summary_and_effort_are_placed_by_the_dialect() {
+        let mut req = request("gpt-5");
+        let efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+        for effort in std::iter::once(None).chain(efforts.map(Some)) {
+            req.reasoning = effort.map(str::to_owned);
+            let body = encode(&req, &Dialect::stateless()).unwrap();
+            assert_eq!(body["reasoning"]["summary"], "auto");
+            assert_eq!(
+                body["reasoning"].get("effort"),
+                effort.map(|e| json!(e)).as_ref()
+            );
+            assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
+        }
+        req.reasoning = Some("low".into());
+        let silent = Dialect {
+            reasoning_summary: ReasoningSummary::Unsupported,
+            ..Dialect::stateless()
+        };
+        let body = encode(&req, &silent).unwrap();
+        assert_eq!(body["reasoning"], json!({"effort":"low"}));
+        req.reasoning = Some("adaptive".into());
+        assert!(encode(&req, &silent).is_err());
+    }
+
+    #[test]
+    fn empty_history_is_explicit_and_http_envelope_is_unchanged() {
+        let mut req = request("gpt-5");
+        req.history.clear();
+        req.max_output_tokens = None;
+        let encoded = crate::provider::codec::Codec::Responses(Dialect::stateless())
+            .encode(&req, &"session".parse().unwrap())
+            .unwrap();
+        assert!(encoded.headers.is_empty());
+        assert_eq!(
+            encoded.body,
+            json!({
+                "model":"gpt-5", "input":[], "stream":true, "store":false,
+                "include":["reasoning.encrypted_content"],
+                "reasoning":{"summary":"auto"}, "prompt_cache_key":"session"
+            })
+        );
+    }
+
+    #[test]
+    fn request_transmits_native_tools_schema_reasoning_and_cache_key() {
+        let mut req = request("gpt-5");
+        req.system = vec![SystemSegment {
+            text: "system".into(),
+            cache: false,
+        }];
+        req.tools = vec![ToolDefinition {
+            name: "search".into(),
+            description: "Search".into(),
+            input_schema: json!({"type":"object"}),
+        }];
+        let schema = json!({"type":"object", "properties":{}, "additionalProperties":false});
+        req.response_schema = Some(ResponseSchema {
+            name: "answer".into(),
+            schema: schema.clone(),
+        });
+        req.reasoning = Some("high".into());
+        let attach = |attachment| UserContent::Attachment { attachment };
+        let Message::User(mut content) = user("look") else {
+            unreachable!()
+        };
+        content.extend([
+            attach(AttachmentRef::Image(image())),
+            attach(AttachmentRef::Text(notes())),
+        ]);
+        req.history = vec![
+            Message::User(content),
+            tool_result(json!({"answer":42, "error":null}), vec![image()], true),
+        ];
+        assert!(encode(&req, &Dialect::stateless()).is_err());
+        // Load the fixture blobs as the session store would.
+        req.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
+        req.blobs.insert(notes().blob, b"notes".to_vec());
+        let body = encode(&req, &Dialect::stateless()).unwrap();
+        let image_url = "data:image/png;base64,AQID";
+        assert_eq!(body["instructions"], "system");
+        assert_eq!(body["tools"][0]["name"], "search");
+        assert_eq!(body["text"]["format"]["schema"], schema);
+        assert_eq!(
+            body["reasoning"],
+            json!({"effort":"high", "summary":"auto"})
+        );
+        let content = &body["input"][0]["content"];
+        assert_eq!(content[0]["text"], "look");
+        assert_eq!(content[1]["image_url"], image_url);
+        assert_eq!(
+            content[2],
+            json!({"type":"input_text", "text":"File: notes.txt\nnotes"})
+        );
+        assert_eq!(body["input"][1]["call_id"], "call_1");
+        let result: Value =
+            serde_json::from_str(body["input"][1]["output"].as_str().unwrap()).unwrap();
+        assert_eq!(
+            result,
+            json!({"result":{"answer":42,"error":null},"is_error":true})
+        );
+        assert_eq!(body["input"][2]["content"][1]["image_url"], image_url);
+    }
+
+    #[test]
+    fn reasoning_from_other_providers_or_models_is_not_replayed() {
+        for (format, model) in [
+            (ReplayFormat::Messages, "gpt-5"),
+            (ReplayFormat::Responses, "other-model"),
+        ] {
+            let mut req = request("gpt-5");
+            let replay = envelope(format, model, reasoning_item(), Binding::Free);
+            let reasoning = AssistantItem::reasoning("r", 0, "private", Some(replay));
+            req.history = vec![Message::Assistant(vec![reasoning])];
+            assert_eq!(
+                encode(&req, &Dialect::stateless()).unwrap()["input"],
+                json!([])
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_reasoning_replays_only_to_its_model_beside_tools() {
+        let mut req = request("gpt-5");
+        // No display summary is required for native reasoning to be replayable.
+        let native = json!({"type":"reasoning", "id":"rs_opaque", "summary":[],
+            "encrypted_content":"opaque+/=", "future_state":{"signature":"unchanged"},
+            "content":[{"type":"reasoning_text", "text":"native reasoning text"}]});
+        let decoder = Decoder::new(
+            req.model.clone(),
+            scope(),
+            &Dialect::stateless(),
+            ErrorSignals::NONE,
+        );
+        let reduced =
+            assemble_with(decoder, vec![completed(vec![native.clone(), call_item()])]).unwrap();
+        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
+        let items = reduced.items().to_vec();
+        assert_eq!(
+            items[0].reasoning_text().as_deref(),
+            Some("native reasoning text")
+        );
+        req.history = vec![
+            Message::Assistant(items),
+            tool_result(json!({"found":true}), vec![], false),
+        ];
+        let body = encode(&req, &Dialect::stateless()).unwrap();
+        let input = &body["input"];
+        assert_eq!(input[0], native);
+        assert_eq!(
+            (&input[1]["type"], &input[2]["type"]),
+            (&json!("function_call"), &json!("function_call_output"))
+        );
+        assert_eq!(input[1]["call_id"], input[2]["call_id"]);
+        // Another model's reasoning stays behind; the call and its output do not.
+        req.model = "gpt-6".into();
+        let wire = encode(&req, &Dialect::stateless()).unwrap();
+        assert_eq!(wire["input"], json!([input[1].clone(), input[2].clone()]));
+    }
+
+    #[test]
+    fn terminal_only_output_replays_across_tool_and_followup_turns() {
+        let mut native_reasoning = reasoning_item();
+        native_reasoning["encrypted_content"] = json!("mock-replay-state");
+        let items = assemble(vec![
+            native_reasoning.clone(),
+            text_item("text-terminal", "checking"),
+            call_item(),
+        ]);
+        let mut req = request("gpt-5");
+        req.history = vec![
+            user("look it up"),
+            Message::Assistant(items),
+            tool_result(json!({"value":42}), vec![], false),
+        ];
+        let encoded = encode(&req, &Dialect::stateless()).unwrap();
+        let input = encoded["input"].as_array().unwrap();
+        let reasoning = input.iter().filter(|item| item["type"] == "reasoning");
+        assert_eq!(reasoning.count(), 1);
+        assert_eq!(input[1], native_reasoning);
+        // Assistant items are typed: some servers cannot identify them otherwise.
+        assert_eq!(
+            (&input[2]["type"], &input[2]["role"]),
+            (&json!("message"), &json!("assistant"))
+        );
+        assert_eq!(
+            input[2]["content"][0],
+            json!({"type":"output_text", "text":"checking"})
+        );
+        assert_eq!(
+            input[3],
+            json!({"type":"function_call", "call_id":"call_1", "name":"search", "arguments":"{\"query\":\"rust\"}"})
+        );
+        assert_eq!(
+            (&input[4]["type"], &input[4]["call_id"]),
+            (&json!("function_call_output"), &json!("call_1"))
+        );
+
+        req.history.push(Message::Assistant(assemble(vec![text_item(
+            "answer", "42",
+        )])));
+        req.history.push(user("thanks"));
+        let replayed = encode(&req, &Dialect::stateless()).unwrap();
+        let replayed = replayed["input"].as_array().unwrap();
+        assert_eq!(&replayed[..input.len()], input.as_slice());
+        assert_eq!(replayed[5]["content"][0]["text"], "42");
+        assert_eq!(replayed[6]["content"][0]["text"], "thanks");
+    }
+
+    #[test]
+    fn runtime_tail_joins_the_final_tool_output_or_user_turn() {
+        let text = "<skyhook_state>";
+        let state = Message::User(vec![UserContent::Runtime { text: text.into() }]);
+        let mut req = request("gpt-5");
+        req.history = vec![tool_result(json!(1), vec![], false)];
+        let without_tail = encode(&req, &Dialect::stateless()).unwrap()["input"].take();
+        req.tail = vec![state.clone()];
+        let input = encode(&req, &Dialect::stateless()).unwrap()["input"].take();
+        assert_eq!(input.as_array().unwrap().len(), 1);
+        let output = without_tail[0]["output"].as_str().unwrap();
+        assert_eq!(input[0]["output"], format!("{output}\n\n{text}"));
+        req.history = vec![user("hi")];
+        let input = encode(&req, &Dialect::stateless()).unwrap()["input"].take();
+        assert_eq!(
+            input,
+            json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":text}]}])
+        );
+    }
+}

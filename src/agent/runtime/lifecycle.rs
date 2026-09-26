@@ -64,12 +64,7 @@ impl SessionRuntime {
             router.clone(),
         )?;
         install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
-        tools::register(
-            &mut builder,
-            runtime_slot.clone(),
-            &harness.model_profiles,
-            &modes,
-        )?;
+        tools::register(&mut builder, runtime_slot.clone(), &harness.models, &modes)?;
         builder.extend(&harness.extra_tools)?;
         let (mcp, startup_warnings) =
             tools::connect_mcp(&mut builder, &harness, &capabilities, &store).await;
@@ -208,10 +203,10 @@ impl SessionRuntime {
 
     pub(super) async fn start_root(
         self: &Arc<Self>,
-        selection: Option<String>,
+        selection: Option<ModelRef>,
     ) -> Result<SessionHandle, HarnessError> {
         let root = AgentId::root(self.store.id());
-        let model_profile = selection.unwrap_or_else(|| self.harness.default_model_profile.clone());
+        let model = selection.unwrap_or_else(|| self.harness.default_model.clone());
         let mode = self.harness.mode.clone();
         let capabilities = match &mode {
             Some(mode) => self.mode_capabilities(mode)?,
@@ -221,7 +216,7 @@ impl SessionRuntime {
             .spawn_agent(AgentLaunch {
                 id: root.clone(),
                 owner_job: None,
-                model_profile,
+                model: Some(model),
                 todos: None,
                 available_depth: self.harness.max_child_depth,
                 location: crate::execution::ExecutionLocation::root(self.harness.workspace.clone()),

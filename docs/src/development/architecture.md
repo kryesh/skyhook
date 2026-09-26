@@ -13,7 +13,7 @@ See [embedding](embedding.md) for host API and replay contracts,
 | Owner | Responsibility |
 | --- | --- |
 | `config::RuntimeConfig` | An admitted, immutable configuration generation. A selected model retains the configuration that admitted it. |
-| `agent::Harness` | Shared provider factories, model profiles, policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions. |
+| `agent::Harness` | Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions. |
 | `agent::SessionHandle` / session runtime | One agent tree, its registry and jobs, target routing, MCP connections, observation stream, and session store. |
 | `AgentContext` | One agent loop's projected history, request template, model profile, token calibration, and owned provider context. |
 | `provider::ProviderContext` | Conversation-scoped provider resources and one-attempt model invocations, not authoritative conversation history or retry policy. |
@@ -28,17 +28,24 @@ select machines and workspaces; tools still operate on those machines' files.
 `provider::Provider` is a shared factory. `open_context(id)` creates an independently owned
 `ProviderContext` for one conversation without making a model request; `invoke(&mut self,
 request)` returns an owned asynchronous response stream that does not borrow the context. A
-startup failure is the stream's first and only item. Backends may send the context identity as
-cache-affinity metadata. Custom providers implement both traits; native adapters and codecs
-live under `provider::backends`, while shared request, message, and response types live under
-`provider::protocol`.
+startup failure is the stream's first and only item. Providers may send the context identity as
+cache-affinity metadata. Custom providers implement both traits. The three inference API
+families live under `provider::codec`: each codec encodes requests and decodes native streams
+under a typed dialect that names the conventions varying between servers of that family (field
+placements, tool-name rules, schema constraint, replay spelling, terminal-event shape), while the
+codec keeps the correctness rules and reads error bodies with its API's own codes. Vendor modules
+under `provider::dialect` own an entry's configuration, the codecs they speak and the dialect
+presets for each, credentials, and the transport conventions (fixed headers, per-turn session
+headers, and rules and typed readers that map their servers' own error codes and wording onto
+error kinds); every configured provider runs as the one `provider::http::HttpProvider`. Shared
+request, message, and response types live under `provider::protocol`.
 
 The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context
-for later input; resources are released when that loop exits. A model-profile change prepares
+for later input; resources are released when that loop exits. A model change prepares
 its replacement before committing the selection, preserves journal history, and resets token
-calibration. Equivalent profiles keep the current context. A mode change also replaces the
-prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
+calibration. Reselecting the current model keeps the current context. A mode change also replaces
+the prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
 context under the same context identity.
 
 The session owns the durable conversation (`session::Message`): user text and attachments, the
@@ -63,13 +70,14 @@ cacheable. A profile's `state_mode` puts runtime state in the tail (`dynamic`), 
 history (`persist`), or omits it (`none`). Persisted state lets later requests extend an unchanged
 conversation, which matters for reasoning bound to that conversation.
 
-`history_lifetime` communicates cache reuse without prescribing a backend implementation:
+`history_lifetime` communicates cache reuse without prescribing a provider implementation:
 
 - `extends` is the default: later requests extend this history.
 - `detached` marks one-off settings, such as a compaction summary request, with no reusable
   history prefix under those settings.
 
-Anthropic marks the last history block as a cache breakpoint except for detached requests.
+Messages, and Chat dialects that select content-part breakpoints, mark the last history block as a
+cache breakpoint except for detached requests.
 OpenAI protocols use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
 to the final tool output or user message instead of introducing a separate user turn, which
 would look like the user speaking again after every tool call.
@@ -108,11 +116,16 @@ cancellable and continues until success or interruption.
 
 A retry starts a fresh live response while retaining the attempt audit records and any reported
 usage. A stream that fails or closes before its end never authorizes tool execution, and
-transient recovery does not rerun completed tools. Authentication, invalid requests, and protocol
-errors do not enter this retry loop. Context-window recovery and invalid compaction summaries
-have their own bounded recovery path. A refusal cut fails without committing the refused message;
-an abort cut can retain completed safe content but still fails the turn; a truncated or
-incomplete cut commits its retained content as a completed response with that outcome.
+transient recovery does not rerun completed tools. An expired command-sourced credential is
+transient: the provider discards it on a 401 and the retry fetches a fresh one. Other
+authentication failures, invalid requests, and protocol errors do not enter this retry loop.
+Context-window recovery and invalid compaction summaries have their own bounded recovery path.
+
+A refusal cut fails without committing the refused message; an abort cut can retain completed
+safe content but still fails the turn. Any other response with neither nonblank text nor a tool
+call fails with nothing committed: `OutputLimit` when cut at the output limit, `Empty` otherwise.
+A truncated or incomplete cut with content commits it as a completed response with that outcome.
+Empty text is never committed, even beside a tool call.
 
 ## Compaction and context accounting
 

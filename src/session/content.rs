@@ -50,16 +50,9 @@ pub enum UserPart {
 }
 
 impl Message {
-    /// An assistant message that yields no content blocks at all, and so cannot be
-    /// encoded into a later request: Anthropic rejects it outright, and Chat/Responses
-    /// drop it silently. It must never reach the append-only journal, because a
-    /// committed one makes every subsequent request fail.
-    ///
-    /// Emptiness here is structural, never a judgement about text. An empty or
-    /// whitespace-only text block is content: providers legitimately emit one
-    /// alongside tool calls on a non-final turn, and it replays without complaint.
-    /// Reasoning is content whenever it carries replay state, or a block that an
-    /// encoder may render.
+    /// An assistant message with neither nonblank text nor a tool call. Reasoning
+    /// accompanies an action but is never one, so such a turn is refused before it
+    /// is committed: a committed one would make every later request unencodable.
     #[must_use]
     pub fn is_content_free(&self) -> bool {
         match self {
@@ -70,13 +63,13 @@ impl Message {
 
     /// Drop replay bound to the conversation that produced it, keeping display text. Changing
     /// that conversation, as compaction or a mode switch does, invalidates such replay; other
-    /// replay is kept. A message left content-free cannot be encoded and is dropped whole.
+    /// replay is kept.
     #[must_use]
-    pub fn without_bound_reasoning(mut self) -> Option<Self> {
+    pub fn without_bound_reasoning(mut self) -> Self {
         if let Self::Assistant(items) = &mut self {
             items.iter_mut().for_each(AssistantItem::unbind);
         }
-        (!self.is_content_free()).then_some(self)
+        self
     }
 
     /// The message as a provider receives it: runtime state and job events as
@@ -422,26 +415,13 @@ mod tests {
         assert_eq!(cell("two words"), "\"two words\"");
         assert_eq!(cell("λ"), "\"λ\"");
     }
-}
 
-#[cfg(test)]
-mod content_free_tests {
-    use super::*;
-    use crate::provider::protocol::{
-        Binding, ItemId, Position, Provenance, Replay, Scope, ToolCall,
-    };
+    use crate::provider::codec::common::tests::envelope;
+    use crate::provider::protocol::{Binding, ItemId, Position, Replay, ReplayFormat};
     use serde_json::json;
 
-    fn envelope() -> Replay {
-        Replay {
-            provenance: Provenance {
-                protocol: "anthropic".into(),
-                model: "model".into(),
-                scope: Scope::try_from("scope".to_owned()).unwrap(),
-            },
-            payload: json!({"type":"thinking","thinking":"private","signature":"signed"}),
-            binding: Binding::Conversation,
-        }
+    fn replay(binding: Binding) -> Replay {
+        envelope(ReplayFormat::Messages, "model", json!({}), binding)
     }
 
     fn id(id: &str) -> ItemId {
@@ -466,57 +446,40 @@ mod content_free_tests {
         }
     }
 
+    /// Only nonblank text or a call makes an assistant turn; reasoning, with or
+    /// without replay, and blank text ride along.
     #[test]
-    fn content_free_means_no_blocks_at_all_not_empty_text() {
-        // The only unencodable shapes: no items, or items carrying no blocks and
-        // no replay state. A tool call is always content.
+    fn content_free_means_no_nonblank_text_and_no_call() {
         assert!(Message::Assistant(Vec::new()).is_content_free());
         assert!(Message::Assistant(vec![blockless_text()]).is_content_free());
         assert!(Message::Assistant(vec![blockless_reasoning(None)]).is_content_free());
+        let replayed = blockless_reasoning(Some(replay(Binding::Conversation)));
+        assert!(Message::Assistant(vec![replayed]).is_content_free());
+        let reasoning = AssistantItem::reasoning("r", 0, "thought", None);
+        assert!(Message::Assistant(vec![reasoning]).is_content_free());
+        for text in ["", " ", " \n", "\n\t "] {
+            let item = AssistantItem::text("answer", 0, text);
+            assert!(Message::Assistant(vec![item]).is_content_free(), "{text:?}");
+        }
+        let visible = AssistantItem::text("answer", 0, "hello");
+        assert!(!Message::Assistant(vec![visible]).is_content_free());
         // Only assistant messages can be content-free.
         assert!(!Message::User(Vec::new()).is_content_free());
         assert!(!Message::Tool(Vec::new()).is_content_free());
     }
 
     #[test]
-    fn empty_and_whitespace_text_blocks_remain_content() {
-        // Providers emit an empty or blank text block alongside tool calls on a
-        // non-final turn. Such a block encodes and replays, so it is not a failure.
-        for text in ["", " ", "\n\t "] {
-            let item = AssistantItem::text("answer", 0, text);
-            assert!(!Message::Assistant(vec![item]).is_content_free());
-        }
-        let call = ToolCall::new("call", "exec", json!({})).unwrap();
-        let non_final = vec![
-            AssistantItem::text("answer", 0, ""),
-            AssistantItem::tool_call("tool-1", 1, call),
-        ];
-        assert!(!Message::Assistant(non_final).is_content_free());
-        // Reasoning is content through a rendered block or through replay state.
-        let blank_prose = AssistantItem::reasoning("thought", 0, "   ", None);
-        assert!(!Message::Assistant(vec![blank_prose]).is_content_free());
-        let signed = blockless_reasoning(Some(envelope()));
-        assert!(!Message::Assistant(vec![signed]).is_content_free());
-        let visible = AssistantItem::text("answer", 0, "hello");
-        assert!(!Message::Assistant(vec![visible]).is_content_free());
-    }
-
-    #[test]
-    fn unbinding_drops_only_conversation_bound_replay_and_empties_fall_away() {
-        let free = Replay {
-            binding: Binding::Free,
-            ..envelope()
-        };
+    fn unbinding_drops_only_conversation_bound_replay() {
+        let free = replay(Binding::Free);
         let message = Message::Assistant(vec![
-            AssistantItem::reasoning("bound", 0, "visible", Some(envelope())),
+            AssistantItem::reasoning("bound", 0, "visible", Some(replay(Binding::Conversation))),
             AssistantItem::reasoning("free", 1, "kept", Some(free.clone())),
+            AssistantItem::text("said", 2, "answer"),
         ]);
-        let Some(Message::Assistant(items)) = message.without_bound_reasoning() else {
-            panic!("readable text keeps the message")
+        let Message::Assistant(items) = message.without_bound_reasoning() else {
+            unreachable!()
         };
         assert_eq!(items[0].replay(), None);
         assert_eq!(items[1].replay(), Some(&free));
-        let signed_only = Message::Assistant(vec![blockless_reasoning(Some(envelope()))]);
-        assert_eq!(signed_only.without_bound_reasoning(), None);
     }
 }

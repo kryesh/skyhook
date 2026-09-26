@@ -82,7 +82,7 @@ named_enum! {
 }
 
 string_newtype! {
-    /// Stable identity of one conversation's provider context. Backends may send it as
+    /// Stable identity of one conversation's provider context. Providers may send it as
     /// cache-affinity metadata; it never selects history.
     pub struct ContextId(Blank) = |id| nonblank("context identity", id);
 }

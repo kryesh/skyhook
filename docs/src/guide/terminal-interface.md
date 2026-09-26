@@ -64,8 +64,9 @@ Spinners indicate that a request is still active.
 
 ## Model selection and UI state
 
-Models are listed in configuration declaration order. For a new session, selection uses
-`--model`, then the most recently submitted configured model, then the first model in the list.
+Models are named `provider/model` and listed in configuration declaration order. For a new
+session, selection uses `--model`, then the most recently submitted configured model, then
+`default_model`, else the first model of the first provider.
 The starting [mode](permissions.md#modes) is chosen the same way: `--mode`, then the mode of the
 most recently submitted message if it is still configured, then `default_mode`. Batch jobs
 ignore the remembered mode.
@@ -78,7 +79,7 @@ The batch cannot be split across requests; the last message's captured model is 
 Tool follow-ups, retries, compaction, and `/retry` retain the active turn's model. The bottom bar
 shows the choice for the next message; reply footers identify the model that actually answered.
 Resumed sessions retain their last applied model. `/models` remains an alias for `/model`.
-Restore a missing recorded model profile before resuming rather than substituting another model.
+Restore a missing recorded model before resuming rather than substituting another model.
 
 The interface stores the last submitted model and mode and the sidebar setting in the workspace's
 `.skyhook/state.json`, beside its sessions, without changing the model configuration.

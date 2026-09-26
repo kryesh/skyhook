@@ -16,7 +16,7 @@ pub struct QueuedInput {
     /// and nothing behind it is dispatched until they edit or remove it.
     pub(super) unknown: bool,
     pub(super) submission: Submission,
-    pub(super) model: String,
+    pub(super) model: ModelRef,
     pub(super) mode: String,
 }
 
@@ -143,8 +143,8 @@ impl App {
         });
         self.dirty = true;
     }
-    fn remember_selection(&mut self, model: &str, mode: &str) {
-        let selection = (Some(model.to_owned()), Some(mode.to_owned()));
+    fn remember_selection(&mut self, model: &ModelRef, mode: &str) {
+        let selection = (Some(model.clone()), Some(mode.to_owned()));
         if (&self.remembered_model, &self.remembered_mode) == (&selection.0, &selection.1) {
             return;
         }
@@ -316,14 +316,14 @@ impl App {
         self.queue
             .iter()
             .map(|queued| {
-                let models = &self.launch.model.config().config().models;
+                let profile = self.launch.model.config().model(&queued.model);
                 Item::new(
                     queued.id,
                     crate::tui::format::brief(&queued.submission.text, 100),
-                    match models.get(&queued.model) {
-                        _ if queued.unknown => "outcome unknown",
-                        Some(profile) => profile.model.as_str(),
-                        None => queued.model.as_str(),
+                    match profile {
+                        _ if queued.unknown => "outcome unknown".to_owned(),
+                        Some(profile) => profile.model.clone(),
+                        None => queued.model.to_string(),
                     },
                 )
             })
@@ -441,8 +441,8 @@ mod tests {
             .options
             .model
             .as_ref()
-            .map(|model| model.name());
-        assert_eq!(model, Some("first"));
+            .map(|model| model.name().to_string());
+        assert_eq!(model.as_deref(), Some("test/first"));
         assert!(app.queue.iter().all(|input| input.in_flight.is_some()));
         assert!(app.history.is_empty());
 

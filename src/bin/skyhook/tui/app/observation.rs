@@ -128,7 +128,7 @@ mod tests {
         let (_root, mut app) = fixture().await;
         let agent = app.selected.clone();
         let profile = ProfileSnapshot {
-            name: "fixture".into(),
+            name: app.launch.model.name(),
             profile: app.launch.model.profile().clone(),
         };
         let context = ModelContext {

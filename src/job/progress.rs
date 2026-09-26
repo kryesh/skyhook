@@ -141,7 +141,7 @@ mod tests {
     async fn started(jobs: &JobManager, agent: &AgentId, owner: JobId, target: &str) {
         let location =
             ExecutionLocation::named(target.parse().unwrap(), format!("/{target}/work").into());
-        let event = crate::session::fixture::child_started(Some(owner), location.clone());
+        let event = crate::session::tests::child_started(Some(owner), location.clone());
         jobs.test_append(agent.clone(), event).await;
         jobs.set_agent_location(owner, location).await.unwrap();
     }
@@ -174,7 +174,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_progress_is_recursive_exclusive_and_location_filtered() {
-        let session = crate::session::fixture::MemorySession::new().await;
+        let session = crate::session::tests::MemorySession::new().await;
         let (store, root) = (session.store.clone(), session.agent.clone());
         let child = root.child(1);
         let grandchild = child.child(1);
@@ -261,7 +261,7 @@ mod tests {
 
     #[tokio::test]
     async fn progress_survives_retained_resume_and_replay() {
-        let session = crate::session::fixture::MemorySession::new().await;
+        let session = crate::session::tests::MemorySession::new().await;
         let (store, root) = (session.store.clone(), session.agent.clone());
         let child = root.child(1);
         let jobs = JobManager::new(store.clone());

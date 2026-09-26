@@ -20,7 +20,7 @@ use crate::{
     job::{CancellationToken, JobManager},
     mcp::{McpServerConfig, manager::McpManager},
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
-    provider::profile::ModelProfile,
+    provider::profile::{ModelName, ModelProfile, ModelRef, ProviderName},
     provider::protocol::{
         CutReason, LiveResponse, ModelRequest, Outcome, Step as LiveStep, SystemSegment, ToolCall,
         ToolResult, Usage, visible_text,
@@ -70,6 +70,7 @@ mod state;
 mod turn;
 pub(crate) use builder::Catalog;
 pub use builder::HarnessBuilder;
+pub(crate) use builder::ModelEntry;
 
 #[derive(Clone)]
 pub struct Harness {
@@ -79,9 +80,8 @@ pub struct Harness {
 struct HarnessInner {
     workspace: PathBuf,
     session_root: PathBuf,
-    providers: BTreeMap<String, Arc<dyn Provider>>,
-    model_profiles: BTreeMap<String, ModelProfile>,
-    default_model_profile: String,
+    models: indexmap::IndexMap<ModelRef, ModelEntry>,
+    default_model: ModelRef,
     policy: Arc<dyn Policy>,
     questions: Option<Arc<dyn QuestionHandler>>,
     extra_tools: ToolRegistry,
@@ -150,10 +150,10 @@ impl ContinueOutcome {
 
 /// Model and mode selections carried by a submitted or queued message, or by a
 /// continued turn. Issued by [`SessionHandle::selection`], so it only ever names a
-/// model profile and a mode the issuing runtime instance has.
+/// `provider/model` and a mode the issuing runtime instance has.
 #[derive(Clone, Debug, Default)]
 pub struct Selection {
-    /// Model profile when this input is consumed. Omitted retains the agent's
+    /// Model when this input is consumed. Omitted retains the agent's
     /// active model, which for a refusal would deterministically refuse again;
     /// later explicit queued selections can change it.
     pub model: Option<SessionModel>,
@@ -162,11 +162,11 @@ pub struct Selection {
     pub mode: Option<SessionMode>,
 }
 
-/// A model profile one runtime instance admitted.
+/// A model one runtime instance admitted.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionModel {
     runtime: RuntimeInstance,
-    name: String,
+    name: ModelRef,
 }
 
 /// A mode one runtime instance admitted.
@@ -190,7 +190,7 @@ impl RuntimeInstance {
 
 impl SessionModel {
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &ModelRef {
         &self.name
     }
 }
@@ -233,7 +233,7 @@ struct SessionRuntime {
 }
 
 struct LiveAgent {
-    model_profile: String,
+    model: ModelRef,
     capabilities: CapabilitySet,
     sender: AgentSender,
     cancellation: CancellationToken,
@@ -274,7 +274,8 @@ enum AgentCommand {
 struct AgentLaunch {
     id: AgentId,
     owner_job: Option<JobId>,
-    model_profile: String,
+    /// The model to start under; None resumes the agent's journaled contract.
+    model: Option<ModelRef>,
     todos: Option<Vec<TodoItem>>,
     available_depth: usize,
     location: crate::execution::ExecutionLocation,
@@ -296,7 +297,6 @@ struct AgentLoop {
 
 /// What an agent currently runs under; a consumed input may change any of it.
 struct AgentSettings {
-    model_profile: String,
     /// The agent's mode, when it runs in one. Only the root's can change.
     mode: Option<String>,
     capabilities: CapabilitySet,
@@ -453,11 +453,13 @@ mod tests {
     pub(super) use super::*;
     pub(super) use crate::{
         agent::Question,
+        provider::codec::common::tests::envelope,
         provider::protocol::{
-            AssistantItem, Binding, BlockId, BlockRef, ContextId, ItemId, ItemKind, Provenance,
-            Replay, ResponseEvent, Scope, ToolCall,
+            AssistantItem, Binding, BlockId, BlockRef, ContextId, ItemId, ItemKind, ReplayFormat,
+            ResponseEvent, ToolCall,
         },
         provider::{ProviderContext, ResponseStream},
+        session::tests::usage,
     };
 
     /// A request as the scripted context that received it saw it.
@@ -776,7 +778,7 @@ mod tests {
         AgentLaunch {
             id,
             owner_job,
-            model_profile: session.runtime.harness.default_model_profile.clone(),
+            model: Some(session.runtime.harness.default_model.clone()),
             todos: None,
             available_depth: 0,
             location: crate::execution::ExecutionLocation::root(workspace),
@@ -818,12 +820,24 @@ mod tests {
         provider: Arc<dyn Provider>,
         supports_images: bool,
     ) -> HarnessBuilder {
-        let profile = ModelProfile::new("test", "test", None, 128_000, 16_384, supports_images);
+        let profile = ModelProfile::new("test", None, 128_000, 16_384, supports_images);
         HarnessBuilder::new(workspace)
             .session_root(sessions)
-            .provider("test", provider)
-            .model_profile("test", profile)
-            .default_model_profile("test")
+            .provider(provider_name("test"), provider, models([("test", profile)]))
+            .default_model(model_ref("test"))
+    }
+
+    /// A test harness builder whose `test` provider also serves `entries`.
+    pub(super) fn serving<const N: usize>(
+        root: &Path,
+        provider: Arc<dyn Provider>,
+        entries: [(&str, ModelProfile); N],
+    ) -> HarnessBuilder {
+        test_builder(root, &root.join("sessions"), provider.clone(), false).provider(
+            provider_name("test"),
+            provider,
+            models(entries),
+        )
     }
 
     #[track_caller]
@@ -872,7 +886,7 @@ mod tests {
     ) -> AgentId {
         let workspace = session.runtime.harness.workspace.clone();
         let store = &session.runtime.store;
-        crate::session::fixture::start_child(store, &session.root, index, owner, &workspace).await
+        crate::session::tests::start_child(store, &session.root, index, owner, &workspace).await
     }
 
     /// A running Agent-role job owning retained children and their questions.
@@ -933,12 +947,19 @@ mod tests {
         .await;
     }
 
-    pub(super) fn usage(input_tokens: u64, cached_input_tokens: u64, output_tokens: u64) -> Usage {
-        Usage {
-            input_tokens,
-            cached_input_tokens,
-            output_tokens,
-        }
+    /// A model under the `test` provider.
+    pub(super) fn model_ref(name: &str) -> ModelRef {
+        format!("test/{name}").parse().unwrap()
+    }
+
+    pub(super) fn provider_name(name: &str) -> ProviderName {
+        name.parse().unwrap()
+    }
+
+    pub(super) fn models<const N: usize>(
+        entries: [(&str, ModelProfile); N],
+    ) -> [(ModelName, ModelProfile); N] {
+        entries.map(|(name, profile)| (name.parse().unwrap(), profile))
     }
 
     /// A normal finish: tool use when any item is a call, otherwise an answer.

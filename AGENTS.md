@@ -42,6 +42,9 @@ Architecture: `docs/src/development/architecture.md`.
   ```sh
   cargo nextest run --all-features -E 'test(<name>)' --stress-count 200 --no-fail-fast
   ```
+- Tests belong in a `tests` module at the bottom of the file containing the logic they
+  test; tests of a module's functionality go in that module's top-level file. Avoid
+  dedicated test files, except binary integration tests under `tests/`.
 
 ## Verify
 

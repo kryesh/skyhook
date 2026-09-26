@@ -12,15 +12,16 @@ The configuration-backed entry point is:
 ```rust,ignore
 let harness = config
     .into_runtime()?
-    .select_model(name)?
+    .select_model(&name)?
     .harness_builder(workspace)?
     .build()
     .await?;
 let session = harness.new_session().await?;
 ```
 
-`into_runtime()` admits an immutable configuration generation; `select_model(name)` binds the
-host's explicit choice to that generation. Admission and selection precede provider construction,
+`into_runtime()` admits an immutable configuration generation, including any edits the host made
+to the `Config`; `select_model(&name)` binds the host's explicit choice, a `ModelRef` parsed from
+`provider/model`, to that generation. Admission and selection precede provider construction,
 credential lookup, and workspace access. `harness_builder(workspace)` returns a `HarnessBuilder`
 that can be customized before `build().await`; hosts supplying their own providers and model
 profiles can instead start with `HarnessBuilder::new(workspace)`.
@@ -28,12 +29,12 @@ profiles can instead start with `HarnessBuilder::new(workspace)`.
 The configuration-backed builder carries the configured modes and selects the configured default.
 `mode(name)` selects another, and `capabilities(set)` limits what modes can grant; `build()` rejects
 a selected mode the modes do not declare, whichever was set first. A builder without modes gives the
-root agent that capability set directly, and no mode applies. `SessionHandle::selection(model, mode)` issues the
-`Selection` a submitted message or a continued turn carries, rejecting a model profile or mode the
-session does not have; omitted selections retain the active model and mode. A mode change applies
-to the root agent from the boundary that consumes it, not retroactively to children it already
-started. A session pins each mode's definition on
-first use and cannot outgrow its original capability ceiling.
+root agent that capability set directly, and no mode applies.
+`SessionHandle::selection(model, mode)` issues the `Selection` a submitted message or a continued
+turn carries, rejecting a `provider/model` or mode the session does not have; omitted selections
+retain the active model and mode. A mode change applies to the root agent from the boundary that
+consumes it, not retroactively to children it already started. A session pins each mode's
+definition on first use and cannot outgrow its original capability ceiling.
 
 Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
 and an embedded shim catalog. A `SensitivePromptHandler` answers each `SensitivePrompt` with a
@@ -91,7 +92,7 @@ before starting agents and opens fresh provider contexts; it does not reuse old 
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases use format 12. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 14. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 
@@ -123,7 +124,7 @@ its identity and version; there is no migration or compatibility layer for earli
 
 ## Reconstructing model calls
 
-The journal records inputs at the shared `Provider` boundary, not backend-specific request bodies
+The journal records inputs at the shared `Provider` boundary, not codec-specific request bodies
 or authentication headers:
 
 - `model_context` stores a `ModelContext`: the purpose, named model-profile snapshot, assembled
@@ -149,17 +150,17 @@ or authentication headers:
   requests keep their recorded inputs; usage identifies the originating request, including summary
   requests and failed attempts.
 
-`session::reconstruct_model_request(&records, sequence)` returns the configured provider name and
-reconstructed `ModelRequest` for a `model_requested` sequence, using sequence-ordered records from
-`SessionStore`. Attachments and tool images reference content-addressed blobs by SHA-256;
-`load_blobs(&mut request).await` on an owning `SessionStore` loads their contents for provider
-encoding; unlike `read_records`, opening a store acquires the session's writer lock. Reconstruction
-reproduces Skyhook's provider-neutral input, not an API-specific wire encoding or a replay of the
-external call.
+`session::reconstruct_model_request(&records, sequence)` returns the `provider/model` name the
+request was issued under and the reconstructed `ModelRequest` for a `model_requested` sequence,
+using sequence-ordered records from `SessionStore`. Attachments and tool images reference
+content-addressed blobs by SHA-256; `load_blobs(&mut request).await` on an owning `SessionStore`
+loads their contents for provider encoding; unlike `read_records`, opening a store acquires the
+session's writer lock. Reconstruction reproduces Skyhook's provider-neutral input, not an
+API-specific wire encoding or a replay of the external call.
 
 The `ModelRequest` contract preserves the history/tail split and `history_lifetime` cache hints.
 See [history, transient state, and caching](architecture.md#history-transient-state-and-caching)
-for their semantics and backend rationale.
+for their semantics and provider rationale.
 
 Source: [configuration admission](https://github.com/kryesh/skyhook/blob/main/src/config/runtime.rs),
 [session handle](https://github.com/kryesh/skyhook/blob/main/src/agent/runtime/session.rs),

@@ -20,17 +20,21 @@ impl SessionRuntime {
         let model = options
             .model
             .map(|model| model.name)
-            .filter(|name| name != &settings.model_profile);
+            .filter(|name| name != &context.profile.name);
         let mode = options
             .mode
             .map(|mode| mode.name)
             .filter(|name| settings.mode.as_ref() != Some(name));
-        let profile = match &model {
-            Some(name) => self.harness.model_profiles[name].clone(),
+        let snapshot = match &model {
+            Some(name) => crate::session::ProfileSnapshot {
+                name: name.clone(),
+                profile: self.model_entry(name)?.profile,
+            },
             None => context.profile.clone(),
         };
+        let profile = &snapshot.profile;
         if images && !profile.supports_images {
-            return Err(HarnessError::ImagesUnsupported(profile.model));
+            return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
         }
         let mode = match mode {
             Some(name) if agent.depth() != 0 => return Err(HarnessError::UnknownMode(name)),
@@ -46,18 +50,24 @@ impl SessionRuntime {
                 .system_prompt(agent, turn.location, *depth, Some(name), capabilities)
                 .await?;
             let opening =
-                self.open_agent_context(agent, profile.clone(), system, capabilities, None, false);
+                self.open_agent_context(agent, snapshot.clone(), system, capabilities, None, false);
             // Projected before its `ModeChanged` is journaled, which later projections see.
             let mut replacement = opening.await?;
             replacement.strip_bound_reasoning();
             Some(replacement)
-        } else if profile != context.profile {
+        } else if model.is_some() {
             let system = context.template.system().to_vec();
             // The tools stay pinned across a model change.
             let tools = Some(context.template.to_request().tools);
             let capabilities = &settings.capabilities;
-            let opening =
-                self.open_agent_context(agent, profile.clone(), system, capabilities, tools, false);
+            let opening = self.open_agent_context(
+                agent,
+                snapshot.clone(),
+                system,
+                capabilities,
+                tools,
+                false,
+            );
             Some(opening.await?)
         } else {
             None
@@ -67,14 +77,11 @@ impl SessionRuntime {
                 .as_ref()
                 .is_some_and(AgentContext::contains_images)
         {
-            return Err(HarnessError::ImagesUnsupported(profile.model));
+            return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
         }
         let mut events = Vec::new();
-        if let Some(name) = &model {
-            let profile = crate::session::ProfileSnapshot {
-                name: name.clone(),
-                profile,
-            };
+        if model.is_some() {
+            let profile = snapshot;
             events.push((agent.clone(), SessionEvent::ModelChanged { profile }));
         }
         if let Some((name, _, capabilities)) = &mode {
@@ -92,15 +99,12 @@ impl SessionRuntime {
         if let Some(replacement) = replacement {
             *context = replacement;
         }
-        if let Some(name) = model {
-            settings.model_profile = name;
-        }
         if let Some((name, _, capabilities)) = mode {
             turn.capabilities.clone_from(&capabilities);
             (settings.mode, settings.capabilities) = (Some(name), capabilities);
         }
         if let Some(live) = self.agents_mut().get_mut(agent) {
-            live.model_profile.clone_from(&settings.model_profile);
+            live.model.clone_from(&context.profile.name);
             live.capabilities.clone_from(&settings.capabilities);
         }
         Ok(())
@@ -157,6 +161,7 @@ impl SessionRuntime {
 mod tests {
     use super::super::tests::*;
     use super::*;
+    use crate::agent::runtime::tests::{answer, model_ref, scripted_provider};
 
     #[tokio::test]
     async fn running_child_parent_inputs_are_fifo_once_after_tool_or_final_responses() {
@@ -355,12 +360,20 @@ mod tests {
         assert_eq!(in_flight.model, "first-model");
 
         let first_image = vec![image("first.png", &first_png)];
-        let (first, first_cancel) =
-            enqueue(&session, "test:queued-one", first_image, Some("second"));
+        let (first, first_cancel) = enqueue(
+            &session,
+            "test:queued-one",
+            first_image,
+            Some("queue-test/second"),
+        );
         buffered(&session, 1).await;
         let second_image = vec![image("second.png", &second_png)];
-        let (second, second_cancel) =
-            enqueue(&session, "test:queued-two", second_image, Some("third"));
+        let (second, second_cancel) = enqueue(
+            &session,
+            "test:queued-two",
+            second_image,
+            Some("queue-test/third"),
+        );
         buffered(&session, 2).await;
         assert!(!first.is_finished() && !second.is_finished());
         assert!(!first_cancel.is_claimed() && !second_cancel.is_claimed());
@@ -394,13 +407,48 @@ mod tests {
         // The ongoing tool call must finish normally.
         assert!(next.messages().any(todo_finished));
         // Do not collapse intermediate captured model changes.
-        assert_eq!(model_changes(&session).await, ["second", "third"]);
+        assert_eq!(
+            model_changes(&session).await,
+            ["queue-test/second", "queue-test/third"]
+        );
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         stop(&session).await;
         // Queued inputs must not become additional turns.
         assert_eq!(count(&tracking), 2);
         assert_eq!(texts(&committed(&session).await), expected);
+    }
+
+    #[tokio::test]
+    async fn selecting_a_model_with_an_equal_profile_switches_its_provider() {
+        let root = tempfile::tempdir().unwrap();
+        let requests = Default::default();
+        let (first, second) = (
+            scripted_provider(&requests, [answer("from a")]),
+            scripted_provider(&requests, [answer("from b")]),
+        );
+        let profile = ModelProfile::new("same", None, 128_000, 4096, false);
+        let harness = HarnessBuilder::new(root.path())
+            .session_root(root.path().join("sessions"))
+            .provider(
+                provider_name("a"),
+                first.clone(),
+                models([("m", profile.clone())]),
+            )
+            .provider(provider_name("b"), second.clone(), models([("m", profile)]))
+            .default_model("a/m".parse().unwrap())
+            .build()
+            .await
+            .unwrap();
+        let session = ephemeral_session(&harness).await;
+        assert_eq!(session.prompt("test:first").await.unwrap(), "from a");
+        let options = session
+            .selection(Some(&"b/m".parse().unwrap()), None)
+            .unwrap();
+        let switched = session.prompt_with_options("test:second", &[], options);
+        assert_eq!(bounded(switched).await.unwrap(), "from b");
+        assert_eq!((first.remaining(), second.remaining()), (0, 0));
+        stop(&session).await;
     }
 
     #[tokio::test]
@@ -428,7 +476,8 @@ mod tests {
         let (_root, tracking, session) = start(true).await;
         let turn = prompt(&session, "test:initial");
         tracking.request(0).await;
-        let (receipt, token_cancel) = enqueue(&session, "test:canceled", vec![], Some("second"));
+        let (receipt, token_cancel) =
+            enqueue(&session, "test:canceled", vec![], Some("queue-test/second"));
         buffered(&session, 1).await;
         assert!(!receipt.is_finished());
         assert!(token_cancel.cancel());
@@ -471,10 +520,9 @@ mod tests {
     async fn queued_validation_errors_do_not_claim_or_commit() {
         let (_root, tracking, session) = start(false).await;
         let runtime = &session.runtime;
-        let unknown = session.selection(Some("missing-model"), None).unwrap_err();
-        assert!(
-            matches!(unknown, HarnessError::UnknownModelProfile(name) if name == "missing-model")
-        );
+        let missing = model_ref("missing");
+        let unknown = session.selection(Some(&missing), None).unwrap_err();
+        assert!(matches!(unknown, HarnessError::UnknownModel(name) if name == missing));
         // One byte over the per-image limit, and one image over the count limit.
         let image = |bytes: &[u8]| crate::media::Attachment::Image {
             file: None,

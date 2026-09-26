@@ -7,7 +7,7 @@ use std::fmt;
 
 use serde::{
     Deserialize, Deserializer,
-    de::{self, MapAccess, SeqAccess, Visitor},
+    de::{self, DeserializeSeed, IntoDeserializer, MapAccess, SeqAccess, Visitor},
 };
 use serde_json::{Map, Number, Value, map::Entry};
 use serde_saphyr::{DuplicateKeyPolicy, MergeKeyPolicy, Options, Tagged};
@@ -136,6 +136,95 @@ impl<'de> Deserialize<'de> for StringKey {
             (Value::String(key), None | Some("!" | "tag:yaml.org,2002:str")) => Ok(Self(key)),
             _ => Err(de::Error::custom("YAML mapping keys must be strings")),
         }
+    }
+}
+
+/// The keys of a mapping that a struct beside them does not name.
+pub(crate) trait Rest<'de> {
+    fn read<A: MapAccess<'de>>(&mut self, key: String, map: &mut A) -> Result<(), A::Error>;
+}
+
+/// Deserialize a struct from a mapping it shares: the keys `T` names are read
+/// in place, so their errors keep their path, and `rest` reads every other key.
+/// A structural alternative to `#[serde(flatten)]`, which loses the path.
+pub(crate) fn split<'de, T, D>(deserializer: D, rest: &mut impl Rest<'de>) -> Result<T, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    struct Mapping<'r, R, T>(&'r mut R, std::marker::PhantomData<T>);
+
+    impl<'de, R: Rest<'de>, T: Deserialize<'de>> Visitor<'de> for Mapping<'_, R, T> {
+        type Value = T;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("a mapping")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<T, A::Error> {
+            T::deserialize(Split { map, rest: self.0 })
+        }
+    }
+
+    deserializer.deserialize_map(Mapping(rest, std::marker::PhantomData))
+}
+
+struct Split<'r, A, R> {
+    map: A,
+    rest: &'r mut R,
+}
+
+impl<'de, A: MapAccess<'de>, R: Rest<'de>> Deserializer<'de> for Split<'_, A, R> {
+    type Error = A::Error;
+
+    fn deserialize_struct<V: Visitor<'de>>(
+        self,
+        _: &'static str,
+        fields: &'static [&'static str],
+        visitor: V,
+    ) -> Result<V::Value, A::Error> {
+        visitor.visit_map(Fields {
+            map: self.map,
+            fields,
+            rest: self.rest,
+        })
+    }
+
+    fn deserialize_any<V: Visitor<'de>>(self, visitor: V) -> Result<V::Value, A::Error> {
+        self.deserialize_struct("", &[], visitor)
+    }
+
+    serde::forward_to_deserialize_any! {
+        bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+        byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map
+        enum identifier ignored_any
+    }
+}
+
+struct Fields<'r, A, R> {
+    map: A,
+    fields: &'static [&'static str],
+    rest: &'r mut R,
+}
+
+impl<'de, A: MapAccess<'de>, R: Rest<'de>> MapAccess<'de> for Fields<'_, A, R> {
+    type Error = A::Error;
+
+    fn next_key_seed<K: DeserializeSeed<'de>>(
+        &mut self,
+        seed: K,
+    ) -> Result<Option<K::Value>, A::Error> {
+        while let Some(key) = self.map.next_key::<String>()? {
+            if self.fields.contains(&key.as_str()) {
+                return seed.deserialize(key.into_deserializer()).map(Some);
+            }
+            self.rest.read(key, &mut self.map)?;
+        }
+        Ok(None)
+    }
+
+    fn next_value_seed<V: DeserializeSeed<'de>>(&mut self, seed: V) -> Result<V::Value, A::Error> {
+        self.map.next_value_seed(seed)
     }
 }
 
@@ -279,6 +368,48 @@ mod tests {
             from_str("min: -9223372036854775808\nmax: 18446744073709551615\n").unwrap(),
             json!({"min": i64::MIN, "max": u64::MAX})
         );
+    }
+
+    #[test]
+    fn split_keeps_nested_paths_and_hands_other_keys_to_the_rest() {
+        #[derive(Deserialize)]
+        struct Inner {
+            count: u64,
+        }
+        #[derive(Deserialize)]
+        struct Named {
+            inner: Inner,
+        }
+        #[derive(Default)]
+        struct Others(Vec<(String, Value)>);
+        impl<'de> Rest<'de> for Others {
+            fn read<A: MapAccess<'de>>(
+                &mut self,
+                key: String,
+                map: &mut A,
+            ) -> Result<(), A::Error> {
+                self.0.push((key, map.next_value()?));
+                Ok(())
+            }
+        }
+        struct Shared(Named, Others);
+        impl<'de> Deserialize<'de> for Shared {
+            fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                let mut rest = Others::default();
+                let named = split(deserializer, &mut rest)?;
+                Ok(Self(named, rest))
+            }
+        }
+        let read = |text| serde_path_to_error::deserialize::<_, Shared>(from_str(text).unwrap());
+        let Shared(named, rest) = read("extra: 1\ninner: {count: 2}\nmore: x\n").unwrap();
+        assert_eq!(named.inner.count, 2);
+        let others = [
+            ("extra".to_owned(), json!(1)),
+            ("more".to_owned(), json!("x")),
+        ];
+        assert_eq!(rest.0, others);
+        let error = read("extra: 1\ninner: {count: two}\n").err().unwrap();
+        assert_eq!(error.path().to_string(), "inner.count");
     }
 
     #[test]

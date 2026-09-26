@@ -142,14 +142,10 @@ named_enum! {
 /// The visible reply an assistant response projects: its text blocks concatenated,
 /// with a whitespace-only projection normalized to none.
 ///
-/// Blank text is content that must be kept for replay (see
-/// [`Message::is_content_free`]), but it is not an answer. Providers routinely emit a
-/// whitespace-only text block alongside tool calls — typically a `"\n\n"` separator
-/// sent as `content` beside `reasoning_content`, a strictly empty delta already being
-/// dropped by the Chat decoder — and a reasoning model does so on nearly every working
-/// turn. Every consumer that asks "did this response say
-/// anything?" must therefore normalize here rather than test `is_empty` on a raw
-/// concatenation, or a child agent publishes a blank reply to its parent per turn.
+/// Whitespace-only text is history, since it may separate the calls beside it,
+/// but it is not an answer: reasoning models routinely emit a `"\n\n"` text block
+/// beside their tool calls. Ask here whether a response said anything, not with
+/// `is_empty` on a raw concatenation.
 #[must_use]
 pub fn visible_text(items: &[AssistantItem]) -> String {
     let text: String = items
@@ -174,13 +170,30 @@ pub struct Replay {
 /// Where a replay came from. Encoders compare it for equality and never interpret it.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Provenance {
-    pub protocol: String,
+    pub format: ReplayFormat,
     pub model: String,
     pub scope: Scope,
 }
 
+named_enum! {
+    /// The native shape of a replay payload, which selects the encoder field it returns in.
+    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    pub enum ReplayFormat {
+        /// Chat Completions reasoning text.
+        ChatText = "chat_text",
+        /// One entry of a Chat `thinking_blocks` list.
+        ChatThinkingBlock = "chat_thinking_block",
+        /// One entry of a Chat `reasoning_details` sequence.
+        ChatReasoningDetail = "chat_reasoning_detail",
+        /// A Responses output item.
+        Responses = "responses",
+        /// A Messages content block.
+        Messages = "messages",
+    }
+}
+
 string_newtype! {
-    /// The configured provider identity a replay is valid under, assigned by the backend
+    /// The configured provider identity a replay is valid under, assigned by the provider
     /// that issued it. Private state never crosses to another endpoint or provider name.
     pub struct Scope(Blank) = |scope| nonblank("replay scope", scope);
 }
@@ -314,13 +327,13 @@ impl AssistantItem {
         }
     }
 
-    /// Whether nothing of this item can be encoded: no blocks and no replay. A blank
-    /// text block is content; a tool call always is.
+    /// Whether the item carries nothing a turn can stand on: text that says
+    /// nothing, or reasoning, which accompanies an action but is never one.
     #[must_use]
     pub fn is_content_free(&self) -> bool {
         match self {
-            Self::Text { blocks, .. } => blocks.is_empty(),
-            Self::Reasoning { blocks, replay, .. } => blocks.is_empty() && replay.is_none(),
+            Self::Text { blocks, .. } => blocks.iter().all(|block| block.text.trim().is_empty()),
+            Self::Reasoning { .. } => true,
             Self::ToolCall { .. } => false,
         }
     }
@@ -422,7 +435,7 @@ pub struct ToolResult {
 }
 
 #[cfg(test)]
-mod visible_text_tests {
+mod tests {
     use super::*;
 
     fn tool_call() -> AssistantItem {
@@ -445,7 +458,7 @@ mod visible_text_tests {
                 tool_call(),
             ];
             assert_eq!(visible_text(&items), "", "blank text {blank:?}");
-            // Blank text remains content for replay; only the projection normalizes.
+            // The call makes the turn; blank text and reasoning alone would not.
             assert!(!crate::session::Message::Assistant(items).is_content_free());
         }
     }
@@ -474,11 +487,7 @@ mod visible_text_tests {
         assert_eq!(items[0].reasoning_text().as_deref(), Some("private"));
         assert_eq!(items[0].text_content(), None);
     }
-}
 
-#[cfg(test)]
-mod boundary_tests {
-    use super::*;
     use serde_json::json;
 
     #[test]

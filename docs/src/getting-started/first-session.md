@@ -13,17 +13,16 @@ Create `config.yaml` in that directory with a provider and model you can access.
 ```yaml
 providers:
   openai:
-    kind: "openai"
+    codec: "responses"
+    dialect: "openai"
     base_url: "https://api.openai.com/v1"
-    api: "responses"
-    api_key_env: "OPENAI_API_KEY"
-
-models:
-  default:
-    provider: "openai"
-    model: "gpt-5.6"
-    max_context: 1050000
-    max_output: 128000
+    api_key:
+      env: "OPENAI_API_KEY"
+    models:
+      default:
+        model: "gpt-5.6"
+        max_context: 1050000
+        max_output: 128000
 ```
 
 Use a model identifier supported by your account and set its token limits explicitly; Skyhook

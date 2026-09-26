@@ -406,7 +406,7 @@ mod tests {
             jobs.child_name_owner(&runtime.agent, "worker", third).await,
             Some(second)
         );
-        let other = crate::session::fixture::start_child(
+        let other = crate::session::tests::start_child(
             &runtime.store,
             &runtime.agent,
             2,

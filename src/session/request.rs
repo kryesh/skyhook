@@ -1,5 +1,9 @@
 //! Reconstruct model-visible history and exact provider requests from durable events.
-use crate::{identity::AgentId, provider::protocol::ModelRequest, session::Message};
+use crate::{
+    identity::AgentId,
+    provider::{profile::ModelRef, protocol::ModelRequest},
+    session::Message,
+};
 
 use super::{EventRecord, ModelContext, ModelPurpose, SessionError, SessionEvent};
 use crate::session::{MessageSeq, RecordSeq, RequestSeq};
@@ -130,9 +134,8 @@ pub fn project_history(records: &[EventRecord], agent: &AgentId) -> Projection {
             let SessionEvent::MessageCommitted { message } = &source.event else {
                 unreachable!()
             };
-            if let Some(message) = message.clone().without_bound_reasoning() {
-                result.messages.push(((*sequence).into(), message));
-            }
+            let message = message.clone().without_bound_reasoning();
+            result.messages.push(((*sequence).into(), message));
         }
         checkpoint.frontier
     } else {
@@ -145,12 +148,12 @@ pub fn project_history(records: &[EventRecord], agent: &AgentId) -> Projection {
             && let SessionEvent::MessageCommitted { message } = &record.event
         {
             let message = message.clone();
-            return if record.sequence < switched {
+            let message = if record.sequence < switched {
                 message.without_bound_reasoning()
             } else {
-                Some(message)
-            }
-            .map(|message| (record.sequence, message));
+                message
+            };
+            return Some((record.sequence, message));
         }
         None
     }));
@@ -316,14 +319,15 @@ fn valid_tool_pair(assistant: &Message, tools: &[&Message]) -> bool {
         && call_set == result_set
 }
 
-/// Return the configured provider name and exact request at a `ModelRequested` event.
+/// Return the model the request was issued under and the exact request at a
+/// `ModelRequested` event.
 /// Records must be ordered by sequence, as returned by `SessionStore`.
 /// Attachment and image references keep their blob digests; use
 /// `SessionStore::load_blobs` to load their contents for provider encoding.
 pub fn reconstruct_model_request(
     records: &[EventRecord],
     sequence: RequestSeq,
-) -> Result<(String, ModelRequest), SessionError> {
+) -> Result<(ModelRef, ModelRequest), SessionError> {
     let index = records
         .binary_search_by_key(&sequence.into(), |record| record.sequence)
         .map_err(|_| SessionError::ModelRequestReplay {
@@ -380,15 +384,15 @@ pub fn reconstruct_model_request(
             }
         };
         // As in projection and summaries, bound reasoning never enters a changed conversation.
-        let message = if context.purpose == ModelPurpose::Compaction
+        let changed = context.purpose == ModelPurpose::Compaction
             || source < switched
-            || frontier.is_some_and(|last| source <= last)
-        {
-            message.clone().without_bound_reasoning()
+            || frontier.is_some_and(|last| source <= last);
+        let message = message.clone();
+        history.push(if changed {
+            message.without_bound_reasoning()
         } else {
-            (!message.is_content_free()).then(|| message.clone())
-        };
-        history.extend(message);
+            message
+        });
     }
     let request = ModelRequest {
         history: render_history(history),
@@ -396,7 +400,7 @@ pub fn reconstruct_model_request(
         history_lifetime: *history_lifetime,
         ..context.template()
     };
-    Ok((context.profile.profile.provider.clone(), request))
+    Ok((context.profile.name.clone(), request))
 }
 
 #[cfg(test)]
@@ -405,13 +409,12 @@ mod tests {
     use crate::{
         agent::{TodoItem, TodoStatus},
         identity::AgentId,
+        provider::codec::common::tests::envelope,
         provider::protocol::{
-            AssistantItem, Binding, HistoryLifetime, Provenance, Replay, Scope, SystemSegment,
-            ToolCall, ToolDefinition, ToolResult,
+            AssistantItem, Binding, HistoryLifetime, ReplayFormat, SystemSegment, ToolCall,
+            ToolDefinition, ToolResult,
         },
-        session::{
-            AttemptRef, CompactionCheckpoint, SessionStore, UserPart, fixture::MemorySession,
-        },
+        session::{AttemptRef, CompactionCheckpoint, SessionStore, UserPart, tests::MemorySession},
     };
     use serde_json::json;
 
@@ -440,8 +443,8 @@ mod tests {
     }
 
     fn context(purpose: ModelPurpose, provider: &str, model: &str, system: &str) -> SessionEvent {
-        let mut profile = crate::session::fixture::profile();
-        profile.profile.provider = provider.into();
+        let mut profile = crate::session::tests::profile();
+        profile.name.provider = provider.parse().unwrap();
         profile.profile.model = model.into();
         profile.profile.reasoning = Some("high".into());
         SessionEvent::ModelContext {
@@ -474,9 +477,9 @@ mod tests {
 
     #[tokio::test]
     async fn replay_preserves_context_boundaries_and_image_payloads() {
-        let (directory, store, agent) = crate::session::fixture::on_disk().await;
+        let (directory, store, agent) = crate::session::tests::on_disk().await;
         let child = agent.child(1);
-        let child_start = crate::session::fixture::agent_started(directory.path());
+        let child_start = crate::session::tests::agent_started(directory.path());
         store.append(child.clone(), child_start).await.unwrap();
         let png = crate::tests::png(b"image payload");
         let image = store
@@ -499,17 +502,16 @@ mod tests {
                 attachment: notes.clone(),
             },
         ]);
-        let envelope = Replay {
-            provenance: Provenance {
-                protocol: "test".into(),
-                model: "original-model".into(),
-                scope: Scope::try_from("reasoning".to_owned()).unwrap(),
-            },
-            // Opaque to the journal: nesting, key order, numbers and escapes must survive.
-            payload: json!({"signature":"pre\"serve\u{e9}","a":[1.5,{"z":null,"b":-0.0}],"n":1e300}),
-            binding: Binding::Free,
-        };
-        let reasoning = AssistantItem::reasoning("reasoning-item", 0, "reasoning", Some(envelope));
+        // Opaque to the journal: nesting, key order, numbers and escapes must survive.
+        let payload =
+            json!({"signature":"pre\"serve\u{e9}","a":[1.5,{"z":null,"b":-0.0}],"n":1e300});
+        let replay = envelope(
+            ReplayFormat::Messages,
+            "original-model",
+            payload,
+            Binding::Free,
+        );
+        let reasoning = AssistantItem::reasoning("reasoning-item", 0, "reasoning", Some(replay));
         let read = crate::provider::protocol::ToolCall::new("read-1", "read", json!({})).unwrap();
         let assistant = Message::Assistant(vec![
             reasoning,
@@ -558,9 +560,9 @@ mod tests {
         let id = store.id();
         drop(store);
         let (store, records) = SessionStore::open(directory.path(), id).await.unwrap();
-        let (provider, mut restored) =
+        let (model, mut restored) =
             reconstruct_model_request(&records, call.sequence.request()).unwrap();
-        assert_eq!(provider, "original-provider");
+        assert_eq!(model.to_string(), "original-provider/test");
         let mut expected = template;
         (expected.history, expected.history_lifetime) = (
             vec![user.render(), assistant.render(), tool.render()],
@@ -877,23 +879,20 @@ mod tests {
     #[test]
     fn bound_reasoning_does_not_survive_compaction() {
         let (agent, mut records) = projection_fixture();
-        let portable = Replay {
-            provenance: Provenance {
-                protocol: "test".into(),
-                model: "model".into(),
-                scope: Scope::try_from("scope".to_owned()).unwrap(),
-            },
-            payload: json!({"signature":"opaque"}),
-            binding: Binding::Free,
+        let replay = |binding| {
+            envelope(
+                ReplayFormat::Messages,
+                "model",
+                json!({"signature":"opaque"}),
+                binding,
+            )
         };
-        let bound = Replay {
-            binding: Binding::Conversation,
-            ..portable.clone()
-        };
+        let (portable, bound) = (replay(Binding::Free), replay(Binding::Conversation));
         let message = |replay| {
             Message::Assistant(vec![
                 AssistantItem::reasoning("bound", 0, "visible", replay),
                 AssistantItem::reasoning("portable", 1, "kept", Some(portable.clone())),
+                AssistantItem::text("said", 2, "answer"),
             ])
         };
         let (signed, stripped) = (message(Some(bound)), message(None));

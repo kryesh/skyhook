@@ -116,8 +116,8 @@ mod tests {
     use super::*;
     use crate::agent::runtime::tests::{
         Requests, Script, Sent, SentPart, Served, Step, bounded, child_launch, count, delta,
-        enqueue_prompts, events, owner, poll, response, shutdown_session, stream, summary_json,
-        test_builder, test_harness, tool_call, usage,
+        enqueue_prompts, events, model_ref, owner, poll, rendered, response, shutdown_session,
+        stream, summary_json, test_builder, test_harness, tool_call, usage,
     };
     use crate::provider::{
         Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
@@ -137,13 +137,16 @@ mod tests {
         error(ProviderErrorKind::Transport, "scripted connection lost")
     }
 
+    /// A context overflow at invocation, or after streaming text as a Messages stop does.
     fn overflow(streaming: bool) -> Step {
         let error = error(
             ProviderErrorKind::ContextWindowExceeded,
             "scripted context overflow",
         );
         if streaming {
-            Step::stream(vec![Err(error)])
+            let mut events = partial(&[AssistantItem::text("cut", 0, "DO NOT COMMIT")]);
+            events.push(Err(error));
+            Step::stream(events)
         } else {
             Step::fail(error)
         }
@@ -471,8 +474,9 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn all_transient_categories_retry_past_three_startup_or_stream_failures() {
-        use ProviderErrorKind::{RateLimited, Timeout, Transport, Unavailable};
+        use ProviderErrorKind::{CredentialExpired, RateLimited, Timeout, Transport, Unavailable};
         for kind in [
+            CredentialExpired,
             Unavailable { retry_after: None },
             Transport,
             Timeout,
@@ -667,7 +671,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn repeated_context_overflows_remain_bounded_to_three_failures() {
+    async fn context_overflows_compact_even_after_streamed_output_up_to_three_failures() {
         for streaming in [false, true] {
             let summary = || answer(&summary_json().to_string());
             let fixture = Fixture::new([
@@ -681,12 +685,27 @@ mod tests {
             .await;
             let error = fixture.session.prompt("continue").await.unwrap_err();
             assert!(error.to_string().contains("scripted context overflow"));
-            let requests = fixture.requests().len();
-            assert_eq!(requests, 5, "three context failures and two summaries");
+            let requests = fixture.requests();
+            assert_eq!(
+                requests.len(),
+                5,
+                "three context failures and two summaries"
+            );
             assert_eq!(fixture.script.remaining(), 1);
             let records = fixture.records().await;
             assert!(recoveries(&records).is_empty());
             assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), 3);
+            let summaries = requests
+                .iter()
+                .filter(|sent| sent.response_schema.is_some());
+            assert_eq!(summaries.count(), 2);
+            // Text streamed before an overflow is discarded with the attempt.
+            assert!(
+                requests
+                    .iter()
+                    .all(|sent| !rendered(sent).contains("DO NOT"))
+            );
+            assert_eq!(fixture.history(&records).1, 0);
             fixture.session.shutdown().await.unwrap();
         }
     }
@@ -728,7 +747,7 @@ mod tests {
                     };
                     let reconstructed =
                         crate::session::reconstruct_model_request(&records, sequence);
-                    assert_eq!(reconstructed.unwrap(), ("test".into(), request));
+                    assert_eq!(reconstructed.unwrap(), (model_ref("test"), request));
                     Err::<ResponseStream, _>(ProviderError::protocol(
                         "intentional provider failure",
                     ))

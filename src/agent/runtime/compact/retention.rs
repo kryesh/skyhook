@@ -60,9 +60,7 @@ pub(super) fn retained_sources<'a>(
     let mut start = visible.len();
     for (index, (_, message)) in visible.iter().enumerate().rev() {
         let kept = message.clone().without_bound_reasoning();
-        let tokens = kept.map_or(0, |kept| {
-            compaction::estimate_message(&kept.render(), model)
-        });
+        let tokens = compaction::estimate_message(&kept.render(), model);
         if total > 0 && total.saturating_add(tokens) > budget {
             break;
         }
@@ -215,9 +213,8 @@ pub(super) fn included_message_jobs(message: &Message, jobs: &mut BTreeSet<JobId
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::protocol::{
-        AssistantItem, Binding, Provenance, Replay, Scope, ToolCall, ToolResult,
-    };
+    use crate::provider::codec::common::tests::envelope;
+    use crate::provider::protocol::{AssistantItem, Binding, ReplayFormat, ToolCall, ToolResult};
     use crate::session::UserPart;
     use serde_json::json;
 
@@ -242,16 +239,9 @@ mod tests {
     #[test]
     fn active_exchange_retains_complete_reasoning_bundle_outside_visible_tail() {
         let agent = AgentId::root(crate::identity::SessionId::from_bytes([0; 16]));
-        for protocol in ["chat_completions", "responses", "anthropic"] {
-            let replay = Replay {
-                provenance: Provenance {
-                    protocol: protocol.into(),
-                    model: "model".into(),
-                    scope: Scope::try_from("scope".to_owned()).unwrap(),
-                },
-                payload: json!({"opaque":"must survive", "signature":"signed"}),
-                binding: Binding::Free,
-            };
+        for format in ReplayFormat::ALL {
+            let payload = json!({"opaque":"must survive", "signature":"signed"});
+            let replay = envelope(format, "model", payload, Binding::Free);
             let reasoning =
                 AssistantItem::reasoning("reason", 0, "visible reasoning", Some(replay));
             let call = ToolCall::new("call", "agent", json!({"prompt":"continue"})).unwrap();

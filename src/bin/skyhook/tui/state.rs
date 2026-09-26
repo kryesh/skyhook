@@ -1,11 +1,16 @@
-use serde::{Deserialize, Serialize};
-use skyhook::fs::{CommitMode, PermissionPolicy, StagedFile};
+use serde::{Deserialize, Deserializer, Serialize};
+use skyhook::{
+    fs::{CommitMode, PermissionPolicy, StagedFile},
+    provider::profile::ModelRef,
+};
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct SavedState {
-    pub model: Option<String>,
+    /// A name that is not `provider/model` is dropped, for the default to apply.
+    #[serde(deserialize_with = "model_ref")]
+    pub model: Option<ModelRef>,
     pub mode: Option<String>,
     pub sidebar: bool,
 }
@@ -18,6 +23,10 @@ impl Default for SavedState {
         }
     }
 }
+fn model_ref<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<ModelRef>, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.and_then(|name| name.parse().ok()))
+}
+
 /// UI state lives with the workspace's sessions.
 pub fn state_path(workspace: &Path) -> PathBuf {
     workspace.join(".skyhook/state.json")
@@ -64,21 +73,24 @@ mod tests {
     fn updates_keep_other_settings_and_the_sidebar_defaults_on() {
         let root = tempfile::tempdir().unwrap();
         assert!(load(root.path()).0.sidebar);
-        update(root.path(), |state| state.model = Some("m".into())).unwrap();
+        let model: ModelRef = "p/m".parse().unwrap();
+        update(root.path(), |state| state.model = Some(model.clone())).unwrap();
         update(root.path(), |state| state.mode = Some("look".into())).unwrap();
         update(root.path(), |state| state.sidebar = false).unwrap();
         let (state, warning) = load(root.path());
         assert_eq!(
             (
-                state.model.as_deref(),
+                state.model.as_ref(),
                 state.mode.as_deref(),
                 state.sidebar,
                 warning
             ),
-            (Some("m"), Some("look"), false, None)
+            (Some(&model), Some("look"), false, None)
         );
+        // An unqualified saved name is dropped; the other settings still load.
         std::fs::write(state_path(root.path()), br#"{"model":"m"}"#).unwrap();
-        let (state, _) = load(root.path());
-        assert!(state.sidebar && state.mode.is_none());
+        let (state, warning) = load(root.path());
+        assert!(state.model.is_none() && state.sidebar && state.mode.is_none());
+        assert!(warning.is_none());
     }
 }

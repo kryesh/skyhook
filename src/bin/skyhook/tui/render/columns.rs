@@ -286,6 +286,7 @@ mod tests {
             usage: Some(skyhook::provider::protocol::Usage {
                 input_tokens: 80,
                 cached_input_tokens: 20,
+                cache_write_input_tokens: 0,
                 output_tokens: output,
             }),
             elapsed_tenths: Some(12),

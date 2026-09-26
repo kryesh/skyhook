@@ -10,7 +10,7 @@ use crate::{
     media::ImageRef,
     named_enum::named_enum,
     provider::{
-        profile::ModelProfile,
+        profile::{ModelProfile, ModelRef},
         protocol::{
             CutReason, HistoryLifetime, ModelRequest, Outcome, ResponseSchema, SystemSegment,
             ToolDefinition, Usage,
@@ -205,7 +205,7 @@ impl CompactionFailure {
 /// A named model profile exactly as it was applied, independent of later configuration.
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ProfileSnapshot {
-    pub name: String,
+    pub name: ModelRef,
     pub profile: ModelProfile,
 }
 

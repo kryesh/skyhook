@@ -42,7 +42,7 @@ impl Fixture {
     }
     fn provider_config(&self, endpoint: &str, top: &str, credential: &str) {
         self.write("config/skyhook/config.yaml", &format!(
-            "{top}\nproviders:\n  test:\n    kind: openai\n    api: chat_completions\n    base_url: '{endpoint}'\n    {credential}\nmodels:\n  first:\n    provider: test\n    model: fixture\n    max_context: 128000\n    max_output: 4096\n    supports_images: true\n"
+            "{top}\nproviders:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: '{endpoint}'\n    {credential}\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n        supports_images: true\n"
         ));
     }
     fn bare_command(&self) -> Command {
@@ -320,8 +320,8 @@ mod dotenv {
     #[test]
     fn dotenv_selects_the_config_directory_and_supplies_provider_credentials() {
         for credential in [
-            format!("api_key_env: '{KEY}'"),
-            format!("api_key_command: \"printf '%s' \\\"${KEY}\\\"\""),
+            format!("api_key: {{env: '{KEY}'}}"),
+            format!("api_key: {{command: \"printf '%s' \\\"${KEY}\\\"\"}}"),
         ] {
             let f = fixture();
             let (endpoint, server) = mock_provider();
@@ -384,7 +384,10 @@ mod dump {
         f.write("config/skyhook/config.toml", legacy);
         f.write(".skyhook/config.toml", "[models.first]\nmax_output=0\n");
         let discovered = successful_config(&output(f.bare_command().arg("dump")));
-        assert_eq!(discovered["models"]["first"]["max_output"], 4096);
+        assert_eq!(
+            discovered["providers"]["test"]["models"]["first"]["max_output"],
+            4096
+        );
 
         let yaml = f.read("config/skyhook/config.yaml");
         fs::remove_file(f.path("config/skyhook/config.yaml")).unwrap();
@@ -410,17 +413,20 @@ mod dump {
         );
         f.write(
             ".skyhook/config.yaml",
-            "models:\n  first:\n    max_output: 0\n",
+            "providers:\n  test:\n    models:\n      first:\n        max_output: 0\n",
         );
         f.write(
             "project/.skyhook/config.yaml",
-            "models:\n  first:\n    max_output: 8192\n",
+            "providers:\n  test:\n    models:\n      first:\n        max_output: 8192\n",
         );
         let project = f.path("project");
         let merged = output(f.bare_command().args(["dump", "--workspace"]).arg(&project));
         let config = successful_config(&merged);
         assert_eq!(config["approve_all"].as_bool(), Some(false));
-        assert_eq!(config["models"]["first"]["max_output"].as_i64(), Some(8192));
+        assert_eq!(
+            config["providers"]["test"]["models"]["first"]["max_output"].as_i64(),
+            Some(8192)
+        );
         let overridden = output(
             f.bare_command()
                 .args(["dump", "config", "--workspace"])
@@ -445,7 +451,11 @@ mod dump {
         let f = Fixture::new();
         f.write("bin/ssh", "#!/bin/sh\ntouch SSH_WAS_RUN\nexit 1\n");
         fs::set_permissions(f.path("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
-        f.provider_config("http://127.0.0.1:1/v1", "", "api_key_env: MISSING_API_KEY");
+        f.provider_config(
+            "http://127.0.0.1:1/v1",
+            "",
+            "api_key: {env: MISSING_API_KEY}",
+        );
         let mut text = f.read("config/skyhook/config.yaml");
         text.push_str(
             "\nmcp:\n  trap:\n    transport: stdio\n    start_command: [/bin/sh, -c, touch MCP_WAS_RUN]\n",
@@ -459,7 +469,7 @@ mod dump {
         let dumped = output(f.bare_command().env("PATH", path).args(["dump", "config"]));
         let config = successful_config(&dumped);
         assert_eq!(
-            config["providers"]["test"]["api_key_env"].as_str(),
+            config["providers"]["test"]["api_key"]["env"].as_str(),
             Some("MISSING_API_KEY")
         );
         assert_eq!(
@@ -570,7 +580,7 @@ mod stats {
         assert_eq!(json["agents"].as_array().unwrap().len(), 1);
         assert_eq!(json["agents"][0]["path"], "/");
         assert_eq!(json["agents"][0]["name"], "root");
-        assert_eq!(json["agents"][0]["model"], "first");
+        assert_eq!(json["agents"][0]["model"], "test/first");
         assert_eq!(json["agents"][0]["jobs"]["scripts"], 1);
         assert_eq!(json["totals"]["usage"]["input_tokens"], 0);
         let rendered = stats(&[]);
@@ -582,10 +592,10 @@ mod stats {
         assert!(row.contains("first") && row.contains("0/0"), "{rendered}");
         let markdown = stats(&["--format", "markdown"]);
         assert!(markdown.starts_with(&format!("# Session {id}\n")));
-        assert!(markdown.contains("| / | first | 0/0 |"), "{markdown}");
+        assert!(markdown.contains("| / | test/first | 0/0 |"), "{markdown}");
         let tree = stats(&["--format", "tree"]);
         assert!(
-            tree.starts_with(&id) && tree.contains("\n/ [first]"),
+            tree.starts_with(&id) && tree.contains("\n/ [test/first]"),
             "{tree}"
         );
         assert!(tree.contains("\n1 agents, 0/0 calls"), "{tree}");
@@ -802,29 +812,37 @@ mod headless {
     fn model_memory_explicit_selection_resume_and_startup_warnings_are_shared() {
         let f = Fixture::new();
         let mut config = f.read("config/skyhook/config.yaml");
-        config.push_str("  second:\n    provider: test\n    model: second-model\n    max_context: 128000\n    max_output: 4096\n");
+        config.push_str("      second:\n        model: second-model\n        max_context: 128000\n        max_output: 4096\n");
         f.write("config/skyhook/config.yaml", &config);
-        f.write(".skyhook/state.json", r#"{"model":"second"}"#);
+        f.write(".skyhook/state.json", r#"{"model":"test/second"}"#);
         let saved = f.script("return 'saved';", &[]);
         assert!(saved.status.success());
-        assert!(f.journal(&saved).contains(r#""profile":{"name":"second""#));
-        let explicit = f.script("return 'explicit';", &["-m", "first"]);
+        assert!(
+            f.journal(&saved)
+                .contains(r#""profile":{"name":"test/second""#)
+        );
+        let explicit = f.script("return 'explicit';", &["-m", "test/first"]);
         assert!(explicit.status.success());
         assert!(
             f.journal(&explicit)
-                .contains(r#""profile":{"name":"first""#)
+                .contains(r#""profile":{"name":"test/first""#)
         );
         let remembered: serde_json::Value =
             serde_json::from_str(&f.read(".skyhook/state.json")).unwrap();
-        assert_eq!(remembered["model"], "first");
+        assert_eq!(remembered["model"], "test/first");
         let id = std::str::from_utf8(&saved.stdout).unwrap().trim();
-        let resumed = f.script("return 'resume-model';", &["--resume", id, "-m", "first"]);
+        let resumed = f.script(
+            "return 'resume-model';",
+            &["--resume", id, "-m", "test/first"],
+        );
         assert!(resumed.status.success());
         let records = f.records(&resumed);
         let root = skyhook::identity::AgentId::root(id.parse().unwrap());
         assert_eq!(
-            skyhook::session::agent_selection(&records, &root).unwrap(),
-            "second"
+            skyhook::session::agent_selection(&records, &root)
+                .unwrap()
+                .to_string(),
+            "test/second"
         );
         f.write(".skyhook/state.json", "invalid JSON");
         let warning = f.script("return 'warning';", &[]);
@@ -838,7 +856,7 @@ mod headless {
         let missing_id = "00000000000000000000000000000001";
         let args = ["-p", "hello", "--resume", missing_id];
         assert_reported_failure(&output(f.batch().args(args)));
-        f.write("config/skyhook/config.yaml", "providers:\n  test:\n    kind: codex\nmodels:\n  first:\n    provider: test\n    model: fixture\n    max_context: 128000\n    max_output: 4096\n");
+        f.write("config/skyhook/config.yaml", "providers:\n  test:\n    dialect: codex\n    codec: responses\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n");
         let out = output(f.batch().args(["--approve-all", "-p", "hello"]));
         assert!(!out.status.success());
         assert!(f.journal(&out).contains("Failed:"));

@@ -95,9 +95,7 @@ impl SessionRuntime {
         let template = summary_request.clone();
         // Dropping tools changes the conversation, invalidating bound reasoning.
         summary_request.history = crate::session::render_history(
-            projected
-                .history()
-                .filter_map(Message::without_bound_reasoning),
+            projected.history().map(Message::without_bound_reasoning),
         );
         summary_request.tail = summary_tail.iter().map(Message::render).collect();
         // The checkpoint replaces this history once the summary completes.
@@ -251,11 +249,10 @@ impl SessionRuntime {
             }
         }
         let mut compacted = input.clone();
-        // Estimate what projection sends: retained bound reasoning is dropped,
-        // and a message left content-free by that is dropped with it.
+        // Estimate what projection sends: retained bound reasoning is dropped.
         let retained_history = retained
             .iter()
-            .filter_map(|source| source.message().clone().without_bound_reasoning());
+            .map(|source| source.message().clone().without_bound_reasoning());
         compacted.history = crate::session::render_history(
             std::iter::once(message.clone()).chain(retained_history),
         );
@@ -407,7 +404,7 @@ mod tests {
         // notification independently of the compaction under test.
         let workspace = fixture.workspace.path();
         let store = &runtime.store;
-        let owner = crate::session::fixture::start_child(store, agent, 99, None, workspace).await;
+        let owner = crate::session::tests::start_child(store, agent, 99, None, workspace).await;
         let spec = JobSpec {
             background: true,
             ..JobSpec::test(owner.clone(), "background-research")
@@ -494,7 +491,7 @@ mod tests {
         runtime.todos.replace(agent, original).await.unwrap();
         let workspace = fixture.workspace.path();
         let store = &runtime.store;
-        let child = crate::session::fixture::start_child(store, agent, 1, None, workspace).await;
+        let child = crate::session::tests::start_child(store, agent, 1, None, workspace).await;
         let child_todos = vec![todo("Independent delegated work", TodoStatus::InProgress)];
         let todos = &runtime.todos;
         todos.replace(&child, child_todos.clone()).await.unwrap();
@@ -530,7 +527,7 @@ mod tests {
         let arguments = json!({"path":"evidence.txt", "literal":null});
         let output = "evidence\n".repeat(400);
         let workspace = fixture.workspace.path();
-        crate::session::fixture::start_child(&runtime.store, agent, 99, None, workspace).await;
+        crate::session::tests::start_child(&runtime.store, agent, 99, None, workspace).await;
         let lease = runtime.jobs.create(JobSpec {
             arguments: arguments.clone(),
             output_schema: Some(json!({"type":"object","properties":{"content":{"type":"string","x-skyhook-truncatable":true}}})),
