@@ -56,7 +56,7 @@ pub(super) fn job_event_entries(
                     ));
                     if let Some(body) = &mut body {
                         body.line("Agent message received by model", Role::Muted);
-                        body.line(clean(&message.text), Role::Plain);
+                        body.line(message.text.as_str(), Role::Plain);
                     }
                 }
                 JobEvent::Job(job_view) => {

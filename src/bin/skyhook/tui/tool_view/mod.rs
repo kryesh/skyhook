@@ -6,7 +6,7 @@ mod preview;
 
 pub use output::OutputView;
 
-use super::{format::push_clean, model, theme::ContentTheme};
+use super::{format::Clean, theme::THEME};
 use highlighting::CodeKey;
 pub use highlighting::{CodeSource, HighlightCache};
 use ratatui::{
@@ -36,21 +36,21 @@ pub enum Role {
     Added,
 }
 impl Role {
-    fn style(self, theme: ContentTheme) -> Style {
+    fn style(self) -> Style {
         let color = match self {
-            Self::Plain | Self::ToolName => theme.fg,
-            Self::Indicator => theme.primary,
-            Self::Target => theme.accent,
-            Self::Success => theme.success,
-            Self::Warning => theme.warning,
-            Self::Error => theme.error,
-            Self::Heading => theme.heading,
-            Self::Label => theme.secondary,
-            Self::String | Self::Added => theme.success,
-            Self::Number => theme.accent,
-            Self::Constant => theme.primary,
-            Self::Muted => theme.muted,
-            Self::Removed => theme.error,
+            Self::Plain | Self::ToolName => THEME.fg,
+            Self::Indicator => THEME.primary,
+            Self::Target => THEME.accent,
+            Self::Success => THEME.success,
+            Self::Warning => THEME.warning,
+            Self::Error => THEME.error,
+            Self::Heading => THEME.heading,
+            Self::Label => THEME.secondary,
+            Self::String | Self::Added => THEME.success,
+            Self::Number => THEME.accent,
+            Self::Constant => THEME.primary,
+            Self::Muted => THEME.muted,
+            Self::Removed => THEME.error,
         };
         let style = Style::default().fg(color);
         if matches!(self, Self::Heading | Self::Label | Self::ToolName) {
@@ -63,7 +63,7 @@ impl Role {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Run {
-    text: String,
+    text: Clean,
     role: Role,
 }
 impl Run {
@@ -71,7 +71,7 @@ impl Run {
         &self.text
     }
 
-    pub(super) fn new(text: impl Into<String>, role: Role) -> Self {
+    pub(super) fn new(text: impl Into<Clean>, role: Role) -> Self {
         Self {
             text: text.into(),
             role,
@@ -80,10 +80,9 @@ impl Run {
 }
 /// Render structured presentation metadata without inferring semantics from its text.
 pub fn header_line(runs: &[Run]) -> Line<'static> {
-    let theme = ContentTheme::new();
     Line::from(
         runs.iter()
-            .map(|run| Span::styled(model::clean(&run.text), run.role.style(theme)))
+            .map(|run| Span::styled(run.text.to_string(), run.role.style()))
             .collect::<Vec<_>>(),
     )
 }
@@ -98,7 +97,7 @@ pub enum Section {
         language: String,
         indent: usize,
         /// No gutter or one shared marker, never a marker per source line.
-        gutters: Option<String>,
+        gutters: Option<Clean>,
         role: Role,
     },
 }
@@ -125,7 +124,7 @@ impl Document {
                     }
                     first = false;
                     for run in runs {
-                        push_clean(&mut text, &run.text);
+                        text.push_str(&run.text);
                     }
                 }
                 Section::Code {
@@ -141,9 +140,9 @@ impl Document {
                         first = false;
                         text.extend(std::iter::repeat_n(' ', *indent));
                         if let Some(gutter) = gutters.as_deref() {
-                            push_clean(&mut text, gutter);
+                            text.push_str(gutter);
                         }
-                        push_clean(&mut text, line);
+                        text.push_str(line);
                     }
                 }
             }
@@ -158,7 +157,6 @@ impl Document {
     }
     /// Styled logical lines and their presentation-only reflow policy.
     pub fn layout_lines(&self, cache: Option<&HighlightCache>) -> Vec<(Line<'static>, Wrap)> {
-        let p = ContentTheme::new();
         let mut lines = Vec::new();
         for section in &self.sections {
             match section {
@@ -181,18 +179,18 @@ impl Document {
                         let mut spans = vec![Span::raw(" ".repeat(*indent))];
                         if let Some(gutter) = gutters.as_deref() {
                             spans.push(Span::styled(
-                                model::clean(gutter),
+                                gutter.to_owned(),
                                 if matches!(role, Role::Added | Role::Removed) {
-                                    role.style(p)
+                                    role.style()
                                 } else {
-                                    Role::Muted.style(p)
+                                    Role::Muted.style()
                                 },
                             ));
                         }
                         if let Some(line) = highlighted.and_then(|lines| lines.get(index)) {
                             spans.extend(line.spans.iter().cloned());
                         } else {
-                            spans.push(Span::styled(model::clean(text), role.style(p)));
+                            spans.push(Span::styled(text.to_owned(), role.style()));
                         }
                         lines.push((Line::from(spans), Wrap::Hard));
                     }

@@ -725,13 +725,18 @@ mod tests {
         let cursor = terminal.get_cursor_position().unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(cursor.x, cursor.y)].symbol(), "t");
-        let p = crate::tui::render::Palette::new();
         let bold = ratatui::style::Modifier::BOLD;
-        assert_eq!(buffer[(2, app.prompt_body_rect.y)].fg, p.warning);
+        assert_eq!(
+            buffer[(2, app.prompt_body_rect.y)].fg,
+            crate::tui::theme::THEME.warning
+        );
         let title = &buffer[(2, app.prompt_body_rect.y + 1)];
-        assert!(title.fg == p.accent && title.modifier.contains(bold));
+        assert!(title.fg == crate::tui::theme::THEME.primary && title.modifier.contains(bold));
         let label = &buffer[(4, app.prompt_options_rect.y)];
-        assert_eq!((label.symbol(), label.fg), ("1", p.fg));
+        assert_eq!(
+            (label.symbol(), label.fg),
+            ("1", crate::tui::theme::THEME.fg)
+        );
         assert!(!label.modifier.contains(bold));
         key(&mut app, Tab, M::NONE);
         app.prompt_input_mut().body_scroll = 5;

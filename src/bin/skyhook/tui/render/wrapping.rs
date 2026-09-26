@@ -32,17 +32,13 @@ pub(super) fn cells_width(text: &str) -> usize {
     }
 }
 
-pub fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+pub(super) fn wrap_plain(text: &str, width: usize) -> Vec<String> {
     text.split('\n')
-        .flat_map(|line| wrap_line(Line::from(line.to_owned()), width.max(1)))
+        .flat_map(|line| wrap_words(Line::from(line.to_owned()), width))
         .map(|line| line.to_string())
         .collect()
 }
-pub(super) fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
-    wrap_line_widths(line, width, width)
-}
-
-pub(super) fn wrap_line_widths(
+pub(super) fn wrap_line(
     line: Line<'static>,
     width: usize,
     continuation_width: usize,
@@ -153,7 +149,7 @@ pub(super) fn wrap_words(line: Line<'static>, width: usize) -> Vec<Line<'static>
             // Whitespace and overlong tokens retain every grapheme; the latter
             // cannot fit on any row even if moved to its own line.
             row.spans.extend(spans);
-            let mut wrapped = wrap_line(row, width);
+            let mut wrapped = wrap_line(row, width, width);
             row = wrapped.pop().unwrap_or_default();
             used = row.width();
             result.extend(wrapped);
@@ -163,23 +159,44 @@ pub(super) fn wrap_words(line: Line<'static>, width: usize) -> Vec<Line<'static>
     result
 }
 
-/// Truncate metadata at grapheme boundaries.
-pub(super) fn clipped_header(value: &str, width: u16) -> String {
-    let budget = width as usize;
-    if budget == 0 {
-        return String::new();
+/// The leading graphemes of styled text that fit in `width` cells.
+pub(super) fn truncated(mut line: Line<'static>, width: usize) -> Line<'static> {
+    let mut budget = width;
+    let mut kept = Vec::new();
+    for span in line.spans {
+        let mut used = 0;
+        let cut = cells(&span.content).find(|&(_, _, cell)| {
+            used += cell;
+            used > budget
+        });
+        let Some((end, _, _)) = cut else {
+            budget -= used;
+            kept.push(span);
+            continue;
+        };
+        if end > 0 {
+            kept.push(Span::styled(span.content[..end].to_owned(), span.style));
+        }
+        break;
     }
-    if value.width() <= budget {
-        return value.to_owned();
+    line.spans = kept;
+    line
+}
+
+/// Text that fits in `width` cells, ending a cut with `…`.
+pub(super) fn clipped(line: Line<'static>, width: usize) -> Line<'static> {
+    if line.width() <= width {
+        return line;
     }
-    let mut used = 0;
-    let end = cells(value)
-        .find(|&(_, _, width)| {
-            used += width;
-            used > budget - 1
-        })
-        .map_or(value.len(), |(byte, _, _)| byte);
-    format!("{}…", &value[..end])
+    let mut line = truncated(line, width.saturating_sub(1));
+    if width > 0 {
+        let style = line
+            .spans
+            .last()
+            .map_or_else(Style::default, |span| span.style);
+        line.spans.push(Span::styled("…", style));
+    }
+    line
 }
 
 #[cfg(test)]

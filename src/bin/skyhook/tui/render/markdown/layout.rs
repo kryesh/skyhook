@@ -1,25 +1,24 @@
 //! Wrapping and source-versus-decoration geometry for Markdown rows.
 use super::super::super::tool_view;
-use super::super::{Palette, cells, cells_width, wrap_line, wrap_words};
+use super::super::{cells, cells_width, truncated, wrap_line, wrap_words};
 use super::parser::{LineInfo, parse};
-use super::{CodeGeometry, LayoutLine, RowLayout};
+use super::{CodeGeometry, Layout, LayoutLine, RowLayout};
 use ratatui::text::{Line, Span};
 
 /// Wrap source inside its paragraph/container, then add geometry-only code
 /// padding. Measuring the entire code block keeps all its rows the same width.
 pub(in super::super) fn layout_highlighted(
     text: &str,
-    palette: Palette,
     placeholder: bool,
     width: usize,
     markdown_width: usize,
     prefix: &str,
     cache: Option<&tool_view::HighlightCache>,
-) -> Vec<LayoutLine> {
+) -> Layout {
     let width = width.max(1);
-    let mut parsed = parse(text, palette, placeholder, markdown_width, cache);
+    let mut parsed = parse(text, placeholder, markdown_width, cache);
     if !prefix.is_empty() && !parsed.lines.is_empty() {
-        if super::super::stream::starts_with_table(text) {
+        if parsed.table_first {
             parsed.lines.insert(0, Line::from(prefix.to_owned()).into());
         } else {
             parsed.lines[0]
@@ -81,7 +80,7 @@ pub(in super::super) fn layout_highlighted(
             let code = CodeGeometry::new(width, indent, longest, widest);
             let decoration = LayoutLine {
                 layout: RowLayout::decoration(
-                    clipped_prefix(block[0].1.continuation.clone(), indent),
+                    truncated(block[0].1.continuation.clone(), indent),
                     code,
                 ),
                 ..LayoutLine::default()
@@ -95,26 +94,10 @@ pub(in super::super) fn layout_highlighted(
             layout_source(line, info, width, None, &mut output);
         }
     }
-    output
-}
-
-fn clipped_prefix(mut line: Line<'static>, width: usize) -> Line<'static> {
-    let mut remaining = width;
-    line.spans = line
-        .spans
-        .into_iter()
-        .filter_map(|span| {
-            let end = cells(&span.content)
-                .find(|&(_, _, width)| {
-                    let clipped = width > remaining;
-                    remaining -= if clipped { 0 } else { width };
-                    clipped
-                })
-                .map_or(span.content.len(), |(byte, _, _)| byte);
-            (end > 0).then(|| Span::styled(span.content[..end].to_owned(), span.style))
-        })
-        .collect();
-    line
+    Layout {
+        lines: output,
+        fences: parsed.fences,
+    }
 }
 
 fn layout_source(
@@ -132,7 +115,7 @@ fn layout_source(
         .width()
         .max(info.continuation.width())
         .min(width.saturating_sub(1));
-    let continuation = clipped_prefix(info.continuation, width.saturating_sub(1));
+    let continuation = truncated(info.continuation, width.saturating_sub(1));
     let indent = source_prefix_width.max(continuation.width());
     let budget = code.map_or_else(
         || width.saturating_sub(indent).max(1),
@@ -144,7 +127,7 @@ fn layout_source(
         alignment: line.alignment,
     };
     let wrapped = if code.is_some() {
-        wrap_line(body, budget)
+        wrap_line(body, budget, budget)
     } else {
         wrap_words(body, budget)
     };
@@ -185,9 +168,10 @@ mod tests {
             Row, RowBlocks, TextPosition, render_row_line, selected_text, tests::fixture_row,
         };
         use ratatui::{buffer::Buffer, layout::Rect};
-        let (p, width) = (Palette::new(), 12);
-        let lines = layout_highlighted(text, p, false, width as usize, width as usize, "", None);
-        let rows: Vec<Row> = lines
+        let width = 12;
+        let layout = layout_highlighted(text, false, width as usize, width as usize, "", None);
+        let rows: Vec<Row> = layout
+            .lines
             .into_iter()
             .map(|line| fixture_row(line.line, line.layout, 0, width, 0))
             .collect();
@@ -198,7 +182,7 @@ mod tests {
             byte: usize::MAX,
         };
         let copied = selected_text(&blocks, (TextPosition { row: 0, byte: 0 }, end));
-        let source = render(text, p, false, width as usize);
+        let source = render(text, false, width as usize);
         let source: Vec<_> = source.iter().map(ToString::to_string).collect();
         assert_eq!(
             copied,
@@ -209,7 +193,7 @@ mod tests {
             .map(|row| {
                 let area = Rect::new(0, 0, width, 1);
                 let mut buffer = Buffer::empty(area);
-                render_row_line(row, area, &mut buffer, Style::default(), p);
+                render_row_line(row, area, &mut buffer, Style::default());
                 let painted: String = (0..width).map(|x| buffer[(x, 0)].symbol()).collect();
                 painted.trim_end().to_owned()
             })

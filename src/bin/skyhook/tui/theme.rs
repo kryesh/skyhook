@@ -1,4 +1,4 @@
-//! Shared content colours, independent of Skyhook's neutral UI surfaces.
+//! Skyhook's colours: neutral UI surfaces and the semantic content palette.
 //!
 //! Semantic text and syntax roles share a blue/cyan palette.
 //! OKLCH was converted to sRGB, reducing chroma
@@ -7,11 +7,18 @@
 //! keep Skyhook's existing neutral foreground/muted colours and all backgrounds.
 use ratatui::style::Color;
 use syntect::highlighting::{
-    Color as SyntaxColor, FontStyle, StyleModifier, Theme, ThemeItem, ThemeSettings,
+    Color as SyntaxColor, FontStyle, StyleModifier, Theme as SyntaxTheme, ThemeItem, ThemeSettings,
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ContentTheme {
+pub struct Theme {
+    pub base: Color,
+    pub panel: Color,
+    pub input: Color,
+    pub agent: Color,
+    pub user: Color,
+    pub selected: Color,
+    /// Markdown code-block surface; syntax spans and tool output stay foreground-only.
+    pub code_bg: Color,
     pub fg: Color,
     pub muted: Color,
     pub primary: Color,
@@ -25,50 +32,54 @@ pub struct ContentTheme {
     pub strong: Color,
     pub quote: Color,
     pub inline_code: Color,
-    /// Markdown code-block surface; syntax spans and tool output stay foreground-only.
-    pub code_bg: Color,
 }
 
-impl ContentTheme {
-    pub const fn new() -> Self {
-        let (fg, muted, primary, secondary, accent, info, success, warning, error) = (
-            Color::Rgb(222, 225, 230),
-            Color::Rgb(146, 153, 163),
-            Color::Rgb(0, 185, 250),
-            Color::Rgb(97, 157, 255),
-            Color::Rgb(0, 206, 233),
-            Color::Rgb(0, 185, 250),
-            Color::Rgb(0, 208, 147),
-            Color::Rgb(246, 185, 1),
-            Color::Rgb(255, 102, 127),
-        );
-        Self {
-            fg,
-            muted,
-            primary,
-            secondary,
-            accent,
-            info,
-            success,
-            warning,
-            error,
-            heading: primary,
-            strong: secondary,
-            quote: muted,
-            inline_code: primary,
-            code_bg: Color::Rgb(16, 16, 16),
-        }
+pub const THEME: Theme = {
+    let (fg, muted, primary, secondary, accent, info, success, warning, error) = (
+        Color::Rgb(222, 225, 230),
+        Color::Rgb(146, 153, 163),
+        Color::Rgb(0, 185, 250),
+        Color::Rgb(97, 157, 255),
+        Color::Rgb(0, 206, 233),
+        Color::Rgb(0, 185, 250),
+        Color::Rgb(0, 208, 147),
+        Color::Rgb(246, 185, 1),
+        Color::Rgb(255, 102, 127),
+    );
+    Theme {
+        base: Color::Rgb(0, 0, 0),
+        panel: Color::Rgb(28, 28, 28),
+        input: Color::Rgb(40, 40, 40),
+        agent: Color::Rgb(34, 34, 34),
+        user: Color::Rgb(44, 44, 44),
+        selected: Color::Rgb(64, 64, 64),
+        code_bg: Color::Rgb(16, 16, 16),
+        fg,
+        muted,
+        primary,
+        secondary,
+        accent,
+        info,
+        success,
+        warning,
+        error,
+        heading: primary,
+        strong: secondary,
+        quote: muted,
+        inline_code: primary,
     }
+};
 
+impl Theme {
     /// Foreground-only syntax theme. Consumers must leave UI backgrounds alone.
-    pub fn syntax_theme(self) -> Theme {
-        let mut theme = Theme {
+    pub fn syntax_theme(&self) -> SyntaxTheme {
+        let mut theme = SyntaxTheme {
             name: Some("Skyhook dark".into()),
             settings: ThemeSettings {
                 foreground: Some(syntax_color(self.fg)),
                 ..ThemeSettings::default()
             },
-            ..Theme::default()
+            ..SyntaxTheme::default()
         };
         // More specific selectors override their containing string/keyword scope.
         for (scope, color, font_style) in [
@@ -132,21 +143,20 @@ mod tests {
             };
             0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
         }
-        let theme = ContentTheme::new();
         for color in [
-            theme.fg,
-            theme.muted,
-            theme.primary,
-            theme.secondary,
-            theme.accent,
-            theme.info,
-            theme.success,
-            theme.warning,
-            theme.error,
+            THEME.fg,
+            THEME.muted,
+            THEME.primary,
+            THEME.secondary,
+            THEME.accent,
+            THEME.info,
+            THEME.success,
+            THEME.warning,
+            THEME.error,
         ] {
             // The brightest surface includes selection; normal content sits on
             // user/agent backgrounds.
-            for (bg, minimum) in [(Color::Rgb(64, 64, 64), 3.), (Color::Rgb(44, 44, 44), 4.5)] {
+            for (bg, minimum) in [(THEME.selected, 3.), (THEME.user, 4.5)] {
                 let (a, b) = (luminance(color), luminance(bg));
                 let contrast = (a.max(b) + 0.05) / (a.min(b) + 0.05);
                 assert!(

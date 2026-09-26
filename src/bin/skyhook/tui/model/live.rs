@@ -82,19 +82,16 @@ pub(super) fn reasoning_entry(
         ReasoningStatus::Incomplete => "Reasoning · incomplete",
     };
     let running = status == ReasoningStatus::Running;
-    let default_open = running;
     // Source lines determine collapsibility; terminal wrapping must not change interaction.
     let text = text.trim_matches(['\r', '\n']);
     if text.lines().count() <= 1 {
         let mut entry = Entry::new(key, text.to_owned(), Surface::Reasoning);
-        entry.default_open = default_open;
         entry.running = running;
         return entry;
     }
-    let open = view.is_expanded(&key, default_open);
+    let open = view.is_expanded(&key, running);
     let body = if open { text.to_owned() } else { String::new() };
     let mut entry = Entry::titled(key, Title::disclosed(label, open), body, Surface::Reasoning);
-    entry.default_open = default_open;
     entry.running = running;
     entry
 }
@@ -230,7 +227,7 @@ mod tests {
         assert_eq!(active.title(), Some(&Title::disclosed("Reasoning", true)));
         assert_eq!(active.body(), "First\nSecond");
         assert_eq!(active.text(), "▾ Reasoning\nFirst\nSecond");
-        assert!(active.expandable() && active.default_open && active.running);
+        assert!(active.running);
         view.set_expanded(key.clone(), false);
         let collapsed = entry(&view, "First\nSecond", Running);
         assert_eq!(
@@ -244,7 +241,7 @@ mod tests {
             complete.title(),
             Some(&Title::disclosed("Reasoning", false))
         );
-        assert!(!complete.running && !complete.default_open);
+        assert!(!complete.running);
         view.set_expanded(key.clone(), true);
         assert_eq!(
             entry(&view, "First\nSecond", Complete).body(),

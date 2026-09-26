@@ -239,7 +239,7 @@ fn wrap_cell(mut cell: Line<'static>, width: usize) -> Vec<Line<'static>> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::Palette;
+    use super::super::super::THEME;
     use super::super::render;
     use super::*;
     use ratatui::style::Style;
@@ -250,7 +250,7 @@ mod tests {
         "| L | C | R |\n| :--- | :---: | ---: |\n| **abcdef** | *ab cd e* | `abcde` |";
 
     fn table(text: &str, width: usize) -> Vec<Line<'static>> {
-        render(text, Palette::new(), false, width)
+        render(text, false, width)
     }
 
     fn strings(lines: &[Line<'_>]) -> Vec<String> {
@@ -323,7 +323,7 @@ mod tests {
         assert!(has("cd", &|style| style
             .add_modifier
             .contains(Modifier::ITALIC)));
-        let code = Palette::new().content.inline_code;
+        let code = THEME.inline_code;
         assert!(has("e", &|style| style.fg == Some(code)));
     }
 

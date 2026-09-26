@@ -71,7 +71,8 @@ pub fn footer_stats(usage: Usage, context: Option<(u64, u64)>) -> [String; 3] {
 }
 
 /// Remove terminal controls while preserving line boundaries and expanding tabs.
-pub fn push_clean(output: &mut String, text: &str) {
+pub fn clean(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
     for ch in text.chars() {
         match ch {
             '\t' => output.push_str("    "),
@@ -80,12 +81,34 @@ pub fn push_clean(output: &mut String, text: &str) {
             _ => {}
         }
     }
+    output
 }
 
-pub fn clean(text: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    push_clean(&mut output, text);
-    output
+/// Text that is safe to paint: `clean` has been applied.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Clean(String);
+
+impl From<String> for Clean {
+    fn from(text: String) -> Self {
+        if text.contains(|ch: char| ch.is_control() && ch != '\n') {
+            Self(clean(&text))
+        } else {
+            Self(text)
+        }
+    }
+}
+
+impl From<&str> for Clean {
+    fn from(text: &str) -> Self {
+        Self::from(text.to_owned())
+    }
+}
+
+impl std::ops::Deref for Clean {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.0
+    }
 }
 
 pub fn pretty(value: &impl serde::Serialize) -> String {
@@ -105,9 +128,7 @@ mod tests {
                 .collect::<String>()
                 .replace('\t', "    ");
             assert_eq!(clean(text), expected);
-            let mut prefixed = "prefix:".to_owned();
-            push_clean(&mut prefixed, text);
-            assert_eq!(prefixed, format!("prefix:{expected}"));
+            assert_eq!(*Clean::from(text), expected);
         }
     }
 }

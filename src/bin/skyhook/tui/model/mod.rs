@@ -9,7 +9,7 @@ mod projection;
 mod requests;
 mod retry;
 
-pub use super::format::{clean, footer, number, pretty};
+pub use super::format::{Clean, clean, footer, number, pretty};
 pub use cache::ContentCache;
 pub use entries::entries;
 pub use jobs::{state_name, target_suffix};
@@ -120,19 +120,19 @@ pub enum Disclosure {
 /// expandable and is drawn as its glyph; the spinner gutter is a render decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Title {
-    pub label: String,
+    label: Clean,
     pub disclosure: Option<Disclosure>,
 }
 
 impl Title {
-    pub fn plain(label: impl Into<String>) -> Self {
+    pub fn plain(label: impl Into<Clean>) -> Self {
         Self {
             label: label.into(),
             disclosure: None,
         }
     }
 
-    pub fn disclosed(label: impl Into<String>, open: bool) -> Self {
+    pub fn disclosed(label: impl Into<Clean>, open: bool) -> Self {
         Self {
             label: label.into(),
             disclosure: Some(if open {
@@ -151,7 +151,7 @@ impl Title {
             None => "",
         };
         let gutter = if gutter { "  " } else { "" };
-        format!("{glyph}{gutter}{}", self.label)
+        format!("{glyph}{gutter}{}", &*self.label)
     }
 }
 
@@ -161,7 +161,7 @@ enum EntryBody {
     /// A titled or bare text body with its eager plain projection.
     Text {
         title: Option<Title>,
-        body: String,
+        body: Clean,
         plain: String,
     },
     Request {
@@ -183,7 +183,7 @@ impl Card {
     fn new(header: Vec<Run>, body: Option<Document>) -> Self {
         let mut plain = String::new();
         for run in &header {
-            super::format::push_clean(&mut plain, run.text());
+            plain.push_str(run.text());
         }
         if let Some(body) = &body {
             let body_text = body.plain_text();
@@ -205,9 +205,8 @@ pub struct Entry {
     key: EntryKey,
     body: EntryBody,
     pub surface: Surface,
-    pub default_open: bool,
     pub running: bool,
-    pub footer: Option<String>,
+    pub footer: Option<Clean>,
     pub indent: u16,
     /// Omit the separator before a related sibling tool or this script's first child.
     pub compact_after: bool,
@@ -270,36 +269,46 @@ impl Entry {
         }
     }
 
-    pub fn expandable(&self) -> bool {
+    /// Expansion as projection built it: a title's disclosure, or whether a
+    /// card carries its body.
+    fn disclosure(&self) -> Option<Disclosure> {
         match &self.body {
-            EntryBody::Text { title, .. } => title
-                .as_ref()
-                .is_some_and(|title| title.disclosure.is_some()),
-            EntryBody::Request { .. } => false,
-            EntryBody::Card(_) => true,
+            EntryBody::Text { title, .. } => title.as_ref()?.disclosure,
+            EntryBody::Request { .. } => None,
+            EntryBody::Card(card) => Some(if card.body.is_some() {
+                Disclosure::Open
+            } else {
+                Disclosure::Closed
+            }),
         }
     }
 
-    /// One expansion policy for card layout and interactive toggling.
-    pub fn is_expanded(&self, view: &View, tab: Tab, details: bool) -> bool {
-        let all = details
-            && (self.job_id().is_some()
-                || (tab == Tab::Conversation && self.surface == Surface::Tool));
-        self.expandable() && view.is_expanded(self.key(), all || self.default_open)
+    pub fn expandable(&self) -> bool {
+        self.disclosure().is_some()
+    }
+
+    pub fn open(&self) -> bool {
+        self.disclosure() == Some(Disclosure::Open)
+    }
+
+    /// Inline reasoning and the working indicator are not navigable or copyable.
+    pub fn selectable(&self) -> bool {
+        self.expandable()
+            || !(self.surface == Surface::Reasoning || matches!(self.key, EntryKey::Working(_)))
     }
 
     /// Projection chooses key variants from semantic source kinds; untrusted
     /// text and historical values never choose the key/payload pairing.
     pub(crate) fn new(key: EntryKey, body: String, surface: Surface) -> Self {
+        let body = Clean::from(body);
         Self {
             key,
             body: EntryBody::Text {
                 title: None,
-                plain: body.clone(),
+                plain: body.to_string(),
                 body,
             },
             surface,
-            default_open: false,
             running: false,
             footer: None,
             indent: 0,
@@ -308,6 +317,7 @@ impl Entry {
     }
 
     pub(crate) fn titled(key: EntryKey, title: Title, body: String, surface: Surface) -> Self {
+        let body = Clean::from(body);
         let mut plain = title.line(false);
         if !body.is_empty() {
             plain.push('\n');

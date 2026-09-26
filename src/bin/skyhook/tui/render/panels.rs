@@ -117,7 +117,7 @@ impl PromptLayout {
     }
 }
 
-pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: &PromptLayout) {
+pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayout) {
     let rect = app.composer_rect;
     let lines = &layout.body;
     let option_lines = &layout.options;
@@ -145,27 +145,26 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
             .title_start
             .is_some_and(|start| app.prompt_input().body_scroll + offset >= start);
         let style = if title {
-            Style::default().fg(p.accent).add_modifier(Modifier::BOLD)
+            Style::default()
+                .fg(THEME.primary)
+                .add_modifier(Modifier::BOLD)
         } else {
-            Style::default().fg(p.warning)
+            Style::default().fg(THEME.warning)
         };
-        frame.render_widget(
-            Paragraph::new(line.as_str()).style(style.bg(p.input)),
+        render_line(
+            &Line::from(line.as_str()),
             r(2, rect.y + offset as u16, rect.width.saturating_sub(4), 1),
+            frame.buffer_mut(),
+            style.bg(THEME.input),
         );
     }
     app.prompt_option_rows = option_lines.len();
-    if !app.prompt_input().options_scrolled {
-        if selected_start < app.prompt_input().option_scroll {
-            app.prompt_input_mut().option_scroll = selected_start;
-        } else if selected_start >= app.prompt_input().option_scroll + option_height as usize {
-            app.prompt_input_mut().option_scroll =
-                selected_start.saturating_sub(option_height.saturating_sub(1) as usize);
-        }
-        app.prompt_input_mut().options_scrolled = true;
+    let input = app.prompt_input_mut();
+    if !input.options_scrolled {
+        input.option_scroll = scroll_to(input.option_scroll, selected_start, option_height);
+        input.options_scrolled = true;
     }
-    app.prompt_input_mut().option_scroll = app
-        .prompt_input()
+    input.option_scroll = input
         .option_scroll
         .min(option_lines.len().saturating_sub(option_height as usize));
     let mut cursor_drawn = false;
@@ -181,16 +180,18 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
             rect.width.saturating_sub(4),
             1,
         );
-        frame.render_widget(
-            Paragraph::new(line.text.as_str()).style(line.style(p, app.prompt_input().choice)),
+        render_line(
+            &Line::from(line.text.as_str()),
             row,
+            frame.buffer_mut(),
+            line.style(app.prompt_input().choice),
         );
         if line.index == app.prompt_input().choice
             && !cursor_drawn
             && app.menu.is_none()
             && !(app.multiple_questions() && app.question_editing())
         {
-            focus_cursor(frame, row.x - 1, row.y, p.input);
+            focus_cursor(frame, row.x - 1, row.y, THEME.input);
             cursor_drawn = true;
         }
         app.hits.push((row, Hit::PromptChoice(line.index)));
@@ -210,8 +211,8 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
             frame,
             r(2, input_y + offset as u16, rect.width.saturating_sub(4), 1),
             label.clone(),
-            p.muted,
-            p.input,
+            THEME.muted,
+            THEME.input,
         );
     }
     if let Some(input) = &layout.input {
@@ -230,10 +231,10 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
                 row.line(
                     Style::default(),
                     Style::default(),
-                    Style::default().bg(p.selected),
+                    Style::default().bg(THEME.selected),
                 ),
-                p.fg,
-                p.input,
+                THEME.fg,
+                THEME.input,
             );
         }
         if visible > 0
@@ -247,68 +248,61 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, p: Palette, layout: 
             ));
         }
     }
-    let question_counter = matches!(
-        app.prompts.front().map(|prompt| &prompt.kind),
+    let (hint, color) = match app.prompts.front().map(|prompt| &prompt.kind) {
         Some(crate::interaction::PromptKind::Questions { questions, .. })
-            if questions.len() > 1 && app.question_index() < questions.len()
+            if questions.len() > 1 && app.question_index() < questions.len() =>
+        {
+            let keys = if app.question_editing() {
+                "←→ cursor · Tab switch questions"
+            } else {
+                "←→ switch · Tab edit"
+            };
+            let (index, count) = (app.question_index() + 1, questions.len());
+            let hint = format!(
+                "Question {index}/{count} · {keys} · ↑↓ choose · Enter answer · Esc cancel"
+            );
+            (hint, THEME.warning)
+        }
+        kind => {
+            let escape = match kind {
+                Some(crate::interaction::PromptKind::Approval { .. }) => "dismiss",
+                _ => "cancel",
+            };
+            let hint = format!(
+                "↑↓ choose · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc {escape}"
+            );
+            (hint, THEME.muted)
+        }
+    };
+    let footer = r(
+        2,
+        rect.bottom().saturating_sub(1),
+        rect.width.saturating_sub(4),
+        1,
     );
-    text(
-        frame,
-        r(
-            2,
-            rect.bottom().saturating_sub(1),
-            rect.width.saturating_sub(4),
-            1,
-        ),
-        match app.prompts.front().map(|prompt| &prompt.kind) {
-            Some(crate::interaction::PromptKind::Questions { questions, .. })
-                if questions.len() > 1 && app.question_index() < questions.len() =>
-            {
-                format!(
-                    "Question {}/{} · {} · ↑↓ choose · Enter answer · Esc cancel",
-                    app.question_index() + 1,
-                    questions.len(),
-                    if app.question_editing() {
-                        "←→ cursor · Tab switch questions"
-                    } else {
-                        "←→ switch · Tab edit"
-                    }
-                )
-            }
-            kind => format!(
-                "↑↓ choose · PgUp/PgDn text · Ctrl+PgUp/PgDn choices · Enter submit · Esc {}",
-                if matches!(kind, Some(crate::interaction::PromptKind::Approval { .. })) {
-                    "dismiss"
-                } else {
-                    "cancel"
-                },
-            ),
-        },
-        if question_counter { p.warning } else { p.muted },
-        p.input,
-    );
+    text(frame, footer, hint, color, THEME.input);
+}
+
+/// Move a `height`-row window's first row as little as possible to show `cursor`.
+fn scroll_to(top: usize, cursor: usize, height: u16) -> usize {
+    top.min(cursor)
+        .max((cursor + 1).saturating_sub(height as usize))
 }
 
 /// Visible agent hierarchy with shared statistics and navigation hit targets.
 pub(super) fn draw_tree(
     frame: &mut Frame,
     app: &mut App,
-    p: Palette,
     tree_agents: &[model::AgentInfo],
     tree_rows: u16,
     navigation_active: bool,
 ) {
     let width = app.tree_rect.width;
     let tree_y = app.tree_rect.y;
-    fill(frame, app.tree_rect, p.panel);
+    fill(frame, app.tree_rect, THEME.panel);
     app.tree_cursor = app.tree_cursor.min(tree_agents.len().saturating_sub(1));
     if app.focus == Focus::Tree {
-        if app.tree_cursor < app.tree_scroll {
-            app.tree_scroll = app.tree_cursor;
-        }
-        if app.tree_cursor >= app.tree_scroll + tree_rows as usize {
-            app.tree_scroll = app.tree_cursor + 1 - tree_rows as usize;
-        }
+        app.tree_scroll = scroll_to(app.tree_scroll, app.tree_cursor, tree_rows);
     }
     app.tree_scroll = app
         .tree_scroll
@@ -317,13 +311,8 @@ pub(super) fn draw_tree(
         .iter()
         .map(|agent| model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id))
         .collect::<Vec<_>>();
-    let stats_columns = AgentStatsColumns::new(agent_stats.iter());
-    let minimum_name_width = AgentColumnsLayout::minimum_identity_width(tree_agents, width);
-    let columns = AgentColumnsLayout::new(
-        width.saturating_sub(4),
-        minimum_name_width,
-        stats_columns.width(),
-    );
+    let row_width = width.saturating_sub(4);
+    let columns = AgentColumns::new(tree_agents, row_width, AgentStatsColumns::new(&agent_stats));
     for (index, agent) in tree_agents
         .iter()
         .enumerate()
@@ -333,50 +322,23 @@ pub(super) fn draw_tree(
         let y = tree_y + 1 + (index - app.tree_scroll) as u16;
         let selected = agent.id == app.selected;
         let focused = navigation_active && app.focus == Focus::Tree && app.tree_cursor == index;
-        let rect = r(2, y, width.saturating_sub(4), 1);
+        let rect = r(2, y, row_width, 1);
         let hover = navigation_active && app.hover.is_some_and(|point| rect.contains(point.into()));
         let bg = if selected || focused || hover {
-            p.selected
+            THEME.selected
         } else {
-            p.panel
+            THEME.panel
         };
-        fill(frame, rect, bg);
-        let status = app.agent_status(agent);
-        app.animating |= status.running();
-        let symbol = agent_symbol(status, agent.terminal(), app.tick_count);
-        let indent = (agent.id.depth() as u16 * 4).min(width / 3);
-        let target = model::target_suffix(&agent.target);
-        let stats = stats_columns.format(&agent_stats[index]);
-        let name_width = columns.identity_width.saturating_sub(indent);
-        let name = agent_identity(
-            &agent.name,
-            &target,
-            if selected { "> " } else { "  " },
-            Span::styled(symbol, Style::default().fg(agent_status_color(status, p))),
-            name_width,
-            p,
-        );
-        text(frame, r(2 + indent, y, name_width, 1), name, p.fg, bg);
+        let row = AgentRow {
+            agent,
+            state: app.agent_status(agent),
+            stats: &agent_stats[index],
+            marker: if selected { "> " } else { "  " },
+        };
+        app.animating |= row.state.running();
+        let x = draw_agent_row(frame, rect, row, &columns, app.tick_count, bg);
         if focused {
-            focus_cursor(frame, 2 + indent, y, bg);
-        }
-        if columns.status_width > 0 {
-            text(
-                frame,
-                r(columns.identity_width + 4, y, columns.status_width, 1),
-                status.label(),
-                agent_status_color(status, p),
-                bg,
-            );
-        }
-        if columns.stats_width > 0 {
-            text(
-                frame,
-                r(width - columns.stats_width - 2, y, columns.stats_width, 1),
-                stats,
-                p.muted,
-                bg,
-            );
+            focus_cursor(frame, x, y, bg);
         }
         app.hits.push((rect, Hit::Agent(agent.id.clone())));
     }
@@ -390,16 +352,16 @@ struct PromptOptionLine {
 }
 
 impl PromptOptionLine {
-    fn style(&self, p: Palette, selected: usize) -> Style {
+    fn style(&self, selected: usize) -> Style {
         let style = Style::default().bg(if self.index == selected {
-            p.selected
+            THEME.selected
         } else {
-            p.input
+            THEME.input
         });
         if self.description {
-            style.fg(p.muted)
+            style.fg(THEME.muted)
         } else {
-            style.fg(p.fg)
+            style.fg(THEME.fg)
         }
     }
 }
@@ -422,7 +384,7 @@ fn prompt_option_lines(
             if description && source.is_empty() {
                 continue;
             }
-            for (offset, line) in wrap_plain(&source, width.saturating_sub(2).max(1) as usize)
+            for (offset, line) in wrap_plain(&source, width.saturating_sub(2) as usize)
                 .into_iter()
                 .enumerate()
             {
@@ -458,7 +420,6 @@ mod tests {
             ),
             ("Write an answer…".into(), String::new()),
         ];
-        let p = Palette::new();
         for width in [6, 12, 30] {
             let (rows, selected_start) = prompt_option_lines(&options, 1, width);
             assert_eq!(rows[selected_start].index, 1);
@@ -467,10 +428,10 @@ mod tests {
                 rows.iter().filter(|row| row.text.starts_with("> ")).count(),
                 1
             );
-            assert!(
-                rows.iter()
-                    .all(|row| row.text.width() <= width as usize && !row.text.contains('—'))
-            );
+            // Separators stay on the row they end, past its visible edge.
+            assert!(rows.iter().all(|row| {
+                row.text.trim_end().width() <= width as usize && !row.text.contains('—')
+            }));
             for (index, (label, description)) in options.iter().enumerate() {
                 let choice: Vec<_> = rows.iter().filter(|row| row.index == index).collect();
                 assert!(!choice[0].description);
@@ -487,12 +448,23 @@ mod tests {
                 }
             }
             for row in &rows {
-                let style = row.style(p, 1);
+                let style = row.style(1);
                 assert_eq!(
                     style.bg,
-                    Some(if row.index == 1 { p.selected } else { p.input })
+                    Some(if row.index == 1 {
+                        THEME.selected
+                    } else {
+                        THEME.input
+                    })
                 );
-                assert_eq!(style.fg, Some(if row.description { p.muted } else { p.fg }));
+                assert_eq!(
+                    style.fg,
+                    Some(if row.description {
+                        THEME.muted
+                    } else {
+                        THEME.fg
+                    })
+                );
                 assert!(!style.add_modifier.contains(Modifier::BOLD));
             }
         }

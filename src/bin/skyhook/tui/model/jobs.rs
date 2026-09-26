@@ -194,6 +194,7 @@ pub(super) fn job_entry(
 #[cfg(test)]
 mod tests {
     use super::super::super::tool_view::Section;
+    use super::super::clean;
     use super::super::tests::{header_text, job_info, root};
     use super::*;
     use crate::tui::app::OutputStore;
@@ -235,7 +236,7 @@ mod tests {
             job_entry(&job, &projection, &View::default(), &outputs, true),
         ] {
             assert!(!entry.text().contains("absent") && !entry.text().contains("\"error\""));
-            assert!(has_code(&entry, |source| source == "  literal null\t\n"));
+            assert!(has_code(&entry, |source| source == "  literal null    \n"));
             assert!(has_code(&entry, |source| {
                 serde_json::from_str::<Value>(source).ok().as_ref() == Some(&kept)
             }));
@@ -338,7 +339,7 @@ mod tests {
             assert!(!expanded.text().contains("Loading output"));
             let result = output.as_ref().map(|output| &output["result"]);
             if let Some(Value::String(stdout)) = result.map(|result| &result["stdout"]) {
-                assert!(has_code(&expanded, |source| source == stdout));
+                assert!(has_code(&expanded, |source| source == clean(stdout)));
             }
             if result.is_some_and(|result| result.get("stderr").is_some()) {
                 assert!(expanded.text().contains("other details"));

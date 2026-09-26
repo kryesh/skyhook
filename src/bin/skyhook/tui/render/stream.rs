@@ -2,29 +2,26 @@
 //! authoritative replacements: every update renders its complete source, with a
 //! stateless plain-prose fast path and a conservative Markdown fallback.
 
-use super::markdown::{self, LayoutLine};
-use super::{Palette, wrap_words};
-use ratatui::{
-    style::Style,
-    text::{Line, Span},
-};
+use super::markdown::{self, Layout, LayoutLine};
+use super::wrap_words;
+use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 pub(super) fn layout_highlighted(
     text: &str,
     width: usize,
-    p: Palette,
     prefix: &str,
     highlights: Option<&super::super::tool_view::HighlightCache>,
-) -> Vec<LayoutLine> {
+) -> Layout {
     let width = width.max(1);
-    if let Some(rows) = plain_layout(text, width, prefix, p) {
-        return rows;
+    if let Some(lines) = plain_layout(text, width, prefix) {
+        return Layout {
+            lines,
+            ..Layout::default()
+        };
     }
-    let cleaned = super::model::clean(text);
     markdown::layout_highlighted(
-        &cleaned,
-        p,
+        text,
         true,
         width,
         width.saturating_sub(prefix.width()),
@@ -34,7 +31,7 @@ pub(super) fn layout_highlighted(
 }
 
 /// Render a complete plain source once, or decline so Markdown handles it.
-fn plain_layout(text: &str, width: usize, prefix: &str, p: Palette) -> Option<Vec<LayoutLine>> {
+fn plain_layout(text: &str, width: usize, prefix: &str) -> Option<Vec<LayoutLine>> {
     // Conservative narrow-prefix admission, including multibyte prefixes.
     if !prefix.is_empty() && width < prefix.len() {
         return None;
@@ -61,10 +58,7 @@ fn plain_layout(text: &str, width: usize, prefix: &str, p: Palette) -> Option<Ve
         if output.is_empty() && !prefix.is_empty() {
             spans.push(Span::raw(prefix.to_owned()));
         }
-        spans.push(Span::styled(
-            visible.to_owned(),
-            Style::default().fg(p.content.fg),
-        ));
+        spans.push(Span::raw(visible.to_owned()));
         output.extend(
             wrap_words(Line::from(spans), width)
                 .into_iter()
@@ -76,21 +70,6 @@ fn plain_layout(text: &str, width: usize, prefix: &str, p: Palette) -> Option<Ve
         output.push((Line::from(prefix.to_owned()), false).into());
     }
     Some(output)
-}
-
-// Look through containers and empty blocks. A list item already emits a marker
-// before its table, whereas a block quote emits no row until content arrives.
-pub(super) fn starts_with_table(text: &str) -> bool {
-    use pulldown_cmark::{Event, Parser, Tag};
-    for event in Parser::new_ext(text, super::markdown::options()) {
-        match event {
-            Event::Start(Tag::Table(_)) => return true,
-            Event::Start(Tag::BlockQuote(_) | Tag::Paragraph | Tag::Heading { .. })
-            | Event::End(_) => {}
-            _ => return false,
-        }
-    }
-    false
 }
 
 fn safe_char(ch: char, line_start: bool) -> bool {
@@ -116,9 +95,10 @@ fn safe_char(ch: char, line_start: bool) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::style::Style;
 
     fn render(text: &str, width: usize, prefix: &str) -> Vec<LayoutLine> {
-        layout_highlighted(text, width, Palette::new(), prefix, None)
+        layout_highlighted(text, width, prefix, None).lines
     }
 
     #[test]
@@ -227,7 +207,6 @@ mod tests {
     /// Markdown render would, including every prefix that could become Markdown.
     #[test]
     fn plain_shortcut_matches_markdown_for_every_prefix() {
-        let p = Palette::new();
         let canonical = |rows: Vec<LayoutLine>| {
             rows.into_iter()
                 .map(|row| {
@@ -275,9 +254,8 @@ mod tests {
             for end in ends.chain([source.len()]) {
                 let text = &source[..end];
                 for width in [1, 3, 13, 80] {
-                    let cleaned = super::super::model::clean(text);
                     let reference =
-                        markdown::layout_highlighted(&cleaned, p, true, width, width, "", None);
+                        markdown::layout_highlighted(text, true, width, width, "", None).lines;
                     assert_eq!(
                         canonical(render(text, width, "")),
                         canonical(reference),

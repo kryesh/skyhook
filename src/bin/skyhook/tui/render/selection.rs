@@ -5,14 +5,17 @@ use super::*;
 #[derive(Clone)]
 pub struct Row {
     pub(super) line: std::sync::Arc<Line<'static>>,
+    /// The row's filled cells.
     pub(super) x: u16,
     pub(super) width: u16,
+    /// Text starts `inset` cells into the row and spans `text_width` cells.
+    pub(super) inset: u16,
+    pub(super) text_width: u16,
     pub(super) surface: Surface,
     pub entry: usize,
     pub(super) entry_key: std::sync::Arc<model::EntryKey>,
     pub selectable: bool,
     pub(super) layout: markdown::RowLayout,
-    pub(super) inset: u16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -21,19 +24,12 @@ pub struct TextPosition {
     pub byte: usize,
 }
 
-/// Inline reasoning and the working indicator are not navigable or copyable entries.
-pub fn entry_selectable(entry: &model::Entry) -> bool {
-    entry.expandable()
-        || !(entry.surface == Surface::Reasoning
-            || matches!(entry.key(), model::EntryKey::Working(_)))
-}
-
 impl Row {
     pub fn text(&self) -> String {
         self.line.to_string()
     }
     pub(super) fn paragraph_x(&self) -> u16 {
-        self.x + self.inset + u16::from(matches!(self.surface, Surface::User | Surface::Agent)) * 2
+        self.x + self.inset
     }
     pub(super) fn text_view(&self) -> RowText<'_> {
         RowText {
@@ -46,29 +42,22 @@ impl Row {
     }
     #[cfg(test)]
     pub(super) fn text_x(&self) -> u16 {
-        self.paragraph_x()
-            .saturating_add(self.text_view().source_column(0).unwrap() as u16)
+        let (_, prefix_width) = self.layout.source_prefix();
+        let body = self.layout.prefix.width() + prefix_width;
+        let body = self.layout.code().map_or(body, |code| code.body_start());
+        let first = self.text_view().source_cells().next();
+        self.paragraph_x() + first.map_or(body, |(_, column, _)| column) as u16
     }
     pub fn byte_at_column(&self, column: u16) -> usize {
         let target = column.saturating_sub(self.paragraph_x()) as usize;
-        let text = self.text();
-        let mut column = self.layout.prefix.width();
         let (prefix_bytes, prefix_width) = self.layout.source_prefix();
-        let prefix_end = column + prefix_width;
-        for (byte, _, width) in cells(&text) {
-            if byte == prefix_bytes {
-                column = self
-                    .layout
-                    .code()
-                    .map_or(prefix_end, |code| code.body_start());
-            }
+        let prefix_end = self.layout.prefix.width() + prefix_width;
+        let view = self.text_view();
+        let hit = view.source_cells().find(|&(byte, column, width)| {
             let clipped_prefix = byte < prefix_bytes && column + width > prefix_end;
-            if !clipped_prefix && target < column + width {
-                return byte;
-            }
-            column += width;
-        }
-        text.len()
+            !clipped_prefix && target < column + width
+        });
+        hit.map_or(view.text().len(), |(byte, _, _)| byte)
     }
 }
 
@@ -88,23 +77,7 @@ impl RowText<'_> {
         let byte = byte.min(self.text.len());
         self.text.is_char_boundary(byte).then_some(byte)
     }
-    #[cfg(test)]
-    pub fn source_column(&self, byte: usize) -> Option<usize> {
-        let byte = self.endpoint(byte)?;
-        let layout = &self.row.layout;
-        let (prefix_bytes, prefix_width) = layout.source_prefix();
-        let prefix = self.endpoint(prefix_bytes)?;
-        let leading = layout.prefix.width();
-        Some(if byte < prefix {
-            leading + cells_width(&self.text[..byte]).min(prefix_width)
-        } else {
-            layout
-                .code()
-                .map_or(leading + prefix_width, |code| code.body_start())
-                + cells_width(&self.text[prefix..byte])
-        })
-    }
-    /// Every grapheme as (byte, `source_column`, width), in one pass over the row.
+    /// Every grapheme as (byte, source column, width), in one pass over the row.
     pub fn source_cells(&self) -> impl Iterator<Item = (usize, usize, usize)> + '_ {
         fn columns(
             text: &str,
@@ -233,23 +206,8 @@ pub(super) fn selection_unchanged<'a>(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::tool_view::HighlightCache;
-    use super::super::tests::expandable_entry;
+    use super::super::tests::layout;
     use super::*;
-
-    fn layout(entry: &model::Entry, width: u16) -> Vec<Row> {
-        let highlights = HighlightCache::default();
-        let mut rows = Vec::new();
-        let options = EntryLayout {
-            width,
-            palette: Palette::new(),
-            highlights: &highlights,
-            request_columns: RequestColumns::default(),
-            expanded: entry.default_open,
-        };
-        update_entry_rows(&mut rows, entry, 0, options);
-        rows
-    }
 
     fn source_row(text: &str) -> Row {
         let entry = model::Entry::new(
@@ -258,34 +216,6 @@ mod tests {
             Surface::Tool,
         );
         EntryGeometry::new(&entry, 30, 0).row(Line::from(text.to_owned()), false, false)
-    }
-
-    #[test]
-    fn expansion_matches_toggle_defaults_and_explicit_overrides() {
-        let mut entry = expandable_entry();
-        let mut view = model::View::default();
-        let tab = Tab::Conversation;
-        assert!(!entry.is_expanded(&view, tab, false));
-        assert!(entry.is_expanded(&view, tab, true));
-        let tab = Tab::Jobs;
-        assert!(!entry.is_expanded(&view, tab, true));
-        let job = model::EntryKey::Job(skyhook::identity::JobId::new(1).unwrap());
-        let title = entry.title().unwrap().clone();
-        entry = model::Entry::titled(job, title, entry.body().to_owned(), Surface::Tool);
-        assert!(entry.is_expanded(&view, tab, true));
-        entry = expandable_entry();
-        entry.surface = Surface::Reasoning;
-        entry.default_open = true;
-        assert!(entry.is_expanded(&view, tab, false));
-        view.set_expanded(entry.key().clone(), false);
-        assert!(!entry.is_expanded(&view, tab, true));
-        // A single override cannot represent simultaneous collapsed/expanded
-        // membership. Explicitly reopening replaces the collapsed override.
-        view.set_expanded(entry.key().clone(), true);
-        entry.default_open = false;
-        assert!(entry.is_expanded(&view, tab, false));
-        entry = model::Entry::new(entry.key().clone(), entry.text().to_owned(), entry.surface);
-        assert!(!entry.is_expanded(&view, tab, true));
     }
 
     #[test]
@@ -328,12 +258,8 @@ mod tests {
             Surface::Agent,
         );
         for row in rows.iter().chain(&layout(&list, 16)) {
-            let view = row.text_view();
-            let cells: Vec<_> = view.source_cells().collect();
-            assert_eq!(cells.len(), row.text().graphemes(true).count());
-            for (byte, column, _) in cells {
-                assert_eq!(view.source_column(byte), Some(column), "{:?}", row.text());
-            }
+            let cells = row.text_view().source_cells().count();
+            assert_eq!(cells, row.text().graphemes(true).count());
         }
         for (text, unchanged) in [
             (format!("{}\nLater streaming text", entry.body()), true),
@@ -396,7 +322,6 @@ mod tests {
         let start = TextPosition { row: 0, byte: 0 };
         for byte in [1, 3, 6] {
             let end = TextPosition { row: 0, byte };
-            assert!(row.text_view().source_column(byte).is_none());
             assert!(
                 row.text_view()
                     .selection_range(0, Some((start, end)))

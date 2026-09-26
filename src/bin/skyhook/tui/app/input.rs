@@ -311,13 +311,12 @@ impl App {
                 KeyCode::Up | KeyCode::Down => {
                     let current = self.view().row;
                     let next = if key.code == KeyCode::Up {
-                        (0..current.min(self.entries().len())).rev().find(|&index| {
-                            crate::tui::render::entry_selectable(&self.entries()[index])
-                        })
+                        (0..current.min(self.entries().len()))
+                            .rev()
+                            .find(|&index| self.entries()[index].selectable())
                     } else {
-                        (current.saturating_add(1)..self.entries().len()).find(|&index| {
-                            crate::tui::render::entry_selectable(&self.entries()[index])
-                        })
+                        (current.saturating_add(1)..self.entries().len())
+                            .find(|&index| self.entries()[index].selectable())
                     };
                     if let Some(next) = next {
                         self.view().row = next;
@@ -342,7 +341,9 @@ impl App {
     }
     pub(super) fn scroll(&mut self, delta: isize) {
         let max = self
-            .content_rows
+            .render
+            .rows
+            .len()
             .saturating_sub(self.content_rect.height as usize);
         let old = self.view().scroll.unwrap_or(max);
         let next = old.saturating_add_signed(delta).min(max);
@@ -362,7 +363,8 @@ impl App {
             // Borrow only metadata; do not clone the trace/document to toggle.
             let key = entry.key().clone();
             let job = entry.job_id();
-            let closing = entry.is_expanded(&self.views[&self.selected], self.tab, self.details);
+            // An override from a toggle not yet rebuilt into the entries wins.
+            let closing = self.views[&self.selected].is_expanded(&key, entry.open());
             let view = self.view();
             view.set_expanded(key, !closing);
             self.selection = None;
@@ -391,7 +393,7 @@ impl App {
             } else {
                 (start + step) % count
             };
-            if crate::tui::render::entry_selectable(&self.entries()[index])
+            if self.entries()[index].selectable()
                 && self.entries()[index].text().to_lowercase().contains(&query)
             {
                 self.view().row = index;
@@ -418,14 +420,14 @@ impl App {
             self.clipboard = self
                 .entries()
                 .get(row)
-                .filter(|entry| crate::tui::render::entry_selectable(entry))
+                .filter(|entry| entry.selectable())
                 .or_else(|| {
                     self.entries()
                         .iter()
                         .rev()
                         .find(|e| e.surface == model::Surface::Agent)
                 })
-                .map(|e| model::clean(e.text()));
+                .map(|e| e.text().to_owned());
         }
         if self.clipboard.is_some() {
             self.toast("Copied to terminal clipboard");

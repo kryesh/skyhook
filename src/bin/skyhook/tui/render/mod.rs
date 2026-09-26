@@ -1,6 +1,5 @@
 //! Terminal rendering: cached layout, selection geometry, and frame painting.
 mod cache;
-mod code;
 mod columns;
 mod document;
 mod frame;
@@ -16,10 +15,8 @@ mod wrapping;
 
 pub use cache::RenderState;
 pub use frame::draw;
-pub use painting::Palette;
 pub use rows::RowBlocks;
-pub use selection::{Row, TextPosition, entry_selectable, selected_text};
-pub use wrapping::wrap_plain;
+pub use selection::{Row, TextPosition, selected_text};
 
 use cache::*;
 use columns::*;
@@ -34,6 +31,7 @@ use wrapping::*;
 use super::{
     app::{App, Focus, Hit, MenuKind, SessionRef},
     model::{self, Surface, Tab},
+    theme::THEME,
 };
 use ratatui::{
     Frame,
@@ -41,7 +39,6 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::Paragraph,
 };
 use unicode_segmentation::UnicodeSegmentation;
 use unicode_width::UnicodeWidthStr;
@@ -62,13 +59,23 @@ mod tests {
             line: std::sync::Arc::new(line),
             x,
             width,
+            inset: 0,
+            text_width: width,
             surface: Surface::Tool,
             entry,
             entry_key: std::sync::Arc::new(model::EntryKey::UnsavedStatus(entry)),
             selectable: true,
             layout,
-            inset: 0,
         }
+    }
+
+    /// An entry's rows at `width`, as the transcript lays them out.
+    pub(super) fn layout(entry: &model::Entry, width: u16) -> Vec<Row> {
+        let mut rows = Vec::new();
+        let highlights = super::super::tool_view::HighlightCache::default();
+        let columns = RequestColumns::default();
+        update_entry_rows(&mut rows, entry, 0, width, &highlights, columns);
+        rows
     }
 
     pub(super) fn expandable_entry() -> model::Entry {

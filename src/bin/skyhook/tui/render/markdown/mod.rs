@@ -6,12 +6,12 @@ mod layout;
 mod parser;
 mod tables;
 
+use super::super::tool_view::Document;
 use ratatui::text::Line;
 
 pub(super) use layout::layout_highlighted;
 #[cfg(test)]
 pub(super) use parser::tests::{render, render_highlighted};
-pub(super) use parser::{Fence, options};
 
 /// Source and decoration stay separate: wrapping and code padding must not add
 /// bytes/newlines to selection. Prefix boundaries are recorded by the parser,
@@ -163,6 +163,13 @@ impl CodeGeometry {
     pub fn body_end(self) -> usize {
         self.indent + self.width - self.padding()
     }
+}
+
+/// Laid-out rows and the fences whose highlighting they show.
+#[derive(Default)]
+pub(super) struct Layout {
+    pub lines: Vec<LayoutLine>,
+    pub fences: Document,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

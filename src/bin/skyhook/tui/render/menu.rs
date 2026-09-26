@@ -3,54 +3,102 @@
 use super::*;
 use skyhook::job::JobState;
 
-pub(super) fn agent_status_color(state: model::AgentDisplayState, p: Palette) -> Color {
+fn agent_status_color(state: model::AgentDisplayState) -> Color {
     use model::AgentDisplayState as State;
     match state {
-        State::Job(JobState::Failed) => p.content.error,
+        State::Job(JobState::Failed) => THEME.error,
         State::Waiting(_) | State::Job(JobState::AwaitingApproval | JobState::WaitingInput) => {
-            p.content.warning
+            THEME.warning
         }
         State::Working | State::Reconnecting { .. } | State::Compacting | State::RunningTools => {
-            p.content.primary
+            THEME.primary
         }
-        State::Job(JobState::Completed) => p.content.success,
-        State::Ready | State::Job(_) => p.muted,
+        State::Job(JobState::Completed) => THEME.success,
+        State::Ready | State::Job(_) => THEME.muted,
     }
 }
 
-/// Shared by the inline tree and agent inspector. Selection only changes the
-/// neutral surface, not the independent identity, target, and state roles.
-pub(super) fn agent_identity(
-    name: &str,
-    target: &str,
-    prefix: &str,
-    symbol: Span<'static>,
-    width: u16,
-    p: Palette,
-) -> Line<'static> {
-    let available = width.saturating_sub((prefix.width() + symbol.width() + 1) as u16);
-    let target = model::clean(target);
-    let target_width = (target.width() as u16).min(available / 2);
-    Line::from(vec![
-        Span::styled(prefix.to_owned(), Style::default().fg(p.accent)),
-        symbol,
-        Span::raw(" "),
-        Span::styled(
-            clipped_header(&model::clean(name), available.saturating_sub(target_width)),
-            Style::default().fg(p.fg),
-        ),
-        Span::styled(
-            clipped_header(&target, target_width),
-            Style::default().fg(p.content.accent),
-        ),
-    ])
+/// One agent in a tree or agents menu row.
+pub(super) struct AgentRow<'a> {
+    pub(super) agent: &'a model::AgentInfo,
+    pub(super) state: model::AgentDisplayState,
+    pub(super) stats: &'a [String; 3],
+    /// Precedes the status symbol, e.g. the selected agent's `>`.
+    pub(super) marker: &'a str,
 }
 
-pub(super) fn agent_symbol(
-    state: model::AgentDisplayState,
-    terminal: bool,
+/// Fill `rect` with the row's identity, status and statistics. Returns where
+/// the identity starts.
+pub(super) fn draw_agent_row(
+    frame: &mut Frame,
+    rect: Rect,
+    row: AgentRow<'_>,
+    columns: &AgentColumns,
     tick: usize,
-) -> &'static str {
+    bg: Color,
+) -> u16 {
+    let AgentRow {
+        agent,
+        state,
+        stats,
+        marker,
+    } = row;
+    fill(frame, rect, bg);
+    let color = agent_status_color(state);
+    let symbol = agent_symbol(state, agent.terminal(), tick);
+    let indent = (agent.id.depth() as u16 * 4).min(rect.width / 3);
+    let name_width = columns.identity_width.saturating_sub(indent);
+    let available = name_width.saturating_sub((marker.width() + symbol.width() + 1) as u16);
+    let target = model::clean(&model::target_suffix(&agent.target));
+    let target_width = (target.width() as u16).min(available / 2);
+    // Selection only changes the neutral surface, not the independent
+    // identity, target, and state roles.
+    let mut identity = Line::from(vec![
+        Span::styled(marker.to_owned(), Style::default().fg(THEME.primary)),
+        Span::styled(symbol, Style::default().fg(color)),
+        Span::raw(" "),
+    ]);
+    for (text, fg, width) in [
+        (
+            model::clean(&agent.name),
+            THEME.fg,
+            available - target_width,
+        ),
+        (target, THEME.accent, target_width),
+    ] {
+        let text = Line::from(Span::styled(text, Style::default().fg(fg)));
+        identity.spans.extend(clipped(text, width as usize).spans);
+    }
+    let x = rect.x + indent;
+    text(frame, r(x, rect.y, name_width, 1), identity, THEME.fg, bg);
+    if columns.status_width > 0 {
+        let status = r(
+            rect.x + columns.identity_width + 2,
+            rect.y,
+            columns.status_width,
+            1,
+        );
+        text(frame, status, state.label(), color, bg);
+    }
+    if columns.stats_width > 0 {
+        let stats_rect = r(
+            rect.right().saturating_sub(columns.stats_width),
+            rect.y,
+            columns.stats_width,
+            1,
+        );
+        text(
+            frame,
+            stats_rect,
+            columns.stats.format(stats),
+            THEME.muted,
+            bg,
+        );
+    }
+    x
+}
+
+fn agent_symbol(state: model::AgentDisplayState, terminal: bool, tick: usize) -> &'static str {
     use model::{AgentDisplayState as State, WaitReason};
     if state.running() {
         return spinner(tick);
@@ -72,15 +120,14 @@ pub(super) fn draw_menu_item(
     item: &super::super::app::ItemRef<'_>,
     kind: &MenuKind,
     selected: bool,
-    p: Palette,
     bg: Color,
 ) {
     let label = model::clean(item.label);
     let detail = model::clean(item.detail);
     let fg = if selected && !matches!(kind, MenuKind::Output(_, _)) {
-        p.content.primary
+        THEME.primary
     } else {
-        p.fg
+        THEME.fg
     };
     if matches!(kind, MenuKind::Commands(_)) {
         // Paint the whole row, including the gap between label and shortcut.
@@ -100,7 +147,7 @@ pub(super) fn draw_menu_item(
                 frame,
                 r(row.right() - hint_width as u16, row.y, hint_width as u16, 1),
                 detail,
-                p.muted,
+                THEME.muted,
                 bg,
             );
         }
@@ -113,14 +160,14 @@ pub(super) fn draw_menu_item(
                 } else {
                     format!("   {detail}")
                 },
-                Style::default().fg(p.muted),
+                Style::default().fg(THEME.muted),
             ),
         ]);
         text(frame, row, line, fg, bg);
     }
 }
 
-pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
+pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
     app.refresh_agent_menu();
     let Some(menu) = &app.menu else { return };
     let area = app.content_rect;
@@ -135,51 +182,48 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     // Likewise a short transcript keeps every row for the palette.
     let gap = 1.min(area.height.saturating_sub(6) / 2);
     let rect = r(area.x + margin, area.y + gap, width, area.height - gap * 2);
-    fill(frame, rect, p.input);
+    fill(frame, rect, THEME.input);
     text(
         frame,
         r(rect.x + 1, rect.y, width.saturating_sub(2), 1),
         menu.title.clone(),
-        p.accent,
-        p.input,
+        THEME.primary,
+        THEME.input,
     );
     text(
         frame,
         r(rect.x + 1, rect.y + 1, width.saturating_sub(2), 1),
         format!("> {}▏", model::clean(menu.input.text())),
-        p.fg,
-        p.input,
+        THEME.fg,
+        THEME.input,
     );
     let items = menu.filtered();
     let agent_menu = matches!(menu.kind, MenuKind::Agents(_));
-    let agent_stats = if agent_menu {
-        app.projection
-            .agents
-            .iter()
+    let agents = &app.projection.agents;
+    let agent_stats: Vec<_> = if agent_menu {
+        let stats = agents.iter();
+        stats
             .map(|agent| model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id))
-            .collect::<Vec<_>>()
+            .collect()
     } else {
         Vec::new()
     };
     let row_width = width.saturating_sub(2);
-    let stats_columns = AgentStatsColumns::menu(agent_stats.iter());
-    let minimum_identity_width =
-        AgentColumnsLayout::minimum_identity_width(&app.projection.agents, row_width);
-    let columns = AgentColumnsLayout::new(row_width, minimum_identity_width, stats_columns.width());
-    let headers = AGENT_STATS_HEADERS.map(String::from);
-    let header_height = u16::from(agent_menu && columns.stats_width > 0);
+    let columns = AgentColumns::new(agents, row_width, AgentStatsColumns::menu(&agent_stats));
+    let stats_width = columns.stats_width;
+    let header_height = u16::from(agent_menu && stats_width > 0);
     if header_height > 0 {
-        stats_columns.draw(
+        text(
             frame,
             r(
-                rect.right() - 1 - columns.stats_width,
+                rect.right() - 1 - stats_width,
                 rect.y + 2,
-                columns.stats_width,
+                stats_width,
                 header_height.min(rect.height.saturating_sub(2)),
             ),
-            &headers,
-            p.muted,
-            p.input,
+            columns.stats.format(&AGENT_STATS_HEADERS.map(String::from)),
+            THEME.muted,
+            THEME.input,
         );
     }
     let height = rect.height.saturating_sub(3 + header_height) as usize;
@@ -193,50 +237,23 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
     for (i, item) in items.iter().enumerate().skip(top).take(height) {
         let y = rect.y + 2 + header_height + (i - top) as u16;
         let selected = i == menu.selected && !page;
-        let bg = if selected { p.selected } else { p.input };
+        let bg = if selected {
+            THEME.selected
+        } else {
+            THEME.input
+        };
         let row = r(rect.x + 1, y, width.saturating_sub(2), 1);
-        if let MenuKind::Agents(agents) = &menu.kind {
-            if let Some(agent) = app
-                .projection
-                .agents
-                .iter()
-                .find(|agent| agent.id == agents[item.index].value)
-            {
-                let state = app.agent_status(agent);
-                app.animating |= state.running();
-                let symbol = agent_symbol(state, agent.terminal(), app.tick_count);
-                let stats = model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id);
-                let target = model::target_suffix(&agent.target);
-                let indent = (agent.id.depth() as u16 * 4).min(row.width / 3);
-                let name_width = columns.identity_width;
-                let name = agent_identity(
-                    &agent.name,
-                    &target,
-                    &" ".repeat(indent as usize),
-                    Span::styled(symbol, Style::default().fg(agent_status_color(state, p))),
-                    name_width,
-                    p,
-                );
-                fill(frame, row, bg);
-                text(frame, r(row.x, y, name_width, 1), name, p.fg, bg);
-                if columns.status_width > 0 {
-                    text(
-                        frame,
-                        r(row.x + name_width + 2, y, columns.status_width, 1),
-                        state.label(),
-                        agent_status_color(state, p),
-                        bg,
-                    );
-                }
-                if columns.stats_width > 0 {
-                    stats_columns.draw(
-                        frame,
-                        r(row.right() - columns.stats_width, y, columns.stats_width, 1),
-                        &stats,
-                        p.muted,
-                        bg,
-                    );
-                }
+        if let MenuKind::Agents(choices) = &menu.kind {
+            let id = &choices[item.index].value;
+            if let Some((index, agent)) = agents.iter().enumerate().find(|(_, a)| &a.id == id) {
+                let agent_row = AgentRow {
+                    agent,
+                    state: app.agent_status(agent),
+                    stats: &agent_stats[index],
+                    marker: "",
+                };
+                app.animating |= agent_row.state.running();
+                draw_agent_row(frame, row, agent_row, &columns, app.tick_count, bg);
             }
         } else if let MenuKind::Sessions(sessions) = &menu.kind {
             // Open sessions carry their live status; saved ones align beneath them.
@@ -248,16 +265,16 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
             if let Some(peer) = peer {
                 app.animating |= peer.state.running();
                 let symbol = agent_symbol(peer.state, false, app.tick_count);
-                let color = agent_status_color(peer.state, p);
+                let color = agent_status_color(peer.state);
                 text(frame, r(row.x, y, 1, 1), symbol, color, bg);
             }
             let row = r(row.x + 2, y, row.width.saturating_sub(2), 1);
-            draw_menu_item(frame, row, item, &menu.kind, selected, p, bg);
+            draw_menu_item(frame, row, item, &menu.kind, selected, bg);
         } else {
-            draw_menu_item(frame, row, item, &menu.kind, selected, p, bg);
+            draw_menu_item(frame, row, item, &menu.kind, selected, bg);
         }
         if selected {
-            focus_cursor(frame, rect.x, y, p.input);
+            focus_cursor(frame, rect.x, y, THEME.input);
         }
         app.hits.push((row, Hit::Menu(i)));
     }
@@ -271,8 +288,8 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
                 1,
             ),
             "No matching entries",
-            p.muted,
-            p.input,
+            THEME.muted,
+            THEME.input,
         );
     }
     text(
@@ -284,8 +301,8 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App, p: Palette) {
             1,
         ),
         "↑↓ select · Enter open · Esc return",
-        p.muted,
-        p.input,
+        THEME.muted,
+        THEME.input,
     );
 }
 
@@ -297,7 +314,6 @@ mod tests {
     #[tokio::test]
     async fn only_pickable_rows_are_highlighted() {
         let (_root, mut app) = crate::tui::app::tests::fixture().await;
-        let p = Palette::new();
         for (command, highlighted) in [
             (crate::tui::keys::Command::Help, false),
             (crate::tui::keys::Command::Commands, true),
@@ -305,11 +321,9 @@ mod tests {
             app.command(command);
             let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
             app.content_rect = r(0, 0, 80, 20);
-            terminal
-                .draw(|frame| draw_menu(frame, &mut app, p))
-                .unwrap();
+            terminal.draw(|frame| draw_menu(frame, &mut app)).unwrap();
             let cells = &terminal.backend().buffer().content;
-            let found = cells.iter().any(|cell| cell.bg == p.selected);
+            let found = cells.iter().any(|cell| cell.bg == THEME.selected);
             assert_eq!(found, highlighted, "{command}");
             app.menu = None;
         }
@@ -342,9 +356,7 @@ mod tests {
             let mut terminal = Terminal::new(TestBackend::new(width, 10)).unwrap();
             app.content_rect = r(0, 0, width, 10);
             app.hits.clear();
-            terminal
-                .draw(|frame| draw_menu(frame, &mut app, Palette::new()))
-                .unwrap();
+            terminal.draw(|frame| draw_menu(frame, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
             let line = |y| {
                 (0..width)
@@ -373,7 +385,6 @@ mod tests {
 
     #[test]
     fn menu_hints_are_muted_right_aligned_and_yield_to_labels() {
-        let p = Palette::new();
         let kind = MenuKind::Commands(vec![]);
         for (label, hint) in [
             ("New session", "ctrl+x n"),
@@ -389,12 +400,16 @@ mod tests {
                 for selected in [false, true] {
                     let mut terminal = Terminal::new(TestBackend::new(90, 3)).unwrap();
                     let row = r(3, 1, width, 1);
-                    let bg = if selected { p.selected } else { p.input };
+                    let bg = if selected {
+                        THEME.selected
+                    } else {
+                        THEME.input
+                    };
                     terminal
                         .draw(|frame| {
-                            fill(frame, frame.area(), p.base);
+                            fill(frame, frame.area(), THEME.base);
                             fill(frame, row, bg);
-                            draw_menu_item(frame, row, &item, &kind, selected, p, bg);
+                            draw_menu_item(frame, row, &item, &kind, selected, bg);
                         })
                         .unwrap();
                     let buffer = terminal.backend().buffer();
@@ -414,7 +429,7 @@ mod tests {
                     if fits {
                         assert!(actual.ends_with(hint), "{actual:?}");
                         let start = row.right() - hint.width() as u16;
-                        assert!((start..row.right()).all(|x| cell(x).fg == p.muted));
+                        assert!((start..row.right()).all(|x| cell(x).fg == THEME.muted));
                     } else if !hint.is_empty() {
                         assert!(!actual.contains(hint), "{actual:?}");
                     }
@@ -422,7 +437,7 @@ mod tests {
                         assert!(actual.starts_with(label), "{actual:?}");
                     }
                     if width > 0 && !label.contains('界') {
-                        let fg = if selected { p.content.primary } else { p.fg };
+                        let fg = if selected { THEME.primary } else { THEME.fg };
                         assert_eq!(cell(row.x).fg, fg);
                     }
                     let filled = painted.iter().all(|&x| cell(x).bg == bg);
@@ -430,7 +445,7 @@ mod tests {
                         filled,
                         "row background: {label:?}, {hint:?}, width={width}, selected={selected}"
                     );
-                    assert_eq!(cell(row.right()).bg, p.base);
+                    assert_eq!(cell(row.right()).bg, THEME.base);
                 }
             }
         }

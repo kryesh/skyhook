@@ -2,49 +2,18 @@
 
 use super::*;
 
-#[derive(Clone, Copy)]
-pub struct Palette {
-    pub content: super::super::theme::ContentTheme,
-    pub base: Color,
-    pub panel: Color,
-    pub input: Color,
-    pub agent: Color,
-    pub user: Color,
-    pub fg: Color,
-    pub muted: Color,
-    pub selected: Color,
-    pub accent: Color,
-    pub warning: Color,
+pub(super) fn background(surface: Surface) -> Color {
+    match surface {
+        Surface::User => THEME.user,
+        Surface::Agent => THEME.agent,
+        _ => THEME.base,
+    }
 }
-impl Palette {
-    pub fn new() -> Self {
-        Self {
-            content: super::super::theme::ContentTheme::new(),
-            base: Color::Rgb(0, 0, 0),
-            panel: Color::Rgb(28, 28, 28),
-            input: Color::Rgb(40, 40, 40),
-            agent: Color::Rgb(34, 34, 34),
-            user: Color::Rgb(44, 44, 44),
-            fg: Color::Rgb(222, 225, 230),
-            muted: Color::Rgb(146, 153, 163),
-            selected: Color::Rgb(64, 64, 64),
-            accent: super::super::theme::ContentTheme::new().primary,
-            warning: super::super::theme::ContentTheme::new().warning,
-        }
-    }
-    pub(super) fn background(self, surface: Surface) -> Color {
-        match surface {
-            Surface::User => self.user,
-            Surface::Agent => self.agent,
-            _ => self.base,
-        }
-    }
-    pub(super) fn foreground(self, surface: Surface) -> Color {
-        match surface {
-            Surface::Muted | Surface::Status | Surface::Reasoning => self.content.muted,
-            Surface::Error => self.content.error,
-            _ => self.content.fg,
-        }
+pub(super) fn foreground(surface: Surface) -> Color {
+    match surface {
+        Surface::Muted | Surface::Status | Surface::Reasoning => THEME.muted,
+        Surface::Error => THEME.error,
+        _ => THEME.fg,
     }
 }
 pub(super) fn spinner(tick: usize) -> &'static str {
@@ -76,13 +45,17 @@ pub(super) fn text(
     fg: Color,
     bg: Color,
 ) {
-    let mut text = text.into();
-    for span in &mut text.spans {
-        span.content = super::super::model::clean(&span.content).into();
+    let mut line = text.into();
+    for span in &mut line.spans {
+        if span.content.contains(char::is_control) {
+            span.content = super::super::model::clean(&span.content).into();
+        }
     }
-    frame.render_widget(
-        Paragraph::new(text).style(Style::default().fg(fg).bg(bg)),
+    render_line(
+        &line,
         rect,
+        frame.buffer_mut(),
+        Style::default().fg(fg).bg(bg),
     );
 }
 pub(super) fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
@@ -90,13 +63,7 @@ pub(super) fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
 }
 
 /// Paint Markdown geometry without inserting decorative text into the source.
-pub(super) fn render_row_line(
-    row: &Row,
-    area: Rect,
-    buffer: &mut Buffer,
-    style: Style,
-    p: Palette,
-) {
+pub(super) fn render_row_line(row: &Row, area: Rect, buffer: &mut Buffer, style: Style) {
     if !row.layout.has_geometry() {
         render_line(&row.line, area, buffer, style);
         return;
@@ -124,7 +91,7 @@ pub(super) fn render_row_line(
             1,
         )
         .intersection(area);
-        buffer.set_style(rect, Style::default().bg(p.content.code_bg));
+        buffer.set_style(rect, Style::default().bg(THEME.code_bg));
     }
     if row.layout.decorative() {
         return;
@@ -132,6 +99,9 @@ pub(super) fn render_row_line(
     let mut byte = 0;
     let mut column = prefix_width;
     let (source_prefix, source_prefix_width) = row.layout.source_prefix();
+    let body_end = row.layout.code().map_or(area.width as usize, |code| {
+        code.body_end().min(area.width as usize)
+    });
     for grapheme in styled_cells(&row.line) {
         if byte == source_prefix {
             column = row
@@ -142,9 +112,6 @@ pub(super) fn render_row_line(
         let size = grapheme.width;
         let in_prefix = byte < source_prefix;
         let prefix_clipped = in_prefix && column + size > prefix_width + source_prefix_width;
-        let body_end = row.layout.code().map_or(area.width as usize, |code| {
-            code.body_end().min(area.width as usize)
-        });
         if !in_prefix && column + size > body_end {
             break;
         }
@@ -178,6 +145,9 @@ fn styled_cells<'a>(line: &'a Line<'_>) -> impl Iterator<Item = StyledCell<'a>> 
     })
 }
 
+/// Paint borrowed spans with an unwrapped Paragraph's clipping and styling:
+/// wide continuation cells keep the area style, and graphemes wider than the
+/// area are skipped.
 pub(super) fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer, style: Style) {
     let area = area.intersection(buffer.area);
     if area.is_empty() {
@@ -216,7 +186,6 @@ pub(super) fn render_line(line: &Line<'_>, area: Rect, buffer: &mut Buffer, styl
 impl Row {
     pub(super) fn background(
         &self,
-        p: Palette,
         expanded: bool,
         interactive: bool,
         text_selected: bool,
@@ -224,9 +193,9 @@ impl Row {
         // Fill expanded items and collapsed hover/focus highlights uniformly.
         // Text selection is painted separately over the persistent expanded fill.
         if !self.layout.is_spacer() && (expanded || (interactive && !text_selected)) {
-            p.content.code_bg
+            THEME.code_bg
         } else {
-            p.background(self.surface)
+            background(self.surface)
         }
     }
 }
@@ -234,14 +203,14 @@ impl Row {
 #[cfg(test)]
 mod tests {
     use super::super::super::tool_view::{Document, HighlightCache, Role, Section};
-    use super::super::tests::{expandable_entry, fixture_row};
+    use super::super::tests::{expandable_entry, fixture_row, layout};
     use super::*;
-    use ratatui::widgets::Widget;
+    use ratatui::widgets::{Paragraph, Widget};
 
     fn markdown_rows(input: &str, width: u16, cache: Option<&HighlightCache>) -> Vec<Row> {
-        let (p, columns) = (Palette::new(), width as usize);
-        let lines = markdown::layout_highlighted(input, p, false, columns, columns, "", cache);
-        let rows = lines.into_iter();
+        let columns = width as usize;
+        let layout = markdown::layout_highlighted(input, false, columns, columns, "", cache);
+        let rows = layout.lines.into_iter();
         rows.map(|line| fixture_row(line.line, line.layout, 1, width, 0))
             .collect()
     }
@@ -258,7 +227,7 @@ mod tests {
 
     /// The copyable text of unwrapped markdown.
     fn original(input: &str) -> String {
-        let lines = markdown::render(input, Palette::new(), true, 80);
+        let lines = markdown::render(input, true, 80);
         lines
             .iter()
             .map(Line::to_string)
@@ -267,18 +236,17 @@ mod tests {
     }
 
     fn assert_code_geometry(rows: &[Row], width: u16) {
-        let p = Palette::new();
         for row in rows {
             let mut buffer = Buffer::empty(Rect::new(0, 0, width + 2, 1));
-            buffer.set_style(buffer.area, Style::default().bg(p.agent));
-            let style = Style::default().fg(p.fg).bg(p.agent);
-            render_row_line(row, Rect::new(1, 0, width, 1), &mut buffer, style, p);
+            buffer.set_style(buffer.area, Style::default().bg(THEME.agent));
+            let style = Style::default().fg(THEME.fg).bg(THEME.agent);
+            render_row_line(row, Rect::new(1, 0, width, 1), &mut buffer, style);
             let left = 1 + row.layout.code().map_or(0, |code| code.indent());
             for x in 0..width + 2 {
                 let code = row.layout.code().is_some_and(|code| {
                     (left..(left + code.width()).min(width as usize + 1)).contains(&(x as usize))
                 });
-                let expected = if code { p.content.code_bg } else { p.agent };
+                let expected = if code { THEME.code_bg } else { THEME.agent };
                 assert_eq!(buffer[(x, 0)].bg, expected, "row={:?}, x={x}", row.text());
             }
             if row.layout.decorative() {
@@ -410,20 +378,8 @@ mod tests {
 
     #[test]
     fn expanded_backgrounds_fill_all_content_rows_even_with_selection() {
-        let p = Palette::new();
-        let entry = expandable_entry();
-        let highlights = HighlightCache::default();
-        let mut layout = Vec::new();
-        let options = EntryLayout {
-            width: 20,
-            palette: p,
-            highlights: &highlights,
-            request_columns: RequestColumns::default(),
-            expanded: entry.default_open,
-        };
-        update_entry_rows(&mut layout, &entry, 0, options);
         let mut rows = RowBlocks::default();
-        rows.replace_entry(0, layout, Vec::new());
+        rows.replace_entry(0, layout(&expandable_entry(), 20), Vec::new());
         let nonblank: Vec<_> = rows
             .iter()
             .filter(|row| !row.text().trim().is_empty())
@@ -431,13 +387,13 @@ mod tests {
         assert!(nonblank.len() > 4, "both header and body should wrap");
         for row in rows.iter() {
             let expected = if row.layout.is_spacer() {
-                p.background(row.surface)
+                background(row.surface)
             } else {
-                p.content.code_bg
+                THEME.code_bg
             };
             for interactive in [false, true] {
                 for selected in [false, true] {
-                    let background = row.background(p, true, interactive, selected);
+                    let background = row.background(true, interactive, selected);
                     assert_eq!(
                         background,
                         expected,
@@ -448,9 +404,9 @@ mod tests {
             }
         }
         let row = nonblank[0];
-        assert_eq!(row.background(p, false, true, false), p.content.code_bg);
-        assert_eq!(row.background(p, false, false, false), p.base);
-        assert_eq!(row.background(p, false, true, true), p.base);
+        assert_eq!(row.background(false, true, false), THEME.code_bg);
+        assert_eq!(row.background(false, false, false), THEME.base);
+        assert_eq!(row.background(false, true, true), THEME.base);
     }
 
     #[test]

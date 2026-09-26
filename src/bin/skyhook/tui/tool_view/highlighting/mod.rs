@@ -1,6 +1,6 @@
 //! Bounded asynchronous syntax cache and immutable source identities.
 mod syntax;
-use super::super::app::Work;
+use super::super::{app::Work, format::Clean};
 use super::{Document, MAX_LINE, MAX_SECTION, Section};
 use indexmap::IndexSet;
 use ratatui::text::Line;
@@ -11,8 +11,7 @@ use std::{
     sync::{Arc, mpsc},
     thread,
 };
-pub use syntax::highlight_code;
-use syntax::syntax_resources;
+use syntax::{highlight_code, syntax_resources};
 
 const CACHE_SECTIONS: usize = 128;
 // Source-byte admission budget, not allocated token/span output.
@@ -28,6 +27,7 @@ pub struct CodeSource {
 }
 impl From<&str> for CodeSource {
     fn from(text: &str) -> Self {
+        let text = &*Clean::from(text);
         let mut hasher = DefaultHasher::new();
         text.hash(&mut hasher);
         Self {
@@ -144,7 +144,7 @@ impl HighlightCache {
                 // Load grammars while the initial UI is being displayed, not on the first click.
                 let _ = syntax_resources();
                 while let Ok((generation, key)) = jobs.recv() {
-                    let result = highlight_code(&key.source, &key.language);
+                    let result = highlight_code(&key);
                     if completed
                         .send(Completion {
                             generation,
@@ -442,11 +442,7 @@ mod tests {
         let document = code(original, "unknown-extension", Role::Constant);
         cache.prepare(std::iter::once(&document));
         let (generation, key) = queued.try_recv().unwrap();
-        complete(
-            &completed,
-            (generation, key.clone()),
-            highlight_code(&key.source, &key.language),
-        );
+        complete(&completed, (generation, key.clone()), highlight_code(&key));
         assert!(cache.poll());
         assert_fallback(&cache, &document);
         // The shared key must not bake in the first document's role.

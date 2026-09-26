@@ -4,40 +4,45 @@ use super::*;
 
 /// Numeric fields share their own right edge, not just the footer's right edge.
 /// Measure all agents, including off-screen rows, to keep columns stable on scroll.
-#[derive(Clone, Copy)]
-pub(super) struct AgentStatsColumns([usize; 3]);
+pub(super) struct AgentStatsColumns {
+    widths: [usize; 3],
+    /// Between fields; headed columns need no delimiter.
+    separator: &'static str,
+}
 
 pub(super) const AGENT_STATS_HEADERS: [&str; 3] = ["Output", "Input (uncached)", "Context"];
-
-/// Shared visibility policy: reserve identity space, then a fixed-width status
-/// column, then statistics as a group. Hidden columns never consume another row.
-pub(super) struct AgentColumnsLayout {
-    pub(super) identity_width: u16,
-    pub(super) status_width: u16,
-    pub(super) stats_width: u16,
-}
 
 fn right_aligned(value: &str, width: usize) -> String {
     format!("{}{value}", " ".repeat(width.saturating_sub(value.width())))
 }
 
-fn join_right_aligned(values: &[String], widths: &[usize]) -> String {
+fn join_right_aligned(values: &[String], widths: &[usize], separator: &str) -> String {
     let values = values.iter().zip(widths);
     let values = values.map(|(value, width)| right_aligned(value, *width));
-    values.collect::<Vec<_>>().join(" · ")
+    values.collect::<Vec<_>>().join(separator)
 }
 
-impl AgentColumnsLayout {
-    /// Identity space that keeps the deepest agent's name and target legible.
-    pub(super) fn minimum_identity_width(agents: &[model::AgentInfo], width: u16) -> u16 {
-        let widths = agents.iter().map(|agent| {
+/// Columns shared by every row of an agent list, measured over all its agents.
+pub(super) struct AgentColumns {
+    pub(super) identity_width: u16,
+    pub(super) status_width: u16,
+    pub(super) stats_width: u16,
+    pub(super) stats: AgentStatsColumns,
+}
+
+impl AgentColumns {
+    pub(super) fn new(agents: &[model::AgentInfo], width: u16, stats: AgentStatsColumns) -> Self {
+        // Identity space that keeps the deepest agent's name and target legible.
+        let minimum = agents.iter().map(|agent| {
             let indent = (agent.id.depth() as u16 * 4).min(width / 3);
             indent + 16.max(model::target_suffix(&agent.target).width() as u16 + 8)
         });
-        widths.max().unwrap_or(16)
+        Self::fit(width, minimum.max().unwrap_or(16), stats)
     }
 
-    pub(super) fn new(width: u16, minimum_identity_width: u16, stats_width: u16) -> Self {
+    /// Reserve identity space, then a fixed-width status column, then
+    /// statistics as a group. Hidden columns never consume another row.
+    fn fit(width: u16, minimum_identity_width: u16, stats: AgentStatsColumns) -> Self {
         let status_width = if usize::from(width) >= usize::from(minimum_identity_width) + 30 {
             28
         } else {
@@ -53,9 +58,9 @@ impl AgentColumnsLayout {
         // measured width is smaller than the fixed-width status column.
         let stats_width = if status_width > 0
             && usize::from(remaining)
-                >= usize::from(stats_width) + usize::from(minimum_identity_width) + 2
+                >= usize::from(stats.width()) + usize::from(minimum_identity_width) + 2
         {
-            stats_width
+            stats.width()
         } else {
             0
         };
@@ -64,48 +69,20 @@ impl AgentColumnsLayout {
             identity_width: remaining.saturating_sub(stats_reserved),
             status_width,
             stats_width,
+            stats,
         }
     }
 }
 
 impl AgentStatsColumns {
+    /// Columns measured wide enough for their headers.
     pub(super) fn menu<'a>(rows: impl IntoIterator<Item = &'a [String; 3]>) -> Self {
         let mut columns = Self::new(rows);
-        for (column, header) in columns.0.iter_mut().zip(AGENT_STATS_HEADERS) {
+        for (column, header) in columns.widths.iter_mut().zip(AGENT_STATS_HEADERS) {
             *column = (*column).max(header.width());
         }
+        columns.separator = "   ";
         columns
-    }
-
-    pub(super) fn draw(
-        &self,
-        frame: &mut Frame,
-        rect: Rect,
-        row: &[String; 3],
-        fg: Color,
-        bg: Color,
-    ) {
-        if rect.height == 0 {
-            return;
-        }
-        let mut x = rect.x;
-        for (value, width) in row.iter().zip(self.0) {
-            text(
-                frame,
-                r(
-                    x,
-                    rect.y,
-                    width.min(usize::from(rect.right().saturating_sub(x))) as u16,
-                    1,
-                ),
-                right_aligned(value, width),
-                fg,
-                bg,
-            );
-            x = x
-                .saturating_add(width.min(u16::MAX as usize) as u16)
-                .saturating_add(3);
-        }
     }
 
     pub(super) fn new<'a>(rows: impl IntoIterator<Item = &'a [String; 3]>) -> Self {
@@ -115,17 +92,21 @@ impl AgentStatsColumns {
                 *width = (*width).max(value.width());
             }
         }
-        Self(widths)
+        Self {
+            widths,
+            separator: " · ",
+        }
     }
 
     pub(super) fn width(&self) -> u16 {
-        (self.0.iter().sum::<usize>() + 6).min(u16::MAX as usize) as u16
+        let separators = self.separator.width() * (self.widths.len() - 1);
+        (self.widths.iter().sum::<usize>() + separators).min(u16::MAX as usize) as u16
     }
 
     /// A row outside the measured set is never truncated: it pads to the
     /// shared width when it fits and otherwise prints at its own width.
     pub(super) fn format(&self, row: &[String; 3]) -> String {
-        join_right_aligned(row, &self.0)
+        join_right_aligned(row, &self.widths, self.separator)
     }
 }
 
@@ -186,10 +167,10 @@ impl RequestColumns {
     }
 
     fn format_statistics(&self, values: &[String; 4]) -> String {
-        join_right_aligned(values, &self.statistics)
+        join_right_aligned(values, &self.statistics, " · ")
     }
 
-    pub(super) fn header(&self, width: u16, p: Palette) -> Option<Line<'static>> {
+    pub(super) fn header(&self, width: u16) -> Option<Line<'static>> {
         if !self.show_statistics(width) {
             return None;
         }
@@ -197,12 +178,12 @@ impl RequestColumns {
             Span::raw(" ".repeat(usize::from(width) - self.statistics_width())),
             Span::styled(
                 self.format_statistics(&REQUEST_STATS_HEADERS.map(String::from)),
-                Style::default().fg(p.content.muted),
+                Style::default().fg(THEME.muted),
             ),
         ]))
     }
 
-    pub(super) fn line(&self, row: &model::RequestRow, width: u16, p: Palette) -> Line<'static> {
+    pub(super) fn line(&self, row: &model::RequestRow, width: u16) -> Line<'static> {
         let show_statistics = self.show_statistics(width);
         // The animation overlay paints at column zero. Reserve its cell and a
         // separator on every row so running/completed requests stay aligned.
@@ -218,54 +199,39 @@ impl RequestColumns {
         // Clip the model column first so IDs, purpose and state remain visible.
         let excess = (widths.iter().sum::<usize>() + 9).saturating_sub(left_width as usize);
         widths[2] = widths[2].saturating_sub(excess);
-        let metadata = row
+        let status = match row.status {
+            model::RequestStatus::Completed => THEME.success,
+            model::RequestStatus::Failed => THEME.error,
+            model::RequestStatus::Interrupted | model::RequestStatus::Retrying => THEME.warning,
+            model::RequestStatus::Running => THEME.info,
+        };
+        let styles = [Some(THEME.primary), None, None, Some(status)];
+        let mut fields = Vec::new();
+        for (index, (value, (width, fg))) in row
             .metadata()
-            .iter()
-            .zip(widths)
-            .map(|(value, width)| {
-                let value = clipped_header(value, width.min(u16::MAX as usize) as u16);
-                format!("{value}{}", " ".repeat(width - value.width()))
-            })
-            .collect::<Vec<_>>();
-        let status_start = metadata[..3].iter().map(String::len).sum::<usize>() + " · ".len() * 3;
-        let title_end = metadata[0].len();
-        let metadata = clipped_header(&metadata.join(" · "), left_width);
+            .into_iter()
+            .zip(widths.into_iter().zip(styles))
+            .enumerate()
+        {
+            if index > 0 {
+                fields.push(Span::raw(" · "));
+            }
+            let style = Style {
+                fg,
+                ..Style::default()
+            };
+            let value = clipped(Line::from(Span::styled(value, style)), width);
+            let padding = " ".repeat(width.saturating_sub(value.width()));
+            fields.extend(value.spans);
+            fields.push(Span::styled(padding, style));
+        }
+        let metadata = clipped(Line::from(fields), left_width as usize);
         let gap = width as usize - metadata.width();
         let mut spans = vec![Span::raw(" ".repeat(gutter as usize))];
-        if metadata.is_char_boundary(title_end) && title_end <= metadata.len() {
-            spans.push(Span::styled(
-                metadata[..title_end].to_owned(),
-                Style::default().fg(p.content.primary),
-            ));
-            if metadata.is_char_boundary(status_start) && status_start <= metadata.len() {
-                spans.push(Span::raw(metadata[title_end..status_start].to_owned()));
-                let color: Color = match row.status {
-                    model::RequestStatus::Completed => p.content.success,
-                    model::RequestStatus::Failed => p.content.error,
-                    model::RequestStatus::Interrupted | model::RequestStatus::Retrying => {
-                        p.content.warning
-                    }
-                    model::RequestStatus::Running => p.content.info,
-                };
-                spans.push(Span::styled(
-                    metadata[status_start..].to_owned(),
-                    Style::default().fg(color),
-                ));
-            } else {
-                spans.push(Span::raw(metadata[title_end..].to_owned()));
-            }
-        } else {
-            spans.push(Span::styled(
-                metadata,
-                Style::default().fg(p.content.primary),
-            ));
-        }
+        spans.extend(metadata.spans);
         if show_statistics {
             spans.push(Span::raw(" ".repeat(gap - statistics.width())));
-            spans.push(Span::styled(
-                statistics,
-                Style::default().fg(p.content.muted),
-            ));
+            spans.push(Span::styled(statistics, Style::default().fg(THEME.muted)));
         }
         Line::from(spans)
     }
@@ -274,7 +240,7 @@ impl RequestColumns {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::widgets::Widget;
+    use ratatui::widgets::{Paragraph, Widget};
     use skyhook::session::RequestSeq;
 
     fn request(status: model::RequestStatus, output: u64) -> model::RequestRow {
@@ -294,48 +260,21 @@ mod tests {
     }
 
     #[test]
-    fn agents_palette_stats_align_without_delimiters_and_narrow_viewports_are_safe() {
+    fn agents_palette_stats_align_without_delimiters() {
         let headers = AGENT_STATS_HEADERS.map(String::from);
         let values = ["123456789".into(), "56789(12345)".into(), "54321".into()];
         let columns = AgentStatsColumns::menu([&values]);
-        let backend = ratatui::backend::TestBackend::new(columns.width(), 2);
-        let mut terminal = ratatui::Terminal::new(backend).unwrap();
-        let p = Palette::new();
-        let rows = [&headers, &values];
-        terminal
-            .draw(|frame| {
-                for (y, row) in rows.iter().enumerate() {
-                    let area = r(0, y as u16, columns.width(), 1);
-                    columns.draw(frame, area, row, p.muted, p.input);
-                }
-            })
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        for (y, row) in rows.iter().enumerate() {
-            let symbol = |x| buffer[(x, y as u16)].symbol();
-            let mut x = 0;
-            for (index, width) in columns.0.iter().enumerate() {
-                let end = x + *width as u16;
-                assert_eq!(
-                    (x..end).map(symbol).collect::<String>().trim_start(),
-                    row[index]
-                );
-                if index < 2 {
-                    assert!((end..end + 3).all(|x| symbol(x) == " "));
-                }
-                x = end + 3;
+        for row in [&headers, &values] {
+            let line = columns.format(row);
+            assert_eq!(line.width(), usize::from(columns.width()));
+            let mut rest = line.as_str();
+            for (value, width) in row.iter().zip(columns.widths) {
+                let (field, after) = rest.split_at(width);
+                assert_eq!(field.trim_start(), value);
+                let gap = after.len().min(columns.separator.len());
+                assert!(after[..gap].trim().is_empty());
+                rest = &after[gap..];
             }
-        }
-        let small = ["1".into(), "2".into(), "3".into()];
-        let large = ["123456789".into(), "界界界".into(), "1000% (10k/1k)".into()];
-        for width in [0, 1, 2, 20, 60] {
-            let columns = AgentStatsColumns::new([&small]);
-            let backend = ratatui::backend::TestBackend::new(width.max(1), 1);
-            let mut terminal = ratatui::Terminal::new(backend).unwrap();
-            let area = r(0, 0, width, 1);
-            terminal
-                .draw(|frame| columns.draw(frame, area, &large, p.fg, p.base))
-                .unwrap();
         }
     }
 
@@ -350,7 +289,8 @@ mod tests {
             (81, 51, 0, 28),
             (82, 16, 34, 28),
         ] {
-            let columns = AgentColumnsLayout::new(width, 16, 34);
+            let values = ["x".repeat(10), "x".repeat(10), "x".repeat(8)];
+            let columns = AgentColumns::fit(width, 16, AgentStatsColumns::new([&values]));
             let actual = (
                 columns.identity_width,
                 columns.stats_width,
@@ -365,9 +305,9 @@ mod tests {
         let running = request(model::RequestStatus::Running, 84);
         let completed = request(model::RequestStatus::Completed, 84);
         let columns = RequestColumns::new([&running, &completed]);
-        let header = columns.header(100, Palette::new()).unwrap().to_string();
+        let header = columns.header(100).unwrap().to_string();
         for row in [&running, &completed] {
-            let line = columns.line(row, 100, Palette::new());
+            let line = columns.line(row, 100);
             let text = line.to_string();
             assert!(text.starts_with(&format!("  Request #{}", row.sequence)));
             assert!(text.ends_with(&columns.format_statistics(&row.statistics())));
@@ -398,11 +338,11 @@ mod tests {
         };
         let columns = RequestColumns::new([&row]);
         for width in [0, 1, 2, 3, 8, 20, 45, 46, 60, 81, 82, 99] {
-            let line = columns.line(&row, width, Palette::new());
+            let line = columns.line(&row, width);
             assert!(line.width() <= width as usize, "overflow at width {width}");
             let text = line.to_string();
             assert!(text.starts_with(&" ".repeat(width.min(2) as usize)));
-            let header = columns.header(width, Palette::new());
+            let header = columns.header(width);
             assert_eq!(header.is_some(), text.contains('—'));
             if let Some(header) = header {
                 assert_eq!(header.width(), usize::from(width));

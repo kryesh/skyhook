@@ -416,7 +416,9 @@ impl App {
                                 .get(&self.selected)
                                 .and_then(|v| v.scroll)
                                 .unwrap_or(
-                                    self.content_rows
+                                    self.render
+                                        .rows
+                                        .len()
                                         .saturating_sub(self.content_rect.height as usize),
                                 );
                             // Hold the viewport still while selecting a streaming reply.
@@ -479,7 +481,9 @@ impl App {
             .get(&self.selected)
             .and_then(|view| view.scroll)
             .unwrap_or(
-                self.content_rows
+                self.render
+                    .rows
+                    .len()
                     .saturating_sub(self.content_rect.height as usize),
             );
         let row = (scroll + point.1.saturating_sub(self.content_rect.y) as usize)
@@ -705,7 +709,7 @@ mod tests {
                     mouse(&mut app, Rect::new(column, y, 1, 1), kind);
                 }
                 let selected = draw_buffer(&mut app);
-                let color = crate::tui::render::Palette::new().selected;
+                let color = crate::tui::theme::THEME.selected;
                 // Terminals paint wide characters from their leading cell; Ratatui's
                 // backend diff skips their continuation cells.
                 let mut column = x;
@@ -725,7 +729,7 @@ mod tests {
 
     #[tokio::test]
     async fn pre_job_failure_updates_the_existing_tool_card_and_expands_in_place() {
-        use crate::tui::theme::ContentTheme;
+        use crate::tui::theme::THEME;
         use skyhook::provider::protocol::{AssistantItem, ToolCall, ToolResult};
         let (_root, mut app) = fixture().await;
         async fn commit(app: &mut App, message: Message) {
@@ -759,7 +763,7 @@ mod tests {
         );
         assert!(cards[0].text().contains("Failed") && cards[0].expandable());
         assert!(!cards[0].text().contains("Permission was denied"));
-        let error = ContentTheme::new().error;
+        let error = THEME.error;
         assert!(buffer.content.windows(6).any(|cells| {
             cells.iter().map(|cell| cell.symbol()).collect::<String>() == "Failed"
                 && cells.iter().all(|cell| cell.fg == error)

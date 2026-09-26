@@ -13,7 +13,7 @@ use super::notifications::job_event_entries;
 use super::projection::JobInfo;
 use super::requests::request_entry;
 use super::{
-    Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Title, number, pretty,
+    Clean, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Title, number, pretty,
 };
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
@@ -679,7 +679,7 @@ impl History {
         let response = request.map_or(ResponseRef::Message(message), ResponseRef::Request);
         let footer = request
             .and_then(|request| projection.ledger.get(request))
-            .map(|request| request.profile.profile.model.clone());
+            .map(|request| Clean::from(request.profile.profile.model.as_str()));
         // The model footer sits under the last visible text of an answer; a working
         // turn (one with calls) has none.
         let final_text = (!items.iter().any(|item| item.call().is_some()))

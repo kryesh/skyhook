@@ -1,8 +1,8 @@
 //! Build semantic documents from tool arguments and result envelopes.
 use super::output::OutputShape;
 use super::preview::{Pagination, PreviewView};
-use super::{CodeSource, Document, OutputView, Role, Run, Section, model};
-use crate::tui::format::pretty;
+use super::{CodeSource, Document, OutputView, Role, Run, Section};
+use crate::tui::format::{Clean, clean, pretty};
 use serde_json::Value;
 use skyhook::job::omit_null_fields;
 use unicode_width::UnicodeWidthStr;
@@ -36,7 +36,7 @@ impl Document {
         text: &str,
         language: &str,
         indent: usize,
-        gutters: Option<String>,
+        gutters: Option<Clean>,
         role: Role,
     ) {
         self.sections.push(Section::Code {
@@ -65,7 +65,8 @@ impl Document {
         let entries: Vec<(String, &Value)> = match value {
             Value::Object(values) => values
                 .iter()
-                .map(|(key, value)| (model::clean(key).replace('\n', " "), value))
+                // Clean before measuring, so the label column aligns.
+                .map(|(key, value)| (clean(key).replace('\n', " "), value))
                 .collect(),
             Value::Array(values) => values
                 .iter()
@@ -577,7 +578,7 @@ fn output_language(tool: &str, args: &Value, field: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{ContentTheme, Wrap};
+    use super::super::{THEME, Wrap};
     use super::*;
     use serde_json::json;
 
@@ -623,7 +624,9 @@ mod tests {
         })
     }
 
+    /// Sources are stored as painted: cleaned of controls, tabs expanded.
     fn has_source(document: &Document, expected: &str) -> bool {
+        let expected = clean(expected);
         has_code(document, |source, _, _| source == expected)
     }
 
@@ -715,7 +718,7 @@ mod tests {
                 Section::Code {
                     gutters: Some(marker),
                     ..
-                } => Some(marker.as_str()),
+                } => Some(&**marker),
                 _ => None,
             })
             .collect();
@@ -738,7 +741,7 @@ mod tests {
             .iter()
             .find(|line| line.to_string().contains("Permission was denied"));
         let color = error.unwrap().spans.last().unwrap().style.fg;
-        assert_eq!(color, Some(ContentTheme::new().error));
+        assert_eq!(color, Some(THEME.error));
         let output =
             json!({"error": {"message": "validation failed", "details": ["argv is required"]}});
         let text = rendered("exec", &Value::Null, &output).plain_text();
@@ -902,7 +905,7 @@ mod tests {
             assert!(text.contains("More saved output available"));
             assert!(document.sections.iter().any(|section| {
                 matches!(section, Section::Line(runs) if runs.len() == 1
-                    && runs[0].text == "/result/missing" && runs[0].role == Role::Label)
+                    && &*runs[0].text == "/result/missing" && runs[0].role == Role::Label)
             }));
             assert!(has_source(&document, "  live payload\t"));
         }

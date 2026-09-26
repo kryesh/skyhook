@@ -1,6 +1,6 @@
 //! Markdown event interpretation, styles, and source container metadata.
 use super::super::super::tool_view::{self, Document, Section};
-use super::super::Palette;
+use super::super::THEME;
 use super::tables::Table;
 use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use ratatui::{
@@ -34,22 +34,26 @@ impl From<Line<'static>> for ParsedLine {
 
 pub(super) struct Parsed {
     pub(super) lines: Vec<ParsedLine>,
+    /// Closed, named fences: the sources the highlight cache may color.
+    pub(super) fences: Document,
+    /// A table is the first block, possibly inside containers.
+    pub(super) table_first: bool,
 }
 
-pub(in super::super) fn options() -> Options {
+fn options() -> Options {
     Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS
 }
 
 /// Pulldown emits an end event even for an unfinished fence. Its source range
 /// includes a real closing marker, but text events consume invalid candidates.
 /// Track the un-emitted tail so EOF/container closure cannot enable highlighting.
-pub(in super::super) struct Fence {
+struct Fence {
     marker: u8,
     tail: Range<usize>,
 }
 
 impl Fence {
-    pub(in super::super) fn new(text: &str, range: Range<usize>) -> Self {
+    fn new(text: &str, range: Range<usize>) -> Self {
         let body = text[range.clone()]
             .find('\n')
             .map_or(range.end, |end| range.start + end + 1);
@@ -59,11 +63,11 @@ impl Fence {
         }
     }
 
-    pub(in super::super) fn text(&mut self, end: usize) {
+    fn text(&mut self, end: usize) {
         self.tail.start = end;
     }
 
-    pub(in super::super) fn closed(self, text: &str) -> bool {
+    fn closed(self, text: &str) -> bool {
         text.as_bytes()[self.tail].contains(&self.marker)
     }
 }
@@ -99,7 +103,6 @@ struct ActiveCodeBlock {
 
 struct Renderer<'a> {
     input: &'a str,
-    palette: Palette,
     width: usize,
     lines: Vec<ParsedLine>,
     marker_spans: usize,
@@ -116,6 +119,8 @@ struct Renderer<'a> {
     marker_only: bool,
     links: Vec<String>,
     table: Option<Table>,
+    fences: Document,
+    table_first: bool,
 }
 
 impl Renderer<'_> {
@@ -140,27 +145,31 @@ impl Renderer<'_> {
     }
 
     fn style(&self) -> Style {
-        let content = self.palette.content;
+        let content = THEME;
         // Foreground precedence is independent of modifiers: code/link wins
         // over headings (including table headers), then strong, then prose.
+        // Prose keeps its row's surface colour, so reasoning stays muted.
         let foreground = if self.code.is_some() {
-            content.inline_code
+            Some(content.inline_code)
         } else if !self.links.is_empty() {
-            content.accent
+            Some(content.accent)
         } else if self.heading > 0 {
-            content.heading
+            Some(content.heading)
         } else if self.bold > 0 {
-            content.strong
+            Some(content.strong)
         } else if self
             .containers
             .iter()
             .any(|c| matches!(c, Container::Quote))
         {
-            content.quote
+            Some(content.quote)
         } else {
-            content.fg
+            None
         };
-        let mut style = Style::default().fg(foreground);
+        let mut style = Style {
+            fg: foreground,
+            ..Style::default()
+        };
         if self.bold > 0 || self.heading > 0 {
             style = style.add_modifier(Modifier::BOLD);
         }
@@ -191,10 +200,9 @@ impl Renderer<'_> {
         let mut spans = Vec::new();
         for container in &self.containers {
             match container {
-                Container::Quote => spans.push(Span::styled(
-                    "│ ",
-                    Style::default().fg(self.palette.content.muted),
-                )),
+                Container::Quote => {
+                    spans.push(Span::styled("│ ", Style::default().fg(THEME.muted)))
+                }
                 Container::List(list) => {
                     let indent = list.indent;
                     if indent > 0 {
@@ -217,10 +225,9 @@ impl Renderer<'_> {
         let mut continuation = Vec::new();
         for (depth, container) in self.containers.iter().enumerate() {
             match container {
-                Container::Quote => continuation.push(Span::styled(
-                    "│ ",
-                    Style::default().fg(self.palette.content.muted),
-                )),
+                Container::Quote => {
+                    continuation.push(Span::styled("│ ", Style::default().fg(THEME.muted)))
+                }
                 Container::List(list) => {
                     // The checkbox hangs only the task's own paragraph. A
                     // descendant list/quote starts at the ordinary item indent,
@@ -326,12 +333,11 @@ impl Renderer<'_> {
                             role: tool_view::Role::Constant,
                         }],
                     };
-                    let highlights = if fence.closed(self.input) {
-                        self.highlights
-                    } else {
-                        None
-                    };
-                    let mut lines = document.lines(highlights);
+                    let closed = fence.closed(self.input);
+                    let mut lines = document.lines(self.highlights.filter(|_| closed));
+                    if closed {
+                        self.fences.sections.extend(document.sections);
+                    }
                     // Markdown's text() flushes the preceding row at a final
                     // newline; it does not emit split()'s trailing empty row.
                     if trailing_newline {
@@ -392,10 +398,8 @@ impl Renderer<'_> {
                 } else {
                     "• ".to_owned()
                 };
-                self.spans.push(Span::styled(
-                    marker,
-                    Style::default().fg(self.palette.content.primary),
-                ));
+                self.spans
+                    .push(Span::styled(marker, Style::default().fg(THEME.primary)));
                 self.marker_spans = self.spans.len();
             }
             Event::End(TagEnd::Item) => self.flush(false),
@@ -454,7 +458,7 @@ impl Renderer<'_> {
                 self.marker_only = false;
                 self.spans.push(Span::styled(
                     value.into_string(),
-                    self.style().fg(self.palette.content.inline_code),
+                    self.style().fg(THEME.inline_code),
                 ));
             }
             Event::SoftBreak | Event::HardBreak => self.flush(true),
@@ -466,7 +470,7 @@ impl Renderer<'_> {
             Event::TaskListMarker(checked) => {
                 self.spans.push(Span::styled(
                     if checked { "[x] " } else { "[ ] " },
-                    Style::default().fg(self.palette.content.primary),
+                    Style::default().fg(THEME.primary),
                 ));
                 self.marker_spans += 1;
                 if let Some(list) = self.list_mut() {
@@ -474,6 +478,7 @@ impl Renderer<'_> {
                 }
             }
             Event::Start(Tag::Table(alignments)) => {
+                self.table_first |= self.lines.is_empty() && self.spans.is_empty();
                 self.flush(false);
                 self.table = Some(Table::new(alignments));
             }
@@ -512,14 +517,12 @@ impl Renderer<'_> {
 
 pub(super) fn parse(
     text: &str,
-    palette: Palette,
     placeholder: bool,
     width: usize,
     cache: Option<&tool_view::HighlightCache>,
 ) -> Parsed {
     let mut renderer = Renderer {
         input: text,
-        palette,
         width,
         lines: Vec::new(),
         marker_spans: 0,
@@ -536,6 +539,8 @@ pub(super) fn parse(
         marker_only: false,
         links: Vec::new(),
         table: None,
+        fences: Document::default(),
+        table_first: false,
     };
     for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
         renderer.event(event, range);
@@ -546,6 +551,8 @@ pub(super) fn parse(
     }
     Parsed {
         lines: renderer.lines,
+        fences: renderer.fences,
+        table_first: renderer.table_first,
     }
 }
 
@@ -556,26 +563,24 @@ pub(in super::super) mod tests {
 
     pub(in super::super::super) fn render(
         text: &str,
-        palette: Palette,
         placeholder: bool,
         width: usize,
     ) -> Vec<Line<'static>> {
-        super::super::render_highlighted(text, palette, placeholder, width, None)
+        super::super::render_highlighted(text, placeholder, width, None)
     }
 
     pub(in super::super::super) fn render_highlighted(
         text: &str,
-        palette: Palette,
         placeholder: bool,
         width: usize,
         cache: Option<&tool_view::HighlightCache>,
     ) -> Vec<Line<'static>> {
-        let lines = parse(text, palette, placeholder, width, cache).lines;
+        let lines = parse(text, placeholder, width, cache).lines;
         lines.into_iter().map(|parsed| parsed.line).collect()
     }
 
     fn rendered(text: &str, width: usize) -> Vec<Line<'static>> {
-        render(text, Palette::new(), false, width)
+        render(text, false, width)
     }
 
     fn strings(lines: &[Line<'_>]) -> Vec<String> {
@@ -599,7 +604,7 @@ pub(in super::super) mod tests {
     #[test]
     fn empty_and_multiple_code_blocks_keep_distinct_ids() {
         let source = "```rust\n```\n\nprose\n\n```\n\n```\n\n    indented\n\n```rust\nlast\n```";
-        let parsed = parse(source, Palette::new(), false, 80, None);
+        let parsed = parse(source, false, 80, None);
         let lines: Vec<_> = parsed
             .lines
             .iter()
@@ -616,13 +621,12 @@ pub(in super::super) mod tests {
 
     #[test]
     fn nested_foregrounds_preserve_heading_and_inline_modifiers() {
-        let p = Palette::new();
         let lines = rendered(
             "# head **strong** *italic* [link](https://example.com) **[*`code`*](https://code.example)**\n\n**bold *emphasis* [linked](https://strong.example) `inline`**\n\n*neutral* plain",
             200,
         );
         let (bold, italic, underlined) = (Modifier::BOLD, Modifier::ITALIC, Modifier::UNDERLINED);
-        let content = p.content;
+        let content = THEME;
         for (text, fg, modifiers) in [
             ("strong", content.heading, bold),
             ("italic", content.heading, bold | italic),
@@ -641,15 +645,11 @@ pub(in super::super) mod tests {
             assert_style(&lines, text, fg, modifiers);
         }
         let neutral = span_style(&lines, "neutral");
-        assert_eq!(
-            (neutral.fg, neutral.add_modifier),
-            (Some(content.fg), italic)
-        );
+        assert_eq!((neutral.fg, neutral.add_modifier), (None, italic));
     }
 
     #[test]
     fn quote_and_list_markers_use_content_roles_without_changing_text() {
-        let p = Palette::new().content;
         let lines = rendered(
             "> quoted *quiet*\n\n- bullet\n- [x] done\n\n3. numbered",
             80,
@@ -663,20 +663,21 @@ pub(in super::super) mod tests {
             "3. numbered",
         ];
         assert_eq!(strings(&lines), expected);
+        // Prose leaves its colour to the row's surface.
         for (text, fg) in [
-            ("│ ", p.muted),
-            ("quoted ", p.quote),
-            ("• ", p.primary),
-            ("[x] ", p.primary),
-            ("3. ", p.primary),
-            ("bullet", p.fg),
+            ("│ ", Some(THEME.muted)),
+            ("quoted ", Some(THEME.quote)),
+            ("• ", Some(THEME.primary)),
+            ("[x] ", Some(THEME.primary)),
+            ("3. ", Some(THEME.primary)),
+            ("bullet", None),
         ] {
-            assert_eq!(span_style(&lines, text).fg, Some(fg), "{text}");
+            assert_eq!(span_style(&lines, text).fg, fg, "{text}");
         }
         let quiet = span_style(&lines, "quiet");
         assert_eq!(
             (quiet.fg, quiet.add_modifier),
-            (Some(p.quote), Modifier::ITALIC)
+            (Some(THEME.quote), Modifier::ITALIC)
         );
     }
 
@@ -701,11 +702,10 @@ pub(in super::super) mod tests {
     fn open_fences_ignore_cached_highlights_until_closed() {
         let open = "```rust\nlet answer = 42;\n";
         let closed = format!("{open}```");
-        let mut fences = crate::tui::render::code::Fences::default();
-        fences.update(&closed);
+        let fences = parse(&closed, false, 80, None).fences;
         let mut cache = tool_view::HighlightCache::default();
-        cache.wait(&fences.document);
-        let render = |text| render_highlighted(text, Palette::new(), false, 80, Some(&cache));
+        cache.wait(&fences);
+        let render = |text| render_highlighted(text, false, 80, Some(&cache));
         let plain = rendered(open, 80);
         assert_eq!(render(open), plain);
         assert_ne!(render(&closed), plain);
@@ -718,15 +718,11 @@ pub(in super::super) mod tests {
         assert_eq!(oversized, rendered(&format!("```\n{body}```"), 80));
         let lines = rendered("```not-a-language\nplain\n```", 80);
         assert_eq!(strings(&lines), ["plain"]);
-        assert_eq!(
-            span_style(&lines, "plain").fg,
-            Some(Palette::new().content.inline_code)
-        );
+        assert_eq!(span_style(&lines, "plain").fg, Some(THEME.inline_code));
     }
 
     #[test]
     fn table_headers_have_heading_precedence_even_in_borderless_fallback() {
-        let p = Palette::new().content;
         let (bold, underlined) = (Modifier::BOLD, Modifier::UNDERLINED);
         for width in [1, 80] {
             let lines = rendered(
@@ -734,14 +730,68 @@ pub(in super::super) mod tests {
                 width,
             );
             for (text, fg, modifiers) in [
-                ("H", p.heading, bold),
-                ("I", p.heading, bold),
-                ("L", p.accent, bold | underlined),
-                ("C", p.inline_code, bold),
-                ("B", p.strong, Modifier::empty()),
+                ("H", THEME.heading, bold),
+                ("I", THEME.heading, bold),
+                ("L", THEME.accent, bold | underlined),
+                ("C", THEME.inline_code, bold),
+                ("B", THEME.strong, Modifier::empty()),
             ] {
                 assert_style(&lines, text, fg, modifiers);
             }
         }
+    }
+
+    /// Fences as entry layout finds them, in cleaned text.
+    fn fences(source: &str) -> Vec<(String, String)> {
+        let source = crate::tui::model::clean(source);
+        let fences = parse(&source, false, 80, None).fences;
+        let sections = fences.sections.into_iter();
+        sections
+            .map(|section| {
+                let Section::Code {
+                    source, language, ..
+                } = section
+                else {
+                    panic!("only code sections")
+                };
+                (language, source.to_string())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn only_closed_named_fences_are_collected() {
+        let rust = [("rust".to_owned(), "let x = 42;\n".to_owned())];
+        // No prefix of a fence is closed; trailing text after the marker is.
+        for source in [
+            "```rust\nlet x = 42;\n```",
+            "~~~~rust\nlet x = 42;\n~~~~",
+            "> ```rust\n> let x = 42;\n> ```",
+            "> - ~~~~rust\n>   let x = 42;\n>   ~~~~",
+        ] {
+            for end in 0..source.len() {
+                assert!(fences(&source[..end]).is_empty(), "{:?}", &source[..end]);
+            }
+            for suffix in ["", "  \t", "\n\n```rust\nlet incomplete ="] {
+                assert_eq!(fences(&format!("{source}{suffix}")), rust);
+            }
+        }
+        let oversized = format!("```rust\n{}\n```", "x".repeat(tool_view::MAX_SECTION + 1));
+        for source in [
+            "~~~rust ~~~",
+            "````rust\nlet x = 42;\n```",
+            "```rust\nlet x = 42;\n``` trailing",
+            "```rust\nlet x = 42;\n    ```",
+            "> ```rust\n> let x = 42;\n\nOutside the quote",
+            "- ```rust\n  let x = 42;\n\nOutside the list",
+            "```\nnot labelled\n```\n\n    indented\n",
+            &oversized,
+        ] {
+            assert!(fences(source).is_empty(), "{source:?}");
+        }
+        let source = "```rust extra\nlet café = 42;  \n\n```\n\n- ```sh\n  echo hi\n  ```\n";
+        let expected = [("rust", "let café = 42;  \n\n"), ("sh", "echo hi\n")];
+        let expected = expected.map(|(language, source)| (language.to_owned(), source.to_owned()));
+        assert_eq!(fences(source), expected);
     }
 }

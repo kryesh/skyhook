@@ -1,7 +1,7 @@
 //! Main frame composition and viewport orchestration.
 
 use super::*;
-use crate::tui::keys::Command;
+use crate::tui::{composer::ComposerLayout, keys::Command};
 use skyhook::agent::AgentActivity;
 
 /// Contextual labels for typed commands, rendered only when they are bound.
@@ -39,14 +39,42 @@ fn background_attention(app: &App) -> usize {
     others.filter(|peer| peer.attention).count()
 }
 
+/// The row above the tree and composer, most urgent first, and what clicking it
+/// opens; hints and toasts only inform.
+fn notice(app: &App, prompt_active: bool) -> Option<(String, Option<Hit>)> {
+    let waiting = background_attention(app);
+    if let Some(prefix) = app.leader {
+        Some((app.keys.leader_hint(prefix, &leader_hints(app)), None))
+    } else if let Some((message, _)) = &app.toast {
+        Some((message.clone(), None))
+    } else if !app.prompts.is_empty() && !prompt_active {
+        let hint = match app.keys.binding(Command::Attention) {
+            Some(binding) => format!("{binding} reopen"),
+            None => "Reopen questions and permissions in the command palette".to_owned(),
+        };
+        let message = format!("{} pending request(s) · {hint}", app.prompts.len());
+        Some((message, Some(Hit::Attention)))
+    } else if waiting > 0 {
+        let hint = app.keys.binding(Command::Sessions);
+        let hint = hint.unwrap_or("/sessions".into());
+        let message = format!("{waiting} other session(s) need attention · {hint}");
+        Some((message, Some(Hit::Sessions)))
+    } else if !app.queue.is_empty() {
+        let paused = if app.paused { " · paused" } else { "" };
+        let message = format!("{} follow-up(s) queued{paused} · /queue", app.queue.len());
+        Some((message, Some(Hit::Queue)))
+    } else {
+        None
+    }
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let p = Palette::new();
-    fill(frame, area, p.base);
+    fill(frame, area, THEME.base);
     app.hits.clear();
     app.animating = false;
     if area.width < 20 || area.height < 9 {
-        text(frame, area, "Enlarge terminal", p.warning, p.base);
+        text(frame, area, "Enlarge terminal", THEME.warning, THEME.base);
         return;
     }
     let width = area.width;
@@ -67,32 +95,13 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let editor_width = width.saturating_sub(4).max(1) as usize;
     app.editor.set_width(editor_width);
     let editor_layout = app.editor.layout(editor_width);
-    let editor_lines: Vec<_> = editor_layout
-        .rows
-        .iter()
-        .map(|row| {
-            row.line(
-                Style::default(),
-                Style::default()
-                    .fg(p.accent)
-                    .remove_modifier(Modifier::all()),
-                Style::default().bg(p.selected),
-            )
-        })
-        .collect();
     let viewing_child = !app.selected.path().is_empty();
     let editor_height =
-        (editor_lines.len() as u16 + 2 + u16::from(!app.editor.attachments().is_empty()))
+        (editor_layout.rows.len() as u16 + 2 + u16::from(!app.editor.attachments().is_empty()))
             .clamp(3, 7)
             .min(height.saturating_sub(footer_height + 3).max(3));
-    let waiting = background_attention(app);
-    let notice_height = u16::from(
-        !app.queue.is_empty()
-            || waiting > 0
-            || (!app.prompts.is_empty() && !prompt_active)
-            || app.leader.is_some()
-            || app.toast.is_some(),
-    );
+    let notice = notice(app, prompt_active);
+    let notice_height = u16::from(notice.is_some());
     let prompt_layout = prompt_active.then(|| PromptLayout::new(app, width));
     let composer_height = if let Some(layout) = &prompt_layout {
         layout
@@ -114,13 +123,14 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 0
             },
     );
-    let show_tree = !app.selected.path().is_empty() || app.projection.has_active_children();
+    let show_tree = viewing_child || app.projection.has_active_children();
     let tree_rows = if show_tree && tree_capacity >= 3 {
         (tree_agents.len() as u16).min(tree_capacity - 2)
     } else {
         0
     };
     let tree_height = if tree_rows > 0 { tree_rows + 2 } else { 0 };
+    // Focus cannot stay on a hidden tree or a child's absent composer.
     if tree_height == 0 && app.focus == Focus::Tree {
         app.focus = if viewing_child {
             Focus::Content
@@ -149,60 +159,102 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             width - content_width,
             app.content_rect.height + notice_height,
         );
-        draw_sidebar(frame, app, rect, p);
+        draw_sidebar(frame, app, rect);
     }
-    fill(frame, r(0, 0, width, 2), p.panel);
+    draw_header(frame, app, width);
+    prepare_rows(app, content_width);
+    let navigation_active = app.menu.is_none() && app.search_editor.is_none() && !prompt_active;
+    draw_content(frame, app, navigation_active);
+    // The popup and any notice share the row above the tree and composer.
+    let latest_width = draw_scrollbar(frame, app);
+    if let Some(search) = &app.search_editor {
+        text(
+            frame,
+            r(2, app.content_rect.y, content_width.saturating_sub(4), 1),
+            format!("Find: {}▏", search.text()),
+            THEME.fg,
+            THEME.input,
+        );
+    }
+    if let Some((message, hit)) = notice {
+        let taken = if latest_width > 0 {
+            latest_width + 3
+        } else {
+            2
+        };
+        let rect = r(
+            1,
+            tree_y.saturating_sub(1),
+            content_width.saturating_sub(taken),
+            1,
+        );
+        if let Some(hit) = hit {
+            app.hits.push((rect, hit));
+        }
+        text(frame, rect, message, THEME.warning, THEME.base);
+    }
+    draw_tree(frame, app, &tree_agents, tree_rows, navigation_active);
+    fill(frame, app.composer_rect, THEME.input);
+    if let Some(layout) = &prompt_layout {
+        draw_prompt(frame, app, layout);
+    } else if !viewing_child {
+        draw_composer(frame, app, &editor_layout);
+    }
+    let footer = r(0, height - footer_height, width, footer_height);
+    draw_footer(frame, app, footer, &stats, &stat_lines);
+    draw_menu(frame, app);
+}
+
+/// The workspace and the tab strip.
+fn draw_header(frame: &mut Frame, app: &mut App, width: u16) {
+    fill(frame, r(0, 0, width, 2), THEME.panel);
     let workspace = app.launch.workspace.display().to_string();
-    let workspace = clipped_header(&workspace, width.saturating_sub(4));
+    let workspace = clipped(Line::from(workspace), width.saturating_sub(4) as usize);
     let workspace_width = workspace.width() as u16;
     text(
         frame,
         r((width - workspace_width) / 2, 0, workspace_width, 1),
         workspace,
-        p.fg,
-        p.panel,
+        THEME.fg,
+        THEME.panel,
     );
-    let tab = app.tab;
     let mut x = 2;
-    for (label, value) in [
-        ("Conversation", Tab::Conversation),
-        ("Requests", Tab::Requests),
-        ("Jobs", Tab::Jobs),
-    ] {
-        let label = if width < 50 {
-            match value {
-                Tab::Conversation => "Chat",
-                Tab::Requests => "Calls",
-                Tab::Jobs => "Jobs",
-            }
-        } else {
-            label
+    for tab in [Tab::Conversation, Tab::Requests, Tab::Jobs] {
+        let label = match (tab, width < 50) {
+            (Tab::Conversation, false) => "Conversation",
+            (Tab::Conversation, true) => "Chat",
+            (Tab::Requests, false) => "Requests",
+            (Tab::Requests, true) => "Calls",
+            (Tab::Jobs, _) => "Jobs",
         };
         let n = label.len() as u16 + 2;
         let rect = r(x, 1, n, 1);
-        text(
-            frame,
-            rect,
-            format!(" {label} "),
-            if tab == value { p.accent } else { p.muted },
-            if tab == value { p.selected } else { p.panel },
-        );
-        app.hits.push((rect, Hit::Tab(value)));
+        let (fg, bg) = if app.tab == tab {
+            (THEME.primary, THEME.selected)
+        } else {
+            (THEME.muted, THEME.panel)
+        };
+        text(frame, rect, format!(" {label} "), fg, bg);
+        app.hits.push((rect, Hit::Tab(tab)));
         x += n + 1;
     }
-    prepare_rows(app, content_width, p);
-    if tab == Tab::Requests
+}
+
+/// The transcript rows in view, with selection, focus and running spinners.
+fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
+    let content_width = app.content_rect.width;
+    if app.tab == Tab::Requests
         && app.content_rect.height > 1
         && let Some(entry) = app.entries().iter().find(|entry| entry.request().is_some())
     {
         let geometry = EntryGeometry::new(entry, content_width, 0);
-        if let Some(header) = app.render.request_columns.header(geometry.body_width, p) {
+        if let Some(header) = app.render.request_columns.header(geometry.body_width) {
             text(
                 frame,
                 r(geometry.x, app.content_rect.y, geometry.body_width, 1),
                 header,
-                p.content.muted,
-                p.base,
+                THEME.muted,
+                THEME.base,
             );
             // The fixed header is not an entry: paging, hit testing and selection
             // all use a viewport containing data rows only.
@@ -211,26 +263,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
     }
     let max = app
-        .content_rows
+        .render
+        .rows
+        .len()
         .saturating_sub(app.content_rect.height as usize);
-    let scroll = app.view().scroll.map(|n| n.min(max)).unwrap_or(max);
-    if app.view().scroll.is_some() {
-        app.view().scroll = Some(scroll);
+    let view = app.view();
+    let scroll = view.scroll.map_or(max, |n| n.min(max));
+    if view.scroll.is_some() {
+        view.scroll = Some(scroll);
     }
-    let selected_entry = app.view().row;
-    let view = app.views.get(&app.selected).expect("selected view");
-    let mut expanded_entry = None;
-    let navigation_active = app.menu.is_none() && app.search_editor.is_none() && !prompt_active;
-    let mut cursor_drawn = false;
+    let selected_entry = view.row;
     if app.entries().is_empty() {
         text(
             frame,
             r(3, 4, content_width.saturating_sub(6), 1),
             "Start a conversation, or /sessions to open one.",
-            p.muted,
-            p.base,
+            THEME.muted,
+            THEME.base,
         );
     }
+    let mut cursor_drawn = false;
     for (offset, row) in app
         .render
         .rows
@@ -249,61 +301,40 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .as_ref()
             .and_then(|view| view.selection_range(scroll + offset, app.selection));
         let entry = app.content_cache.entries().get(row.entry);
-        let expanded = match expanded_entry {
-            Some((index, expanded)) if index == row.entry => expanded,
-            _ => {
-                let expanded =
-                    entry.is_some_and(|entry| entry.is_expanded(view, app.tab, app.details));
-                expanded_entry = Some((row.entry, expanded));
-                expanded
-            }
-        };
+        let expandable = entry.is_some_and(model::Entry::expandable);
         let focused = navigation_active
             && app.focus == Focus::Content
             && row.selectable
             && row.entry == selected_entry;
-        let hovered = navigation_active
-            && app.hover.is_some_and(|point| rect.contains(point.into()))
-            && entry.is_some_and(|e| e.expandable());
+        let hovered =
+            navigation_active && app.hover.is_some_and(|point| rect.contains(point.into()));
         let bg = row.background(
-            p,
-            expanded,
-            (focused && entry.is_some_and(|e| e.expandable())) || hovered,
+            entry.is_some_and(model::Entry::open),
+            expandable && (focused || hovered),
             selected.is_some(),
         );
         fill(frame, rect, bg);
-        let text_rect = r(
-            row.paragraph_x(),
-            y,
-            row.width.saturating_sub(row.inset).saturating_sub(
-                if matches!(row.surface, Surface::User | Surface::Agent) {
-                    4
-                } else {
-                    0
-                },
-            ),
-            1,
-        );
+        let text_rect = r(row.paragraph_x(), y, row.text_width, 1);
         render_row_line(
             row,
             text_rect,
             frame.buffer_mut(),
-            Style::default().fg(p.foreground(row.surface)).bg(bg),
-            p,
+            Style::default().fg(foreground(row.surface)).bg(bg),
         );
         if let Some(range) = selected {
             let view = row_text.as_ref().expect("selected range has row text");
             // Source-to-column geometry skips hanging prefixes and code padding.
             // A malformed layout yields no cells; never paint it elsewhere.
+            let text_end = text_rect.right() as usize;
+            let source_end = row.layout.code().map_or(text_end, |code| {
+                (text_rect.x as usize + code.body_end()).min(text_end)
+            });
             for (byte, column, width) in view.source_cells() {
                 if !range.contains(&byte) {
                     continue;
                 }
-                let start = row.paragraph_x() as usize + column;
+                let start = text_rect.x as usize + column;
                 let end = start + width;
-                let source_end = row.layout.code().map_or(content_width as usize, |code| {
-                    (row.paragraph_x() as usize + code.body_end()).min(content_width as usize)
-                });
                 if start >= source_end {
                     break;
                 }
@@ -311,211 +342,173 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                     continue;
                 }
                 for x in start..end {
-                    frame.buffer_mut()[(x as u16, y)].set_bg(p.selected);
+                    frame.buffer_mut()[(x as u16, y)].set_bg(THEME.selected);
                 }
             }
         }
-        if !row.layout.is_spacer() {
-            if row.layout.header() && entry.is_some_and(|entry| entry.running) {
-                app.animating = true;
-                // Paint only the spinner; cached reasoning rows need no relayout on ticks.
-                text(
-                    frame,
-                    r(
-                        row.x
-                            + if entry.is_some_and(|entry| entry.expandable()) {
-                                2
-                            } else {
-                                0
-                            },
-                        y,
-                        1,
-                        1,
-                    ),
-                    spinner(app.tick_count),
-                    if row.surface == Surface::Tool
-                        && entry.is_some_and(|entry| entry.header().is_some())
-                    {
-                        p.content.primary
-                    } else {
-                        p.muted
-                    },
-                    bg,
-                );
-            }
-            if focused && !cursor_drawn {
-                focus_cursor(frame, row.x.saturating_sub(1), y, p.base);
-                cursor_drawn = true;
-            }
-            if row.selectable {
-                app.hits.push((
-                    rect,
-                    Hit::Entry(
-                        row.entry,
-                        row.layout.header() || entry.is_some_and(|entry| entry.expandable()),
-                    ),
-                ));
-            }
+        if row.layout.is_spacer() {
+            continue;
         }
-    }
-    // The popup and any notice share the row above the tree and composer.
-    let mut latest_width = 0;
-    if app.content_rows > app.content_rect.height as usize && app.content_rect.height > 0 {
-        let thumb = app.content_rect.y
-            + ((scroll as u64 * app.content_rect.height.saturating_sub(1) as u64)
-                / max.max(1) as u64) as u16;
-        text(
-            frame,
-            r(content_width - 1, thumb, 1, 1),
-            "▐",
-            p.muted,
-            p.base,
-        );
-        if app
-            .views
-            .get(&app.selected)
-            .is_some_and(|v| v.scroll.is_some())
+        if row.layout.header()
+            && let Some(entry) = entry.filter(|entry| entry.running)
         {
-            latest_width = 17.min(content_width.saturating_sub(2));
-            let rect = r(
-                content_width.saturating_sub(1 + latest_width),
-                tree_y.saturating_sub(1),
-                latest_width,
-                1,
-            );
-            // Text-only overlay: retain every underlying cell's background.
-            render_line(
-                &Line::from("↓ Latest activity"),
-                rect,
-                frame.buffer_mut(),
-                Style::default().fg(p.accent),
-            );
-            app.hits.push((rect, Hit::Latest));
+            app.animating = true;
+            // Paint only the spinner; cached reasoning rows need no relayout on ticks.
+            let x = row.x + if expandable { 2 } else { 0 };
+            let color = if entry.header().is_some() {
+                THEME.primary
+            } else {
+                THEME.muted
+            };
+            text(frame, r(x, y, 1, 1), spinner(app.tick_count), color, bg);
+        }
+        if focused && !cursor_drawn {
+            focus_cursor(frame, row.x.saturating_sub(1), y, THEME.base);
+            cursor_drawn = true;
+        }
+        if row.selectable {
+            let toggles = row.layout.header() || expandable;
+            app.hits.push((rect, Hit::Entry(row.entry, toggles)));
         }
     }
-    if let Some(search) = &app.search_editor {
+}
+
+/// The scrollbar thumb, and a way back to the tail while scrolled. Returns the
+/// width the tail link takes from the notice row.
+fn draw_scrollbar(frame: &mut Frame, app: &mut App) -> u16 {
+    let content = app.content_rect;
+    let height = content.height as usize;
+    if app.render.rows.len() <= height || height == 0 {
+        return 0;
+    }
+    let max = app.render.rows.len() - height;
+    let view = app.view();
+    let scroll = view.scroll.unwrap_or(max);
+    let thumb = content.y + (scroll as u64 * (height as u64 - 1) / max as u64) as u16;
+    text(
+        frame,
+        r(content.width - 1, thumb, 1, 1),
+        "▐",
+        THEME.muted,
+        THEME.base,
+    );
+    if view.scroll.is_none() {
+        return 0;
+    }
+    let width = 17.min(content.width.saturating_sub(2));
+    let rect = r(
+        content.width.saturating_sub(1 + width),
+        app.tree_rect.y.saturating_sub(1),
+        width,
+        1,
+    );
+    // Text-only overlay: retain every underlying cell's background.
+    render_line(
+        &Line::from("↓ Latest activity"),
+        rect,
+        frame.buffer_mut(),
+        Style::default().fg(THEME.primary),
+    );
+    app.hits.push((rect, Hit::Latest));
+    width
+}
+
+/// The root agent's message editor and its attachments.
+fn draw_composer(frame: &mut Frame, app: &mut App, layout: &ComposerLayout) {
+    let rect = app.composer_rect;
+    let text_width = rect.width.saturating_sub(4);
+    let (cursor_line, cursor_column) = layout.cursor;
+    let visible = rect.height.saturating_sub(2) as usize;
+    let top = cursor_line.saturating_sub(visible.saturating_sub(1));
+    let paste = Style::default()
+        .fg(THEME.primary)
+        .remove_modifier(Modifier::all());
+    let selection = Style::default().bg(THEME.selected);
+    for (i, row) in layout.rows.iter().skip(top).take(visible).enumerate() {
+        let line = row.line(Style::default(), paste, selection);
+        let y = rect.y + 1 + i as u16;
+        text(frame, r(2, y, text_width, 1), line, THEME.fg, THEME.input);
+    }
+    let attachments = app.editor.attachments();
+    if !attachments.is_empty() {
+        let names = attachments.iter().map(|attachment| {
+            match attachment.file().and_then(|file| file.file_name()) {
+                Some(name) => format!("[{}]", name.to_string_lossy()),
+                None => match attachment {
+                    skyhook::media::Attachment::Text { .. } => "[text]".to_owned(),
+                    skyhook::media::Attachment::Image { .. } => "[image]".to_owned(),
+                },
+            }
+        });
+        let names = names.collect::<Vec<_>>().join(" ");
+        let y = rect.bottom() - 1;
         text(
             frame,
-            r(2, app.content_rect.y, content_width.saturating_sub(4), 1),
-            format!("Find: {}▏", search.text()),
-            p.fg,
-            p.input,
+            r(2, y, text_width, 1),
+            names,
+            THEME.muted,
+            THEME.input,
         );
+        app.hits.push((r(0, y, rect.width, 1), Hit::Attachments));
     }
-    if notice_height > 0 {
-        let message = if let Some(prefix) = app.leader {
-            app.keys.leader_hint(prefix, &leader_hints(app))
-        } else if let Some((message, _)) = &app.toast {
-            message.clone()
-        } else if !app.prompts.is_empty() && !prompt_active {
-            let hint = match app.keys.binding(Command::Attention) {
-                Some(binding) => format!("{binding} reopen"),
-                None => "Reopen questions and permissions in the command palette".to_owned(),
-            };
-            format!("{} pending request(s) · {hint}", app.prompts.len())
-        } else if waiting > 0 {
-            let hint = app
-                .keys
-                .binding(Command::Sessions)
-                .unwrap_or("/sessions".into());
-            format!("{waiting} other session(s) need attention · {hint}")
-        } else if !app.queue.is_empty() {
-            format!(
-                "{} follow-up(s) queued{} · /queue",
-                app.queue.len(),
-                if app.paused { " · paused" } else { "" }
-            )
-        } else {
-            String::new()
-        };
-        let taken = if latest_width > 0 {
-            latest_width + 3
-        } else {
-            2
-        };
-        let rect = r(
-            1,
-            tree_y.saturating_sub(1),
-            content_width.saturating_sub(taken),
-            1,
+    if app.focus == Focus::Composer && app.menu.is_none() && app.search_editor.is_none() {
+        frame.set_cursor_position((
+            2 + (cursor_column as u16).min(text_width),
+            rect.y + 1 + (cursor_line - top) as u16,
+        ));
+    }
+    app.hits.insert(0, (rect, Hit::Composer));
+}
+
+/// The viewed agent's model and mode, the session, and usage statistics.
+fn draw_footer(frame: &mut Frame, app: &App, rect: Rect, stats: &str, stat_lines: &[String]) {
+    fill(frame, rect, THEME.base);
+    let model = footer_model(app);
+    let session = app.session().as_ref().map_or_else(
+        || "new session".to_owned(),
+        |session| session.id().to_string(),
+    );
+    let (width, y) = (rect.width, rect.y);
+    if rect.height > 1 {
+        let metadata = footer_metadata(&model, &session, width.saturating_sub(2));
+        text(
+            frame,
+            r(1, y, width.saturating_sub(2), 1),
+            metadata,
+            THEME.muted,
+            THEME.base,
         );
-        text(frame, rect, model::clean(&message), p.warning, p.base);
-        if app.leader.is_none() && app.toast.is_none() {
-            app.hits.push((
-                rect,
-                if !app.prompts.is_empty() && !prompt_active {
-                    Hit::Attention
-                } else if waiting > 0 {
-                    Hit::Sessions
-                } else {
-                    Hit::Queue
-                },
-            ));
+        for (index, line) in stat_lines.iter().enumerate() {
+            let rect = r(1, y + 1 + index as u16, width.saturating_sub(2), 1);
+            text(frame, rect, line.clone(), THEME.fg, THEME.base);
         }
-    }
-    draw_tree(frame, app, p, &tree_agents, tree_rows, navigation_active);
-    fill(frame, app.composer_rect, p.input);
-    if let Some(layout) = &prompt_layout {
-        draw_prompt(frame, app, p, layout);
-    } else if !viewing_child {
-        let (cursor_line, cursor_column) = editor_layout.cursor;
-        let visible = composer_height.saturating_sub(2) as usize;
-        let top = cursor_line.saturating_sub(visible.saturating_sub(1));
-        for (i, line) in editor_lines.iter().skip(top).take(visible).enumerate() {
+    } else {
+        let stat_width = stats.width() as u16;
+        let model_width = width.saturating_sub(stat_width + 4);
+        if model_width > 0 {
+            let metadata = footer_metadata(&model, &session, model_width);
             text(
                 frame,
-                r(2, composer_y + 1 + i as u16, width.saturating_sub(4), 1),
-                line.clone(),
-                p.fg,
-                p.input,
+                r(1, y, model_width, 1),
+                metadata,
+                THEME.muted,
+                THEME.base,
             );
         }
-        if !app.editor.attachments().is_empty() {
-            text(
-                frame,
-                r(
-                    2,
-                    composer_y + composer_height - 1,
-                    width.saturating_sub(4),
-                    1,
-                ),
-                app.editor
-                    .attachments()
-                    .iter()
-                    .map(
-                        |attachment| match attachment.file().and_then(|file| file.file_name()) {
-                            Some(name) => format!("[{}]", name.to_string_lossy()),
-                            None => match attachment {
-                                skyhook::media::Attachment::Text { .. } => "[text]".to_owned(),
-                                skyhook::media::Attachment::Image { .. } => "[image]".to_owned(),
-                            },
-                        },
-                    )
-                    .collect::<Vec<_>>()
-                    .join(" "),
-                p.muted,
-                p.input,
-            );
-            app.hits.push((
-                r(0, composer_y + composer_height - 1, width, 1),
-                Hit::Attachments,
-            ));
-        }
-        if app.focus == Focus::Composer && app.menu.is_none() && app.search_editor.is_none() {
-            let column = cursor_column as u16;
-            frame.set_cursor_position((
-                2 + column.min(width.saturating_sub(4)),
-                composer_y + 1 + (cursor_line - top) as u16,
-            ));
-        }
-        app.hits.insert(0, (app.composer_rect, Hit::Composer));
+        let x = width.saturating_sub(stat_width + 1);
+        let rect = r(x, y, stat_width.min(width), 1);
+        text(frame, rect, stats.to_owned(), THEME.fg, THEME.base);
     }
-    let fy = height - footer_height;
-    fill(frame, r(0, fy, width, footer_height), p.base);
-    let agent = app.projection.agents.iter().find(|a| a.id == app.selected);
-    let model = if app.selected.path().is_empty() {
+}
+
+/// The viewed agent's model. The root composer's next message goes out in the
+/// chosen mode; a child's mode is fixed.
+fn footer_model(app: &App) -> String {
+    let root = app.selected.path().is_empty();
+    let model = if root {
         Some(&app.model)
     } else {
+        let agent = app.projection.agents.iter().find(|a| a.id == app.selected);
         agent.map_or(Some(&app.model), |a| a.model.as_ref())
     };
     let config = app.launch.model.config();
@@ -527,66 +520,18 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
                 .map_or_else(|| name.to_string(), |profile| profile.model.clone())
         },
     );
-    // The root composer's next message goes out in this mode; a child's is fixed.
-    let model = if app.selected.path().is_empty() {
+    if root {
         format!("{} · {model}", app.mode)
     } else {
         model
-    };
-    let model = model.as_str();
-    let session = app.session().as_ref().map_or_else(
-        || "new session".to_owned(),
-        |session| session.id().to_string(),
-    );
-    if footer_height > 1 {
-        text(
-            frame,
-            r(1, fy, width.saturating_sub(2), 1),
-            footer_metadata(model, &session, width.saturating_sub(2)),
-            p.muted,
-            p.base,
-        );
-        for (index, line) in stat_lines.iter().enumerate() {
-            text(
-                frame,
-                r(1, fy + 1 + index as u16, width.saturating_sub(2), 1),
-                line.clone(),
-                p.fg,
-                p.base,
-            );
-        }
-    } else {
-        let stat_width = stats.width() as u16;
-        let model_width = width.saturating_sub(stat_width + 4);
-        if model_width > 0 {
-            text(
-                frame,
-                r(1, fy, model_width, 1),
-                footer_metadata(model, &session, model_width),
-                p.muted,
-                p.base,
-            );
-        }
-        text(
-            frame,
-            r(
-                width.saturating_sub(stat_width + 1),
-                fy,
-                stat_width.min(width),
-                1,
-            ),
-            stats,
-            p.fg,
-            p.base,
-        );
     }
-    draw_menu(frame, app, p);
 }
 
 /// Keep both model and session identifiable when the footer is compact.
-fn footer_metadata(model: &str, session: &str, width: u16) -> String {
+fn footer_metadata(model: &str, session: &str, width: u16) -> Line<'static> {
+    let clip = |text: &str, width: u16| clipped(Line::from(text.to_owned()), width as usize);
     if width < 5 {
-        return clipped_header(model, width);
+        return clip(model, width);
     }
     let available = width - 3; // Separator between model and session.
     let session_width = session
@@ -594,11 +539,10 @@ fn footer_metadata(model: &str, session: &str, width: u16) -> String {
         .min((available - (available / 2).min(16)) as usize);
     let model_width = model.width().min(available as usize - session_width) as u16;
     let session_width = available - model_width;
-    format!(
-        "{} · {}",
-        clipped_header(model, model_width),
-        clipped_header(session, session_width),
-    )
+    let mut line = clip(model, model_width);
+    line.spans.push(Span::raw(" · "));
+    line.spans.extend(clip(session, session_width).spans);
+    line
 }
 
 #[cfg(test)]
@@ -609,7 +553,7 @@ mod tests {
             Work,
             tests::{fixture, push_record},
         },
-        theme::ContentTheme,
+        theme::THEME,
     };
     use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
@@ -757,7 +701,7 @@ mod tests {
                 let line: String = (0..width).map(|x| buffer[(x, 2)].symbol()).collect();
                 assert_eq!(line.contains("Input (uncached)"), header);
                 assert_eq!(
-                    (app.content_rect.y, app.content_rows),
+                    (app.content_rect.y, app.render.rows.len()),
                     (2 + u16::from(header), 30)
                 );
                 let first = app.hits.iter().find_map(|(rect, hit)| match hit {
@@ -787,26 +731,24 @@ mod tests {
     async fn expanded_items_paint_solid_code_backgrounds_across_clipped_rows() {
         let (_root, mut app) = fixture().await;
         app.content_dirty = false;
-        let mut entry = model::Entry::titled(
+        let entry = model::Entry::titled(
             model::EntryKey::UnsavedStatus(1),
             model::Title::disclosed("Expandable tool", true),
             "body\n\n".repeat(20),
             Surface::Tool,
         );
-        entry.default_open = true;
         app.install_entries(vec![entry]);
-        let p = Palette::new();
         for width in [30, 60] {
             let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            let scroll = app.content_rows - app.content_rect.height as usize;
+            let scroll = app.render.rows.len() - app.content_rect.height as usize;
             assert!(scroll > 0, "exercise a viewport clipped inside the body");
             let buffer = terminal.backend().buffer();
             let mut empty_body_rows = 0;
             for (offset, row) in app.render.rows.iter().skip(scroll).enumerate() {
                 let y = app.content_rect.y + offset as u16;
                 let spacer = row.layout.is_spacer();
-                let expected = if spacer { p.base } else { p.content.code_bg };
+                let expected = if spacer { THEME.base } else { THEME.code_bg };
                 empty_body_rows += usize::from(!spacer && row.text().is_empty());
                 for x in row.x..row.x + row.width {
                     assert_eq!(
@@ -831,7 +773,7 @@ mod tests {
         )
         .await;
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
-        let accent = ContentTheme::new().accent;
+        let accent = THEME.accent;
         // A cold frame, an explicit reset at unchanged dimensions, then resizes
         // with warm highlights at different widths.
         for (width, reset, completion) in [
@@ -887,7 +829,7 @@ mod tests {
             push_record(&mut app, SessionEvent::MessageCommitted { message }).await;
         }
         app.refresh();
-        let accent = ContentTheme::new().accent;
+        let accent = THEME.accent;
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         for (scroll, source) in [(None, "let last = 42;"), (Some(0), "let first = 42;")] {
             app.view().scroll = scroll;

@@ -1,18 +1,28 @@
 //! Entry-local rows addressed through cumulative entry heights. Updates cost
 //! the number of later entries; streaming and resets only touch the tail.
+use super::super::tool_view::Document;
 use super::Row;
 use std::{
     collections::{HashMap, HashSet},
     ops::Index,
 };
 
+/// One entry's rows and the highlight sources they show.
+#[derive(Default)]
+struct Block {
+    rows: Vec<Row>,
+    sources: Vec<u64>,
+    /// Fenced code found while laying out Markdown, for highlight scheduling.
+    fences: Document,
+}
+
 #[derive(Default)]
 pub struct RowBlocks {
-    blocks: Vec<Vec<Row>>,
+    blocks: Vec<Block>,
     /// Rows through the end of each entry.
     ends: Vec<usize>,
+    /// Entries showing each highlight source.
     sources: HashMap<u64, HashSet<usize>>,
-    entry_sources: HashMap<usize, Vec<u64>>,
 }
 impl RowBlocks {
     pub fn entry_start(&self, entry: usize) -> Option<usize> {
@@ -31,75 +41,83 @@ impl RowBlocks {
     }
     pub fn get(&self, row: usize) -> Option<&Row> {
         let (entry, offset) = self.locate(row)?;
-        self.blocks[entry].get(offset)
+        self.blocks[entry].rows.get(offset)
     }
     #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = &Row> {
-        self.blocks.iter().flatten()
+        self.blocks.iter().flat_map(|block| &block.rows)
     }
     /// Rows from `row` onward, without visiting earlier entries.
     pub fn iter_from(&self, row: usize) -> impl Iterator<Item = &Row> {
         let (entry, offset) = self.locate(row).unwrap_or((self.blocks.len(), 0));
         let (first, rest) = self.blocks[entry..]
             .split_first()
-            .map_or((&[][..], &[][..]), |(first, rest)| (&first[offset..], rest));
-        first.iter().chain(rest.iter().flatten())
+            .map_or((&[][..], &[][..]), |(first, rest)| {
+                (&first.rows[offset..], rest)
+            });
+        first
+            .iter()
+            .chain(rest.iter().flat_map(|block| &block.rows))
+    }
+    pub(super) fn fences(&self, entry: usize) -> Option<&Document> {
+        self.blocks.get(entry).map(|block| &block.fences)
     }
     pub fn clear(&mut self) {
         self.blocks.clear();
         self.sources.clear();
-        self.entry_sources.clear();
         self.ends.clear();
     }
     pub(super) fn truncate_entries(&mut self, len: usize) {
         while self.blocks.len() > len {
             let index = self.blocks.len() - 1;
-            self.blocks[index].clear();
+            self.blocks[index].rows.clear();
             self.sync_entry(index, Vec::new());
             self.ends.pop();
             self.blocks.pop();
         }
     }
-    /// Update rows and their admitted highlight-source memberships as one unit.
+    /// Lay out an entry again. `update` returns the fences it found; their
+    /// sources join `sources` as the entry's highlight memberships.
     pub(super) fn update_entry(
         &mut self,
         index: usize,
         mut sources: Vec<u64>,
-        update: impl FnOnce(&mut Vec<Row>),
+        update: impl FnOnce(&mut Vec<Row>) -> Document,
     ) {
+        self.ensure_entry(index);
+        let block = &mut self.blocks[index];
+        block.fences = update(&mut block.rows);
+        sources.extend(block.fences.highlight_sources());
         sources.sort_unstable();
         sources.dedup();
-        self.ensure_entry(index);
-        update(&mut self.blocks[index]);
         self.sync_entry(index, sources);
     }
     // Fixture convenience; production mutations use update_entry as well,
     // retaining the existing row-vector allocation.
     #[cfg(test)]
     pub(super) fn replace_entry(&mut self, index: usize, rows: Vec<Row>, sources: Vec<u64>) {
-        self.update_entry(index, sources, |block| *block = rows);
+        self.update_entry(index, sources, |block| {
+            *block = rows;
+            Document::default()
+        });
     }
     fn sync_entry(&mut self, index: usize, sources: Vec<u64>) {
         let start = self.entry_start(index).expect("synced entry exists");
-        let (old, new) = (self.ends[index] - start, self.blocks[index].len());
+        let block = &mut self.blocks[index];
+        let (old, new) = (self.ends[index] - start, block.rows.len());
         for end in &mut self.ends[index..] {
             *end = *end - old + new;
         }
-        if let Some(old) = self.entry_sources.remove(&index) {
-            for source in old {
-                if let Some(entries) = self.sources.get_mut(&source) {
-                    entries.remove(&index);
-                    if entries.is_empty() {
-                        self.sources.remove(&source);
-                    }
+        for source in std::mem::replace(&mut block.sources, sources) {
+            if let Some(entries) = self.sources.get_mut(&source) {
+                entries.remove(&index);
+                if entries.is_empty() {
+                    self.sources.remove(&source);
                 }
             }
         }
-        for &source in &sources {
+        for &source in &block.sources {
             self.sources.entry(source).or_default().insert(index);
-        }
-        if !sources.is_empty() {
-            self.entry_sources.insert(index, sources);
         }
     }
     pub(super) fn highlight_entries(&self, sources: &[u64], dirty: &mut Vec<usize>) {
@@ -112,7 +130,7 @@ impl RowBlocks {
     fn ensure_entry(&mut self, index: usize) {
         while self.blocks.len() <= index {
             self.ends.push(self.len());
-            self.blocks.push(Vec::new());
+            self.blocks.push(Block::default());
         }
     }
 }
@@ -212,6 +230,7 @@ mod tests {
                 } else {
                     rows.truncate(step % 4);
                 }
+                Document::default()
             });
             if step % 2 == 0 {
                 naive.blocks[index].push(row(index, step));
