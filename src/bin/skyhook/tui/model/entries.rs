@@ -10,13 +10,13 @@ use super::live::{
     block_key, live_tail_responses, reasoning_entry, response_entries, working_entry,
 };
 use super::notifications::job_event_entries;
+use super::projection::JobInfo;
 use super::requests::request_entry;
 use super::{
     Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Title, number, pretty,
 };
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
-use skyhook::job::JobRole;
 use skyhook::provider::protocol::{AssistantItem, BlockRef, ToolResult};
 use skyhook::session::{
     EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestPhase, RequestSeq, SessionEvent,
@@ -28,7 +28,8 @@ use std::ops::Range;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ToolGroup {
     Response(MessageSeq),
-    Script(JobId),
+    /// A job no response called, with its children.
+    Job(JobId),
     Notification(RecordSeq, usize),
 }
 
@@ -49,11 +50,36 @@ enum Source {
     Job(JobId),
 }
 
-#[derive(Clone, Copy)]
+/// Where a source's segment sorts: its parent job's place, then its own source, so
+/// a script's children sit directly under it even while scripts run in parallel.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct Place(Vec<Source>);
+impl Place {
+    fn under(parent: Option<&Self>, source: Source) -> Self {
+        let mut path = parent.map_or_else(Vec::new, |parent| parent.0.clone());
+        path.push(source);
+        Self(path)
+    }
+
+    fn source(&self) -> Source {
+        *self.0.last().expect("a place ends with its own source")
+    }
+
+    fn depth(&self) -> usize {
+        self.0.len() - 1
+    }
+}
+
 struct Segment {
-    source: Source,
+    place: Place,
     start: usize,
     len: usize,
+}
+
+/// A job card's place and tool group, kept so its children can inherit them.
+struct Placed {
+    place: Place,
+    group: ToolGroup,
 }
 
 /// One source's entries, their tool groups, and what they were built from.
@@ -176,6 +202,8 @@ pub struct History {
     deps: HashMap<Dep, Vec<Source>>,
     /// Each entry's tool group, for the spacing between siblings.
     groups: Vec<Option<ToolGroup>>,
+    /// Each job card's place and group.
+    jobs: HashMap<JobId, Placed>,
 }
 
 impl History {
@@ -190,9 +218,9 @@ impl History {
         let candidates = inputs.projection.jobs.keys().copied().collect();
         // Every record is folded before any segment is built: a call's segment
         // shows the result that arrives after it.
-        let sources = history.fold(inputs, candidates, &mut HashSet::new());
-        for source in sources {
-            history.insert(source, inputs, &mut entries, &mut Changed::default());
+        let places = history.fold(inputs, candidates, &mut HashSet::new());
+        for place in places {
+            history.insert(place, inputs, &mut entries, &mut Changed::default());
         }
         (history, entries)
     }
@@ -212,7 +240,7 @@ impl History {
                 _ => None,
             })
             .collect();
-        let sources = self.fold(inputs, candidates, &mut changed);
+        let places = self.fold(inputs, candidates, &mut changed);
         let mut result = Changed::default();
         let mut positions: Vec<_> = changed
             .iter()
@@ -225,26 +253,26 @@ impl History {
         for position in positions {
             self.rebuild(position, inputs, entries, &mut result);
         }
-        for source in sources {
-            self.insert(source, inputs, entries, &mut result);
+        for place in places {
+            self.insert(place, inputs, entries, &mut result);
         }
         result
     }
 
     /// The entries of a source, if it has any.
     pub fn record_entries(&self, record: RecordSeq) -> Option<Range<usize>> {
-        let segment = self.segments[*self.index.get(&Source::Record(record))?];
+        let segment = &self.segments[*self.index.get(&Source::Record(record))?];
         Some(segment.start..segment.start + segment.len)
     }
 
-    /// New sources in order: the agent's unfolded records, or its jobs among
-    /// `candidates` on the Jobs tab.
+    /// Places of new sources in order: the agent's unfolded records, or its jobs
+    /// among `candidates` on the Jobs tab.
     fn fold(
         &mut self,
         inputs: Inputs<'_>,
         candidates: Vec<JobId>,
         changed: &mut HashSet<Dep>,
-    ) -> Vec<Source> {
+    ) -> Vec<Place> {
         let Inputs {
             snapshot,
             projection,
@@ -255,27 +283,27 @@ impl History {
         if presentation.tab == Tab::Jobs {
             let mut jobs: Vec<_> = candidates
                 .into_iter()
-                .filter(|job| {
-                    !self.index.contains_key(&Source::Job(*job))
-                        && projection
-                            .jobs
-                            .get(job)
-                            .is_some_and(|job| &job.agent == agent)
-                })
-                .map(Source::Job)
+                .filter(|job| !self.index.contains_key(&Source::Job(*job)))
+                .filter_map(|job| projection.jobs.get(&job))
+                .filter(|job| &job.agent == agent)
                 .collect();
-            jobs.sort_unstable();
-            return jobs;
+            // IDs follow creation, so a script is placed before its children.
+            jobs.sort_unstable_by_key(|job| job.id);
+            return jobs
+                .into_iter()
+                .map(|job| self.place_job(Source::Job(job.id), job, None))
+                .collect();
         }
         let records = projection.records_by_agent.get(agent);
         let records = records.map_or(&[][..], Vec::as_slice);
         let new = &records[self.folded.min(records.len())..];
         self.folded = records.len();
-        let mut sources = Vec::new();
+        let mut places = Vec::new();
         for record in new
             .iter()
             .filter_map(|sequence| snapshot.records.get(sequence))
         {
+            let source = Source::Record(record.sequence);
             match presentation.tab {
                 Tab::Conversation => self.pairing.observe(record, changed),
                 Tab::Requests if !matches!(record.event, SessionEvent::ModelRequested { .. }) => {
@@ -283,22 +311,55 @@ impl History {
                 }
                 _ => {}
             }
-            sources.push(Source::Record(record.sequence));
+            let job = match &record.event {
+                SessionEvent::JobCreated { job, origin, .. }
+                    if presentation.tab == Tab::Conversation =>
+                {
+                    projection.jobs.get(job).map(|job| (job, origin))
+                }
+                _ => None,
+            };
+            places.push(match job {
+                Some((job, origin)) => {
+                    let origin = origin.as_ref().map(|origin| origin.message);
+                    self.place_job(source, job, origin)
+                }
+                None => Place::under(None, source),
+            });
         }
-        sources
+        places
     }
 
-    /// Place a new source's segment in source order.
+    /// A child job follows its parent and shares its tool group, so children sit
+    /// tight under their script and the script's block against its siblings.
+    /// Other jobs group with the response that called them, if any.
+    fn place_job(&mut self, source: Source, job: &JobInfo, origin: Option<MessageSeq>) -> Place {
+        let parent = job.parent.and_then(|parent| self.jobs.get(&parent));
+        let group = parent.map_or_else(
+            || origin.map_or(ToolGroup::Job(job.id), ToolGroup::Response),
+            |parent| parent.group,
+        );
+        let place = Place::under(parent.map(|parent| &parent.place), source);
+        let placed = Placed {
+            place: place.clone(),
+            group,
+        };
+        self.jobs.insert(job.id, placed);
+        place
+    }
+
+    /// Place a new source's segment in place order.
     fn insert(
         &mut self,
-        source: Source,
+        place: Place,
         inputs: Inputs<'_>,
         entries: &mut Vec<Entry>,
         result: &mut Changed,
     ) {
+        let source = place.source();
         let position = self
             .segments
-            .partition_point(|segment| segment.source < source);
+            .partition_point(|segment| segment.place < place);
         let start = self
             .segments
             .get(position)
@@ -309,12 +370,12 @@ impl History {
         entries.splice(start..start, built.entries);
         self.groups.splice(start..start, built.groups);
         self.segments
-            .insert(position, Segment { source, start, len });
+            .insert(position, Segment { place, start, len });
         for later in &mut self.segments[position + 1..] {
             later.start += len;
         }
         for (offset, segment) in self.segments[position..].iter().enumerate() {
-            self.index.insert(segment.source, position + offset);
+            self.index.insert(segment.place.source(), position + offset);
         }
         if position + 1 < self.segments.len() && len > 0 {
             result.shift(start);
@@ -334,7 +395,8 @@ impl History {
         entries: &mut Vec<Entry>,
         result: &mut Changed,
     ) {
-        let Segment { source, start, len } = self.segments[position];
+        let segment = &self.segments[position];
+        let (source, start, len) = (segment.place.source(), segment.start, segment.len);
         let built = self.build_source(source, inputs);
         self.register(source, &built.deps);
         let new_len = built.entries.len();
@@ -370,9 +432,9 @@ impl History {
         }
     }
 
-    /// An entry sits tight against the next when both share a tool group, or the
-    /// next is a child of its script. It is stored on the entry so equality-based
-    /// invalidation also relays out a neighbour when a sibling arrives or leaves.
+    /// An entry sits tight against the next when both share a tool group. It is
+    /// stored on the entry so equality-based invalidation also relays out a
+    /// neighbour when a sibling arrives or leaves.
     fn compact(
         &self,
         inputs: Inputs<'_>,
@@ -385,11 +447,7 @@ impl History {
         }
         for index in range.start..range.end.min(entries.len()) {
             let next = self.groups.get(index + 1).copied().flatten();
-            let script_child = entries[index]
-                .job_id()
-                .is_some_and(|job| next == Some(ToolGroup::Script(job)));
-            let compact =
-                script_child || self.groups[index].is_some_and(|group| next == Some(group));
+            let compact = self.groups[index].is_some_and(|group| next == Some(group));
             if entries[index].compact_after != compact {
                 entries[index].compact_after = compact;
                 result.dirty.push(index);
@@ -397,20 +455,35 @@ impl History {
         }
     }
 
+    /// A job's card, indented under its parents, and its tool group.
+    fn job_card(
+        &self,
+        job: JobId,
+        inputs: Inputs<'_>,
+        built: &mut Built,
+    ) -> Option<(Entry, ToolGroup)> {
+        built.deps.push(Dep::Job(job));
+        let info = inputs.projection.jobs.get(&job)?;
+        let placed = self.jobs.get(&job)?;
+        let EntryView {
+            view, all_details, ..
+        } = inputs.presentation;
+        let mut entry = job_entry(info, inputs.projection, view, inputs.outputs, all_details);
+        entry.indent = (placed.place.depth().min(8) * 2) as u16;
+        Some((entry, placed.group))
+    }
+
     fn build_source(&self, source: Source, inputs: Inputs<'_>) -> Built {
         let Inputs {
             snapshot,
             projection,
             presentation,
-            outputs,
+            ..
         } = inputs;
         let mut built = Built::default();
         match source {
             Source::Job(job) => {
-                built.deps.push(Dep::Job(job));
-                if let Some(job) = projection.jobs.get(&job) {
-                    let (view, all) = (presentation.view, presentation.all_details);
-                    let mut entry = job_entry(job, projection, view, outputs, all);
+                if let Some((mut entry, _)) = self.job_card(job, inputs, &mut built) {
                     // The Jobs tab is a dense list; conversation grouping owns its
                     // spacing separately, and expanded documents stay unchanged.
                     entry.compact_after = true;
@@ -439,7 +512,7 @@ impl History {
             snapshot,
             projection,
             presentation,
-            outputs,
+            ..
         } = inputs;
         let EntryView {
             agent,
@@ -544,23 +617,9 @@ impl History {
                     }
                 }
             },
-            SessionEvent::JobCreated { job, origin, .. } => {
-                built.deps.push(Dep::Job(*job));
-                if let Some(job) = projection.jobs.get(job) {
-                    let entry = job_entry(job, projection, view, outputs, all_details);
-                    // Script children belong to their immediate script, not to the
-                    // model response that launched the script.
-                    let group = job
-                        .parent
-                        .and_then(|parent| projection.jobs.get(&parent))
-                        .filter(|parent| parent.role == JobRole::Script)
-                        .map(|parent| ToolGroup::Script(parent.id))
-                        .or_else(|| {
-                            origin
-                                .as_ref()
-                                .map(|origin| ToolGroup::Response(origin.message))
-                        });
-                    built.push(entry, group);
+            SessionEvent::JobCreated { job, .. } => {
+                if let Some((entry, group)) = self.job_card(*job, inputs, built) {
+                    built.push(entry, Some(group));
                 }
             }
             SessionEvent::Compaction { checkpoint } => {

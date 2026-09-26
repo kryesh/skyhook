@@ -646,7 +646,8 @@ mod tests {
             AssistantItem::text("text", 0, "working on it"),
             call("admitted", "exec", 1),
             call("script", "script", 2),
-            call("plain", "exec", 3),
+            call("parallel", "script", 3),
+            call("plain", "exec", 4),
         ]);
         let message = journal.record(&agent, committed(reply)).await.message();
         step(&journal, "calls committed", &[]);
@@ -676,10 +677,14 @@ mod tests {
                 location: skyhook::execution::ExecutionLocation::root("/workspace".into()),
             }
         };
+        // Parallel scripts' children interleave in the journal.
         let created = [
             job(1, "exec", JobRole::Tool, None, Some("admitted")),
             job(2, "script", JobRole::Script, None, Some("script")),
+            job(4, "script", JobRole::Script, None, Some("parallel")),
             job(3, "exec", JobRole::Tool, Some(2), None),
+            job(5, "exec", JobRole::Tool, Some(4), None),
+            job(6, "exec", JobRole::Tool, Some(2), None),
         ];
         for (index, created) in created.into_iter().enumerate() {
             journal.record(&agent, created).await;
@@ -691,7 +696,7 @@ mod tests {
         };
         journal.record(&agent, running).await;
         step(&journal, "job running", &[]);
-        for id in [3, 1, 2] {
+        for id in [3, 5, 6, 1, 2, 4] {
             let finished = SessionEvent::JobFinished {
                 job: JobId::new(id).unwrap(),
                 state: JobEnd::Completed,
@@ -712,6 +717,7 @@ mod tests {
         for (id, name) in [
             ("admitted", "exec"),
             ("script", "script"),
+            ("parallel", "script"),
             ("plain", "exec"),
         ] {
             let results = Message::Tool(vec![result(id, name)]);
@@ -750,6 +756,21 @@ mod tests {
         };
         journal.record(&agent, status).await;
         step(&journal, "status", &[]);
+
+        // Each script's children sit directly under it, indented, on both tabs,
+        // and the response's tool cards stay one tight block.
+        let tree = [(1, 0), (2, 0), (3, 2), (6, 2), (4, 0), (5, 2)]
+            .map(|(id, indent)| (JobId::new(id).unwrap(), indent));
+        let cards = |entries: &[Entry]| -> Vec<_> {
+            let cards = entries.iter().filter_map(|e| Some((e.job_id()?, e.indent)));
+            cards.collect()
+        };
+        let entries = tabs[0].2.entries();
+        let first = entries.iter().position(|entry| entry.job_id().is_some());
+        let block = &entries[first.unwrap()..][..6];
+        assert_eq!(cards(block), tree);
+        assert!(block[..5].iter().all(|entry| entry.compact_after));
+        assert_eq!(cards(tabs[2].2.entries()), tree);
     }
 
     #[tokio::test]

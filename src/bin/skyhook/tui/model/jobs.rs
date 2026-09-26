@@ -188,13 +188,7 @@ pub(super) fn job_entry(
         );
         document = Some(body);
     }
-    let mut entry = Entry::card(key, header, document);
-    let mut parent = job.parent;
-    while let Some(p) = parent.and_then(|id| projection.jobs.get(&id)) {
-        entry.indent = entry.indent.saturating_add(2).min(16);
-        parent = p.parent;
-    }
-    entry
+    Entry::card(key, header, document)
 }
 
 #[cfg(test)]
