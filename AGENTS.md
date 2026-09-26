@@ -17,6 +17,12 @@ Architecture: `docs/src/development/architecture.md`.
   broadening scope to replace one.
 - Document behavior, usage, and non-obvious rationale. Keep implementation details
   out of user docs; keep architecture docs accurate.
+- Use the type system to enforce invariants, the best logic is enforced by the compiler
+  and doesn't need tests that validate magic numbers or stringly-typed variants.
+- Avoid redundant/self explanatory comments in code, comments should important nuance
+  in an algorithm or logic.
+- Avoid adding special cases, if there is a better structural solution prefer to use that instead.
+- Avoid single huge files, if a file is getting big consider if it should be split up into multiple modules.
 
 ## Types
 
