@@ -45,6 +45,7 @@ pub fn register(
             .preserve_schema_dialect()
             .background()
             .placement(ToolPlacement::Host)
+            .internal_result(result::schema())
             .permission_resource(ResourceId::mcp(server, tool.name.as_ref()));
         let manager = manager.clone();
         let store = store.clone();
@@ -113,7 +114,8 @@ for line in sys.stdin:
           {'name':'open','inputSchema':{'type':'object'}},
           {'name':'invalid','inputSchema':{'type':'array'}}]}
     elif method == 'tools/call':
-        result = {'content':[], 'structuredContent':{'tool':req['params']['name'],'arguments':req['params']['arguments']},'isError':False}
+        arguments = req['params']['arguments']
+        result = {'content':[{'type':'text','text':json.dumps(arguments)},{'type':'text','text':'plain'}], 'structuredContent':{'tool':req['params']['name'],'arguments':arguments},'isError':False}
     else: result = {}
     print(json.dumps({'jsonrpc':'2.0','id':req['id'],'result':result}), flush=True)
 "#;
@@ -196,7 +198,16 @@ for line in sys.stdin:
         let output = executor
             .execute(agent(), native, native_input.clone(), None)
             .await;
-        assert_eq!(arguments(&output.unwrap().output.value), native_input);
+        let output = output.unwrap().output.value;
+        assert_eq!(arguments(&output), native_input);
+        // Text blocks holding JSON read as it, under a result schema the
+        // protocol fixes and tool descriptions leave out.
+        assert_eq!(
+            output["content"],
+            json!([{"type":"text","text":native_input},{"type":"text","text":"plain"}])
+        );
+        let surface = executor.surface_for_agent(&runtime.agent);
+        assert!(surface.get(native).unwrap().result_schema.is_none());
         let wrapped = json!({"bg":"upstream","target":"upstream"});
         let input = json!({ "arguments": wrapped });
         let output = executor.execute(agent(), open, input, None).await;

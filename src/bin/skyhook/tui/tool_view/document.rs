@@ -6,7 +6,8 @@ use serde::Deserialize;
 use serde_json::Value;
 use skyhook::agent::Question;
 use skyhook::job::{
-    FieldPointer, JobView, OutputPreview, Presentation, diagnostic_slot, omit_null_fields,
+    FieldPointer, JobView, OutputPreview, OutputTruncation, Presentation, diagnostic_slot,
+    omit_null_fields,
 };
 use unicode_width::UnicodeWidthStr;
 
@@ -185,17 +186,20 @@ impl Document {
         match presentation.and_then(Presentation::preview) {
             // Live output may have no saved whole document yet. The capture
             // pages are more useful than an empty complete result pane.
-            Some(preview)
+            Some(preview @ OutputPreview::Lines(page))
                 if preview.field().is_some_and(FieldPointer::is_root)
-                    && preview.lines().is_empty()
+                    && page.lines().is_empty()
                     && pages.clone().any(|(.., page)| page.is_some()) => {}
             Some(preview) => self.preview(hints, preview),
             None => {
                 if let Some(result) = view.result() {
                     self.result(hints, result);
                 }
-                if presentation.is_some_and(|presentation| !presentation.truncated().is_empty()) {
-                    self.line("More saved output available", Role::Muted);
+                if let Some(presentation) = presentation {
+                    self.cuts(presentation.truncated(), presentation.shape());
+                    if !presentation.truncated().is_empty() {
+                        self.line("More saved output available", Role::Muted);
+                    }
                 }
             }
         }
@@ -260,24 +264,62 @@ impl Document {
             None => "Requested field",
         };
         self.line(heading, Role::Muted);
-        let source = preview.lines().join("\n");
         let more = preview.continuation().is_some();
-        let syntax = field.map_or(Syntax::Detect, |field| hints.field_syntax(field));
-        let formatted = syntax
-            .detects_json()
-            .then(|| pretty_json_preview(&source, more, root));
-        match formatted.flatten() {
-            Some(formatted) => self.code(&formatted, "json", 2, None, Role::Plain),
-            None => self.code(&source, &hints.language(syntax), 2, None, Role::Plain),
+        match preview {
+            OutputPreview::Lines(page) => {
+                let source = page.lines().join("\n");
+                let syntax = field.map_or(Syntax::Detect, |field| hints.field_syntax(field));
+                let formatted = syntax
+                    .detects_json()
+                    .then(|| pretty_json_preview(&source, more, root));
+                match formatted.flatten() {
+                    Some(formatted) => self.code(&formatted, "json", 2, None, Role::Plain),
+                    None => self.code(&source, &hints.language(syntax), 2, None, Role::Plain),
+                }
+            }
+            OutputPreview::Elements(page) => {
+                let elements = Value::Array(page.elements().to_vec());
+                self.code(&pretty(&elements), "json", 2, None, Role::Plain);
+            }
+            OutputPreview::Members(page) => {
+                let mut members = Value::Object(page.members().clone());
+                if root {
+                    omit_null_fields(&mut members);
+                }
+                self.code(&pretty(&members), "json", 2, None, Role::Plain);
+            }
+            OutputPreview::Matches(page) => {
+                if page.matches().is_empty() {
+                    self.line("No matches", Role::Muted);
+                }
+                for found in page.matches() {
+                    self.line(found.at().as_str(), Role::Label);
+                    self.code(&pretty(found.value()), "json", 2, None, Role::Plain);
+                }
+            }
         }
+        let sampled = !preview.truncated().is_empty();
+        self.cuts(preview.truncated(), preview.shape());
         self.line(
-            if more {
-                "More saved output available"
-            } else {
-                "End of available output"
+            match (more, sampled) {
+                (true, _) => "More saved output available",
+                (false, true) => "End of this field; follow the cuts above for the rest",
+                (false, false) => "End of available output",
             },
             Role::Muted,
         );
+    }
+    /// What a presentation left out, and the shape of the whole value.
+    fn cuts(&mut self, truncated: &[OutputTruncation], shape: Option<&Value>) {
+        if !truncated.is_empty() {
+            self.line("Left out", Role::Muted);
+            let cuts = serde_json::to_value(truncated).unwrap_or_default();
+            self.code(&pretty(&cuts), "json", 2, None, Role::Muted);
+        }
+        if let Some(shape) = shape {
+            self.line("Shape", Role::Muted);
+            self.code(&pretty(shape), "json", 2, None, Role::Muted);
+        }
     }
     fn text(&mut self, text: &str, hints: Hints<'_>, syntax: Syntax, role: Role) {
         if syntax.detects_json()
@@ -300,12 +342,11 @@ fn whole_diagnostic(view: &JobView) -> Option<String> {
     };
     match view.presentation().and_then(Presentation::preview) {
         None => diagnostic(view.result()?),
-        Some(preview)
+        Some(preview @ OutputPreview::Members(page))
             if preview.field().is_some_and(FieldPointer::is_root)
                 && preview.continuation().is_none() =>
         {
-            let document: Value = serde_json::from_str(&preview.lines().join("\n")).ok()?;
-            diagnostic(document.get("result")?)
+            diagnostic(page.members().get("result")?)
         }
         Some(_) => None,
     }
@@ -653,8 +694,7 @@ mod tests {
     fn a_whole_result_showing_the_error_takes_the_place_of_its_summary() {
         let error = "Permission was denied";
         let result = json!({"error": {"message": error}});
-        let saved = json!({"result": result}).to_string();
-        let page = json!({"field": "", "lines": [saved]});
+        let page = json!({"field": "", "members": {"result": result}, "total_members": 1});
         for output in [
             json!({"result": result}),
             json!({"presentation": {"preview": page}}),

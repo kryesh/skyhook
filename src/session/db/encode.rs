@@ -617,19 +617,27 @@ mod tests {
                     code: Some(crate::tool::DenialCode::PermissionDenied),
                 }),
                 presentation: Some(crate::job::Presentation {
-                    preview: Some(crate::job::output::OutputPreview {
-                        field: Some(crate::job::FieldPointer::result()),
-                        lines: crate::job::output::PageLines::Numbered(vec![
-                            crate::job::output::NumberedLine {
-                                line: 3,
-                                text: "line".into(),
-                            },
-                        ]),
-                        total_lines: Some(1),
-                        next_start: None,
-                        next_offset: None,
-                    }),
-                    truncated: None,
+                    preview: Some(crate::job::output::OutputPreview::Lines(
+                        crate::job::output::LinePage {
+                            field: Some(crate::job::FieldPointer::result()),
+                            lines: crate::job::output::PageLines::Numbered(vec![
+                                crate::job::output::NumberedLine {
+                                    line: 3,
+                                    text: "line".into(),
+                                },
+                            ]),
+                            total_lines: Some(1),
+                            next_start: None,
+                            next_offset: None,
+                        },
+                    )),
+                    shape: Some(json!({"items": [3, "integer"]})),
+                    truncated: Some(vec![crate::job::output::OutputTruncation::Elements {
+                        field: "/result/items".parse().unwrap(),
+                        shown: 1,
+                        total_elements: 3,
+                        kept: None,
+                    }]),
                     captures: Some(vec![crate::job::output::CaptureDescriptor {
                         field: "/result/stdout".parse().unwrap(),
                         complete: true,

@@ -225,6 +225,7 @@ fn register_child_agent(
         crate::tool::builtins::names::AGENT,
         "Start a child agent. Names are unique among your own installed children, including terminal children; other callers may reuse the same names. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Earlier replies arrive as events; the final reply is the job's result. Sending input to a completed child resumes its retained history under the same job ID.",
         ToolOptions::default().job_role(crate::job::JobRole::Agent)
+            .result::<crate::tool::output::Complete<String>>()
             .named()
             .requires(Capability::Agents)
             .conditional_input(TARGET, Capability::Targets, crate::target::TargetRef::schema())

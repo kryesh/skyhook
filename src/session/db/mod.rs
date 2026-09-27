@@ -27,12 +27,12 @@ mod state;
 
 pub(super) use decode::{decode_records, u64_of};
 pub(super) use encode::Encoder;
-pub(crate) use output::{CaptureExtent, CaptureRow, OutputSizes, Presentation};
+pub(crate) use output::{CaptureExtent, CaptureRow};
 pub use state::SessionSummary;
 pub(super) use state::summary;
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 15;
+pub(super) const USER_VERSION: i64 = 16;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
@@ -44,7 +44,7 @@ const MUTABLE_TABLES: [&str; 6] = [
     "job_capture",
     "job_capture_chunk",
     "job_output_field",
-    "job_presentation",
+    "job_complete_field",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -369,6 +369,7 @@ impl Dictionaries<'_> {
         self.names("cut_reason", &Truncation::ALL)?;
         self.names("job_role", &JobRole::ALL)?;
         self.names("capture_kind", &CaptureKind::ALL)?;
+        self.names("capture_detection", &crate::job::output::Detection::ALL)?;
         self.names("diagnostic_slot", &diagnostic::Slot::ALL)?;
         self.names("diagnostic_operation", &Operation::ALL)?;
         self.flagged(

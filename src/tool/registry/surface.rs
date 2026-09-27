@@ -77,12 +77,15 @@ pub(super) enum OutputSchema {
     Static(Value),
     Generated(SchemaGenerator),
     JobViews(JobViewResult),
+    /// Describes stored results for detection and presentation without being
+    /// documented to models, for results whose shape a protocol already fixes.
+    Internal(Value),
 }
 
 impl OutputSchema {
     pub(super) fn generate(&self, capabilities: &CapabilitySet) -> Value {
         match self {
-            Self::Static(schema) => schema.clone(),
+            Self::Static(schema) | Self::Internal(schema) => schema.clone(),
             Self::Generated(generate) => generate(capabilities),
             Self::JobViews(views) => ResultSchema::JobViews(*views).schema().clone(),
         }
@@ -144,17 +147,19 @@ impl<C, O: OutputValue> CatalogEntry<C, O> {
                 // Foreground/background presentation both wrap that payload in
                 // JobView elsewhere, so a background envelope alternative here
                 // would misdescribe the value persisted and later projected.
-                let result_schema = definition
-                    .output_schema
-                    .as_ref()
-                    .map(|schema| match schema {
-                        OutputSchema::JobViews(views) => ResultSchema::JobViews(*views),
-                        schema => {
-                            let mut schema = schema.generate(capabilities);
-                            sanitize_schema(&mut schema);
-                            ResultSchema::Json(schema)
-                        }
-                    });
+                let result_schema =
+                    definition
+                        .output_schema
+                        .as_ref()
+                        .and_then(|schema| match schema {
+                            OutputSchema::JobViews(views) => Some(ResultSchema::JobViews(*views)),
+                            OutputSchema::Internal(_) => None,
+                            schema => {
+                                let mut schema = schema.generate(capabilities);
+                                sanitize_schema(&mut schema);
+                                Some(ResultSchema::Json(schema))
+                            }
+                        });
                 ToolSpec {
                     supports_background: definition.supports_background,
                     job_role: self.execution.job_role,

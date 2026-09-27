@@ -35,8 +35,9 @@ use crate::{
 
 pub(crate) mod output;
 pub use output::{
-    CaptureDescriptor, CaptureKind, FieldPointer, OutputArgs as JobOutputQuery, OutputPreview,
-    OutputSelection, PresentedOutput, diagnostic_slot, omit_null_fields,
+    CaptureDescriptor, CaptureKind, Continuation, ElementPage, FieldPointer, LinePage, Match,
+    MatchPage, MemberPage, OutputArgs as JobOutputQuery, OutputFields, OutputPreview,
+    OutputSelection, OutputTruncation, PresentedOutput, diagnostic_slot, omit_null_fields,
 };
 mod cancellation;
 pub(crate) use cancellation::CANCELLATION_GRACE;

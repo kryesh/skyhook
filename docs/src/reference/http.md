@@ -67,19 +67,22 @@ Multipart form-data encoding is not supported. File bodies can set their media t
 ## Responses and extraction
 
 Responses include the status, the received byte count (`size`), the elapsed milliseconds
-(`duration`), and a tagged `body`: `text`, `base64`, `file`, or `empty`. Followed redirects add
+(`duration`), and a tagged `body`: `text`, `json`, `base64`, `file`, or `empty`. Followed redirects add
 their history (`redirects`), whose last `location` is the final URL. Response `headers` is absent
 by default; set `include_headers: true` to return a map of repeated header values.
 This option does not affect the `headers` request-header map.
-JSON responses remain decoded text; scripts can use `JSON.parse(response.body.text)`.
+A textual body that is JSON is read as that value, following the
+[JSON output](job-output.md#json-output) rules: the body is then `{kind: "json", value}`. Other
+bodies, and any body fetched with `response_format: "text"` or `text: true`, remain decoded text in
+`body.text`.
 `response_format` defaults to `auto` (text for textual content, base64 otherwise); `text` forces
 character decoding and `base64` preserves response entity bytes. HTTP decompression is automatic;
 these are not raw wire bytes. `save_to` saves the response to a file on success instead of
 embedding the payload. Errors or cancellation do not replace an existing destination.
-Automatic job presentation may shorten `body.text` and `body.data`, with continuation markers;
-retrieve the complete saved payload using `jobs({job})` fields `/result/body/text` or
-`/result/body/data`. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
-calls still receive the complete payload for processing.
+Automatic job presentation may shorten a result over its preview budget: the body, and also long
+header values and redirect lists, recording what it cut; retrieve the complete saved payload
+using `jobs({job})` fields such as `/result/body/text`, `/result/body/value`, `/result/body/data`
+or `/result/headers`. JavaScript calls still receive the complete payload for processing.
 
 `text:true` is separate from `response_format:"text"`: it extracts readable article content from
 HTML, returning plain text and metadata with the title, plus byline, site name, and language when

@@ -257,11 +257,9 @@ enum ReadOutput {
         error: ReadError,
     },
     File {
-        #[schemars(extend("x-skyhook-truncatable" = true))]
         content: String,
     },
     Directory {
-        #[schemars(extend("x-skyhook-truncatable" = true))]
         entries: DirectoryEntries,
     },
     Image {

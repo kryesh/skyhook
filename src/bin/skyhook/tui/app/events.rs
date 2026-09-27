@@ -458,6 +458,7 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
+    use skyhook::job::{Continuation, OutputPreview};
     use skyhook::session::Message;
 
     fn capture_text(output: &skyhook::job::JobView, field: &str) -> String {
@@ -466,7 +467,10 @@ mod tests {
             .iter()
             .find(|capture| capture.field().as_str() == field);
         let page = capture.and_then(|capture| capture.output()?.presentation()?.preview());
-        page.map_or_else(String::new, |page| page.lines().join("\n"))
+        page.map_or_else(String::new, |page| match page {
+            OutputPreview::Lines(page) => page.lines().join("\n"),
+            page => panic!("capture pages are text: {page:?}"),
+        })
     }
 
     fn job_text(app: &App, job: JobId) -> String {
@@ -751,7 +755,14 @@ mod tests {
         let job = job_named(&app, "read");
         let output = fetch_output(&mut app, job).await;
         assert!(source.starts_with(output.result().unwrap()["content"].as_str().unwrap()));
-        let (field, start, offset) = output.continuation().unwrap();
+        let Some(Continuation::Lines {
+            field,
+            start,
+            offset,
+        }) = output.continuation()
+        else {
+            panic!("a text continuation")
+        };
         app.command(Command::Details);
         draw(&mut app);
         select_job(&mut app, job);

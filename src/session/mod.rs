@@ -25,7 +25,7 @@ mod template;
 pub(crate) use template::ModelRequestTemplate;
 
 pub use content::{JobEvent, Message, RuntimeState, StateJob, StateJobKind, UserPart};
-pub(crate) use db::{CaptureExtent, CaptureRow, OutputSizes, Presentation, SharedDb};
+pub(crate) use db::{CaptureExtent, CaptureRow, SharedDb};
 pub use db::{DbError, SessionSummary};
 pub(crate) use event::EntryKind;
 pub use event::{

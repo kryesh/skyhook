@@ -87,6 +87,20 @@ impl McpImage {
     }
 }
 
+/// The stored result's shape, as far as presentation needs it: text blocks may
+/// hold the JSON they are read as.
+pub(super) fn schema() -> Value {
+    let text = serde_json::json!({
+        "type": "object",
+        "properties": {"type": {"const": "text"}, "text": crate::tool::output::JsonText::schema()},
+        "required": ["type", "text"]
+    });
+    serde_json::json!({
+        "type": "object",
+        "properties": {"content": {"type": "array", "items": {"anyOf": [text, {}]}}}
+    })
+}
+
 fn output(sanitized: &SanitizedResult, images: Vec<ImageRef>) -> Result<ToolOutput, ToolError> {
     Ok(ToolOutput::new(serde_json::to_value(sanitized)?).with_images(images))
 }

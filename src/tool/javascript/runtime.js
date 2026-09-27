@@ -3,19 +3,19 @@ const __executions = new WeakMap();
 const __callData = new WeakMap();
 const __parse = JSON.parse;
 const __stringify = JSON.stringify;
-const __annotatedArrays = new WeakSet();
-const __annotatedProperties = new WeakMap();
+const __completeValues = new WeakSet();
+const __completeProperties = new WeakMap();
 
-function __rememberAnnotations(value, annotations) {
+function __rememberComplete(value, complete) {
   if (value === null || typeof value !== "object") return;
-  for (const pointer of annotations) {
+  for (const pointer of complete) {
     const keys = pointer === "" ? [] : pointer.slice(1).split("/").map(key => key.replace(/~1/g, "/").replace(/~0/g, "~"));
     let child = value, parent, key;
     for (key of keys) { parent = child; child = child[key]; }
-    if (child !== null && typeof child === "object") __annotatedArrays.add(child);
+    if (child !== null && typeof child === "object") __completeValues.add(child);
     if (parent) {
-      let properties = __annotatedProperties.get(parent);
-      if (!properties) __annotatedProperties.set(parent, properties = new Set());
+      let properties = __completeProperties.get(parent);
+      if (!properties) __completeProperties.set(parent, properties = new Set());
       properties.add(key);
     }
   }
@@ -158,7 +158,7 @@ async function __request(request) {
   if (!response.ok) {
     throw new Error(response.error);
   }
-  if (response.annotations) __rememberAnnotations(response.value, response.annotations);
+  if (response.complete) __rememberComplete(response.value, response.complete);
   // Only tool calls produce JobViews. A received message or a nested payload
   // may look like one, but remains arbitrary user JSON without runtime methods.
   if (request.type === "call") {
@@ -250,7 +250,7 @@ class WorkPool {
 
 const receive = async () => __request({type:"receive"});
 
-async function __resolve(value, path, ancestors, pointer, presentation) {
+async function __resolve(value, path, ancestors, pointer, complete) {
   if (value && value[__callKind] === true) {
     value = await __execute(value).catch(error => {
       throw __toolError(`deferred tool call at ${path} failed: ${error?.message ?? error}`, error);
@@ -268,14 +268,14 @@ async function __resolve(value, path, ancestors, pointer, presentation) {
   if (typeof value !== "object") throw new TypeError(`${typeof value} at ${path} is not JSON-compatible`);
   if (ancestors.has(value)) throw new TypeError(`circular value at ${path}`);
   const nested = new Set(ancestors); nested.add(value);
-  if (__annotatedArrays.has(value)) presentation.fields.push(pointer);
-  const properties = __annotatedProperties.get(value);
+  if (__completeValues.has(value)) complete.push(pointer);
+  const properties = __completeProperties.get(value);
   const output = Array.isArray(value) ? new Array(value.length) : Object.create(null);
   const keys = Array.isArray(value) ? value.map((_, index) => String(index)) : Object.keys(value);
   await Promise.all(keys.map(async key => {
     const childPointer = `${pointer}/${key.replace(/~/g, "~0").replace(/\//g, "~1")}`;
-    if (properties?.has(key)) presentation.fields.push(childPointer);
-    output[key] = await __resolve(value[key], Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`, nested, childPointer, presentation);
+    if (properties?.has(key)) complete.push(childPointer);
+    output[key] = await __resolve(value[key], Array.isArray(value) ? `${path}[${key}]` : `${path}.${key}`, nested, childPointer, complete);
   }));
   return output;
 }

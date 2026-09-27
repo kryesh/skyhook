@@ -280,7 +280,20 @@ impl ToolExecutor {
             .await
     }
 
-    async fn create(
+    /// Boxed, so agent loops prove the creation future `Send` at this boundary
+    /// rather than through every type planning and publishing hold.
+    fn create<'a>(
+        &'a self,
+        kind: InvocationKind,
+        agent: AgentId,
+        name: &'a str,
+        arguments: Value,
+        parent: Option<JobId>,
+    ) -> futures_util::future::BoxFuture<'a, Result<CreatedInvocation, ToolError>> {
+        Box::pin(self.plan_and_publish(kind, agent, name, arguments, parent))
+    }
+
+    async fn plan_and_publish(
         &self,
         kind: InvocationKind,
         agent: AgentId,

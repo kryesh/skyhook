@@ -2,9 +2,13 @@
 //! so line seeks are indexed lookups.
 
 use super::{
-    Db, DbError, DbResult, SharedDb, corrupt, enum_column, params, rejected, u64_of as integer,
+    Db, DbError, DbResult, SharedDb, corrupt, enum_column, optional_enum_column, params, rejected,
+    u64_of as integer,
 };
-use crate::{job::CaptureKind, tool::output::FieldPointer};
+use crate::{
+    job::{CaptureKind, output::Detection},
+    tool::output::FieldPointer,
+};
 
 /// Largest chunk row written; readers accept any length the schema allows.
 const CHUNK_BYTES: usize = 256 * 1024;
@@ -17,6 +21,8 @@ pub(crate) struct CaptureRow {
     pub kind: CaptureKind,
     /// The saved terminal document references this capture as a result field.
     pub referenced: bool,
+    /// Set once a finished capture its schema declares as JSON is classified.
+    pub detection: Option<Detection>,
 }
 
 /// Committed capture length, newline count, and whether the bytes end a line.
@@ -25,16 +31,6 @@ pub(crate) struct CaptureExtent {
     pub bytes: u64,
     pub newlines: u64,
     pub ends_line: bool,
-}
-
-/// A saved result's length and the capture length of each field it references.
-pub(crate) struct OutputSizes {
-    pub result: u64,
-    pub fields: Vec<(FieldPointer, u64)>,
-}
-
-pub(crate) struct Presentation {
-    pub fields: Vec<FieldPointer>,
 }
 
 /// One run's saved product: its result JSON, if the run produced one, and the
@@ -91,7 +87,7 @@ impl SharedDb {
         let generation = generation(&db, job)?;
         db.query_row(
             "INSERT INTO job_capture (job, generation, pointer, capture_kind, rendered) \
-             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (job, generation, pointer) DO NOTHING \
+             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (job, generation, pointer, rendered) DO NOTHING \
              RETURNING id",
             params![job, generation, pointer, kind, rendered],
             |row| Ok(row.get::<i64>(0)?),
@@ -133,6 +129,15 @@ impl SharedDb {
             .map(drop)
     }
 
+    pub(crate) fn set_detection(&self, capture: i64, detection: Detection) -> Result<(), DbError> {
+        self.lock()
+            .execute(
+                "UPDATE job_capture SET detection = ?2 WHERE id = ?1",
+                params![capture, detection],
+            )
+            .map(drop)
+    }
+
     pub(crate) fn finish_capture(&self, capture: i64) -> Result<(), DbError> {
         let db = self.lock();
         let extent = extent(&db, capture)?;
@@ -148,7 +153,7 @@ impl SharedDb {
     pub(crate) fn captures(&self, job: u64) -> Result<Vec<CaptureRow>, DbError> {
         self.lock().query(
             "SELECT c.id, c.pointer, c.capture_kind, \
-               EXISTS (SELECT 1 FROM job_output_field f WHERE f.capture = c.id) \
+               EXISTS (SELECT 1 FROM job_output_field f WHERE f.capture = c.id), c.detection \
              FROM job_capture c JOIN job_generation g \
                ON g.job = c.job AND g.generation = c.generation \
              WHERE c.job = ?1 AND c.rendered = 0 ORDER BY c.pointer",
@@ -159,6 +164,7 @@ impl SharedDb {
                     pointer: pointer(row, 1)?,
                     kind: enum_column(row, 2)?,
                     referenced: row.get::<i64>(3)? != 0,
+                    detection: optional_enum_column(row, 4)?,
                 })
             },
         )
@@ -264,13 +270,16 @@ impl SharedDb {
             .collect())
     }
 
-    /// Replace the current generation's product and its referenced captures.
+    /// Save the current generation's product and its referenced captures, once per
+    /// run: the fields its schema declares complete join those a script recorded
+    /// before it finished, and its presentation is measured afresh.
     pub(crate) fn save_output(
         &self,
         job: u64,
         result: Option<&str>,
         captures_complete: bool,
         referenced: &[i64],
+        complete: &[FieldPointer],
     ) -> Result<(), DbError> {
         let db = self.lock();
         db.atomic(|| {
@@ -280,7 +289,7 @@ impl SharedDb {
                     "INSERT INTO job_output (job, generation, captures_complete, result) \
                      VALUES (?1, ?2, ?3, ?4) ON CONFLICT (job, generation) DO UPDATE \
                      SET captures_complete = excluded.captures_complete, \
-                     result = excluded.result RETURNING id",
+                     result = excluded.result, presented_bytes = NULL RETURNING id",
                     params![job, generation, captures_complete, result],
                     |row| Ok(row.get::<i64>(0)?),
                 )?
@@ -301,8 +310,41 @@ impl SharedDb {
                     params![output, *capture, job, generation],
                 )?;
             }
+            for pointer in complete {
+                db.execute(
+                    "INSERT INTO job_complete_field (job, generation, pointer) \
+                     VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
+                    params![job, generation, pointer],
+                )?;
+            }
             Ok(())
         })
+    }
+
+    pub(crate) fn set_presented_bytes(&self, job: u64, bytes: usize) -> Result<(), DbError> {
+        let db = self.lock();
+        let generation = generation(&db, job)?;
+        let bytes = i64::try_from(bytes).unwrap_or(i64::MAX);
+        db.execute(
+            "UPDATE job_output SET presented_bytes = ?3 \
+             WHERE job = ?1 AND generation = ?2 AND presented_bytes IS NULL",
+            params![job, generation, bytes],
+        )?;
+        Ok(())
+    }
+
+    /// The current run's measured presentation size, once measured.
+    pub(crate) fn presented_bytes(&self, job: u64) -> Result<Option<usize>, DbError> {
+        let db = self.lock();
+        let generation = generation(&db, job)?;
+        let bytes = db
+            .query_row(
+                "SELECT presented_bytes FROM job_output WHERE job = ?1 AND generation = ?2",
+                params![job, generation],
+                |row| Ok(row.get::<Option<i64>>(0)?),
+            )?
+            .flatten();
+        Ok(bytes.map(|bytes| usize::try_from(bytes).unwrap_or(usize::MAX)))
     }
 
     /// The current generation's product, once the run finished.
@@ -337,50 +379,21 @@ impl SharedDb {
         }))
     }
 
-    /// The current generation's stored sizes, once the run finished.
-    pub(crate) fn output_sizes(&self, job: u64) -> Result<Option<OutputSizes>, DbError> {
-        let rows = self.lock().query(
-            "SELECT length(CAST(o.result AS BLOB)), c.pointer, \
-               (SELECT sum(length(k.data)) FROM job_capture_chunk k WHERE k.capture = c.id) \
-             FROM job_output o JOIN job_generation g \
-               ON g.job = o.job AND g.generation = o.generation \
-             LEFT JOIN job_output_field f ON f.output = o.id \
-             LEFT JOIN job_capture c ON c.id = f.capture WHERE o.job = ?1",
-            params![job],
-            |row| {
-                let bytes = |index| {
-                    row.get::<Option<i64>>(index)
-                        .map(|bytes| bytes.map_or(0, integer))
-                };
-                let field = match row.get::<Option<String>>(1)? {
-                    Some(_) => Some((pointer(row, 1)?, bytes(2)?)),
-                    None => None,
-                };
-                Ok((bytes(0)?, field))
-            },
-        )?;
-        let result = rows.first().map(|(result, _)| *result);
-        Ok(result.map(|result| OutputSizes {
-            result,
-            fields: rows.into_iter().filter_map(|(_, field)| field).collect(),
-        }))
-    }
-
-    pub(crate) fn save_presentation(
+    pub(crate) fn save_complete_fields(
         &self,
         job: u64,
-        presentation: &Presentation,
+        fields: &[FieldPointer],
     ) -> Result<(), DbError> {
         let db = self.lock();
         db.atomic(|| {
             let generation = generation(&db, job)?;
             db.execute(
-                "DELETE FROM job_presentation WHERE job = ?1 AND generation = ?2",
+                "DELETE FROM job_complete_field WHERE job = ?1 AND generation = ?2",
                 params![job, generation],
             )?;
-            for pointer in &presentation.fields {
+            for pointer in fields {
                 db.execute(
-                    "INSERT INTO job_presentation (job, generation, pointer) \
+                    "INSERT INTO job_complete_field (job, generation, pointer) \
                      VALUES (?1, ?2, ?3)",
                     params![job, generation, pointer],
                 )?;
@@ -389,15 +402,14 @@ impl SharedDb {
         })
     }
 
-    pub(crate) fn presentation(&self, job: u64) -> Result<Presentation, DbError> {
-        let fields = self.lock().query(
-            "SELECT p.pointer FROM job_presentation p JOIN job_generation g \
+    pub(crate) fn complete_fields(&self, job: u64) -> Result<Vec<FieldPointer>, DbError> {
+        self.lock().query(
+            "SELECT p.pointer FROM job_complete_field p JOIN job_generation g \
                ON g.job = p.job AND g.generation = p.generation \
              WHERE p.job = ?1 ORDER BY p.id",
             params![job],
             |row| pointer(row, 0),
-        )?;
-        Ok(Presentation { fields })
+        )
     }
 
     #[cfg(test)]

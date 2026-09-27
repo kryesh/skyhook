@@ -1,7 +1,7 @@
 //! Job presentation and live metadata queries.
 use super::*;
 use crate::session::StateJob;
-use crate::tool::diagnostic::DiagnosticViewer;
+use crate::tool::{diagnostic::DiagnosticViewer, output::complete};
 
 /// An agent's live work, as an interrupt and a `wait` each need to see it.
 #[derive(Default)]
@@ -152,15 +152,16 @@ pub struct JobView {
     pub(crate) id: Option<JobId>,
     #[schemars(with = "JobState")]
     pub(crate) state: Option<JobState>,
+    /// Precedes the result, so a reader learns what was left out before reading it.
+    #[schemars(with = "Presentation")]
+    pub(crate) presentation: Option<Presentation>,
     /// A present `null` is a real result, distinct from no result.
     #[serde(default, deserialize_with = "present")]
     pub(crate) result: Option<Value>,
-    #[schemars(with = "String")]
+    #[schemars(with = "String", transform = complete)]
     pub(crate) error: Option<String>,
     #[schemars(with = "JobMetadata")]
     pub(crate) meta: Option<JobMetadata>,
-    #[schemars(with = "Presentation")]
-    pub(crate) presentation: Option<Presentation>,
 }
 
 fn present<'de, D: serde::Deserializer<'de>>(value: D) -> Result<Option<Value>, D::Error> {
@@ -192,13 +193,15 @@ pub struct JobMetadata {
 pub struct Presentation {
     #[schemars(with = "output::OutputPreview")]
     pub(crate) preview: Option<output::OutputPreview>,
+    /// The whole result's type, with counts, when samples leave parts out.
+    pub(crate) shape: Option<Value>,
     #[schemars(with = "Vec<output::OutputTruncation>")]
     pub(crate) truncated: Option<Vec<output::OutputTruncation>>,
     /// Captures a presented result does not already show in full.
     #[schemars(with = "Vec<output::CaptureDescriptor>")]
     pub(crate) captures: Option<Vec<output::CaptureDescriptor>>,
     /// A waiting child agent returns a question batch rather than a result.
-    #[schemars(with = "QuestionOutput")]
+    #[schemars(with = "QuestionOutput", transform = complete)]
     pub(crate) question: Option<QuestionOutput>,
     // The schema keeps the plain string the system prompt's JobView type shows.
     #[schemars(with = "String")]
@@ -215,6 +218,10 @@ crate::named_enum::named_enum! {
 impl Presentation {
     pub fn preview(&self) -> Option<&output::OutputPreview> {
         self.preview.as_ref()
+    }
+
+    pub fn shape(&self) -> Option<&Value> {
+        self.shape.as_ref()
     }
 
     pub fn truncated(&self) -> &[output::OutputTruncation] {
@@ -300,6 +307,7 @@ impl JobView {
                     .collect()
             });
             Presentation {
+                shape: presentation.shape.clone(),
                 truncated: presentation.truncated.clone(),
                 captures,
                 ..Presentation::default()
@@ -320,18 +328,13 @@ impl JobView {
     /// continuation, then the first truncated field's, then the first
     /// continuing capture page's. A preview without a field continues the
     /// field that was requested.
-    pub fn continuation(&self) -> Option<(Option<&FieldPointer>, usize, Option<usize>)> {
+    pub fn continuation(&self) -> Option<output::Continuation<'_>> {
         let presentation = self.presentation.as_ref()?;
         let preview = presentation.preview.as_ref();
         preview
             .and_then(output::OutputPreview::continuation)
             .or_else(|| {
-                let truncated = presentation.truncated().first()?;
-                Some((
-                    Some(&truncated.field),
-                    truncated.next_start,
-                    truncated.next_offset,
-                ))
+                (presentation.truncated().iter()).find_map(output::OutputTruncation::continuation)
             })
             .or_else(|| {
                 presentation
@@ -466,15 +469,22 @@ fn render_output_diagnostic(
 }
 
 /// The schemas of one job view and of a list of them, as results declare them.
+/// A job view is itself a presentation; presenting it again never shortens it.
 pub(crate) struct JobViewSchemas {
     pub(crate) one: Value,
     pub(crate) many: Value,
+    /// A tool response's own view, which keeps its error and questions whole.
+    pub(crate) response: Value,
 }
 
 pub(crate) static JOB_VIEW_SCHEMAS: std::sync::LazyLock<JobViewSchemas> =
-    std::sync::LazyLock::new(|| JobViewSchemas {
-        one: crate::tool::registry::result_schema::<JobView>(),
-        many: crate::tool::registry::result_schema::<Vec<JobView>>(),
+    std::sync::LazyLock::new(|| {
+        use crate::tool::registry::{complete_result_schema, result_schema};
+        JobViewSchemas {
+            one: complete_result_schema::<JobView>(),
+            many: complete_result_schema::<Vec<JobView>>(),
+            response: result_schema::<JobView>(),
+        }
     });
 
 impl JobManager {
@@ -853,12 +863,14 @@ mod tests {
     #[test]
     fn continuation_prefers_the_preview_then_a_truncation_then_a_capture_page() {
         let field = |field: &str| field.parse::<FieldPointer>().unwrap();
-        let page = |at: &str, next_start| output::OutputPreview {
-            field: Some(field(at)),
-            lines: output::PageLines::Text(Vec::new()),
-            total_lines: None,
-            next_start,
-            next_offset: Some(5),
+        let page = |at: &str, next_start| {
+            output::OutputPreview::Lines(output::LinePage {
+                field: Some(field(at)),
+                lines: output::PageLines::Text(Vec::new()),
+                total_lines: None,
+                next_start,
+                next_offset: Some(5),
+            })
         };
         let view = |presentation| JobView {
             presentation: Some(presentation),
@@ -874,12 +886,20 @@ mod tests {
         };
         let mut presentation = Presentation {
             preview: Some(page("", Some(1))),
-            truncated: Some(vec![output::OutputTruncation {
-                field: field("/result/stdout"),
-                total_lines: 9,
-                next_start: 4,
-                next_offset: Some(7),
-            }]),
+            truncated: Some(vec![
+                output::OutputTruncation::Elements {
+                    field: field("/result/items"),
+                    shown: 2,
+                    total_elements: 9,
+                    kept: None,
+                },
+                output::OutputTruncation::Text {
+                    field: field("/result/stdout"),
+                    total_lines: 9,
+                    next_start: 4,
+                    next_offset: Some(7),
+                },
+            ]),
             captures: Some(vec![
                 capture("/result/end", None),
                 capture("/result/custom", Some(8)),
@@ -889,10 +909,22 @@ mod tests {
         let next = |presentation: &Presentation| {
             let view = view(presentation.clone());
             let next = view.continuation();
-            next.map(|(field, start, offset)| (field.unwrap().as_str().to_owned(), start, offset))
+            next.map(|next| match next {
+                output::Continuation::Lines {
+                    field,
+                    start,
+                    offset,
+                } => (field.unwrap().as_str().to_owned(), start, offset),
+                output::Continuation::Index { field, index } => {
+                    (field.unwrap().as_str().to_owned(), index, None)
+                }
+            })
         };
         assert_eq!(next(&presentation), Some((String::new(), 1, Some(5))));
         presentation.preview = None;
+        // An array cut continues at its first element not shown.
+        assert_eq!(next(&presentation), Some(("/result/items".into(), 2, None)));
+        presentation.truncated.as_mut().unwrap().remove(0);
         assert_eq!(
             next(&presentation),
             Some(("/result/stdout".into(), 4, Some(7)))

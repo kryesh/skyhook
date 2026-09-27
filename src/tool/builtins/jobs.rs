@@ -23,7 +23,7 @@ pub(crate) fn register(
     let admitted = jobs.clone();
     builder.register_checked(
         "jobs",
-        "Without `job`, list this agent's active jobs, excluding this call and its containing script; `all` adds finished jobs. With `job`, read or search that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; filtered or paginated reads return text in preview.lines without images.",
+        "Without `job`, list this agent's active jobs, excluding this call and its containing script; `all` adds finished jobs. With `job`, read, page, search or query that job's saved output and status immediately, returning its JobView in place of this call's. Whole-output reads attach saved images; field reads return one page in preview, without images: text by line (start/offset/pattern), JSON by element or member (index), or query matches.",
         ToolOptions::default().job_views(JobViewResult::Many),
         |args: JobsArgs| JobsRequest::try_from(args),
         move |request| {
@@ -136,20 +136,25 @@ struct JobsArgs {
     all: bool,
     /// JSON Pointer in saved content, e.g. /result/stdout, /result/content, /result/console.
     field: Option<FieldPointer>,
-    /// One-based first source line; use returned next_start to continue.
+    /// Text fields: one-based first source line; use returned next_start to continue.
     #[schemars(range(min = 1), extend("default" = 1))]
     start: Option<usize>,
-    /// Maximum returned lines, including match context.
+    /// Maximum returned lines (including match context), values or query matches.
     #[schemars(range(min = 1, max = MAX_LIMIT), extend("default" = DEFAULT_LIMIT))]
     limit: Option<usize>,
-    /// Case-sensitive line regex; use (?i) for case-insensitive matching.
+    /// Text fields: case-sensitive line regex; use (?i) for case-insensitive matching.
     pattern: Option<String>,
     /// Surrounding lines per match.
     #[schemars(range(min = 0, max = MAX_CONTEXT), extend("default" = 0))]
     context: Option<usize>,
-    /// Zero-based UTF-8 byte offset within the starting line; use returned next_offset to continue.
+    /// Text fields: zero-based UTF-8 byte offset within the starting line; use returned next_offset to continue.
     #[schemars(range(min = 0), extend("default" = 0))]
     offset: Option<usize>,
+    /// JSON fields: zero-based first element, member or query match; use returned next_index to continue.
+    #[schemars(range(min = 0), extend("default" = 0))]
+    index: Option<usize>,
+    /// JSONPath (RFC 9535) query over a JSON field, with `$` as the field; returns matches with their pointers. Numeric comparisons use double precision.
+    query: Option<String>,
 }
 
 enum JobsRequest {
@@ -170,6 +175,8 @@ impl TryFrom<JobsArgs> for JobsRequest {
             pattern,
             context,
             offset,
+            index,
+            query,
         } = args;
         match job {
             Some(_) if all => Err(AdmissionError::invalid_arguments(
@@ -183,13 +190,17 @@ impl TryFrom<JobsArgs> for JobsRequest {
                 pattern,
                 context,
                 offset,
+                index,
+                query,
             })),
             None if field.is_some()
                 || start.is_some()
                 || limit.is_some()
                 || pattern.is_some()
                 || context.is_some()
-                || offset.is_some() =>
+                || offset.is_some()
+                || index.is_some()
+                || query.is_some() =>
             {
                 Err(AdmissionError::invalid_arguments(
                     "output selection requires job",

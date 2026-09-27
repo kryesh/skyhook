@@ -38,9 +38,10 @@ return results;
 
 Read or search saved command output with `tool.jobs({job: commandJobId, field: "/result/stdout"})`.
 A `jobs` read returns the existing JobView for that job; it does not add another wrapper.
-Field-selected output is a job view, not a raw string: available text is in
-`presentation.preview.lines`, with pagination metadata alongside it. Field, pagination, and
-search selections omit image attachments; whole-output reads can attach saved images.
+Field-selected output is a job view, not a raw string: the page is in `presentation.preview`,
+as `lines` of text, `elements` or `members` of JSON, or query `matches`, with pagination metadata
+alongside it. Field, pagination, search, and query selections omit image attachments; whole-output
+reads can attach saved images.
 
 ## JobView response contract
 
@@ -70,13 +71,15 @@ at all: a tool that is no longer available, or a call interrupted while the sess
 running, is answered with this same failure shape.
 
 `presentation` is absent when a successful foreground response has no truncation, page, capture,
-question, or notice. When present, it groups `preview`, `truncated`, `captures`, `question`, and
-`notice`, each present only when it has content. Read a page as
-`r.presentation.preview.lines` and a question as `r.presentation.question`.
+question, or notice. When present, it groups `preview`, `shape`, `truncated`, `captures`,
+`question`, and `notice`, each present only when it has content, and precedes `result`. Read a
+text page as `r.presentation.preview.lines` and a question as `r.presentation.question`.
 Truncation entries keep their source paths rooted at `/result/...`.
 
 JavaScript receives complete data; model views may shorten fields as described in
-[saved job output](job-output.md#automatic-previews).
+[saved job output](job-output.md#automatic-previews). A returned tool response keeps its complete
+fields whole in the script's own preview; a value taken out of it, such as `response.result`, is
+shortened like any other returned value.
 Tool descriptions' `Result` refers to the envelope's `.result`, not a separate wrapper. A successful
 `jobs({job})` read of a failed target is still a successful tool invocation returning that failed
 `JobView`; `response.unwrap()` checks the observed job state and can therefore throw for that view.
@@ -117,8 +120,8 @@ script's captured text can be inspected with
 available output; they do not subscribe to future writes or wait for script completion.
 
 There is no fixed console-capture size cap. Disk capacity and I/O failures still apply.
-Automatic previews can truncate displayed text without discarding captured output; use
-[paging or search](job-output.md) to inspect more. The **16 MiB limit applies to JavaScript
+Automatic previews can shorten displayed output without discarding captured output; use
+[paging, search, or queries](job-output.md#paging-searching-and-querying) to inspect more. The **16 MiB limit applies to JavaScript
 source**, not console capture.
 
 On a script execution failure, the saved script payload is `{value: null, console?: <captured text>, failure?: <details>}`;

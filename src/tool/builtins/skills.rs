@@ -582,12 +582,14 @@ enum SkillOutput {
         /// The skill directory, for `read` and `write` sources.
         #[schemars(with = "crate::target::TargetPath")]
         location: Option<crate::target::TargetPath>,
+        /// The skill's instructions, never shortened.
+        #[schemars(transform = crate::tool::output::complete)]
         content: String,
-        #[schemars(with = "String", extend("x-skyhook-truncatable" = true))]
+        #[schemars(with = "String")]
         assets: Option<String>,
     },
     Directory {
-        #[schemars(with = "String", extend("x-skyhook-truncatable" = true))]
+        #[schemars(with = "String")]
         assets: Option<String>,
     },
     Image {
@@ -597,7 +599,6 @@ enum SkillOutput {
         bytes: usize,
     },
     Text {
-        #[schemars(extend("x-skyhook-truncatable" = true))]
         content: String,
         bytes: usize,
     },

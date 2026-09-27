@@ -373,9 +373,9 @@ struct ProcessOutput {
     exit_code: Option<i32>,
     #[schemars(with = "i32")]
     signal: Option<i32>,
-    #[schemars(with = "String", extend("x-skyhook-truncatable" = true))]
+    #[schemars(with = "crate::tool::output::JsonText")]
     stdout: Option<String>,
-    #[schemars(with = "String", extend("x-skyhook-truncatable" = true))]
+    #[schemars(with = "String")]
     stderr: Option<String>,
 }
 
@@ -486,6 +486,12 @@ mod tests {
             (
                 "printf warning >&2",
                 json!({"exit_code":0,"stderr":"warning"}),
+                json!([]),
+            ),
+            // Only stdout declares JSON content, read as the value it holds.
+            (
+                r#"printf '{"a":1}\n{"a":2}\n'; printf '[]' >&2"#,
+                json!({"exit_code":0,"stdout":[{"a":1},{"a":2}],"stderr":"[]"}),
                 json!([]),
             ),
         ] {

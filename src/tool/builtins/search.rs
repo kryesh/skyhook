@@ -539,7 +539,6 @@ struct SearchArgs {
 
 #[derive(Serialize, JsonSchema)]
 struct SearchOutput {
-    #[schemars(extend("x-skyhook-truncatable" = true))]
     matches: SearchMatches,
 }
 
@@ -581,7 +580,6 @@ struct GlobArgs {
 
 #[derive(Serialize, JsonSchema)]
 struct GlobOutput {
-    #[schemars(extend("x-skyhook-truncatable" = true))]
     paths: Vec<String>,
 }
 
@@ -853,7 +851,7 @@ mod tests {
         let detailed = search(json!({"path":"files","pattern":"needle","details":true})).await;
         let first = json!({"path":"files/a.txt","line":1,"column":3,"text":"  needle  "});
         assert_eq!(detailed.output.value["matches"][0], first);
-        std::fs::write(directory.join("a.txt"), "needle λ\n".repeat(500)).unwrap();
+        std::fs::write(directory.join("a.txt"), "needle λ\n".repeat(5000)).unwrap();
         let args = json!({"path":"files","pattern":"needle"});
         let preview = executor
             .run_model(&runtime.agent, "search", args)
@@ -861,21 +859,21 @@ mod tests {
             .unwrap();
         let matches = serde_json::to_vec(&preview.output.value["result"]["matches"]).unwrap();
         assert!(matches.len() <= crate::job::output::CONTENT_BYTES);
-        assert_eq!(
-            preview.output.value["presentation"]["truncated"][0]["field"],
-            "/result/matches"
-        );
+        let cut = &preview.output.value["presentation"]["truncated"][0];
+        assert_eq!(cut["field"], "/result/matches/files~1a.txt");
+        assert_eq!(cut["total_elements"], 5000);
         let mut query = crate::job::JobOutputQuery::new(preview.job);
-        query.field = Some("/result/matches".parse().unwrap());
-        query.pattern = Some("500: needle".into());
+        query.field = Some("/result/matches/files~1a.txt".parse().unwrap());
+        (query.index, query.limit) = (Some(4999), Some(1));
         let page = runtime
             .jobs
             .inspect_output(query, CancellationToken::new(), &Default::default())
             .await
             .unwrap();
-        let lines = page["presentation"]["preview"]["lines"].as_array().unwrap();
-        assert_eq!(lines.len(), 1);
-        assert!(lines[0]["text"].as_str().unwrap().contains("500: needle λ"));
+        let preview = &page["presentation"]["preview"];
+        assert_eq!(preview["elements"], json!(["5000: needle λ"]));
+        assert_eq!(preview["total_elements"], 5000);
+        assert!(preview.get("next_index").is_none());
     }
 
     #[test]

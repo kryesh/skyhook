@@ -38,8 +38,8 @@ impl JsonSchema for ScriptResult {
             "type": "object",
             "properties": {
                 "value": {},
-                "console": {"type": "string", "x-skyhook-truncatable": true},
-                "failure": {"type": "object", "x-skyhook-truncatable": true}
+                "console": {"type": "string"},
+                "failure": {"type": "object"}
             },
             "required": ["value"],
             "additionalProperties": false

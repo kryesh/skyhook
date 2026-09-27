@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 15). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 16). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 --
@@ -637,11 +637,14 @@ CREATE TABLE job_output (
   -- The tool's result, NULL when the run produced none ('null' is a literal null);
   -- referenced captures are emptied placeholders.
   result TEXT CHECK (result IS NULL OR json_valid(result)),
+  -- Bytes of the result's automatic presentation, measured once it is saved.
+  presented_bytes INTEGER CHECK (presented_bytes >= 0),
   UNIQUE (job, generation),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
 ) STRICT;
 
 CREATE TABLE capture_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+CREATE TABLE capture_detection (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 -- Streamed or offloaded bytes at one JSON Pointer. A row exists from reservation, so
 -- partial output stays readable; an abandoned builtin capture deletes its row.
@@ -655,21 +658,27 @@ CREATE TABLE job_capture (
   final_lines INTEGER CHECK (final_lines >= 0),
   -- A cached page rendering of a saved value, not producer output.
   rendered INTEGER NOT NULL DEFAULT 0 CHECK (rendered IN (0,1)),
-  UNIQUE (job, generation, pointer),
+  -- What a finished text capture its schema declares as JSON holds.
+  detection TEXT REFERENCES capture_detection(name),
+  CHECK (detection IS NULL OR (final_bytes IS NOT NULL AND capture_kind = 'text' AND rendered = 0)),
+  -- A rendering of a saved value may share its pointer with the capture it reads.
+  UNIQUE (job, generation, pointer, rendered),
   UNIQUE (id, job, generation),
   CHECK ((final_bytes IS NULL) = (final_lines IS NULL)),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
 ) STRICT;
 
--- Identity is immutable; an unknown kind may resolve once, and a writer finishes once.
+-- Identity is immutable; an unknown kind may resolve once, a writer finishes once, and
+-- a finished capture is classified once.
 CREATE TRIGGER job_capture_update_rules BEFORE UPDATE ON job_capture
 WHEN NEW.id IS NOT OLD.id OR NEW.job IS NOT OLD.job OR NEW.generation IS NOT OLD.generation
   OR NEW.pointer IS NOT OLD.pointer OR NEW.rendered IS NOT OLD.rendered
   OR (NEW.capture_kind IS NOT OLD.capture_kind AND OLD.capture_kind <> 'unknown')
   OR (OLD.final_bytes IS NOT NULL
       AND (NEW.final_bytes IS NOT OLD.final_bytes OR NEW.final_lines IS NOT OLD.final_lines))
+  OR (OLD.detection IS NOT NULL AND NEW.detection IS NOT OLD.detection)
 BEGIN
-  SELECT RAISE(ABORT, 'job_capture: identity is immutable; kind resolves and final sets once');
+  SELECT RAISE(ABORT, 'job_capture: identity is immutable; kind, final and detection set once');
 END;
 
 -- first_line = newlines before byte_offset; chunks are contiguous from offset 0.
@@ -695,8 +704,9 @@ CREATE TABLE job_output_field (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX job_output_field_capture ON job_output_field(capture);
 
--- Annotated truncatable fields of a script's independently saved result.
-CREATE TABLE job_presentation (
+-- Fields of a saved result that presentation never shortens: those its schema
+-- declares and those a script's returned tool results carry.
+CREATE TABLE job_complete_field (
   id INTEGER PRIMARY KEY,
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,

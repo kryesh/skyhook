@@ -209,7 +209,6 @@ mod tests {
         }
         #[derive(serde::Serialize, schemars::JsonSchema)]
         struct Payload {
-            #[schemars(extend("x-skyhook-truncatable" = true))]
             text: String,
             nullable: Option<String>,
         }

@@ -292,6 +292,13 @@ impl<A> ToolOptions<A> {
         self
     }
 
+    /// A stored-result schema that tool descriptions leave out.
+    #[must_use]
+    pub(crate) fn internal_result(mut self, schema: Value) -> Self {
+        self.output_schema = Some(OutputSchema::Internal(schema));
+        self
+    }
+
     #[must_use]
     pub(crate) fn job_views(mut self, views: super::JobViewResult) -> Self {
         self.output_schema = Some(OutputSchema::JobViews(views));

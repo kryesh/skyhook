@@ -221,13 +221,14 @@ impl JobManager {
                     diagnostic: None,
                     output_diagnostic: output_diagnostic.map(PartialDiagnostic::resolve),
                 });
-                let previous = {
+                let (previous, schema) = {
                     let jobs = manager.inner.jobs.lock().await;
                     let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
                     entry
                         .admits(JobStep::Finish(end))
                         .map_err(|rejected| rejected.lifecycle(id))?;
-                    entry.finished().cloned()
+                    let schema = entry.output_schema.clone().unwrap_or(Value::Bool(true));
+                    (entry.finished().cloned(), schema)
                 };
                 if let Some(previous) = previous {
                     // Cancelling an interruption ends resumability, not its published
@@ -243,7 +244,7 @@ impl JobManager {
                     // Captures have independent pointer/type metadata. A failed tool need not
                     // produce a result, and unfinished JSON captures are not valid result trees.
                     output::blocking(move || {
-                        output::save_completed(&saved, output, capture_complete, captures)
+                        output::save_completed(&saved, &schema, output, capture_complete, captures)
                     })
                     .await
                     .map_err(|error| JobError::Output(Box::new(error)))?;

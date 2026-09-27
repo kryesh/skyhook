@@ -234,7 +234,7 @@ fn without_terminator(line: &str) -> &str {
         .map_or(line, |line| line.strip_suffix('\r').unwrap_or(line))
 }
 
-pub(super) fn empty(selection: &Selection, total: Option<usize>, terminal: bool) -> OutputPreview {
+pub(super) fn empty(selection: &Selection, total: Option<usize>, terminal: bool) -> LinePage {
     response(
         selection,
         total,
@@ -252,8 +252,8 @@ fn response(
     total: Option<usize>,
     lines: PageLines,
     next: Option<(usize, usize)>,
-) -> OutputPreview {
-    OutputPreview {
+) -> LinePage {
+    LinePage {
         field: Some(selection.field.clone()),
         lines,
         total_lines: total,
@@ -361,7 +361,7 @@ pub(super) fn page(
     selection: &Selection,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
-) -> Result<OutputPreview, ToolError> {
+) -> Result<LinePage, ToolError> {
     let Some(mut source) = source else {
         return Ok(empty(
             selection,
@@ -453,7 +453,7 @@ fn search(
     selection: &Selection,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
-) -> Result<OutputPreview, ToolError> {
+) -> Result<LinePage, ToolError> {
     let matcher = selection.matcher.as_ref().expect("search matcher");
     // Validate independently of whether the starting line matches.
     Source::seek_line(&mut reader, index, selection.start, cancellation)?;

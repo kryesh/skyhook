@@ -199,9 +199,8 @@ Diagnostics are persisted with the job and rendered per viewer. Target aliases i
 diagnostics and result slots registered by their producer, such as an expected `read` failure, are
 rendered only when the viewer's capabilities permit exposing them. Host-site wording is relative
 to the viewer's target: “on session host” is omitted for host-local viewers and retained for remote
-viewers. Capability-sensitive enclosing output pages use private file-backed renderings rather
-than shared render caches, keeping captured output out of memory without reusing privileged
-renderings for those diagnostic slots.
+viewers. Pages of a value enclosing a diagnostic slot stream from the viewer's own rendering of
+the saved document; nothing capability-sensitive is cached.
 
 This rendering boundary does not guarantee that target aliases never appear in a restricted view.
 A privileged `jobs` output read saves its rendered view as an ordinary JSON snapshot. Later
@@ -209,11 +208,27 @@ restricted views of that saved result, or script results that copy it, retain th
 JSON unchanged. Already-committed model messages are not rewritten. Arbitrary returned JSON is not
 inspected for diagnostics or target aliases, and copied data does not acquire diagnostic provenance.
 
-Saved output and model-visible presentation are separate. Automatic previews shorten only fields
-marked `x-skyhook-truncatable` in the output schema; storing a field separately does not make it
-truncatable. Jobs persist their output schemas so resumed and remote results use the same rules.
-JavaScript receives complete results, while the journal retains the exact previews delivered to
-the model. See [saved job output](../reference/job-output.md) for the user-facing limits.
+Saved output and model-visible presentation are separate. A finished result is saved as a compact
+document whose large parts live in captures: referenced streams, strings over 4 KiB, and the
+outermost larger containers, unless they enclose a capture, JSON-declared text, a complete field,
+a long string reached through object members alone, or the diagnostic slot. Text a schema
+declares as `contentMediaType: application/json` is classified once at finalization, unless its
+output was cut off, and when it is JSON is read as that value from its original bytes.
+Finalization also records the fields presentation never shortens, those marked
+`x-skyhook-complete` in the output schema joining those a script's returned tool results carry,
+and then the size of the result's automatic presentation, which notification batching budgets
+without previewing it again. Jobs persist their output schemas so resumed and remote results use
+the same rules.
+
+All saved JSON is read through streaming readers built in `job::output::json`. Previews, pages,
+and navigation into stored containers hold a bounded pool of what they may show rather than the
+value, and sampled readings take stored text only up to its prefix, with its extent from storage.
+Memory still grows with the largest single key or number, which the reader buffers whole; with the
+keys of each open object while detection tracks duplicates by hash; with fields marked complete,
+which are read whole; and with a JSONPath query's selected field, which is loaded within a cap
+metered on the bytes it reads. JavaScript receives complete results, while the journal retains the
+exact previews delivered to the model. See [saved job output](../reference/job-output.md) for the
+user-facing limits.
 
 Child messages and job notifications use a prepared delivery receipt: snapshot pending events,
 then commit them to the parent's history together with their acknowledgment. Abandoned preparation leaves the

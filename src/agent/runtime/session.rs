@@ -132,12 +132,18 @@ impl SessionHandle {
             .await
     }
 
-    /// Selectable saved-output pointers, unaffected by presentation-only wrappers.
+    /// Selectable saved-output pointers one level below `parent`, from its child
+    /// at `index`, unaffected by presentation-only wrappers.
     pub async fn inspect_output_fields(
         &self,
         job: JobId,
-    ) -> Result<Vec<crate::job::FieldPointer>, crate::tool::ToolError> {
-        self.runtime.jobs.inspect_output_fields(job).await
+        parent: crate::job::FieldPointer,
+        index: usize,
+    ) -> Result<crate::job::OutputFields, crate::tool::ToolError> {
+        self.runtime
+            .jobs
+            .inspect_output_fields(job, parent, index)
+            .await
     }
 
     pub async fn cancel_job(

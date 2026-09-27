@@ -12,7 +12,8 @@ shell parsing: `exec({command: "cargo test 2>&1 | tail"})` or `exec({command: ["
 `jobs({all:true})` includes completed history, and the listing payload is in the envelope's `.result`.
 `jobs({job})` reads that job's saved output and status immediately; it never waits for new output or
 completion. It returns the existing queried view, not another wrapper, and accepts the
-[output selections](job-output.md) `field`, `start`, `limit`, `pattern`, `context`, and `offset`.
+[output selections](job-output.md#paging-searching-and-querying) `field` and `limit`, with
+`start`, `offset`, `pattern`, and `context` for text, or `index` and `query` for JSON.
 `all` cannot be combined with `job`, and selections require `job`. Scripts also control jobs with
 `tool.job(id).send({value})` and `.cancel()`.
 

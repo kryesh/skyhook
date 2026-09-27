@@ -17,6 +17,7 @@ fn invalid(message: impl Into<String>) -> io::Error {
 /// stays unreferenced and is reported incomplete. Only persistence failures are errors.
 pub(crate) fn save_completed(
     output: &Output,
+    schema: &Value,
     result: Option<Value>,
     captures_complete: bool,
     completed: Vec<CompletedCapture>,
@@ -72,8 +73,31 @@ pub(crate) fn save_completed(
     for (id, kind) in kinds {
         output.db.resolve_capture_kind(id, kind).map_err(database)?;
     }
+    let root = FieldPointer::result();
+    // Cut-off output is never taken as JSON, however it happens to end.
+    let candidates = match captures_complete {
+        true => projection::json_text_fields(&document["result"], &root, schema),
+        false => BTreeSet::new(),
+    };
+    let mut complete = projection::complete_fields(&document["result"], &root, schema);
+    // A result with an output diagnostic saves its slot as null; presentation
+    // renders each viewer's diagnostic into it, whole.
+    let slot = diagnostic_slot();
+    if document.pointer(slot.as_str()) == Some(&Value::Null) {
+        complete.insert(slot);
+    }
     let result = has_result.then(|| document["result"].take());
-    save_document(output, registered, result, captures_complete, &references)
+    save_document(
+        output,
+        registered,
+        result,
+        captures_complete,
+        &Stored {
+            referenced: &references,
+            candidates: &candidates,
+            complete: &complete,
+        },
+    )
 }
 
 /// Interpret one bound receipt against the terminal document. `Ok(None)` is a
@@ -206,10 +230,9 @@ fn install(document: &mut Value, field: &FieldPointer, value: Value) -> io::Resu
 }
 
 fn array_index(key: &str, length: usize) -> io::Result<usize> {
-    let index = key
-        .parse::<usize>()
-        .map_err(|_| invalid("capture array index is invalid"))?;
-    if key != index.to_string() || index > length {
+    let index =
+        FieldPointer::array_index(key).ok_or_else(|| invalid("capture array index is invalid"))?;
+    if index > length {
         return Err(invalid("capture array index is out of range"));
     }
     Ok(index)
@@ -285,7 +308,14 @@ mod tests {
             ("/result/a~1b/~0key", CaptureKind::Json, br#"[null,"x"]"#),
         ]
         .map(|(field, kind, bytes)| completed(&output, field, kind, bytes));
-        save_completed(&output, Some(json!({})), true, captures.into()).unwrap();
+        save_completed(
+            &output,
+            &json!(true),
+            Some(json!({})),
+            true,
+            captures.into(),
+        )
+        .unwrap();
         let document = document(&output);
         assert_eq!(
             document["result"],
@@ -325,7 +355,14 @@ mod tests {
             ("ancestor", &b"valid"[..]),
         ] {
             let (_root, _manager, output, other) = outputs().await;
-            save_completed(&output, Some(json!({"prior":true})), false, Vec::new()).unwrap();
+            save_completed(
+                &output,
+                &json!(true),
+                Some(json!({"prior":true})),
+                false,
+                Vec::new(),
+            )
+            .unwrap();
             let kind = if failure == "json" {
                 CaptureKind::Json
             } else {
@@ -363,7 +400,7 @@ mod tests {
             }
             let target = if failure == "job" { &other } else { &output };
             let product = Some(json!({"scalar":"text"}));
-            save_completed(target, product, true, proofs).expect(failure);
+            save_completed(target, &json!(true), product, true, proofs).expect(failure);
             let document = document(target);
             assert_eq!(document["result"]["scalar"], "text", "{failure}");
             assert!(document.pointer(field).is_none(), "{failure}");
@@ -447,7 +484,7 @@ mod tests {
                 .chain(scalars)
                 .map(|(field, bytes)| completed(&output, &format!("/result/{field}"), kind, bytes))
                 .collect();
-            save_completed(&output, Some(initial.clone()), true, captures).unwrap();
+            save_completed(&output, &json!(true), Some(initial.clone()), true, captures).unwrap();
             let hydrated = hydrate(&saved(&output), document(&output)).unwrap();
             if unknown {
                 assert_eq!(hydrated["result"]["text"], r#"{"looks":"json"}"#);
@@ -481,37 +518,12 @@ mod tests {
             b"abandoned raw bytes",
         );
         let result = json!({"raw":"ordinary value".repeat(1000)});
-        save_completed(&output, Some(result.clone()), true, vec![]).unwrap();
+        save_completed(&output, &json!(true), Some(result.clone()), true, vec![]).unwrap();
         assert_eq!(document(&output)["result"], result);
         assert!(output.test_fields().is_empty());
         assert_eq!(
             output.test_bytes("/result/raw").unwrap(),
             b"abandoned raw bytes"
         );
-    }
-
-    /// Notification sizing budgets what automatic presentation emits, escapes
-    /// included: a truncatable capture as its retained prefix, others in full.
-    #[tokio::test]
-    async fn presentation_size_budgets_what_automatic_presentation_emits() {
-        let (_root, manager, agent) = runtime().await;
-        let text = "\u{1}".repeat(3 * CONTENT_BYTES);
-        let truncatable = json!({"properties":{"text":{"x-skyhook-truncatable":true}}});
-        for schema in [truncatable, Value::Bool(true)] {
-            let mut spec = JobSpec::test(agent.clone(), "sized");
-            spec.output_schema = Some(schema.clone());
-            let id = manager.test_running(spec).await.into_test_id();
-            manager.test_finish(id, json!({"text":text})).await;
-            let args = OutputArgs::new(id);
-            let view = (manager.inspect_output(args, Default::default(), &Default::default()))
-                .await
-                .unwrap();
-            let emitted = serde_json::to_vec(&view["result"]).unwrap().len();
-            let estimate = presentation_size(&manager.output(id), &schema);
-            assert!(
-                (emitted..emitted + 16).contains(&estimate),
-                "{estimate} bytes estimated for {emitted} emitted"
-            );
-        }
     }
 }

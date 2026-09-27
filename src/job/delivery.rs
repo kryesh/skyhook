@@ -247,13 +247,13 @@ impl JobManager {
         let envelopes = output::blocking(move || {
             let mut remaining = LIFECYCLE_BATCH_BYTES;
             let mut pending = Vec::new();
-            for (envelope, (output, schema)) in candidates {
+            for (envelope, output) in candidates {
                 if remaining == 0 {
                     break;
                 }
                 let metadata =
                     serde_json::to_vec(&envelope).map_or(output::PAGE_BYTES, |bytes| bytes.len());
-                let cost = output::presentation_size(&output, &schema)
+                let cost = output::presented_size(&output)
                     .saturating_add(metadata)
                     .saturating_add(ENVELOPE_OVERHEAD);
                 if cost > remaining && !pending.is_empty() {
@@ -284,7 +284,7 @@ impl JobManager {
         jobs: &HashMap<JobId, JobEntry>,
         owner: &AgentId,
         messages: &[AgentMessage],
-    ) -> Vec<(JobEnvelope, (output::Output, Value))> {
+    ) -> Vec<(JobEnvelope, output::Output)> {
         let messages_through = messages
             .last()
             .map_or(MessageSeq::default(), |message| message.message);
@@ -299,10 +299,7 @@ impl JobManager {
                         child.messages.iter().all(|message| message.message <= messages_through)
                     })
             })
-            .map(|(&id, entry)| {
-                let schema = entry.output_schema.clone().unwrap_or(Value::Bool(true));
-                (entry.envelope(id), (self.output(id), schema))
-            })
+            .map(|(&id, entry)| (entry.envelope(id), self.output(id)))
             .collect::<Vec<_>>();
         candidates.sort_by_key(|(envelope, _)| envelope.id);
         candidates

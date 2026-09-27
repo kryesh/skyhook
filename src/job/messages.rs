@@ -465,15 +465,19 @@ mod tests {
     }
 
     /// The lifecycle budget is denominated in the bytes presentation really emits,
-    /// so a fan-in of untruncatable results is bounded instead of concatenated.
+    /// so a fan-in of large presentations is bounded instead of concatenated.
     #[tokio::test]
     async fn lifecycle_batch_bounds_presented_bytes() {
         let (_session, manager, owner) = owner_session().await;
         let mut jobs = Vec::new();
         for _ in 0..5 {
             let job = tool_job(&manager, &owner).await;
-            // Not schema-annotated, so presentation cannot shorten it.
-            let result = serde_json::json!({"value": "z".repeat(2 * output::PAGE_BYTES)});
+            // Text fields up to the allowance keep their own limits, so the
+            // presentation stays large.
+            let result: serde_json::Map<_, _> = (0..8)
+                .map(|field| (format!("f{field}"), "z".repeat(output::PAGE_BYTES).into()))
+                .collect();
+            let result = serde_json::Value::Object(result);
             manager.test_finish(job, result).await;
             jobs.push(job);
         }

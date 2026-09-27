@@ -12,7 +12,7 @@ pub(crate) use envelope::{BACKGROUND, split_envelope};
 pub use envelope::{ExecutionEnvelope, JobLaunch, JobName, TARGET};
 pub use options::ToolOptions;
 pub use registration::CatalogBuilder;
-pub(crate) use registration::result_schema;
+pub(crate) use registration::{complete_result_schema, result_schema};
 pub(crate) use schema::{MAX_TOOL_NAME_BYTES, is_tool_name_char, is_valid_tool_name};
 pub(crate) use surface::AgentLevel;
 pub use surface::{Catalog, ResultSchema, ToolSpec, ToolSurface};

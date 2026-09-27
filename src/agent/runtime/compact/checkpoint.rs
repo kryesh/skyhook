@@ -546,12 +546,19 @@ mod tests {
         let output = "evidence\n".repeat(400);
         let workspace = fixture.workspace.path();
         crate::session::tests::start_child(&runtime.store, agent, 99, None, workspace).await;
-        let lease = runtime.jobs.create(JobSpec {
-            arguments: arguments.clone(),
-            output_schema: Some(json!({"type":"object","properties":{"content":{"type":"string","x-skyhook-truncatable":true}}})),
-            background: true,
-            ..JobSpec::test(agent.child(99), "read")
-        }).await.unwrap().into_test_id();
+        let lease = runtime
+            .jobs
+            .create(JobSpec {
+                arguments: arguments.clone(),
+                output_schema: Some(
+                    json!({"type":"object","properties":{"content":{"type":"string"}}}),
+                ),
+                background: true,
+                ..JobSpec::test(agent.child(99), "read")
+            })
+            .await
+            .unwrap()
+            .into_test_id();
         let outcome = JobOutcome::Completed(ToolOutput::new(json!({"content":output})));
         runtime.jobs.finish(lease, outcome).await.unwrap();
         fixture.add_history(20_000).await;

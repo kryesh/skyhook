@@ -166,13 +166,15 @@ struct Redirect {
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum ResponseBody {
     Text {
-        #[schemars(extend("x-skyhook-truncatable" = true))]
         text: String,
         #[schemars(with = "text::ExtractionMetadata")]
         metadata: Option<text::ExtractionMetadata>,
     },
+    /// A textual body that holds JSON, read as it.
+    Json {
+        value: serde_json::Value,
+    },
     Base64 {
-        #[schemars(extend("x-skyhook-truncatable" = true))]
         data: String,
     },
     File {
@@ -280,6 +282,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn json_bodies_are_read_as_values_unless_text_is_requested() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let executor = executor(&runtime);
+        let json = "Content-Type: application/json\r\n";
+        for (format, body, expected) in [
+            (
+                "auto",
+                "{\"a\": [1, 2]}\n",
+                json!({"kind":"json","value":{"a":[1,2]}}),
+            ),
+            (
+                "auto",
+                "{\"a\":1}\n{\"a\":2}\n",
+                json!({"kind":"json","value":[{"a":1},{"a":2}]}),
+            ),
+            (
+                "text",
+                "{\"a\": [1, 2]}\n",
+                json!({"kind":"text","text":"{\"a\": [1, 2]}\n"}),
+            ),
+            // A number a double cannot hold as written stays in its text.
+            (
+                "auto",
+                "{\"id\":9007199254740993}",
+                json!({"kind":"text","text":"{\"id\":9007199254740993}"}),
+            ),
+        ] {
+            let (url, task) = server(vec![reply("200 OK", json, body)]).await;
+            let arguments = json!({"url": url, "response_format": format});
+            let output = fetch(&runtime, &executor, arguments).await.unwrap();
+            task.finish().await;
+            assert_eq!(output["body"], expected, "{format}: {body}");
+        }
+    }
+
+    #[tokio::test]
     async fn response_body_payloads_are_truncated_but_full_output_is_retrievable() {
         use crate::job::JobOutputQuery;
 
@@ -317,39 +355,39 @@ mod tests {
                 .collect();
             assert_eq!(json!(projected), marker);
 
-            let mut query = JobOutputQuery::new(call.job);
-            query.field = Some(pointer.parse().unwrap());
-            let mut full = String::new();
-            let mut pages = 0;
-            loop {
-                let page = runtime
-                    .jobs
-                    .inspect_output(query.clone(), CancellationToken::new(), &Default::default())
-                    .await
-                    .unwrap();
-                let preview = &page["presentation"]["preview"];
-                let lines = preview["lines"].as_array().unwrap();
-                assert_eq!(lines.len(), 1);
-                full.push_str(lines[0].as_str().unwrap());
-                pages += 1;
-                let Some(start) = preview["next_start"].as_u64() else {
-                    break;
-                };
-                query.start = Some(start as usize);
-                query.offset = Some(preview["next_offset"].as_u64().unwrap() as usize);
-            }
+            // Paging from the start, and from where the preview stops, reads the
+            // body exactly.
+            let read = async |start: usize, offset: usize| {
+                let mut query = JobOutputQuery::new(call.job);
+                query.field = Some(pointer.parse().unwrap());
+                (query.start, query.offset) = (Some(start), Some(offset));
+                let (mut text, mut pages) = (String::new(), 0);
+                loop {
+                    let page = runtime
+                        .jobs
+                        .inspect_output(
+                            query.clone(),
+                            CancellationToken::new(),
+                            &Default::default(),
+                        )
+                        .await
+                        .unwrap();
+                    let preview = &page["presentation"]["preview"];
+                    let lines = preview["lines"].as_array().unwrap();
+                    assert_eq!(lines.len(), 1);
+                    text.push_str(lines[0].as_str().unwrap());
+                    pages += 1;
+                    let Some(start) = preview["next_start"].as_u64() else {
+                        return (text, pages);
+                    };
+                    query.start = Some(start as usize);
+                    query.offset = Some(preview["next_offset"].as_u64().unwrap() as usize);
+                }
+            };
+            let (full, pages) = read(1, 0).await;
             assert!(pages > 1);
             assert_eq!(full, expected);
-            (query.start, query.offset) = (Some(1), Some(prefix.len()));
-            let remainder = runtime
-                .jobs
-                .inspect_output(query, CancellationToken::new(), &Default::default())
-                .await
-                .unwrap();
-            assert_eq!(
-                remainder["presentation"]["preview"]["lines"],
-                json!([&expected[prefix.len()..]])
-            );
+            assert_eq!(read(1, prefix.len()).await.0, expected[prefix.len()..]);
         }
 
         // Small payloads keep their original shape and need no truncation marker.

@@ -251,6 +251,11 @@ impl<C: Send + 'static, P: OutputValue> CatalogBuilder<C, P> {
             output_schema,
         } = options;
         let output_schema = match output_schema {
+            Some(OutputSchema::Internal(_)) if !conditional_outputs.is_empty() => {
+                return Err(RegistryError::Schema(
+                    "internal result schemas cannot add conditional outputs".to_owned(),
+                ));
+            }
             Some(base) if !conditional_outputs.is_empty() => {
                 check_conditional(&base.generate(&all), &conditional_outputs, "output")?;
                 Some(OutputSchema::Generated(Arc::new(move |capabilities| {
@@ -336,12 +341,21 @@ fn input_schema<I: JsonSchema>() -> Value {
 /// `Option` a null alternative, so a field that omits `None` declares the schema
 /// of its present value with `#[schemars(with = "T")]`.
 pub(crate) fn result_schema<O: JsonSchema>() -> Value {
-    schema_value(
-        SchemaSettings::default()
-            .for_serialize()
-            .into_generator()
-            .into_root_schema_for::<O>(),
-    )
+    schema_value(root_schema::<O>())
+}
+
+/// The result schema of `O` for a result presentation never shortens.
+pub(crate) fn complete_result_schema<O: JsonSchema>() -> Value {
+    let mut schema = root_schema::<O>();
+    crate::tool::output::complete(&mut schema);
+    schema_value(schema)
+}
+
+fn root_schema<O: JsonSchema>() -> schemars::Schema {
+    SchemaSettings::default()
+        .for_serialize()
+        .into_generator()
+        .into_root_schema_for::<O>()
 }
 
 /// Serialized rather than unwrapped: serialization puts keywords in schemars'

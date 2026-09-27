@@ -318,15 +318,32 @@ async fn response_body(
         }
     }
     if matches!(mode, InlineMode::Auto) && entity.class() == ContentClass::Binary {
-        Ok(ResponseBody::Base64 {
+        return Ok(ResponseBody::Base64 {
             data: STANDARD.encode(entity.bytes()),
-        })
-    } else {
-        Ok(ResponseBody::Text {
-            text: entity.decode(),
-            metadata: None,
-        })
+        });
     }
+    let text = entity.decode();
+    // Only automatic handling reads JSON; `text` keeps the decoded text as sent.
+    if !matches!(mode, InlineMode::Auto) {
+        return Ok(ResponseBody::Text {
+            text,
+            metadata: None,
+        });
+    }
+    // A body can be large, so it is parsed off the async workers.
+    let parsed = tokio::task::spawn_blocking(move || {
+        let json = crate::job::output::parse_json_text(&text);
+        (text, json)
+    })
+    .await;
+    let (text, json) = parsed.unwrap_or_else(|error| std::panic::resume_unwind(error.into_panic()));
+    Ok(match json {
+        Some(value) => ResponseBody::Json { value },
+        None => ResponseBody::Text {
+            text,
+            metadata: None,
+        },
+    })
 }
 
 #[cfg(test)]

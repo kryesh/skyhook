@@ -461,7 +461,14 @@ mod tests {
         assert_eq!(descriptors.len(), 2);
         assert!(descriptors.iter().all(|capture| !capture.complete));
         let result = Some(serde_json::json!({}));
-        crate::job::output::save_completed(&output, result, true, vec![completed, empty]).unwrap();
+        crate::job::output::save_completed(
+            &output,
+            &serde_json::json!(true),
+            result,
+            true,
+            vec![completed, empty],
+        )
+        .unwrap();
         assert!(
             captures(&output, true)
                 .iter()

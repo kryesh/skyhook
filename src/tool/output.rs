@@ -63,6 +63,57 @@ impl schemars::JsonSchema for FieldPointer {
     }
 }
 
+/// The schema keyword marking a field presentation never shortens.
+pub(crate) const COMPLETE: &str = "x-skyhook-complete";
+
+/// Mark `schema` complete: `#[schemars(transform = complete)]` on a field or type.
+pub(crate) fn complete(schema: &mut schemars::Schema) {
+    schema.insert(COMPLETE.into(), true.into());
+}
+
+/// Schema of `T` for a result presentation never shortens.
+pub(crate) struct Complete<T>(std::marker::PhantomData<T>);
+
+impl<T: schemars::JsonSchema> schemars::JsonSchema for Complete<T> {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        T::schema_name()
+    }
+    fn inline_schema() -> bool {
+        true
+    }
+    fn json_schema(generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        let mut schema = T::json_schema(generator);
+        complete(&mut schema);
+        schema
+    }
+}
+
+/// Schema of text a finished job reads as the JSON it holds, when it holds one
+/// object or array, or a whitespace-separated sequence of them.
+pub(crate) struct JsonText;
+
+impl JsonText {
+    pub(crate) fn schema() -> Value {
+        serde_json::json!({"anyOf": [
+            {"type": "string", "contentMediaType": "application/json"},
+            {"type": "object"},
+            {"type": "array"}
+        ]})
+    }
+}
+
+impl schemars::JsonSchema for JsonText {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "JsonText".into()
+    }
+    fn inline_schema() -> bool {
+        true
+    }
+    fn json_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::Schema::try_from(Self::schema()).expect("an object schema")
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("field must be a JSON Pointer")]
 pub struct InvalidFieldPointer;
@@ -92,6 +143,12 @@ impl FieldPointer {
     pub fn index(&self, index: usize) -> Self {
         Self(format!("{}/{index}", self.0))
     }
+    /// The array index a reference token names: digits without a sign or a
+    /// leading zero, as JSON Pointer requires.
+    pub(crate) fn array_index(segment: &str) -> Option<usize> {
+        let index = segment.parse::<usize>().ok()?;
+        (segment == index.to_string()).then_some(index)
+    }
     /// The unescaped reference tokens, outermost first; none for the root.
     pub fn segments(&self) -> impl Iterator<Item = String> + '_ {
         self.0
@@ -99,6 +156,13 @@ impl FieldPointer {
             .skip(1)
             .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
     }
+    /// The pointer of the value containing this one; none for the root.
+    pub fn parent(&self) -> Option<Self> {
+        self.0
+            .rsplit_once('/')
+            .map(|(parent, _)| Self(parent.to_owned()))
+    }
+
     /// Whether `other` addresses a strict descendant of this pointer.
     pub fn contains(&self, other: &Self) -> bool {
         other
