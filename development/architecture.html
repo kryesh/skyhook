@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -260,7 +260,7 @@ would look like the user speaking again after every tool call.</p>
 <ol>
 <li>At a request boundary, the runtime applies accepted input and model/mode selections, refreshes
 history from the journal, and builds the request. Shared settings are recorded in
-<code>model_context</code>; <code>model_requested</code> freezes the exact history references and inline tail.</li>
+<code>model_context</code>; <code>model_requested</code> freezes the exact history range and inline tail.</li>
 <li>Each provider invocation gets a <code>model_attempt_started</code> record for that logical request.
 The stream carries display-only <code>Delta</code>s for blocks, cumulative <code>Usage</code> snapshots, and one
 terminal <code>End</code> holding the <code>Completion</code>: the complete items in position order and how the
@@ -276,10 +276,16 @@ after a crash without making completion order part of the next model request.</l
 <li>Once a tool exchange is closed, the runtime can compact history or build the next request.
 An agent with no further work returns to its idle loop rather than discarding its context.</li>
 </ol>
-<p>Hosts fold these records into one <code>RequestPhase</code> per request in <code>session::RequestLedger</code>;
-session statistics and the terminal interface read request outcomes, retry state, and
-message attribution from that fold rather than deriving them from live activity. Folding a
-record reports the requests it changed, so a host can refresh just those.</p>
+<p><code>session::RequestLedger</code> folds these records into one <code>RequestPhase</code> per request, the only fold of
+the request lifecycle. Observation snapshots embed it, and session statistics, resume settlement
+(open attempts to interrupt) and the terminal interface read request outcomes, retry state, usage
+and message attribution from it. Folding a record reports the requests it changed, and the ledger
+lists the requests changed after a given record, so a host folding records incrementally refreshes
+just those. Interrupt and continue read each agent loop’s own turn state instead: idle,
+busy, parked after a failed or interrupted turn, when only new input resumes it and job
+notifications wait for that input’s request, or held: interrupted while waiting on retained
+children, which <code>continue</code> restarts together with it. The host’s observation is a display, never an
+input to that decision.</p>
 <p>Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized <code>ProviderErrorKind</code> values rather than error-message text: rate limits, timeouts,
 transport failures, and unavailable servers repeat the frozen logical request. Input
@@ -291,7 +297,8 @@ usage. A stream that fails or closes before its end never authorizes tool execut
 transient recovery does not rerun completed tools. An expired command-sourced credential is
 transient: the provider discards it on a 401 and the retry fetches a fresh one. Other
 authentication failures, invalid requests, and protocol errors do not enter this retry loop.
-Context-window recovery and invalid compaction summaries have their own bounded recovery path.</p>
+Context-window recovery and unusable compaction summaries have their own bounded recovery path;
+a checkpoint that breaks a journal invariant is not retried.</p>
 <p>A refusal cut fails without committing the refused message; an abort cut can retain completed
 safe content but still fails the turn. Any other response with neither nonblank text nor a tool
 call fails with nothing committed: <code>OutputLimit</code> when cut at the output limit, <code>Empty</code> otherwise.
@@ -311,19 +318,28 @@ summary or today’s renderer. See <a href="embedding.html#reconstructing-model-
 for the durable reference contract.</p>
 <h2 id="tools-jobs-and-execution"><a class="header" href="#tools-jobs-and-execution">Tools, jobs, and execution</a></h2>
 <p><code>ToolRegistryBuilder</code> supports typed and JSON-based registrations. Typed registrations generate
-input and output schemas; registry metadata also supplies compact result documentation to the
-model and JavaScript runtime. Both call paths use the same executor, capability checks,
-authorization coordinator, and job supervision rather than separate tool implementations.
-A tool’s argument checks (validation, path arguments, derived permissions) receive its parsed
-input and run before authorization. The host planner and a remote worker assemble an
-invocation’s permissions by one rule, and a capability the caller lacks makes the tool
-unavailable rather than denied.</p>
+input and output schemas, and a unit registration completes its job without a result;
+registry metadata also supplies compact result documentation to the model
+and JavaScript runtime. Both call paths use the same executor, capability checks, authorization
+coordinator, and job supervision rather than separate tool implementations. Every call is admitted
+once, before authorization: a typed registration may declare an admission step that turns its
+parsed input into the value its handler receives, so its checks run at the boundary rather than in
+the handler. The admitted value names its path arguments, which are resolved in place, and derives
+its permissions, so an inadmissible call never asks for approval. Path admission (<code>tool::path</code>)
+resolves a requested path where the call runs: relative to the workspace, through existing
+symbolic links, as the tool will use it (an existing entry, a write target, or a removal). The
+resolved path, not the spelling the caller gave, is what the call asks permission for, over the
+exact file or a directory’s descendants. The host planner and a remote worker assemble an
+invocation’s permissions by one rule, and a capability the caller lacks makes the tool unavailable
+rather than denied.</p>
 <p>The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
 (queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
 are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
 its startup stage carries a job from creation to its running worker. A tool may declare a source argument, a
 <code>TargetPath</code> on any target: the executor selects its location like a tool target, authorizes the
-read with the call, and opens it for the call’s context. Remote contents stream in chunks through the
+read with the call, and opens it for the call’s context. A host tool whose input places its job
+elsewhere, such as a child agent’s target and workspace, has that location selected before the job
+exists, so every view of the job reports it. Remote contents stream in chunks through the
 host, spooled to anonymous files: a remote file through its worker’s source request, which the
 worker authorizes and reports as the consuming tool, and to a remote handler before its call starts. The local invocation layer
 admits typed arguments and runs operations without requiring a session database. The SSH shim reuses that layer
@@ -361,12 +377,14 @@ the model. See <a href="../reference/job-output.html">saved job output</a> for t
 then commit them to the parent’s history together with their acknowledgment. Abandoned preparation leaves the
 events pending; cancellation cannot split an accepted commit from its acknowledgment. Replay
 recovers pending child messages from durable history, independently of output inspection.</p>
-<p>Process tools never connect stdin, and capture stdout/stderr. Without the <code>Interactive</code> capability, they
-also detach from the controlling terminal on Unix and replace inherited askpass settings with a
-rejecting helper. Redirecting stdio alone is insufficient: a program could still prompt through
+<p>Process tools never connect stdin, and capture stdout/stderr. Without the <code>Interactive</code> capability,
+they also detach from the controlling terminal on Unix and replace inherited askpass settings with
+a rejecting helper. Redirecting stdio alone is insufficient: a program could still prompt through
 <code>/dev/tty</code>. The helper remains alive through process cleanup, independently of whether target
-management is enabled. SSH’s host-mediated prompt channel is described under
-<a href="remote-transport-and-shims.html#authentication-and-prompt-isolation">authentication and prompt isolation</a>.</p>
+management is enabled. OpenSSH runs a Skyhook binary as its askpass helper, so every binary calls
+<code>remote::askpass_main()</code> first: it answers the prompt and exits when started in that role and
+returns otherwise. SSH’s host-mediated prompt channel is described under <a href="remote-transport-and-shims.html#authentication-and-prompt-isolation">authentication and prompt
+isolation</a>.</p>
 <h2 id="durability-and-resume"><a class="header" href="#durability-and-resume">Durability and resume</a></h2>
 <p>Each durable session uses one SQLite database, <code>session.db</code>. The event ledger is append-only and
 normalized; blobs, job results, and line-addressable captures share the database rather than

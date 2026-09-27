@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -205,7 +205,7 @@ Process execution remains subject to confirmation on each invocation. These defa
 the CLI; <a href="../development/embedding.html">library hosts</a> can supply a different approval policy.</p>
 <p>Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
 queued job while authorization is pending. A denial preserves its reason and marks the rejected
-operation with <code>code: "permission_denied", executed: false</code>; it does not undo work that a
+operation with <code>code: "permission_denied"</code>; it does not undo work that a
 containing script already performed.
 Agents must not circumvent a denial through another tool or route. For programmatic failure
 handling, see the <a href="../reference/javascript.html#responseunwrap-and-native-results">JavaScript response contract</a>.</p>

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -242,9 +242,9 @@ await tool.skill({ name: "release", path: "references/template.md" }); // Origin
 await tool.skill({ name: "release", path: "assets/logo.png" }); // Attached image
 </code></pre>
 <p>Results have a <code>kind</code> discriminator: <code>list</code>, <code>skill</code>, <code>directory</code>, <code>text</code>, <code>image</code>, or <code>binary</code>.
-Base skill results contain <code>name</code>, <code>description</code>, <code>location</code>, complete <code>content</code>, and an <code>assets</code>
-text tree that includes nested files but excludes the already-loaded root <code>SKILL.md</code>. Directory
-results use the same tree format, rooted at the selected path. Trees mark symlinks without
+Base skill results contain <code>location</code>, complete <code>content</code>, and, when the skill has other files, an
+<code>assets</code> text tree that includes nested files but excludes the already-loaded root <code>SKILL.md</code>.
+Directory results use the same tree format, rooted at the selected path. Trees mark symlinks without
 descending through them. Long trees and asset text are saved in full and can be paged using <code>jobs</code>.</p>
 <p>Text assets (including JSON, YAML, source code, and SVG) are returned unchanged, never executed.
 Supported raster images are attached with metadata. Other binary files return metadata rather

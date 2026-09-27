@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -187,26 +187,27 @@ sets. There is no configured capture-size cap or automatic eviction; storage fai
 as failures, with retained partial output marked incomplete.</p>
 <h2 id="tool-result-shapes"><a class="header" href="#tool-result-shapes">Tool result shapes</a></h2>
 <p>See the <a href="javascript.html#jobview-response-contract">JavaScript JobView response contract</a> for the
-seven-key envelope, metadata, presentation group, <code>has_result</code>, and <code>unwrap()</code> behavior. This page
+envelope, metadata, presentation group, and <code>unwrap()</code> behavior. This page
 focuses on saved output and the task-specific payloads below. A failed or pending view remains an
 ordinary response.</p>
 <p>Search and glob patterns filter eligible files without overriding hidden-file or ignore settings.
-Nulls in tool payloads and metadata are preserved; known empty/default output fields do not disappear.
-Process results always contain <code>exit_code: number|null</code>, <code>stdout: string</code>, <code>stderr: string</code>, and
-<code>timed_out: boolean</code>, including empty streams and a false timeout flag. Completed agent calls return
-their complete answer string without automatic truncation. Child questions return <code>{questions:[{id,prompt,options?}]}</code>.</p>
+Nulls in tool payloads are preserved; fields a tool has no value for are absent.
+Process results contain <code>exit_code</code>, or <code>signal</code> when a signal killed the process, and the
+<code>stdout</code> and <code>stderr</code> streams that produced output; scripts read an absent stream as <code>""</code>.
+Completed agent calls return their complete answer string without automatic truncation. Child questions return <code>{questions:[{id,prompt,options?}]}</code>.</p>
 <p>Directory reads return grouped entries with file sizes, for example:
-<code>{kind:"directory",path:"src",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"],symlinks:[],other:[]}}</code>.
-Groups are <code>files</code>, <code>directories</code>, <code>symlinks</code>, and <code>other</code>, with sorted names; known empty groups
-remain present. <code>read({path:"src",details:true})</code> returns flat <code>{name,kind,bytes?}</code> entries; regular files include sizes in both forms.
+<code>{kind:"directory",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}</code>.
+Groups are <code>files</code>, <code>directories</code>, <code>symlinks</code>, and <code>other</code>, with sorted names; empty <code>symlinks</code> and
+<code>other</code> groups are absent, and scripts read them as <code>[]</code>.
+<code>read({path:"src",details:true})</code> returns flat <code>{name,kind,bytes?}</code> entries; regular files include sizes in both forms.
 Missing paths and operating-system access denials from <code>read</code> are successful tool results with
-<code>{kind:"error", path, error:{code:"not_found"|"permission_denied", message}}</code>, so workflows can inspect the
+<code>{kind:"error", error:{code:"not_found"|"permission_denied", message}}</code>, so workflows can inspect the
 error without catching an exception. Tool-policy permission denials remain tool errors.
 Search returns <code>{matches:{"src/main.rs":["12: matching text"]}}</code>, preserving source whitespace.
 <code>search({pattern:"...",details:true})</code> returns structured <code>{path,line,column,text}</code> matches instead.
 An empty search result has <code>matches: {}</code>. Grouped maps share a single preview budget.
-<code>targets({details:true})</code> returns full target metadata. Defaults and <code>target_add</code> retain their documented
-fields and populate known name/type/host/workspace/via/origin metadata; fields are null only when genuinely unavailable.
+<code>targets({details:true})</code> returns full target metadata; fields a target does not set are absent.
+<code>target_add</code> completes without a result.
 All defaulted input fields, including <code>details: false</code>, are optional in tool schemas.</p>
 <p>By default, hidden entries (including <code>.git</code>) and ignored files are excluded. <code>hidden: true</code>
 includes hidden entries, while <code>no_ignore: true</code> independently disables ignore files. Searches
@@ -244,20 +245,20 @@ is no aggregate response-size limit or whole-result fallback.</p>
 is reached first. Strings count UTF-8 content bytes before JSON escaping; arrays and grouped maps
 count their saved JSON text and retain only complete items. Grouped maps share one budget across
 all groups. Shortened fields keep their original types.</p>
-<p><code>presentation.truncated</code> contains <code>{field, total_lines, next_start, next_offset}</code> for each shortened
-field, reporting its total source lines and exact first unread position. <code>next_offset</code> is always
-numeric, including <code>0</code>. Finished jobs with incomplete captures include an <code>Output incomplete.</code>
-notice. These rules also apply after session resume and to completed remote jobs.</p>
+<p><code>presentation.truncated</code> contains <code>{field, total_lines, next_start, next_offset?}</code> for each
+shortened field, reporting its total source lines and exact first unread position. <code>next_offset</code>
+is present only when the first unread position is inside a line. Finished jobs with incomplete
+captures include an <code>Output incomplete.</code> notice. These rules also apply after session resume and to completed remote jobs.</p>
 <h2 id="script-result-presentation"><a class="header" href="#script-result-presentation">Script result presentation</a></h2>
-<p>The enclosing script’s <code>.result</code> is <code>{value, console, failure}</code>; silent scripts retain
-<code>console: ""</code>. Ordinary tools have no console field. Existing JobViews such as
+<p>The enclosing script’s <code>.result</code> is <code>{value, console?, failure?}</code>; silent scripts have no
+<code>console</code>. Ordinary tools have no console field. Existing JobViews such as
 <code>tool.jobs({job})</code> reads are not wrapped again.</p>
 <p>Presentation never changes the full saved return value. Default script output retrieval returns
 the composed script payload; explicit field selections read saved script data. Logging and
 returning the same data explicitly produces both outputs.</p>
 <h2 id="paging-and-searching"><a class="header" href="#paging-and-searching">Paging and searching</a></h2>
 <p>Explicit <code>jobs({job})</code> selections return a view whose <code>presentation.preview</code> defaults to
-100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is always returned in full.</p>
+100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is never truncated.</p>
 <pre><code class="language-js">// Read a selected part of a saved result.
 jobs({job:42, field:"/result/stdout", start:300, limit:80})
 // Search stored text, with surrounding context.
@@ -278,31 +279,31 @@ for larger lines; ordinary paging can still read those lines.</p>
 starting line (default 0). <code>limit</code> is 1–1000 returned source lines (default 100), including
 match context. <code>context</code> is 0–20 surrounding lines (default 0); positive context requires <code>pattern</code>.
 Output inspection returns immediately; it does not wait for new output.</p>
-<p>Explicit read pages contain <code>field</code> and <code>lines</code>, plus <code>total_lines</code> (which is <code>null</code> when
-unavailable) and a next position. <code>next_start</code> is <code>null</code> when no continuation remains, while
-<code>next_offset</code> is always present and numeric, including <code>0</code>.
-<code>lines</code> is an array of strings, one per returned line (or fragment of an oversized line),
-without per-line objects or match flags. Empty fields have zero lines;
+<p>Explicit read pages contain <code>lines</code>, plus <code>total_lines</code> (absent when unavailable) and a next
+position. <code>field</code> is omitted when it is the field the model asked for. <code>next_start</code> is absent when
+no continuation remains, and <code>next_offset</code> is present only when the next position is inside a
+line. <code>lines</code> has one entry per returned line (or fragment of an oversized line): a string for a
+plain read, and <code>{line, text}</code> with the one-based source line number for a search. Empty fields
+have zero lines;
 a final unterminated line counts, and a trailing newline does not add an empty line.
 Read pages and automatic string previews prefer whole lines; oversized lines are split at
 UTF-8 boundaries. The page byte budget may return fewer lines than <code>limit</code>: use the returned
 position instead of computing <code>start + limit</code>. Offsets beyond a line or inside a UTF-8
 character are rejected. A start past the available lines returns an empty page with the total.</p>
-<p>For closed fields, <code>next_start: null</code> means no selected content remains; <code>next_offset</code> remains
-numeric (usually <code>0</code>). For running fields, <code>total_lines</code> describes currently captured output and
+<p>For closed fields, a missing <code>next_start</code> means no selected content remains. For running fields, <code>total_lines</code> describes currently captured output and
 the numeric next position can be retried after yielding with <code>wait</code>, even when no content is
-currently available. Unavailable output uses <code>total_lines: null</code>; known empty output retains zero.
+currently available. Unavailable output omits <code>total_lines</code>; known empty output retains zero.
 Repeat the field, regex, and context when continuing a search; overlapping
 match context is reconstructed from saved text. Live searches defer incomplete lines and context
 windows until more output arrives or capture closes. A wait timeout never stops the original job.</p>
 <h2 id="persistence-and-live-output"><a class="header" href="#persistence-and-live-output">Persistence and live output</a></h2>
 <p>Reads are repeatable and survive session resume. Finished jobs with retained partial output have
 an <code>Output incomplete.</code> notice, including when viewing the final captured page.</p>
-<p>The view’s <code>presentation.captures</code> lists available captures, even without a structured result:</p>
-<pre><code class="language-json">[{"field":"/result/console","kind":"text","complete":false,"output":null}]
+<p>The view’s <code>presentation.captures</code> lists the available captures its result does not already show
+in full, even without a structured result:</p>
+<pre><code class="language-json">[{"field":"/result/console","complete":false}]
 </code></pre>
-<p><code>kind</code> is <code>text</code>, <code>json</code>, or <code>unknown</code>. <code>complete: false</code> means the capture is still live or
-incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
+<p><code>complete: false</code> means the capture is still live or incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
 Select a descriptor’s <code>field</code> to page or search its retained bytes. Capture descriptors survive
 failures, cancellation, and session resume even when there is no structured result containing
 those fields. Empty or absent result fields are not fabricated to represent partial captures.</p>

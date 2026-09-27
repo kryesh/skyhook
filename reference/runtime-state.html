@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -183,7 +183,8 @@
                         <h1 id="todos-and-runtime-state"><a class="header" href="#todos-and-runtime-state">Todos and runtime state</a></h1>
 <h2 id="todo-lists"><a class="header" href="#todo-lists">Todo lists</a></h2>
 <p>Every agent has an ordered advisory todo list. <code>todo()</code> reads the caller’s list;
-<code>todo({items:[...]})</code> replaces the whole list and returns <code>{updated:true}</code>; an empty array clears it.
+<code>todo({items:[...]})</code> replaces the whole list and completes without a result; an empty array
+clears it.
 Each item has <code>text</code> and a <code>status</code> of <code>pending</code>, <code>in_progress</code>, or <code>completed</code>. Multiple items may
 be in progress. Unfinished items do not prevent an agent from finishing.</p>
 <p>Any agent allowed to delegate can seed a child with <code>agent.todos</code>. The task <code>prompt</code> remains

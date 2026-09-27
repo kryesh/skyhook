@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -274,7 +274,8 @@ because options such as <code>ProxyCommand</code> can run commands. Configuratio
 commands.</p>
 <p>Passwords, key passphrases, keyboard-interactive challenges, host confirmations, and agent
 confirmations appear in Skyhook’s interface, including prompts from SSH started on a remote
-origin. Target configuration cannot enable prompts in a noninteractive session.
+origin; each names the target being connected to and, when it is remote, that origin.
+Target configuration cannot enable prompts in a noninteractive session.
 <code>skyhook batch</code> has no authentication prompts; invocations without an interactive terminal
 must use it and fail operations that require input; <code>--approve-all</code> does not approve
 authentication prompts. Secrets are never included in tool results or session logs.</p>

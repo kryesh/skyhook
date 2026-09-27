@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -199,7 +199,7 @@ server follows:</p>
 </thead>
 <tbody>
 <tr><td><code>compatible</code></td><td>any</td><td>Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only <code>base_url</code>. A key is sent as each API specifies: a bearer token, or <code>x-api-key</code> on <code>messages</code>.</td></tr>
-<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary: false</code> for an unverified organisation (Responses only), <code>organization</code>, <code>project</code>.</td></tr>
+<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary: unsupported</code> (default <code>requested</code>) for an unverified organisation (Responses only), <code>organization</code>, <code>project</code>.</td></tr>
 <tr><td><code>anthropic</code></td><td><code>messages</code></td><td><code>https://api.anthropic.com/v1</code>. Extra fields: <code>workspace_id</code>, <code>cache_ttl: "5m"</code> or <code>"1h"</code>.</td></tr>
 <tr><td><code>codex</code></td><td><code>responses</code></td><td>The ChatGPT subscription service; no <code>api_key</code>—run <code>skyhook auth login</code>. <code>base_url</code> defaults to <code>https://chatgpt.com/backend-api/codex</code> and the extra field <code>auth_url</code> to <code>https://auth.openai.com</code>; set them only for a mirror.</td></tr>
 <tr><td><code>openrouter</code></td><td>any</td><td><code>https://openrouter.ai/api/v1</code>. Reasoning effort and returned reasoning follow OpenRouter’s conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: <code>routing</code> (Chat only: <code>order</code>, <code>allow_fallbacks</code>, <code>require_parameters</code>, <code>data_collection: "allow"</code> or <code>"deny"</code>, <code>quantizations</code>, <code>zdr</code>, <code>fallback_models</code>) and <code>cache_ttl: "5m"</code> or <code>"1h"</code>. A response schema always sets <code>require_parameters</code>.</td></tr>
@@ -258,7 +258,8 @@ You can deliberately choose smaller budgets for cost, latency, or available memo
 it to the conversation.
 <code>persist</code> keeps each snapshot in the conversation. Use it for models that bind signed reasoning
 to the exact earlier conversation (such as Claude Fable 5.1), at the cost of keeping every snapshot in context until
-compaction. <code>none</code> sends no runtime state. See <a href="../reference/runtime-state.html">runtime state</a>
+compaction. <code>none</code> sends no runtime state, except to a compaction summary, which needs the
+current todo list to reconcile it. See <a href="../reference/runtime-state.html">runtime state</a>
 for what the model receives.</p>
 <p>The <a href="overview.html#complete-example">complete example</a> uses published hosted-model limits:</p>
 <div class="table-wrapper">
@@ -348,6 +349,10 @@ provider may have processed the interrupted request, and additional usage may be
 Usage reported before interruption is retained; unreported provider usage remains unknown.
 Retries also cannot guarantee that tools hosted by the provider will not repeat side effects.</p>
 <h2 id="reasoning-history-and-local-server-compatibility"><a class="header" href="#reasoning-history-and-local-server-compatibility">Reasoning history and local-server compatibility</a></h2>
+<p>On <code>chat_completions</code> and <code>responses</code>, a model’s <code>reasoning</code> is an effort level: <code>none</code>, <code>minimal</code>,
+<code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code> or <code>max</code>. On <code>messages</code> it is a thinking mode (<code>off</code> or <code>adaptive</code>)
+or an effort level under adaptive thinking: <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code> or <code>max</code>. A value the
+codec does not accept is refused when the configuration loads, with the accepted values listed.</p>
 <p>Responses and Codex automatically request reasoning summaries, even when no model <code>reasoning</code>
 effort is configured. Anthropic requests summarized thinking when <code>reasoning</code> enables thinking;
 with <code>reasoning</code> unset, the model’s default applies and may omit thinking text.

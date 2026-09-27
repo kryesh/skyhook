@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -432,6 +432,10 @@ The workspace path is centered in the top bar. The bottom bar shows the model ID
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
 (usually Shift-drag) and copy shortcut. Copy uses the terminal’s OSC 52 clipboard support. <code>@</code> or <code>Ctrl+X F</code> attaches a workspace file
 (press <code>Esc</code> to keep a typed <code>@</code>): image files attach as images and other files as text.
+The picker lists up to 10,000 workspace files by path, leaving out what Git and ripgrep would:
+hidden files and directories (including <code>.skyhook</code>), paths matched by <code>.gitignore</code> (in a Git
+repository or not), <code>.ignore</code> files, and Git’s global and repository excludes. It always skips
+<code>target</code> and <code>node_modules</code> directories, and does not follow symbolic links.
 Attachments are listed below the composer, and attached text is sent after the message. Pastes longer than 12 lines appear as inline items at the cursor. Type
 before, between, or after multiple paste items; move across, select, delete, and undo them as
 single editing units. Sending or copying expands their original contents in place. Shorter pastes
@@ -550,8 +554,9 @@ summary can still be incomplete or inaccurate.</p>
 <p>Invalid, truncated, cancelled, or unsaved summaries leave the preceding context and todos
 active. A summary that would not reduce context is skipped rather than installed. The terminal
 reports compaction start, estimated input reduction, skips, and failures without printing the
-summary. Eligible compaction failures have a bounded retry policy, separate from transient
-model failures, which retry until success or cancellation. See
+summary. Eligible compaction failures, such as a truncated or invalid summary, have a bounded
+retry policy, separate from transient model failures, which retry until success or
+cancellation. A refused or aborted summary is not retried. See
 <a href="#model-failure-recovery">model failure recovery</a>.</p>
 <p>For persistence and request reconstruction internals, see
 <a href="#library-architecture">library architecture</a> and
@@ -582,7 +587,7 @@ Process execution remains subject to confirmation on each invocation. These defa
 the CLI; <a href="#embedding">library hosts</a> can supply a different approval policy.</p>
 <p>Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
 queued job while authorization is pending. A denial preserves its reason and marks the rejected
-operation with <code>code: "permission_denied", executed: false</code>; it does not undo work that a
+operation with <code>code: "permission_denied"</code>; it does not undo work that a
 containing script already performed.
 Agents must not circumvent a denial through another tool or route. For programmatic failure
 handling, see the <a href="#responseunwrap-and-native-results">JavaScript response contract</a>.</p>
@@ -754,7 +759,8 @@ because options such as <code>ProxyCommand</code> can run commands. Configuratio
 commands.</p>
 <p>Passwords, key passphrases, keyboard-interactive challenges, host confirmations, and agent
 confirmations appear in Skyhook’s interface, including prompts from SSH started on a remote
-origin. Target configuration cannot enable prompts in a noninteractive session.
+origin; each names the target being connected to and, when it is remote, that origin.
+Target configuration cannot enable prompts in a noninteractive session.
 <code>skyhook batch</code> has no authentication prompts; invocations without an interactive terminal
 must use it and fail operations that require input; <code>--approve-all</code> does not approve
 authentication prompts. Secrets are never included in tool results or session logs.</p>
@@ -851,9 +857,9 @@ await tool.skill({ name: "release", path: "references/template.md" }); // Origin
 await tool.skill({ name: "release", path: "assets/logo.png" }); // Attached image
 </code></pre>
 <p>Results have a <code>kind</code> discriminator: <code>list</code>, <code>skill</code>, <code>directory</code>, <code>text</code>, <code>image</code>, or <code>binary</code>.
-Base skill results contain <code>name</code>, <code>description</code>, <code>location</code>, complete <code>content</code>, and an <code>assets</code>
-text tree that includes nested files but excludes the already-loaded root <code>SKILL.md</code>. Directory
-results use the same tree format, rooted at the selected path. Trees mark symlinks without
+Base skill results contain <code>location</code>, complete <code>content</code>, and, when the skill has other files, an
+<code>assets</code> text tree that includes nested files but excludes the already-loaded root <code>SKILL.md</code>.
+Directory results use the same tree format, rooted at the selected path. Trees mark symlinks without
 descending through them. Long trees and asset text are saved in full and can be paged using <code>jobs</code>.</p>
 <p>Text assets (including JSON, YAML, source code, and SVG) are returned unchanged, never executed.
 Supported raster images are attached with metadata. Other binary files return metadata rather
@@ -1066,7 +1072,7 @@ providers:
     api_key:
       env: "OPENAI_API_KEY"
     # Reasoning summaries need a verified OpenAI organisation:
-    # reasoning_summary: false
+    # reasoning_summary: unsupported
     # Published model limits; smaller budgets can be chosen for cost/latency.
     models:
       # https://developers.openai.com/api/docs/models/gpt-5.6-sol
@@ -1286,7 +1292,7 @@ server follows:</p>
 </thead>
 <tbody>
 <tr><td><code>compatible</code></td><td>any</td><td>Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only <code>base_url</code>. A key is sent as each API specifies: a bearer token, or <code>x-api-key</code> on <code>messages</code>.</td></tr>
-<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary: false</code> for an unverified organisation (Responses only), <code>organization</code>, <code>project</code>.</td></tr>
+<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary: unsupported</code> (default <code>requested</code>) for an unverified organisation (Responses only), <code>organization</code>, <code>project</code>.</td></tr>
 <tr><td><code>anthropic</code></td><td><code>messages</code></td><td><code>https://api.anthropic.com/v1</code>. Extra fields: <code>workspace_id</code>, <code>cache_ttl: "5m"</code> or <code>"1h"</code>.</td></tr>
 <tr><td><code>codex</code></td><td><code>responses</code></td><td>The ChatGPT subscription service; no <code>api_key</code>—run <code>skyhook auth login</code>. <code>base_url</code> defaults to <code>https://chatgpt.com/backend-api/codex</code> and the extra field <code>auth_url</code> to <code>https://auth.openai.com</code>; set them only for a mirror.</td></tr>
 <tr><td><code>openrouter</code></td><td>any</td><td><code>https://openrouter.ai/api/v1</code>. Reasoning effort and returned reasoning follow OpenRouter’s conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: <code>routing</code> (Chat only: <code>order</code>, <code>allow_fallbacks</code>, <code>require_parameters</code>, <code>data_collection: "allow"</code> or <code>"deny"</code>, <code>quantizations</code>, <code>zdr</code>, <code>fallback_models</code>) and <code>cache_ttl: "5m"</code> or <code>"1h"</code>. A response schema always sets <code>require_parameters</code>.</td></tr>
@@ -1345,7 +1351,8 @@ You can deliberately choose smaller budgets for cost, latency, or available memo
 it to the conversation.
 <code>persist</code> keeps each snapshot in the conversation. Use it for models that bind signed reasoning
 to the exact earlier conversation (such as Claude Fable 5.1), at the cost of keeping every snapshot in context until
-compaction. <code>none</code> sends no runtime state. See <a href="#todos-and-runtime-state">runtime state</a>
+compaction. <code>none</code> sends no runtime state, except to a compaction summary, which needs the
+current todo list to reconcile it. See <a href="#todos-and-runtime-state">runtime state</a>
 for what the model receives.</p>
 <p>The <a href="#complete-example">complete example</a> uses published hosted-model limits:</p>
 <div class="table-wrapper">
@@ -1435,6 +1442,10 @@ provider may have processed the interrupted request, and additional usage may be
 Usage reported before interruption is retained; unreported provider usage remains unknown.
 Retries also cannot guarantee that tools hosted by the provider will not repeat side effects.</p>
 <h2 id="reasoning-history-and-local-server-compatibility"><a class="header" href="#reasoning-history-and-local-server-compatibility">Reasoning history and local-server compatibility</a></h2>
+<p>On <code>chat_completions</code> and <code>responses</code>, a model’s <code>reasoning</code> is an effort level: <code>none</code>, <code>minimal</code>,
+<code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code> or <code>max</code>. On <code>messages</code> it is a thinking mode (<code>off</code> or <code>adaptive</code>)
+or an effort level under adaptive thinking: <code>low</code>, <code>medium</code>, <code>high</code>, <code>xhigh</code> or <code>max</code>. A value the
+codec does not accept is refused when the configuration loads, with the accepted values listed.</p>
 <p>Responses and Codex automatically request reasoning summaries, even when no model <code>reasoning</code>
 effort is configured. Anthropic requests summarized thinking when <code>reasoning</code> enables thinking;
 with <code>reasoning</code> unset, the model’s default applies and may omit thinking text.
@@ -1667,8 +1678,8 @@ The <a href="#built-in-tools">tool reference</a>, <a href="#http-requests-with-f
 <h1 id="jobs-and-agents"><a class="header" href="#jobs-and-agents">Jobs and agents</a></h1>
 <h2 id="delegation-and-child-input"><a class="header" href="#delegation-and-child-input">Delegation and child input</a></h2>
 <p>Child agents retain their conversation for follow-up work. Send instructions with
-<code>tool.job(id).send({value: instructions})</code>; the returned JobView’s payload includes
-<code>.result.accepted</code>. A running child receives the input at its next model-request boundary,
+<code>tool.job(id).send({value: instructions})</code>; the returned JobView completes, without a result,
+once the input is accepted. A running child receives the input at its next model-request boundary,
 without interrupting its current request or tools. Children do not need <code>receive()</code> for these
 updates.</p>
 <p>A retained child whose job is <code>completed</code>, <code>failed</code>, or <code>interrupted</code> resumes under the same
@@ -1680,18 +1691,17 @@ the child conversation and messages already delivered to the parent remain intac
 selecting them individually. A child-only retry leaves a parent waiting on work untouched and
 does not add a root model request. Retrying without an instruction continues the same history
 without adding a synthetic message.</p>
-<p>A background child’s visible text replies, including progress and final replies, arrive as
-message events without waiting for the child job to finish. Events carry <code>kind: "message"</code>,
-the child job <code>id</code>, source <code>message</code> sequence, optional <code>name</code>, and <code>text</code>. They reach the
-parent at a model-request boundary, not by interrupting an in-flight request. Pending messages
-survive session restart. Reading a background job’s output does not consume its message events.</p>
+<p>A child’s final reply is its job’s result. A background child’s earlier visible text replies
+arrive as message events without waiting for the child job to finish. Events carry
+<code>kind: "message"</code>, the child job <code>id</code>, optional <code>name</code>, and <code>text</code>.
+They reach the parent at a model-request boundary, not by interrupting an in-flight request.
+Pending messages survive session restart. Reading a background job’s output does not consume
+its message events.</p>
 <p>Message delivery does not mean the child has finished: completion also requires its owned work
-and queued inputs to be resolved. A completed background child’s notification references its
-<code>meta.last_message</code> instead of repeating the reply already delivered. Explicit <code>jobs({job})</code>
-reads and script calls still expose the saved final result; progress text is not concatenated
-into it. A foreground child returns its final reply in the call’s <code>.result</code>, with no progress
-or later message events. The parent cannot make another model request until its foreground
-calls return.</p>
+and queued inputs to be resolved. A completed background child’s notification carries the final
+reply in <code>.result</code>; earlier replies are not concatenated into it. A foreground child returns its
+final reply in the call’s <code>.result</code>, with no progress or later message events. The parent cannot
+make another model request until its foreground calls return.</p>
 <p>Child names are scoped to their caller: <code>A</code> and <code>B</code> may each create a child named <code>worker</code>, but
 all scripts owned by <code>A</code> share <code>A</code>’s child-name scope. A child retains its name even after
 termination; send follow-ups to its existing job instead of launching a duplicate. A failed
@@ -1729,8 +1739,9 @@ finish or cancel all owned jobs and descendants before their agent job completes
 may leave background services running after answering.</p>
 <h2 id="job-lifecycle-and-cancellation"><a class="header" href="#job-lifecycle-and-cancellation">Job lifecycle and cancellation</a></h2>
 <p>Background-capable tools accept an optional <code>bg</code> argument. Calls use the <a href="#jobview-response-contract">common JobView
-contract</a>; background launches have
-<code>result: null</code> and <code>has_result: false</code>, while loaded literal <code>null</code> results have <code>has_result: true</code>.
+contract</a>; a background launch reports
+the job as launched, <code>running</code> and without a <code>result</code>, even if it has already finished. A loaded
+literal <code>null</code> result is <code>result: null</code>.
 Cancellation returns target-job metadata in <code>.result</code>. A child
 question has <code>state: "waiting_input"</code>; <code>jobs({job})</code> returns its stable question IDs and text in
 <code>presentation.question</code>, regardless of its size.</p>
@@ -1911,7 +1922,8 @@ row, then totals per model and per tool.</p>
 <li><strong><code>markdown</code></strong> prints that document as Markdown headings and tables.</li>
 <li><strong><code>tree</code></strong> lists the agents as <code>tree</code> would, each line carrying that agent’s figures, followed
 by a one-line total.</li>
-<li><strong><code>json</code></strong> writes one JSON document with every figure: per agent, its outcome, start and
+<li><strong><code>json</code></strong> writes one JSON document with every figure: per agent, its outcome (a failure
+as <code>{"kind", "provider", "message"}</code>, with <code>provider</code> only for a provider failure), start and
 final finish times (a resumed child counts only its last completion),
 usage, request counts (requested, completed, failed, interrupted, attempts), compactions, jobs
 created by role, and calls, errors, and unanswered calls per tool; plus per-model and
@@ -1982,27 +1994,29 @@ Field-selected output is a job view, not a raw string: available text is in
 <code>presentation.preview.lines</code>, with pagination metadata alongside it. Field, pagination, and
 search selections omit image attachments; whole-output reads can attach saved images.</p>
 <h2 id="jobview-response-contract"><a class="header" href="#jobview-response-contract">JobView response contract</a></h2>
-<p>Direct model calls and JavaScript tool calls return the same seven-key <code>JobView</code> envelope. Its
-required keys and types are:</p>
-<pre><code class="language-text">id: number|null
-state: string
-has_result: boolean
-result: JSON
-error: string|null
-meta: null|JobMetadata
-presentation: null|Presentation
+<p>Direct model calls and JavaScript tool calls return the same <code>JobView</code> envelope:</p>
+<pre><code class="language-text">id?: number
+state?: string
+result?: JSON
+error?: string
+meta?: JobMetadata
+presentation?: Presentation
 </code></pre>
-<p><code>result</code> is the native tool payload (and may be a loaded literal <code>null</code>); <code>has_result</code> tells
-whether that payload is available. <code>meta</code> is <code>null</code> on an ordinary successful foreground call
-when no full metadata is needed. Background, status, inspection, and failure responses carry
-<code>meta</code> when available. It has nullable <code>parent</code>, <code>tool</code>, <code>name</code>, <code>target</code>, <code>workspace</code>,
-<code>last_message</code>, <code>code</code>, and <code>executed</code> fields. <code>target</code> is <code>null</code> when target capabilities are
-unavailable. A pre-admission failure can have <code>id: null</code>, as can a call the runtime could not
-make at all: a tool that is no longer available, or a call interrupted while the session was not
+<p>Tool results omit absent fields and empty lists at every level. JavaScript receives the same
+JSON, so an absent field is <code>undefined</code>, as <code>x?: T</code> means in TypeScript.</p>
+<p>A completed call with nothing more to read or resume (no truncation, page, capture, question,
+notice, or retained child that input resumes) omits <code>id</code> and <code>state</code>. <code>result</code> is the native tool payload. It is present exactly when the job
+has a result, and a loaded literal <code>null</code> result stays <code>result: null</code>. A tool with nothing to
+return, such as <code>tool.job(id).send</code>, completes without a result. <code>meta</code> is absent on an ordinary
+successful foreground call. Background handles, listings, inspections, and failures carry <code>meta</code>
+with what the caller does not already know: <code>tool</code> and <code>name</code> except in the response to the
+caller’s own foreground call, <code>parent</code>, <code>target</code>, and <code>workspace</code> only when they differ from the
+calling agent’s own, and <code>code</code> for a denial. A pre-admission failure lacks <code>id</code>, as does a call the runtime could not make
+at all: a tool that is no longer available, or a call interrupted while the session was not
 running, is answered with this same failure shape.</p>
-<p><code>presentation</code> is <code>null</code> when a successful foreground response has no truncation, page, capture,
+<p><code>presentation</code> is absent when a successful foreground response has no truncation, page, capture,
 question, or notice. When present, it groups <code>preview</code>, <code>truncated</code>, <code>captures</code>, <code>question</code>, and
-<code>notice</code>; empty or absent members use their nullable/empty defaults. Read a page as
+<code>notice</code>, each present only when it has content. Read a page as
 <code>r.presentation.preview.lines</code> and a question as <code>r.presentation.question</code>.
 Truncation entries keep their source paths rooted at <code>/result/...</code>.</p>
 <p>JavaScript receives complete data; model views may shorten fields as described in
@@ -2014,10 +2028,9 @@ Tool descriptions’ <code>Result</code> refers to the envelope’s <code>.resul
 <p>Use <code>response.unwrap()</code> synchronously when a completed native payload is needed:</p>
 <pre><code class="language-js">const data = (await tool.read({path: "README.md"})).unwrap();
 </code></pre>
-<p>It returns <code>response.result</code> only when <code>state: "completed"</code> and <code>has_result: true</code>, including a
-completed literal <code>null</code>. It throws for failed, pending, or result-unavailable responses; the
-thrown error has <code>error.response</code> containing the envelope and <code>error.output</code> equal to its
-<code>.result</code>. The method is non-enumerable and runtime-only: <code>Object.keys</code>, JSON serialization,
+<p>It returns <code>response.result</code> when the response is completed (an absent <code>state</code> means completed),
+or <code>null</code> when the job has no result, and throws for failed or pending responses; the thrown error has <code>error.response</code> containing the envelope and <code>error.output</code> equal to its
+<code>.result</code>, plus <code>error.job</code> and <code>error.code</code> when the response has an <code>id</code> or denial <code>code</code>. The method is non-enumerable and runtime-only: <code>Object.keys</code>, JSON serialization,
 logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
 <code>receive()</code> values are not decorated, and there is no built-in <code>tool.unwrap</code> helper.</p>
 <p><code>jobs({job})</code> reads already return views, so inspect their <code>presentation.preview</code>,
@@ -2028,9 +2041,9 @@ still throw.</p>
 typed arrays with <code>Array.from(bytes)</code>, <code>.toBase64()</code>, or <code>.toHex()</code>. The runtime does not provide
 Node.js APIs, <code>fetch</code>, <code>URL</code>, <code>TextEncoder</code>/<code>TextDecoder</code>, or <code>setTimeout</code>/<code>setInterval</code>.</p>
 <h2 id="script-results-and-failures"><a class="header" href="#script-results-and-failures">Script results and failures</a></h2>
-<p>Every script result payload is always <code>{value: &lt;JavaScript return&gt;, console: &lt;captured text&gt;, failure: null|JSON}</code>,
-including silent scripts (<code>console: ""</code>) and scripts without a return (<code>value: null</code>). <code>failure</code>
-is <code>null</code> on success. In a script JobView, the payload is at <code>/result</code> and its return is at
+<p>Every script result payload is <code>{value: &lt;JavaScript return&gt;, console?: &lt;captured text&gt;, failure?: &lt;details&gt;}</code>.
+Scripts without a return have <code>value: null</code>, silent scripts have no <code>console</code>, and <code>failure</code> is
+absent on success. In a script JobView, the payload is at <code>/result</code> and its return is at
 <code>/result/value</code>; logs are at <code>/result/console</code>.</p>
 <p><code>console.log(...values)</code> captures space-separated text, formatting objects as JSON. A running
 script’s captured text can be inspected with
@@ -2040,13 +2053,14 @@ available output; they do not subscribe to future writes or wait for script comp
 Automatic previews can truncate displayed text without discarding captured output; use
 <a href="#saved-job-output">paging or search</a> to inspect more. The <strong>16 MiB limit applies to JavaScript
 source</strong>, not console capture.</p>
-<p>On a script execution failure, the saved script payload is <code>{value: null, console: &lt;captured text&gt;, failure: &lt;details&gt;}</code>;
-the enclosing JobView is <code>failed</code> and also carries its <code>error</code>. Console text belongs to the script
-result, not job metadata.</p>
-<p>Failure details do not have a fixed <code>{message, stack}</code> shape. Error objects retain available
-<code>message</code>, <code>stack</code>, and <code>cause</code> fields, together with enumerable properties; other thrown values
-can produce primitive or array details. <code>failure</code> can also be <code>null</code> on a failed job, so use the
-enclosing JobView’s <code>state</code> and <code>error</code> to determine whether execution failed.</p>
+<p>On a script execution failure, the saved script payload is <code>{value: null, console?: &lt;captured text&gt;, failure?: &lt;details&gt;}</code>;
+the enclosing JobView is <code>failed</code> and carries its <code>error</code>: the thrown error’s message and stack,
+or the JSON of any other thrown value. Console text belongs to the script result, not job
+metadata.</p>
+<p><code>failure</code> holds a thrown error’s other properties: its <code>cause</code> and enumerable properties, such as
+the <code>job</code> and <code>code</code> of an unwrapped failed response, whose full view <code>tool.jobs({job})</code> reads.
+It is absent when there are none, so use the enclosing JobView’s <code>state</code> and <code>error</code> to determine
+whether execution failed. Automatic previews can shorten it.</p>
 <p>A top-level <code>undefined</code> becomes JSON <code>null</code>; nested <code>undefined</code> is not coerced or removed and
 causes serialization failure.</p>
 <h2 id="builder-execution-and-policy"><a class="header" href="#builder-execution-and-policy">Builder execution and policy</a></h2>
@@ -2183,9 +2197,10 @@ Do not combine <code>auth</code> with an <code>Authorization</code> header or em
 <p>Multipart form-data encoding is not supported. File bodies can set their media type through the
 <code>Content-Type</code> request header; they are not interchangeable with multipart uploads.</p>
 <h2 id="responses-and-extraction"><a class="header" href="#responses-and-extraction">Responses and extraction</a></h2>
-<p>Responses include final URL/method, status, <code>ok</code> (2xx), redirect history, received byte count,
-elapsed time, and a tagged <code>body</code>: <code>text</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Response <code>headers</code> is
-<code>null</code> by default; set <code>include_headers: true</code> to return a map of repeated header values.
+<p>Responses include the status, the received byte count (<code>size</code>), the elapsed milliseconds
+(<code>duration</code>), and a tagged <code>body</code>: <code>text</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Followed redirects add
+their history (<code>redirects</code>), whose last <code>location</code> is the final URL. Response <code>headers</code> is absent
+by default; set <code>include_headers: true</code> to return a map of repeated header values.
 This option does not affect the <code>headers</code> request-header map.
 JSON responses remain decoded text; scripts can use <code>JSON.parse(response.body.text)</code>.
 <code>response_format</code> defaults to <code>auto</code> (text for textual content, base64 otherwise); <code>text</code> forces
@@ -2197,8 +2212,8 @@ retrieve the complete saved payload using <code>jobs({job})</code> fields <code>
 <code>/result/body/data</code>. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
 calls still receive the complete payload for processing.</p>
 <p><code>text:true</code> is separate from <code>response_format:"text"</code>: it extracts readable article content from
-HTML, returning plain text and metadata identifying the extraction engine and title, plus byline,
-excerpt, site name, and language when available.
+HTML, returning plain text and metadata with the title, plus byline, site name, and language when
+available.
 It does not execute JavaScript or fetch linked assets. Plain text, JSON, and other textual types
 pass through decoded; binary content is not converted. Extraction failures are explicit, never
 silently replaced with raw HTML. Fetch with <code>text:false</code> to inspect the original response. Empty
@@ -2214,10 +2229,10 @@ rather than reporting an incomplete body as successful. Model-visible preview tr
 independent: retrieve saved results with <code>jobs({job})</code>. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.</p>
 <p>Transport and processing failures remain failed jobs and failed JobViews (not rejected
-operational script calls), but include a structured failure result. It contains <code>method</code>, a safe
-<code>origin</code>, <code>elapsed_ms</code>, <code>received_bytes</code>, redirect history, and <code>diagnostic</code>: <code>phase</code>, <code>error_kind</code>,
-and a concise <code>message</code>. When available, <code>diagnostic.os_error</code> supplies the executing platform,
-a numeric OS <code>code</code>, and a portable <code>kind</code>.
+operational script calls). The error names the method, a safe origin, a concise message and the
+elapsed time; the structured failure result contains <code>duration</code>, <code>size</code> once bytes were received,
+redirect history, and <code>diagnostic.error_kind</code>. When available, <code>diagnostic.os_error</code> supplies the
+executing platform, a numeric OS <code>code</code>, and a portable <code>kind</code>.
 Timeouts include <code>diagnostic.timeout.kind</code> (<code>total</code>, <code>connect</code>, or <code>unknown</code>) and a <code>limit_ms</code> only
 when the expiring limit is known. Timing starts inside fetch on the execution target; it does not
 include SSH startup or initial tool approval.</p>
@@ -2228,11 +2243,11 @@ firewall caused an error. Diagnostic messages do not copy arbitrary error string
 credentials, headers, or bodies. Failure URL/redirect context is reduced to origins. Received HTTP
 headers are included only with <code>include_headers: true</code>; they retain their normal response semantics
 and may still contain sensitive response data.
-<code>proxy_origin</code>, when non-null, describes an explicit proxy; <code>null</code> does not rule out an
+<code>proxy_origin</code>, when present, describes an explicit proxy; its absence does not rule out an
 environment proxy. Use the job’s target for source attribution, and interpret OS codes using the reported platform.</p>
 <p>If headers arrived before a failure (including an outer timeout), the failure retains the
-HTTP status, <code>ok</code>, and byte count, plus headers when <code>include_headers: true</code>; known fields retain
-null/default values when unavailable. HTTP 4xx/5xx responses still complete normally: a 405
+HTTP status and byte count, plus headers when <code>include_headers: true</code>; unavailable fields are
+absent. HTTP 4xx/5xx responses still complete normally: a 405
 establishes HTTP connectivity, not successful ingestion. Permission denial and cancellation
 retain their separate semantics.</p>
 <p>In scripts, operational fetch failures are failed JobViews rather than rejected promises. Inspect
@@ -2244,7 +2259,7 @@ if (response.state === "failed") {
     target,
     http_reached: Number.isInteger(failure.status),
     status: failure.status ?? null,
-    elapsed_ms: failure.elapsed_ms ?? null,
+    duration: failure.duration ?? null,
     diagnostic: failure.diagnostic ?? null,
     error: response.error,
   };
@@ -2278,26 +2293,27 @@ sets. There is no configured capture-size cap or automatic eviction; storage fai
 as failures, with retained partial output marked incomplete.</p>
 <h2 id="tool-result-shapes"><a class="header" href="#tool-result-shapes">Tool result shapes</a></h2>
 <p>See the <a href="#jobview-response-contract">JavaScript JobView response contract</a> for the
-seven-key envelope, metadata, presentation group, <code>has_result</code>, and <code>unwrap()</code> behavior. This page
+envelope, metadata, presentation group, and <code>unwrap()</code> behavior. This page
 focuses on saved output and the task-specific payloads below. A failed or pending view remains an
 ordinary response.</p>
 <p>Search and glob patterns filter eligible files without overriding hidden-file or ignore settings.
-Nulls in tool payloads and metadata are preserved; known empty/default output fields do not disappear.
-Process results always contain <code>exit_code: number|null</code>, <code>stdout: string</code>, <code>stderr: string</code>, and
-<code>timed_out: boolean</code>, including empty streams and a false timeout flag. Completed agent calls return
-their complete answer string without automatic truncation. Child questions return <code>{questions:[{id,prompt,options?}]}</code>.</p>
+Nulls in tool payloads are preserved; fields a tool has no value for are absent.
+Process results contain <code>exit_code</code>, or <code>signal</code> when a signal killed the process, and the
+<code>stdout</code> and <code>stderr</code> streams that produced output; scripts read an absent stream as <code>""</code>.
+Completed agent calls return their complete answer string without automatic truncation. Child questions return <code>{questions:[{id,prompt,options?}]}</code>.</p>
 <p>Directory reads return grouped entries with file sizes, for example:
-<code>{kind:"directory",path:"src",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"],symlinks:[],other:[]}}</code>.
-Groups are <code>files</code>, <code>directories</code>, <code>symlinks</code>, and <code>other</code>, with sorted names; known empty groups
-remain present. <code>read({path:"src",details:true})</code> returns flat <code>{name,kind,bytes?}</code> entries; regular files include sizes in both forms.
+<code>{kind:"directory",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}</code>.
+Groups are <code>files</code>, <code>directories</code>, <code>symlinks</code>, and <code>other</code>, with sorted names; empty <code>symlinks</code> and
+<code>other</code> groups are absent, and scripts read them as <code>[]</code>.
+<code>read({path:"src",details:true})</code> returns flat <code>{name,kind,bytes?}</code> entries; regular files include sizes in both forms.
 Missing paths and operating-system access denials from <code>read</code> are successful tool results with
-<code>{kind:"error", path, error:{code:"not_found"|"permission_denied", message}}</code>, so workflows can inspect the
+<code>{kind:"error", error:{code:"not_found"|"permission_denied", message}}</code>, so workflows can inspect the
 error without catching an exception. Tool-policy permission denials remain tool errors.
 Search returns <code>{matches:{"src/main.rs":["12: matching text"]}}</code>, preserving source whitespace.
 <code>search({pattern:"...",details:true})</code> returns structured <code>{path,line,column,text}</code> matches instead.
 An empty search result has <code>matches: {}</code>. Grouped maps share a single preview budget.
-<code>targets({details:true})</code> returns full target metadata. Defaults and <code>target_add</code> retain their documented
-fields and populate known name/type/host/workspace/via/origin metadata; fields are null only when genuinely unavailable.
+<code>targets({details:true})</code> returns full target metadata; fields a target does not set are absent.
+<code>target_add</code> completes without a result.
 All defaulted input fields, including <code>details: false</code>, are optional in tool schemas.</p>
 <p>By default, hidden entries (including <code>.git</code>) and ignored files are excluded. <code>hidden: true</code>
 includes hidden entries, while <code>no_ignore: true</code> independently disables ignore files. Searches
@@ -2335,20 +2351,20 @@ is no aggregate response-size limit or whole-result fallback.</p>
 is reached first. Strings count UTF-8 content bytes before JSON escaping; arrays and grouped maps
 count their saved JSON text and retain only complete items. Grouped maps share one budget across
 all groups. Shortened fields keep their original types.</p>
-<p><code>presentation.truncated</code> contains <code>{field, total_lines, next_start, next_offset}</code> for each shortened
-field, reporting its total source lines and exact first unread position. <code>next_offset</code> is always
-numeric, including <code>0</code>. Finished jobs with incomplete captures include an <code>Output incomplete.</code>
-notice. These rules also apply after session resume and to completed remote jobs.</p>
+<p><code>presentation.truncated</code> contains <code>{field, total_lines, next_start, next_offset?}</code> for each
+shortened field, reporting its total source lines and exact first unread position. <code>next_offset</code>
+is present only when the first unread position is inside a line. Finished jobs with incomplete
+captures include an <code>Output incomplete.</code> notice. These rules also apply after session resume and to completed remote jobs.</p>
 <h2 id="script-result-presentation"><a class="header" href="#script-result-presentation">Script result presentation</a></h2>
-<p>The enclosing script’s <code>.result</code> is <code>{value, console, failure}</code>; silent scripts retain
-<code>console: ""</code>. Ordinary tools have no console field. Existing JobViews such as
+<p>The enclosing script’s <code>.result</code> is <code>{value, console?, failure?}</code>; silent scripts have no
+<code>console</code>. Ordinary tools have no console field. Existing JobViews such as
 <code>tool.jobs({job})</code> reads are not wrapped again.</p>
 <p>Presentation never changes the full saved return value. Default script output retrieval returns
 the composed script payload; explicit field selections read saved script data. Logging and
 returning the same data explicitly produces both outputs.</p>
 <h2 id="paging-and-searching"><a class="header" href="#paging-and-searching">Paging and searching</a></h2>
 <p>Explicit <code>jobs({job})</code> selections return a view whose <code>presentation.preview</code> defaults to
-100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is always returned in full.</p>
+100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is never truncated.</p>
 <pre><code class="language-js">// Read a selected part of a saved result.
 jobs({job:42, field:"/result/stdout", start:300, limit:80})
 // Search stored text, with surrounding context.
@@ -2369,31 +2385,31 @@ for larger lines; ordinary paging can still read those lines.</p>
 starting line (default 0). <code>limit</code> is 1–1000 returned source lines (default 100), including
 match context. <code>context</code> is 0–20 surrounding lines (default 0); positive context requires <code>pattern</code>.
 Output inspection returns immediately; it does not wait for new output.</p>
-<p>Explicit read pages contain <code>field</code> and <code>lines</code>, plus <code>total_lines</code> (which is <code>null</code> when
-unavailable) and a next position. <code>next_start</code> is <code>null</code> when no continuation remains, while
-<code>next_offset</code> is always present and numeric, including <code>0</code>.
-<code>lines</code> is an array of strings, one per returned line (or fragment of an oversized line),
-without per-line objects or match flags. Empty fields have zero lines;
+<p>Explicit read pages contain <code>lines</code>, plus <code>total_lines</code> (absent when unavailable) and a next
+position. <code>field</code> is omitted when it is the field the model asked for. <code>next_start</code> is absent when
+no continuation remains, and <code>next_offset</code> is present only when the next position is inside a
+line. <code>lines</code> has one entry per returned line (or fragment of an oversized line): a string for a
+plain read, and <code>{line, text}</code> with the one-based source line number for a search. Empty fields
+have zero lines;
 a final unterminated line counts, and a trailing newline does not add an empty line.
 Read pages and automatic string previews prefer whole lines; oversized lines are split at
 UTF-8 boundaries. The page byte budget may return fewer lines than <code>limit</code>: use the returned
 position instead of computing <code>start + limit</code>. Offsets beyond a line or inside a UTF-8
 character are rejected. A start past the available lines returns an empty page with the total.</p>
-<p>For closed fields, <code>next_start: null</code> means no selected content remains; <code>next_offset</code> remains
-numeric (usually <code>0</code>). For running fields, <code>total_lines</code> describes currently captured output and
+<p>For closed fields, a missing <code>next_start</code> means no selected content remains. For running fields, <code>total_lines</code> describes currently captured output and
 the numeric next position can be retried after yielding with <code>wait</code>, even when no content is
-currently available. Unavailable output uses <code>total_lines: null</code>; known empty output retains zero.
+currently available. Unavailable output omits <code>total_lines</code>; known empty output retains zero.
 Repeat the field, regex, and context when continuing a search; overlapping
 match context is reconstructed from saved text. Live searches defer incomplete lines and context
 windows until more output arrives or capture closes. A wait timeout never stops the original job.</p>
 <h2 id="persistence-and-live-output"><a class="header" href="#persistence-and-live-output">Persistence and live output</a></h2>
 <p>Reads are repeatable and survive session resume. Finished jobs with retained partial output have
 an <code>Output incomplete.</code> notice, including when viewing the final captured page.</p>
-<p>The view’s <code>presentation.captures</code> lists available captures, even without a structured result:</p>
-<pre><code class="language-json">[{"field":"/result/console","kind":"text","complete":false,"output":null}]
+<p>The view’s <code>presentation.captures</code> lists the available captures its result does not already show
+in full, even without a structured result:</p>
+<pre><code class="language-json">[{"field":"/result/console","complete":false}]
 </code></pre>
-<p><code>kind</code> is <code>text</code>, <code>json</code>, or <code>unknown</code>. <code>complete: false</code> means the capture is still live or
-incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
+<p><code>complete: false</code> means the capture is still live or incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
 Select a descriptor’s <code>field</code> to page or search its retained bytes. Capture descriptors survive
 failures, cancellation, and session resume even when there is no structured result containing
 those fields. Empty or absent result fields are not fabricated to represent partial captures.</p>
@@ -2411,7 +2427,8 @@ they are not regenerated from saved output.</p>
 <h1 id="todos-and-runtime-state"><a class="header" href="#todos-and-runtime-state">Todos and runtime state</a></h1>
 <h2 id="todo-lists"><a class="header" href="#todo-lists">Todo lists</a></h2>
 <p>Every agent has an ordered advisory todo list. <code>todo()</code> reads the caller’s list;
-<code>todo({items:[...]})</code> replaces the whole list and returns <code>{updated:true}</code>; an empty array clears it.
+<code>todo({items:[...]})</code> replaces the whole list and completes without a result; an empty array
+clears it.
 Each item has <code>text</code> and a <code>status</code> of <code>pending</code>, <code>in_progress</code>, or <code>completed</code>. Multiple items may
 be in progress. Unfinished items do not prevent an agent from finishing.</p>
 <p>Any agent allowed to delegate can seed a child with <code>agent.todos</code>. The task <code>prompt</code> remains
@@ -2673,7 +2690,7 @@ would look like the user speaking again after every tool call.</p>
 <ol>
 <li>At a request boundary, the runtime applies accepted input and model/mode selections, refreshes
 history from the journal, and builds the request. Shared settings are recorded in
-<code>model_context</code>; <code>model_requested</code> freezes the exact history references and inline tail.</li>
+<code>model_context</code>; <code>model_requested</code> freezes the exact history range and inline tail.</li>
 <li>Each provider invocation gets a <code>model_attempt_started</code> record for that logical request.
 The stream carries display-only <code>Delta</code>s for blocks, cumulative <code>Usage</code> snapshots, and one
 terminal <code>End</code> holding the <code>Completion</code>: the complete items in position order and how the
@@ -2689,10 +2706,16 @@ after a crash without making completion order part of the next model request.</l
 <li>Once a tool exchange is closed, the runtime can compact history or build the next request.
 An agent with no further work returns to its idle loop rather than discarding its context.</li>
 </ol>
-<p>Hosts fold these records into one <code>RequestPhase</code> per request in <code>session::RequestLedger</code>;
-session statistics and the terminal interface read request outcomes, retry state, and
-message attribution from that fold rather than deriving them from live activity. Folding a
-record reports the requests it changed, so a host can refresh just those.</p>
+<p><code>session::RequestLedger</code> folds these records into one <code>RequestPhase</code> per request, the only fold of
+the request lifecycle. Observation snapshots embed it, and session statistics, resume settlement
+(open attempts to interrupt) and the terminal interface read request outcomes, retry state, usage
+and message attribution from it. Folding a record reports the requests it changed, and the ledger
+lists the requests changed after a given record, so a host folding records incrementally refreshes
+just those. Interrupt and continue read each agent loop’s own turn state instead: idle,
+busy, parked after a failed or interrupted turn, when only new input resumes it and job
+notifications wait for that input’s request, or held: interrupted while waiting on retained
+children, which <code>continue</code> restarts together with it. The host’s observation is a display, never an
+input to that decision.</p>
 <p>Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized <code>ProviderErrorKind</code> values rather than error-message text: rate limits, timeouts,
 transport failures, and unavailable servers repeat the frozen logical request. Input
@@ -2704,7 +2727,8 @@ usage. A stream that fails or closes before its end never authorizes tool execut
 transient recovery does not rerun completed tools. An expired command-sourced credential is
 transient: the provider discards it on a 401 and the retry fetches a fresh one. Other
 authentication failures, invalid requests, and protocol errors do not enter this retry loop.
-Context-window recovery and invalid compaction summaries have their own bounded recovery path.</p>
+Context-window recovery and unusable compaction summaries have their own bounded recovery path;
+a checkpoint that breaks a journal invariant is not retried.</p>
 <p>A refusal cut fails without committing the refused message; an abort cut can retain completed
 safe content but still fails the turn. Any other response with neither nonblank text nor a tool
 call fails with nothing committed: <code>OutputLimit</code> when cut at the output limit, <code>Empty</code> otherwise.
@@ -2724,19 +2748,28 @@ summary or today’s renderer. See <a href="#reconstructing-model-calls">model-c
 for the durable reference contract.</p>
 <h2 id="tools-jobs-and-execution"><a class="header" href="#tools-jobs-and-execution">Tools, jobs, and execution</a></h2>
 <p><code>ToolRegistryBuilder</code> supports typed and JSON-based registrations. Typed registrations generate
-input and output schemas; registry metadata also supplies compact result documentation to the
-model and JavaScript runtime. Both call paths use the same executor, capability checks,
-authorization coordinator, and job supervision rather than separate tool implementations.
-A tool’s argument checks (validation, path arguments, derived permissions) receive its parsed
-input and run before authorization. The host planner and a remote worker assemble an
-invocation’s permissions by one rule, and a capability the caller lacks makes the tool
-unavailable rather than denied.</p>
+input and output schemas, and a unit registration completes its job without a result;
+registry metadata also supplies compact result documentation to the model
+and JavaScript runtime. Both call paths use the same executor, capability checks, authorization
+coordinator, and job supervision rather than separate tool implementations. Every call is admitted
+once, before authorization: a typed registration may declare an admission step that turns its
+parsed input into the value its handler receives, so its checks run at the boundary rather than in
+the handler. The admitted value names its path arguments, which are resolved in place, and derives
+its permissions, so an inadmissible call never asks for approval. Path admission (<code>tool::path</code>)
+resolves a requested path where the call runs: relative to the workspace, through existing
+symbolic links, as the tool will use it (an existing entry, a write target, or a removal). The
+resolved path, not the spelling the caller gave, is what the call asks permission for, over the
+exact file or a directory’s descendants. The host planner and a remote worker assemble an
+invocation’s permissions by one rule, and a capability the caller lacks makes the tool unavailable
+rather than denied.</p>
 <p>The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
 (queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
 are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
 its startup stage carries a job from creation to its running worker. A tool may declare a source argument, a
 <code>TargetPath</code> on any target: the executor selects its location like a tool target, authorizes the
-read with the call, and opens it for the call’s context. Remote contents stream in chunks through the
+read with the call, and opens it for the call’s context. A host tool whose input places its job
+elsewhere, such as a child agent’s target and workspace, has that location selected before the job
+exists, so every view of the job reports it. Remote contents stream in chunks through the
 host, spooled to anonymous files: a remote file through its worker’s source request, which the
 worker authorizes and reports as the consuming tool, and to a remote handler before its call starts. The local invocation layer
 admits typed arguments and runs operations without requiring a session database. The SSH shim reuses that layer
@@ -2774,12 +2807,14 @@ the model. See <a href="#saved-job-output">saved job output</a> for the user-fac
 then commit them to the parent’s history together with their acknowledgment. Abandoned preparation leaves the
 events pending; cancellation cannot split an accepted commit from its acknowledgment. Replay
 recovers pending child messages from durable history, independently of output inspection.</p>
-<p>Process tools never connect stdin, and capture stdout/stderr. Without the <code>Interactive</code> capability, they
-also detach from the controlling terminal on Unix and replace inherited askpass settings with a
-rejecting helper. Redirecting stdio alone is insufficient: a program could still prompt through
+<p>Process tools never connect stdin, and capture stdout/stderr. Without the <code>Interactive</code> capability,
+they also detach from the controlling terminal on Unix and replace inherited askpass settings with
+a rejecting helper. Redirecting stdio alone is insufficient: a program could still prompt through
 <code>/dev/tty</code>. The helper remains alive through process cleanup, independently of whether target
-management is enabled. SSH’s host-mediated prompt channel is described under
-<a href="#authentication-and-prompt-isolation">authentication and prompt isolation</a>.</p>
+management is enabled. OpenSSH runs a Skyhook binary as its askpass helper, so every binary calls
+<code>remote::askpass_main()</code> first: it answers the prompt and exits when started in that role and
+returns otherwise. SSH’s host-mediated prompt channel is described under <a href="#authentication-and-prompt-isolation">authentication and prompt
+isolation</a>.</p>
 <h2 id="durability-and-resume"><a class="header" href="#durability-and-resume">Durability and resume</a></h2>
 <p>Each durable session uses one SQLite database, <code>session.db</code>. The event ledger is append-only and
 normalized; blobs, job results, and line-addressable captures share the database rather than
@@ -2847,6 +2882,8 @@ boundary. Apply updates to the snapshot in revision order with <code>Observation
 It contains:</p>
 <ul>
 <li>Durable records keyed by their original journal sequence.</li>
+<li>The request ledger: each logical request’s lifecycle phase, outcome, and usage, folded from
+those records. Host statistics and displays read request state from it.</li>
 <li>Request-scoped live responses keyed by agent and logical request: their streamed blocks in
 arrival order, then the authoritative blocks once the response has ended.</li>
 <li>Current agent activity and context-usage estimates.</li>
@@ -2861,7 +2898,7 @@ separate operation that requests cancellation. <code>startup_warnings</code>, <c
 expose startup diagnostics and MCP discovery outcomes without inserting diagnostics into model
 context or writing directly to a terminal. <code>record_status</code> likewise records host-facing status,
 not a user message.</p>
-<p><code>TodoItem</code>, <code>TodoStatus</code>, and <code>TodoSnapshot</code> are exported by <code>skyhook::agent</code>. Hosts projecting
+<p><code>TodoItem</code> and <code>TodoStatus</code> are exported by <code>skyhook::agent</code>. Hosts projecting
 checklists from observed records apply <code>SessionEvent::TodosReplaced</code> and the reconciled todos in
 <code>SessionEvent::Compaction</code> checkpoints in sequence. Both replace the owning agent’s entire list;
 child-agent lists remain independent.</p>
@@ -2875,9 +2912,10 @@ not imply that a waiting or live root also ran. <code>continue_turn</code> uses 
 the root answer, or an empty string when there is none.</p>
 <p>Use <code>Harness::resume_session</code> to reopen durable state. The runtime reconciles interrupted work
 before starting agents and opens fresh provider contexts; it does not reuse old network resources.
+A root turn that failed or was interrupted before the session closed can still be continued.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.</p>
-<p>Session databases use format 14. Earlier formats are not migrated and cannot be resumed with
+<p>Session databases use format 15. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
@@ -2889,8 +2927,9 @@ that append before dropping the session/store owner.</p>
 <code>HarnessBuilder::shim_catalog</code> to enable remote execution. The CLI supplies its own catalog, but
 library hosts do not inherit the CLI’s artifacts.</p>
 <p><code>EmbeddedShimCatalog::from_embedded_assets</code> accepts names of the form <code>platform-protocol-arch</code>
-(for example, <code>linux-ssh-aarch64</code>) and artifact bytes. Selection uses the destination’s protocol,
-platform, and architecture. A missing matching artifact produces an explicit deployment error.
+(for example, <code>linux-ssh-aarch64</code>) and a loader that returns a named artifact’s bytes, called only
+for the artifact being deployed. Selection uses the destination’s protocol, platform, and
+architecture. A missing matching artifact produces an explicit deployment error.
 See <a href="#remote-transport-and-shims">remote transport and shims</a> for build, packaging, and deployment
 behavior.</p>
 <h2 id="reading-a-session-archive"><a class="header" href="#reading-a-session-archive">Reading a session archive</a></h2>
@@ -2909,8 +2948,9 @@ and optional response schema. Its <code>template()</code> derives the history-fr
 including the model ID, reasoning setting, and output limit. Context records describe request
 settings, not the lifetime of a <code>ProviderContext</code> resource.</li>
 <li><code>model_requested</code> identifies one frozen logical request before its first invocation. It references
-the context record and stores the checkpoint it opens with, <code>history</code> as ordered source-event
-sequences, <code>tail</code> as exact inline messages, and <code>history_lifetime</code>. Retries refer back to this
+the context record and stores the checkpoint it opens with, its history as the agent’s commits
+through a message sequence, <code>tail</code> as exact inline messages, and
+<code>history_lifetime</code>. Retries refer back to this
 request using <code>model_attempt_started</code>, with separate failure/interruption or completion outcomes.
 Ordinary requests reuse a context record while their settings remain applicable; summarization
 has a separate context with its structured response schema.</li>
@@ -2928,9 +2968,11 @@ requests and failed attempts.</li>
 </ul>
 <p><code>session::reconstruct_model_request(&amp;records, sequence)</code> returns the <code>provider/model</code> name the
 request was issued under and the reconstructed <code>ModelRequest</code> for a <code>model_requested</code> sequence,
-using sequence-ordered records from <code>SessionStore</code>. Attachments and tool images reference
-content-addressed blobs by SHA-256; <code>load_blobs(&amp;mut request).await</code> on an owning <code>SessionStore</code>
-loads their contents for provider encoding; unlike <code>read_records</code>, opening a store acquires the
+using sequence-ordered records from <code>SessionStore</code>. It checks the request’s context, checkpoint
+and history bound as an append does, so other records fail with a <code>ReplayError</code>. Attachments and
+tool images reference content-addressed blobs by SHA-256; <code>load_blobs(&amp;mut request, &amp;mut cache)</code>
+on an owning <code>SessionStore</code> loads their contents for provider encoding, reusing and then keeping
+exactly this request’s blobs in <code>cache</code>; unlike <code>read_records</code>, opening a store acquires the
 session’s writer lock. Reconstruction reproduces Skyhook’s provider-neutral input, not an
 API-specific wire encoding or a replay of the external call.</p>
 <p>The <code>ModelRequest</code> contract preserves the history/tail split and <code>history_lifetime</code> cache hints.

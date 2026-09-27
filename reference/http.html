@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -240,9 +240,10 @@ Do not combine <code>auth</code> with an <code>Authorization</code> header or em
 <p>Multipart form-data encoding is not supported. File bodies can set their media type through the
 <code>Content-Type</code> request header; they are not interchangeable with multipart uploads.</p>
 <h2 id="responses-and-extraction"><a class="header" href="#responses-and-extraction">Responses and extraction</a></h2>
-<p>Responses include final URL/method, status, <code>ok</code> (2xx), redirect history, received byte count,
-elapsed time, and a tagged <code>body</code>: <code>text</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Response <code>headers</code> is
-<code>null</code> by default; set <code>include_headers: true</code> to return a map of repeated header values.
+<p>Responses include the status, the received byte count (<code>size</code>), the elapsed milliseconds
+(<code>duration</code>), and a tagged <code>body</code>: <code>text</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Followed redirects add
+their history (<code>redirects</code>), whose last <code>location</code> is the final URL. Response <code>headers</code> is absent
+by default; set <code>include_headers: true</code> to return a map of repeated header values.
 This option does not affect the <code>headers</code> request-header map.
 JSON responses remain decoded text; scripts can use <code>JSON.parse(response.body.text)</code>.
 <code>response_format</code> defaults to <code>auto</code> (text for textual content, base64 otherwise); <code>text</code> forces
@@ -254,8 +255,8 @@ retrieve the complete saved payload using <code>jobs({job})</code> fields <code>
 <code>/result/body/data</code>. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
 calls still receive the complete payload for processing.</p>
 <p><code>text:true</code> is separate from <code>response_format:"text"</code>: it extracts readable article content from
-HTML, returning plain text and metadata identifying the extraction engine and title, plus byline,
-excerpt, site name, and language when available.
+HTML, returning plain text and metadata with the title, plus byline, site name, and language when
+available.
 It does not execute JavaScript or fetch linked assets. Plain text, JSON, and other textual types
 pass through decoded; binary content is not converted. Extraction failures are explicit, never
 silently replaced with raw HTML. Fetch with <code>text:false</code> to inspect the original response. Empty
@@ -271,10 +272,10 @@ rather than reporting an incomplete body as successful. Model-visible preview tr
 independent: retrieve saved results with <code>jobs({job})</code>. Cancellation and timeouts cannot undo
 server-side effects, and requests are not automatically retried.</p>
 <p>Transport and processing failures remain failed jobs and failed JobViews (not rejected
-operational script calls), but include a structured failure result. It contains <code>method</code>, a safe
-<code>origin</code>, <code>elapsed_ms</code>, <code>received_bytes</code>, redirect history, and <code>diagnostic</code>: <code>phase</code>, <code>error_kind</code>,
-and a concise <code>message</code>. When available, <code>diagnostic.os_error</code> supplies the executing platform,
-a numeric OS <code>code</code>, and a portable <code>kind</code>.
+operational script calls). The error names the method, a safe origin, a concise message and the
+elapsed time; the structured failure result contains <code>duration</code>, <code>size</code> once bytes were received,
+redirect history, and <code>diagnostic.error_kind</code>. When available, <code>diagnostic.os_error</code> supplies the
+executing platform, a numeric OS <code>code</code>, and a portable <code>kind</code>.
 Timeouts include <code>diagnostic.timeout.kind</code> (<code>total</code>, <code>connect</code>, or <code>unknown</code>) and a <code>limit_ms</code> only
 when the expiring limit is known. Timing starts inside fetch on the execution target; it does not
 include SSH startup or initial tool approval.</p>
@@ -285,11 +286,11 @@ firewall caused an error. Diagnostic messages do not copy arbitrary error string
 credentials, headers, or bodies. Failure URL/redirect context is reduced to origins. Received HTTP
 headers are included only with <code>include_headers: true</code>; they retain their normal response semantics
 and may still contain sensitive response data.
-<code>proxy_origin</code>, when non-null, describes an explicit proxy; <code>null</code> does not rule out an
+<code>proxy_origin</code>, when present, describes an explicit proxy; its absence does not rule out an
 environment proxy. Use the job’s target for source attribution, and interpret OS codes using the reported platform.</p>
 <p>If headers arrived before a failure (including an outer timeout), the failure retains the
-HTTP status, <code>ok</code>, and byte count, plus headers when <code>include_headers: true</code>; known fields retain
-null/default values when unavailable. HTTP 4xx/5xx responses still complete normally: a 405
+HTTP status and byte count, plus headers when <code>include_headers: true</code>; unavailable fields are
+absent. HTTP 4xx/5xx responses still complete normally: a 405
 establishes HTTP connectivity, not successful ingestion. Permission denial and cancellation
 retain their separate semantics.</p>
 <p>In scripts, operational fetch failures are failed JobViews rather than rejected promises. Inspect
@@ -301,7 +302,7 @@ if (response.state === "failed") {
     target,
     http_reached: Number.isInteger(failure.status),
     status: failure.status ?? null,
-    elapsed_ms: failure.elapsed_ms ?? null,
+    duration: failure.duration ?? null,
     diagnostic: failure.diagnostic ?? null,
     error: response.error,
   };

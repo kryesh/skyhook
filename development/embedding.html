@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -226,6 +226,8 @@ boundary. Apply updates to the snapshot in revision order with <code>Observation
 It contains:</p>
 <ul>
 <li>Durable records keyed by their original journal sequence.</li>
+<li>The request ledger: each logical request’s lifecycle phase, outcome, and usage, folded from
+those records. Host statistics and displays read request state from it.</li>
 <li>Request-scoped live responses keyed by agent and logical request: their streamed blocks in
 arrival order, then the authoritative blocks once the response has ended.</li>
 <li>Current agent activity and context-usage estimates.</li>
@@ -240,7 +242,7 @@ separate operation that requests cancellation. <code>startup_warnings</code>, <c
 expose startup diagnostics and MCP discovery outcomes without inserting diagnostics into model
 context or writing directly to a terminal. <code>record_status</code> likewise records host-facing status,
 not a user message.</p>
-<p><code>TodoItem</code>, <code>TodoStatus</code>, and <code>TodoSnapshot</code> are exported by <code>skyhook::agent</code>. Hosts projecting
+<p><code>TodoItem</code> and <code>TodoStatus</code> are exported by <code>skyhook::agent</code>. Hosts projecting
 checklists from observed records apply <code>SessionEvent::TodosReplaced</code> and the reconciled todos in
 <code>SessionEvent::Compaction</code> checkpoints in sequence. Both replace the owning agent’s entire list;
 child-agent lists remain independent.</p>
@@ -254,9 +256,10 @@ not imply that a waiting or live root also ran. <code>continue_turn</code> uses 
 the root answer, or an empty string when there is none.</p>
 <p>Use <code>Harness::resume_session</code> to reopen durable state. The runtime reconciles interrupted work
 before starting agents and opens fresh provider contexts; it does not reuse old network resources.
+A root turn that failed or was interrupted before the session closed can still be continued.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.</p>
-<p>Session databases use format 14. Earlier formats are not migrated and cannot be resumed with
+<p>Session databases use format 15. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
@@ -268,8 +271,9 @@ that append before dropping the session/store owner.</p>
 <code>HarnessBuilder::shim_catalog</code> to enable remote execution. The CLI supplies its own catalog, but
 library hosts do not inherit the CLI’s artifacts.</p>
 <p><code>EmbeddedShimCatalog::from_embedded_assets</code> accepts names of the form <code>platform-protocol-arch</code>
-(for example, <code>linux-ssh-aarch64</code>) and artifact bytes. Selection uses the destination’s protocol,
-platform, and architecture. A missing matching artifact produces an explicit deployment error.
+(for example, <code>linux-ssh-aarch64</code>) and a loader that returns a named artifact’s bytes, called only
+for the artifact being deployed. Selection uses the destination’s protocol, platform, and
+architecture. A missing matching artifact produces an explicit deployment error.
 See <a href="remote-transport-and-shims.html">remote transport and shims</a> for build, packaging, and deployment
 behavior.</p>
 <h2 id="reading-a-session-archive"><a class="header" href="#reading-a-session-archive">Reading a session archive</a></h2>
@@ -288,8 +292,9 @@ and optional response schema. Its <code>template()</code> derives the history-fr
 including the model ID, reasoning setting, and output limit. Context records describe request
 settings, not the lifetime of a <code>ProviderContext</code> resource.</li>
 <li><code>model_requested</code> identifies one frozen logical request before its first invocation. It references
-the context record and stores the checkpoint it opens with, <code>history</code> as ordered source-event
-sequences, <code>tail</code> as exact inline messages, and <code>history_lifetime</code>. Retries refer back to this
+the context record and stores the checkpoint it opens with, its history as the agent’s commits
+through a message sequence, <code>tail</code> as exact inline messages, and
+<code>history_lifetime</code>. Retries refer back to this
 request using <code>model_attempt_started</code>, with separate failure/interruption or completion outcomes.
 Ordinary requests reuse a context record while their settings remain applicable; summarization
 has a separate context with its structured response schema.</li>
@@ -307,9 +312,11 @@ requests and failed attempts.</li>
 </ul>
 <p><code>session::reconstruct_model_request(&amp;records, sequence)</code> returns the <code>provider/model</code> name the
 request was issued under and the reconstructed <code>ModelRequest</code> for a <code>model_requested</code> sequence,
-using sequence-ordered records from <code>SessionStore</code>. Attachments and tool images reference
-content-addressed blobs by SHA-256; <code>load_blobs(&amp;mut request).await</code> on an owning <code>SessionStore</code>
-loads their contents for provider encoding; unlike <code>read_records</code>, opening a store acquires the
+using sequence-ordered records from <code>SessionStore</code>. It checks the request’s context, checkpoint
+and history bound as an append does, so other records fail with a <code>ReplayError</code>. Attachments and
+tool images reference content-addressed blobs by SHA-256; <code>load_blobs(&amp;mut request, &amp;mut cache)</code>
+on an owning <code>SessionStore</code> loads their contents for provider encoding, reusing and then keeping
+exactly this request’s blobs in <code>cache</code>; unlike <code>read_records</code>, opening a store acquires the
 session’s writer lock. Reconstruction reproduces Skyhook’s provider-neutral input, not an
 API-specific wire encoding or a replay of the external call.</p>
 <p>The <code>ModelRequest</code> contract preserves the history/tail split and <code>history_lifetime</code> cache hints.

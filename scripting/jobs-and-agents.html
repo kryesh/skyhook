@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-3c76d1f2.js";
+            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -183,8 +183,8 @@
                         <h1 id="jobs-and-agents"><a class="header" href="#jobs-and-agents">Jobs and agents</a></h1>
 <h2 id="delegation-and-child-input"><a class="header" href="#delegation-and-child-input">Delegation and child input</a></h2>
 <p>Child agents retain their conversation for follow-up work. Send instructions with
-<code>tool.job(id).send({value: instructions})</code>; the returned JobView’s payload includes
-<code>.result.accepted</code>. A running child receives the input at its next model-request boundary,
+<code>tool.job(id).send({value: instructions})</code>; the returned JobView completes, without a result,
+once the input is accepted. A running child receives the input at its next model-request boundary,
 without interrupting its current request or tools. Children do not need <code>receive()</code> for these
 updates.</p>
 <p>A retained child whose job is <code>completed</code>, <code>failed</code>, or <code>interrupted</code> resumes under the same
@@ -196,18 +196,17 @@ the child conversation and messages already delivered to the parent remain intac
 selecting them individually. A child-only retry leaves a parent waiting on work untouched and
 does not add a root model request. Retrying without an instruction continues the same history
 without adding a synthetic message.</p>
-<p>A background child’s visible text replies, including progress and final replies, arrive as
-message events without waiting for the child job to finish. Events carry <code>kind: "message"</code>,
-the child job <code>id</code>, source <code>message</code> sequence, optional <code>name</code>, and <code>text</code>. They reach the
-parent at a model-request boundary, not by interrupting an in-flight request. Pending messages
-survive session restart. Reading a background job’s output does not consume its message events.</p>
+<p>A child’s final reply is its job’s result. A background child’s earlier visible text replies
+arrive as message events without waiting for the child job to finish. Events carry
+<code>kind: "message"</code>, the child job <code>id</code>, optional <code>name</code>, and <code>text</code>.
+They reach the parent at a model-request boundary, not by interrupting an in-flight request.
+Pending messages survive session restart. Reading a background job’s output does not consume
+its message events.</p>
 <p>Message delivery does not mean the child has finished: completion also requires its owned work
-and queued inputs to be resolved. A completed background child’s notification references its
-<code>meta.last_message</code> instead of repeating the reply already delivered. Explicit <code>jobs({job})</code>
-reads and script calls still expose the saved final result; progress text is not concatenated
-into it. A foreground child returns its final reply in the call’s <code>.result</code>, with no progress
-or later message events. The parent cannot make another model request until its foreground
-calls return.</p>
+and queued inputs to be resolved. A completed background child’s notification carries the final
+reply in <code>.result</code>; earlier replies are not concatenated into it. A foreground child returns its
+final reply in the call’s <code>.result</code>, with no progress or later message events. The parent cannot
+make another model request until its foreground calls return.</p>
 <p>Child names are scoped to their caller: <code>A</code> and <code>B</code> may each create a child named <code>worker</code>, but
 all scripts owned by <code>A</code> share <code>A</code>’s child-name scope. A child retains its name even after
 termination; send follow-ups to its existing job instead of launching a duplicate. A failed
@@ -245,8 +244,9 @@ finish or cancel all owned jobs and descendants before their agent job completes
 may leave background services running after answering.</p>
 <h2 id="job-lifecycle-and-cancellation"><a class="header" href="#job-lifecycle-and-cancellation">Job lifecycle and cancellation</a></h2>
 <p>Background-capable tools accept an optional <code>bg</code> argument. Calls use the <a href="../reference/javascript.html#jobview-response-contract">common JobView
-contract</a>; background launches have
-<code>result: null</code> and <code>has_result: false</code>, while loaded literal <code>null</code> results have <code>has_result: true</code>.
+contract</a>; a background launch reports
+the job as launched, <code>running</code> and without a <code>result</code>, even if it has already finished. A loaded
+literal <code>null</code> result is <code>result: null</code>.
 Cancellation returns target-job metadata in <code>.result</code>. A child
 question has <code>state: "waiting_input"</code>; <code>jobs({job})</code> returns its stable question IDs and text in
 <code>presentation.question</code>, regardless of its size.</p>
