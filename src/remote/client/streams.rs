@@ -1,16 +1,19 @@
 //! Flow-controlled SSH byte streams relayed over a shim connection.
 use super::*;
-use crate::remote::flow::{CHUNK_BYTES, Credits, WINDOW};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use crate::{
+    remote::{flow::WINDOW, protocol::ControlRequest, transport::ReportingReader},
+    target::Route,
+};
+use tokio::io::AsyncWriteExt as _;
+
+/// The in-process pipe between a stream's caller and its relay to the shim.
+const PIPE_BYTES: usize = 64 * 1024;
 
 pub(super) struct ClientStream {
-    pub(super) output: tokio::sync::mpsc::Sender<Result<Vec<u8>, RemoteError>>,
-    pub(super) credit: Credits,
-}
-impl Drop for ClientStream {
-    fn drop(&mut self) {
-        self.credit.close();
-    }
+    pub(super) output: tokio::sync::mpsc::Sender<Vec<u8>>,
+    pub(super) credit: OwnedCredits,
+    /// Reported to the stream's reader after its output.
+    pub(super) closed: oneshot::Sender<Result<(), RemoteError>>,
 }
 
 struct StreamOwner {
@@ -28,86 +31,69 @@ impl Drop for StreamOwner {
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
                 parent.state.lock().await.streams.remove(&channel);
-                let _ = write_frame(
-                    &mut parent.writer.lock().await.input,
-                    &Request::StreamClose { channel },
-                )
-                .await;
+                let close = Request::Control(ControlRequest::StreamClose { channel });
+                let _ = write_frame(&mut *parent.writer.lock().await, &close).await;
             });
         }
     }
 }
 impl PooledConnection {
-    pub(super) async fn open_stream(
+    /// Start SSH along `route` on this connection's machine, relaying its byte stream.
+    pub(in crate::remote) async fn open_ssh(
         self: &Arc<Self>,
-        route: Vec<TargetDefinition>,
+        route: Route,
         command: String,
-    ) -> Result<crate::remote::transport::Transport, RemoteError> {
-        let (sender, mut receiver) = tokio::sync::mpsc::channel(WINDOW + 1);
+    ) -> Result<Transport, RemoteError> {
+        let (sender, mut receiver) = tokio::sync::mpsc::channel(WINDOW);
+        let (closed, result) = oneshot::channel();
         let credit = Credits::default();
-        let (channel, ()) = self
+        // Owned from registration, so a stream dropped while its open request is
+        // still being written is closed too.
+        let (channel, mut owner) = self
             .submit(|channel, state| {
-                state.streams.insert(
+                let stream = ClientStream {
+                    output: sender,
+                    credit: OwnedCredits(credit.clone()),
+                    closed,
+                };
+                state.streams.insert(channel, stream);
+                let open = ControlRequest::OpenSsh {
                     channel,
-                    ClientStream {
-                        output: sender,
-                        credit: credit.clone(),
-                    },
-                );
-                (
-                    Request::OpenSsh {
-                        channel,
-                        route,
-                        command,
-                    },
-                    (),
-                )
+                    route: Box::new(route),
+                    command,
+                };
+                let owner = StreamOwner {
+                    parent: self.clone(),
+                    channel,
+                    tasks: Vec::new(),
+                };
+                (Request::Control(open), owner)
             })
             .await?;
-        let (client, peer) = tokio::io::duplex(64 * 1024);
-        let (mut input, mut output) = tokio::io::split(peer);
+        let (client, peer) = tokio::io::duplex(PIPE_BYTES);
+        let (input, mut output) = tokio::io::split(peer);
         let parent = self.clone();
         let write_task = tokio::spawn(async move {
-            let mut bytes = vec![0; CHUNK_BYTES];
-            while let Ok(count) = input.read(&mut bytes).await {
-                let Ok(()) = credit.take().await else {
-                    break;
-                };
-                let request = if count == 0 {
-                    Request::StreamEnd { channel }
-                } else {
-                    Request::StreamData {
-                        channel,
-                        data: bytes[..count].to_vec(),
-                    }
+            let parent = &parent;
+            let _ = flow::pump(input, Some(&credit), |data| async move {
+                let request = match data {
+                    Some(data) => ControlRequest::StreamData { channel, data },
+                    None => ControlRequest::StreamEnd { channel },
                 };
                 let writer = parent.writer.clone().lock_owned().await;
-                if parent.write(writer, request).await.is_err() || count == 0 {
-                    break;
-                }
-            }
+                write_request(writer, &parent.state, Request::Control(request)).await
+            })
+            .await;
         });
         let parent = self.clone();
-        let failure = Arc::new(std::sync::Mutex::new(None));
-        let read_failure = failure.clone();
         let read_task = tokio::spawn(async move {
-            while let Some(result) = receiver.recv().await {
-                let bytes = match result {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        *read_failure
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(error.to_string());
-                        break;
-                    }
-                };
+            while let Some(bytes) = receiver.recv().await {
                 if output.write_all(&bytes).await.is_err() {
                     break;
                 }
                 let writer = parent.writer.clone().lock_owned().await;
-                if parent
-                    .write(writer, Request::StreamAck { channel })
+                let acknowledgement = Request::Control(ControlRequest::StreamAck { channel });
+                if write_request(writer, &parent.state, acknowledgement)
                     .await
                     .is_err()
                 {
@@ -116,15 +102,12 @@ impl PooledConnection {
             }
             let _ = output.shutdown().await;
         });
+        owner.tasks = vec![write_task.abort_handle(), read_task.abort_handle()];
         let (output, input) = tokio::io::split(client);
-        Ok(crate::remote::transport::Transport {
+        Ok(Transport {
             input: Box::new(input),
-            output: Box::new(crate::remote::transport::RelayedReader { output, failure }),
-            owner: Box::new(StreamOwner {
-                parent: self.clone(),
-                channel,
-                tasks: vec![write_task.abort_handle(), read_task.abort_handle()],
-            }),
+            output: Box::new(ReportingReader::new(output, result)),
+            owner: Box::new(owner),
         })
     }
 }

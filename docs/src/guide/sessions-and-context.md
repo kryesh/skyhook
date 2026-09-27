@@ -63,8 +63,9 @@ summary can still be incomplete or inaccurate.
 Invalid, truncated, cancelled, or unsaved summaries leave the preceding context and todos
 active. A summary that would not reduce context is skipped rather than installed. The terminal
 reports compaction start, estimated input reduction, skips, and failures without printing the
-summary. Eligible compaction failures have a bounded retry policy, separate from transient
-model failures, which retry until success or cancellation. See
+summary. Eligible compaction failures, such as a truncated or invalid summary, have a bounded
+retry policy, separate from transient model failures, which retry until success or
+cancellation. A refused or aborted summary is not retried. See
 [model failure recovery](../configuration/providers-and-models.md#model-failure-recovery).
 
 For persistence and request reconstruction internals, see

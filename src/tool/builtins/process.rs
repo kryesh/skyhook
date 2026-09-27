@@ -1,11 +1,12 @@
+use super::TimeoutSecs;
 #[cfg(unix)]
 use crate::process_group::ProcessGroup;
 use crate::tool::ToolOptions;
 use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
 use crate::tool::invocation::{AdmissionError, LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
+use crate::tool::registry::Invocation;
 use std::process::{ExitStatus, Stdio};
-use std::time::Duration;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,7 +18,7 @@ use tokio::{
 use crate::tool::StreamEnd;
 use crate::tool::output::{FinishedOutput, TextCaptureField};
 use crate::tool::{
-    PathKind, RegistryError,
+    PathArgument, PathKind, RegistryError,
     policy::{Capability, PathAccess},
 };
 
@@ -26,26 +27,68 @@ use capture::Capture;
 
 const PROCESS_CHUNK: usize = 8 * 1024;
 
-pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
-    builder.register_product::<ExecArgs, ProcessOutput, _, _>(
-        "exec",
+/// Register `exec`, whose `timeout` elapses when `sleep` does.
+pub(super) fn register<F: Future<Output = ()> + Send + 'static>(
+    builder: &mut LocalCatalogBuilder,
+    sleep: impl Fn(std::time::Duration) -> F + Clone + Send + Sync + 'static,
+) -> Result<(), RegistryError> {
+    builder.register_checked(
+        super::names::EXEC,
         "Run a command. Stdin is closed.",
         ToolOptions::new(vec![Capability::Exec])
+            .result::<ProcessOutput>()
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
             .target_authentication()
             .named()
             .background()
-            .default_path_argument("cwd", ".", PathAccess::Read, PathKind::Existing)
-            .argument_validator(|args: &ExecArgs| args.command.process().map(drop)),
-        move |context, args| async move {
-            let mut command = args.command.process()?;
-            command.current_dir(working_directory(&args.cwd).await?);
-            run_process(context, command, args.timeout)
-                .await
-                .map(ProcessResult::into_output)
+            .argument_paths(|exec: &mut Exec| {
+                let kind = PathKind::WorkingDirectory;
+                vec![PathArgument::new(&mut exec.cwd, PathAccess::Read, kind)]
+            }),
+        |args: ExecArgs| {
+            Ok(Exec {
+                command: args.command.process()?,
+                cwd: args.cwd,
+                timeout: args.timeout,
+            })
+        },
+        move |exec| {
+            let sleep = sleep.clone();
+            Invocation::new(|context| exec.run(context, sleep))
         },
     )?;
     Ok(())
+}
+
+/// A command admitted to run: its process, working directory and deadline.
+struct Exec {
+    command: Command,
+    cwd: String,
+    timeout: Option<TimeoutSecs>,
+}
+
+impl Exec {
+    async fn run<F: Future<Output = ()>>(
+        mut self,
+        context: LocalContext,
+        sleep: impl FnOnce(std::time::Duration) -> F,
+    ) -> Result<ProducedOutput, LocalError> {
+        self.command
+            .current_dir(working_directory(&self.cwd).await?);
+        let timeout = self.timeout;
+        let deadline = async move {
+            match timeout {
+                Some(timeout) => {
+                    sleep(timeout.duration()).await;
+                    timeout
+                }
+                None => std::future::pending().await,
+            }
+        };
+        run_process(context, self.command, deadline)
+            .await
+            .map(ProcessResult::into_output)
+    }
 }
 
 async fn working_directory(cwd: &str) -> Result<&std::path::Path, LocalError> {
@@ -63,27 +106,22 @@ async fn working_directory(cwd: &str) -> Result<&std::path::Path, LocalError> {
     Ok(path)
 }
 
+/// Run `command` until it exits, the call is cancelled, or `deadline` elapses.
 async fn run_process(
     context: LocalContext,
     mut command: Command,
-    timeout: Option<u64>,
+    deadline: impl Future<Output = TimeoutSecs>,
 ) -> Result<ProcessResult, LocalError> {
-    if timeout.is_some_and(|seconds| !(1..=3_600).contains(&seconds)) {
-        return Err(
-            LocalError::invalid_arguments("timeout must be 1 through 3600")
-                .operation(Operation::Validate, Subject::argument(["timeout"]))
-                .effects(Effects::NotStarted),
-        );
-    }
     // Override inherited/provider askpass settings even without Targets. Keep the
     // rejecting broker alive until the command and its cleanup have completed.
     let rejecting_askpass = if context.capabilities().contains(Capability::Interactive) {
         None
     } else {
         Some(
-            crate::remote::AskpassServer::start(std::sync::Arc::new(
-                crate::remote::RejectSensitivePrompts,
-            ))
+            crate::remote::AskpassServer::start(
+                std::sync::Arc::new(crate::remote::RejectSensitivePrompts),
+                None,
+            )
             .map_err(|error| {
                 LocalError::io(error)
                     .operation(
@@ -149,15 +187,6 @@ async fn run_process(
         .take()
         .ok_or_else(|| pipe_unavailable(STDERR_PIPE))?;
 
-    let deadline = async {
-        match timeout {
-            Some(seconds) => {
-                tokio::time::sleep(Duration::from_secs(seconds)).await;
-                seconds
-            }
-            None => std::future::pending::<u64>().await,
-        }
-    };
     // Keep cancellation and the deadline active while descendants hold output pipes open.
     let mut stdout_capture = Capture::create(&context, TextCaptureField::Stdout).await?;
     let mut stderr_capture = Capture::create(&context, TextCaptureField::Stderr).await?;
@@ -196,7 +225,7 @@ async fn run_process(
     };
     let finish = async move |status: ExitStatus| {
         Ok::<_, LocalError>(ProcessResult {
-            exit_code: status.code(),
+            status,
             captures: [
                 stdout_capture.finish().await?,
                 stderr_capture.finish().await?,
@@ -204,7 +233,6 @@ async fn run_process(
             .into_iter()
             .flatten()
             .collect(),
-            timed_out: false,
         })
     };
     // Keep select! unbiased above. The selected variant alone controls both
@@ -212,13 +240,11 @@ async fn run_process(
     match completion {
         ProcessCompletion::Exited(status) => finish(status).await,
         ProcessCompletion::TimedOut(seconds) => {
-            let output = ProcessResult {
-                timed_out: true,
-                ..finish(stop().await?).await?
-            };
+            let mut output = finish(stop().await?).await?.into_output();
+            output.streams = StreamEnd::Cut;
             Err(LocalError::with_output(
-                format!("timed out after {seconds} seconds"),
-                output.into_output(),
+                format!("timed out after {} seconds", u64::from(seconds)),
+                output,
             )
             .context(started(Operation::Wait, Subject::Process)))
         }
@@ -239,7 +265,7 @@ fn started(operation: Operation, subject: Subject) -> PartialContext {
 
 enum ProcessCompletion {
     Exited(ExitStatus),
-    TimedOut(u64),
+    TimedOut(TimeoutSecs),
     Cancelled,
 }
 
@@ -274,8 +300,7 @@ struct ExecArgs {
     #[serde(default = "super::default_dot")]
     cwd: String,
     /// Timeout seconds; omitted/null means no deadline.
-    #[schemars(range(min = 1, max = 3600))]
-    timeout: Option<u64>,
+    timeout: Option<TimeoutSecs>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -318,40 +343,40 @@ impl CommandLine {
 
 /// Internal output retains completed field bindings until the canonical product handoff.
 struct ProcessResult {
-    exit_code: Option<i32>,
+    status: ExitStatus,
     captures: Vec<FinishedOutput>,
-    timed_out: bool,
 }
 
 impl ProcessResult {
     fn into_output(self) -> ProducedOutput {
         let output = ProcessOutput {
-            exit_code: self.exit_code,
-            // Completed captures replace these fields when bytes were observed. An
-            // absent capture therefore means the stream was observed to be empty,
-            // not that its value is unknown.
-            stdout: String::new(),
-            stderr: String::new(),
-            timed_out: self.timed_out,
+            exit_code: self.status.code(),
+            #[cfg(unix)]
+            signal: std::os::unix::process::ExitStatusExt::signal(&self.status),
+            #[cfg(not(unix))]
+            signal: None,
+            // Completed captures install these fields when bytes were observed. An
+            // absent stream was therefore observed to be empty, not unknown.
+            stdout: None,
+            stderr: None,
         };
-        let mut output =
-            ProducedOutput::new(serde_json::to_value(output).expect("process output serializes"))
-                .with_captures(self.captures);
-        if self.timed_out {
-            output.streams = StreamEnd::Cut;
-        }
-        output
+        ProducedOutput::new(serde_json::to_value(output).expect("process output serializes"))
+            .with_captures(self.captures)
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
-pub struct ProcessOutput {
-    pub exit_code: Option<i32>,
-    #[schemars(extend("x-skyhook-truncatable" = true))]
-    pub stdout: String,
-    #[schemars(extend("x-skyhook-truncatable" = true))]
-    pub stderr: String,
-    pub timed_out: bool,
+/// A terminated process has exactly one of an exit code or the signal that killed it.
+#[serde_with::skip_serializing_none]
+#[derive(JsonSchema, Serialize)]
+struct ProcessOutput {
+    #[schemars(with = "i32")]
+    exit_code: Option<i32>,
+    #[schemars(with = "i32")]
+    signal: Option<i32>,
+    #[schemars(with = "String", extend("x-skyhook-truncatable" = true))]
+    stdout: Option<String>,
+    #[schemars(with = "String", extend("x-skyhook-truncatable" = true))]
+    stderr: Option<String>,
 }
 
 #[cfg(test)]
@@ -364,8 +389,10 @@ mod tests {
     };
 
     use serde_json::{Value, json};
+    use std::time::Duration;
 
     use super::*;
+    use crate::tests::bounded;
     use crate::tool::ToolRegistryBuilder;
     use crate::{
         job::{CancellationToken, JobState, output::OutputArgs},
@@ -377,43 +404,21 @@ mod tests {
         },
     };
 
-    fn executor(runtime: &TestRuntime, interactive: bool) -> ToolExecutor {
+    fn executor<F: Future<Output = ()> + Send + 'static>(
+        runtime: &TestRuntime,
+        interactive: bool,
+        sleep: impl Fn(Duration) -> F + Clone + Send + Sync + 'static,
+    ) -> ToolExecutor {
         let mut builder = ToolRegistryBuilder::default();
-        builder.register_local(register).unwrap();
+        builder
+            .register_local(|builder| register(builder, sleep))
+            .unwrap();
         let mut capabilities = CapabilitySet::default();
         capabilities.remove(Capability::Targets);
         if !interactive {
             capabilities.remove(Capability::Interactive);
         }
         runtime.executor(builder).with_capabilities(capabilities)
-    }
-
-    #[test]
-    fn output_schema_requires_stable_fields_but_keeps_exit_code_nullable() {
-        let schema = serde_json::to_value(
-            schemars::generate::SchemaSettings::default()
-                .for_serialize()
-                .into_generator()
-                .into_root_schema_for::<ProcessOutput>(),
-        )
-        .unwrap();
-        let required = schema["required"].as_array().unwrap();
-        for field in ["exit_code", "stdout", "stderr", "timed_out"] {
-            assert!(required.contains(&json!(field)), "{field}: {schema}");
-        }
-        fn allows_null(schema: &Value) -> bool {
-            schema["type"] == "null"
-                || schema["type"]
-                    .as_array()
-                    .is_some_and(|types| types.contains(&json!("null")))
-                || ["anyOf", "oneOf"]
-                    .into_iter()
-                    .filter_map(|key| schema[key].as_array())
-                    .flatten()
-                    .any(allows_null)
-        }
-        assert!(allows_null(&schema["properties"]["exit_code"]), "{schema}");
-        assert!(!allows_null(&schema["properties"]["stdout"]), "{schema}");
     }
 
     /// Argv and shell-string `exec` arguments running the same `/bin/sh` command.
@@ -430,29 +435,58 @@ mod tests {
         args
     }
 
+    /// The first stdout line of the running job, once it has produced one.
+    /// Nothing announces live output, so poll for it.
+    async fn live_stdout(runtime: &TestRuntime) -> Value {
+        bounded(async {
+            loop {
+                let jobs = runtime.jobs.list(&runtime.agent).await;
+                if let Some(job) = jobs.iter().find(|job| job.state == JobState::Running) {
+                    let mut args = OutputArgs::new(job.id);
+                    args.field = Some("/result/stdout".parse().unwrap());
+                    let capabilities = Default::default();
+                    let view = runtime.jobs.present_output(args, &capabilities);
+                    let view = view.await.unwrap();
+                    if let Some(line) = view["presentation"]["preview"]["lines"].get(0) {
+                        break line.clone();
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+    }
+
+    /// A sleep that elapses once `deadline` is cancelled, whatever its duration.
+    fn elapses(
+        deadline: &CancellationToken,
+    ) -> impl Fn(Duration) -> tokio_util::sync::WaitForCancellationFutureOwned
+    + Clone
+    + Send
+    + Sync
+    + use<> {
+        let deadline = deadline.clone();
+        move |_| deadline.clone().cancelled_owned()
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn exit_codes_captures_and_timeout_partial_output() {
         let runtime = TestRuntime::new().await;
         let (agent, jobs) = (&runtime.agent, &runtime.jobs);
-        let executor = executor(&runtime, true);
+        let deadline = CancellationToken::new();
+        let executor = executor(&runtime, true, elapses(&deadline));
         let shell = async |command: Value| executor.run_host(agent, "exec", command).await;
-        // A signal exit has an unknown (null) exit code, while both observed
-        // streams and the timeout flag still have concrete defaults.
+        // A signal death reports the signal instead of an exit code; observed
+        // empty streams are absent.
         let signal = shell(json!({"command":"kill -TERM $$"})).await.unwrap();
-        assert_eq!(
-            signal.output.value,
-            json!({"exit_code":null,"stdout":"","stderr":"","timed_out":false})
-        );
+        assert_eq!(signal.output.value, json!({"signal":libc::SIGTERM}));
         for (command, expected, captures) in [
-            (
-                "exit 0",
-                json!({"exit_code":0,"stdout":"","stderr":"","timed_out":false}),
-                json!([]),
-            ),
+            ("exit 0", json!({"exit_code":0}), json!([])),
             (
                 "printf warning >&2",
-                json!({"exit_code":0,"stdout":"","stderr":"warning","timed_out":false}),
-                json!([{"field": "/result/stderr", "kind": "text", "complete": true, "output": null}]),
+                json!({"exit_code":0,"stderr":"warning"}),
+                json!([]),
             ),
         ] {
             let output = shell(json!({"command":command})).await.unwrap();
@@ -479,52 +513,68 @@ mod tests {
                 .contains('\u{fffd}')
         );
 
-        let error = shell(json!({"command":"printf partial; sleep 2", "timeout":1}))
-            .await
-            .expect_err("timeout must fail with partial output");
-        let (diagnostic, output) = error.into_tool_error().into_parts();
+        // The deadline elapses once the tool has captured the partial output.
+        let command = json!({"command":"printf partial; exec sleep 3600", "timeout":3600});
+        let (result, ()) = tokio::join!(bounded(shell(command)), async {
+            live_stdout(&runtime).await;
+            deadline.cancel();
+        });
+        let diagnostic = result.unwrap_err().diagnostic();
         assert_eq!(diagnostic.context.operation, Operation::Wait);
         assert_eq!(diagnostic.context.subject, Subject::Process);
         assert_eq!(diagnostic.context.effects, Effects::Started);
-        assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("timed out")));
-        let output = output.expect("timeout must retain partial output");
-        assert_eq!(output.value["timed_out"], true);
-        assert_eq!(output.value["stdout"], "partial");
-        let failed_job = jobs.list(agent).await.last().unwrap().id;
-        let envelope = jobs.snapshot(failed_job).await.unwrap();
-        assert_eq!(envelope.state, JobState::Failed);
-        assert_eq!(envelope.output.unwrap()["timed_out"], true);
+        assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("3600")));
+        let failed = jobs.list(agent).await.last().unwrap().id;
+        let view = jobs
+            .inspect_output(
+                OutputArgs::new(failed),
+                CancellationToken::new(),
+                &Default::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(view["state"], "failed");
+        assert_eq!(
+            view["result"],
+            json!({"signal":libc::SIGKILL,"stdout":"partial"})
+        );
+        assert_eq!(view["presentation"]["notice"], "Output incomplete.");
     }
 
     #[cfg(unix)]
     #[tokio::test]
     async fn failures_before_spawn_report_their_stage_and_that_nothing_started() {
         let runtime = TestRuntime::new().await;
-        let executor = executor(&runtime, true);
+        let executor = executor(&runtime, true, tokio::time::sleep);
         std::fs::write(runtime.root.path().join("file-cwd"), "not a directory").unwrap();
-        for (arguments, operation, cwd) in [
+        for (arguments, operation, argument) in [
             // A missing cwd fails path preflight; a file passes it and fails the handler.
             (
                 json!({"command":"touch started", "cwd":"missing-cwd"}),
                 Operation::Canonicalize,
-                Some("missing-cwd"),
+                "cwd",
             ),
             (
                 json!({"command":"touch started", "cwd":"file-cwd"}),
                 Operation::Validate,
-                Some("file-cwd"),
+                "cwd",
             ),
-            (
-                json!({"command":"touch started", "timeout":0}),
-                Operation::Validate,
-                None,
-            ),
-            (json!({"command":""}), Operation::Validate, None),
-            (json!({"command":[]}), Operation::Validate, None),
+            (json!({"command":""}), Operation::Validate, "command"),
+            (json!({"command":[]}), Operation::Validate, "command"),
             (
                 json!({"command":r#" ["touch", "started"] "#}),
                 Operation::Validate,
-                None,
+                "command",
+            ),
+            (
+                json!({"command":"true", "timeout":0}),
+                Operation::Deserialize,
+                "timeout",
+            ),
+            (
+                json!({"command":"true", "timeout":3601}),
+                Operation::Deserialize,
+                "timeout",
             ),
         ] {
             let jobs = runtime.jobs.list(&runtime.agent).await.len();
@@ -533,8 +583,8 @@ mod tests {
                 .await
                 .unwrap_err();
             let Diagnostic { cause, context } = error.diagnostic();
-            // Command-line validation fails at admission, before any job exists.
-            if context.subject == Subject::argument(["command"]) {
+            // Argument validation fails at admission, before any job exists.
+            if argument != "cwd" {
                 assert_eq!(runtime.jobs.list(&runtime.agent).await.len(), jobs);
                 let Cause::InvalidArguments(message) = cause else {
                     panic!("{cause:?}")
@@ -545,16 +595,16 @@ mod tests {
                 assert_eq!(message.contains("as an array"), encoded, "{message}");
             }
             assert_eq!(context.operation, operation);
-            assert_eq!(context.effects, Effects::NotStarted);
-            match cwd {
+            // Typed deserialization claims no effects; no job exists to have any.
+            if operation != Operation::Deserialize {
+                assert_eq!(context.effects, Effects::NotStarted);
+            }
+            match arguments["cwd"].as_str() {
                 Some(cwd) => assert!(
                     matches!(&context.subject, Subject::WorkingDirectory(path) if path.ends_with(cwd)),
                     "{context:?}"
                 ),
-                None if arguments.get("timeout").is_some() => {
-                    assert_eq!(context.subject, Subject::argument(["timeout"]));
-                }
-                None => assert_eq!(context.subject, Subject::argument(["command"])),
+                None => assert_eq!(context.subject, Subject::argument([argument])),
             }
         }
         // Spawn ENOENT can also mean a missing interpreter, so no path is the subject.
@@ -626,18 +676,15 @@ mod tests {
                 tokio_util::sync::CancellationToken::new(),
                 producer.clone(),
                 Arc::new(Authorizations::default()),
-                Value::Null,
             );
             let mut command = Command::new("/bin/sh");
             command
                 .args(["-c", "printf output"])
                 .current_dir(root.path());
-            let error =
-                tokio::time::timeout(Duration::from_secs(5), run_process(context, command, None))
-                    .await
-                    .expect("capture failure did not terminate process execution")
-                    .err()
-                    .unwrap();
+            let error = bounded(run_process(context, command, std::future::pending()))
+                .await
+                .err()
+                .unwrap();
             let diagnostic = error.diagnostic();
             assert_eq!(diagnostic.context.operation, operation);
             assert_eq!(
@@ -646,10 +693,7 @@ mod tests {
             );
             assert_eq!(diagnostic.context.effects, Effects::Started);
             assert_eq!(diagnostic.cause, opaque);
-            tokio::time::timeout(Duration::from_secs(5), producer.settle())
-                .await
-                .expect("capture settlement hung")
-                .unwrap();
+            bounded(producer.settle()).await.unwrap();
         }
 
         struct FailingPipe;
@@ -687,57 +731,49 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn cancellation_and_timeout_kill_descendants_even_after_the_shell_exits() {
-        let cancelled = async |interactive: bool| {
+        // The descendant outlives the shell holding `held`, a FIFO, open for
+        // writing. Its reader sees EOF once every holder has died, whether or
+        // not anything reaps them.
+        const COMMAND: &str = "exec 3>held; sleep 3600 & printf started; exit 0";
+        let stopped = async |interactive: bool, timeout: bool| {
             let runtime = TestRuntime::new().await;
-            let jobs = runtime.jobs.clone();
-            let executor = executor(&runtime, interactive);
-            let command = "(sleep 0.3; printf escaped > escaped) & printf ready; exit 0";
-            let arguments = json!({"command":command, "bg":true});
-            let running = executor
+            let held = runtime.root.path().join("held");
+            let path = std::ffi::CString::new(held.as_os_str().as_encoded_bytes()).unwrap();
+            // SAFETY: `path` is a valid NUL-terminated string for the call.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let mut held = tokio::net::unix::pipe::OpenOptions::new()
+                .open_receiver(&held)
+                .unwrap();
+            let deadline = CancellationToken::new();
+            let mut arguments = json!({"command":COMMAND, crate::tool::registry::BACKGROUND:true});
+            if timeout {
+                arguments["timeout"] = json!(3600);
+            }
+            let running = executor(&runtime, interactive, elapses(&deadline))
                 .run_host(&runtime.agent, "exec", arguments)
                 .await
                 .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), async {
-                loop {
-                    let mut args = OutputArgs::new(running.job);
-                    args.field = Some("/result/stdout".parse().unwrap());
-                    let view = jobs
-                        .present_output(args, &Default::default())
-                        .await
-                        .unwrap();
-                    if view["presentation"]["preview"]["lines"]
-                        .as_array()
-                        .is_some_and(|lines| !lines.is_empty())
-                    {
-                        break;
-                    }
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .unwrap();
-            jobs.cancel(running.job).await.unwrap();
-            let waited = jobs
-                .wait(running.job, Some(Duration::from_secs(2)), true)
-                .await;
-            assert_eq!(waited.unwrap().state, JobState::Cancelled);
-            tokio::time::sleep(Duration::from_millis(400)).await;
-            assert!(!runtime.root.path().join("escaped").exists());
+            live_stdout(&runtime).await;
+            if timeout {
+                deadline.cancel();
+            } else {
+                runtime.jobs.cancel(running.job).await.unwrap();
+            }
+            let finished = bounded(runtime.jobs.wait(running.job, None, true)).await;
+            bounded(held.read_to_end(&mut Vec::new())).await.unwrap();
+            finished.unwrap()
         };
-        // Timeout kills noninteractive descendants that hold the pipes open.
-        let timed_out = async {
-            let runtime = TestRuntime::new().await;
-            let command = "(sleep 1.5; printf escaped > escaped) & printf ready; exit 0";
-            let arguments = json!({"command":command, "timeout":1});
-            let error = executor(&runtime, false)
-                .run_host(&runtime.agent, "exec", arguments)
-                .await;
-            let error = error.expect_err("descendant-held pipes must time out");
-            assert!(error.to_string().contains("timed out"), "{error}");
-            tokio::time::sleep(Duration::from_millis(700)).await;
-            assert!(!runtime.root.path().join("escaped").exists());
-        };
-        tokio::join!(cancelled(false), cancelled(true), timed_out);
+        let (cancelled, interactive, timed_out) = tokio::join!(
+            stopped(false, false),
+            stopped(true, false),
+            stopped(false, true)
+        );
+        assert_eq!(cancelled.state, JobState::Cancelled);
+        assert_eq!(interactive.state, JobState::Cancelled);
+        // A timeout kills noninteractive descendants that hold the pipes open.
+        assert_eq!(timed_out.state, JobState::Failed);
+        let diagnostic = timed_out.diagnostic.unwrap();
+        assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("timed out")));
     }
 
     // Use a separate session with a real controlling PTY; never change the
@@ -794,8 +830,7 @@ mod tests {
         }
         let child = command.spawn().unwrap();
         let _group = ProcessGroup::led_by(&child);
-        let output = tokio::time::timeout(Duration::from_secs(20), child.wait_with_output());
-        let output = output.await.expect("PTY executor helper hung").unwrap();
+        let output = bounded(child.wait_with_output()).await.unwrap();
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(
@@ -844,7 +879,7 @@ mod tests {
             for interactive in [false, true] {
                 let runtime = TestRuntime::new().await;
                 // The fixture disables Targets: terminal gating must not depend on it.
-                let executor = executor(&runtime, interactive);
+                let executor = executor(&runtime, interactive, tokio::time::sleep);
                 let (command, expected) = if interactive {
                     ("if (: <> /dev/tty) 2>/dev/null; then printf attached; else printf missing; fi", "attached")
                 } else {
@@ -889,7 +924,6 @@ mod tests {
             for argv in [false, true] {
                 let sink = Arc::new(crate::tool::invocation::tests::CapturedOutput::default());
                 let producer = crate::tool::output::OutputContext::new(sink.clone());
-                let arguments = sh_args(argv, command, None);
                 let context = crate::tool::invocation::LocalContext::new(
                     crate::execution::ExecutionLocation::root(root.path().to_owned()),
                     capabilities.clone(),
@@ -897,10 +931,9 @@ mod tests {
                     tokio_util::sync::CancellationToken::new(),
                     producer.clone(),
                     Arc::new(crate::tool::invocation::tests::Authorizations::default()),
-                    arguments.clone(),
                 );
                 let output = catalog
-                    .run("exec", arguments, context, root.path())
+                    .run("exec", sh_args(argv, command, None), context, root.path())
                     .await
                     .unwrap()
                     .value;

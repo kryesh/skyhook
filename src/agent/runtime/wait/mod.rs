@@ -20,8 +20,8 @@ use std::time::Duration;
 use tokio::sync::{mpsc, watch};
 
 /// A batch releases this long after the *most recent* event of a burst, so
-/// events that trickle in (a child's final message notification, then its job
-/// completion a few milliseconds later) become one wake instead of two.
+/// events that trickle in (a child's progress reply, then its job completion a
+/// few milliseconds later) become one wake instead of two.
 const COALESCE_QUIET_WINDOW: Duration = Duration::from_millis(100);
 /// Ceiling on a single window, measured from the burst's first event: a steady
 /// stream of notifications would otherwise reset the quiet timer forever, and
@@ -355,8 +355,8 @@ mod tests {
     pub(super) async fn start(tracking: &Arc<Script>) -> (tempfile::TempDir, Arc<SessionHandle>) {
         let root = tempfile::tempdir().unwrap();
         let profile = |model: &str| ModelProfile {
-            hint: Some(model.to_owned()),
-            ..ModelProfile::new(model, None, 128_000, 4096, true)
+            hint: Some(model.parse().unwrap()),
+            ..crate::tests::profile(model, true)
         };
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
@@ -448,13 +448,11 @@ mod tests {
             crate::agent::runtime::tests::until(session, job, |job| job.state.is_terminal());
         assert_eq!(snapshot.await.state, JobState::Completed);
     }
-    /// A completion references the child's last message rather than copying its text.
-    pub(super) fn assert_child_completion(event: &Value, message: &Value) {
-        assert_eq!(event["id"], message["id"]);
+    /// A child's completion carries its final reply as the result.
+    pub(super) fn assert_child_completion(event: &Value, job: JobId, answer: &str) {
+        assert_eq!(event["id"], job.get());
         assert_eq!(event["state"], "completed");
-        assert_eq!(event["meta"]["last_message"], message["message"]);
-        assert!(event["result"].is_null(), "{event}");
-        assert!(event.get("text").is_none(), "{event}");
+        assert_eq!(event["result"], answer, "{event}");
     }
 
     pub(super) fn assert_reason(request: &ModelRequest, id: &str, reason: &str) {
@@ -723,7 +721,8 @@ mod tests {
                     .unwrap()
             }
         });
-        // The input's batch has released, yet the wait defers to the busy script.
+        // Paused time passes the batch cap only once every task idles, so the
+        // input's batch has released and been handled, yet the wait defers.
         tokio::time::sleep(COALESCE_MAX_WINDOW).await;
         assert!(
             scripts()
@@ -935,10 +934,7 @@ mod tests {
         let source = "const direct = (await tool.wait({timeout:1})).result; const builder = (await tool.wait().timeout(1)).result; return [direct, builder];";
         let output = bounded(session.run_script(source)).await.unwrap();
         let timeouts = json!([{"reason":"timeout"}, {"reason":"timeout"}]);
-        assert_eq!(
-            output.value,
-            json!({"value":timeouts, "console":"", "failure":null})
-        );
+        assert_eq!(output.value, json!({"value":timeouts}));
         session.shutdown().await.unwrap();
     }
 

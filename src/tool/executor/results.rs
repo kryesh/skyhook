@@ -1,8 +1,6 @@
 //! Collect job outcomes, import remote payloads, and present execution failures.
 
 use super::*;
-use crate::tool::diagnostic::{Diagnostic, safe_text};
-use thiserror::Error;
 
 #[derive(Clone, Copy)]
 enum CollectionPurpose {
@@ -14,16 +12,17 @@ impl ToolExecutor {
     pub(super) async fn collect_model_started(
         &self,
         started: StartedExecution,
-    ) -> Result<ExecutionResult, ExecutionError> {
-        // A launch always returns metadata, even if the worker won the race to
-        // completion. Reading its result here would also consume its notification.
-        if started.background {
+    ) -> Result<ExecutionResult, ToolError> {
+        let StartedExecution::Foreground(job) = started else {
             return self
                 .collect_full_view_started(started, crate::tool::ToolResultPolicy::Value)
                 .await;
-        }
-        let job = started.job;
-        self.shared.jobs.wait_foreground(job).await?;
+        };
+        self.shared
+            .jobs
+            .wait_foreground(job)
+            .await
+            .map_err(job_error)?;
         let presented = self
             .shared
             .jobs
@@ -55,7 +54,7 @@ impl ToolExecutor {
         &self,
         started: StartedExecution,
         policy: crate::tool::ToolResultPolicy,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<ExecutionResult, ToolError> {
         self.collect_result(started, CollectionPurpose::Public(policy))
             .await
     }
@@ -63,7 +62,7 @@ impl ToolExecutor {
     pub(crate) async fn collect_started(
         &self,
         started: StartedExecution,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<ExecutionResult, ToolError> {
         self.collect_result(started, CollectionPurpose::Native)
             .await
     }
@@ -72,22 +71,26 @@ impl ToolExecutor {
         &self,
         started: StartedExecution,
         purpose: CollectionPurpose,
-    ) -> Result<ExecutionResult, ExecutionError> {
-        let StartedExecution { job, background } = started;
-        if background {
-            let envelope = self.shared.jobs.metadata(job).await?;
-            let value = envelope
-                .metadata_view(self.diagnostic_viewer())
-                .into_value();
-            return Ok(ExecutionResult {
-                job,
-                background: true,
-                is_error: false,
-                output: ToolOutput::new(value),
-            });
-        }
-        let mut envelope = self.shared.jobs.wait_foreground(job).await?;
-        self.shared.jobs.hydrate_envelope(&mut envelope).await?;
+    ) -> Result<ExecutionResult, ToolError> {
+        let job = match started {
+            StartedExecution::Foreground(job) => job,
+            StartedExecution::Background(launched) => {
+                let value = launched
+                    .metadata_view(self.diagnostic_viewer())
+                    .into_value();
+                return Ok(ExecutionResult {
+                    job: launched.id,
+                    background: true,
+                    is_error: false,
+                    output: ToolOutput::new(value),
+                });
+            }
+        };
+        let jobs = &self.shared.jobs;
+        let mut envelope = jobs.wait_foreground(job).await.map_err(job_error)?;
+        jobs.hydrate_envelope(&mut envelope)
+            .await
+            .map_err(job_error)?;
         envelope.render_output_diagnostic(self.diagnostic_viewer());
         if !envelope.state.is_terminal() {
             return Ok(ExecutionResult {
@@ -107,8 +110,8 @@ impl ToolExecutor {
                 ),
             });
         }
-        self.shared.jobs.claim(job).await?;
-        let images = self.shared.jobs.images(job).await?;
+        jobs.claim(job).await.map_err(job_error)?;
+        let images = jobs.images(job).await.map_err(job_error)?;
         if let CollectionPurpose::Public(policy) = purpose {
             // A successful output query already returns the target view. The
             // invocation's state, not the target's, determines is_error.
@@ -144,30 +147,17 @@ impl ToolExecutor {
             if let Some(value) = envelope.output {
                 failure = failure.with_result(ToolOutput::new(value).with_images(images));
             }
-            Err(ExecutionError::Failure {
-                failure,
-                capabilities: self.capabilities.clone(),
-            })
+            Err(failure)
         }
     }
 }
 
-pub(crate) struct StartedExecution {
-    pub job: JobId,
-    pub(super) background: bool,
-}
-
-pub(crate) async fn persist_completion(jobs: &JobManager, job: JobId, completion: JobOutcome) {
-    let result = jobs.finish(job, completion).await;
-    if let Err(error) = result
-        && !matches!(error, JobError::AlreadyTerminal(_))
-    {
-        jobs.fail_volatile(
-            job,
-            format!("job finalization could not be persisted: {error}"),
-        )
-        .await;
-    }
+/// A started invocation. A background launch is answered with the job as it was
+/// at launch, never its later state: its outcome reaches the owner as a
+/// notification, which reading it here would consume.
+pub(crate) enum StartedExecution {
+    Foreground(JobId),
+    Background(Box<crate::job::JobEnvelope>),
 }
 
 #[derive(Debug)]
@@ -178,99 +168,19 @@ pub struct ExecutionResult {
     pub(crate) is_error: bool,
 }
 
-#[derive(Debug, Error)]
-pub enum ExecutionError {
-    #[error("{}", failure.diagnostic().render(capabilities))]
-    Failure {
-        failure: ToolError,
-        capabilities: CapabilitySet,
-    },
-    #[error("unknown tool `{0}`")]
-    UnknownTool(String),
-    #[error("tool `{0}` is not exposed for direct model calls")]
-    ModelHidden(String),
-    #[error("tool `{0}` is not available in scripts")]
-    ScriptUnavailable(String),
-    #[error(transparent)]
-    Tool(#[from] ToolError),
-}
-
-impl From<JobError> for ExecutionError {
-    fn from(error: JobError) -> Self {
-        // Job state lives on the session host; the caller names the failed stage.
-        Self::Tool(ToolError::from(error).or(PartialContext::default().at(FailureSite::Host)))
-    }
-}
-
-impl From<serde_json::Error> for ExecutionError {
-    fn from(error: serde_json::Error) -> Self {
-        Self::Tool(error.into())
-    }
-}
-
-impl From<crate::tool::AdmissionError> for ExecutionError {
-    fn from(error: crate::tool::AdmissionError) -> Self {
-        Self::Tool(error.into())
-    }
-}
-
-impl ExecutionError {
-    /// Errors before a job can provide its own view still use the public response
-    /// contract. A null ID explicitly means there is no inspectable job handle.
-    pub(crate) fn into_response(
-        self,
-        tool: &str,
-        parent: Option<JobId>,
-        name: Option<crate::tool::registry::JobName>,
-        viewer: crate::tool::diagnostic::DiagnosticViewer<'_>,
-    ) -> ToolOutput {
-        let message = match &self {
-            Self::Failure { .. } | Self::Tool(_) => self.diagnostic().render_for(viewer),
-            error => error.to_string(),
-        };
-        let (diagnostic, output) = self.into_tool_error().into_parts();
-        let (value, images) = output.map_or((None, Vec::new()), |output| {
-            (Some(output.value), output.images)
-        });
-        let metadata = crate::job::JobMetadata {
-            tool: Some(tool.to_owned()),
-            parent,
-            name: name.map(String::from),
-            ..Default::default()
-        };
-        let view = crate::job::JobView::failure(message, value, diagnostic.is_denial(), metadata);
-        ToolOutput::new(view.into_value()).with_images(images)
-    }
-
-    pub(crate) fn diagnostic(&self) -> Diagnostic {
-        self.facts().resolve()
-    }
-
-    pub(super) fn facts(&self) -> PartialDiagnostic {
-        match self {
-            Self::Failure { failure, .. } | Self::Tool(failure) => failure.facts().clone(),
-            error => PartialDiagnostic::new(
-                PartialContext::default(),
-                Cause::Message(safe_text(&error.to_string())),
-            ),
-        }
-    }
-
-    /// Fill the facts still unset; those chosen nearer the failure win.
-    pub(super) fn or(self, fallback: PartialContext, capabilities: &CapabilitySet) -> Self {
-        Self::Failure {
-            failure: self.into_tool_error().or(fallback),
-            capabilities: capabilities.clone(),
-        }
-    }
-
-    /// Normalize once for tool adapters, preserving typed causes and partial results.
-    pub(crate) fn into_tool_error(self) -> ToolError {
-        match self {
-            Self::Failure { failure, .. } | Self::Tool(failure) => failure,
-            error => ToolError::from_facts(error.facts(), None),
-        }
-    }
+/// Errors before a job can provide its own view still use the public response
+/// contract. A missing ID means there is no inspectable job handle.
+pub(crate) fn failure_response(
+    error: ToolError,
+    viewer: crate::tool::diagnostic::DiagnosticViewer<'_>,
+) -> ToolOutput {
+    let (diagnostic, output) = error.into_parts();
+    let message = diagnostic.render_for(viewer);
+    let (value, images) = output.map_or((None, Vec::new()), |output| {
+        (Some(output.value), output.images)
+    });
+    let view = crate::job::JobView::failure(message, value, diagnostic.is_denial());
+    ToolOutput::new(view.into_value()).with_images(images)
 }
 
 #[cfg(test)]
@@ -284,12 +194,8 @@ mod tests {
     };
     use serde_json::json;
 
-    async fn created(runtime: &crate::tests::TestRuntime, spec: JobSpec) -> JobId {
-        runtime.jobs.create(spec).await.unwrap().into_test_id()
-    }
-
     async fn complete(runtime: &crate::tests::TestRuntime, job: JobId, value: serde_json::Value) {
-        let outcome = JobOutcome::Completed(ToolOutput::new(value));
+        let outcome = crate::job::JobOutcome::Completed(ToolOutput::new(value));
         runtime.jobs.finish(job, outcome).await.unwrap();
     }
 
@@ -344,24 +250,21 @@ mod tests {
                 let response = call(kind, "payload", json!({})).await.unwrap();
                 assert!(!response.is_error);
                 let view = response.output.value;
-                assert_eq!(view.as_object().unwrap().len(), 7);
-                assert!(view["id"].as_u64().unwrap() > 0);
-                assert_eq!(view["state"], "completed");
-                assert_eq!(view["has_result"], true);
-                assert_eq!(view.get("error"), Some(&Value::Null));
-                assert_eq!(view.get("meta"), Some(&Value::Null));
                 assert_eq!(view["result"].get("nullable"), Some(&Value::Null));
                 let length = view["result"]["text"].as_str().unwrap().len();
                 if matches!(kind, InvocationKind::Script) {
+                    // Nothing more to read: the completed response needs no handle.
                     assert_eq!(length, PAYLOAD_BYTES);
-                    assert_eq!(view.get("presentation"), Some(&Value::Null));
+                    assert_eq!(view.as_object().unwrap().len(), 1);
                 } else {
+                    assert!(view["id"].as_u64().unwrap() > 0);
+                    assert_eq!(view["state"], "completed");
                     assert!(length < PAYLOAD_BYTES);
                     assert_eq!(
                         view["presentation"]["truncated"][0]["field"],
                         "/result/text"
                     );
-                    assert!(view["presentation"]["preview"].is_null());
+                    assert_eq!(view["presentation"].get("preview"), None);
                 }
 
                 let failure = call(kind, "payload", json!({"fail":true})).await.unwrap();
@@ -394,42 +297,44 @@ mod tests {
                 );
             }
         }
-        let response = ExecutionError::UnknownTool("missing".into())
-            .into_response(
-                "missing",
-                Some(JobId::new(7).unwrap()),
-                crate::tool::registry::JobName::try_from("requested-name".to_owned()).ok(),
-                executor.diagnostic_viewer(),
-            )
-            .value;
-        assert_eq!(response.get("id"), Some(&Value::Null));
-        assert_eq!(response.get("result"), Some(&Value::Null));
-        assert_eq!(response["state"], "failed");
-        assert_eq!(response["error"], "unknown tool `missing`");
-        assert_eq!(response["meta"]["tool"], "missing");
-        assert_eq!(response["meta"]["parent"], 7);
-        assert_eq!(response["meta"]["name"], "requested-name");
+        let missing = executor.execute_as(
+            InvocationKind::Script,
+            runtime.agent.clone(),
+            "missing",
+            json!({}),
+            JobId::new(7).ok(),
+        );
+        let error = missing.await.unwrap_err();
+        assert_eq!(
+            error.diagnostic().cause,
+            Cause::UnknownTool {
+                tool: "missing".into()
+            }
+        );
+        let response = failure_response(error, executor.diagnostic_viewer()).value;
+        assert_eq!(
+            response,
+            json!({"state": "failed",
+                   "error": "validate tool `missing` failed: unknown tool `missing`"})
+        );
     }
 
+    /// A background handle shows the job as launched, even when the job completed
+    /// before the handle was collected: never a completed state without its result.
     #[tokio::test]
-    async fn completed_background_launches_return_the_same_unclaimed_metadata() {
+    async fn background_launches_report_the_job_as_launched() {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = runtime.executor(ToolRegistryBuilder::default());
-        let job = created(
-            &runtime,
-            JobSpec {
-                background: true,
-                name: Some("fast-job".parse().unwrap()),
-                ..JobSpec::test(runtime.agent.clone(), "fast")
-            },
-        )
-        .await;
+        let spec = JobSpec {
+            background: true,
+            name: Some("fast-job".parse().unwrap()),
+            ..JobSpec::test(runtime.agent.clone(), "fast")
+        };
+        let job = runtime.jobs.test_running(spec).await.into_test_id();
+        let launched = Box::new(runtime.jobs.metadata(job).await.unwrap());
         let payload = json!({"data": null});
         complete(&runtime, job, payload.clone()).await;
-        let started = || StartedExecution {
-            job,
-            background: true,
-        };
+        let started = || StartedExecution::Background(launched.clone());
         let model = executor.collect_model_started(started()).await.unwrap();
         let script = executor
             .collect_full_view_started(started(), crate::tool::ToolResultPolicy::Value)
@@ -439,12 +344,11 @@ mod tests {
         assert!(model.background && script.background);
         assert!(model.output.images.is_empty() && script.output.images.is_empty());
         let view = model.output.value;
-        assert_eq!(view["state"], "completed");
+        assert_eq!(view["state"], "running");
         assert_eq!(view["id"], job.get());
         assert_eq!(view["meta"]["tool"], "fast");
         assert_eq!(view["meta"]["name"], "fast-job");
-        assert_eq!(view["has_result"], false);
-        assert_eq!(view.get("result"), Some(&Value::Null));
+        assert_eq!(view.get("result"), None);
         assert!(runtime.jobs.has_pending(&runtime.agent).await);
         assert_eq!(
             runtime.jobs.snapshot(job).await.unwrap().output,
@@ -452,10 +356,10 @@ mod tests {
         );
     }
 
+    /// A child's final reply is its job's result: a foreground call returns it and
+    /// a background child's completion carries it, never as a separate reply.
     #[tokio::test]
-    async fn automatic_completed_child_results_reference_independent_messages() {
-        // Cover foreground presentation and a background child that has already
-        // finished before its launch response is collected, without a timing race.
+    async fn completed_child_answers_are_their_results() {
         for background in [false, true] {
             let runtime = crate::tests::TestRuntime::new().await;
             let executor = runtime.executor(ToolRegistryBuilder::default());
@@ -471,63 +375,42 @@ mod tests {
                 ExecutionLocation::root(runtime.root.path().to_owned()),
             );
             runtime.store.append(child.clone(), started).await.unwrap();
-            let text: String = (0..500)
-                .map(|line| format!("child answer line {line}\n"))
-                .collect();
-            let message = Message::Assistant(vec![AssistantItem::text("answer", 0, text.clone())]);
-            let sequence = runtime
-                .jobs
-                .commit_child_message(&child, job, message, text.clone(), true, |_| Vec::new())
+            let jobs = &runtime.jobs;
+            jobs.set_child_agent(job, child.clone()).await.unwrap();
+            let text = "child answer";
+            let message = Message::Assistant(vec![AssistantItem::text("answer", 0, text)]);
+            jobs.commit_child_message(&child, job, message, text.into(), |_| Vec::new())
                 .await
                 .unwrap();
             complete(&runtime, job, json!(text)).await;
-
-            let result = executor
-                .collect_model_started(StartedExecution { job, background })
-                .await
-                .unwrap();
-            assert_eq!(result.output.value["state"], "completed");
-            if background {
-                let notification = runtime
-                    .jobs
-                    .present_output_with(
-                        crate::job::output::OutputArgs::new(job),
-                        crate::job::CancellationToken::new(),
-                        &CapabilitySet::default(),
-                        crate::job::output::OutputOptions::Model {
-                            presentation: crate::job::OutputPresentation::Automatic,
-                        },
-                    )
-                    .await
-                    .unwrap();
-                assert_eq!(notification.view()["meta"]["last_message"], json!(sequence));
-            }
-            let pending = runtime.jobs.pending_delivery(&runtime.agent).await.unwrap();
-            if background {
-                // Launch handles do not read output or claim delivery. Automatic
-                // notifications still reference the independently delivered reply.
-                assert_eq!(result.output.value["has_result"], false);
-                assert!(result.output.value["meta"]["last_message"].is_null());
-                for field in ["result", "presentation"] {
-                    assert_eq!(
-                        result.output.value.get(field),
-                        Some(&Value::Null),
-                        "{field}"
-                    );
-                }
-                assert_eq!(pending.messages().len(), 1);
-                assert_eq!(pending.messages()[0].text, text);
-            } else {
-                // A foreground call returns its answer; nothing is delivered later.
-                assert!(result.output.value["meta"]["last_message"].is_null());
-                let presented = serde_json::to_string(&result.output.value).unwrap();
-                assert!(presented.contains("child answer line 0"), "{presented}");
-                assert!(pending.messages().is_empty());
-            }
+            let pending = jobs.pending_delivery(&runtime.agent).await.unwrap();
+            assert!(pending.messages().is_empty());
+            let delivered: Vec<_> = pending.envelopes().iter().map(|job| job.id).collect();
             drop(pending);
-            // The saved final answer survives either way.
-            let saved = runtime.jobs.snapshot(job).await.unwrap();
-            assert_eq!(saved.output, Some(json!(text)));
+            let view = if background {
+                assert_eq!(delivered, [job]);
+                jobs.present_output_with(
+                    crate::job::output::OutputArgs::new(job),
+                    crate::job::CancellationToken::new(),
+                    &CapabilitySet::default(),
+                    crate::job::output::OutputOptions::Host,
+                )
+                .await
+                .unwrap()
+                .into_view()
+            } else {
+                assert!(delivered.is_empty());
+                let started = StartedExecution::Foreground(job);
+                executor
+                    .collect_model_started(started)
+                    .await
+                    .unwrap()
+                    .output
+                    .value
+            };
+            let view: crate::job::JobView = serde_json::from_value(view).unwrap();
+            assert_eq!(view.state(), JobState::Completed);
+            assert_eq!(view.result(), Some(&json!(text)));
         }
     }
 }

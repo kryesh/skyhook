@@ -1,5 +1,8 @@
 use super::*;
-use skyhook::{agent::Question, remote::PromptAnswer};
+use skyhook::{
+    agent::{Question, QuestionAnswer},
+    remote::PromptAnswer,
+};
 use std::ops::Deref;
 
 /// Editor and view travel with their prompt (and with each question page).
@@ -20,49 +23,17 @@ impl PromptInput {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Answer {
-    Text(String),
-    Choice {
-        label: String,
-        comment: Option<String>,
-    },
-}
-impl Answer {
-    fn into_value(self) -> Value {
-        match self {
-            Self::Text(text)
-            | Self::Choice {
-                label: text,
-                comment: None,
-            } => Value::String(text),
-            Self::Choice {
-                label,
-                comment: Some(comment),
-            } => {
-                serde_json::json!({"answer": label, "comment": comment})
-            }
-        }
-    }
-    fn summary(&self) -> String {
-        match self {
-            Self::Text(text)
-            | Self::Choice {
-                label: text,
-                comment: None,
-            } => text.clone(),
-            Self::Choice {
-                label,
-                comment: Some(comment),
-            } => format!("{label} — {comment}"),
-        }
+fn summary(answer: &QuestionAnswer) -> String {
+    match answer {
+        QuestionAnswer::Text(text) => text.clone(),
+        QuestionAnswer::Commented { answer, comment } => format!("{answer} — {comment}"),
     }
 }
 
 #[derive(Default)]
 struct QuestionDraft {
     input: PromptInput,
-    answer: Option<Answer>,
+    answer: Option<QuestionAnswer>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum QuestionPage {
@@ -134,8 +105,10 @@ enum PromptState {
 pub struct UiPrompt {
     request: Prompt,
     state: PromptState,
-    /// Visibility and focus of an ordinary prompt suspended by authentication.
-    resume: Option<(bool, Focus)>,
+    /// In view in place of the composer; dismissing it keeps it pending.
+    shown: bool,
+    /// The focus of an ordinary prompt suspended by authentication.
+    resume: Option<Focus>,
 }
 // Read-only projection preserves request consumers without exposing a way to
 // replace its category/questions independently of the associated draft.
@@ -146,7 +119,7 @@ impl Deref for UiPrompt {
     }
 }
 impl UiPrompt {
-    fn new(request: Prompt) -> Self {
+    fn new(request: Prompt, shown: bool) -> Self {
         let state = match &request.kind {
             PromptKind::Approval { .. } => PromptState::Approval(PromptInput::default()),
             PromptKind::Questions { questions, .. } => {
@@ -159,6 +132,7 @@ impl UiPrompt {
         Self {
             request,
             state,
+            shown,
             resume: None,
         }
     }
@@ -207,22 +181,36 @@ enum ApprovalAction {
 }
 fn approval_items(
     request: &skyhook::tool::policy::AuthorizationRequest,
-) -> Vec<Item<ApprovalAction>> {
+) -> Vec<(ApprovalAction, &'static str)> {
     let mut items = vec![
-        Item::new(ApprovalAction::Allow, "Allow once", ""),
-        Item::new(ApprovalAction::Deny, "Deny", ""),
-        Item::new(ApprovalAction::Details, "Details", ""),
+        (ApprovalAction::Allow, "Allow once"),
+        (ApprovalAction::Deny, "Deny"),
+        (ApprovalAction::Details, "Details"),
     ];
     if request.permissions.iter().any(|p| p.proposed.is_some()) {
-        items.push(Item::new(ApprovalAction::Grant, "Allow proposed scope", ""));
+        items.push((ApprovalAction::Grant, "Allow proposed scope"));
     }
     items
 }
+/// The approval document's tool arguments, then where the call comes from, so
+/// the brief preview spends its characters on the arguments.
+fn approval_preview(document: &serde_json::Value) -> String {
+    use crate::tui::format::pretty;
+    let mut parts = document.as_object().cloned().unwrap_or_default();
+    let arguments = parts
+        .shift_remove("tool")
+        .map(|arguments| pretty(&arguments));
+    let context = parts
+        .iter()
+        .map(|(part, value)| format!("{part}: {}", pretty(value)));
+    let text: Vec<_> = arguments.into_iter().chain(context).collect();
+    crate::text::brief(&text.join("\n"), 240)
+}
 /// Host-key and agent-key confirmations are answered by choice, not by text.
-fn confirmation_items() -> Vec<Item<PromptAnswer>> {
+fn confirmation_items() -> Vec<(PromptAnswer, &'static str)> {
     vec![
-        Item::new(PromptAnswer::Confirmed, "Confirm", ""),
-        Item::new(PromptAnswer::Rejected, "Decline", ""),
+        (PromptAnswer::Confirmed, "Confirm"),
+        (PromptAnswer::Rejected, "Decline"),
     ]
 }
 #[derive(Clone, Copy)]
@@ -232,29 +220,17 @@ enum QuestionAction {
     Submit,
     Review,
 }
-fn question_items(question: Option<&Question>) -> Vec<Item<QuestionAction>> {
+fn question_items(question: Option<&Question>) -> Vec<(QuestionAction, &str)> {
     if let Some(question) = question {
-        question
-            .options
-            .iter()
-            .enumerate()
-            .map(|(index, option)| {
-                Item::new(
-                    QuestionAction::Choice(index),
-                    &option.label,
-                    &option.description,
-                )
-            })
-            .chain(std::iter::once(Item::new(
-                QuestionAction::Write,
-                "Write an answer…",
-                "",
-            )))
+        let options = question.options.iter().enumerate();
+        options
+            .map(|(index, option)| (QuestionAction::Choice(index), option.label.as_str()))
+            .chain(std::iter::once((QuestionAction::Write, "Write an answer…")))
             .collect()
     } else {
         vec![
-            Item::new(QuestionAction::Submit, "Submit answers", ""),
-            Item::new(QuestionAction::Review, "Review again", ""),
+            (QuestionAction::Submit, "Submit answers"),
+            (QuestionAction::Review, "Review again"),
         ]
     }
 }
@@ -288,8 +264,10 @@ impl App {
             prompt.input_mut().options_scrolled = false;
         }
     }
+    pub fn prompt_shown(&self) -> bool {
+        self.prompts.front().is_some_and(|prompt| prompt.shown)
+    }
     pub fn prompt(&mut self, prompt: Prompt) {
-        let prompt = UiPrompt::new(prompt);
         if matches!(prompt.kind, PromptKind::Authentication { .. }) {
             // Authentication is FIFO before ordinary prompts. Ordinary state
             // stays attached to its own queued request, including every page.
@@ -301,76 +279,79 @@ impl App {
             if index == 0
                 && let Some(previous) = self.prompts.front_mut()
             {
-                previous.resume = Some((self.prompt_active, self.focus));
+                previous.resume = Some(self.focus);
             }
-            self.prompts.insert(index, prompt);
+            self.prompts.insert(index, UiPrompt::new(prompt, false));
             self.activate_prompt();
         } else {
-            let show = self.prompts.is_empty();
-            self.prompts.push_back(prompt);
-            if show {
-                self.prompt_active = true;
+            let shown = self.prompts.is_empty();
+            self.prompts.push_back(UiPrompt::new(prompt, shown));
+            if shown {
                 self.leader = None;
             }
         }
+        self.refresh_menu();
         self.dirty = true;
+    }
+    /// Take out the prompts `remove` picks. A new front prompt restores the
+    /// focus it was suspended with, or else stays in view if the old one was.
+    pub(super) fn take_prompts(
+        &mut self,
+        remove: impl Fn(&UiPrompt) -> bool,
+    ) -> VecDeque<UiPrompt> {
+        let front = self.prompts.front().map(|prompt| (prompt.id, prompt.shown));
+        let prompts = std::mem::take(&mut self.prompts).into_iter();
+        let (removed, kept): (VecDeque<_>, _) = prompts.partition(|prompt| remove(prompt));
+        self.prompts = kept;
+        if !removed.is_empty() {
+            self.refresh_menu();
+        }
+        let Some((id, shown)) = front else {
+            return removed;
+        };
+        match self.prompts.front_mut() {
+            Some(prompt) if prompt.id == id => return removed,
+            Some(prompt) => match prompt.resume.take() {
+                Some(focus) => self.focus = focus,
+                None => prompt.shown = shown,
+            },
+            None => {}
+        }
+        self.dirty = true;
+        removed
     }
     pub(super) fn cancel_prompt(&mut self) {
         let error = match self.prompts.front().map(|prompt| &prompt.kind) {
-            Some(PromptKind::Authentication { .. }) => Some("authentication cancelled"),
+            Some(PromptKind::Authentication { .. }) => "authentication cancelled",
             Some(PromptKind::Questions {
                 background: true, ..
-            }) => Some("questions cancelled"),
-            _ => None,
-        };
-        if let Some(error) = error {
-            if let Some(prompt) = self.prompts.pop_front() {
-                prompt.reject(error.into());
-            }
-            self.reset_prompt();
-        } else {
+            }) => "questions cancelled",
             // Dismissal is not cancellation: request and owned draft persist.
-            self.prompt_active = false;
+            Some(_) => {
+                self.prompts[0].shown = false;
+                return;
+            }
+            None => return,
+        };
+        let front = self.prompts[0].id;
+        for prompt in self.take_prompts(|prompt| prompt.id == front) {
+            prompt.reject(error.into());
         }
-        self.dirty = true;
     }
     pub(super) fn reject_pending_questions(&mut self) {
-        let previous = self.prompts.front().map(|p| p.id);
-        for prompt in std::mem::take(&mut self.prompts) {
-            if matches!(prompt.kind, PromptKind::Questions { .. }) {
-                prompt.reject("questions cancelled by a new user prompt".into());
-            } else {
-                self.prompts.push_back(prompt);
-            }
-        }
-        if previous != self.prompts.front().map(|p| p.id) {
-            self.reset_prompt();
-        }
-        if self.prompts.is_empty() {
-            self.prompt_active = false;
+        let questions = |prompt: &UiPrompt| matches!(prompt.kind, PromptKind::Questions { .. });
+        for prompt in self.take_prompts(questions) {
+            prompt.reject("questions cancelled by a new user prompt".into());
         }
     }
     pub(super) fn activate_prompt(&mut self) {
-        if self.prompts.is_empty() {
+        let Some(prompt) = self.prompts.front_mut() else {
             return;
-        }
-        self.prompt_active = true;
+        };
+        prompt.shown = true;
         self.focus = Focus::Composer;
         self.leader = None;
-        self.menu = None;
-        self.search_editor = None;
-    }
-    pub(super) fn reset_prompt(&mut self) {
-        // The new front already owns its input. Only suspended visibility and
-        // pane focus need restoration; removing a stale item drops its draft.
-        if let Some(prompt) = self.prompts.front_mut() {
-            if let Some((active, focus)) = prompt.resume.take() {
-                self.prompt_active = active;
-                self.focus = focus;
-            }
-        } else {
-            self.prompt_active = false;
-        }
+        self.overlay = None;
     }
     pub(super) fn scroll_prompt(&mut self, options: bool, delta: isize) {
         if self.prompts.is_empty() {
@@ -391,32 +372,20 @@ impl App {
             input.body_scroll = input.body_scroll.saturating_add_signed(delta).min(max);
         }
     }
-    pub fn prompt_options(&self) -> Vec<String> {
+    pub fn prompt_options(&self) -> Vec<&str> {
         let Some(prompt) = self.prompts.front() else {
             return vec![];
         };
+        fn labels<T>(items: Vec<(T, &str)>) -> Vec<&str> {
+            items.into_iter().map(|(_, label)| label).collect()
+        }
         match &prompt.kind {
-            PromptKind::Approval { request, .. } => approval_items(request)
-                .into_iter()
-                .map(|item| item.label)
-                .collect(),
+            PromptKind::Approval { request, .. } => labels(approval_items(request)),
             PromptKind::Questions { questions, .. } => {
-                question_items(questions.get(self.question_index()))
-                    .into_iter()
-                    .map(|item| {
-                        if matches!(item.value, QuestionAction::Choice(_)) {
-                            format!("{} — {}", item.label, item.detail)
-                        } else {
-                            item.label
-                        }
-                    })
-                    .collect()
+                labels(question_items(questions.get(self.question_index())))
             }
             PromptKind::Authentication { prompt, .. } if prompt.kind.is_confirmation() => {
-                confirmation_items()
-                    .into_iter()
-                    .map(|item| item.label)
-                    .collect()
+                labels(confirmation_items())
             }
             PromptKind::Authentication { .. } => vec![],
         }
@@ -430,7 +399,7 @@ impl App {
                 "Permission · agent {} · {}\n{}",
                 crate::tui::format::agent_label(&r.agent),
                 r.tool,
-                crate::tui::format::brief(&crate::tui::format::pretty(&r.arguments), 240)
+                approval_preview(&r.arguments)
             ),
             PromptKind::Questions {
                 agent, questions, ..
@@ -444,7 +413,7 @@ impl App {
                             draft
                                 .answer
                                 .as_ref()
-                                .map(|answer| format!("{}: {}", question.id, answer.summary()))
+                                .map(|answer| format!("{}: {}", question.id, summary(answer)))
                         })
                         .collect::<Vec<_>>()
                         .join("\n");
@@ -461,7 +430,10 @@ impl App {
                 },
             ),
             PromptKind::Authentication { prompt, .. } => {
-                format!("Authentication\n{}", prompt.message)
+                let target = (prompt.target.as_ref())
+                    .map_or_else(String::new, |target| format!(" · {target}"));
+                let origin = crate::tui::model::target_suffix(&prompt.origin);
+                format!("Authentication{target}{origin}\n{}", prompt.message)
             }
         }
     }
@@ -501,10 +473,7 @@ impl App {
         // and its category-specific reply is consumed exactly once below.
         match (&prompt.request.kind, &mut prompt.state) {
             (PromptKind::Approval { request, .. }, PromptState::Approval(input)) => {
-                let Some(action) = approval_items(request)
-                    .get(input.choice)
-                    .map(|item| item.value)
-                else {
+                let Some(&(action, _)) = approval_items(request).get(input.choice) else {
                     return;
                 };
                 if action == ApprovalAction::Details {
@@ -520,19 +489,20 @@ impl App {
                 }
             }
             (PromptKind::Questions { questions, .. }, PromptState::Questions(batch)) => {
-                let Some(action) = question_items(questions.get(batch.index()))
-                    .get(batch.input().choice)
-                    .map(|item| item.value)
-                else {
+                let items = question_items(questions.get(batch.index()));
+                let Some(&(action, _)) = items.get(batch.input().choice) else {
                     return;
                 };
                 match (batch.page, action) {
                     (QuestionPage::Question(index), QuestionAction::Choice(option)) => {
                         let draft = &mut batch.drafts[index];
                         let text = draft.input.editor.text();
-                        draft.answer = Some(Answer::Choice {
-                            label: questions[index].options[option].label.clone(),
-                            comment: (!text.trim().is_empty()).then(|| text.to_owned()),
+                        let answer = questions[index].options[option].label.clone();
+                        draft.answer = Some(if text.trim().is_empty() {
+                            QuestionAnswer::Text(answer)
+                        } else {
+                            let comment = text.to_owned();
+                            QuestionAnswer::Commented { answer, comment }
                         });
                     }
                     (QuestionPage::Question(index), QuestionAction::Write) => {
@@ -541,7 +511,7 @@ impl App {
                         if text.trim().is_empty() {
                             return;
                         }
-                        draft.answer = Some(Answer::Text(text.to_owned()));
+                        draft.answer = Some(QuestionAnswer::Text(text.to_owned()));
                     }
                     (QuestionPage::Review, QuestionAction::Review) => {
                         batch.select(0);
@@ -570,12 +540,14 @@ impl App {
             (PromptKind::Authentication { .. }, PromptState::Authentication(_)) => {}
             _ => unreachable!("request and draft are constructed together and cannot be replaced"),
         }
+        let front = self.prompts[0].id;
+        let removed = self.take_prompts(|prompt| prompt.id == front);
         let UiPrompt {
             request, mut state, ..
-        } = self.prompts.pop_front().unwrap();
+        } = removed.into_iter().next().unwrap();
         match (request.kind, &mut state) {
             (PromptKind::Approval { request, reply }, PromptState::Approval(input)) => {
-                let answer = match approval_items(&request)[input.choice].value {
+                let answer = match approval_items(&request)[input.choice].0 {
                     ApprovalAction::Allow => ApprovalReply::Allow,
                     ApprovalAction::Deny => ApprovalReply::Deny,
                     ApprovalAction::Grant => ApprovalReply::Grant,
@@ -589,21 +561,14 @@ impl App {
                 },
                 PromptState::Questions(batch),
             ) => {
-                let mut answers = batch
-                    .drafts
-                    .iter_mut()
-                    .map(|draft| draft.answer.take().expect("confirmed answer").into_value());
-                let value = if questions.len() == 1 {
-                    answers.next().unwrap()
-                } else {
-                    let ids = questions.into_iter().map(|question| question.id);
-                    Value::Object(ids.zip(answers).collect())
-                };
-                let _ = reply.send(Ok(value));
+                let answers = batch.drafts.iter_mut();
+                let answers = answers.map(|draft| draft.answer.take().expect("confirmed answer"));
+                let ids = questions.into_iter().map(|question| question.id);
+                let _ = reply.send(Ok(ids.zip(answers).collect()));
             }
             (PromptKind::Authentication { prompt, reply }, PromptState::Authentication(input)) => {
                 let answer = if prompt.kind.is_confirmation() {
-                    confirmation_items().swap_remove(input.choice).value
+                    confirmation_items().swap_remove(input.choice).0
                 } else {
                     PromptAnswer::Secret(input.editor.take_sensitive())
                 };
@@ -611,7 +576,6 @@ impl App {
             }
             _ => unreachable!("request and draft are constructed together"),
         }
-        self.reset_prompt();
     }
 }
 
@@ -622,12 +586,12 @@ mod tests {
     use KeyCode::{Char, Down, Enter, Esc, Left, Right, Tab, Up};
     use skyhook::remote::SensitivePromptKind;
 
-    fn confirmed_answers(app: &App) -> HashMap<String, Answer> {
+    fn confirmed_answers(app: &App) -> QuestionReply {
         let Some(prompt) = app.prompts.front() else {
-            return HashMap::new();
+            return QuestionReply::new();
         };
         let PromptKind::Questions { questions, .. } = &prompt.kind else {
-            return HashMap::new();
+            return QuestionReply::new();
         };
         let drafts = &prompt.batch().unwrap().drafts;
         let answers = questions.iter().zip(drafts);
@@ -658,6 +622,8 @@ mod tests {
         let prompt = skyhook::remote::SensitivePrompt {
             kind,
             message: format!("SSH prompt {id}"),
+            target: None,
+            origin: skyhook::target::TargetRef::Root,
         };
         let kind = PromptKind::Authentication { prompt, reply };
         app.prompt(Prompt { id, kind });
@@ -667,11 +633,8 @@ mod tests {
     #[tokio::test]
     async fn questions_open_and_accept_answers_while_inspecting_agents() {
         let (_root, mut app) = fixture().await;
-        let mut child = app.projection.agents[0].clone();
-        child.id = child.id.child(1);
-        child.name = "worker".into();
-        app.projection.agents.push(child.clone());
-        app.select(child.id.clone());
+        let child = push_child(&mut app, 1).await;
+        app.select(child.clone());
         app.editor.set("preserved draft".into());
 
         for focus in [Focus::Tree, Focus::Content] {
@@ -681,13 +644,14 @@ mod tests {
                 description: "Keep working".into(),
             };
             let answer = question(&mut app, "Choose a direction".into(), vec![option]);
-            assert!(app.prompt_active);
+            assert!(app.prompt_shown());
             let screen = draw(&mut app);
             assert!(app.tree_rect.height > 0);
             assert!(screen.contains("Choose a direction") && screen.contains("Continue"));
             key(&mut app, Enter, M::NONE);
-            assert_eq!(answer.await.unwrap().unwrap(), "Continue");
-            assert_eq!(app.selected, child.id);
+            let reply = answer.await.unwrap().unwrap();
+            assert_eq!(reply, texts(&[("answer", "Continue")]));
+            assert_eq!(app.selected, child);
             assert!(app.focus == focus);
             assert_eq!(app.editor.text(), "preserved draft");
         }
@@ -751,12 +715,12 @@ mod tests {
         assert!(confirmed_answers(&app).is_empty());
         assert!(pending(&mut response));
         key(&mut app, Esc, M::NONE);
-        assert!(!app.prompt_active);
+        assert!(!app.prompt_shown());
         assert_eq!(app.prompts.len(), 1);
         assert!(pending(&mut response));
         assert!(!draw(&mut app).contains("/attention"));
         chord(&mut app, KeyCode::Char('r'));
-        assert!(app.prompt_active);
+        assert!(app.prompt_shown());
         assert_eq!(app.question_index(), 2);
         key(&mut app, Left, M::NONE);
         assert_eq!(app.prompt_input_mut().editor.text(), "draft");
@@ -807,8 +771,11 @@ mod tests {
         press(&mut app, &[Tab, Left, Enter]);
         assert_eq!(app.prompt_input_mut().editor.text(), "second revised");
         press(&mut app, &[Enter, Enter]);
-        let value = response.await.unwrap().unwrap();
-        assert_eq!(value, json!({"answer": "first", "last": "second revised"}));
+        let reply = response.await.unwrap().unwrap();
+        assert_eq!(
+            reply,
+            texts(&[("answer", "first"), ("last", "second revised")])
+        );
     }
 
     #[tokio::test]
@@ -819,7 +786,10 @@ mod tests {
         key(&mut app, Left, M::NONE);
         assert_eq!(app.prompt_input_mut().editor.cursor(), 2);
         key(&mut app, Enter, M::NONE);
-        assert_eq!(response.await.unwrap().unwrap(), "abc");
+        assert_eq!(
+            response.await.unwrap().unwrap(),
+            texts(&[("answer", "abc")])
+        );
         let ssh = authentication(&mut app, 100, SensitivePromptKind::Password);
         assert!(app.prompt_options().is_empty());
         app.prompt_input_mut().editor.insert("sec");
@@ -890,17 +860,21 @@ mod tests {
         key(&mut app, Enter, M::NONE);
         assert_eq!(app.prompt_input_mut().editor.text(), "freeform");
         press(&mut app, &[Enter, Enter]);
-        assert_eq!(
-            response.await.unwrap().unwrap(),
-            json!({"answer": {"answer": "Second", "comment": "my comment amended"}, "next": "freeform"})
-        );
-        // Wire grammar: a blank comment is dropped, free-form text is untrimmed
-        // and whitespace-only free-form input never confirms.
+        let mut expected = texts(&[("next", "freeform")]);
+        let commented = QuestionAnswer::Commented {
+            answer: "Second".into(),
+            comment: "my comment amended".into(),
+        };
+        expected.insert("answer".into(), commented);
+        assert_eq!(response.await.unwrap().unwrap(), expected);
+        // A blank comment is dropped, free-form text is untrimmed and
+        // whitespace-only free-form input never confirms.
         let response = question(&mut app, "Choose".into(), suggestions());
         app.prompt_input_mut().choice = 2;
         app.prompt_input_mut().editor.set(" free form ".into());
         app.answer();
-        assert_eq!(response.await.unwrap().unwrap(), " free form ");
+        let reply = response.await.unwrap().unwrap();
+        assert_eq!(reply, texts(&[("answer", " free form ")]));
         let mut response = question(&mut app, "Write".into(), vec![]);
         app.prompt_input_mut().editor.set(" ".into());
         app.answer();
@@ -929,10 +903,10 @@ mod tests {
                 input.options_scrolled,
             ) = (3, 2, true);
             app.info("Details", "An open menu".into());
-            app.search_editor = Some(Editor::default());
+            app.overlay = Some(Overlay::Search(Editor::default()));
             let response = authentication(&mut app, 100, SensitivePromptKind::Password);
             assert!(matches!(app.input_target(), InputTarget::Prompt));
-            assert!(app.menu.is_none() && app.search_editor.is_none());
+            assert!(app.overlay.is_none());
             assert_eq!(app.prompts.front().unwrap().id, 100);
             assert!(app.prompt_input_mut().editor.text().is_empty());
             assert!(confirmed_answers(&app).is_empty());
@@ -956,7 +930,7 @@ mod tests {
                     app.tick();
                 }
             }
-            assert!(app.prompt_active && app.focus == Focus::Tree);
+            assert!(app.prompt_shown() && app.focus == Focus::Tree);
             assert_eq!(app.question_index(), 1);
             let input = app.prompt_input_mut();
             assert_eq!(input.editor.text(), "unfinished answer");
@@ -968,16 +942,16 @@ mod tests {
                 ),
                 (3, 2, true)
             );
-            let first = Answer::Text("first answer".into());
-            assert_eq!(confirmed_answers(&app)["answer"], first);
+            assert_eq!(
+                confirmed_answers(&app),
+                texts(&[("answer", "first answer")])
+            );
             assert_eq!(app.editor.text(), "composer draft");
             assert!(!has_suspended_prompt(&app));
             press(&mut app, &[Enter, Enter]);
-            let value = answer.await.unwrap().unwrap();
-            assert_eq!(
-                value,
-                json!({"answer": "first answer", "second": "unfinished answer"})
-            );
+            let reply = answer.await.unwrap().unwrap();
+            let expected = [("answer", "first answer"), ("second", "unfinished answer")];
+            assert_eq!(reply, texts(&expected));
         }
     }
 
@@ -990,7 +964,7 @@ mod tests {
         let first = authentication(&mut app, 100, SensitivePromptKind::Password);
         paste(&mut app, "first secret");
         let second = authentication(&mut app, 101, SensitivePromptKind::Password);
-        assert!(app.prompt_active);
+        assert!(app.prompt_shown());
         assert_eq!(
             app.prompts.iter().map(|p| p.id).collect::<Vec<_>>(),
             [100, 101, 1]
@@ -998,16 +972,27 @@ mod tests {
         assert_eq!(app.prompt_input_mut().editor.text(), "first secret");
         key(&mut app, Esc, M::NONE);
         assert!(first.await.unwrap().is_err());
-        assert!(app.prompt_active);
+        assert!(app.prompt_shown());
         assert!(app.prompt_input_mut().editor.text().is_empty());
         assert_eq!(app.prompts.front().unwrap().id, 101);
         key(&mut app, Esc, M::NONE);
         assert!(second.await.unwrap().is_err());
-        assert!(!app.prompt_active);
+        assert!(!app.prompt_shown());
         assert_eq!(app.prompt_input_mut().editor.text(), "saved answer");
         chord(&mut app, KeyCode::Char('r'));
         key(&mut app, Enter, M::NONE);
-        assert_eq!(answer.await.unwrap().unwrap(), "saved answer");
+        let reply = answer.await.unwrap().unwrap();
+        assert_eq!(reply, texts(&[("answer", "saved answer")]));
+    }
+
+    #[tokio::test]
+    async fn closing_the_only_prompt_redraws() {
+        let (_root, mut app) = fixture().await;
+        drop(question(&mut app, "Question".into(), vec![]));
+        app.dirty = false;
+        app.tick();
+        assert!(app.prompts.is_empty());
+        assert!(app.dirty);
     }
 
     #[tokio::test]
@@ -1035,7 +1020,7 @@ mod tests {
         assert!(app.prompts.is_empty());
         assert!(confirmed_answers(&app).is_empty());
         chord(&mut app, KeyCode::Char('r'));
-        assert!(!app.prompt_active);
+        assert!(!app.prompt_shown());
         let rejected = question(&mut app, "Next question".into(), vec![]);
         assert!(app.prompt_input_mut().editor.text().is_empty());
         key(&mut app, Esc, M::NONE);
@@ -1045,7 +1030,25 @@ mod tests {
         assert!(app.prompts.is_empty());
         assert_eq!(app.queue.len(), 1);
         chord(&mut app, KeyCode::Char('r'));
-        assert!(!app.prompt_active);
+        assert!(!app.prompt_shown());
+    }
+
+    #[tokio::test]
+    async fn approval_preview_leads_with_the_tool_arguments() {
+        let mut document = crate::interaction::tests::approval_request()
+            .await
+            .arguments;
+        let arguments = crate::tui::format::pretty(&document["tool"]);
+        document["network_origin"] = json!("https://redirect.test");
+        let preview = approval_preview(&document);
+        assert!(
+            preview.starts_with(&crate::text::brief(&arguments, 240)),
+            "{preview}"
+        );
+        assert!(
+            preview.ends_with(r#"network_origin: "https://redirect.test""#),
+            "{preview}"
+        );
     }
 
     #[tokio::test]
@@ -1067,10 +1070,10 @@ mod tests {
             assert_eq!(app.prompt_options().len(), if proposed { 4 } else { 3 });
             app.prompt_input_mut().choice = 2;
             app.answer();
-            assert!(app.menu.is_some());
+            assert!(app.menu().is_some());
             assert_eq!(app.prompts.len(), 1);
             assert!(pending(&mut response));
-            app.menu = None;
+            app.overlay = None;
             app.prompt_input_mut().choice = if proposed { 3 } else { 1 };
             app.answer();
             let expected = if proposed {

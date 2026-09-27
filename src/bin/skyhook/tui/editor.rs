@@ -1,6 +1,6 @@
 use super::composer::ComposerLayout;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
-use unicode_segmentation::UnicodeSegmentation;
+use unicode_segmentation::GraphemeCursor;
 
 use std::{collections::VecDeque, ops::Range};
 use zeroize::Zeroize;
@@ -15,21 +15,237 @@ pub(super) fn push_history<T>(history: &mut VecDeque<T>, entry: T) {
     history.push_back(entry);
 }
 
-/// An edit can be handled without changing text (navigation or a boundary no-op).
+/// The grapheme of `text` holding `offset`; empty at the end of the text.
+pub(super) fn grapheme(text: &str, offset: usize) -> Range<usize> {
+    // The text is one whole chunk, so the cursor never asks for context.
+    let mut cursor = GraphemeCursor::new(offset, text.len(), true);
+    if cursor.is_boundary(text, 0) == Ok(false) {
+        let _ = cursor.prev_boundary(text, 0);
+    }
+    let from = cursor.cur_cursor();
+    let to = cursor.next_boundary(text, 0).ok().flatten();
+    from..to.unwrap_or(text.len())
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-pub struct EditOutcome {
-    pub handled: bool,
-    pub text_changed: bool,
+pub enum EditOutcome {
+    #[default]
+    Ignored,
+    /// Handled without changing text: navigation or a boundary no-op.
+    Handled,
+    Changed,
 }
 impl EditOutcome {
-    /// Handled without changing text: navigation or a boundary no-op.
-    pub const HANDLED: Self = Self::handled(false);
-    pub const CHANGED: Self = Self::handled(true);
     pub const fn handled(text_changed: bool) -> Self {
-        Self {
-            handled: true,
-            text_changed,
+        if text_changed {
+            Self::Changed
+        } else {
+            Self::Handled
         }
+    }
+    pub fn text_changed(self) -> bool {
+        self == Self::Changed
+    }
+}
+
+/// Where a movement or deletion reaches from the cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Motion {
+    Previous,
+    Next,
+    WordBack,
+    WordForward,
+    LineStart,
+    LineEnd,
+    Start,
+    End,
+    /// The visual row above or below, keeping the column.
+    Up,
+    Down,
+}
+
+/// One editing action, read from a key the same way for every text field.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Edit {
+    Move {
+        motion: Motion,
+        extend: bool,
+    },
+    /// The selection, or else the text up to where `motion` reaches.
+    Delete(Motion),
+    /// The text to the line boundary, whatever is selected. Forward at the end
+    /// of a line joins the next one.
+    DeleteLine {
+        forward: bool,
+    },
+    Insert(char),
+    Undo,
+    Redo,
+}
+impl Edit {
+    pub fn parse(key: KeyEvent) -> Option<Self> {
+        let ctrl = key.modifiers.contains(M::CONTROL);
+        let alt = key.modifiers.contains(M::ALT);
+        let word = ctrl || alt;
+        let motion = match key.code {
+            KeyCode::Left if word => Motion::WordBack,
+            KeyCode::Left => Motion::Previous,
+            KeyCode::Right if word => Motion::WordForward,
+            KeyCode::Right => Motion::Next,
+            KeyCode::Home => Motion::Start,
+            KeyCode::End => Motion::End,
+            KeyCode::Up => Motion::Up,
+            KeyCode::Down => Motion::Down,
+            KeyCode::Char('a') if ctrl => Motion::LineStart,
+            KeyCode::Char('e') if ctrl => Motion::LineEnd,
+            KeyCode::Char('b') if alt => Motion::WordBack,
+            KeyCode::Char('b') if ctrl => Motion::Previous,
+            KeyCode::Char('f') if alt => Motion::WordForward,
+            KeyCode::Char('f') if ctrl => Motion::Next,
+            KeyCode::Char('-') if ctrl => return Some(Self::Undo),
+            KeyCode::Char('.') if ctrl => return Some(Self::Redo),
+            KeyCode::Char('u') if ctrl => return Some(Self::DeleteLine { forward: false }),
+            KeyCode::Char('k') if ctrl => return Some(Self::DeleteLine { forward: true }),
+            KeyCode::Backspace if word => return Some(Self::Delete(Motion::WordBack)),
+            KeyCode::Char('w') if ctrl => return Some(Self::Delete(Motion::WordBack)),
+            KeyCode::Backspace => return Some(Self::Delete(Motion::Previous)),
+            KeyCode::Delete | KeyCode::Char('d') if word => {
+                return Some(Self::Delete(Motion::WordForward));
+            }
+            KeyCode::Delete => return Some(Self::Delete(Motion::Next)),
+            KeyCode::Char(c) if !word => return Some(Self::Insert(c)),
+            _ => return None,
+        };
+        let extend = key.modifiers.contains(M::SHIFT);
+        Some(Self::Move { motion, extend })
+    }
+}
+
+/// A text field that carries out every [`Edit`] through its own primitives.
+pub trait TextField {
+    fn text(&self) -> &str;
+    fn cursor(&self) -> usize;
+    fn anchor(&self) -> Option<usize>;
+    /// The atomic unit holding `offset`; empty at the end of the text.
+    fn unit(&self, offset: usize) -> Range<usize>;
+    /// An indivisible object, which is a word by itself.
+    fn is_object(&self, _unit: &Range<usize>) -> bool {
+        false
+    }
+    /// Where Up or Down lands, keeping a column across shorter visual rows.
+    /// A field drawn on a single row stays put.
+    fn vertical(&mut self, _down: bool) -> usize {
+        self.cursor()
+    }
+    /// Forget the column vertical movement keeps.
+    fn forget_column(&mut self) {}
+    /// Move the cursor to a unit boundary, selecting from `anchor`.
+    fn place(&mut self, cursor: usize, anchor: Option<usize>);
+    /// Delete `range` as one undoable edit; only an actual deletion enters history.
+    fn erase(&mut self, range: Range<usize>) -> bool;
+    fn insert(&mut self, text: &str) -> EditOutcome;
+    /// Undo (or redo) one edit, moving the current state onto the opposite stack.
+    fn step_history(&mut self, redo: bool) -> bool;
+
+    fn selection(&self) -> Option<Range<usize>> {
+        let cursor = self.cursor();
+        self.anchor().map(|a| a.min(cursor)..a.max(cursor))
+    }
+
+    fn handle(&mut self, key: KeyEvent) -> EditOutcome {
+        Edit::parse(key).map_or(EditOutcome::Ignored, |edit| self.apply(edit))
+    }
+
+    fn apply(&mut self, edit: Edit) -> EditOutcome {
+        let cursor = self.cursor();
+        let text_changed = match edit {
+            Edit::Move { motion, extend } => {
+                let target = self.target(motion);
+                let anchor = extend.then(|| self.anchor().unwrap_or(cursor));
+                self.place(target, anchor);
+                if !matches!(motion, Motion::Up | Motion::Down) {
+                    self.forget_column();
+                }
+                return EditOutcome::Handled;
+            }
+            Edit::Delete(motion) => {
+                let range = self.selection().filter(|range| !range.is_empty());
+                let range = range.unwrap_or_else(|| {
+                    let target = self.target(motion);
+                    target.min(cursor)..target.max(cursor)
+                });
+                self.erase(range)
+            }
+            Edit::DeleteLine { forward: false } => {
+                let start = self.target(Motion::LineStart);
+                self.erase(start..cursor)
+            }
+            Edit::DeleteLine { forward: true } => {
+                let end = match self.target(Motion::LineEnd) {
+                    end if end == cursor => self.target(Motion::Next),
+                    end => end,
+                };
+                self.erase(cursor..end)
+            }
+            Edit::Insert(c) => {
+                let mut bytes = [0; 4];
+                let changed = self.insert(c.encode_utf8(&mut bytes)).text_changed();
+                bytes.zeroize();
+                changed
+            }
+            Edit::Undo => self.step_history(false),
+            Edit::Redo => self.step_history(true),
+        };
+        EditOutcome::handled(text_changed)
+    }
+
+    fn target(&mut self, motion: Motion) -> usize {
+        let (text, cursor) = (self.text(), self.cursor());
+        match motion {
+            Motion::Previous => self.step(cursor, false).map_or(0, |unit| unit.start),
+            Motion::Next => self.step(cursor, true).map_or(cursor, |unit| unit.end),
+            Motion::WordBack => self.word(false),
+            Motion::WordForward => self.word(true),
+            Motion::LineStart => text[..cursor].rfind('\n').map_or(0, |i| i + 1),
+            Motion::LineEnd => {
+                let end = text[cursor..].find('\n').map_or(text.len(), |i| cursor + i);
+                self.unit(end).start
+            }
+            Motion::Start => 0,
+            Motion::End => text.len(),
+            Motion::Up | Motion::Down => self.vertical(motion == Motion::Down),
+        }
+    }
+
+    /// The unit beside `offset`, before or after it.
+    fn step(&self, offset: usize, forward: bool) -> Option<Range<usize>> {
+        if forward {
+            (offset < self.text().len()).then(|| self.unit(offset))
+        } else {
+            let before = self.text()[..offset].chars().next_back()?;
+            Some(self.unit(offset - before.len_utf8()))
+        }
+    }
+
+    fn word(&self, forward: bool) -> usize {
+        let mut end = self.cursor();
+        let mut seen_word = false;
+        while let Some(unit) = self.step(end, forward) {
+            let edge = if forward { unit.end } else { unit.start };
+            if self.is_object(&unit) {
+                if !seen_word {
+                    end = edge;
+                }
+                break;
+            }
+            let whitespace = self.text()[unit].chars().all(char::is_whitespace);
+            if seen_word && whitespace {
+                break;
+            }
+            seen_word |= !whitespace;
+            end = edge;
+        }
+        end
     }
 }
 
@@ -96,32 +312,16 @@ pub struct Editor {
     redo: VecDeque<(SensitiveText, usize)>,
 }
 impl Editor {
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-    pub fn anchor(&self) -> Option<usize> {
-        self.anchor
-    }
-
-    pub fn set_cursor(&mut self, cursor: usize) -> bool {
-        if !self.text.is_char_boundary(cursor) {
-            return false;
-        }
-        self.cursor = cursor;
-        true
-    }
-
     /// Reject invalid UTF-8 coordinates before changing either position.
     pub fn set_selection(&mut self, anchor: Option<usize>, cursor: usize) -> bool {
-        if anchor.is_some_and(|anchor| !self.text.is_char_boundary(anchor))
-            || !self.set_cursor(cursor)
+        if [Some(cursor), anchor]
+            .into_iter()
+            .flatten()
+            .any(|offset| !self.text.is_char_boundary(offset))
         {
             return false;
         }
-        self.anchor = anchor;
+        (self.cursor, self.anchor) = (cursor, anchor);
         true
     }
 
@@ -147,7 +347,47 @@ impl Editor {
         push_history(&mut self.undo, (self.text.clone(), self.cursor));
         self.redo.clear();
     }
-    /// Undo (or redo) one edit, moving the current text onto the opposite stack.
+    /// Transfer a secret without making an undo copy, and wipe its editing history.
+    pub fn take_sensitive(&mut self) -> skyhook::remote::SecretValue {
+        let secret = skyhook::remote::SecretValue::new(std::mem::take(&mut self.text.0));
+        self.clear_sensitive();
+        secret
+    }
+}
+impl TextField for Editor {
+    fn text(&self) -> &str {
+        &self.text
+    }
+    fn cursor(&self) -> usize {
+        self.cursor
+    }
+    fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+    fn unit(&self, offset: usize) -> Range<usize> {
+        grapheme(&self.text, offset)
+    }
+    fn place(&mut self, cursor: usize, anchor: Option<usize>) {
+        (self.cursor, self.anchor) = (cursor, anchor);
+    }
+    fn erase(&mut self, range: Range<usize>) -> bool {
+        let changed = !range.is_empty();
+        if changed {
+            self.save();
+        }
+        self.anchor = None;
+        self.text.replace_range(range.clone(), "");
+        self.cursor = range.start;
+        changed
+    }
+    fn insert(&mut self, text: &str) -> EditOutcome {
+        self.save();
+        let anchor = self.anchor.take().unwrap_or(self.cursor);
+        let (a, b) = (anchor.min(self.cursor), anchor.max(self.cursor));
+        let text_changed = self.text.replace_range(a..b, text);
+        self.cursor = a + text.len();
+        EditOutcome::handled(text_changed)
+    }
     fn step_history(&mut self, redo: bool) -> bool {
         let (from, to) = if redo {
             (&mut self.redo, &mut self.undo)
@@ -162,180 +402,6 @@ impl Editor {
         self.cursor = cursor;
         self.anchor = None;
         changed
-    }
-    fn selection(&mut self) -> bool {
-        if let Some(anchor) = self.anchor.take() {
-            let (a, b) = (anchor.min(self.cursor), anchor.max(self.cursor));
-            let changed = self.text.replace_range(a..b, "");
-            self.cursor = a;
-            changed
-        } else {
-            false
-        }
-    }
-    pub fn insert(&mut self, text: &str) -> EditOutcome {
-        self.save();
-        let anchor = self.anchor.take().unwrap_or(self.cursor);
-        let (a, b) = (anchor.min(self.cursor), anchor.max(self.cursor));
-        let text_changed = self.text.replace_range(a..b, text);
-        self.cursor = a + text.len();
-        EditOutcome::handled(text_changed)
-    }
-    /// Transfer a secret without making an undo copy, and wipe its editing history.
-    pub fn take_sensitive(&mut self) -> skyhook::remote::SecretValue {
-        let secret = skyhook::remote::SecretValue::new(std::mem::take(&mut self.text.0));
-        self.clear_sensitive();
-        secret
-    }
-    fn previous(&self) -> usize {
-        self.text[..self.cursor]
-            .grapheme_indices(true)
-            .next_back()
-            .map_or(0, |(i, _)| i)
-    }
-    fn next(&self) -> usize {
-        self.text[self.cursor..]
-            .graphemes(true)
-            .next()
-            .map_or(self.text.len(), |s| self.cursor + s.len())
-    }
-    fn word(&self, forward: bool) -> usize {
-        if forward {
-            let suffix = &self.text[self.cursor..];
-            let n = suffix
-                .char_indices()
-                .skip_while(|(_, c)| c.is_whitespace())
-                .find(|(_, c)| c.is_whitespace())
-                .map_or(suffix.len(), |(i, _)| i);
-            self.cursor + n
-        } else {
-            let prefix = self.text[..self.cursor].trim_end();
-            prefix
-                .char_indices()
-                .rev()
-                .find(|(_, c)| c.is_whitespace())
-                .map_or(0, |(i, c)| i + c.len_utf8())
-        }
-    }
-    pub fn handle(&mut self, key: KeyEvent) -> EditOutcome {
-        let ctrl = key.modifiers.contains(M::CONTROL);
-        let alt = key.modifiers.contains(M::ALT);
-        let shift = key.modifiers.contains(M::SHIFT);
-        let start = self.text[..self.cursor].rfind('\n').map_or(0, |n| n + 1);
-        let end = self.text[self.cursor..]
-            .find('\n')
-            .map_or(self.text.len(), |n| self.cursor + n);
-        let movement = match key.code {
-            KeyCode::Left => Some(if ctrl || alt {
-                self.word(false)
-            } else {
-                self.previous()
-            }),
-            KeyCode::Right => Some(if ctrl || alt {
-                self.word(true)
-            } else {
-                self.next()
-            }),
-            KeyCode::Home => Some(0),
-            KeyCode::End => Some(self.text.len()),
-            KeyCode::Char('a') if ctrl => Some(start),
-            KeyCode::Char('e') if ctrl => Some(end),
-            KeyCode::Char('b') if ctrl || alt => Some(if alt {
-                self.word(false)
-            } else {
-                self.previous()
-            }),
-            KeyCode::Char('f') if ctrl || alt => {
-                Some(if alt { self.word(true) } else { self.next() })
-            }
-            KeyCode::Up if start > 0 => {
-                let previous = self.text[..start - 1].rfind('\n').map_or(0, |n| n + 1);
-                let column = self.text[start..self.cursor].graphemes(true).count();
-                Some(
-                    previous
-                        + self.text[previous..start - 1]
-                            .graphemes(true)
-                            .take(column)
-                            .map(str::len)
-                            .sum::<usize>(),
-                )
-            }
-            KeyCode::Down if end < self.text.len() => {
-                let next = end + 1;
-                let tail = &self.text[next..];
-                let line = tail.split('\n').next().unwrap_or_default();
-                let column = self.text[start..self.cursor].graphemes(true).count();
-                Some(
-                    next + line
-                        .graphemes(true)
-                        .take(column)
-                        .map(str::len)
-                        .sum::<usize>(),
-                )
-            }
-            _ => None,
-        };
-        if let Some(cursor) = movement {
-            if shift {
-                self.anchor.get_or_insert(self.cursor);
-            } else {
-                self.anchor = None;
-            }
-            self.cursor = cursor;
-            return EditOutcome::HANDLED;
-        }
-        let text_changed = match key.code {
-            KeyCode::Char('-') if ctrl => self.step_history(false),
-            KeyCode::Char('.') if ctrl => self.step_history(true),
-            KeyCode::Backspace | KeyCode::Char('w') if key.code == KeyCode::Backspace || ctrl => {
-                self.save();
-                if self.anchor.is_some() {
-                    self.selection()
-                } else {
-                    let from = if ctrl || alt {
-                        self.word(false)
-                    } else {
-                        self.previous()
-                    };
-                    let changed = self.text.replace_range(from..self.cursor, "");
-                    self.cursor = from;
-                    changed
-                }
-            }
-            KeyCode::Delete | KeyCode::Char('d') if key.code == KeyCode::Delete || ctrl || alt => {
-                self.save();
-                if self.anchor.is_some() {
-                    self.selection()
-                } else {
-                    let to = if ctrl || alt {
-                        self.word(true)
-                    } else {
-                        self.next()
-                    };
-                    self.text.replace_range(self.cursor..to, "")
-                }
-            }
-            KeyCode::Char('u') if ctrl => {
-                self.save();
-                self.anchor = None;
-                let changed = self.text.replace_range(start..self.cursor, "");
-                self.cursor = start;
-                changed
-            }
-            KeyCode::Char('k') if ctrl => {
-                self.save();
-                self.anchor = None;
-                self.text.replace_range(self.cursor..end, "")
-            }
-            KeyCode::Char(c) if !ctrl && !alt => {
-                let mut bytes = [0; 4];
-                let changed = self.insert(c.encode_utf8(&mut bytes)).text_changed;
-                bytes.zeroize();
-                changed
-            }
-            _ => return EditOutcome::default(),
-        };
-        EditOutcome::handled(text_changed)
     }
 }
 
@@ -416,21 +482,21 @@ mod tests {
         let mut editor = Editor::default();
         assert_eq!(
             press(&mut editor, KeyCode::Backspace, M::NONE),
-            EditOutcome::HANDLED
+            EditOutcome::Handled
         );
         assert_eq!(
             press(&mut editor, KeyCode::Esc, M::NONE),
-            EditOutcome::default()
+            EditOutcome::Ignored
         );
-        assert!(editor.insert("aé👩‍💻").text_changed);
+        assert!(editor.insert("aé👩‍💻").text_changed());
         press(&mut editor, KeyCode::Left, M::SHIFT);
         let same = editor.insert("👩‍💻");
         assert_eq!(
             same,
-            EditOutcome::HANDLED,
+            EditOutcome::Handled,
             "identical selection replacement is not a text change"
         );
-        assert!(press(&mut editor, KeyCode::Backspace, M::NONE).text_changed);
+        assert!(press(&mut editor, KeyCode::Backspace, M::NONE).text_changed());
         assert_eq!(editor.text(), "aé");
         // Invalid selections are rejected atomically.
         for (anchor, cursor) in [(Some(0), 2), (Some(4), 0)] {
@@ -438,7 +504,7 @@ mod tests {
             assert_eq!((editor.cursor(), editor.anchor()), (3, None));
         }
         assert!(editor.set_selection(Some(1), 3));
-        assert!(editor.insert("界").text_changed);
+        assert!(editor.insert("界").text_changed());
         assert_eq!(editor.text(), "a界");
     }
 }

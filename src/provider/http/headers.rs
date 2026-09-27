@@ -17,7 +17,10 @@ use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use tokio::{io::AsyncReadExt, process::Command, sync::OnceCell};
 
 use super::auth::Authenticator;
-use crate::provider::{ProviderError, ProviderErrorKind};
+use crate::{
+    newtype::string_newtype,
+    provider::{ProviderError, ProviderErrorKind},
+};
 
 // Credentials should be small; cap even unsuccessful or never-ending output.
 const MAX_STDOUT_BYTES: usize = 64 * 1024;
@@ -283,7 +286,7 @@ impl Resolved {
     /// any had been accepted before, for the runtime to retry with fresh ones,
     /// and a plain authentication failure otherwise. Each generation carried is
     /// discarded unless a newer one already replaced it.
-    pub(crate) fn unauthorized(&self, mut error: ProviderError) -> ProviderError {
+    pub(crate) fn unauthorized(&self, error: ProviderError) -> ProviderError {
         let mut leases = self.leases().peekable();
         if leases.peek().is_none() {
             return error;
@@ -296,30 +299,44 @@ impl Resolved {
                 *current = Arc::default();
             }
         }
-        error.kind = if expired {
+        let kind = if expired {
             ProviderErrorKind::CredentialExpired
         } else {
             ProviderErrorKind::Authentication
         };
-        error
+        kind.error(error.message)
     }
 }
 
-/// What a command value supplies; its failures say which.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Role {
-    /// `api_key`.
-    Credential,
-    /// An entry under `headers`.
-    Header,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("must be a valid header value, without line breaks or control characters")]
+pub struct InvalidHeaderText;
+
+string_newtype! {
+    /// Configured text sent as a header value.
+    pub struct HeaderText(InvalidHeaderText) =
+        |text| HeaderValue::from_str(text).map(drop).map_err(|_| InvalidHeaderText);
 }
 
-impl fmt::Display for Role {
+impl HeaderText {
+    pub(crate) fn value(&self) -> HeaderValue {
+        HeaderValue::from_str(self.as_str()).expect("header text is a header value")
+    }
+}
+
+/// The setting a configured value belongs to.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ValueField {
+    ApiKey,
+    Header(HeaderName),
+}
+
+impl fmt::Display for ValueField {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::Credential => "credential",
-            Self::Header => "header",
-        })
+        match self {
+            Self::ApiKey => f.write_str("api_key"),
+            Self::Header(name) => write!(f, "headers.{name}"),
+        }
     }
 }
 
@@ -331,7 +348,7 @@ impl fmt::Display for Role {
 pub(crate) struct CommandValue {
     command: String,
     prefix: Option<&'static str>,
-    role: Role,
+    field: ValueField,
     current: Current,
 }
 
@@ -353,11 +370,11 @@ impl fmt::Debug for CommandValue {
 }
 
 impl CommandValue {
-    pub(crate) fn new(command: String, prefix: Option<&'static str>, role: Role) -> Self {
+    pub(crate) fn new(command: String, prefix: Option<&'static str>, field: ValueField) -> Self {
         Self {
             command,
             prefix,
-            role,
+            field,
             current: Current::default(),
         }
     }
@@ -367,7 +384,7 @@ impl CommandValue {
         let generation = Arc::clone(&self.current.lock().unwrap_or_else(PoisonError::into_inner));
         let value = generation
             .value
-            .get_or_try_init(|| execute(&self.command, self.prefix, self.role))
+            .get_or_try_init(|| execute(&self.command, self.prefix, &self.field))
             .await?
             .clone();
         let lease = Lease {
@@ -384,20 +401,13 @@ struct Lease {
     generation: Arc<Generation>,
 }
 
-fn failure(role: Role, what: &str) -> ProviderError {
-    // Never retain the command, output, exit status, or underlying OS error.
-    ProviderError {
-        kind: ProviderErrorKind::Authentication,
-        message: format!("{role} command {what}"),
-    }
-}
-
 async fn execute(
     command: &str,
     prefix: Option<&'static str>,
-    role: Role,
+    field: &ValueField,
 ) -> Result<HeaderValue, ProviderError> {
-    let failure = |what| failure(role, what);
+    // Never retain the command, output, exit status, or underlying OS error.
+    let failure = |what| ProviderErrorKind::Authentication.error(format!("{field} command {what}"));
     let mut child = Command::new("/bin/sh")
         .arg("-c")
         .arg(command)
@@ -447,6 +457,10 @@ mod tests {
     use reqwest::header::AUTHORIZATION;
     use std::{path::Path, time::Duration};
 
+    fn header() -> ValueField {
+        ValueField::Header(HeaderName::from_static("x-test"))
+    }
+
     fn quote(path: &Path) -> String {
         format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"))
     }
@@ -465,7 +479,7 @@ mod tests {
     fn counting(count: &Path) -> CommandValue {
         let count = quote(count);
         let text = format!("printf x >> {count}; printf key-%s \"$(wc -c < {count})\"");
-        CommandValue::new(text, None, Role::Credential)
+        CommandValue::new(text, None, ValueField::ApiKey)
     }
 
     fn runs(count: &Path) -> usize {
@@ -501,7 +515,7 @@ mod tests {
         let empty = dir.path().join("empty");
         let blank = |count: &Path| {
             let text = format!("printf x >> {}; printf ' , '", quote(count));
-            Value::Command(CommandValue::new(text, None, Role::Header))
+            Value::Command(CommandValue::new(text, None, header()))
         };
         let issuer = Arc::new(Counted::default());
         let issued = || Value::Issued(Arc::clone(&issuer) as Arc<dyn Authenticator>);
@@ -530,12 +544,9 @@ mod tests {
         assert!(!map.contains_key("x-empty"));
         assert_eq!(issuer.0.load(Ordering::SeqCst), 1);
         assert_eq!((runs(&replaced), runs(&empty)), (0, 2));
-        let limited = ProviderErrorKind::RateLimited { retry_after: None };
-        let error = ProviderError {
-            kind: limited,
-            message: "provider HTTP 401 error".into(),
-        };
-        assert_eq!(resolved.unauthorized(error).kind, limited);
+        let limited = ProviderErrorKind::RateLimited;
+        let error = limited.error("provider HTTP 401 error");
+        assert_eq!(resolved.unauthorized(error).kind(), limited);
     }
 
     #[tokio::test]
@@ -546,7 +557,7 @@ mod tests {
             "printf x >> {}; printf ' \\t  resolved-key  \\r\\n '",
             quote(&count)
         );
-        let value = CommandValue::new(text, Some("Bearer "), Role::Credential);
+        let value = CommandValue::new(text, Some("Bearer "), ValueField::ApiKey);
         assert!(!count.exists(), "nothing runs before the first use");
         let shared: Vec<_> = (0..8).map(|_| value.clone()).collect();
         let resolved = futures_util::future::join_all(shared.iter().map(CommandValue::value)).await;
@@ -562,45 +573,45 @@ mod tests {
     async fn command_failures_are_sanitized_uncached_and_stdin_is_closed() {
         let cases = [
             (
-                Role::Credential,
+                ValueField::ApiKey,
                 "printf private-stdout; printf private-stderr >&2; exit 7",
-                "credential command exited unsuccessfully",
+                "api_key command exited unsuccessfully",
             ),
             (
-                Role::Credential,
+                ValueField::ApiKey,
                 "printf '\\377'",
-                "credential command output was not valid UTF-8",
+                "api_key command output was not valid UTF-8",
             ),
             (
-                Role::Credential,
+                ValueField::ApiKey,
                 "printf ' \\t\\r\\n '",
-                "credential command output was empty",
+                "api_key command output was empty",
             ),
             (
-                Role::Credential,
+                ValueField::ApiKey,
                 "printf 'private-stdout\\ninvalid-header'",
-                "credential command output was not a valid header value",
+                "api_key command output was not a valid header value",
             ),
             (
-                Role::Credential,
+                ValueField::ApiKey,
                 "head -c 65537 /dev/zero",
-                "credential command output exceeded the size limit",
+                "api_key command output exceeded the size limit",
             ),
             (
-                Role::Header,
+                header(),
                 "if read value; then printf stdin-open; else exit 1; fi",
-                "header command exited unsuccessfully",
+                "headers.x-test command exited unsuccessfully",
             ),
         ];
-        for (role, bad, expected) in cases {
+        for (field, bad, expected) in cases {
             let dir = tempfile::tempdir().unwrap();
             let marker = quote(&dir.path().join("attempted"));
             let text = format!(
                 "# private-command-text\nif test -e {marker}; then printf retry-key; else touch {marker}; {bad}; fi"
             );
-            let value = CommandValue::new(text, None, role);
+            let value = CommandValue::new(text, None, field);
             let error = value.value().await.unwrap_err();
-            assert_eq!(error.kind, ProviderErrorKind::Authentication);
+            assert_eq!(error.kind(), ProviderErrorKind::Authentication);
             assert_eq!(error.message, expected);
             let rendered = format!("{error:?} {error} {value:?}");
             for forbidden in ["private-command-text", "private-std", "retry-key"] {
@@ -621,11 +632,10 @@ mod tests {
             let resolved = headers.resolve().await.unwrap();
             (resolved.map()[AUTHORIZATION].clone(), resolved)
         }
+        // A proxy's rate-limit hint on a 401 does not outlive the reclassification.
         fn refused() -> ProviderError {
-            ProviderError {
-                kind: ProviderErrorKind::Authentication,
-                message: "provider HTTP 401 error".into(),
-            }
+            let limited = ProviderErrorKind::RateLimited.error("provider HTTP 401 error");
+            limited.with_retry_after(Some(Duration::from_secs(60)))
         }
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
@@ -637,7 +647,7 @@ mod tests {
             let renewals = sent.into_iter().map(|(_, leases)| {
                 let value = value.clone();
                 tokio::spawn(async move {
-                    let kind = leases.unauthorized(refused()).kind;
+                    let kind = leases.unauthorized(refused()).kind();
                     (kind, send(value).await.0, leases)
                 })
             });
@@ -650,13 +660,12 @@ mod tests {
             }
             assert_eq!(runs(&count), 2);
             let late = stale[0].unauthorized(refused());
-            assert_eq!(late.kind, ProviderErrorKind::CredentialExpired);
+            assert_eq!(late.kind(), ProviderErrorKind::CredentialExpired);
+            assert_eq!(late.retry_after(), None);
             assert_eq!(send(value.clone()).await.0, "key-2");
             assert_eq!(runs(&count), 2);
         };
-        tokio::time::timeout(Duration::from_secs(10), run)
-            .await
-            .unwrap();
+        crate::tests::bounded(run).await;
     }
 
     #[cfg(target_os = "linux")]
@@ -668,7 +677,7 @@ mod tests {
         let text = format!(
             "if test -e {quoted}; then printf retry-key; else printf '%s' $$ > {quoted}; exec sleep 30; fi"
         );
-        let value = CommandValue::new(text, None, Role::Credential);
+        let value = CommandValue::new(text, None, ValueField::ApiKey);
         let run = async {
             let pending = value.value();
             let pid = tokio::select! {
@@ -690,13 +699,9 @@ mod tests {
                     tokio::time::sleep(Duration::from_millis(5)).await;
                 }
             };
-            tokio::time::timeout(Duration::from_secs(5), dead)
-                .await
-                .expect("child was killed");
+            dead.await;
             assert_eq!(value.value().await.unwrap().to_str().unwrap(), "retry-key");
         };
-        tokio::time::timeout(Duration::from_secs(10), run)
-            .await
-            .unwrap();
+        crate::tests::bounded(run).await;
     }
 }

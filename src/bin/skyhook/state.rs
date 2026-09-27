@@ -2,16 +2,17 @@ use serde::{Deserialize, Deserializer, Serialize};
 use skyhook::{
     fs::{CommitMode, PermissionPolicy, StagedFile},
     provider::profile::ModelRef,
+    tool::policy::ModeName,
 };
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Serialize)]
 #[serde(default)]
 pub struct SavedState {
-    /// A name that is not `provider/model` is dropped, for the default to apply.
-    #[serde(deserialize_with = "model_ref")]
+    #[serde(deserialize_with = "lenient")]
     pub model: Option<ModelRef>,
-    pub mode: Option<String>,
+    #[serde(deserialize_with = "lenient")]
+    pub mode: Option<ModeName>,
     pub sidebar: bool,
 }
 impl Default for SavedState {
@@ -23,13 +24,17 @@ impl Default for SavedState {
         }
     }
 }
-fn model_ref<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<ModelRef>, D::Error> {
+/// A saved name that no longer parses is dropped, for the default to apply,
+/// without discarding the other settings.
+fn lenient<'de, D: Deserializer<'de>, T: std::str::FromStr>(
+    deserializer: D,
+) -> Result<Option<T>, D::Error> {
     Ok(Option::<String>::deserialize(deserializer)?.and_then(|name| name.parse().ok()))
 }
 
 /// UI state lives with the workspace's sessions.
 pub fn state_path(workspace: &Path) -> PathBuf {
-    workspace.join(".skyhook/state.json")
+    skyhook::config::workspace_directory(workspace).join("state.json")
 }
 pub fn load(workspace: &Path) -> (SavedState, Option<String>) {
     match std::fs::read(state_path(workspace)) {
@@ -75,22 +80,26 @@ mod tests {
         assert!(load(root.path()).0.sidebar);
         let model: ModelRef = "p/m".parse().unwrap();
         update(root.path(), |state| state.model = Some(model.clone())).unwrap();
-        update(root.path(), |state| state.mode = Some("look".into())).unwrap();
+        update(root.path(), |state| {
+            state.mode = Some("look".parse().unwrap())
+        })
+        .unwrap();
         update(root.path(), |state| state.sidebar = false).unwrap();
         let (state, warning) = load(root.path());
         assert_eq!(
             (
                 state.model.as_ref(),
-                state.mode.as_deref(),
+                state.mode.as_ref().map(ModeName::as_str),
                 state.sidebar,
                 warning
             ),
             (Some(&model), Some("look"), false, None)
         );
-        // An unqualified saved name is dropped; the other settings still load.
-        std::fs::write(state_path(root.path()), br#"{"model":"m"}"#).unwrap();
+        // Invalid saved names are dropped; the other settings still load.
+        let saved = br#"{"model":"m","mode":" ","sidebar":false}"#;
+        std::fs::write(state_path(root.path()), saved).unwrap();
         let (state, warning) = load(root.path());
-        assert!(state.model.is_none() && state.sidebar && state.mode.is_none());
+        assert!(state.model.is_none() && !state.sidebar && state.mode.is_none());
         assert!(warning.is_none());
     }
 }

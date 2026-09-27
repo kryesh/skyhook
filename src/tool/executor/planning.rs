@@ -4,15 +4,16 @@ use super::*;
 use crate::{
     target::TargetPath,
     tool::{
-        PathKind,
-        builtins::workspace::resolve_for_authorization,
-        diagnostic::PathRole,
+        JobLocation, PathKind,
+        authorization::{AuthorizationArguments, SourceArguments},
+        diagnostic::{Cause, PathRole},
         invocation::{
             PathOutcome, PathPreflight, assemble_permissions, preflight_path_arguments,
             scope_capabilities,
         },
+        path::resolve_for_authorization,
         policy::PathText,
-        registry::split_envelope,
+        registry::{AgentLevel, SOURCE_ARGUMENT, TARGET, split_envelope},
     },
 };
 
@@ -21,7 +22,7 @@ impl ToolExecutor {
         &self,
         tool: &crate::tool::RegisteredTool,
         explicit: Option<TargetRef>,
-    ) -> Result<SelectedLocation, ExecutionError> {
+    ) -> Result<SelectedLocation, ToolError> {
         if tool.placement() == ToolPlacement::Host {
             return Ok(SelectedLocation {
                 location: self.shared.root_location.clone(),
@@ -34,7 +35,7 @@ impl ToolExecutor {
     async fn select_location(
         &self,
         explicit: Option<TargetRef>,
-    ) -> Result<SelectedLocation, ExecutionError> {
+    ) -> Result<SelectedLocation, ToolError> {
         let router = self.shared.router.as_ref();
         let selected = crate::target::select_location(
             &self.caller_location,
@@ -54,29 +55,46 @@ impl ToolExecutor {
         })
     }
 
+    /// Select where a host tool's input places its job, before the job exists.
+    async fn locate_job(&self, requested: JobLocation) -> Result<ExecutionLocation, ToolError> {
+        let mut location = (self.select_location(requested.target).await)
+            .map_err(|error| {
+                error
+                    .operation(Operation::Lookup, Subject::argument([TARGET]))
+                    .at(FailureSite::Host)
+                    .effects(Effects::NotStarted)
+            })?
+            .location;
+        if let Some(workspace) = requested.workspace {
+            if workspace.as_os_str().is_empty() {
+                return Err(ToolError::invalid_arguments("workspace cannot be empty")
+                    .operation(Operation::Validate, Subject::argument(["workspace"]))
+                    .effects(Effects::NotStarted));
+            }
+            location.workspace = location.workspace.join(workspace);
+        }
+        Ok(location)
+    }
+
     fn prepare_invocation(
         &self,
         kind: InvocationKind,
         agent: &AgentId,
         name: &str,
         mut arguments: Value,
-    ) -> Result<PreparedInvocation, ExecutionError> {
-        let tool = self
-            .shared
-            .registry
-            .get(name)
-            .ok_or_else(|| ExecutionError::UnknownTool(name.to_owned()))?;
+    ) -> Result<PreparedInvocation, ToolError> {
+        let tool = (self.shared.registry.get(name)).ok_or_else(|| ToolError::unknown_tool(name))?;
         let spec = tool
-            .spec(&self.capabilities, agent)
+            .spec(&self.capabilities, AgentLevel::of(agent))
             .ok_or_else(|| ToolError::unavailable(name))?;
         // Only model output is repaired; host and script callers must match exactly.
         if matches!(kind, InvocationKind::Model) {
             crate::tool::coerce::coerce_arguments(&spec.input_schema, &mut arguments);
         }
-        spec.validate_arguments(&arguments)?;
+        let mut handler_arguments = spec.validate_arguments(arguments)?;
         validate_invocation(&spec, kind)?;
-        let original_arguments = arguments.clone();
-        let (handler_arguments, envelope) = split_envelope(&spec, &tool, arguments)?;
+        let original_arguments = handler_arguments.clone();
+        let envelope = split_envelope(&spec, &tool, &mut handler_arguments)?;
         Ok(PreparedInvocation {
             tool,
             original_arguments,
@@ -92,14 +110,13 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<InvocationPlan, ExecutionError> {
+    ) -> Result<InvocationPlan, ToolError> {
         let mut plan = self
             .plan_invocation(kind, agent, name, arguments, parent)
             .await?;
-        let source = plan
-            .tool
-            .source_argument()
-            .and_then(|name| plan.original_arguments.get(name))
+        let source = (plan.tool.reads_source())
+            .then(|| plan.original_arguments.get(SOURCE_ARGUMENT))
+            .flatten()
             .filter(|source| !source.is_null())
             .cloned();
         if let Some(source) = source {
@@ -115,11 +132,11 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<InvocationPlan, ExecutionError> {
+    ) -> Result<InvocationPlan, ToolError> {
         let PreparedInvocation {
             tool,
             original_arguments,
-            handler_arguments: mut arguments,
+            handler_arguments: arguments,
             envelope: ExecutionEnvelope { launch, target },
         } = self.prepare_invocation(kind, &agent, name, arguments)?;
         let selected = self
@@ -127,48 +144,40 @@ impl ToolExecutor {
             .await
             .map_err(|error| {
                 error.or(
-                    PartialContext::new(Operation::Lookup, Subject::argument(["target"]))
+                    PartialContext::new(Operation::Lookup, Subject::argument([TARGET]))
                         .at(FailureSite::Host),
-                    &self.capabilities,
                 )
             })?;
         // Validation failures belong to the selected location, not the caller's.
-        let invalid = |error: ExecutionError| {
-            error.or(
-                PartialContext::new(Operation::Validate, Subject::Tool(name.to_owned())).at(
-                    FailureSite::bound(&selected.location, tool.placement() == ToolPlacement::Host),
-                ),
-                &self.capabilities,
+        let invalid = |error: crate::tool::AdmissionError| {
+            ToolError::from(error).or(PartialContext::new(
+                Operation::Validate,
+                Subject::Tool(name.to_owned()),
             )
+            .at(FailureSite::bound(&selected.location, tool.placement())))
         };
-        let checked = tool
-            .check_arguments(&selected.location, &arguments)
-            .map_err(|error| invalid(error.into()))?;
+        let mut admitted = tool.admit(&arguments).map_err(invalid)?;
+        let derived = admitted.permissions(&selected.location).map_err(invalid)?;
+        let job_location = match admitted.job_location() {
+            Some(requested) => self.locate_job(requested).await?,
+            None => selected.location.clone(),
+        };
         // A remote destination resolves its own paths.
         let path = if selected.route.is_none() {
-            preflight_path_arguments(
-                &tool,
-                checked.paths,
-                &selected.location,
-                &self.shared.root_location.workspace,
-                &mut arguments,
-            )
-            .await
-            .map_err(|error| invalid(error.into()))?
+            let root = &self.shared.root_location.workspace;
+            preflight_path_arguments(&tool, admitted.paths(), &selected.location, root)
+                .await
+                .map_err(invalid)?
         } else {
             // Remote location frames spell the workspace as text.
             PathText::new(&selected.location.workspace)?;
-            PathPreflight {
-                permissions: Vec::new(),
-                outcome: PathOutcome::Ready,
-                paths: Vec::new(),
-            }
+            PathPreflight::deferred()
         };
         let mut permissions = assemble_permissions(
             &tool,
             &selected.location,
             &self.capabilities,
-            checked.permissions,
+            derived,
             &path,
             selected.route.is_some(),
         )?;
@@ -177,25 +186,23 @@ impl ToolExecutor {
             paths: path_facts,
             ..
         } = path;
-        let authorization_arguments = if let Some(route) = &selected.route {
+        if let Some(route) = &selected.route {
             permissions.extend(route.route.permissions());
-            serde_json::json!({
-                "tool": original_arguments,
-                "route": route.route.authorization_arguments(),
-            })
-        } else {
-            original_arguments.clone()
+        }
+        let authorization_arguments = AuthorizationArguments {
+            tool: original_arguments.clone(),
+            route: (selected.route.as_ref()).map(|route| route.route.authorization_arguments()),
+            source: None,
         };
-        // Schema-valid input that the typed handler rejects still owns a job,
-        // approval, and failure. A remote dispatch admits only on its destination.
+        let invocation = tool.invoke(admitted);
+        let result_policy = invocation.result_policy();
+        // A remote destination admits the call again where it runs.
         let dispatch = match (outcome, selected.route) {
             (PathOutcome::ReadError { value, diagnostic }, _) => InvocationDispatch::ReadError(
                 Box::new(ToolOutput::new(value).with_diagnostic(*diagnostic)),
             ),
             (PathOutcome::Ready, Some(remote)) => InvocationDispatch::Remote { remote, arguments },
-            (PathOutcome::Ready, None) => {
-                InvocationDispatch::Local(tool.admit(arguments, &original_arguments))
-            }
+            (PathOutcome::Ready, None) => InvocationDispatch::Local(invocation),
         };
         Ok(InvocationPlan {
             origin: if matches!(kind, InvocationKind::Model) {
@@ -209,10 +216,12 @@ impl ToolExecutor {
             authorization_arguments,
             caller_location: self.caller_location.clone(),
             execution_location: selected.location,
+            job_location,
             permissions,
             path_facts,
             parent,
             launch,
+            result_policy,
             dispatch,
             source: None,
         })
@@ -220,31 +229,28 @@ impl ToolExecutor {
 
     /// Plan a source argument's read where the file lives, authorized with the
     /// call: local paths are resolved now, remote ones by their worker.
-    async fn plan_source(
-        &self,
-        source: Value,
-        plan: &mut InvocationPlan,
-    ) -> Result<(), ExecutionError> {
+    async fn plan_source(&self, source: Value, plan: &mut InvocationPlan) -> Result<(), ToolError> {
         if !self.capabilities.contains(Capability::Read) {
-            return Err(ToolError::unavailable(plan.tool.name()).into());
+            return Err(ToolError::unavailable(plan.tool.name()));
         }
         let source: TargetPath = serde_json::from_value(source).map_err(|error| {
             ToolError::invalid_arguments(format!("invalid source: {error}"))
-                .operation(Operation::Validate, Subject::argument(["source"]))
+                .operation(Operation::Validate, Subject::argument([SOURCE_ARGUMENT]))
         })?;
         let SelectedLocation { location, route } =
             self.select_location(source.target).await.map_err(|error| {
-                error.or(
-                    PartialContext::new(Operation::Lookup, Subject::argument(["source", "target"]))
-                        .at(FailureSite::Host),
-                    &self.capabilities,
+                error.or(PartialContext::new(
+                    Operation::Lookup,
+                    Subject::argument([SOURCE_ARGUMENT, TARGET]),
                 )
+                .at(FailureSite::Host))
             })?;
         let mut permissions = scope_capabilities(vec![Capability::Read], &location, None)?;
-        let mut authorization_arguments = serde_json::json!({
-            "path": source.path,
-            "target": location.target,
-        });
+        let mut authorization_arguments = SourceArguments {
+            path: source.path.clone(),
+            target: location.target.clone(),
+            route: None,
+        };
         let source = match route {
             None => {
                 let resolved = resolve_for_authorization(
@@ -271,7 +277,7 @@ impl ToolExecutor {
             }
             Some(remote) => {
                 permissions.extend(remote.route.permissions());
-                authorization_arguments["route"] = remote.route.authorization_arguments();
+                authorization_arguments.route = Some(remote.route.authorization_arguments());
                 SourcePlan::Remote {
                     remote,
                     workspace: location.workspace,
@@ -280,11 +286,7 @@ impl ToolExecutor {
             }
         };
         plan.permissions.extend(permissions);
-        if !matches!(plan.dispatch, InvocationDispatch::Remote { .. }) {
-            plan.authorization_arguments =
-                serde_json::json!({"tool": plan.authorization_arguments});
-        }
-        plan.authorization_arguments["source"] = authorization_arguments;
+        plan.authorization_arguments.source = Some(authorization_arguments);
         plan.source = Some(source);
         Ok(())
     }
@@ -298,14 +300,15 @@ struct SelectedLocation {
 fn validate_invocation(
     tool: &crate::tool::ToolSpec,
     kind: InvocationKind,
-) -> Result<(), ExecutionError> {
+) -> Result<(), ToolError> {
+    let name = || tool.name.clone();
     match kind {
         InvocationKind::Host => Ok(()),
         InvocationKind::Model if tool.exposure == ToolExposure::ScriptOnly => {
-            Err(ExecutionError::ModelHidden(tool.name.clone()))
+            Err(ToolError::cause(Cause::ModelHidden { tool: name() }))
         }
         InvocationKind::Script if tool.script_binding == ScriptBinding::Unavailable => {
-            Err(ExecutionError::ScriptUnavailable(tool.name.clone()))
+            Err(ToolError::cause(Cause::ScriptUnavailable { tool: name() }))
         }
         InvocationKind::Model | InvocationKind::Script => Ok(()),
     }
@@ -321,8 +324,11 @@ mod tests {
         target::{TargetDefinition, TargetRegistry},
         tests::RecordingPolicy,
         tool::{
-            ToolOptions, ToolRegistryBuilder,
-            policy::{AuthorizationRequest, PathText, PolicyDecision, PolicyFuture, ResourceId},
+            PathArgument, ToolOptions, ToolRegistryBuilder,
+            policy::{
+                AuthorizationRequest, PathAccess, PathText, PolicyDecision, PolicyFuture,
+                ResourceId,
+            },
         },
     };
 
@@ -333,7 +339,7 @@ mod tests {
             agent: &AgentId,
             name: &str,
             arguments: Value,
-        ) -> Result<ExecutionResult, ExecutionError> {
+        ) -> Result<ExecutionResult, ToolError> {
             self.execute(agent.clone(), name, arguments, None).await
         }
 
@@ -342,7 +348,7 @@ mod tests {
             agent: &AgentId,
             name: &str,
             arguments: Value,
-        ) -> Result<ExecutionResult, ExecutionError> {
+        ) -> Result<ExecutionResult, ToolError> {
             self.execute_model(agent.clone(), name, arguments, None)
                 .await
         }
@@ -350,55 +356,54 @@ mod tests {
 
     #[derive(Deserialize, JsonSchema)]
     struct PathArgs {
-        #[serde(rename = "path")]
-        _path: String,
+        path: String,
     }
 
     fn network_builder() -> ToolRegistryBuilder {
-        use crate::tool::{PathArgument, PathKind, policy::PathAccess};
         let mut builder = ToolRegistryBuilder::default();
         let register = |builder: &mut crate::tool::invocation::LocalCatalogBuilder| {
             builder.register_dynamic(
                 "network_test",
                 "Exercise invocation-derived authorization",
                 serde_json::json!({"type":"object","properties":{
-                    "url":{"type":"string"}, "body":{}, "save_to":{}, "redirect":{}, "insecure":{}
+                    "url":{"type":"string"}, "body":{}, "save_to":{}, "redirect":{}
                 }}),
                 ToolOptions::new(vec![Capability::Network])
                     .placement(ToolPlacement::TargetedWorkspace)
                     .background()
                     .named()
-                    .argument_validator(|arguments: &Value| {
+                    .argument_permissions(|location, arguments: &Value| {
                         if arguments["url"] != "https://initial.test" {
                             return Err(crate::tool::AdmissionError::invalid_arguments(
                                 "invalid test URL",
                             ));
                         }
-                        Ok(())
-                    })
-                    .argument_permissions(|location, _arguments| {
                         Ok(vec![PermissionUse::new(
                             Capability::Network,
                             ResourceId::network(&location.target, "https://initial.test"),
                         )])
                     })
-                    .argument_paths(|arguments| {
+                    .argument_paths(|arguments: &mut Value| {
+                        let Value::Object(arguments) = arguments else {
+                            return Vec::new();
+                        };
                         let mut paths = Vec::new();
-                        if arguments["body"]["kind"] == "file" {
-                            paths.push(PathArgument::pointer(
-                                "/body/path",
-                                PathAccess::Read,
-                                PathKind::Existing,
-                            ));
+                        for (name, value) in arguments {
+                            let (path, access, kind) = match (name.as_str(), value) {
+                                ("body", body) if body["kind"] == "file" => {
+                                    let Some(Value::String(path)) = body.get_mut("path") else {
+                                        continue;
+                                    };
+                                    (path, PathAccess::Read, PathKind::Existing)
+                                }
+                                ("save_to", Value::String(path)) => {
+                                    (path, PathAccess::Write, PathKind::Writable)
+                                }
+                                _ => continue,
+                            };
+                            paths.push(PathArgument::new(path, access, kind).exact());
                         }
-                        if arguments.get("save_to").is_some() {
-                            paths.push(PathArgument::pointer(
-                                "/save_to",
-                                PathAccess::Write,
-                                PathKind::Writable,
-                            ));
-                        }
-                        Ok(paths)
+                        paths
                     }),
                 |context: crate::tool::invocation::LocalContext, arguments| async move {
                     if arguments["redirect"] == true {
@@ -467,7 +472,9 @@ mod tests {
                     .unwrap_err();
                 assert_eq!(
                     error.diagnostic().cause,
-                    Cause::Message("tool `network_test` is unavailable in this context".into())
+                    Cause::Unavailable {
+                        tool: "network_test".into()
+                    }
                 );
                 assert!(policy.requests.lock().unwrap().is_empty());
             }
@@ -593,10 +600,7 @@ mod tests {
 
         let remote = serde_json::json!({"path":"copy.bin", "source":{"path":"/build/out.bin", "target":"build"}});
         let plan_remote = plan(&targeted, agent, "write", remote.clone()).await;
-        assert!(matches!(
-            plan_remote.dispatch,
-            InvocationDispatch::Local(Ok(_))
-        ));
+        assert!(matches!(plan_remote.dispatch, InvocationDispatch::Local(_)));
         assert!(matches!(
             plan_remote.source,
             Some(SourcePlan::Remote { .. })
@@ -608,7 +612,7 @@ mod tests {
                 .any(|p| p.capability == Capability::Targets)
         );
         assert_eq!(
-            plan_remote.authorization_arguments["source"]["path"],
+            plan_remote.authorization_arguments.document(None)["source"]["path"],
             "/build/out.bin"
         );
 
@@ -632,7 +636,9 @@ mod tests {
             .unwrap();
         assert_eq!(
             error.diagnostic().cause,
-            Cause::Message("tool `write` is unavailable in this context".into())
+            Cause::Unavailable {
+                tool: "write".into()
+            }
         );
 
         // Selecting a source target needs the targets capability, and a write
@@ -685,10 +691,11 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let arguments =
-            serde_json::json!({"url":"https://initial.test", "redirect":true,"insecure":true});
+        let arguments = serde_json::json!({
+            "url":"https://initial.test", "redirect":true, "network_origin":"argument"
+        });
         let error = executor
-            .run_host(&runtime.agent, "network_test", arguments)
+            .run_host(&runtime.agent, "network_test", arguments.clone())
             .await
             .unwrap_err();
         assert!(
@@ -706,10 +713,14 @@ mod tests {
             (&requests[0].job, &requests[0].agent),
             (&requests[1].job, &requests[1].agent)
         );
-        assert_eq!(requests[1].arguments["insecure"], true);
+        // The redirect is asked under the admitted arguments, beside the tool's own.
         assert_eq!(
-            requests[1].arguments["network_origin"],
-            "https://redirect.test"
+            requests[0].arguments,
+            serde_json::json!({"tool": arguments})
+        );
+        assert_eq!(
+            requests[1].arguments,
+            serde_json::json!({"tool": arguments, "network_origin": "https://redirect.test"})
         );
         assert_eq!(
             requests[1].permissions,
@@ -759,11 +770,10 @@ mod tests {
             .register::<PathArgs, String, _, _>(
                 "read",
                 "custom read",
-                ToolOptions::new(vec![Capability::Read]).path_argument(
-                    "path",
-                    crate::tool::policy::PathAccess::Read,
-                    crate::tool::PathKind::Existing,
-                ),
+                ToolOptions::new(vec![Capability::Read]).argument_paths(|args: &mut PathArgs| {
+                    let (access, kind) = (PathAccess::Read, PathKind::Existing);
+                    vec![PathArgument::new(&mut args.path, access, kind)]
+                }),
                 |_context, _arguments| async {
                     Err(ToolError::io(std::io::ErrorKind::PermissionDenied.into()))
                 },
@@ -865,10 +875,10 @@ mod tests {
         assert_eq!(policy.requests.lock().unwrap().len(), 1);
     }
 
-    /// Schema-valid arguments that the typed handler rejects still create a job
-    /// and request approval; the job then fails with the admission error.
+    /// Schema-valid arguments that the typed handler rejects fail before a job
+    /// or an approval exists.
     #[tokio::test]
-    async fn typed_admission_failures_fail_their_approved_job() {
+    async fn typed_admission_failures_fail_before_approval() {
         #[derive(Deserialize, JsonSchema)]
         struct Count {
             #[serde(rename = "count")]
@@ -877,7 +887,7 @@ mod tests {
         let runtime = crate::tests::TestRuntime::new().await;
         let mut builder = ToolRegistryBuilder::default();
         builder
-            .register::<Count, (), _, _>(
+            .register_unit::<Count, _, _>(
                 "count",
                 "typed count",
                 ToolOptions::new(vec![Capability::Read]),
@@ -887,7 +897,7 @@ mod tests {
         let policy = RecordingPolicy::allowing();
         let executor = runtime.executor_with_policy(builder, policy.clone());
         let expected = crate::tool::diagnostic::deserialize_arguments::<Count>(
-            &serde_json::json!({"count": 300}),
+            serde_json::json!({"count": 300}).as_object().unwrap(),
         )
         .err()
         .unwrap();
@@ -896,8 +906,6 @@ mod tests {
         };
         // The permissive JSON schema accepts this value; `u8` does not.
         let arguments = serde_json::json!({"count": 300});
-        let plan = plan(&executor, &runtime.agent, "count", arguments.clone()).await;
-        assert!(matches!(plan.dispatch, InvocationDispatch::Local(Err(_))));
         let error = executor
             .run_host(&runtime.agent, "count", arguments)
             .await
@@ -906,9 +914,40 @@ mod tests {
             matches!(error.diagnostic().cause, Cause::InvalidArguments(message) if message == expected),
             "{error:?}"
         );
-        assert_eq!(policy.requests.lock().unwrap().len(), 1);
-        let jobs = runtime.jobs.list(&runtime.agent).await;
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].state, JobState::Failed);
+        assert!(policy.requests.lock().unwrap().is_empty());
+        assert!(runtime.jobs.list(&runtime.agent).await.is_empty());
+    }
+
+    /// Where a hosted local tool runs, the host's admission decides whether its
+    /// job has a result, even when a remote destination admits the call again.
+    #[tokio::test]
+    async fn hosted_unit_calls_keep_their_result_policy() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let policy = RecordingPolicy::allowing();
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_local(crate::tool::builtins::register_local_tools)
+            .unwrap();
+        let targets =
+            TargetRegistry::from_definitions([TargetDefinition::test("build", "/build", None)])
+                .unwrap();
+        let local = runtime
+            .executor_with_policy(builder, policy.clone())
+            .with_target_router(TargetRouter::test(targets, policy));
+        let remote = local.clone().with_location(ExecutionLocation {
+            target: "build".parse().unwrap(),
+            workspace: "/build".into(),
+        });
+        std::fs::write(runtime.root.path().join("file"), "a").unwrap();
+        let arguments = serde_json::json!({"path":"file", "old":"a", "new":"b"});
+        for (executor, remote) in [(local, false), (remote, true)] {
+            let replace = plan(&executor, &runtime.agent, "replace", arguments.clone()).await;
+            let dispatched = matches!(replace.dispatch, InvocationDispatch::Remote { .. });
+            assert_eq!(dispatched, remote);
+            assert_eq!(
+                replace.result_policy,
+                crate::tool::ToolResultPolicy::Nothing
+            );
+        }
     }
 }

@@ -5,24 +5,18 @@ use super::*;
 impl Harness {
     pub async fn new_session(&self) -> Result<SessionHandle, HarnessError> {
         let store = SessionStore::create(&self.inner.session_root).await?;
-        let runtime = SessionRuntime::build(self.inner.clone(), store, Vec::new()).await?;
-        runtime.start_root(None).await
+        let runtime = SessionRuntime::build(self.inner.clone(), store, &[]).await?;
+        runtime.start_root(runtime.new_root()?).await
     }
 
     pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
         let (store, records) = SessionStore::open(&self.inner.session_root, id).await?;
-        let root = AgentId::root(id);
-        let selection = crate::session::agent_selection(&records, &root);
-        let runtime = SessionRuntime::build(self.inner.clone(), store, records).await?;
-        let interrupted = runtime.settle_interrupted_work().await?;
-        let session = runtime.start_root(selection).await?;
-        // Starting an agent marks it idle; a turn settled here can be continued.
-        for agent in &interrupted {
-            session
-                .runtime
-                .activity(agent, AgentActivity::Stopped(TurnFailure::Interrupted));
-        }
-        Ok(session)
+        let runtime = SessionRuntime::build(self.inner.clone(), store, &records).await?;
+        // Settlement closes only what this already reads as stopped.
+        let stopped = runtime.stopped_turn(&records, &AgentId::root(id));
+        let resumed = stopped.map_or(Resumed::Idle, Resumed::Parked);
+        runtime.settle_interrupted_work(&records).await?;
+        runtime.start_root(AgentLaunch::Resume(resumed)).await
     }
 }
 impl SessionHandle {
@@ -60,12 +54,12 @@ impl SessionHandle {
 
     /// The modes the root agent can be sent into: the configured ones, except that a
     /// mode the session has used keeps the definition it was used under.
-    pub fn modes(&self) -> &indexmap::IndexMap<String, crate::tool::policy::Mode> {
+    pub fn modes(&self) -> &indexmap::IndexMap<ModeName, crate::tool::policy::Mode> {
         &self.runtime.modes
     }
 
     /// What sending the root agent into `mode` would grant it.
-    pub fn mode_capabilities(&self, mode: &str) -> Option<crate::tool::policy::CapabilitySet> {
+    pub fn mode_capabilities(&self, mode: &ModeName) -> Option<crate::tool::policy::CapabilitySet> {
         let depth = self.runtime.available_depth(&self.root);
         let granted = self.runtime.mode_capabilities(mode).ok()?;
         Some(granted.for_agent(depth))
@@ -83,17 +77,18 @@ impl SessionHandle {
 
     /// Name the session once; later titles leave the first in place.
     pub async fn set_title(&self, title: String) -> Result<(), HarnessError> {
-        let records = self.runtime.store.records().await;
-        if records
-            .iter()
-            .any(|record| matches!(record.event, SessionEvent::TitleSet { .. }))
+        let titled = |records: &[EventRecord]| {
+            (records.iter()).any(|record| matches!(record.event, SessionEvent::TitleSet { .. }))
+        };
+        let store = &self.runtime.store;
+        if !store
+            .visit_records_after(RecordSeq::default(), titled)
+            .await
         {
-            return Ok(());
+            store
+                .append(self.root.clone(), SessionEvent::TitleSet { title })
+                .await?;
         }
-        self.runtime
-            .store
-            .append(self.root.clone(), SessionEvent::TitleSet { title })
-            .await?;
         Ok(())
     }
 
@@ -141,7 +136,7 @@ impl SessionHandle {
     pub async fn inspect_output_fields(
         &self,
         job: JobId,
-    ) -> Result<Vec<String>, crate::tool::ToolError> {
+    ) -> Result<Vec<crate::job::FieldPointer>, crate::tool::ToolError> {
         self.runtime.jobs.inspect_output_fields(job).await
     }
 
@@ -150,10 +145,6 @@ impl SessionHandle {
         job: JobId,
     ) -> Result<crate::job::JobEnvelope, crate::job::JobError> {
         self.runtime.jobs.cancel(job).await
-    }
-
-    pub async fn usage(&self) -> Usage {
-        *self.runtime.usage.lock().await
     }
 
     #[must_use]
@@ -183,15 +174,34 @@ impl SessionHandle {
         self.admit_selection(&options)?;
         // An immediate resume must not miss children still journaling.
         self.runtime.settle_interrupts().await;
+        // A held wait resumes with its children. Mark it busy before they restart,
+        // while its turn cannot move on.
+        let agents: Vec<_> = (self.runtime.agents().iter())
+            .map(|(agent, live)| (agent.clone(), live.control.clone()))
+            .collect();
+        for (agent, control) in agents {
+            if control.turn_from(&[TurnState::Held], TurnState::Busy) {
+                let waiting = crate::agent::AgentActivity::WaitingChildren;
+                self.runtime.activity(&agent, waiting);
+            }
+        }
         let children_resumed = self.runtime.jobs.continue_resumable_children().await?;
-        let root_retryable = self.runtime.events.retryable(&self.root);
+        let root = self
+            .runtime
+            .agents()
+            .get(&self.root)
+            .map(|live| live.control.clone());
+        let parked = root.filter(|root| root.turn() == TurnState::Parked);
         let holding = self.runtime.jobs.live_work(&self.root).await.holding;
-        if root_retryable && holding.is_some() {
-            // The root's wait resumes with its restarted children.
+        if let Some(root) = &parked
+            && holding.is_some()
+        {
+            // A cancelled turn still waiting on restarted children ends with them.
+            root.set_turn(TurnState::Busy);
             self.runtime
                 .activity(&self.root, crate::agent::AgentActivity::WaitingChildren);
         }
-        if root_retryable && holding.is_none() {
+        if parked.is_some() && holding.is_none() {
             // An independently failed root has no live wait to preserve; continue
             // it after scheduling descendant recovery.
             let selection_applied = options.model.is_some() || options.mode.is_some();
@@ -293,7 +303,7 @@ impl SessionHandle {
     pub fn selection(
         &self,
         model: Option<&ModelRef>,
-        mode: Option<&str>,
+        mode: Option<&ModeName>,
     ) -> Result<Selection, HarnessError> {
         let runtime = self.runtime.instance;
         let model = match model {
@@ -309,9 +319,9 @@ impl SessionHandle {
         let mode = match mode {
             Some(name) if self.runtime.modes.contains_key(name) => Some(SessionMode {
                 runtime,
-                name: name.to_owned(),
+                name: name.clone(),
             }),
-            Some(name) => return Err(HarnessError::UnknownMode(name.to_owned())),
+            Some(name) => return Err(HarnessError::UnknownMode(name.clone())),
             None => None,
         };
         Ok(Selection { model, mode })
@@ -344,14 +354,11 @@ impl SessionHandle {
             .send(AgentCommand::Input {
                 options,
                 content,
-                done: Some(done_tx),
+                done: Some(RequestCompletion::Root(done_tx)),
             })
             .await
             .map_err(|_| HarnessError::AgentStopped)?;
-        done_rx
-            .await
-            .map_err(|_| HarnessError::AgentStopped)?
-            .map_err(HarnessError::from)
+        done_rx.await.map_err(|_| HarnessError::AgentStopped)?
     }
 
     /// Stop runtime producers and drain their accepted work. The journal stays
@@ -398,6 +405,7 @@ mod tests {
     use super::*;
     use crate::agent::TodoStatus;
     use crate::agent::runtime::tests::*;
+    use crate::session::tests::{attempt, requested};
 
     #[tokio::test]
     async fn shutdown_drains_before_final_host_status_without_closing_journal() {
@@ -429,8 +437,7 @@ mod tests {
         let harness = test_harness(root.path(), &sessions, provider).await;
         let session = harness.new_session().await.unwrap();
         assert_eq!(session.prompt("hello").await.unwrap(), "first");
-        let store = &session.runtime.store;
-        let records = store.records().await;
+        let records = session.runtime.store.records().await;
         let context = events!(&records, SessionEvent::ModelContext { .. } => ());
         assert_eq!(context.len(), 1);
         let context = records
@@ -438,10 +445,12 @@ mod tests {
             .find(|record| matches!(record.event, SessionEvent::ModelContext { .. }))
             .unwrap()
             .sequence;
+        let (id, root_agent) = (session.id(), session.root.clone());
+        shutdown_session(session).await;
         // What a process killed mid-turn leaves behind.
+        let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
         let call = ToolCall::new("orphan", "read", json!({"path": "file"})).unwrap();
         let assistant = Message::Assistant(vec![AssistantItem::tool_call("orphan", 0, call)]);
-        let root_agent = session.root.clone();
         store
             .append(
                 root_agent.clone(),
@@ -449,21 +458,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let request = SessionEvent::ModelRequested {
-            context,
-            checkpoint: None,
-            history: Vec::new(),
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
-        };
-        let request = store.append(root_agent.clone(), request).await.unwrap();
-        let attempt = SessionEvent::ModelAttemptStarted(crate::session::AttemptRef {
-            request: request.sequence.request(),
-            attempt: 1,
-        });
+        let request = store.append(root_agent.clone(), requested(context)).await;
+        let request = request.unwrap();
+        let attempt = attempt(request.sequence.request(), 1);
         store.append(root_agent, attempt).await.unwrap();
-        let id = session.id();
-        shutdown_session(session).await;
+        drop(store);
 
         for resume in 0..2 {
             let resumed = harness.resume_session(id).await.unwrap();
@@ -478,8 +477,9 @@ mod tests {
                 (results[0][0].call_id.as_str(), results[0][0].is_error),
                 ("orphan", true)
             );
-            // The resume that settles the turn can continue it.
-            assert_eq!(resumed.runtime.events.retryable(&resumed.root), resume == 0);
+            // The settled turn stays continuable on every resume, not only the
+            // one that settled it.
+            assert_eq!(turn(&resumed, &resumed.root), TurnState::Parked, "{resume}");
             shutdown_session(resumed).await;
         }
     }
@@ -489,9 +489,7 @@ mod tests {
     /// as interrupted, once, like an open attempt.
     #[tokio::test]
     async fn resume_settles_requests_left_waiting_for_an_attempt() {
-        use crate::session::{
-            AttemptRef, EventRecord, ModelFailureKind, RequestLedger, RequestPhase, RequestSeq,
-        };
+        use crate::session::{AttemptRef, EventRecord, RequestLedger, RequestPhase, RequestSeq};
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let requests = Requests::default();
@@ -508,36 +506,39 @@ mod tests {
         let root_agent = session.root.clone();
         let id = session.id();
         shutdown_session(session).await;
-        let requested = || SessionEvent::ModelRequested {
-            context,
-            checkpoint: None,
-            history: Vec::new(),
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
-        };
-        let phase = |records: &[EventRecord], request: RequestSeq| {
+        // The attempt an interruption settled the request after.
+        let interrupted_after = |records: &[EventRecord], request: RequestSeq| {
             let mut ledger = RequestLedger::default();
             for record in records {
                 ledger.observe(record);
             }
-            ledger.get(request).unwrap().phase.clone()
+            match ledger.get(request).unwrap().phase {
+                RequestPhase::Interrupted { attempt, .. } => Some(attempt),
+                _ => None,
+            }
         };
         let interrupted = |records: &[EventRecord]| count!(records, SessionEvent::AgentInterrupted);
 
         // What a killed process leaves behind: failed once, with the retry
         // scheduled but never started.
         let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
-        let retrying = store.append(root_agent.clone(), requested()).await.unwrap();
+        let retrying = store
+            .append(root_agent.clone(), requested(context))
+            .await
+            .unwrap();
         let attempt = AttemptRef {
             request: retrying.sequence.request(),
             attempt: 1,
         };
         let started = SessionEvent::ModelAttemptStarted(attempt);
         store.append(root_agent.clone(), started).await.unwrap();
+        let lost = "connection lost".into();
         let failed = SessionEvent::ModelFailed {
             attempt,
-            error: "connection lost".into(),
-            kind: ModelFailureKind::Error,
+            failure: crate::agent::Failure::Provider(
+                lost,
+                crate::provider::ProviderErrorKind::Transport,
+            ),
         };
         let failed = store.append(root_agent.clone(), failed).await.unwrap();
         let scheduled = SessionEvent::ModelRecoveryScheduled {
@@ -549,29 +550,105 @@ mod tests {
         drop(store);
         let resumed = harness.resume_session(id).await.unwrap();
         let records = resumed.runtime.store.records().await;
-        let expected = RequestPhase::Interrupted { attempt: Some(1) };
-        assert_eq!(phase(&records, retrying.sequence.request()), expected);
+        let request = retrying.sequence.request();
+        assert_eq!(interrupted_after(&records, request), Some(Some(1)));
         assert_eq!(interrupted(&records), before + 1);
         shutdown_session(resumed).await;
 
         // Requested, and never attempted.
         let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
-        let waiting = store.append(root_agent.clone(), requested()).await.unwrap();
+        let waiting = store
+            .append(root_agent.clone(), requested(context))
+            .await
+            .unwrap();
         let before = interrupted(&store.records().await);
         drop(store);
         let resumed = harness.resume_session(id).await.unwrap();
         let records = resumed.runtime.store.records().await;
-        let expected = RequestPhase::Interrupted { attempt: None };
-        assert_eq!(phase(&records, waiting.sequence.request()), expected);
+        let request = waiting.sequence.request();
+        assert_eq!(interrupted_after(&records, request), Some(None));
         assert_eq!(interrupted(&records), before + 1);
         shutdown_session(resumed).await;
 
-        // Nothing left to settle: a further resume journals nothing.
-        let (store, records) = SessionStore::open(&sessions, id).await.unwrap();
-        let before = interrupted(&records);
+        // Nothing left to settle: an attempt its agent's interruption closed without
+        // an outcome of its own is settled already, so a further resume journals
+        // nothing, yet the interrupted turn can still be continued.
+        let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
+        let closed = store
+            .append(root_agent.clone(), requested(context))
+            .await
+            .unwrap();
+        let attempt = AttemptRef {
+            request: closed.sequence.request(),
+            attempt: 1,
+        };
+        let started = SessionEvent::ModelAttemptStarted(attempt);
+        store.append(root_agent.clone(), started).await.unwrap();
+        let stopped = SessionEvent::AgentInterrupted;
+        store.append(root_agent.clone(), stopped).await.unwrap();
+        let before = interrupted(&store.records().await);
         drop(store);
         let resumed = harness.resume_session(id).await.unwrap();
         assert_eq!(interrupted(&resumed.runtime.store.records().await), before);
+        assert_eq!(turn(&resumed, &resumed.root), TurnState::Parked);
+        shutdown_session(resumed).await;
+    }
+
+    /// A turn that failed or was interrupted before the session closed reopens
+    /// stopped for that reason and is continued; a finished one leaves nothing to
+    /// continue.
+    #[tokio::test(start_paused = true)]
+    async fn reopened_failed_or_interrupted_turn_continues() {
+        use crate::agent::{AgentActivity, Failure, TurnFailure};
+        let stopped = async |session: &SessionHandle| {
+            let activity = session.observe().await.snapshot.activity;
+            match &activity[&session.root] {
+                AgentActivity::Stopped(failure) => Some(failure.clone()),
+                _ => None,
+            }
+        };
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let failure = crate::provider::ProviderErrorKind::Protocol.error("not retried");
+        let steps = [
+            Step::fail(failure),
+            Step::new(answer("recovered")),
+            Step::new(answer("never released")).midstream(),
+            Step::new(answer("continued")),
+        ];
+        let script = Script::new(steps, &requests);
+        let harness = test_harness(root.path(), &sessions, script.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let id = session.id();
+        session.prompt("fails").await.unwrap_err();
+        shutdown_session(session).await;
+
+        let resumed = harness.resume_session(id).await.unwrap();
+        let failed = stopped(&resumed).await;
+        assert!(matches!(
+            failed,
+            Some(TurnFailure::Failed(Failure::Provider(..)))
+        ));
+        assert_eq!(resumed.continue_turn().await.unwrap(), "recovered");
+        let interrupted = resumed.prompt("interrupted");
+        let interrupt = async {
+            script.held(2).await;
+            resumed.interrupt().await;
+        };
+        let (result, _) = tokio::join!(interrupted, interrupt);
+        result.unwrap_err();
+        shutdown_session(resumed).await;
+
+        let resumed = harness.resume_session(id).await.unwrap();
+        assert_eq!(stopped(&resumed).await, Some(TurnFailure::Interrupted));
+        assert_eq!(resumed.continue_turn().await.unwrap(), "continued");
+        shutdown_session(resumed).await;
+
+        let resumed = harness.resume_session(id).await.unwrap();
+        assert_eq!(stopped(&resumed).await, None);
+        assert_eq!(resumed.continue_turn().await.unwrap(), "");
+        assert_eq!(requests.lock().unwrap().len(), 4);
         shutdown_session(resumed).await;
     }
 
@@ -657,7 +734,7 @@ mod tests {
 
     /// A mode decides the root agent's capabilities, tools and instructions from the
     /// input that selects it. A child gets what its parent holds when it starts.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn modes_switch_the_root_contract_and_survive_resume() {
         use crate::tool::policy::{Capability, CapabilitySet, Mode};
         let root = tempfile::tempdir().unwrap();
@@ -665,7 +742,7 @@ mod tests {
         let requests = Requests::default();
         let mode = |capabilities: &[Capability], instructions: Option<&str>| Mode {
             capabilities: capabilities.to_vec(),
-            instructions: instructions.map(str::to_owned),
+            instructions: instructions.map(|text| text.parse().unwrap()),
             hint: None,
         };
         let look = mode(&[Capability::Read, Capability::Agents], Some("Only look."));
@@ -679,8 +756,8 @@ mod tests {
             Capability::Read,
         ];
         let modes: indexmap::IndexMap<_, _> = [
-            ("look".to_owned(), look),
-            ("work".to_owned(), mode(&work, None)),
+            (mode_name("look"), look),
+            (mode_name("work"), mode(&work, None)),
         ]
         .into();
         let builder = |provider| {
@@ -716,13 +793,15 @@ mod tests {
         let signed = AssistantItem::reasoning("signed", 0, "visible", Some(signed));
         let signed = Message::Assistant(vec![signed, AssistantItem::text("t", 1, "noted")]);
         session.runtime.commit(&session.root, signed).await.unwrap();
-        let work = session.selection(None, Some("work")).unwrap();
+        let work = session.selection(None, Some(&mode_name("work"))).unwrap();
         let prompt = session.prompt_with_options("write", &[], work.clone());
         assert_eq!(prompt.await.unwrap(), "second");
         let prompt = session.prompt_with_options("again", &[], work);
         assert_eq!(prompt.await.unwrap(), "third");
-        let unknown = session.selection(None, Some("missing"));
-        assert!(matches!(unknown, Err(HarnessError::UnknownMode(mode)) if mode == "missing"));
+        let unknown = session.selection(None, Some(&mode_name("missing")));
+        assert!(
+            matches!(unknown, Err(HarnessError::UnknownMode(mode)) if mode == mode_name("missing"))
+        );
 
         let captured = requests.lock().unwrap().clone();
         let offers = |request: &ModelRequest, tool: &str| {
@@ -764,7 +843,7 @@ mod tests {
             definition.capabilities.sort();
             definition.capabilities.dedup();
             crate::session::ModeSelection {
-                name: name.to_owned(),
+                name: mode_name(name),
                 definition: Some(definition),
             }
         };
@@ -775,17 +854,19 @@ mod tests {
         shutdown_session(session).await;
 
         // The launch's default mode does not replace the journaled one.
-        let rejected = crate::provider::ProviderError {
-            kind: crate::provider::ProviderErrorKind::InvalidRequest,
-            message: "scripted rejection".into(),
-        };
+        let rejected =
+            crate::provider::ProviderErrorKind::InvalidRequest.error("scripted rejection");
         let steps = [
             Step::new(answer("resumed")),
             Step::fail(rejected),
             Step::new(answer("continued")),
         ];
         let provider = Script::new(steps, &requests);
-        let harness = builder(provider).mode("look").build().await.unwrap();
+        let harness = builder(provider)
+            .mode(mode_name("look"))
+            .build()
+            .await
+            .unwrap();
         let resumed = harness.resume_session(id).await.unwrap();
         assert_eq!(resumed.prompt("continue").await.unwrap(), "resumed");
         let captured = requests.lock().unwrap().clone();
@@ -795,13 +876,11 @@ mod tests {
             (&working.system, &working.tools)
         );
         let records = resumed.runtime.store.records().await;
-        let mode = crate::session::agent_mode(&records, &resumed.root);
-        assert_eq!(mode.as_deref(), Some("work"));
         assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 1);
 
         // Continuing a failed turn can change the mode it continues in.
         assert!(resumed.prompt("fails").await.is_err());
-        let look = resumed.selection(None, Some("look")).unwrap();
+        let look = resumed.selection(None, Some(&mode_name("look"))).unwrap();
         let outcome = resumed.continue_turn_with(look).await.unwrap();
         assert_eq!(outcome.answer.as_deref(), Some("continued"));
         assert!(outcome.selection_applied);
@@ -814,7 +893,7 @@ mod tests {
 
     /// A mode consumed at a request boundary narrows the root's next tool call and its
     /// host scripts, while a child it already started keeps what it was given.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_mid_turn_mode_switch_narrows_the_root_but_not_its_running_child() {
         use crate::tool::policy::{Capability, Mode};
         let call = |id: &str, name: &str, arguments: serde_json::Value| {
@@ -850,8 +929,8 @@ mod tests {
         };
         let work = mode(&[Capability::Read, Capability::Write, Capability::Agents]);
         let profile = |model: &str| ModelProfile {
-            hint: Some(model.to_owned()),
-            ..ModelProfile::new(model, None, 128_000, 4096, false)
+            hint: Some(model.parse().unwrap()),
+            ..crate::tests::profile(model, false)
         };
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
@@ -863,8 +942,8 @@ mod tests {
             .default_model(model_ref("root"))
             .modes(
                 [
-                    ("work".to_owned(), work),
-                    ("look".to_owned(), mode(&[Capability::Read])),
+                    (mode_name("work"), work),
+                    (mode_name("look"), mode(&[Capability::Read])),
                 ]
                 .into(),
             )
@@ -881,20 +960,12 @@ mod tests {
         let queued = QueuedPrompt {
             text: "only look from here".into(),
             attachments: Vec::new(),
-            options: session.selection(None, Some("look")).unwrap(),
+            options: session.selection(None, Some(&mode_name("look"))).unwrap(),
             cancellation: Default::default(),
         };
-        let receipt = tokio::spawn({
-            let session = session.clone();
-            async move { enqueue_prompts(&session, vec![queued]).await }
-        });
-        // A spawned enqueue proves nothing: observe the root's mailbox.
-        bounded(async {
-            while session.root_tx.capacity() == AGENT_CHANNEL_CAPACITY {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        let mut receipt = Box::pin(enqueue_prompts(&session, vec![queued]));
+        let sent = async || session.root_tx.capacity() < AGENT_CHANNEL_CAPACITY;
+        pending_until(&mut receipt, sent).await;
         tracking.release(0);
         tracking.request(1).await;
         let narrowed = tracking.request(2).await;
@@ -908,7 +979,7 @@ mod tests {
             !offered.contains(&"write") && !offered.contains(&"agent"),
             "{offered:?}"
         );
-        assert!(bounded(receipt).await.unwrap().iter().all(Result::is_ok));
+        assert!(bounded(receipt).await.iter().all(Result::is_ok));
         // The model calls `write` regardless: it is refused.
         tracking.release(2);
         tracking.request(4).await;
@@ -934,7 +1005,7 @@ mod tests {
 
     /// A session never outgrows the ceiling it started with. A mode it has used keeps
     /// the definition it was used under; a mode new to it is pinned on first use.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn resume_keeps_the_session_ceiling_and_its_pinned_modes() {
         use crate::tool::policy::{Capability, CapabilitySet, Mode};
         let root = tempfile::tempdir().unwrap();
@@ -942,7 +1013,7 @@ mod tests {
         let requests = Requests::default();
         let mode = |capabilities: &[Capability], instructions: &str| Mode {
             capabilities: capabilities.to_vec(),
-            instructions: Some(instructions.to_owned()),
+            instructions: Some(instructions.parse().unwrap()),
             hint: None,
         };
         let build = |ceiling: CapabilitySet, modes: &[(&str, Mode)], reply: &str| {
@@ -950,7 +1021,11 @@ mod tests {
             let modes = modes.iter().cloned();
             test_builder(root.path(), &sessions, provider, false)
                 .capabilities(ceiling)
-                .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).collect())
+                .modes(
+                    modes
+                        .map(|(name, mode)| (name.parse().unwrap(), mode))
+                        .collect(),
+                )
                 .build()
         };
         let look = ("look", mode(&[Capability::Read], "Look."));
@@ -965,8 +1040,9 @@ mod tests {
         let id = session.id();
         shutdown_session(session).await;
 
-        let in_mode =
-            |session: &SessionHandle, mode: &str| session.selection(None, Some(mode)).unwrap();
+        let in_mode = |session: &SessionHandle, mode: &str| {
+            session.selection(None, Some(&mode_name(mode))).unwrap()
+        };
         let changes = |records: &[EventRecord]| events!(records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
         // A wider live ceiling does not widen the session: `work` grants no write here.
         let wide = CapabilitySet::default;
@@ -977,7 +1053,7 @@ mod tests {
         let prompt = resumed.prompt_with_options("widen", &[], in_mode(&resumed, "work"));
         assert_eq!(prompt.await.unwrap(), "two");
         let first = crate::session::ModeSelection {
-            name: "work".into(),
+            name: "work".parse().unwrap(),
             definition: Some(work.1.clone()),
         };
         let records = resumed.runtime.store.records().await;
@@ -1002,7 +1078,7 @@ mod tests {
         }
         let (_store, records) = SessionStore::open(&sessions, id).await.unwrap();
         let named = |name: &str, definition: Option<&Mode>| crate::session::ModeSelection {
-            name: name.to_owned(),
+            name: mode_name(name),
             definition: definition.cloned(),
         };
         let read = vec![Capability::Read];
@@ -1021,7 +1097,7 @@ mod tests {
 
     /// A retained child accepts owner input after a restart: its loop starts again
     /// under its journaled contract and continues its own history.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retained_children_resume_after_the_session_restarts() {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
@@ -1247,7 +1323,10 @@ mod tests {
         completed.insert(completed.len() - 1, ResponseEvent::Usage(usage));
         let responses = [completed, answer(summary.to_string()), answer("resumed")];
         let provider = scripted_provider(&requests, responses);
-        let profile = ModelProfile::new("test", None, 64_000, 4096, false);
+        let profile = ModelProfile {
+            max_context: crate::tests::limit(64_000),
+            ..crate::tests::profile("test", false)
+        };
         let harness = serving(root.path(), provider, [("test", profile)])
             .build()
             .await
@@ -1288,9 +1367,9 @@ mod tests {
 
         let resumed = harness.resume_session(id).await.unwrap();
         let todos = &resumed.runtime.todos;
-        let found = todos.inspect(&resumed.root, None).await.unwrap().items;
+        let found = todos.inspect(&resumed.root, None).await.unwrap();
         assert_eq!(found, reconciled);
-        let found = todos.inspect(&child, None).await.unwrap().items;
+        let found = todos.inspect(&child, None).await.unwrap();
         assert_eq!(found, child_todos);
         assert_eq!(resumed.prompt("Continue.").await.unwrap(), "resumed");
         {
@@ -1310,7 +1389,7 @@ mod tests {
         shutdown_session(resumed).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn switching_models_preserves_image_history_and_reports_unsupported_images() {
         let root = tempfile::tempdir().unwrap();
         let image = crate::media::Attachment::Image {
@@ -1320,7 +1399,7 @@ mod tests {
         let requests = Requests::default();
         let responses = [answer("Image received"), answer("Image still present")];
         let provider = scripted_provider(&requests, responses);
-        let vision = ModelProfile::new("vision-model", None, 128_000, 4096, true);
+        let vision = crate::tests::profile("vision-model", true);
         let harness = serving(root.path(), provider, [("vision", vision)])
             .build()
             .await
@@ -1342,11 +1421,21 @@ mod tests {
         assert!(matches!(rejected.await, Err(HarnessError::ImageLimit)));
         assert_eq!(session.runtime.store.records().await.len(), before);
         let images = [image];
+        let direct = session.prompt_with_options("Look", &images, Selection::default());
+        let error = direct.await.unwrap_err();
+        assert!(
+            matches!(error, HarnessError::ImagesUnsupported(_)),
+            "{error}"
+        );
+        assert_eq!(session.runtime.store.records().await.len(), before);
         let with_image = session.prompt_with_options("Look at this", &images, model("test/vision"));
         with_image.await.unwrap();
         let error = session.prompt_with_options("Go on", &[], model("test/test"));
-        let error = error.await.unwrap_err().to_string();
-        assert!(error.contains("does not support image"), "{error}");
+        let error = error.await.unwrap_err();
+        assert!(
+            matches!(error, HarnessError::ImagesUnsupported(_)),
+            "{error}"
+        );
         assert_eq!(requests.lock().unwrap().len(), 1);
         let again = session.prompt_with_options("Use vision again", &[], model("test/vision"));
         again.await.unwrap();
@@ -1413,7 +1502,49 @@ mod tests {
         assert_eq!(captured.len(), 2);
         assert!(captured[0].messages().eq(captured[1].messages()));
         session.shutdown().await.unwrap();
-        tokio::task::yield_now().await;
+        session.shutdown().await.unwrap();
+    }
+
+    /// Continue resumes every holder's wait, not only the root's: a nested holder's
+    /// resumed turn is busy again, so a second interrupt stops it.
+    #[tokio::test(start_paused = true)]
+    async fn continue_resumes_nested_holders_so_a_second_interrupt_stops_them() {
+        let delegate = |id: &str, depth: u32| {
+            let arguments = json!({"prompt": format!("{id} task"), "depth": depth});
+            response(vec![tool_call(0, id, "agent", arguments)])
+        };
+        let steps = [
+            Step::new(delegate("child", 1)),
+            Step::new(delegate("grandchild", 0)),
+            Step::new(Vec::new()).midstream(),
+            Step::new(answer("grandchild recovered")),
+            Step::new(Vec::new()).midstream(),
+            Step::new(answer("child recovered")),
+            Step::new(answer("parent done")),
+        ];
+        let requests = Requests::default();
+        let provider = Script::new(steps, &requests);
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("delegate").await }
+        });
+        provider.request(2).await;
+        // The grandchild is interrupted; the child and the root holding it keep waiting.
+        assert_eq!(session.interrupt().await, 3);
+        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
+        provider.request(4).await;
+        let child = session.root.child(1);
+        assert_eq!(turn(&session, &child), TurnState::Busy);
+        // The child's resumed turn is in a model request, so it is interrupted; the
+        // root holding it shows interrupted again.
+        assert_eq!(session.interrupt().await, 2);
+        assert_eq!(turn(&session, &child), TurnState::Parked);
+        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
+        assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
         session.shutdown().await.unwrap();
     }
 
@@ -1441,14 +1572,12 @@ mod tests {
         let executor = &session.runtime.executor;
         let running = executor.execute(session.root.clone(), "script", arguments, None);
         let job = running.await.unwrap().job;
-        bounded(async {
-            while session.runtime.jobs.has_running(&session.root).await {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await;
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        assert_eq!(requests.lock().unwrap().len(), 1, "job {job} woke the root");
+        bounded(session.runtime.jobs.wait_settled(job))
+            .await
+            .unwrap();
+        // Queue the completion's wake ahead of the continue: had it woken the
+        // interrupted root, that turn would spend the scripted answer.
+        session.root_tx.send(AgentCommand::JobsReady).await.unwrap();
         // The completion reaches the model with the next request instead.
         assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");
         let captured = requests.lock().unwrap().clone();
@@ -1480,7 +1609,7 @@ mod tests {
                 r#"
     const accepted = [];
     for (const value of [{{text:"hello 🌏", nested:[1,true]}}, null, false]) {{
-      accepted.push((await tool.job({id}).send({{value}})).result);
+      accepted.push((await tool.job({id}).send({{value}})).unwrap());
     }}
     const pending = await tool.jobs({{job:{id}}});
     return {{accepted, state:pending.state}};
@@ -1488,7 +1617,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        let accepted = json!(vec![json!({"accepted":true}); 3]);
+        let accepted = json!([null, null, null]);
         assert_eq!(queued.value["value"]["accepted"], accepted);
         assert_eq!(queued.value["value"]["state"], "running");
         let last = format!("return tool.job({id}).send({{value:\"last\"}});");
@@ -1507,8 +1636,14 @@ mod tests {
 
         let waiting = background("return await receive();").await;
         let id = waiting.get();
-        let cancel = format!("await tool.jobs({{job:{id}}}); return tool.job({id}).cancel();");
-        session.run_script(cancel).await.unwrap();
+        // The cancel result is the target's view, with no denial code.
+        let cancel = format!(
+            "await tool.jobs({{job:{id}}}); return (await tool.job({id}).cancel()).unwrap().meta.code === undefined;"
+        );
+        assert_eq!(
+            session.run_script(cancel).await.unwrap().value["value"],
+            true
+        );
         jobs.wait(waiting, None, true).await.unwrap();
         let output = format!("return tool.jobs({{job:{id}}});");
         let cancelled = session.run_script(output).await.unwrap();

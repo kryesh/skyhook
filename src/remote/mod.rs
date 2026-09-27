@@ -10,7 +10,7 @@ mod payload;
 mod prompt;
 mod protocol;
 mod service;
-pub mod ssh;
+mod ssh;
 mod transport;
 pub mod worker;
 
@@ -19,8 +19,7 @@ pub use artifact::{
 };
 #[cfg(test)]
 pub(crate) use backend::ConnectionFactory;
-pub(crate) use error::{DeploymentError, ProtocolError, SshError};
-pub(crate) use manager::RemoteError;
+pub(crate) use error::RemoteError;
 #[cfg(test)]
 pub(crate) use manager::tests::PendingHandshakeFactory;
 pub(crate) use manager::{PreparedConnection, RemoteManager};
@@ -28,11 +27,5 @@ pub use prompt::{
     PromptAnswer, RejectSensitivePrompts, SecretValue, SensitivePrompt, SensitivePromptError,
     SensitivePromptFuture, SensitivePromptHandler, SensitivePromptKind,
 };
-pub(crate) use ssh::AskpassServer;
-
-pub fn run_askpass_helper(
-    socket: &std::path::Path,
-    prompt: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    ssh::run_askpass_helper(socket, prompt)
-}
+pub use ssh::askpass_main;
+pub(crate) use ssh::{AskpassServer, SshOption};

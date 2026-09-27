@@ -56,6 +56,8 @@ boundary. Apply updates to the snapshot in revision order with `ObservationSnaps
 It contains:
 
 - Durable records keyed by their original journal sequence.
+- The request ledger: each logical request's lifecycle phase, outcome, and usage, folded from
+  those records. Host statistics and displays read request state from it.
 - Request-scoped live responses keyed by agent and logical request: their streamed blocks in
   arrival order, then the authoritative blocks once the response has ended.
 - Current agent activity and context-usage estimates.
@@ -72,7 +74,7 @@ expose startup diagnostics and MCP discovery outcomes without inserting diagnost
 context or writing directly to a terminal. `record_status` likewise records host-facing status,
 not a user message.
 
-`TodoItem`, `TodoStatus`, and `TodoSnapshot` are exported by `skyhook::agent`. Hosts projecting
+`TodoItem` and `TodoStatus` are exported by `skyhook::agent`. Hosts projecting
 checklists from observed records apply `SessionEvent::TodosReplaced` and the reconciled todos in
 `SessionEvent::Compaction` checkpoints in sequence. Both replace the owning agent's entire list;
 child-agent lists remain independent.
@@ -89,10 +91,11 @@ the root answer, or an empty string when there is none.
 
 Use `Harness::resume_session` to reopen durable state. The runtime reconciles interrupted work
 before starting agents and opens fresh provider contexts; it does not reuse old network resources.
+A root turn that failed or was interrupted before the session closed can still be continued.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases use format 14. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 15. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 
@@ -108,8 +111,9 @@ The library's shim catalog is empty by default. Supply `remote::EmbeddedShimCata
 library hosts do not inherit the CLI's artifacts.
 
 `EmbeddedShimCatalog::from_embedded_assets` accepts names of the form `platform-protocol-arch`
-(for example, `linux-ssh-aarch64`) and artifact bytes. Selection uses the destination's protocol,
-platform, and architecture. A missing matching artifact produces an explicit deployment error.
+(for example, `linux-ssh-aarch64`) and a loader that returns a named artifact's bytes, called only
+for the artifact being deployed. Selection uses the destination's protocol, platform, and
+architecture. A missing matching artifact produces an explicit deployment error.
 See [remote transport and shims](remote-transport-and-shims.md) for build, packaging, and deployment
 behavior.
 
@@ -133,8 +137,9 @@ or authentication headers:
   including the model ID, reasoning setting, and output limit. Context records describe request
   settings, not the lifetime of a `ProviderContext` resource.
 - `model_requested` identifies one frozen logical request before its first invocation. It references
-  the context record and stores the checkpoint it opens with, `history` as ordered source-event
-  sequences, `tail` as exact inline messages, and `history_lifetime`. Retries refer back to this
+  the context record and stores the checkpoint it opens with, its history as the agent's commits
+  through a message sequence, `tail` as exact inline messages, and
+  `history_lifetime`. Retries refer back to this
   request using `model_attempt_started`, with separate failure/interruption or completion outcomes.
   Ordinary requests reuse a context record while their settings remain applicable; summarization
   has a separate context with its structured response schema.
@@ -152,9 +157,11 @@ or authentication headers:
 
 `session::reconstruct_model_request(&records, sequence)` returns the `provider/model` name the
 request was issued under and the reconstructed `ModelRequest` for a `model_requested` sequence,
-using sequence-ordered records from `SessionStore`. Attachments and tool images reference
-content-addressed blobs by SHA-256; `load_blobs(&mut request).await` on an owning `SessionStore`
-loads their contents for provider encoding; unlike `read_records`, opening a store acquires the
+using sequence-ordered records from `SessionStore`. It checks the request's context, checkpoint
+and history bound as an append does, so other records fail with a `ReplayError`. Attachments and
+tool images reference content-addressed blobs by SHA-256; `load_blobs(&mut request, &mut cache)`
+on an owning `SessionStore` loads their contents for provider encoding, reusing and then keeping
+exactly this request's blobs in `cache`; unlike `read_records`, opening a store acquires the
 session's writer lock. Reconstruction reproduces Skyhook's provider-neutral input, not an
 API-specific wire encoding or a replay of the external call.
 

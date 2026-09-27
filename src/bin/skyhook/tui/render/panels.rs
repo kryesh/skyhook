@@ -43,7 +43,7 @@ impl PromptLayout {
             None => app
                 .prompt_options()
                 .into_iter()
-                .map(|label| (label, String::new()))
+                .map(|label| (label.to_owned(), String::new()))
                 .collect(),
         };
         let (options, selected_start) =
@@ -188,7 +188,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
         );
         if line.index == app.prompt_input().choice
             && !cursor_drawn
-            && app.menu.is_none()
+            && app.overlay.is_none()
             && !(app.multiple_questions() && app.question_editing())
         {
             focus_cursor(frame, row.x - 1, row.y, THEME.input);
@@ -239,8 +239,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
         }
         if visible > 0
             && (!app.multiple_questions() || app.question_editing())
-            && app.menu.is_none()
-            && app.search_editor.is_none()
+            && app.overlay.is_none()
         {
             frame.set_cursor_position((
                 2 + (cursor_column as u16).min(rect.width.saturating_sub(4)),
@@ -293,11 +292,11 @@ fn scroll_to(top: usize, cursor: usize, height: u16) -> usize {
 pub(super) fn draw_tree(
     frame: &mut Frame,
     app: &mut App,
-    tree_agents: &[model::AgentInfo],
-    tree_rows: u16,
+    tree_agents: &[usize],
     navigation_active: bool,
 ) {
     let width = app.tree_rect.width;
+    let tree_rows = app.tree_rect.height.saturating_sub(2);
     let tree_y = app.tree_rect.y;
     fill(frame, app.tree_rect, THEME.panel);
     app.tree_cursor = app.tree_cursor.min(tree_agents.len().saturating_sub(1));
@@ -307,18 +306,19 @@ pub(super) fn draw_tree(
     app.tree_scroll = app
         .tree_scroll
         .min(tree_agents.len().saturating_sub(tree_rows as usize));
-    let agent_stats = tree_agents
+    let agents = tree_agents
         .iter()
-        .map(|agent| model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id))
-        .collect::<Vec<_>>();
+        .map(|&index| &app.projection.agents[index]);
+    let agent_stats: Vec<_> = agents
+        .clone()
+        .map(|agent| app.projection.agent_stats(&app.snapshot, &agent.id))
+        .collect();
+    let stats = AgentStatsColumns::new(&agent_stats);
     let row_width = width.saturating_sub(4);
-    let columns = AgentColumns::new(tree_agents, row_width, AgentStatsColumns::new(&agent_stats));
-    for (index, agent) in tree_agents
-        .iter()
-        .enumerate()
-        .skip(app.tree_scroll)
-        .take(tree_rows as usize)
-    {
+    let columns = AgentColumns::new(agents, row_width, stats);
+    let rows = tree_agents.iter().enumerate();
+    for (index, &agent_index) in rows.skip(app.tree_scroll).take(tree_rows as usize) {
+        let agent = &app.projection.agents[agent_index];
         let y = tree_y + 1 + (index - app.tree_scroll) as u16;
         let selected = agent.id == app.selected;
         let focused = navigation_active && app.focus == Focus::Tree && app.tree_cursor == index;

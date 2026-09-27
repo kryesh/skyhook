@@ -240,7 +240,7 @@ fn wrap_cell(mut cell: Line<'static>, width: usize) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::super::super::THEME;
-    use super::super::render;
+    use super::super::parser::tests::{rendered as table, strings};
     use super::*;
     use ratatui::style::Style;
     use unicode_width::UnicodeWidthStr;
@@ -248,14 +248,6 @@ mod tests {
     const KEYS: &str = "| Key | Description |\n| --- | --- |\n| x | one two three four |";
     const STYLED: &str =
         "| L | C | R |\n| :--- | :---: | ---: |\n| **abcdef** | *ab cd e* | `abcde` |";
-
-    fn table(text: &str, width: usize) -> Vec<Line<'static>> {
-        render(text, false, width)
-    }
-
-    fn strings(lines: &[Line<'_>]) -> Vec<String> {
-        lines.iter().map(ToString::to_string).collect()
-    }
 
     #[test]
     fn tables_wrap_cells_not_borders_and_keep_alignment_widths_and_styles() {

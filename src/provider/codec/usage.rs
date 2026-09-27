@@ -1,9 +1,10 @@
-//! Token accounting for streamed usage reports, which Chat and Messages fold;
-//! Responses reads its single terminal report instead. The parser locates
-//! counters, the family's accounting says what they mean, and the fold turns
-//! them into Skyhook's counters without losing late refinements.
+//! Token accounting for usage reports. A family's spelling locates the
+//! counters, its accounting says what they mean, and the fold turns them into
+//! Skyhook's counters without losing late refinements.
 
-use crate::provider::protocol::Usage;
+use serde_json::Value;
+
+use crate::provider::{codec::common::lenient_u64, protocol::Usage};
 
 /// What a family's input counter includes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -23,6 +24,34 @@ pub(crate) struct Observed {
     pub cached: Option<u64>,
     pub written: Option<u64>,
     pub output: Option<u64>,
+}
+
+/// Where a family's usage report spells each counter: JSON pointers, of which
+/// the first holding a counter wins.
+pub(crate) struct Spelling {
+    pub input: &'static [&'static str],
+    pub cached: &'static [&'static str],
+    pub written: &'static [&'static str],
+    pub output: &'static [&'static str],
+}
+
+impl Observed {
+    /// The counters `usage` reports, which some servers encode as floats or
+    /// strings; `None` when it reports none.
+    pub(crate) fn read(usage: &Value, spelling: &Spelling) -> Option<Self> {
+        let counter = |pointers: &[&str]| {
+            pointers
+                .iter()
+                .find_map(|pointer| usage.pointer(pointer).and_then(lenient_u64))
+        };
+        let observed = Self {
+            input: counter(spelling.input),
+            cached: counter(spelling.cached),
+            written: counter(spelling.written),
+            output: counter(spelling.output),
+        };
+        (observed != Self::default()).then_some(observed)
+    }
 }
 
 /// Cumulative counters of one response. Reports never regress a counter, so a
@@ -81,6 +110,33 @@ impl Counters {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unusable_counters_read_as_absent() {
+        const SPELLING: Spelling = Spelling {
+            input: &["/input", "/alias"],
+            cached: &["/cached"],
+            written: &["/written"],
+            output: &["/output"],
+        };
+        let read = |usage: Value| Observed::read(&usage, &SPELLING);
+        // An unusable counter falls through to the next spelling, or is absent.
+        assert_eq!(
+            read(
+                serde_json::json!({"input":"garbage","alias":"12","cached":-1,
+                "written":1.5,"output":7.0})
+            ),
+            Some(Observed {
+                input: Some(12),
+                output: Some(7),
+                ..Default::default()
+            })
+        );
+        assert_eq!(
+            read(serde_json::json!({"input":"garbage","cached":null,"output":{}})),
+            None
+        );
+    }
 
     #[test]
     fn total_accounting_refines_the_split_without_moving_the_total() {

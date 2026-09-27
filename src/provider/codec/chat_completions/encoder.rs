@@ -5,16 +5,18 @@ use super::{
 };
 use crate::provider::{
     ProviderError,
+    ProviderErrorKind::InvalidRequest,
     codec::{
         CodecName, SchemaConstraint, ToolNames,
         common::{
-            attach_runtime_tail, check_tool, image_url, invalid, own_replay, signed_context,
-            system_text, tool_text, user_parts,
+            attach_runtime_tail, check_tool, image_url, own_replay, signed_context, system_text,
+            tool_text, user_parts,
         },
         placement::breakpoint,
     },
     protocol::{AssistantItem, Binding, HistoryLifetime, Message, ModelRequest, Replay},
 };
+use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_tool_name_char};
 use serde_json::{Map, Value, json};
 use std::collections::BTreeSet;
 
@@ -65,7 +67,7 @@ pub(crate) fn encode(
         };
         messages.push(json!({"role": role, "content": content}));
     }
-    let signed_only = signed_context(request, dialect.reasoning_replay.format());
+    let signed_only = signed_context(request, dialect.reasoning_replay.format().replay());
     for message in &request.history {
         push_message(request, dialect, signed_only, &mut messages, message)?;
     }
@@ -94,16 +96,11 @@ pub(crate) fn encode(
         }
         UsageRequest::Implicit => {}
     }
-    if let Some(effort) = &request.reasoning {
-        dialect.effort.place(&mut root, effort)?;
+    if let Some(reasoning) = &request.reasoning {
+        dialect.effort.place(&mut root, reasoning)?;
     }
-    if let Some(limit) = request.max_output_tokens {
-        if limit == 0 {
-            return Err(invalid("max_output_tokens must be positive"));
-        }
-        if let Some(path) = &dialect.output_limit {
-            path.set(&mut root, json!(limit))?;
-        }
+    if let (Some(limit), Some(path)) = (request.max_output_tokens, &dialect.output_limit) {
+        path.set(&mut root, json!(limit))?;
     }
     if let Some(path) = &dialect.tool_stream {
         path.set(&mut root, json!(true))?;
@@ -114,7 +111,7 @@ pub(crate) fn encode(
         for tool in &request.tools {
             check_tool(tool, dialect.tool_names, CodecName::ChatCompletions)?;
             if !names.insert(&tool.name) {
-                return Err(invalid("Chat tools require unique function names"));
+                return Err(InvalidRequest.error("Chat tools require unique function names"));
             }
             let mut function = json!({"name": tool.name, "parameters": tool.input_schema});
             if !tool.description.is_empty() {
@@ -128,16 +125,16 @@ pub(crate) fn encode(
         let format = match dialect.schema {
             SchemaConstraint::OpenAiStrict => {
                 if !ToolNames::OpenAi.accepts(&schema.name) {
-                    return Err(invalid(
-                        "Chat response schema requires a name of 1–64 ASCII letters, digits, underscores or hyphens",
-                    ));
+                    return Err(InvalidRequest.error(format!(
+                        "Chat response schema requires a name of {}",
+                        ToolNames::OpenAi.rule()
+                    )));
                 }
                 if schema.schema.get("type").and_then(Value::as_str) != Some("object")
                     || schema.schema.get("anyOf").is_some()
                 {
-                    return Err(invalid(
-                        "Chat strict response schema root must be an object, not anyOf",
-                    ));
+                    return Err(InvalidRequest
+                        .error("Chat strict response schema root must be an object, not anyOf"));
                 }
                 validate_schema(&schema.schema, &schema.schema, 0)?;
                 json!({"name": schema.name, "strict": true, "schema": schema.schema})
@@ -145,9 +142,8 @@ pub(crate) fn encode(
             // The server compiles the whole schema into a grammar; nothing is dropped.
             SchemaConstraint::Grammar => {
                 if schema.name.trim().is_empty() || !schema.schema.is_object() {
-                    return Err(invalid(
-                        "Chat response schema requires a name and a JSON Schema object",
-                    ));
+                    return Err(InvalidRequest
+                        .error("Chat response schema requires a name and a JSON Schema object"));
                 }
                 json!({"name": schema.name, "schema": schema.schema})
             }
@@ -200,8 +196,8 @@ fn push_message(
                     }
                     AssistantItem::Reasoning { replay, .. } => replays.extend(own_replay(
                         replay.as_ref(),
-                        dialect.reasoning_replay.format(),
-                        &request.model,
+                        dialect.reasoning_replay.format().replay(),
+                        request.model.as_str(),
                     )),
                     AssistantItem::ToolCall { call, .. } => {
                         // Results pair by call ID, so sanitizing an invalid name is safe.
@@ -259,7 +255,7 @@ fn push_message(
             let mut images = Vec::new();
             for result in results {
                 if result.call_id.is_empty() {
-                    return Err(invalid("Chat tool results require a call ID"));
+                    return Err(InvalidRequest.error("Chat tool results require a call ID"));
                 }
                 messages.push(json!({"role": "tool", "tool_call_id": result.call_id, "content": tool_text(result)}));
                 if !result.images.is_empty() {
@@ -307,14 +303,8 @@ fn wire_name(name: &str, names: ToolNames) -> String {
     }
     let sanitized: String = name
         .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
-                c
-            } else {
-                '_'
-            }
-        })
-        .take(64)
+        .map(|c| if is_tool_name_char(c) { c } else { '_' })
+        .take(MAX_TOOL_NAME_BYTES)
         .collect();
     if sanitized.is_empty() {
         "_".to_owned()
@@ -361,8 +351,7 @@ mod tests {
         }
     }
     use super::super::{
-        Decoder,
-        decoder::tests::{delta, end},
+        decoder::tests::{delta, end, reduced_as},
         dialect::{ProviderPreferences, Routing},
     };
     use super::*;
@@ -812,7 +801,7 @@ mod tests {
             json!({"role":"user","content":"hello"})
         );
         assert!(body["tools"][0]["function"].get("description").is_none());
-        for (effort, valid) in [("max", true), ("unbounded", false)] {
+        for (effort, valid) in [("max", true), ("adaptive", false)] {
             let mut request = history(vec![]);
             request.reasoning = Some(effort.into());
             let body = encode(&request, &unsupported());
@@ -848,26 +837,14 @@ mod tests {
     #[test]
     fn reasoning_replay_roundtrip_is_policy_selected() {
         let scope = crate::provider::codec::common::tests::scope();
-        let mut decoder = Decoder::new(
-            "test-model".into(),
-            scope.clone(),
-            Dialect::compatible().reasoning_replay.format(),
-            crate::provider::http::errors::ErrorSignals::NONE,
-        );
-        let frames = [
+        let frames = vec![
             delta(json!({"reasoning_content":"first "})),
             delta(json!({"reasoning":"second"})),
             delta(json!({"content":"ok"})),
             end("stop"),
         ];
-        let mut events = Vec::new();
-        for frame in frames {
-            events.extend(decoder.decode(&frame).unwrap());
-        }
-        events.extend(decoder.finish().unwrap());
-        let items = crate::provider::codec::common::tests::reduce(events)
-            .items()
-            .to_vec();
+        let format = Dialect::compatible().reasoning_replay.format();
+        let items = reduced_as(format, frames).items().to_vec();
         let envelope = items[0].replay().unwrap();
         assert_eq!(
             (

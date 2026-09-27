@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 
-use crate::provider::ProviderError;
+use crate::provider::{ProviderError, ProviderErrorKind};
 
 use super::{AssistantItem, BlockId, ItemId, ItemKind, ToolCall};
 
@@ -37,6 +37,17 @@ impl ResponseEvent {
 pub struct BlockRef {
     pub item: ItemId,
     pub block: BlockId,
+}
+
+impl BlockRef {
+    /// The one block of a single-block item, as its constructors and the
+    /// index-addressed decoders key it.
+    pub fn single(item: impl std::fmt::Display) -> Self {
+        Self {
+            block: BlockId::try_from(format!("{item}:0")).expect("suffixed id is nonblank"),
+            item: ItemId::try_from(item.to_string()).expect("item ids are nonblank"),
+        }
+    }
 }
 
 /// A complete response: its items in position order and how it ended. Built only
@@ -86,7 +97,7 @@ pub enum CompletionError {
 
 impl From<CompletionError> for ProviderError {
     fn from(error: CompletionError) -> Self {
-        Self::protocol(error.to_string())
+        ProviderErrorKind::Protocol.error(error.to_string())
     }
 }
 
@@ -222,7 +233,7 @@ pub struct UsageError {
 
 impl From<UsageError> for ProviderError {
     fn from(error: UsageError) -> Self {
-        Self::protocol(error.to_string())
+        ProviderErrorKind::Protocol.error(error.to_string())
     }
 }
 
@@ -283,7 +294,11 @@ impl LiveResponse {
     pub fn push(mut self, event: ResponseEvent) -> Step {
         match event {
             ResponseEvent::Delta { block, kind, text } => {
-                let index = match self.blocks.iter().position(|live| live.block == block) {
+                let index = self
+                    .current
+                    .filter(|&index| self.blocks[index].block == block)
+                    .or_else(|| self.blocks.iter().position(|live| live.block == block));
+                let index = match index {
                     Some(index) => index,
                     None => {
                         self.blocks.push(LiveBlock {
@@ -452,7 +467,7 @@ mod tests {
         };
         let error = ResponseEvent::Usage(invalid).checked().unwrap_err();
         assert_eq!(
-            ProviderError::from(error).kind,
+            ProviderError::from(error).kind(),
             crate::provider::ProviderErrorKind::Protocol
         );
     }

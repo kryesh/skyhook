@@ -1,22 +1,19 @@
 //! api.anthropic.com: the Messages API with its version header, `x-api-key`,
 //! prefix-bound thinking, cache breakpoint lifetimes, and workspace-scoped keys.
 
-use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-use super::{
-    BuildError, Common, Connection, Dialect, DialectConfig, DialectError, Pending, Profile, Scheme,
-    UnsupportedCodec,
-};
+use super::{Common, Dialect, DialectConfig, DialectError, Profile, Scheme, UnsupportedCodec};
 use crate::provider::{
+    ProviderErrorKind,
     codec::{
         CacheTtl, Codec, CodecName,
         messages::{self, ThinkingBinding},
     },
     http::{
-        Headers, Transport,
-        errors::{ErrorRule, ErrorSignals, Field, RuleKind},
-        headers::Value,
+        Transport,
+        errors::{ErrorRule, ErrorSignals, Field},
+        headers::HeaderText,
     },
 };
 
@@ -38,7 +35,7 @@ const ERRORS: ErrorSignals = ErrorSignals {
             "details.error_code",
             "enforced_spend_limit_reached",
         )),
-        ..ErrorRule::kind(RuleKind::Billing)
+        ..ErrorRule::kind(ProviderErrorKind::Billing)
     }],
     ..ErrorSignals::NONE
 };
@@ -55,18 +52,13 @@ fn transport() -> Transport {
 pub struct Config {
     /// Sent as `anthropic-workspace-id`; required by keys that span workspaces.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<String>,
+    pub workspace_id: Option<HeaderText>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_ttl: Option<CacheTtl>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    #[error("workspace_id is not a valid header value")]
-    Workspace,
-}
-
 impl DialectConfig for Config {
+    /// The key travels as the codec's own, `x-api-key`.
     fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
         if codec != CodecName::Messages {
             return Err(UnsupportedCodec {
@@ -79,27 +71,14 @@ impl DialectConfig for Config {
             cache_ttl: self.cache_ttl,
             ..messages()
         });
-        let mut profile = Profile::new(codec, transport(), Dialect::Anthropic);
+        let mut profile = Profile {
+            key: Scheme::XApiKey,
+            ..Profile::new(codec, transport(), Dialect::Anthropic)
+        };
         if let Some(workspace) = &self.workspace_id {
-            let value = HeaderValue::from_str(workspace).map_err(|_| Error::Workspace)?;
-            profile.headers.insert(
-                HeaderName::from_static("anthropic-workspace-id"),
-                Value::Fixed(value),
-            );
+            profile.fixed("anthropic-workspace-id", workspace.value());
         }
         Ok(profile)
-    }
-
-    /// The key travels as the codec's own, `x-api-key`.
-    fn credentials(
-        &self,
-        profile: &Profile,
-        connection: &Connection,
-    ) -> Result<Headers<Pending>, BuildError> {
-        Ok(super::key(
-            connection,
-            Scheme::standard(profile.codec.name()),
-        ))
     }
 }
 
@@ -124,7 +103,7 @@ mod tests {
         assert!(header_values(&keyed, "authorization").is_empty());
         assert_eq!(header_values(&keyed, "anthropic-version"), ["2023-06-01"]);
         let configured = Config {
-            workspace_id: Some("wrkspc_1".into()),
+            workspace_id: Some("wrkspc_1".parse().unwrap()),
             cache_ttl: Some(CacheTtl::OneHour),
         };
         assert_eq!(
@@ -166,24 +145,6 @@ mod tests {
             "details":{"error_code":"enforced_spend_limit_reached"}}});
         assert_eq!(kind(capped), ProviderErrorKind::Billing);
         let limited = serde_json::json!({"error":{"type":"rate_limit_error"}});
-        assert!(matches!(
-            kind(limited),
-            ProviderErrorKind::RateLimited { .. }
-        ));
-    }
-
-    #[test]
-    fn speaks_only_messages() {
-        let chat = CodecName::ChatCompletions;
-        assert_eq!(
-            Config::default()
-                .admit(&Common::default(), chat)
-                .unwrap_err(),
-            UnsupportedCodec {
-                dialect: Dialect::Anthropic,
-                codec: chat
-            }
-            .into()
-        );
+        assert!(matches!(kind(limited), ProviderErrorKind::RateLimited));
     }
 }

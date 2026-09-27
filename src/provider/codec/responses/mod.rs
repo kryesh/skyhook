@@ -1,15 +1,18 @@
 //! Native OpenAI Responses wire codec, shared with Codex.
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde_json::{Value, json};
 
-use crate::provider::codec::common::{Finish, replay};
+use crate::provider::codec::{
+    CodecName,
+    common::{Finish, Native, replay},
+};
 use crate::provider::http::errors::ErrorSignals;
 use crate::provider::{
     ProviderError,
     protocol::{
-        AssistantItem, Binding, BlockId, BlockRef, CutReason, ItemId, ItemKind, ReplayFormat,
-        ResponseEvent, Scope, TextBlock, ToolCall, Usage,
+        AssistantItem, Binding, BlockId, BlockRef, ItemId, ItemKind, ReplayFormat, ResponseEvent,
+        Scope, TextBlock, ToolCall, Usage,
     },
 };
 
@@ -18,18 +21,21 @@ mod dialect;
 mod encoder;
 mod errors;
 mod events;
+mod identity;
 mod native;
 mod normalization;
 mod reasoning;
 mod terminal;
 
-pub(crate) use dialect::{Dialect, Instructions, ReasoningSummary, TerminalOutput};
+pub use dialect::ReasoningSummary;
+pub(crate) use dialect::{Dialect, Instructions, TerminalOutput};
 
 pub(crate) use encoder::{BODY_FIELDS, encode};
-use errors::api_error;
-pub(crate) use errors::read as read_error;
-use native::{arguments, array, final_parts, index, kind, protocol, string};
+pub(crate) use errors::Code;
+use native::{arguments, array, final_parts};
 use reasoning::{readable_reasoning, reasoning_parts, reasoning_position, reasoning_text};
+
+const NATIVE: Native = Native(CodecName::Responses);
 
 /// A part's authoritative content, as the wire states it.
 #[derive(Clone, Debug, PartialEq)]
@@ -122,13 +128,13 @@ macro_rules! variant_accessors {
         fn $name(&self) -> Result<&$ty, ProviderError> {
             match &self.$field {
                 $enum::$variant(state) => Ok(state),
-                _ => Err(protocol($message)),
+                _ => Err(NATIVE.error($message)),
             }
         }
         fn $name_mut(&mut self) -> Result<&mut $ty, ProviderError> {
             match &mut self.$field {
                 $enum::$variant(state) => Ok(state),
-                _ => Err(protocol($message)),
+                _ => Err(NATIVE.error($message)),
             }
         }
     )+};
@@ -154,15 +160,10 @@ enum ItemBody {
 }
 struct Item {
     native_id: ItemId,
-    aliases: BTreeSet<String>,
     wire_index: Option<usize>,
     body: ItemBody,
 }
 impl Item {
-    fn is(&self, native_id: &str) -> bool {
-        self.native_id.as_str() == native_id || self.aliases.contains(native_id)
-    }
-
     fn block_ref(&self, position: usize) -> BlockRef {
         BlockRef {
             item: self.native_id.clone(),
@@ -187,9 +188,9 @@ impl Item {
                     let text = match content {
                         Part::Completed(content) => content
                             .text()
-                            .ok_or_else(|| protocol("content part is not text"))?,
+                            .ok_or_else(|| NATIVE.error("content part is not text"))?,
                         Part::Streaming { .. } => {
-                            return Err(protocol("output item ended with an open content part"));
+                            return Err(NATIVE.error("output item ended with an open content part"));
                         }
                     };
                     Ok(TextBlock {
@@ -229,10 +230,10 @@ impl Item {
                 // A malformed call held for the stop reason fails a normal finish.
                 FunctionPhase::Provisional(native) => {
                     native::function_call(native)?;
-                    return Err(protocol("conflicting final output item"));
+                    return Err(NATIVE.error("conflicting final output item"));
                 }
                 FunctionPhase::Streaming(_) => {
-                    return Err(protocol("terminal response omitted a streamed output item"));
+                    return Err(NATIVE.error("terminal response omitted a streamed output item"));
                 }
             },
         })
@@ -275,22 +276,19 @@ pub(crate) struct Decoder {
     model: String,
     scope: Scope,
     items: BTreeMap<usize, Item>,
+    /// Every native ID and alias, and every bound wire index, to its item.
+    ids: HashMap<String, usize>,
+    wires: HashMap<usize, usize>,
     completed: bool,
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
-    pub(super) use crate::provider::codec::common::tests::{Reduced, reduce, scope};
-    pub(super) use crate::provider::protocol::Outcome;
-
-    /// A service whose terminal event omits streamed items, like Codex.
-    pub(super) fn streamed_only() -> Dialect {
-        Dialect {
-            terminal_output: TerminalOutput::StreamedOnly,
-            ..Dialect::stateless()
-        }
-    }
+    pub(super) use crate::provider::codec::common::tests::{
+        Reduced, reasoning_item, reduce, scope,
+    };
+    pub(super) use crate::provider::protocol::{CutReason, Outcome};
 
     pub(super) fn completed(output: Vec<Value>) -> Value {
         json!({"type":"response.completed", "response":{"status":"completed", "output":output,
@@ -320,23 +318,22 @@ pub(super) mod tests {
             "summary":[{"type":"summary_text", "text":text}]})
     }
 
-    pub(super) fn reasoning_item() -> Value {
-        json!({"type":"reasoning", "id":"rs_1", "encrypted_content":"secret",
-            "summary":[{"type":"summary_text", "text":"first"}, {"type":"summary_text", "text":"second"}]})
-    }
-
     pub(super) fn message(id: &str, text: &str) -> Value {
         json!({"type":"message", "id":id, "role":"assistant", "status":"completed",
             "content":[{"type":"output_text", "text":text, "annotations":[]}]})
     }
 
     pub(super) fn decoder() -> Decoder {
-        Decoder::new(
-            "test-model".into(),
-            scope(),
-            &Dialect::stateless(),
-            ErrorSignals::NONE,
-        )
+        decoder_for(TerminalOutput::Restated)
+    }
+
+    /// `StreamedOnly` is a service whose terminal event omits streamed items, like Codex.
+    pub(super) fn decoder_for(terminal_output: TerminalOutput) -> Decoder {
+        let dialect = Dialect {
+            terminal_output,
+            ..Dialect::stateless()
+        };
+        Decoder::new("test-model".into(), scope(), &dialect, ErrorSignals::NONE)
     }
 
     /// Feed every event, then reduce as the runtime would.
@@ -354,5 +351,17 @@ pub(super) mod tests {
         }
         events.extend(decoder.finish()?);
         Ok(reduce(events))
+    }
+
+    pub(super) fn delta(item_id: &str, text: &str) -> Value {
+        json!({"type":"response.output_text.delta", "item_id":item_id, "delta":text})
+    }
+
+    pub(super) fn unindexed_added(item: Value) -> Value {
+        json!({"type":"response.output_item.added", "item":item})
+    }
+
+    pub(super) fn unindexed_done(item: Value) -> Value {
+        json!({"type":"response.output_item.done", "item":item})
     }
 }

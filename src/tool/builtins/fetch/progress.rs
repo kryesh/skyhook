@@ -10,42 +10,44 @@ use serde::Serialize;
 use super::diagnostics::{FetchDiagnostic, FetchError, FetchPhase};
 use super::response::collect_headers;
 use super::validation::{HttpRequestUrl, SanitizedOrigin};
-use super::{LocalError, ProducedOutput, ResponseBody};
+use super::{LocalError, ProducedOutput};
 
 /// Failures add diagnostics and only include HTTP response fields when a response
-/// actually arrived. Response headers also require explicit opt-in.
+/// actually arrived. Response headers also require explicit opt-in. The error text
+/// carries the method, origin and message.
+#[serde_with::skip_serializing_none]
 #[derive(Serialize, JsonSchema)]
 pub(super) struct FetchFailureOutput {
-    method: String,
-    origin: SanitizedOrigin,
-    elapsed_ms: u64,
-    received_bytes: u64,
+    /// Milliseconds.
+    duration: u64,
+    /// Decoded entity bytes received, when any were.
+    #[schemars(with = "u64")]
+    size: Option<u64>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     redirects: Vec<FailureRedirect>,
     diagnostic: FetchDiagnostic,
-    /// Explicitly configured proxy only; null does not rule out an environment proxy.
+    /// Explicitly configured proxy only; absence does not rule out an environment proxy.
+    #[schemars(with = "SanitizedOrigin")]
     proxy_origin: Option<SanitizedOrigin>,
     #[serde(flatten)]
     response: Option<FailureResponse>,
 }
 
 /// Success redirects intentionally carry full URLs. Failure redirects cannot:
-/// these are distinct types and both endpoints require sanitized origin evidence.
+/// these are distinct types and require sanitized origin evidence.
 #[derive(Clone, Serialize, JsonSchema)]
 struct FailureRedirect {
     status: u16,
-    url: SanitizedOrigin,
     location: SanitizedOrigin,
     method: String,
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Clone, Serialize, JsonSchema)]
 struct FailureResponse {
     status: u16,
-    ok: bool,
-    url: SanitizedOrigin,
-    /// Response headers, or null when include_headers is false.
+    #[schemars(with = "std::collections::BTreeMap<String, Vec<String>>")]
     headers: Option<std::collections::BTreeMap<String, Vec<String>>>,
-    body: ResponseBody,
 }
 
 pub(super) struct FetchProgress {
@@ -133,26 +135,15 @@ impl FetchProgress {
     pub fn response(&mut self, response: &reqwest::Response) {
         self.response = Some(FailureResponse {
             status: response.status().as_u16(),
-            ok: response.status().is_success(),
-            // Never copy secret query parameters into failure URL fields.
-            url: SanitizedOrigin::from_url(response.url()),
             headers: self
                 .include_headers
                 .then(|| collect_headers(response.headers())),
-            body: ResponseBody::Empty,
         });
     }
 
-    pub fn redirect(
-        &mut self,
-        status: u16,
-        from: &HttpRequestUrl,
-        to: &HttpRequestUrl,
-        method: &Method,
-    ) {
+    pub fn redirect(&mut self, status: u16, to: &HttpRequestUrl, method: &Method) {
         self.redirects.push(FailureRedirect {
             status,
-            url: from.origin(),
             location: to.origin(),
             method: method.to_string(),
         });
@@ -195,10 +186,8 @@ impl FetchProgress {
             summary.push_str("; server-side effects are unknown");
         }
         let report = FetchFailureOutput {
-            method: self.method.clone(),
-            origin: self.origin.clone(),
-            elapsed_ms,
-            received_bytes: self.received_bytes,
+            duration: elapsed_ms,
+            size: (self.received_bytes > 0).then_some(self.received_bytes),
             redirects: self.redirects.clone(),
             diagnostic,
             proxy_origin: self.proxy_origin.clone(),
@@ -235,11 +224,11 @@ fn duration_ms(duration: Duration) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{executor, fetch, progress_for, response, server, stalled_server};
+    use super::super::tests::{executor, fetch, progress_for, server};
     use super::*;
+    use crate::provider::http::transport::tests::{Plan, Server, reply};
     use crate::tool::diagnostic::{Cause, FailureSite, PartialDiagnostic};
     use serde_json::{Value, json};
-    use std::time::Duration;
 
     fn with_headers(mut arguments: Value, include_headers: Option<bool>) -> Value {
         if let Some(include) = include_headers {
@@ -273,23 +262,17 @@ mod tests {
                 let headers = format!(
                     "Content-Type: application/pdf\r\nX-Result: one\r\nX-Result: two\r\n{extra}"
                 );
-                let (url, task) = server(vec![response(status, &headers, "body")]).await;
+                let (url, task) = server(vec![reply(status, &headers, "body")]).await;
                 let mut arguments = with_headers(options, include_headers);
                 arguments["url"] = json!(url);
                 let result = fetch(&runtime, &executor, arguments).await;
                 let output = if let Some(kind) = error_kind {
-                    let output = result
-                        .unwrap_err()
-                        .into_tool_error()
-                        .into_parts()
-                        .1
-                        .unwrap()
-                        .value;
+                    let output = result.unwrap_err().into_parts().1.unwrap().value;
                     assert_eq!(output["diagnostic"]["error_kind"], kind);
                     if kind == "extraction_failure" {
                         assert_eq!(
-                            (&output["method"], &output["received_bytes"]),
-                            (&json!("POST"), &json!(4))
+                            (&output["status"], &output["size"]),
+                            (&json!(201), &json!(4))
                         );
                     }
                     output
@@ -301,52 +284,90 @@ mod tests {
                 };
                 let status: u16 = status.split_whitespace().next().unwrap().parse().unwrap();
                 assert_eq!(output["status"], status);
-                assert_eq!(output["ok"], (200..300).contains(&status));
                 if include_headers == Some(true) {
                     assert_eq!(output["headers"]["x-result"], json!(["one", "two"]));
                 } else {
                     assert_eq!(output["headers"], Value::Null, "{output}");
                 }
-                task.await.unwrap();
+                task.finish().await;
             }
         }
     }
 
-    /// Transport failures never have response headers; a body deadline after
-    /// the response head still reports status and opt-in headers.
+    /// Wait until a download's staging file holds `bytes`: the client has read
+    /// the response head and that much of its body.
+    async fn staged(directory: &std::path::Path, bytes: u64) {
+        let holds = || {
+            std::fs::read_dir(directory)
+                .unwrap()
+                .flatten()
+                .any(|entry| {
+                    entry.file_name().to_string_lossy().starts_with(".skyhook-")
+                        && entry
+                            .metadata()
+                            .is_ok_and(|metadata| metadata.len() == bytes)
+                })
+        };
+        crate::tests::bounded(async {
+            while !holds() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+    }
+
+    /// Transport failures never have response headers; a deadline reports the
+    /// status and opt-in headers only once a response head arrived.
     #[tokio::test]
-    async fn transport_failures_and_body_deadlines_report_headers_only_when_received() {
+    async fn transport_failures_and_deadlines_report_headers_only_when_received() {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
+        let hour = Duration::from_secs(3600);
         // A dropped listener's port can be rebound by another test's server
         // before the connect; the privileged port is never listened on.
         let refused = "http://127.0.0.1:1";
-        // Each case waits out a one-second body deadline, so they run together.
-        let case = async |include_headers: Option<bool>| {
+        for include_headers in [None, Some(false), Some(true)] {
             let arguments = with_headers(json!({"url":refused}), include_headers);
             let error = fetch(&runtime, &executor, arguments).await.unwrap_err();
-            let output = error.into_tool_error().into_parts().1.unwrap().value;
+            let output = error.into_parts().1.unwrap().value;
             assert_eq!(output["diagnostic"]["error_kind"], "connection_refused");
             assert!(output.get("status").is_none() && output.get("headers").is_none());
 
-            let head = b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX-Result: waiting\r\n\r\n";
-            let (url, _ready, task) = stalled_server(head).await;
-            let arguments = with_headers(json!({"url":url,"timeout":1}), include_headers);
-            let error = fetch(&runtime, &executor, arguments).await.unwrap_err();
-            let output = error.into_tool_error().into_parts().1.unwrap().value;
-            assert_eq!(output["status"], 200);
+            // The deadline elapses after the head and part of the body arrived.
+            let partial = "partial";
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: 100\r\nX-Result: waiting\r\n\r\n{partial}"
+            );
+            let server = Server::start(vec![Plan::stalled(head.as_bytes())]).await;
+            let arguments = json!({"url":server.root(), "timeout":3600, "save_to":"download"});
+            let fetched = fetch(
+                &runtime,
+                &executor,
+                with_headers(arguments, include_headers),
+            );
+            let received = staged(runtime.root.path(), partial.len() as u64);
+            let (result, ()) = crate::tests::expire(fetched, received, hour).await;
+            let output = result.unwrap_err().into_parts().1.unwrap().value;
             assert_eq!(output["diagnostic"]["timeout"]["kind"], "total");
+            assert_eq!(output["status"], 200);
+            assert_eq!(output["size"], partial.len());
             if include_headers == Some(true) {
                 assert_eq!(output["headers"]["x-result"], json!(["waiting"]));
             } else {
                 assert_eq!(output["headers"], Value::Null);
             }
-            tokio::time::timeout(Duration::from_secs(10), task)
-                .await
-                .unwrap()
-                .unwrap();
-        };
-        tokio::join!(case(None), case(Some(false)), case(Some(true)));
+            assert!(!runtime.root.path().join("download").exists());
+            assert_eq!(server.finish().await.len(), 1);
+        }
+        // The deadline elapses once the server holds the request it never answers.
+        let mut server = Server::start(vec![Plan::stalled_headers()]).await;
+        let arguments = json!({"url":server.root(), "timeout":3600, "include_headers":true});
+        let fetched = fetch(&runtime, &executor, arguments);
+        let (result, _) = crate::tests::expire(fetched, server.request(), hour).await;
+        let output = result.unwrap_err().into_parts().1.unwrap().value;
+        assert_eq!(output["diagnostic"]["timeout"]["kind"], "total");
+        assert!(output.get("status").is_none() && output.get("headers").is_none());
+        assert!(server.finish().await.is_empty(), "unexpected replay");
     }
 
     #[test]
@@ -376,17 +397,15 @@ mod tests {
             assert!(!message.contains("secret"));
             assert!(!output.value.to_string().contains("secret"));
             assert!(output.images.is_empty());
-            assert_eq!(output.value["origin"], "https://example.org");
-            let diagnostic = &output.value["diagnostic"];
-            assert_eq!(
-                (&diagnostic["phase"], &diagnostic["error_kind"]),
-                (&json!("extraction"), &json!("extraction_failure"))
+            assert!(
+                message.contains("HTTP GET https://example.org: Extracting response text failed.")
             );
-            assert_eq!(diagnostic["timeout"], Value::Null);
-            assert_eq!(diagnostic["os_error"], Value::Null);
-            assert_eq!(output.value["proxy_origin"], Value::Null);
+            assert_eq!(
+                output.value["diagnostic"],
+                json!({"error_kind":"extraction_failure"})
+            );
             // No response has been observed; arbitrary extra fields stay excluded too.
-            for absent in ["status", "ok", "url", "headers", "body", "extra"] {
+            for absent in ["status", "url", "headers", "body", "extra", "proxy_origin"] {
                 assert!(output.value.get(absent).is_none(), "{absent}");
             }
         }
@@ -458,8 +477,8 @@ mod tests {
                 panic!("structured timeout")
             };
             let message = diagnostic.render(&Default::default());
+            assert!(message.contains("Local file I/O timed out."), "{message}");
             assert!(message.contains("server-side effects are unknown"));
-            assert_eq!(output.value["diagnostic"]["phase"], "local_io");
             assert_eq!(
                 output.value["diagnostic"]["timeout"],
                 json!({"kind":"total", "limit_ms":7000})
@@ -478,7 +497,7 @@ mod tests {
         progress.request_started();
         progress.phase(FetchPhase::ResponseBody);
         progress.received_bytes = 100;
-        progress.redirect(302, &from, &to, &Method::GET);
+        progress.redirect(302, &to, &Method::GET);
         progress.begin_request(&to, &Method::POST);
         assert_eq!(
             (progress.phase, progress.received_bytes),
@@ -491,13 +510,13 @@ mod tests {
         assert!(!message.contains("secret"));
         assert!(!output.value.to_string().contains("secret"));
         assert!(message.contains("server-side effects are unknown"));
-        assert_eq!(
-            (&output.value["method"], &output.value["origin"]),
-            (&json!("POST"), &json!("https://other.example"))
+        assert!(
+            message.contains("HTTP POST https://other.example:"),
+            "{message}"
         );
         assert_eq!(
             output.value["redirects"],
-            json!([{"status":302,"url":"https://example.org","location":"https://other.example","method":"GET"}])
+            json!([{"status":302,"location":"https://other.example","method":"GET"}])
         );
         assert_eq!(output.value["proxy_origin"], "http://proxy.example:8080");
     }

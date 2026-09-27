@@ -5,19 +5,25 @@ use skyhook::session::SessionError;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QueuedInputId(u64);
 
+/// Where a queued row is on its way to the session.
+pub(super) enum RowState {
+    Waiting,
+    /// Dispatched; the cancellation withdraws it while its commit is pending.
+    InFlight(QueuedPromptCancellation),
+    /// The commit outcome is unknown: only the user may send this row again,
+    /// and nothing behind it is dispatched until they edit or remove it.
+    Unknown,
+}
+
 /// One composer submission waiting behind the current operation.
 pub struct QueuedInput {
     pub(super) id: QueuedInputId,
     /// Advanced by every dispatch and withdrawal, so a late receipt is ignored.
     pub(super) generation: u64,
-    /// Held while the row is dispatched and its commit receipt is pending.
-    pub(super) in_flight: Option<QueuedPromptCancellation>,
-    /// The commit outcome is unknown: only the user may send this row again,
-    /// and nothing behind it is dispatched until they edit or remove it.
-    pub(super) unknown: bool,
+    pub(super) state: RowState,
     pub(super) submission: Submission,
     pub(super) model: ModelRef,
-    pub(super) mode: String,
+    pub(super) mode: ModeName,
 }
 
 pub(super) struct QueueDelivery {
@@ -77,36 +83,16 @@ impl App {
         let queued = self.queued_input(submission);
         if self.busy() || self.paused || !self.queue.is_empty() {
             self.queue.push_back(queued);
-            self.refresh_queue_menu();
+            self.refresh_menu();
             self.deliver_queue();
             self.dirty = true;
             return;
         }
         self.send_input(queued);
     }
-    /// Select the queued input's model and mode for a new session, or retain the
-    /// input and pause when that model is no longer configured.
-    fn select_queued_model(&mut self, input: QueuedInput) -> Option<QueuedInput> {
-        match self.launch.model.config().select_model(&input.model) {
-            Ok(model) => {
-                self.launch.model = model;
-                self.launch.permissions = crate::launch::Permissions::Mode(input.mode.clone());
-                Some(input)
-            }
-            Err(_) => {
-                self.queue.push_front(input);
-                self.paused = true;
-                self.notice("Queued input model is no longer configured; input retained");
-                None
-            }
-        }
-    }
     pub(super) fn send_input(&mut self, queued: QueuedInput) {
         let Some(session) = self.session().cloned() else {
-            if let Some(queued) = self.select_queued_model(queued) {
-                self.begin_session(PendingStart::Input(Box::new(queued)));
-            }
-            return;
+            return self.begin_session(PendingStart::Input(Box::new(queued)));
         };
         self.commit_row(&queued);
         let QueuedInput {
@@ -138,13 +124,13 @@ impl App {
                 Err(error) => Err(error),
             };
             let _ = tx.send(Work::Done {
-                result: result.map(|_| ()).map_err(|e| e.to_string()),
+                result: result.map(|_| ()).map_err(Into::into),
             });
         });
         self.dirty = true;
     }
-    fn remember_selection(&mut self, model: &ModelRef, mode: &str) {
-        let selection = (Some(model.clone()), Some(mode.to_owned()));
+    fn remember_selection(&mut self, model: &ModelRef, mode: &ModeName) {
+        let selection = (Some(model.clone()), Some(mode.clone()));
         if (&self.remembered_model, &self.remembered_mode) == (&selection.0, &selection.1) {
             return;
         }
@@ -162,9 +148,6 @@ impl App {
     }
     /// A committed or directly sent row goes through ordinary history bookkeeping.
     pub(super) fn commit_row(&mut self, input: &QueuedInput) {
-        if let Ok(model) = self.launch.model.config().select_model(&input.model) {
-            self.launch.model = model;
-        }
         self.history.push(input.submission.text.clone());
         self.history_browse = None;
         self.set_title(&input.submission.text);
@@ -173,8 +156,8 @@ impl App {
     /// Withdraw every dispatched row that is still cancellable.
     pub(super) fn cancel_queue_delivery(&mut self) {
         for input in &mut self.queue {
-            if input.in_flight.as_ref().is_some_and(|row| row.cancel()) {
-                input.in_flight = None;
+            if matches!(&input.state, RowState::InFlight(row) if row.cancel()) {
+                input.state = RowState::Waiting;
                 input.generation = input.generation.wrapping_add(1);
             }
         }
@@ -202,20 +185,17 @@ impl App {
         let Some(session) = self.session().cloned() else {
             // Retain the head across creation, then register the entire queue.
             let input = self.queue.pop_front().unwrap();
-            self.refresh_queue_menu();
-            match self.select_queued_model(input) {
-                Some(input) => self.begin_session(PendingStart::QueuedInput(Box::new(input))),
-                None => self.refresh_queue_menu(),
-            }
-            return;
+            self.refresh_menu();
+            return self.begin_session(PendingStart::QueuedInput(Box::new(input)));
         };
         if self.initial_input.is_some() {
             return;
         }
         let mut deliveries = Vec::new();
         let mut rejected = None;
-        for input in self.queue.iter_mut().take_while(|input| !input.unknown) {
-            if input.in_flight.is_some() {
+        let queue = self.queue.iter_mut();
+        for input in queue.take_while(|input| !matches!(input.state, RowState::Unknown)) {
+            if matches!(input.state, RowState::InFlight(_)) {
                 continue;
             }
             // A row the session cannot take holds itself and the rows behind it back.
@@ -228,7 +208,7 @@ impl App {
             };
             let cancellation = QueuedPromptCancellation::default();
             input.generation = input.generation.wrapping_add(1);
-            input.in_flight = Some(cancellation.clone());
+            input.state = RowState::InFlight(cancellation.clone());
             deliveries.push(QueueDelivery {
                 id: input.id,
                 generation: input.generation,
@@ -269,7 +249,9 @@ impl App {
         result: Result<(), HarnessError>,
     ) {
         let Some(index) = self.queue.iter().position(|input| {
-            input.id == id && input.generation == generation && input.in_flight.is_some()
+            input.id == id
+                && input.generation == generation
+                && matches!(input.state, RowState::InFlight(_))
         }) else {
             return;
         };
@@ -282,14 +264,17 @@ impl App {
             Err(error) => {
                 let unknown = matches!(
                     error,
-                    HarnessError::Session(SessionError::AppendIndeterminate(_))
+                    HarnessError::Session(SessionError::AppendIndeterminate { .. })
                 );
-                let row = &mut self.queue[index];
-                (row.in_flight, row.unknown) = (None, unknown);
+                self.queue[index].state = if unknown {
+                    RowState::Unknown
+                } else {
+                    RowState::Waiting
+                };
                 self.pause_queue();
                 // A held-back row is reported by whatever held it back.
                 if matches!(error, HarnessError::Interrupted) {
-                    return self.refresh_queue_menu();
+                    return self.refresh_menu();
                 }
                 self.notice(if unknown {
                     format!("Queued message may or may not have been submitted: {error}. Check the transcript, then edit or remove it from the queue.")
@@ -298,15 +283,14 @@ impl App {
                 });
             }
         }
-        self.refresh_queue_menu();
+        self.refresh_menu();
     }
     pub(super) fn queued_input(&mut self, submission: Submission) -> QueuedInput {
         self.next_queued_id.0 += 1;
         QueuedInput {
             id: self.next_queued_id,
             generation: 0,
-            in_flight: None,
-            unknown: false,
+            state: RowState::Waiting,
             submission,
             model: self.model.clone(),
             mode: self.mode.clone(),
@@ -319,10 +303,12 @@ impl App {
                 let profile = self.launch.model.config().model(&queued.model);
                 Item::new(
                     queued.id,
-                    crate::tui::format::brief(&queued.submission.text, 100),
+                    brief(&queued.submission.text, TITLE_CHARS),
                     match profile {
-                        _ if queued.unknown => "outcome unknown".to_owned(),
-                        Some(profile) => profile.model.clone(),
+                        _ if matches!(queued.state, RowState::Unknown) => {
+                            "outcome unknown".to_owned()
+                        }
+                        Some(profile) => profile.model.to_string(),
                         None => queued.model.to_string(),
                     },
                 )
@@ -332,34 +318,13 @@ impl App {
     /// Take a row out of the queue, withdrawing its dispatch if one is pending.
     pub(super) fn remove_queued(&mut self, id: QueuedInputId) -> Option<QueuedInput> {
         let index = self.queue.iter().position(|queued| queued.id == id)?;
-        if self.queue[index]
-            .in_flight
-            .as_ref()
-            .is_some_and(|row| !row.cancel())
-        {
+        if matches!(&self.queue[index].state, RowState::InFlight(row) if !row.cancel()) {
             self.notice("This message is already being submitted");
             return None;
         }
         let mut input = self.queue.remove(index).unwrap();
-        input.in_flight = None;
+        input.state = RowState::Waiting;
         Some(input)
-    }
-    pub(super) fn refresh_queue_menu(&mut self) {
-        if !self
-            .menu
-            .as_ref()
-            .is_some_and(|menu| matches!(menu.kind, MenuKind::Queue(_)))
-        {
-            return;
-        }
-        let items = self.queue_items();
-        self.menu
-            .as_mut()
-            .unwrap()
-            .replace_items(MenuKind::Queue(items), |kind| match kind {
-                MenuKind::Queue(items) => Some(items),
-                _ => None,
-            });
     }
 }
 
@@ -443,7 +408,11 @@ mod tests {
             .as_ref()
             .map(|model| model.name().to_string());
         assert_eq!(model.as_deref(), Some("test/first"));
-        assert!(app.queue.iter().all(|input| input.in_flight.is_some()));
+        assert!(
+            app.queue
+                .iter()
+                .all(|input| matches!(input.state, RowState::InFlight(_)))
+        );
         assert!(app.history.is_empty());
 
         receipt(&mut app, &first[0], Ok(()));
@@ -467,7 +436,11 @@ mod tests {
         let stale = deliveries.try_recv().unwrap();
         deliveries.try_recv().unwrap();
         app.pause_queue();
-        assert!(app.queue.iter().all(|input| input.in_flight.is_none()));
+        assert!(
+            app.queue
+                .iter()
+                .all(|input| matches!(input.state, RowState::Waiting))
+        );
         assert!(stale[0].prompt.cancellation.cancel());
         // Neither outcome of a withdrawn dispatch touches the row.
         receipt(&mut app, &stale[0], Ok(()));
@@ -501,16 +474,17 @@ mod tests {
         }
         assert!(app.paused && app.history.is_empty());
         assert_eq!(app.queue.len(), 3);
-        assert!(app.queue.iter().all(|input| input.in_flight.is_none()));
-        let notices = notices(&app, &mut rx).await;
-        let failed = notices.iter().filter(|notice| notice.contains("Queued"));
-        assert_eq!(
-            failed.collect::<Vec<_>>(),
-            [
-                "Queued input resumed",
-                "Queued message was not submitted: model `fixture` does not support image inputs. Resume to retry.",
-            ]
+        assert!(
+            app.queue
+                .iter()
+                .all(|input| matches!(input.state, RowState::Waiting))
         );
+        let notices = notices(&app, &mut rx).await;
+        // Only the claimed row reports; the rows it held back stay quiet.
+        let failed = notices
+            .iter()
+            .filter(|notice| notice.contains("was not submitted"));
+        assert_eq!(failed.count(), 1);
         app.session().unwrap().shutdown().await.unwrap();
     }
 
@@ -521,14 +495,17 @@ mod tests {
         app.submit("unknown".into());
         app.submit("behind".into());
         let unknown = deliveries.try_recv().unwrap();
-        let error = SessionError::AppendIndeterminate(skyhook::session::AppendRecovery {
-            identity: skyhook::session::AppendIdentity {
-                event: EventId::generate().unwrap(),
-                session: app.session_id().unwrap(),
-                sequence: RecordSeq::default(),
+        let error = SessionError::AppendIndeterminate {
+            recovery: skyhook::session::AppendRecovery {
+                identity: skyhook::session::AppendIdentity {
+                    event: EventId::generate().unwrap(),
+                    session: app.session_id().unwrap(),
+                    sequence: RecordSeq::default(),
+                },
+                reason: skyhook::session::RecoveryReason::ReceiptLost,
             },
-            reason: "lost".into(),
-        });
+            source: None,
+        };
         receipt(&mut app, &unknown[0], Err(HarnessError::Session(error)));
         deliveries.try_recv().unwrap();
         app.command(Command::Resume);
@@ -554,7 +531,7 @@ mod tests {
         drop(deliveries);
         app.submit("first".into());
         assert!(app.paused && app.queue_sender.is_none());
-        assert!(app.queue[0].in_flight.is_none());
+        assert!(matches!(app.queue[0].state, RowState::Waiting));
         let notices = notices(&app, &mut rx).await;
         assert!(
             notices

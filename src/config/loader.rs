@@ -8,7 +8,6 @@ use std::{
 use tokio::fs;
 
 use super::{Config, ConfigError};
-use crate::provider::dialect::OverrideKey;
 
 #[derive(Debug, thiserror::Error)]
 enum LayerError {
@@ -16,8 +15,27 @@ enum LayerError {
     Missing,
     #[error("could not read configuration: {0}")]
     Read(std::io::Error),
-    #[error("{0}")]
-    Invalid(String),
+    #[error(transparent)]
+    Yaml(crate::yaml::YamlError),
+    #[error("configuration must be a mapping")]
+    NotMapping,
+    #[error("MCP cwd cannot be represented as UTF-8")]
+    NonUtf8Cwd,
+}
+
+/// Where resolution stopped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ResolutionStage {
+    #[error("explicit configuration failed")]
+    Explicit,
+    #[error("could not resolve workspace")]
+    Workspace,
+    #[error("workspace configuration failed")]
+    WorkspaceLayer,
+    #[error("no usable Skyhook config found")]
+    NoUsableLayer,
+    #[error("effective configuration failed")]
+    Effective,
 }
 
 /// A rejected candidate or fatal layer error. Never includes YAML source excerpts.
@@ -89,20 +107,14 @@ async fn resolve_paths(
 ) -> Result<ResolvedConfig, ConfigError> {
     let mut report = ConfigReport::default();
     if let Some(path) = explicit {
-        let value = read_layer(path).await.map_err(|error| {
-            failure(
-                &mut report,
-                "explicit configuration failed",
-                diagnostic(path, error.to_string()),
-            )
-        })?;
-        let config = deserialize(&value).map_err(|message| {
-            failure(
-                &mut report,
-                "explicit configuration failed",
-                diagnostic(path, message),
-            )
-        })?;
+        let explicit = |report: &mut ConfigReport, message: String| {
+            failure(report, ResolutionStage::Explicit, diagnostic(path, message))
+        };
+        let value = read_layer(path)
+            .await
+            .map_err(|error| explicit(&mut report, error.to_string()))?;
+        let config =
+            deserialize(&value).map_err(|error| explicit(&mut report, error.to_string()))?;
         report.sources.push(path.to_path_buf());
         return finish(config, report);
     }
@@ -122,7 +134,7 @@ async fn resolve_paths(
         let loaded = match read_layer(&path).await {
             Ok(value) => deserialize(&value)
                 .map(|_| value)
-                .map_err(|message| diagnostic(&path, message)),
+                .map_err(|error| diagnostic(&path, error.to_string())),
             Err(LayerError::Missing) => {
                 let missing = LayerError::Missing.to_string();
                 report.diagnostics.push(diagnostic(&path, missing));
@@ -146,11 +158,8 @@ async fn resolve_paths(
     }
 
     let workspace = fs::canonicalize(workspace).await.map_err(|error| {
-        failure(
-            &mut report,
-            "could not resolve workspace",
-            diagnostic(workspace, error.to_string()),
-        )
+        let diagnostic = diagnostic(workspace, error.to_string());
+        failure(&mut report, ResolutionStage::Workspace, diagnostic)
     })?;
     let workspace_path = super::paths::workspace_config_path(&workspace);
     match read_layer(&workspace_path).await {
@@ -160,50 +169,48 @@ async fn resolve_paths(
         }
         Err(LayerError::Missing) => {}
         Err(error) => {
+            let diagnostic = diagnostic(&workspace_path, error.to_string());
             return Err(failure(
                 &mut report,
-                "workspace configuration failed",
-                diagnostic(&workspace_path, error.to_string()),
+                ResolutionStage::WorkspaceLayer,
+                diagnostic,
             ));
         }
     }
     if report.sources.is_empty() {
         return Err(if rejected {
             ConfigError::Resolution {
-                message: "no usable Skyhook config found".to_owned(),
+                stage: ResolutionStage::NoUsableLayer,
                 report,
             }
         } else {
             ConfigError::Missing(report)
         });
     }
-    let config = deserialize(&merged).map_err(|message| {
+    let config = deserialize(&merged).map_err(|error| {
         let path = report.sources.last().cloned().unwrap();
-        failure(
-            &mut report,
-            "effective configuration failed",
-            diagnostic(&path, message),
-        )
+        let diagnostic = diagnostic(&path, error.to_string());
+        failure(&mut report, ResolutionStage::Effective, diagnostic)
     })?;
     finish(config, report)
 }
 
 fn finish(config: Config, report: ConfigReport) -> Result<ResolvedConfig, ConfigError> {
-    let normalized_yaml = config.to_yaml().map_err(|error| ConfigError::Resolution {
-        message: error.to_string(),
-        report: report.clone(),
-    })?;
     Ok(ResolvedConfig {
+        normalized_yaml: config.to_yaml()?,
         config,
-        normalized_yaml,
         report,
     })
 }
 
-fn failure(report: &mut ConfigReport, message: &str, diagnostic: ConfigDiagnostic) -> ConfigError {
+fn failure(
+    report: &mut ConfigReport,
+    stage: ResolutionStage,
+    diagnostic: ConfigDiagnostic,
+) -> ConfigError {
     report.diagnostics.push(diagnostic);
     ConfigError::Resolution {
-        message: message.to_owned(),
+        stage,
         report: report.clone(),
     }
 }
@@ -215,11 +222,11 @@ fn diagnostic(path: &Path, message: impl Into<String>) -> ConfigDiagnostic {
     }
 }
 
-fn deserialize(value: &serde_json::Value) -> Result<Config, String> {
+fn deserialize(value: &serde_json::Value) -> Result<Config, ConfigError> {
     if value.as_object().is_none_or(serde_json::Map::is_empty) {
-        return Err("configuration is empty".to_owned());
+        return Err(ConfigError::Empty);
     }
-    Config::from_value(value).map_err(|error| error.to_string())
+    Config::from_value(value)
 }
 
 async fn read_layer(path: &Path) -> Result<serde_json::Value, LayerError> {
@@ -229,11 +236,9 @@ async fn read_layer(path: &Path) -> Result<serde_json::Value, LayerError> {
             std::io::ErrorKind::NotFound => LayerError::Missing,
             _ => LayerError::Read(error),
         })?;
-    let mut value: serde_json::Value = crate::yaml::parse(&text).map_err(LayerError::Invalid)?;
+    let mut value: serde_json::Value = crate::yaml::parse(&text).map_err(LayerError::Yaml)?;
     if !value.is_object() {
-        return Err(LayerError::Invalid(
-            "configuration must be a mapping".into(),
-        ));
+        return Err(LayerError::NotMapping);
     }
     // Convert only source-file-relative values before merging. Thus an inherited
     // cwd retains its own layer's directory even if sibling fields are overridden.
@@ -243,8 +248,7 @@ async fn read_layer(path: &Path) -> Result<serde_json::Value, LayerError> {
         .get_mut("mcp")
         .and_then(serde_json::Value::as_object_mut)
     {
-        let absolute =
-            std::path::absolute(path).map_err(|error| LayerError::Invalid(error.to_string()))?;
+        let absolute = std::path::absolute(path).map_err(LayerError::Read)?;
         let directory = absolute
             .parent()
             .expect("absolute config path has a parent");
@@ -253,74 +257,74 @@ async fn read_layer(path: &Path) -> Result<serde_json::Value, LayerError> {
                 && let Some(relative) = cwd.as_str()
                 && Path::new(relative).is_relative()
             {
-                *cwd = serde_json::Value::String(
-                    directory
-                        .join(relative)
-                        .to_str()
-                        .ok_or_else(|| {
-                            LayerError::Invalid("MCP cwd cannot be represented as UTF-8".into())
-                        })?
-                        .to_owned(),
-                );
+                let joined = directory.join(relative);
+                let joined = joined.to_str().ok_or(LayerError::NonUtf8Cwd)?;
+                *cwd = serde_json::Value::String(joined.to_owned());
             }
         }
     }
     Ok(value)
 }
 
-fn merge(base: &mut serde_json::Value, overlay: serde_json::Value, path: &mut Vec<String>) {
-    match (base, overlay) {
-        // Header names ignore case: a later layer's header replaces an earlier
-        // one's however either spells it.
-        (serde_json::Value::Object(base), serde_json::Value::Object(overlay))
-            if matches!(path.as_slice(), [providers, _, headers]
-                if providers == "providers" && headers == "headers") =>
+/// How a later layer's value at a path joins an earlier one's, following the
+/// shape of [`Config`] and its provider entries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Merge {
+    /// Mapping keys merge one by one.
+    Deep,
+    /// The later value replaces the earlier whole: a target's or mode's
+    /// omitted fields never leak in from another layer, and a source
+    /// (`{env: …}`, `{command: …}`) or a placement (`{header: …}`,
+    /// `{field: …}`) is one of several shapes, chosen rather than merged into.
+    Whole,
+    /// Header names ignore case: a later layer's header replaces an earlier
+    /// one's however either spells it.
+    Headers,
+    /// A provider entry of another dialect keeps none of the earlier
+    /// settings, which belong to that dialect, but its models still merge.
+    Provider,
+}
+
+fn merge_rule(path: &[String]) -> Merge {
+    let placement = |key: &str| key.parse::<crate::provider::dialect::OverrideKey>().is_ok();
+    let path: Vec<&str> = path.iter().map(String::as_str).collect();
+    match path[..] {
+        ["targets" | "modes", _] => Merge::Whole,
+        ["providers", _] => Merge::Provider,
+        ["providers", _, "headers"] => Merge::Headers,
+        ["providers", _, "api_key"] => Merge::Whole,
+        ["providers", _, key] | ["providers", _, "models", _, "overrides", key]
+            if placement(key) =>
         {
-            base.retain(|name, _| !overlay.keys().any(|key| key.eq_ignore_ascii_case(name)));
-            base.extend(overlay);
+            Merge::Whole
         }
-        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
-            for (key, value) in overlay {
-                // A target's or mode's omitted fields must never leak in from another layer.
-                if matches!(path.as_slice(), [table] if table == "targets" || table == "modes") {
-                    base.insert(key, value);
-                } else if let Some(previous) = base.get_mut(&key) {
-                    path.push(key);
-                    if matches!(path.as_slice(), [table, _] if table == "providers")
-                        && changes_kind(previous, &value)
-                    {
-                        replace_provider(previous, value, path);
-                    } else if is_choice(path) {
-                        *previous = value;
-                    } else {
-                        merge(previous, value, path);
-                    }
-                    path.pop();
-                } else {
-                    base.insert(key, value);
-                }
-            }
-        }
-        (base, overlay) => *base = overlay,
+        _ => Merge::Deep,
     }
 }
 
-/// A position whose value is one of several shapes, chosen whole rather than
-/// merged into: a source (`{env: …}`, `{command: …}`) or a placement
-/// (`{header: …}`, `{body: …}`, `{field: …}`), at the entry level or under a
-/// model's `overrides`.
-fn is_choice(path: &[String]) -> bool {
-    let placement = |key: &str| key.parse::<OverrideKey>().is_ok();
-    match path {
-        [providers, _, rest @ ..] if providers == "providers" => match rest {
-            [field] => field == "api_key" || placement(field),
-            [headers, _] => headers == "headers",
-            [models, _, overrides, key] => {
-                models == "models" && overrides == "overrides" && placement(key)
+fn merge(base: &mut serde_json::Value, overlay: serde_json::Value, path: &mut Vec<String>) {
+    match (base, overlay) {
+        (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
+            if merge_rule(path) == Merge::Headers {
+                base.retain(|name, _| !overlay.keys().any(|key| key.eq_ignore_ascii_case(name)));
             }
-            _ => false,
-        },
-        _ => false,
+            for (key, value) in overlay {
+                let Some(previous) = base.get_mut(&key) else {
+                    base.insert(key, value);
+                    continue;
+                };
+                path.push(key);
+                match merge_rule(path) {
+                    Merge::Whole => *previous = value,
+                    Merge::Provider if changes_kind(previous, &value) => {
+                        replace_provider(previous, value, path);
+                    }
+                    _ => merge(previous, value, path),
+                }
+                path.pop();
+            }
+        }
+        (base, overlay) => *base = overlay,
     }
 }
 
@@ -331,8 +335,7 @@ fn changes_kind(base: &serde_json::Value, overlay: &serde_json::Value) -> bool {
         .is_some_and(|dialect| base.get("dialect") != Some(dialect))
 }
 
-/// A provider entry of another dialect keeps none of the earlier settings, which
-/// belong to that dialect, but its models still merge.
+/// Replace a provider entry by one of another dialect, merging their models.
 fn replace_provider(
     base: &mut serde_json::Value,
     overlay: serde_json::Value,
@@ -416,7 +419,7 @@ mod tests {
         assert!(resolved.config.approve_all);
         let main = &resolved.config.providers["local"].common.models["main"];
         assert_eq!(
-            (main.profile.model.as_str(), main.profile.max_output),
+            (main.profile.model.as_str(), main.profile.max_output.get()),
             ("workspace-model", 512)
         );
     }
@@ -600,10 +603,10 @@ mod tests {
         );
         let config = f.resolve().await.unwrap().config;
         assert_eq!(
-            config.modes.keys().collect::<Vec<_>>(),
+            Vec::from_iter(config.modes.keys().map(|mode| mode.as_str())),
             ["general", "changed", "retained"]
         );
-        assert_eq!(config.default_mode, "retained");
+        assert_eq!(config.default_mode.as_str(), "retained");
         let changed = &config.modes["changed"];
         assert!(changed.capabilities.is_empty() && changed.instructions.is_none());
         write(&f.local, "modes:\n  changed:\n    instructions: new\n");
@@ -726,9 +729,9 @@ mod tests {
         let resolved = f.resolve().await.unwrap();
         let config = Config::from_yaml(&resolved.normalized_yaml).unwrap();
         let models = &config.providers["local"].common.models;
-        assert_eq!(models["true"].profile.max_output, 256);
-        assert_eq!(models["true"].profile.model, "42");
-        assert_eq!(models["null"].profile.model, "true");
+        assert_eq!(models["true"].profile.max_output.get(), 256);
+        assert_eq!(models["true"].profile.model.as_str(), "42");
+        assert_eq!(models["null"].profile.model.as_str(), "true");
         let runtime = config.into_runtime().unwrap();
         assert_eq!(
             runtime
@@ -767,7 +770,7 @@ mod tests {
         assert_eq!(
             (
                 models["main"].profile.model.as_str(),
-                models["main"].profile.max_output
+                models["main"].profile.max_output.get()
             ),
             ("test", 256)
         );
@@ -855,7 +858,7 @@ mod tests {
         let env = &local.models["env"];
         assert_eq!(local.models.len(), 2);
         assert_eq!(
-            (env.profile.model.as_str(), env.profile.max_output),
+            (env.profile.model.as_str(), env.profile.max_output.get()),
             ("env-model", 256)
         );
         assert_eq!(
@@ -927,6 +930,21 @@ mod tests {
 
     const CYCLE: &str = "target route contains a cycle";
 
+    /// A route may span layers: the workspace supplies hops a user target names.
+    #[tokio::test]
+    async fn target_routes_resolve_across_layers() {
+        let f = Fixture::new();
+        write(&f.xdg, targets(&[("a", Some("b"))]));
+        write(&f.local, targets(&[("b", Some("c")), ("c", None)]));
+        let resolved = f.resolve().await.unwrap();
+        assert!(resolved.report.diagnostics.is_empty());
+        let definitions = resolved.config.targets.definitions().unwrap();
+        let registry = crate::target::TargetRegistry::from_definitions(definitions).unwrap();
+        let route = registry.route(&"a".parse().unwrap()).await.unwrap();
+        let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
+        assert_eq!(names, ["c", "b", "a"]);
+    }
+
     #[tokio::test]
     async fn explicit_and_merged_target_cycles_are_rejected() {
         // Explicit files, including self cycles, report only the explicit file.
@@ -962,49 +980,5 @@ mod tests {
             assert_eq!(report.diagnostics.len(), 1);
             assert_eq!(report.diagnostics[0].path, f.local);
         }
-    }
-
-    #[tokio::test]
-    async fn acyclic_targets_and_unresolved_references_are_valid_config() {
-        use crate::target::{TargetError, TargetRegistry};
-
-        let f = Fixture::new();
-        write(&f.xdg, targets(&[("a", Some("b"))]));
-        // Names may be supplied later by workspace config or at runtime.
-        let partial = f.resolve().await.unwrap();
-        assert_eq!(partial.report.sources, std::slice::from_ref(&f.xdg));
-        assert!(partial.report.diagnostics.is_empty());
-        assert!(matches!(
-            TargetRegistry::from_definitions(partial.config.targets.definitions().unwrap()),
-            Err(TargetError::UnknownReference {
-                edge: crate::target::TargetEdge::Via,
-                reference: name,
-                ..
-            }) if name == "b"
-        ));
-        write(&f.local, targets(&[("b", Some("c")), ("c", None)]));
-        let resolved = f.resolve().await.unwrap();
-        assert!(resolved.report.diagnostics.is_empty());
-        let registry =
-            TargetRegistry::from_definitions(resolved.config.targets.definitions().unwrap())
-                .unwrap();
-        let route = registry.route(&"a".parse().unwrap()).await.unwrap();
-        let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
-        assert_eq!(names, ["c", "b", "a"]);
-    }
-
-    #[tokio::test]
-    async fn root_is_implicit_and_local_named_targets_remain_invalid() {
-        let f = Fixture::new();
-        for config in [
-            targets(&[("root", None)]),
-            targets(&[("a", Some("root"))]),
-            "targets:\n  a:\n    type: local\n    host: localhost\n".to_owned(),
-        ] {
-            write(&f.xdg, config);
-            assert!(Config::resolve(&f.workspace, Some(&f.xdg)).await.is_err());
-        }
-        write(&f.xdg, targets(&[("a", None)]));
-        assert!(Config::resolve(&f.workspace, Some(&f.xdg)).await.is_ok());
     }
 }

@@ -16,8 +16,7 @@ use super::{bridge::HostResponse, console::ConsoleOutput};
 use crate::{
     media::ImageRef,
     tool::diagnostic::{Effects, FailureSite, Operation, Subject},
-    tool::executor::{ExecutionError, ToolExecutor},
-    tool::registry::JobName,
+    tool::executor::{ToolExecutor, failure_response},
     tool::{ToolContext, ToolError, ToolOutput},
 };
 
@@ -31,7 +30,7 @@ enum HostRequest {
 }
 
 #[derive(Debug, Error)]
-pub enum JsError {
+enum JsError {
     #[error("JavaScript source exceeds the {MAX_SOURCE_BYTES}-byte limit")]
     SourceTooLarge,
     #[error("QuickJS initialization failed: {0}")]
@@ -41,7 +40,10 @@ pub enum JsError {
     #[error("QuickJS execution was cancelled")]
     Cancelled,
     #[error("{message}")]
-    Failure { message: String, details: Value },
+    Failure {
+        message: String,
+        details: Option<Value>,
+    },
     #[error("JavaScript returned invalid JSON: {0}")]
     InvalidOutput(String),
 }
@@ -78,13 +80,8 @@ fn finish_evaluation(
         }
         (Err(error), Ok(console)) => {
             let (diagnostic, mut output) = error.into_facts();
-            if let (Some(output), Some(console)) = (&mut output, console) {
-                output
-                    .value
-                    .as_object_mut()
-                    .expect("script result is an object")
-                    .remove("console");
-                output.captures.push(console);
+            if let Some(output) = &mut output {
+                output.captures.extend(console);
             }
             Err(ToolError::from_facts(diagnostic, output))
         }
@@ -96,23 +93,10 @@ fn finish_evaluation(
         .with_result(
             super::result::script_output(output.value, None, None).with_images(output.images),
         )),
-        (Err(error), Err(secondary)) => {
-            // Keep the primary outcome and summary. A JS stack can retain secondary
-            // storage evidence; outcomes without one still record incomplete output.
-            let secondary = console_failure(
-                secondary.into(),
-                Operation::FinishCapture,
-                Effects::OutputIncomplete,
-            );
-            let (mut diagnostic, mut output) = error.into_facts();
+        (Err(error), Err(_)) => {
+            // Keep the primary outcome and summary, recording the incomplete output.
+            let (mut diagnostic, output) = error.into_facts();
             diagnostic.context = diagnostic.context.effects(Effects::OutputIncomplete);
-            if let Some(Value::String(stack)) = output
-                .as_mut()
-                .and_then(|output| output.value.pointer_mut("/failure/stack"))
-            {
-                stack.push('\n');
-                stack.push_str(&secondary.to_string());
-            }
             Err(ToolError::from_facts(diagnostic, output))
         }
     }
@@ -152,7 +136,7 @@ fn javascript_error(error: JsError) -> ToolError {
         JsError::Cancelled => ToolError::cancelled(),
         JsError::Failure { message, details } => ToolError::with_output(
             message,
-            super::result::script_output(Value::Null, Some(details), None),
+            super::result::script_output(Value::Null, details, None),
         ),
         error => ToolError::with_output(
             error.to_string(),
@@ -249,6 +233,9 @@ async fn evaluate_inner(
         let host_call = Function::new(
             js.clone(),
             Async(move |request: String| {
+                // Counted at the JS call, so calls issued together are all published
+                // before any of them can see its siblings.
+                let issuing = host_executor.jobs().issue(host_context.job());
                 let host_context = host_context.clone();
                 let host_executor = host_executor.clone();
                 let host_images = host_images.clone();
@@ -259,50 +246,43 @@ async fn evaluate_inner(
                     let response = match request {
                         HostRequest::Call { name, arguments } => {
                             let parent = Some(host_context.job());
-                            let requested = arguments.as_object().and_then(JobName::requested);
                             // Failures before and after the job exists are ordinary
                             // tool responses rather than JS exceptions.
-                            let failed = |error: ExecutionError, job_name| {
-                                error.into_response(
-                                    &name,
-                                    parent,
-                                    job_name,
-                                    host_context.diagnostic_viewer(),
-                                )
-                            };
+                            let failed =
+                                |error| failure_response(error, host_context.diagnostic_viewer());
                             // A presented job view already carries its own annotations.
                             // Native schemas describe only envelope.result.
                             let mut native = true;
-                            let output = match host_executor
+                            let created = host_executor
                                 .create_script(
                                     host_context.agent().clone(),
                                     &name,
                                     arguments,
                                     parent,
                                 )
-                                .await
-                            {
+                                .await;
+                            drop(issuing);
+                            let output = match created {
                                 Ok(created) => {
-                                    let job_name = created.job_name().cloned();
                                     native = created.result_policy()
                                         == crate::tool::ToolResultPolicy::Value;
                                     match host_executor.run(created).await {
                                         Ok(result) => result.output,
-                                        Err(error) => failed(error, job_name),
+                                        Err(error) => failed(error),
                                     }
                                 }
-                                Err(error) => failed(error, requested),
+                                Err(error) => failed(error),
                             };
-                            let schema = surface
+                            let result = surface
                                 .get(&name)
                                 .filter(|_| native)
                                 .and_then(|tool| tool.result_schema.as_ref());
-                            let annotations = schema
-                                .and_then(|schema| output.value.get("result").map(|value| (schema, value)))
+                            let annotations = result
+                                .and_then(|result| output.value.get("result").map(|value| (result.schema(), value)))
                                 .map(|(schema, value)| {
-                                    crate::job::output::annotated_fields(value, schema)
+                                    crate::job::output::annotated_fields(value, &crate::job::FieldPointer::result(), schema)
                                         .into_iter()
-                                        .map(|pointer| format!("/result{pointer}"))
+                                        .map(String::from)
                                         .collect::<std::collections::BTreeSet<_>>()
                                 })
                                 .unwrap_or_default();
@@ -312,6 +292,7 @@ async fn evaluate_inner(
                             HostResponse::Success { value: output.value, annotations }
                         }
                         HostRequest::Receive => {
+                            drop(issuing);
                             let result = match host_executor.jobs().is_background(host_context.job()).await {
                                 Ok(true) => host_context.receive().await.map_err(|error| error.to_string()),
                                 Ok(false) => Err("receive() requires the script tool to be invoked with bg: true".to_owned()),
@@ -362,15 +343,7 @@ async fn evaluate_inner(
         } => (value, presentation),
         super::outcome::Envelope::Failed { error: mut details } => {
             map_failure_stack_lines(&mut details, user_start_line, user_line_count);
-            let message = details.get("message").and_then(Value::as_str).map_or_else(
-                || details.to_string(),
-                |message| {
-                    format!(
-                        "{message}\n{}",
-                        details.get("stack").and_then(Value::as_str).unwrap_or("")
-                    )
-                },
-            );
+            let (message, details) = failure_parts(details);
             return Err(javascript_error(JsError::Failure {
                 message: map_script_lines(&message, user_start_line, user_line_count),
                 details,
@@ -396,6 +369,26 @@ async fn evaluate_inner(
                 )
         })?;
     Ok(ToolOutput::new(value).with_images(images))
+}
+
+/// The error text, once: a thrown error's message and then its stack, or the
+/// thrown value's JSON. Only a thrown error's other properties remain as details.
+fn failure_parts(details: Value) -> (String, Option<Value>) {
+    match details {
+        Value::Object(mut error) if error.get("message").is_some_and(Value::is_string) => {
+            let Some(Value::String(mut message)) = error.shift_remove("message") else {
+                unreachable!("checked above")
+            };
+            if let Some(Value::String(stack)) = error.shift_remove("stack")
+                && !stack.is_empty()
+            {
+                message.push('\n');
+                message.push_str(&stack);
+            }
+            (message, (!error.is_empty()).then_some(Value::Object(error)))
+        }
+        details => (details.to_string(), None),
+    }
 }
 
 fn bridge_error(error: &impl ToString) -> rquickjs::Error {
@@ -475,6 +468,8 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::job::JobState;
+    use crate::tests::{assert_loaded, bounded, image_runtime, script};
     use crate::tool::{
         ToolOptions, ToolRegistryBuilder,
         diagnostic::{Cause, IoKind},
@@ -556,18 +551,33 @@ mod tests {
 
     #[tokio::test]
     async fn sleep_stops_on_cancellation_and_unawaited_sleep_does_not_keep_a_script_alive() {
-        let (_scope, executor, context) = test_runtime(ToolRegistryBuilder::default()).await;
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let mut builder = ToolRegistryBuilder::default();
+        let schema = json!({"type":"object", "properties":{}});
+        let notify = entered.clone();
+        builder
+            .register_dynamic(
+                "entered",
+                "",
+                schema,
+                ToolOptions::default(),
+                move |_, _| {
+                    notify.notify_one();
+                    async { Ok(ToolOutput::default()) }
+                },
+            )
+            .unwrap();
+        let (_scope, executor, context) = test_runtime(builder).await;
         let cancellation = context.cancellation_token();
-        let source = "await sleep(60000); return 'finished';";
+        let source = "await tool.entered({}); await sleep(60000); return 'finished';";
         let (result, ()) = tokio::join!(evaluate(source, executor, context), async {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            bounded(entered.notified()).await;
             cancellation.cancel();
         });
         assert_eq!(result.unwrap_err().diagnostic().cause, Cause::Cancelled);
         // Far below the script's sleep, yet generous under load.
-        let unawaited = plain("sleep(60000); return 'finished';");
-        let output = tokio::time::timeout(std::time::Duration::from_secs(20), unawaited);
-        assert_eq!(output.await.unwrap().unwrap().value["value"], "finished");
+        let unawaited = bounded(plain("sleep(60000); return 'finished';"));
+        assert_eq!(unawaited.await.unwrap().value["value"], "finished");
     }
 
     #[tokio::test]
@@ -592,26 +602,13 @@ mod tests {
         let (_scope, executor, context) = test_runtime(builder).await;
         // Two equivalent builders must execute independently; reusing one must not execute again.
         let source = "const x=tool.echo({value:'a'}); return [x,x,tool.echo({value:'a'})];";
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            evaluate(source, executor, context),
-        );
-        let output = output
-            .await
-            .expect("independent builders did not run concurrently")
-            .unwrap();
+        // Each call waits for the other, so only overlapping calls finish.
+        let output = bounded(evaluate(source, executor, context)).await.unwrap();
         let responses = output.value["value"].as_array().unwrap();
         assert_eq!(responses.len(), 3);
         for response in responses {
-            assert_eq!(response["state"], "completed");
-            assert_eq!(response["has_result"], true);
-            assert_eq!(response["result"], "a");
-            assert!(response["error"].is_null());
-            assert!(response["presentation"].is_null());
+            assert_eq!(response, &json!({"result":"a"}));
         }
-        // Reusing one builder keeps the exact response, including its job ID.
-        assert_eq!(responses[0], responses[1]);
-        assert_ne!(responses[0]["id"], responses[2]["id"]);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
@@ -649,8 +646,8 @@ const direct = JSON.parse(await __skyhookHostCall(JSON.stringify({
 const deniedResponse = await tool.deny({value:"x"});
 let denied;
 try { deniedResponse.unwrap(); } catch (error) {
-  denied = {code:error.code, executed:error.executed, message:error.message,
-            output:error.output, sameResponse:error.response === deniedResponse};
+  denied = {code:error.code, job:error.job, message:error.message,
+            output:error.output ?? null, sameResponse:error.response === deniedResponse};
 }
 return {visible: typeof tool.script, direct, deniedResponse, denied};
 "#;
@@ -661,13 +658,8 @@ return {visible: typeof tool.script, direct, deniedResponse, denied};
         assert_eq!(value["visible"], "undefined");
         assert_eq!(value["direct"]["ok"], true);
         assert_eq!(value["direct"]["value"]["state"], "failed");
-        assert_eq!(value["direct"]["value"].get("id"), Some(&Value::Null));
-        assert_eq!(value["direct"]["value"]["meta"]["tool"], "script");
-        assert_eq!(value["direct"]["value"]["meta"]["name"], "nested");
-        assert_eq!(
-            value["direct"]["value"]["meta"]["parent"],
-            json!(context.job())
-        );
+        assert_eq!(value["direct"]["value"].get("id"), None);
+        assert_eq!(value["direct"]["value"].get("meta"), None);
         assert!(
             value["direct"]["value"]["error"]
                 .as_str()
@@ -675,9 +667,10 @@ return {visible: typeof tool.script, direct, deniedResponse, denied};
                 .contains("not available in scripts")
         );
         assert_eq!(value["deniedResponse"]["state"], "failed");
+        let job = &value["deniedResponse"]["id"];
         assert_eq!(
-            (&value["denied"]["code"], &value["denied"]["executed"]),
-            (&json!("permission_denied"), &json!(false))
+            (&value["denied"]["code"], &value["denied"]["job"]),
+            (&json!("permission_denied"), job)
         );
         assert!(value["denied"]["output"].is_null());
         assert_eq!(value["denied"]["sameResponse"], true);
@@ -698,10 +691,12 @@ return {visible: typeof tool.script, direct, deniedResponse, denied};
             panic!("expected nested failure details")
         };
         assert!(matches!(diagnostic.cause, Cause::Message(_)));
-        let details = &output.value["failure"];
+        // The failed response is referenced by its job, not embedded again.
+        let failure = &output.value["failure"];
+        assert_eq!(failure["code"], "permission_denied");
         assert_eq!(
-            (&details["code"], &details["executed"]),
-            (&json!("permission_denied"), &json!(false))
+            failure.as_object().unwrap().keys().collect::<Vec<_>>(),
+            ["job", "code"]
         );
     }
 
@@ -782,23 +777,18 @@ return {first, second, started};
             let Cause::Message(message) = diagnostic.cause else {
                 panic!("expected JavaScript failure");
             };
-            let details = &output.value["failure"];
-            let stack = details["stack"].as_str().unwrap();
-            assert!(
-                stack.contains(&format!("skyhook-script:{line}:")),
-                "{stack}"
-            );
+            // The message and stack appear once, in the error; only other
+            // properties of the thrown error remain as failure details.
             assert!(
                 message.contains(&format!("skyhook-script:{line}:")),
                 "{message}"
             );
-            if let Some(cause) = details.get("cause") {
-                assert!(
-                    cause["stack"]
-                        .as_str()
-                        .unwrap()
-                        .contains(&format!("skyhook-script:{line}:"))
-                );
+            let failure = output.value.get("failure");
+            assert_eq!(failure.is_some(), source.contains("cause"));
+            if let Some(failure) = failure {
+                let cause = failure["cause"]["stack"].as_str().unwrap();
+                assert!(cause.contains(&format!("skyhook-script:{line}:")));
+                assert_eq!(failure.as_object().unwrap().len(), 1);
             }
         }
         let (diagnostic, Some(_)) = plain("\n\nconst value = ;").await.unwrap_err().into_parts()
@@ -833,52 +823,32 @@ return {first, second, started};
 
     #[test]
     fn script_console_finalization_preserves_primary_failure_and_known_output() {
-        let details = json!({"message": "primary failure", "stack": "skyhook-script:3:1"});
-        // One primary with a stack to extend and one without any output.
+        // One primary with failure details and one without any output.
         for error in [
             javascript_error(JsError::Failure {
                 message: "primary failure".into(),
-                details: details.clone(),
+                details: Some(json!({"job": 3})),
             }),
             javascript_error(JsError::Cancelled),
         ] {
             let (expected, expected_output) = error.into_parts();
-            // Check both successful and failed console finalization against the same primary.
-            let primary = ToolError::from_diagnostic(expected.clone(), expected_output.clone());
-            let (diagnostic, mut output) = finish_evaluation(
-                Err(primary),
-                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe)),
-            )
-            .unwrap_err()
-            .into_parts();
             let mut incomplete = expected.clone();
             incomplete.context.effects = Effects::OutputIncomplete;
-            assert_eq!(diagnostic, incomplete);
-            if let Some(stack) = output
-                .as_mut()
-                .and_then(|output| output.value.pointer_mut("/failure/stack"))
-            {
-                let text = stack.as_str().unwrap();
-                assert!(
-                    text.starts_with(details["stack"].as_str().unwrap()),
-                    "{text}"
+            // Check both failed and successful console finalization against the same primary.
+            for (console, diagnostic) in [
+                (Err(std::io::ErrorKind::BrokenPipe.into()), &incomplete),
+                (Ok(None), &expected),
+            ] {
+                let primary = ToolError::from_diagnostic(expected.clone(), expected_output.clone());
+                let (actual, output) = finish_evaluation(Err(primary), console)
+                    .unwrap_err()
+                    .into_parts();
+                assert_eq!(&actual, diagnostic);
+                assert_eq!(
+                    output.map(|output| output.value),
+                    expected_output.as_ref().map(|output| output.value.clone())
                 );
-                assert!(text.contains("broken pipe"), "{text}");
-                *stack = details["stack"].clone();
             }
-            assert_eq!(
-                output.map(|output| output.value),
-                expected_output.as_ref().map(|output| output.value.clone())
-            );
-            let primary = ToolError::from_diagnostic(expected.clone(), expected_output.clone());
-            let (diagnostic, output) = finish_evaluation(Err(primary), Ok(None))
-                .unwrap_err()
-                .into_parts();
-            assert_eq!(diagnostic, expected);
-            assert_eq!(
-                output.map(|output| output.value),
-                expected_output.map(|output| output.value)
-            );
         }
         let (diagnostic, output) = finish_evaluation(
             Ok(ToolOutput::new(json!({"computed": 42}))),
@@ -895,10 +865,7 @@ return {first, second, started};
                 ..
             }
         ));
-        assert_eq!(
-            output.unwrap().value,
-            json!({"value":{"computed":42},"console":"","failure":null})
-        );
+        assert_eq!(output.unwrap().value, json!({"value":{"computed":42}}));
     }
 
     #[test]
@@ -907,7 +874,7 @@ return {first, second, started};
             "state": "failed",
             "error": "eval_script:102: child failure",
             "result": {"stack": "eval_script:102:"},
-            "meta": {"target": "remote", "code": "permission_denied", "executed": false},
+            "meta": {"target": "remote", "code": "permission_denied"},
         });
         let mut details = json!({
             "message": "failed",
@@ -929,11 +896,8 @@ return {first, second, started};
     #[tokio::test]
     async fn script_errors_preserve_captured_console() {
         let runtime = TestRuntime::new().await;
-        let mut builder = ToolRegistryBuilder::default();
-        let slot = Arc::new(std::sync::OnceLock::new());
-        crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
-        let executor = runtime.executor(builder);
-        slot.set(executor.clone()).ok().unwrap();
+        let (executor, _slot) =
+            crate::tests::tool_executor(runtime.jobs.clone(), runtime.root.path());
         for (source, expected) in [
             (
                 "console.log('before error'); throw new Error('boom');",
@@ -955,7 +919,6 @@ return {first, second, started};
                 matches!(&diagnostic.cause, Cause::Message(message) if message.contains(expected))
             );
             let output = error
-                .into_tool_error()
                 .into_parts()
                 .1
                 .expect("script failure retains captured output");
@@ -976,16 +939,10 @@ function __skyhookHostCall(encoded) {
   const request = JSON.parse(encoded);
   __testCalls.push(request);
   if (request.type === "receive") {
-    return JSON.stringify({ok: true, value: {
-      id: 99, state: "completed", has_result: true, result: null,
-    }});
+    return JSON.stringify({ok: true, value: {id: 99, state: "completed"}});
   }
   return JSON.stringify({ok: true, value: {
-    id: __testCalls.length, state: "completed", has_result: true,
-    result: request.arguments, error: null,
-    meta: {parent:null, tool:null, name:null, target:null, workspace:null,
-           last_message:null, code:null, executed:null},
-    presentation: {preview:null, truncated:[], captures:[], question:null, notice:null},
+    id: __testCalls.length, state: "completed", result: request.arguments,
   }, annotations: ["/result/value"]});
 }
 function __skyhookConsoleLog(message) {
@@ -1042,7 +999,7 @@ return {full, extracted};
     fn response_methods_are_runtime_only_and_do_not_decorate_user_json() {
         let result = evaluate_wrapper(
             r#"
-const payload = {id:7, state:"completed", has_result:true, result:null};
+const payload = {id:7, state:"completed", result:null};
 const response = await tool.echo({value:payload});
 const encoded = JSON.stringify(response);
 const copied = JSON.parse(encoded);
@@ -1054,7 +1011,6 @@ return {
   response, encoded, keys:Object.keys(response), logged,
   nonEnumerable:!Object.getOwnPropertyDescriptor(response, "unwrap").enumerable,
   samePayload:response.unwrap() === response.result,
-  grouped:response.meta.code === null && response.presentation.preview === null,
   noGlobalHelper:typeof tool.unwrap === "undefined",
   plainPayload:typeof response.result.unwrap === "undefined"
     && typeof response.result.value.unwrap === "undefined",
@@ -1066,7 +1022,6 @@ return {
         for key in [
             "nonEnumerable",
             "samePayload",
-            "grouped",
             "noGlobalHelper",
             "plainPayload",
             "plainCopy",
@@ -1088,10 +1043,7 @@ return {
                 *response
             );
         }
-        assert_eq!(
-            result["received"],
-            json!({"id":99,"state":"completed","has_result":true,"result":null})
-        );
+        assert_eq!(result["received"], json!({"id":99,"state":"completed"}));
     }
 
     #[test]
@@ -1119,45 +1071,88 @@ return errors;
         }
     }
 
+    /// `unwrap()` returns a completed view's result, where an absent `state`
+    /// means completed, and throws with the view for any other state.
     #[test]
-    fn explicit_unwrap_returns_completed_results_and_preserves_failure_responses() {
+    fn unwrap_returns_completed_results_and_throws_otherwise() {
         let result = evaluate_wrapper(
             r#"
-const completed = await tool.echo({value:42});
-const literalNull = await tool.echo({value:null});
-literalNull.result = null;
-const errors = [];
-for (const patch of [
-  {id:8, state:"failed", error:"boom", result:{partial:true}, meta:null},
-  {id:9, state:"running", has_result:false, result:null},
-  {id:10, has_result:false, result:null},
-  {result:undefined},
+const results = [];
+for (const value of [
+  {result:{value:42}}, {}, {id:8, state:"completed", result:null},
+  {id:9, state:"failed", error:"boom", result:{partial:true}, meta:{code:"permission_denied"}},
+  {state:"failed", error:"unadmitted"},
+  {id:10, state:"running"},
 ]) {
-  const response = Object.assign(await tool.echo({value:null}), patch);
-  try { response.unwrap(); }
+  __skyhookHostCall = () => JSON.stringify({ok:true, value});
+  const response = await tool.echo({value:null});
+  try { results.push({value:response.unwrap()}); }
   catch (error) {
-    errors.push({message:error.message, sameResponse:error.response === response,
-                 ...(error.response ? {output:error.output, code:error.code, executed:error.executed} : {})});
+    results.push({message:error.message, sameResponse:error.response === response,
+                  output:error.output ?? "absent", own:{...error}});
   }
 }
-return {value:completed.unwrap(), literalNull:literalNull.unwrap(), errors};
+return results;
 "#,
         );
-        assert_eq!(result["value"], json!({"value": 42}));
-        assert_eq!(result.get("literalNull"), Some(&Value::Null));
         assert_eq!(
-            result["errors"],
+            result,
             json!([
+                {"value":{"value":42}},
+                {"value":null},
+                {"value":null},
                 {"message":"boom", "sameResponse":true, "output":{"partial":true},
-                 "code":null, "executed":null},
-                {"message":"job 9 is not completed (state: running)", "sameResponse":true,
-                 "output":null, "code":null, "executed":null},
-                {"message":"job 10 has no loaded result; inspect it with tool.jobs({job: id})",
-                 "sameResponse":true, "output":null, "code":null, "executed":null},
-                {"message":"unwrap completed response requires a JSON result field (null is allowed)",
-                 "sameResponse":false}
+                 "own":{"job":9, "code":"permission_denied"}},
+                {"message":"unadmitted", "sameResponse":true, "output":"absent", "own":{}},
+                {"message":"job 10 is not completed (state: running)", "sameResponse":true,
+                 "output":"absent", "own":{"job":10}}
             ])
         );
+    }
+
+    /// Scripts see the JSON the model sees: a direct and an inspected result
+    /// have the same fields, and an absent one is an ordinary missing property.
+    #[tokio::test]
+    async fn direct_and_inspected_results_share_one_sparse_shape() {
+        let runtime = TestRuntime::new().await;
+        tokio::fs::create_dir(runtime.root.path().join("listed"))
+            .await
+            .unwrap();
+        tokio::fs::write(runtime.root.path().join("listed/file"), "x")
+            .await
+            .unwrap();
+        let (executor, _slot) =
+            crate::tests::tool_executor(runtime.jobs.clone(), runtime.root.path());
+        let listed = executor
+            .run_model(&runtime.agent, "read", json!({"path":"listed"}))
+            .await
+            .unwrap();
+        let source = format!(
+            r#"
+const direct = await tool.read({{path:"listed"}});
+const inspected = (await tool.jobs({{job:{}}})).unwrap();
+const entries = direct.unwrap().entries;
+const absent = [direct.state, direct.id, entries.symlinks, inspected.entries.other]
+  .every(value => value === undefined);
+entries.symlinks ??= [];
+entries.symlinks.push("added");
+return {{direct:direct.result, inspected, absent, symlinks:entries.symlinks}};
+"#,
+            listed.job
+        );
+        let output = script(&executor, &runtime.agent, source, false)
+            .await
+            .output;
+        let value = &output.value["result"]["value"];
+        assert_eq!(value["absent"], true, "{value}");
+        assert_eq!(value["symlinks"], json!(["added"]));
+        let mut direct = value["direct"].clone();
+        direct["entries"]
+            .as_object_mut()
+            .unwrap()
+            .remove("symlinks");
+        assert_eq!(direct, value["inspected"]);
+        assert_eq!(value["inspected"]["entries"]["files"][0]["name"], "file");
     }
 
     #[test]
@@ -1188,5 +1183,74 @@ return __testCalls;
                 {"type":"call", "name":"job_cancel", "arguments":{"job":9_007_199_254_740_991_u64}}
             ])
         );
+    }
+
+    #[tokio::test]
+    async fn failed_script_discards_collected_images_but_retains_console_and_source() {
+        let (runtime, executor, _slot) = image_runtime().await;
+        let source = r#"
+            await tool.read({path:"image.png"});
+            console.log("console survives the deliberate image-discard policy");
+            throw new Error("failed after receiving an image");
+        "#;
+        let failed = script(&executor, &runtime.agent, source.into(), false).await;
+        assert!(failed.is_error);
+        let value = &failed.output.value;
+        assert_eq!(
+            (&value["state"], &value["result"]["value"]),
+            (&json!("failed"), &Value::Null)
+        );
+        assert_eq!(
+            value["result"]["console"],
+            "console survives the deliberate image-discard policy\n"
+        );
+        assert!(failed.output.images.is_empty());
+        assert!(runtime.jobs.images(failed.job).await.unwrap().is_empty());
+        let jobs = runtime.jobs.list(&runtime.agent).await;
+        let source = jobs.into_iter().find(|job| job.tool == "read");
+        let source = source.expect("owning read result survives script failure");
+        assert_eq!(source.state, JobState::Completed);
+        assert_loaded(
+            &runtime.store,
+            runtime.jobs.images(source.id).await.unwrap(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn background_image_output_attaches_directly_and_through_javascript() {
+        let (runtime, executor, _slot) = image_runtime().await;
+        let agent = &runtime.agent;
+        // read itself is foreground-only; a background script is the supported way
+        // to read an image asynchronously and retrieve its saved output later.
+        let source = "return await tool.read({path:'image.png'});";
+        let launched = script(&executor, agent, source.into(), true).await;
+        assert!(launched.background);
+        runtime.jobs.wait(launched.job, None, true).await.unwrap();
+        for _ in 0..2 {
+            let output = executor
+                .run_model(agent, "jobs", json!({"job":launched.job}))
+                .await;
+            let output = output.unwrap().output;
+            assert_eq!(output.value["state"], "completed");
+            // Returning a tool response preserves its canonical read JobView.
+            assert_eq!(output.value["result"]["value"]["result"]["kind"], "image");
+            assert_eq!(output.value["result"].get("console"), None);
+            assert_loaded(&runtime.store, output.images).await;
+        }
+        let source = format!("return await tool.jobs({{job:{}}});", launched.job);
+        let output = script(&executor, agent, source.clone(), false).await.output;
+        assert_eq!(output.value["result"]["value"]["id"], launched.job.get());
+        assert_loaded(&runtime.store, output.images).await;
+        // A background script that retrieves an existing image must itself retain
+        // the attachment, not merely the nested job's JSON metadata.
+        let background = script(&executor, agent, source, true).await;
+        runtime.jobs.wait(background.job, None, true).await.unwrap();
+        let output = executor
+            .run_model(agent, "jobs", json!({"job":background.job}))
+            .await;
+        let output = output.unwrap().output;
+        assert_eq!(output.value["state"], "completed");
+        assert_loaded(&runtime.store, output.images).await;
     }
 }

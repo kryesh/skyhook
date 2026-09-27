@@ -1,8 +1,12 @@
-use std::{fmt, str::FromStr};
+use std::{fmt, num::NonZeroU64, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 
-use crate::{named_enum::named_enum, newtype::string_newtype};
+use crate::{
+    named_enum::named_enum,
+    newtype::{Prose, string_newtype},
+    provider::protocol::WireModel,
+};
 
 /// A configured key that also appears in a qualified model reference.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -92,22 +96,22 @@ impl fmt::Display for ModelRef {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ModelProfile {
-    pub model: String,
+    pub model: WireModel,
     pub reasoning: Option<String>,
-    pub max_context: u64,
-    pub max_output: u64,
+    pub max_context: NonZeroU64,
+    pub max_output: NonZeroU64,
     #[serde(default)]
     pub supports_images: bool,
     #[serde(default)]
     pub state_mode: StateMode,
     /// Describes the model to agents choosing one for a child; without it they cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
+    pub hint: Option<Prose>,
 }
 
 named_enum! {
     /// How per-request runtime state (date, jobs, todos) reaches the model.
-    #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
     pub enum StateMode {
         /// Never send runtime state.
         None = "none",
@@ -122,14 +126,14 @@ named_enum! {
 
 impl ModelProfile {
     pub fn new(
-        model: impl Into<String>,
+        model: WireModel,
         reasoning: Option<String>,
-        max_context: u64,
-        max_output: u64,
+        max_context: NonZeroU64,
+        max_output: NonZeroU64,
         supports_images: bool,
     ) -> Self {
         Self {
-            model: model.into(),
+            model,
             reasoning,
             max_context,
             max_output,
@@ -141,29 +145,17 @@ impl ModelProfile {
 
     /// Relational limits are checked at config ingress, not on construction.
     pub(crate) fn validate_limits(&self) -> Result<(), LimitsError> {
-        if self.max_context == 0 {
-            return Err(LimitsError::Context);
-        }
-        if self.max_output == 0 {
-            return Err(LimitsError::Output);
-        }
         if self.max_output >= self.max_context {
-            return Err(LimitsError::OutputExceedsContext);
+            return Err(LimitsError);
         }
         Ok(())
     }
 }
 
-/// Why a profile's token limits cannot be served.
+/// A profile's output limit leaves no room for input.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum LimitsError {
-    #[error("max_context must be positive")]
-    Context,
-    #[error("max_output must be positive")]
-    Output,
-    #[error("max_output must be smaller than max_context")]
-    OutputExceedsContext,
-}
+#[error("max_output must be smaller than max_context")]
+pub struct LimitsError;
 
 #[cfg(test)]
 mod tests {
@@ -171,16 +163,13 @@ mod tests {
 
     #[test]
     fn limits_and_flat_serde_shape() {
-        for (context, output, error) in [
-            (0, 1, LimitsError::Context),
-            (1, 0, LimitsError::Output),
-            (1, 1, LimitsError::OutputExceedsContext),
-            (1, 2, LimitsError::OutputExceedsContext),
-        ] {
-            assert_eq!(
-                ModelProfile::new("m", None, context, output, false).validate_limits(),
-                Err(error)
-            );
+        for output in [1, 2] {
+            let profile = ModelProfile {
+                max_context: crate::tests::limit(1),
+                max_output: crate::tests::limit(output),
+                ..crate::tests::profile("m", false)
+            };
+            assert_eq!(profile.validate_limits(), Err(LimitsError));
         }
         let raw = serde_json::json!({"model":"unlisted:model/version", "reasoning":"opaque vendor mode", "max_context":4096, "max_output":512, "supports_images":false, "state_mode":"persist"});
         let profile: ModelProfile = serde_json::from_value(raw.clone()).unwrap();

@@ -1,10 +1,9 @@
 //! Host interaction contracts and streamed runtime events.
 
-use std::{future::Future, pin::Pin};
+use std::{collections::HashMap, future::Future, pin::Pin};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use thiserror::Error;
 
 use crate::session::RequestSeq;
@@ -36,18 +35,24 @@ pub(crate) struct QuestionOutput {
     pub questions: Vec<Question>,
 }
 
+/// One question's answer as the host collected it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(untagged)]
+pub enum QuestionAnswer {
+    /// Free-form input, or a chosen suggestion's label.
+    Text(String),
+    /// A chosen suggestion's label with the user's non-blank comment.
+    Commented { answer: String, comment: String },
+}
+
+/// A host's answers to one batch, keyed by `Question::id`.
+pub type QuestionReply = HashMap<String, QuestionAnswer>;
+
 pub type QuestionFuture =
-    Pin<Box<dyn Future<Output = Result<Value, QuestionError>> + Send + 'static>>;
+    Pin<Box<dyn Future<Output = Result<QuestionReply, QuestionError>> + Send + 'static>>;
 
 pub trait QuestionHandler: Send + Sync {
-    /// Present a runtime-merged question batch. A single question accepts any JSON answer;
-    /// multiple questions require an object keyed by each stable `Question::id`.
-    ///
-    /// Host interfaces return a selected suggestion's label or free-form input as a string.
-    /// A suggestion with a non-whitespace comment returns
-    /// `{"answer": "selected label", "comment": "user text"}` instead; blank comments leave
-    /// the label as a string. Each value in a multi-question answer object uses the same
-    /// format. The runtime preserves these answer values without interpreting their fields.
+    /// Present a runtime-merged question batch and answer each question by its id.
     ///
     /// `background` is true if any ask, or any enclosing tool job up to the owning
     /// agent, runs in the background; a mixed batch is a background batch. Hosts may
@@ -85,11 +90,9 @@ pub enum RuntimeEvent {
     },
     Context {
         agent: AgentId,
-        tokens: u64,
-        capacity: u64,
+        usage: super::ContextUsage,
     },
     TurnCompleted {
         agent: AgentId,
-        text: String,
     },
 }

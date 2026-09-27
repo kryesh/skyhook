@@ -1,6 +1,6 @@
 use crate::session::{EventRecord, Message, SessionEvent, SessionStore};
 
-use super::{DeliveryState, Finished, JobChange, JobEntry, JobError, JobManager, JobSpec};
+use super::{Finished, JobChange, JobEntry, JobError, JobManager, JobSpec};
 use crate::tool::ToolError;
 
 pub(super) async fn restore(
@@ -59,11 +59,9 @@ pub(super) async fn restore(
             }
             SessionEvent::AgentStarted {
                 owner_job: Some(job),
-                location,
                 ..
             } => {
                 if let Some(entry) = jobs.get_mut(job) {
-                    entry.location.clone_from(location);
                     let owner = entry.agent.clone();
                     if record.agent.parent().as_ref() == Some(&owner)
                         && let Some(launched) = entry.child_mut()
@@ -86,15 +84,11 @@ pub(super) async fn restore(
             }
             SessionEvent::MessageCommitted { message } => {
                 if let Some(job) = children.get(&record.agent).copied()
-                    && let Some(text) = super::messages::visible_text(message)
+                    && let Some(reply) = super::messages::Reply::of(message)
                 {
-                    let publish = if super::views::effectively_background(&jobs, job) {
-                        super::messages::Publish::Wake
-                    } else {
-                        super::messages::Publish::Record
-                    };
+                    let publish = reply.publish(&jobs, job);
                     if let Some(entry) = jobs.get_mut(&job) {
-                        entry.publish_message(job, record.sequence.message(), text, publish);
+                        entry.publish_message(job, record.sequence.message(), reply.text, publish);
                     }
                 }
             }
@@ -117,14 +111,9 @@ pub(super) async fn restore(
                         .map_err(|_| rejected(record))?;
                 }
             }
-            SessionEvent::JobClaimed { job } => {
+            SessionEvent::JobClaimed { job } | SessionEvent::JobInjected { job } => {
                 if let Some(entry) = jobs.get_mut(job) {
-                    entry.delivery = DeliveryState::Claimed;
-                }
-            }
-            SessionEvent::JobInjected { job, .. } => {
-                if let Some(entry) = jobs.get_mut(job) {
-                    entry.delivery = DeliveryState::Injected;
+                    entry.acknowledge();
                 }
             }
             SessionEvent::JobMessageDelivered { job, source, .. } => {
@@ -161,7 +150,7 @@ mod tests {
     use super::*;
     use crate::execution::ExecutionLocation;
     use crate::identity::JobId;
-    use crate::job::{JobOutcome, JobRole, JobState, JobTransition, presented_job_schema};
+    use crate::job::{JOB_VIEW_SCHEMAS, JobOutcome, JobRole, JobState, JobTransition};
     use crate::{
         job::output,
         tool::{ToolOutput, policy::CapabilitySet},
@@ -268,12 +257,12 @@ mod tests {
                     (failed, None),
                     (read, None),
                     (opaque, None),
-                    (read, Some("/result/error/message")),
-                    (failed, Some("")),
-                    (read, Some("/result")),
+                    (read, Some(output::diagnostic_slot())),
+                    (failed, Some(crate::job::FieldPointer::root())),
+                    (read, Some(crate::job::FieldPointer::result())),
                 ] {
                     let mut query = output::OutputArgs::new(job);
-                    query.field = field.map(|field| field.parse().unwrap());
+                    query.field = field;
                     let view = jobs
                         .inspect_output(query, crate::job::CancellationToken::new(), caps)
                         .await
@@ -292,7 +281,6 @@ mod tests {
         let live = views(&jobs).await;
         let (failed_view, read_view, opaque_view) = (&live[0], &live[1], &live[2]);
         assert_eq!(failed_view["state"], "failed");
-        assert_eq!(failed_view["has_result"], true);
         assert_eq!(failed_view["error"], diagnostic.render(&privileged));
         assert_eq!(read_view["state"], "completed");
         assert!(read_view["error"].is_null());
@@ -383,7 +371,7 @@ mod tests {
             pending.metadata_view(&capabilities).into_value()["state"],
             "queued"
         );
-        let schema = presented_job_schema(false).to_string();
+        let schema = JOB_VIEW_SCHEMAS.one.to_string();
         assert!(!schema.contains("awaiting_approval"));
         jobs.finish(job, ToolError::denied("user reason").into())
             .await
@@ -395,7 +383,6 @@ mod tests {
             .metadata_view(&capabilities)
             .into_value();
         assert_eq!(denied["meta"]["code"], "permission_denied");
-        assert_eq!(denied["meta"]["executed"], false);
         assert!(denied["error"].as_str().unwrap().contains("user reason"));
         // The persisted terminal event is the source of truth for replay.
         let restored = reopen(jobs, root.path()).await;
@@ -441,14 +428,9 @@ mod tests {
         }
         abandon(leases);
         let restored = reopen(manager, root.path()).await;
-        for (job, field, kind, location) in [
-            (
-                1,
-                "/result/stdout",
-                "text",
-                ExecutionLocation::root(".".into()),
-            ),
-            (2, "/result/custom", "json", named),
+        for (job, field, location) in [
+            (1, "/result/stdout", ExecutionLocation::root(".".into())),
+            (2, "/result/custom", named),
         ] {
             let id = JobId::new(job).unwrap();
             let args = output::OutputArgs::new(id);
@@ -456,10 +438,8 @@ mod tests {
                 .present_output(args, &CapabilitySet::default())
                 .await
                 .unwrap();
-            assert!(view["result"].is_null());
-            assert!(!view["has_result"].as_bool().unwrap());
-            let capture =
-                serde_json::json!({"field":field,"kind":kind,"complete":false, "output":null});
+            assert_eq!(view.get("result"), None);
+            let capture = serde_json::json!({"field":field,"complete":false});
             assert_eq!(view["presentation"]["captures"][0], capture);
             let snapshot = restored.snapshot(id).await.unwrap();
             assert_eq!(
@@ -491,8 +471,8 @@ mod tests {
             "images": finished.map_or(&[][..], |finished| finished.images.as_slice()),
             "error": diagnostic.map(|diagnostic| diagnostic.render(&CapabilitySet::default())),
             "denied": diagnostic.is_some_and(|diagnostic| diagnostic.is_denial()),
-            "pending": entry.delivery == DeliveryState::Pending,
-            "resumable": entry.resume.is_some(),
+            "pending": entry.unacknowledged(),
+            "resumable": entry.resume().is_some(),
         })
     }
 
@@ -505,6 +485,7 @@ mod tests {
             jobs.store().store_blob(OUTCOME_IMAGE).await.unwrap();
             let spec = JobSpec {
                 accepts_input: true,
+                role: JobRole::Agent,
                 ..JobSpec::test(agent, "outcome")
             };
             let id = jobs.test_running(spec).await.into_test_id();
@@ -528,7 +509,9 @@ mod tests {
                 4 => ToolError::cancelled().with_result(result()).into(),
                 5 | 6 => ToolError::interrupted().into(),
                 _ => {
-                    jobs.fail_volatile(id, "cannot persist".into()).await;
+                    let error = ToolError::failed("cannot persist");
+                    jobs.fail_volatile(id, JobError::Output(Box::new(error)))
+                        .await;
                     let projection = stored_projection(&jobs, id).await;
                     assert_eq!(projection["state"], "failed");
                     assert!(

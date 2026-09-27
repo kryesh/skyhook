@@ -52,12 +52,31 @@ impl ReasoningReplay {
         }
     }
 
-    /// The replay this convention sends back; decoded reasoning is text otherwise.
-    pub(crate) fn format(&self) -> ReplayFormat {
+    /// The reasoning this convention sends back; decoded reasoning is text otherwise.
+    pub(crate) fn format(&self) -> ReasoningFormat {
         match self {
-            Self::Unsupported | Self::Text(_) => ReplayFormat::ChatText,
-            Self::ThinkingBlocks(_) => ReplayFormat::ChatThinkingBlock,
-            Self::Details(_) => ReplayFormat::ChatReasoningDetail,
+            Self::Unsupported | Self::Text(_) => ReasoningFormat::Text,
+            Self::ThinkingBlocks(_) => ReasoningFormat::ThinkingBlocks,
+            Self::Details(_) => ReasoningFormat::Details,
+        }
+    }
+}
+
+/// Which reasoning a decoder keeps for replay: the text, or one of the native
+/// fields whole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReasoningFormat {
+    Text,
+    ThinkingBlocks,
+    Details,
+}
+
+impl ReasoningFormat {
+    pub(crate) fn replay(self) -> ReplayFormat {
+        match self {
+            Self::Text => ReplayFormat::ChatText,
+            Self::ThinkingBlocks => ReplayFormat::ChatThinkingBlock,
+            Self::Details => ReplayFormat::ChatReasoningDetail,
         }
     }
 }

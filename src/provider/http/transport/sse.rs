@@ -1,7 +1,10 @@
 //! SSE body streaming and byte framing, independent of HTTP retry policy.
 use super::{http_error, timeout_error};
-use crate::provider::ProviderError;
-use futures_util::stream::{self, BoxStream};
+use crate::provider::{ProviderError, ProviderErrorKind::Protocol};
+use futures_util::{
+    StreamExt,
+    stream::{self, BoxStream},
+};
 use reqwest::Response;
 use std::{collections::VecDeque, time::Duration};
 
@@ -14,50 +17,67 @@ pub(crate) struct SseEvent {
     pub data: String,
 }
 
-pub(super) fn response_stream(response: Response, read_idle: Duration) -> SseStream {
-    struct State {
-        response: Response,
-        parser: SseParser,
-        pending: VecDeque<SseEvent>,
-        done: bool,
-        read_idle: Duration,
+/// A stateful reader: each input, and the end of input, yields a batch of outputs.
+pub(crate) trait Batches: Send + 'static {
+    type Input: Send + 'static;
+    type Output: Send + 'static;
+
+    fn push(&mut self, input: Self::Input) -> Result<Vec<Self::Output>, ProviderError>;
+
+    fn finish(&mut self) -> Result<Vec<Self::Output>, ProviderError>;
+
+    /// Whether nothing more is read after `output`.
+    fn ends(_output: &Self::Output) -> bool {
+        false
     }
+}
+
+/// `reader`'s outputs over `input`, in order. The stream ends after the first
+/// error, the input's or the reader's, or once an output ends it.
+pub(crate) fn flatten<B: Batches>(
+    input: BoxStream<'static, Result<B::Input, ProviderError>>,
+    reader: B,
+) -> BoxStream<'static, Result<B::Output, ProviderError>> {
+    let state = (input, reader, VecDeque::new(), false);
     Box::pin(stream::unfold(
-        State {
-            response,
-            parser: SseParser::default(),
-            pending: VecDeque::new(),
-            done: false,
-            read_idle,
-        },
-        |mut state| async move {
+        state,
+        |(mut input, mut reader, mut pending, mut done)| async move {
             loop {
-                if let Some(event) = state.pending.pop_front() {
-                    return Some((Ok(event), state));
+                if let Some(output) = pending.pop_front() {
+                    done |= B::ends(&output);
+                    return Some((Ok(output), (input, reader, pending, done)));
                 }
-                if state.done {
+                if done {
                     return None;
                 }
-                let read = tokio::time::timeout(state.read_idle, state.response.chunk()).await;
-                let parsed = match read {
-                    Err(_) => Err(timeout_error("read")),
-                    Ok(Err(error)) => Err(http_error(error)),
-                    Ok(Ok(Some(bytes))) => state.parser.push(&bytes),
-                    Ok(Ok(None)) => {
-                        state.done = true;
-                        state.parser.finish()
+                let batch = match input.next().await {
+                    Some(Ok(item)) => reader.push(item),
+                    Some(Err(error)) => Err(error),
+                    None => {
+                        done = true;
+                        reader.finish()
                     }
                 };
-                match parsed {
-                    Ok(events) => state.pending.extend(events),
-                    Err(error) => {
-                        state.done = true;
-                        return Some((Err(error), state));
-                    }
+                match batch {
+                    Ok(outputs) => pending.extend(outputs),
+                    Err(error) => return Some((Err(error), (input, reader, pending, true))),
                 }
             }
         },
     ))
+}
+
+pub(super) fn response_stream(response: Response, read_idle: Duration) -> SseStream {
+    let chunks = stream::unfold(response, move |mut response| async move {
+        let chunk = match tokio::time::timeout(read_idle, response.chunk()).await {
+            Err(_) => Err(timeout_error("read")),
+            Ok(Err(error)) => Err(http_error(error)),
+            Ok(Ok(Some(bytes))) => Ok(bytes),
+            Ok(Ok(None)) => return None,
+        };
+        Some((chunk, response))
+    });
+    flatten(Box::pin(chunks), SseParser::default())
 }
 
 /// Byte framing before UTF-8 decoding supports codepoints and CRLF split across
@@ -89,7 +109,7 @@ impl SseParser {
                 _ => {
                     self.line.push(byte);
                     if self.line.len() + self.size > MAX_EVENT_BYTES {
-                        return Err(ProviderError::protocol("SSE event exceeds size limit"));
+                        return Err(Protocol.error("SSE event exceeds size limit"));
                     }
                 }
             }
@@ -99,7 +119,7 @@ impl SseParser {
     fn consume_line(&mut self, events: &mut Vec<SseEvent>) -> Result<(), ProviderError> {
         let bytes = std::mem::take(&mut self.line);
         let line = std::str::from_utf8(&bytes)
-            .map_err(|_| ProviderError::protocol("invalid UTF-8 in SSE stream"))?;
+            .map_err(|_| Protocol.error("invalid UTF-8 in SSE stream"))?;
         let line = if !self.started {
             self.started = true;
             line.trim_start_matches('\u{feff}')
@@ -119,7 +139,7 @@ impl SseParser {
         // millions of empty data fields (each still allocates a vector entry).
         self.size += line.len() + 1;
         if self.size > MAX_EVENT_BYTES {
-            return Err(ProviderError::protocol("SSE event exceeds size limit"));
+            return Err(Protocol.error("SSE event exceeds size limit"));
         }
         match field {
             "event" => self.event = Some(value.to_owned()),
@@ -139,7 +159,17 @@ impl SseParser {
         self.data.clear();
         self.size = 0;
     }
-    pub(crate) fn finish(&mut self) -> Result<Vec<SseEvent>, ProviderError> {
+}
+
+impl Batches for SseParser {
+    type Input = bytes::Bytes;
+    type Output = SseEvent;
+
+    fn push(&mut self, bytes: bytes::Bytes) -> Result<Vec<SseEvent>, ProviderError> {
+        SseParser::push(self, &bytes)
+    }
+
+    fn finish(&mut self) -> Result<Vec<SseEvent>, ProviderError> {
         let mut events = Vec::new();
         if !self.line.is_empty() {
             self.consume_line(&mut events)?;
@@ -153,13 +183,13 @@ impl SseParser {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Plan, Server, timeouts};
+    use super::super::tests::{Plan, Server, stalled_response};
     use super::super::{client, post_sse};
     use super::*;
-    use crate::provider::ProviderErrorKind;
+    use crate::provider::{ProviderErrorKind, http::Timeouts};
+    use crate::tests::bounded;
     use futures_util::StreamExt;
     use reqwest::header::HeaderMap;
-    use serde_json::Value;
 
     #[test]
     fn all_boundaries_multiline_utf8_crlf_bom_and_eof() {
@@ -187,39 +217,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn body_failure_or_idle_timeout_after_acceptance_is_not_replayed() {
-        // (partial output, stalled body): a closed body fails; a stalled one times out.
-        for (partial_output, stall_body) in [(true, false), (false, true), (true, true)] {
-            let body = if partial_output {
-                "data: first\n\n"
-            } else {
-                ""
-            };
-            let wire = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 999\r\n\r\n{body}"
-            );
-            let mut plan = Plan::reply(wire);
-            plan.stall_body = stall_body;
-            let mut server = Server::start(vec![plan]).await;
-            let client = client().unwrap();
-            let post = post_sse(
-                &client,
-                &server.url,
-                HeaderMap::new(),
-                &Value::Null,
-                timeouts(100, 100),
-            );
-            let (_, mut stream) = post.await.unwrap();
-            if partial_output {
+    async fn body_failure_after_acceptance_is_not_replayed() {
+        let wire = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: 999\r\n\r\ndata: first\n\n";
+        let mut server = Server::start(vec![Plan::reply(wire)]).await;
+        let client = client().unwrap();
+        let post = post_sse(
+            &client,
+            &server.url,
+            HeaderMap::new(),
+            "null",
+            Timeouts::default(),
+        );
+        let (_, mut stream) = bounded(post).await.unwrap();
+        assert_eq!(stream.next().await.unwrap().unwrap().data, "first");
+        assert!(stream.next().await.unwrap().is_err());
+        assert!(stream.next().await.is_none());
+        server.request().await;
+        assert!(server.finish().await.is_empty(), "unexpected replay");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_body_times_out_after_the_idle_limit() {
+        let idle = Duration::from_secs(1);
+        for prefix in ["data: first\n\n", ""] {
+            let start = tokio::time::Instant::now();
+            let mut stream = response_stream(stalled_response(200, prefix), idle);
+            if !prefix.is_empty() {
                 assert_eq!(stream.next().await.unwrap().unwrap().data, "first");
             }
             let error = stream.next().await.unwrap().unwrap_err();
-            if stall_body {
-                assert_eq!(error.kind, ProviderErrorKind::Timeout);
-            }
+            assert_eq!(error.kind(), ProviderErrorKind::Timeout);
+            assert_eq!(start.elapsed(), idle);
             assert!(stream.next().await.is_none());
-            server.request().await;
-            assert!(server.finish().await.is_empty(), "unexpected replay");
         }
     }
 }

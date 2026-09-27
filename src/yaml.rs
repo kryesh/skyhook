@@ -22,18 +22,27 @@ fn options() -> Options {
     }
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum YamlError {
+    #[error("invalid YAML: {0}")]
+    Syntax(#[from] serde_saphyr::Error),
+    #[error(transparent)]
+    Value(#[from] serde_json::Error),
+    #[error(transparent)]
+    Emit(#[from] serde_saphyr::ser::Error),
+}
+
 pub(crate) fn from_str(text: &str) -> Result<Value, serde_saphyr::Error> {
     serde_saphyr::from_str_with_options::<JsonValue>(text, options()).map(|value| value.0)
 }
 
 /// Typed extraction through the JSON value tree, exactly as config loading does.
-pub(crate) fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, String> {
-    let value = from_str(text).map_err(|error| format!("invalid YAML: {error}"))?;
-    serde_json::from_value(value).map_err(|error| error.to_string())
+pub(crate) fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, YamlError> {
+    Ok(serde_json::from_value(from_str(text)?)?)
 }
 
 /// Unset optional fields are omitted rather than written as `null`.
-pub(crate) fn to_string(value: &impl serde::Serialize) -> Result<String, String> {
+pub(crate) fn to_string(value: &impl serde::Serialize) -> Result<String, YamlError> {
     fn prune(value: &mut Value) {
         match value {
             Value::Object(fields) => {
@@ -44,9 +53,9 @@ pub(crate) fn to_string(value: &impl serde::Serialize) -> Result<String, String>
             _ => {}
         }
     }
-    let mut value = serde_json::to_value(value).map_err(|error| error.to_string())?;
+    let mut value = serde_json::to_value(value)?;
     prune(&mut value);
-    serde_saphyr::to_string(&value).map_err(|error| error.to_string())
+    Ok(serde_saphyr::to_string(&value)?)
 }
 
 // serde_json's ordinary visitor requests String keys, allowing the YAML

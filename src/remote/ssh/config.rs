@@ -1,17 +1,21 @@
 //! OpenSSH configuration generated only from target definitions.
+use super::AUTH_SOCK;
 use crate::remote::{
-    ProtocolError, RemoteError, SensitivePromptHandler, SshError, backend::ProcessEnvironment,
+    backend::ProcessEnvironment,
+    error::{ProtocolError, RemoteError, SshError},
+    prompt::SensitivePromptHandler,
 };
-use crate::target::{TargetAuth, TargetDefinition, TargetError};
+use crate::target::{Route, TargetAuth, TargetDefinition, TargetError, TargetField};
 use std::{io::Write as _, path::Path, sync::Arc};
 use tokio::process::Command;
-/// OpenSSH config and forwarded environment are UTF-8 protocols. Reject a
-/// native path that cannot be represented instead of redirecting authority.
+/// OpenSSH config, forwarded environment and remote commands are UTF-8
+/// protocols. Reject a native path that cannot be represented instead of
+/// redirecting authority; a remote caller recovers the typed [`SshError`].
 pub(super) fn wire_path(path: &Path) -> std::io::Result<&str> {
     path.to_str().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "native path cannot be represented losslessly in SSH configuration",
+            RemoteError::from(SshError::UnrepresentablePath),
         )
     })
 }
@@ -19,7 +23,7 @@ pub(super) fn wire_path(path: &Path) -> std::io::Result<&str> {
 pub(crate) struct SshConfig {
     pub _directory: tempfile::TempDir,
     path: std::path::PathBuf,
-    pub destination: String,
+    destination: String,
     pub(super) askpass: super::askpass::AskpassServer,
 }
 
@@ -29,14 +33,11 @@ impl SshConfig {
     /// `external_agent` is the SSH_AUTH_SOCK this process inherited, if any: Skyhook's
     /// own on root, or the agent forwarded to a remote origin's shim.
     pub fn create(
-        route: &[TargetDefinition],
+        route: &Route,
         environment: &ProcessEnvironment,
         external_agent: Option<&str>,
         prompts: Arc<dyn SensitivePromptHandler>,
     ) -> Result<Self, RemoteError> {
-        if route.is_empty() {
-            return Err(RemoteError::EmptyRoute);
-        }
         // A route deserialized from the wire has not passed through the registry.
         if route.iter().any(|hop| hop.validate().is_err()) {
             return Err(ProtocolError::Violation("unsupported transport route").into());
@@ -80,7 +81,8 @@ impl SshConfig {
         }
 
         file.flush()?;
-        let askpass = super::askpass::AskpassServer::start(prompts)?;
+        let target = Some(route.destination.name.clone());
+        let askpass = super::askpass::AskpassServer::start(prompts, target)?;
         Ok(Self {
             _directory: directory,
             path,
@@ -114,35 +116,31 @@ const MANAGED_OPTIONS: &[&str] = &[
     "forwardx11trusted",
 ];
 
-/// Validate target options without retaining their potentially sensitive values.
-pub(crate) fn validate_option(key: &str, value: &str) -> Result<(), TargetError> {
-    if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
-        return Err(TargetError::InvalidSshOptionName);
+/// What an `ssh.options` key sets.
+pub(crate) enum SshOption {
+    Dedicated(TargetField),
+    /// A setting Skyhook manages.
+    Reserved,
+    ProxyCommand,
+    Free,
+}
+
+impl SshOption {
+    pub(crate) fn parse(key: &str) -> Result<Self, TargetError> {
+        if key.is_empty() || !key.bytes().all(|byte| byte.is_ascii_alphanumeric()) {
+            return Err(TargetError::InvalidSshOptionName);
+        }
+        Ok(match key.to_ascii_lowercase().as_str() {
+            "user" => Self::Dedicated(TargetField::SshUser),
+            "hostname" => Self::Dedicated(TargetField::Host),
+            "port" => Self::Dedicated(TargetField::SshPort),
+            "identityfile" => Self::Dedicated(TargetField::SshAuth),
+            "proxyjump" => Self::Dedicated(TargetField::Via),
+            "proxycommand" => Self::ProxyCommand,
+            key if MANAGED_OPTIONS.contains(&key) => Self::Reserved,
+            _ => Self::Free,
+        })
     }
-    let field = match key.to_ascii_lowercase().as_str() {
-        "user" => Some("ssh.user"),
-        "hostname" => Some("host"),
-        "port" => Some("ssh.port"),
-        "identityfile" => Some("ssh.auth"),
-        "proxyjump" => Some("via"),
-        _ => None,
-    };
-    if let Some(field) = field {
-        return Err(TargetError::DedicatedSshOption(key.to_owned(), field));
-    }
-    if MANAGED_OPTIONS
-        .iter()
-        .any(|option| key.eq_ignore_ascii_case(option))
-    {
-        return Err(TargetError::ReservedSshOption(key.to_owned()));
-    }
-    if value.is_empty() {
-        return Err(TargetError::EmptySshOptionValue(key.to_owned()));
-    }
-    if value.chars().any(char::is_control) {
-        return Err(TargetError::InvalidSshOptionValue(key.to_owned()));
-    }
-    Ok(())
 }
 
 fn write_auth(
@@ -155,11 +153,11 @@ fn write_auth(
     // starting jump hops, so an inherited variable is not stable across hops.
     let agent = if target.ssh.external_agent {
         let socket = external_agent.ok_or_else(|| SshError::ExternalAgentUnavailable {
-            target: target.name.to_string(),
+            target: target.name.clone(),
         })?;
         // Never add keys to an agent Skyhook does not own.
         format!("{}\n  AddKeysToAgent no", ssh_token(socket)?)
-    } else if let Some(socket) = environment.get("SSH_AUTH_SOCK") {
+    } else if let Some(socket) = environment.get(AUTH_SOCK) {
         format!("{}\n  AddKeysToAgent yes", ssh_token(socket)?)
     } else {
         "none".to_owned()
@@ -184,7 +182,7 @@ fn write_auth(
     Ok(())
 }
 
-pub(crate) fn ssh_command(config: &SshConfig, destination: &str) -> Command {
+pub(crate) fn ssh_command(config: &SshConfig) -> Command {
     // -F selects only our generated configuration (including for ProxyJump), so
     // neither user nor system config can reintroduce SendEnv/SetEnv. Do not clear
     // the local client environment: HOME, PATH and authentication helpers need it.
@@ -193,8 +191,7 @@ pub(crate) fn ssh_command(config: &SshConfig, destination: &str) -> Command {
     command
         .args(["-F"])
         .arg(&config.path)
-        .args(["-A", "-T", "--", destination]);
-    command.envs(config.askpass.environment());
+        .args(["-A", "-T", "--", &config.destination]);
     command
 }
 
@@ -224,7 +221,7 @@ mod tests {
     }
 
     fn managed() -> ProcessEnvironment {
-        ProcessEnvironment::from([("SSH_AUTH_SOCK".into(), "/managed.sock".into())])
+        ProcessEnvironment::from([(AUTH_SOCK.into(), "/managed.sock".into())])
     }
 
     #[cfg(unix)]
@@ -233,10 +230,12 @@ mod tests {
         use std::os::unix::ffi::OsStringExt as _;
         let path =
             std::path::PathBuf::from(std::ffi::OsString::from_vec(b"/tmp/key-\xff".to_vec()));
-        assert_eq!(
-            wire_path(&path).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidInput
-        );
+        let error = wire_path(&path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(matches!(
+            RemoteError::from(error),
+            RemoteError::Ssh(SshError::UnrepresentablePath)
+        ));
         assert_eq!(wire_path(Path::new("/tmp/key-é")).unwrap(), "/tmp/key-é");
     }
 
@@ -248,10 +247,10 @@ mod tests {
             "auth": {"kind": "key", "path": "/keys/db"},
             "options": {"IdentitiesOnly": "no", "ServerAliveInterval": "15"},
         }});
-        let route = [
-            target("jump", jump).unwrap(),
-            target("db", destination).unwrap(),
-        ];
+        let route = Route {
+            hops: vec![target("jump", jump).unwrap()],
+            destination: target("db", destination).unwrap(),
+        };
         let prompts = Arc::new(RejectSensitivePrompts);
         let config = SshConfig::create(&route, &managed(), None, prompts).unwrap();
         let text = std::fs::read_to_string(&config.path).unwrap();
@@ -268,7 +267,7 @@ mod tests {
         }
         // Generated settings precede options, so an option cannot weaken them.
         assert!(text.find("IdentitiesOnly yes") < text.find("IdentitiesOnly no"));
-        let command = ssh_command(&config, &config.destination);
+        let command = ssh_command(&config);
         let args: Vec<_> = command.as_std().get_args().collect();
         assert_eq!(
             args[..2],
@@ -276,10 +275,10 @@ mod tests {
         );
         assert!(args.contains(&std::ffi::OsStr::new("-A")));
         // A route from the wire has not passed the registry; unvalidated hops are refused.
-        let mut unvalidated = route[0].clone();
-        unvalidated.host = "jump host".into();
+        let mut unvalidated = route;
+        unvalidated.hops[0].host = "jump host".into();
         let rejected = SshConfig::create(
-            &[unvalidated],
+            &unvalidated,
             &managed(),
             None,
             Arc::new(RejectSensitivePrompts),
@@ -296,20 +295,26 @@ mod tests {
             target("x", forwarding),
             Err(TargetError::ReservedSshOption(_))
         ));
+        let option = |key: &str, value: &str| {
+            target(
+                "x",
+                json!({"type": "ssh", "host": "x", "ssh": {"options": {key: value}}}),
+            )
+        };
         assert!(matches!(
-            validate_option("proxyjump", "a"),
-            Err(TargetError::DedicatedSshOption(_, "via"))
+            option("proxyjump", "a"),
+            Err(TargetError::DedicatedSshOption(_, TargetField::Via))
         ));
         assert!(matches!(
-            validate_option("Server Alive", "1"),
+            option("Server Alive", "1"),
             Err(TargetError::InvalidSshOptionName)
         ));
         assert!(matches!(
-            validate_option("LogLevel", ""),
+            option("LogLevel", ""),
             Err(TargetError::EmptySshOptionValue(_))
         ));
         assert!(matches!(
-            validate_option("ProxyCommand", "nc\n"),
+            option("ProxyCommand", "nc\n"),
             Err(TargetError::InvalidSshOptionValue(_))
         ));
         // Managed options with a field of their own name it.
@@ -320,7 +325,7 @@ mod tests {
 
     #[tokio::test]
     async fn external_agent_hops_use_the_session_host_agent_without_adding_keys() {
-        let route = [
+        let mut hops = [
             json!({"type": "ssh", "host": "jump.test", "ssh": {"external_agent": true}}),
             json!({"type": "ssh", "host": "managed.test", "via": "jump"}),
             json!({"type": "ssh", "host": "db.test", "via": "managed", "ssh": {"external_agent": true}}),
@@ -329,6 +334,8 @@ mod tests {
         .enumerate()
         .map(|(index, config)| target(&format!("hop{index}"), config).unwrap())
         .collect::<Vec<_>>();
+        let destination = hops.pop().unwrap();
+        let route = Route { hops, destination };
         let prompts = || Arc::new(RejectSensitivePrompts);
         let config = SshConfig::create(&route, &managed(), Some("/user.sock"), prompts()).unwrap();
         let text = std::fs::read_to_string(&config.path).unwrap();

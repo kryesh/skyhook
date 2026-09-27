@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+use crate::target::{TargetName, TargetRef};
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SensitivePromptKind {
     Password,
@@ -17,6 +19,23 @@ pub enum SensitivePromptKind {
 pub struct SensitivePrompt {
     pub kind: SensitivePromptKind,
     pub message: String,
+    /// The destination of the SSH connection that prompted, even when a jump hop
+    /// is authenticating; none for an agent's own prompt.
+    pub target: Option<TargetName>,
+    /// Where the prompting process runs.
+    pub origin: TargetRef,
+}
+
+#[cfg(test)]
+impl SensitivePrompt {
+    pub(crate) fn test(kind: SensitivePromptKind) -> Self {
+        Self {
+            kind,
+            message: "fixture".into(),
+            target: None,
+            origin: TargetRef::Root,
+        }
+    }
 }
 
 impl SensitivePromptKind {

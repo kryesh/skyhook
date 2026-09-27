@@ -1,38 +1,5 @@
 use skyhook::provider::protocol::Usage;
 pub use skyhook::session::stats::agent_label;
-/// Normalize only as much text as the preview needs, without allocating a full
-/// normalized copy. Whitespace-only tails still have to be inspected to preserve
-/// the distinction between an exact fit and a truncated preview.
-pub fn brief(value: &str, limit: usize) -> String {
-    let mut text = String::with_capacity(value.len().min(limit.saturating_add(3)));
-    let mut remaining = limit;
-    let mut whitespace = false;
-    let mut started = false;
-    for ch in value.chars() {
-        if ch.is_whitespace() {
-            whitespace |= started;
-            continue;
-        }
-        if whitespace {
-            if remaining == 0 {
-                text.push('…');
-                return text;
-            }
-            text.push(' ');
-            remaining -= 1;
-            whitespace = false;
-        }
-        if remaining == 0 {
-            text.push('…');
-            return text;
-        }
-        text.push(ch);
-        remaining -= 1;
-        started = true;
-    }
-    text
-}
-
 pub fn number(n: u64) -> String {
     if n >= 1_000_000 {
         format!("{:.1}m", n as f64 / 1_000_000.)
@@ -121,14 +88,13 @@ mod tests {
 
     #[test]
     fn terminal_cleaning_preserves_unicode_lines_and_expands_tabs() {
-        for text in ["", "plain 界👩‍💻", "a\tb\n", "\u{1b}[31mred\u{1b}[0m\r\0"] {
-            let expected = text
-                .chars()
-                .filter(|c| !c.is_control() || *c == '\n' || *c == '\t')
-                .collect::<String>()
-                .replace('\t', "    ");
+        for (text, expected) in [
+            ("plain 界👩‍💻", "plain 界👩‍💻"),
+            ("a\tb\n", "a    b\n"),
+            ("\u{1b}[31mred\u{1b}[0m\r\0", "[31mred[0m"),
+        ] {
             assert_eq!(clean(text), expected);
-            assert_eq!(*Clean::from(text), expected);
+            assert_eq!(*Clean::from(text), *expected);
         }
     }
 }

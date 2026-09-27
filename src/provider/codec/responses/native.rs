@@ -1,46 +1,49 @@
 //! Native item shapes and field/argument validation.
+
 use super::*;
+use crate::named_enum::named_enum;
+use crate::provider::codec::common::{arguments_field, parse_tool_arguments, tagged};
 
-pub(super) fn protocol(message: impl Into<String>) -> ProviderError {
-    ProviderError::protocol(format!("Responses: {}", message.into()))
+named_enum! {
+    /// The output item types this protocol represents.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) parsed enum ItemType {
+        Message = "message",
+        Reasoning = "reasoning",
+        FunctionCall = "function_call",
+    }
 }
 
-pub(super) fn string<'a>(value: &'a Value, key: &str) -> Result<&'a str, ProviderError> {
-    value
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| protocol(format!("missing or invalid {key}")))
-}
-
-pub(super) fn index(value: &Value, key: &str) -> Result<usize, ProviderError> {
-    value
-        .get(key)
-        .and_then(Value::as_u64)
-        .and_then(|n| usize::try_from(n).ok())
-        .ok_or_else(|| protocol(format!("missing or invalid {key}")))
+named_enum! {
+    /// The readable content part types.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) parsed enum PartType {
+        OutputText = "output_text",
+        Refusal = "refusal",
+        ReasoningText = "reasoning_text",
+        SummaryText = "summary_text",
+    }
 }
 
 pub(super) fn array<'a>(value: &'a Value, key: &str) -> Result<&'a Vec<Value>, ProviderError> {
     value
         .get(key)
         .and_then(Value::as_array)
-        .ok_or_else(|| protocol(format!("missing or invalid {key}")))
+        .ok_or_else(|| NATIVE.error(format_args!("missing or invalid {key}")))
 }
 
 /// Items of a type this protocol does not represent (hosted tools, future
 /// types) are ignored; items without a type are malformed.
 pub(super) fn is_foreign(item: &Value) -> bool {
-    item.get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|kind| !matches!(kind, "message" | "reasoning" | "function_call"))
+    item.get("type").is_some_and(Value::is_string) && tagged::<ItemType>(item).is_none()
 }
 
-pub(super) fn kind(item: &Value) -> Result<ItemKind, ProviderError> {
-    match string(item, "type")? {
-        "message" => Ok(ItemKind::Text),
-        "reasoning" => Ok(ItemKind::Reasoning),
-        "function_call" => Ok(ItemKind::ToolCall),
-        _ => Err(protocol("unsupported output item type")),
+fn kind(item: &Value) -> Result<ItemKind, ProviderError> {
+    match tagged(item) {
+        Some(ItemType::Message) => Ok(ItemKind::Text),
+        Some(ItemType::Reasoning) => Ok(ItemKind::Reasoning),
+        Some(ItemType::FunctionCall) => Ok(ItemKind::ToolCall),
+        None => Err(NATIVE.error("missing or unsupported output item type")),
     }
 }
 
@@ -53,9 +56,9 @@ pub(super) struct NativeItem<'a> {
 }
 impl<'a> NativeItem<'a> {
     pub(super) fn parse(raw: &'a Value) -> Result<Self, ProviderError> {
-        let id = string(raw, "id")?;
+        let id = NATIVE.string(raw, "id")?;
         if id.is_empty() {
-            return Err(protocol("empty item ID"));
+            return Err(NATIVE.error("empty item ID"));
         }
         Ok(Self {
             raw,
@@ -63,29 +66,21 @@ impl<'a> NativeItem<'a> {
             kind: kind(raw)?,
         })
     }
-
-    pub(super) fn final_parts(self) -> Result<Vec<Content>, ProviderError> {
-        parts_for_kind(self.raw, self.kind)
-    }
 }
 
-pub(super) fn final_parts(item: &Value) -> Result<Vec<Content>, ProviderError> {
-    parts_for_kind(item, kind(item)?)
-}
-
-fn parts_for_kind(item: &Value, kind: ItemKind) -> Result<Vec<Content>, ProviderError> {
+pub(super) fn final_parts(item: &Value, kind: ItemKind) -> Result<Vec<Content>, ProviderError> {
     match kind {
         ItemKind::Text if item.get("role").is_some_and(|role| role != "assistant") => {
-            Err(protocol("output message role is not assistant"))
+            Err(NATIVE.error("output message role is not assistant"))
         }
         // Content parts other than text and refusals carry nothing representable.
         ItemKind::Text => array(item, "content")?
             .iter()
             .filter_map(|part| {
-                let text = match part.get("type").and_then(Value::as_str)? {
-                    "output_text" => string(part, "text"),
-                    "refusal" => string(part, "refusal"),
-                    _ => return None,
+                let text = match tagged(part)? {
+                    PartType::OutputText => NATIVE.string(part, "text"),
+                    PartType::Refusal => NATIVE.string(part, "refusal"),
+                    PartType::ReasoningText | PartType::SummaryText => return None,
                 };
                 Some(text.map(|text| Content::Text { text: text.into() }))
             })
@@ -97,23 +92,23 @@ fn parts_for_kind(item: &Value, kind: ItemKind) -> Result<Vec<Content>, Provider
 
 pub(super) fn function_call(item: &Value) -> Result<ToolCall, ProviderError> {
     let arguments = item_arguments(item)?;
-    let id = string(item, "call_id")?;
-    let name = string(item, "name")?;
-    ToolCall::new(id, name, Value::Object(arguments)).map_err(|error| protocol(error.to_string()))
+    let id = NATIVE.string(item, "call_id")?;
+    let name = NATIVE.string(item, "name")?;
+    ToolCall::new(id, name, Value::Object(arguments)).map_err(|error| NATIVE.error(error))
 }
 
 /// A function item's arguments.
 pub(super) fn item_arguments(
     item: &Value,
 ) -> Result<serde_json::Map<String, Value>, ProviderError> {
-    crate::provider::codec::common::arguments_field(item.get("arguments"))
-        .ok_or_else(|| protocol("function arguments must be a JSON object"))
+    arguments_field(item.get("arguments"))
+        .ok_or_else(|| NATIVE.error("function arguments must be a JSON object"))
 }
 
 /// Executable function arguments must decode to an object.
 pub(super) fn arguments(text: &str) -> Result<serde_json::Map<String, Value>, ProviderError> {
-    crate::provider::codec::common::parse_tool_arguments(text)
-        .ok_or_else(|| protocol("function arguments must be a JSON object"))
+    parse_tool_arguments(text)
+        .ok_or_else(|| NATIVE.error("function arguments must be a JSON object"))
 }
 
 impl ItemKind {
@@ -135,7 +130,7 @@ mod tests {
     #[test]
     fn completed_function_identity_is_nonempty_without_chat_name_rules() {
         let mut item = json!({"type":"function_call", "call_id":"call", "name":"vendor.tool/雪", "arguments":"{}"});
-        let parts = final_parts(&item).unwrap();
+        let parts = final_parts(&item, ItemKind::ToolCall).unwrap();
         let Content::ToolCall(call) = &parts[0] else {
             panic!("a tool call")
         };
@@ -144,7 +139,7 @@ mod tests {
             item["call_id"] = json!(id);
             item["name"] = json!(name);
             assert_eq!(
-                final_parts(&item).unwrap_err().kind,
+                final_parts(&item, ItemKind::ToolCall).unwrap_err().kind(),
                 ProviderErrorKind::Protocol
             );
         }
@@ -156,14 +151,14 @@ mod tests {
         for args in ["not json", "[]", "1", "\"[]\""] {
             item["arguments"] = json!(args);
             assert_eq!(
-                final_parts(&item).unwrap_err().kind,
+                final_parts(&item, ItemKind::ToolCall).unwrap_err().kind(),
                 ProviderErrorKind::Protocol
             );
         }
         for args in [json!(""), json!("null"), Value::Null] {
             item["arguments"] = args;
             assert_eq!(
-                final_parts(&item).unwrap(),
+                final_parts(&item, ItemKind::ToolCall).unwrap(),
                 vec![Content::ToolCall(
                     ToolCall::new("call", "lookup", json!({})).unwrap()
                 )]
@@ -171,7 +166,7 @@ mod tests {
         }
         item["arguments"] = json!(r#"{"query":"rust"}"#);
         assert_eq!(
-            final_parts(&item).unwrap(),
+            final_parts(&item, ItemKind::ToolCall).unwrap(),
             vec![Content::ToolCall(
                 ToolCall::new("call", "lookup", json!({"query":"rust"})).unwrap()
             )]

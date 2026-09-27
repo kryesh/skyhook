@@ -66,9 +66,10 @@ Multipart form-data encoding is not supported. File bodies can set their media t
 
 ## Responses and extraction
 
-Responses include final URL/method, status, `ok` (2xx), redirect history, received byte count,
-elapsed time, and a tagged `body`: `text`, `base64`, `file`, or `empty`. Response `headers` is
-`null` by default; set `include_headers: true` to return a map of repeated header values.
+Responses include the status, the received byte count (`size`), the elapsed milliseconds
+(`duration`), and a tagged `body`: `text`, `base64`, `file`, or `empty`. Followed redirects add
+their history (`redirects`), whose last `location` is the final URL. Response `headers` is absent
+by default; set `include_headers: true` to return a map of repeated header values.
 This option does not affect the `headers` request-header map.
 JSON responses remain decoded text; scripts can use `JSON.parse(response.body.text)`.
 `response_format` defaults to `auto` (text for textual content, base64 otherwise); `text` forces
@@ -81,8 +82,8 @@ retrieve the complete saved payload using `jobs({job})` fields `/result/body/tex
 calls still receive the complete payload for processing.
 
 `text:true` is separate from `response_format:"text"`: it extracts readable article content from
-HTML, returning plain text and metadata identifying the extraction engine and title, plus byline,
-excerpt, site name, and language when available.
+HTML, returning plain text and metadata with the title, plus byline, site name, and language when
+available.
 It does not execute JavaScript or fetch linked assets. Plain text, JSON, and other textual types
 pass through decoded; binary content is not converted. Extraction failures are explicit, never
 silently replaced with raw HTML. Fetch with `text:false` to inspect the original response. Empty
@@ -101,10 +102,10 @@ independent: retrieve saved results with `jobs({job})`. Cancellation and timeout
 server-side effects, and requests are not automatically retried.
 
 Transport and processing failures remain failed jobs and failed JobViews (not rejected
-operational script calls), but include a structured failure result. It contains `method`, a safe
-`origin`, `elapsed_ms`, `received_bytes`, redirect history, and `diagnostic`: `phase`, `error_kind`,
-and a concise `message`. When available, `diagnostic.os_error` supplies the executing platform,
-a numeric OS `code`, and a portable `kind`.
+operational script calls). The error names the method, a safe origin, a concise message and the
+elapsed time; the structured failure result contains `duration`, `size` once bytes were received,
+redirect history, and `diagnostic.error_kind`. When available, `diagnostic.os_error` supplies the
+executing platform, a numeric OS `code`, and a portable `kind`.
 Timeouts include `diagnostic.timeout.kind` (`total`, `connect`, or `unknown`) and a `limit_ms` only
 when the expiring limit is known. Timing starts inside fetch on the execution target; it does not
 include SSH startup or initial tool approval.
@@ -116,12 +117,12 @@ firewall caused an error. Diagnostic messages do not copy arbitrary error string
 credentials, headers, or bodies. Failure URL/redirect context is reduced to origins. Received HTTP
 headers are included only with `include_headers: true`; they retain their normal response semantics
 and may still contain sensitive response data.
-`proxy_origin`, when non-null, describes an explicit proxy; `null` does not rule out an
+`proxy_origin`, when present, describes an explicit proxy; its absence does not rule out an
 environment proxy. Use the job's target for source attribution, and interpret OS codes using the reported platform.
 
 If headers arrived before a failure (including an outer timeout), the failure retains the
-HTTP status, `ok`, and byte count, plus headers when `include_headers: true`; known fields retain
-null/default values when unavailable. HTTP 4xx/5xx responses still complete normally: a 405
+HTTP status and byte count, plus headers when `include_headers: true`; unavailable fields are
+absent. HTTP 4xx/5xx responses still complete normally: a 405
 establishes HTTP connectivity, not successful ingestion. Permission denial and cancellation
 retain their separate semantics.
 
@@ -136,7 +137,7 @@ if (response.state === "failed") {
     target,
     http_reached: Number.isInteger(failure.status),
     status: failure.status ?? null,
-    elapsed_ms: failure.elapsed_ms ?? null,
+    duration: failure.duration ?? null,
     diagnostic: failure.diagnostic ?? null,
     error: response.error,
   };

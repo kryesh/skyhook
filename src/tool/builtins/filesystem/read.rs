@@ -8,25 +8,28 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
-use super::super::workspace::{relative_path, source_file};
+use super::super::{ImageSummary, workspace::relative_path};
+use crate::tool::path::source_file;
 use crate::{
     fs::FileKind,
-    media::{ImageRef, MAX_IMAGE_BYTES},
+    media::MAX_IMAGE_BYTES,
     tool::output::{FinishedOutput, TextCaptureField},
     tool::{
-        PathKind, RegistryError,
+        PathArgument, PathKind, RegistryError,
         policy::{Capability, PathAccess},
     },
 };
 
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
     builder.register_product::<ReadArgs, ReadOutput, _, _>(
-        "read",
-        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use jobs to page or search the saved snapshot. Missing or OS-inaccessible paths return {kind:\"error\",path,error:{code:\"not_found\"|\"permission_denied\",message}} as a completed result; policy/approval denials remain denials.",
+        crate::tool::builtins::names::READ,
+        "Capture a complete UTF-8 file or directory listing, or attach a supported image. Use jobs to page or search the saved snapshot. Missing or OS-inaccessible paths return {kind:\"error\",error:{code:\"not_found\"|\"permission_denied\",message}} as a completed result; policy/approval denials remain denials.",
         ToolOptions::new(vec![Capability::Read])
             .read_error_output(read_error_output)
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
-            .path_argument("path", PathAccess::Read, PathKind::Existing),
+            .argument_paths(|args: &mut ReadArgs| {
+                vec![PathArgument::new(&mut args.path, PathAccess::Read, PathKind::Existing)]
+            }),
         read,
     )?;
     Ok(())
@@ -58,10 +61,8 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
             ));
         }
         entries.sort_by(|left, right| left.name().cmp(right.name()));
-        let directory_path = relative_path(&context.execution_location().workspace, &path);
         return Ok(ProducedOutput::new(serde_json::to_value(
             ReadOutput::Directory {
-                path: directory_path,
                 entries: if args.details {
                     DirectoryEntries::Detailed(entries)
                 } else {
@@ -71,17 +72,11 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
         )?));
     }
 
-    let output_path = relative_path(&context.execution_location().workspace, &path);
-    match read_text(&path, &context).await {
-        Ok(TextReadOutcome::Captured(capture)) => {
-            return Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::File {
-                path: output_path,
-                content: String::new(),
-            })?)
-            .with_captures(vec![capture]));
-        }
-        Ok(TextReadOutcome::NotText) => {}
-        Err(error) => return Err(error),
+    if let Some(capture) = read_text(&path, &context).await? {
+        return Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::File {
+            content: String::new(),
+        })?)
+        .with_captures(vec![capture]));
     }
 
     let bytes = crate::fs::read_regular(&path, MAX_IMAGE_BYTES)
@@ -91,13 +86,13 @@ async fn read(context: LocalContext, args: ReadArgs) -> Result<ProducedOutput, L
         LocalError::failed("file is neither UTF-8 text nor a supported image")
             .operation(Operation::Deserialize, Subject::path(&path))
     })?;
+    let name = relative_path(&context.execution_location().workspace, &path);
     let reference = context
-        .store_image(Some(output_path.clone()), &image)
+        .store_image(Some(name), &image)
         .await
         .map_err(|error| error.operation(Operation::StoreImage, Subject::path(&path)))?;
     Ok(ProducedOutput::new(serde_json::to_value(ReadOutput::Image {
-        path: output_path,
-        image: reference.clone(),
+        image: ImageSummary::from(&reference),
     })?)
     .with_images(vec![reference]))
 }
@@ -111,15 +106,11 @@ fn source(
     move |error| LocalError::source_filesystem_io(error).operation(operation, subject)
 }
 
-enum TextReadOutcome {
-    Captured(FinishedOutput),
-    NotText,
-}
-
+/// The captured text, or `None` when the file is not text.
 async fn read_text(
     path: &std::path::Path,
     context: &LocalContext,
-) -> Result<TextReadOutcome, LocalError> {
+) -> Result<Option<FinishedOutput>, LocalError> {
     let mut capture = context
         .text_capture(TextCaptureField::Content)
         .await
@@ -131,7 +122,7 @@ async fn read_text(
     let _cancel_on_drop = cancellation.clone().drop_guard();
     // Reading, capture writes and finishing run in one blocking owner; an abandoned
     // capture discards itself.
-    let completed = tokio::task::spawn_blocking(move || -> Result<_, LocalError> {
+    tokio::task::spawn_blocking(move || -> Result<_, LocalError> {
         let mut input =
             crate::fs::open_regular_blocking(&path, u64::MAX).map_err(source_file(&path))?;
         match copy_text(
@@ -151,12 +142,7 @@ async fn read_text(
         LocalError::failed(error)
             .operation(Operation::Wait, subject)
             .effects(Effects::OutputIncomplete)
-    })??;
-    if let Some(completed) = completed {
-        Ok(TextReadOutcome::Captured(completed))
-    } else {
-        Ok(TextReadOutcome::NotText)
-    }
+    })?
 }
 
 #[derive(Debug, PartialEq)]
@@ -229,7 +215,8 @@ struct ReadArgs {
 #[derive(Serialize, JsonSchema)]
 struct ReadError {
     code: ReadErrorCode,
-    message: String,
+    #[schemars(with = "String")]
+    message: crate::job::output::DiagnosticSlot,
 }
 
 #[derive(Serialize, JsonSchema)]
@@ -239,7 +226,7 @@ enum ReadErrorCode {
     PermissionDenied,
 }
 
-fn read_error_output(path: &str, diagnostic: &Diagnostic) -> Option<serde_json::Value> {
+fn read_error_output(diagnostic: &Diagnostic) -> Option<serde_json::Value> {
     let code = match diagnostic.cause {
         Cause::Io {
             kind: IoKind::NotFound,
@@ -253,12 +240,9 @@ fn read_error_output(path: &str, diagnostic: &Diagnostic) -> Option<serde_json::
     };
     Some(
         serde_json::to_value(ReadOutput::Error {
-            path: path.to_owned(),
             error: ReadError {
                 code,
-                // The output owns the diagnostic; presentation fills this field
-                // with the caller-capability-aware common renderer.
-                message: String::new(),
+                message: crate::job::output::DiagnosticSlot,
             },
         })
         .expect("read errors serialize"),
@@ -270,22 +254,18 @@ fn read_error_output(path: &str, diagnostic: &Diagnostic) -> Option<serde_json::
 enum ReadOutput {
     /// Expected filesystem failures, not policy or approval denials.
     Error {
-        path: String,
         error: ReadError,
     },
     File {
-        path: String,
         #[schemars(extend("x-skyhook-truncatable" = true))]
         content: String,
     },
     Directory {
-        path: String,
         #[schemars(extend("x-skyhook-truncatable" = true))]
         entries: DirectoryEntries,
     },
     Image {
-        path: String,
-        image: ImageRef,
+        image: ImageSummary,
     },
 }
 
@@ -328,11 +308,14 @@ enum DirectoryEntries {
     Detailed(Vec<DirectoryEntry>),
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Default, Serialize, JsonSchema)]
 struct DirectoryGroups {
     files: Vec<DirectoryFile>,
     directories: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     symlinks: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     other: Vec<String>,
 }
 
@@ -367,51 +350,30 @@ mod tests {
 
     use super::*;
     use crate::job::{CancellationToken, JobState};
-    use crate::tool::ToolRegistryBuilder;
-    use crate::tool::executor::ToolExecutor;
-
-    fn read_executor(
-        runtime: &crate::tests::TestRuntime,
-    ) -> (ToolExecutor, Arc<std::sync::OnceLock<ToolExecutor>>) {
-        let mut builder = ToolRegistryBuilder::default();
-        builder.register_local(register).unwrap();
-        let slot = Arc::new(std::sync::OnceLock::new());
-        crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
-        let executor = runtime.executor(builder);
-        assert!(slot.set(executor.clone()).is_ok());
-        (executor, slot)
-    }
+    use crate::tests::tool_executor;
 
     #[test]
-    fn grouped_directory_entries_keep_empty_groups() {
+    fn grouped_directory_entries_omit_empty_rare_groups() {
         let groups = DirectoryGroups::from(vec![DirectoryEntry::File {
             name: "one.txt".into(),
             bytes: 3,
         }]);
         assert_eq!(
             serde_json::to_value(groups).unwrap(),
-            json!({
-                "files":[{"name":"one.txt", "bytes":3}],
-                "directories":[],
-                "symlinks":[],
-                "other":[]
-            })
+            json!({"files":[{"name":"one.txt", "bytes":3}], "directories":[]})
         );
     }
 
-    /// Schema-valid input rejected by typed admission still owns a job, which
-    /// fails with the admission error before any IO or script evaluation.
+    /// Schema-valid input rejected by typed admission fails before a job, any IO
+    /// or script evaluation exists.
     #[tokio::test]
-    async fn typed_read_and_script_admission_fails_the_job_before_io_or_evaluation() {
+    async fn typed_read_and_script_admission_fails_before_a_job_io_or_evaluation() {
         let runtime = crate::tests::TestRuntime::new().await;
-        let (executor, _slot) = read_executor(&runtime);
-        for (index, (tool, arguments, argument)) in [
+        let (executor, _slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
+        for (tool, arguments, argument) in [
             ("read", json!({"path":".", "details":"invalid"}), "/details"),
             ("script", json!({"source":42}), "/source"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
+        ] {
             let error = executor.run_host(&runtime.agent, tool, arguments).await;
             let error =
                 error.expect_err("typed arguments must reject before IO or script evaluation");
@@ -421,10 +383,8 @@ mod tests {
                 diagnostic.context.subject,
                 Subject::Argument(argument.into())
             );
-            let jobs = runtime.jobs.list(&runtime.agent).await;
-            assert_eq!(jobs.len(), index + 1);
-            assert!(jobs.iter().all(|job| job.state == JobState::Failed));
         }
+        assert!(runtime.jobs.list(&runtime.agent).await.is_empty());
     }
 
     #[cfg(unix)]
@@ -523,7 +483,6 @@ mod tests {
                 0,
                 || std::io::Error::from(std::io::ErrorKind::PermissionDenied),
             )));
-            let arguments = json!({"path":"source.txt"});
             let context = LocalContext::new(
                 ExecutionLocation::root(root.path().to_owned()),
                 [Capability::Read].into_iter().collect(),
@@ -531,10 +490,9 @@ mod tests {
                 CancellationToken::new(),
                 output.clone(),
                 Arc::new(Authorizations::default()),
-                arguments.clone(),
             );
             let error = catalog
-                .run("read", arguments, context, root.path())
+                .run("read", json!({"path":"source.txt"}), context, root.path())
                 .await
                 .unwrap_err();
             assert_eq!(error.diagnostic().context.operation, operation);
@@ -552,7 +510,7 @@ mod tests {
     #[tokio::test]
     async fn missing_reads_complete_direct_and_script_jobs() {
         let runtime = crate::tests::TestRuntime::new().await;
-        let (executor, _slot) = read_executor(&runtime);
+        let (executor, _slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
         let direct = executor
             .run_host(
                 &runtime.agent,
@@ -563,7 +521,6 @@ mod tests {
             .unwrap();
         let value = &direct.output.value;
         assert_eq!(value["kind"], "error");
-        assert_eq!(value["path"], "missing/nested/file.txt");
         assert_eq!(value["error"]["code"], "not_found");
         assert!(!value["error"]["message"].as_str().unwrap().is_empty());
         assert_eq!(
@@ -593,7 +550,7 @@ mod tests {
     #[tokio::test]
     async fn read_captures_complete_snapshot() {
         let runtime = crate::tests::TestRuntime::new().await;
-        let (executor, _slot) = read_executor(&runtime);
+        let (executor, _slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
         let path = runtime.root.path().join("lines.txt");
         fs::write(&path, "one\ntwo\nthree\n").await.unwrap();
         let result = executor

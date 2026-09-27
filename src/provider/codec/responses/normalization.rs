@@ -1,7 +1,12 @@
-//! Shape-based normalization for omitted Responses bookkeeping. Never infer a
-//! tool call identity or resolve an ambiguous reference from array position.
-use super::native::NativeItem;
+//! Native events normalized into the decoder's semantic events. An event on a
+//! live item resolves its item and part exactly once. Never infer a tool call
+//! identity or resolve an ambiguous reference from array position.
+use super::events::Event;
+use super::native::{NativeItem, PartType, is_foreign};
 use super::*;
+use crate::named_enum::NamedEnum;
+use crate::provider::codec::{common::tagged, openai};
+use crate::provider::http::errors;
 
 /// Local item/part indices are produced only by this module's resolution
 /// algorithm; they are not interchangeable with provider-supplied wire indices.
@@ -10,6 +15,20 @@ struct ResolvedReference {
     item: usize,
     kind: ItemKind,
     part: usize,
+}
+
+impl ResolvedReference {
+    fn part(self) -> (usize, usize) {
+        (self.item, self.part)
+    }
+
+    fn content(self, text: &str) -> Content {
+        let text = text.into();
+        match self.kind {
+            ItemKind::Reasoning => Content::Reasoning { text },
+            ItemKind::Text | ItemKind::ToolCall => Content::Text { text },
+        }
+    }
 }
 
 /// Only consumed fields are interpreted here. Native snapshots stay borrowed
@@ -55,16 +74,16 @@ pub(super) enum NormalizedEvent<'a> {
 }
 
 fn optional_index(value: &Value, key: &str) -> Result<Option<usize>, ProviderError> {
-    value.get(key).map(|_| index(value, key)).transpose()
+    value.get(key).map(|_| NATIVE.index(value, key)).transpose()
 }
 
 fn optional_id<'a>(value: &'a Value, key: &str) -> Result<Option<&'a str>, ProviderError> {
     value
         .get(key)
         .map(|_| {
-            let id = string(value, key)?;
+            let id = NATIVE.string(value, key)?;
             if id.is_empty() {
-                Err(protocol("empty item ID"))
+                Err(NATIVE.error("empty item ID"))
             } else {
                 Ok(id)
             }
@@ -73,402 +92,147 @@ fn optional_id<'a>(value: &'a Value, key: &str) -> Result<Option<&'a str>, Provi
 }
 
 impl Decoder {
-    fn next_index(&self) -> Result<usize, ProviderError> {
-        self.items.last_key_value().map_or(Ok(0), |(id, _)| {
-            id.checked_add(1)
-                .ok_or_else(|| protocol("output index overflow"))
-        })
-    }
-
-    fn item_by_id(&self, native_id: &str) -> Option<usize> {
-        self.items
-            .iter()
-            .find_map(|(id, item)| item.is(native_id).then_some(*id))
-    }
-
-    fn bind_wire_index(&mut self, id: usize, wire: Option<usize>) -> Result<(), ProviderError> {
-        let Some(wire) = wire else {
-            return Ok(());
-        };
-        if self.items[&id].wire_index.is_some_and(|old| old != wire)
-            || self
-                .items
-                .iter()
-                .any(|(other, item)| *other != id && item.wire_index == Some(wire))
-        {
-            return Err(protocol("contradictory output item index"));
-        }
-        self.items.get_mut(&id).expect("known item").wire_index = Some(wire);
-        Ok(())
-    }
-
-    fn vacant_index(&self, wire: Option<usize>) -> Result<usize, ProviderError> {
-        if let Some(wire) = wire {
-            if self
-                .items
-                .values()
-                .any(|item| item.wire_index == Some(wire))
-            {
-                return Err(protocol("conflicting output item identity"));
-            }
-            if !self.items.contains_key(&wire) {
-                return Ok(wire);
-            }
-        }
-        self.next_index()
-    }
-
-    /// Only completed, semantically equivalent content can establish an alias
-    /// for an output-item ID. Executable call IDs are never aliases.
-    fn equivalent_snapshot(&self, item: &Item, header: NativeItem<'_>) -> bool {
-        let native = header.raw;
-        if header.kind != item.kind() {
-            return false;
-        }
-        if let ItemBody::Function(state) = &item.body {
-            let streaming = state.streaming().ok();
-            let call = streaming
-                .and_then(|state| state.call_id.as_deref())
-                .or_else(|| state.snapshot()?.get("call_id")?.as_str());
-            if call.is_none() || call != native.get("call_id").and_then(Value::as_str) {
-                return false;
-            }
-            if streaming
-                .and_then(|state| state.name.as_deref())
-                .is_some_and(|name| Some(name) != native.get("name").and_then(Value::as_str))
-            {
-                return false;
-            }
-        }
-        let Ok(parts) = header.final_parts() else {
-            return false;
-        };
-        if let ItemBody::Function(state) = &item.body
-            && let FunctionPhase::Completed { call, .. } = &state.phase
-        {
-            return parts.as_slice() == [Content::ToolCall(call.clone())];
-        }
-        if let Some(old) = item.snapshot() {
-            return final_parts(old).ok().as_ref() == Some(&parts);
-        }
-        if let ItemBody::Function(state) = &item.body {
-            let Ok(streaming) = state.streaming() else {
-                return false;
-            };
-            let observed = match &streaming.final_arguments {
-                Some(FinalArguments::Object(arguments)) => Some(arguments.clone()),
-                Some(FinalArguments::Incomplete(text)) => arguments(text).ok(),
-                None => state
-                    .part
-                    .as_ref()
-                    .and_then(|part| arguments(part.streamed()).ok()),
-            };
-            return observed.is_some() && observed == super::native::item_arguments(native).ok();
-        }
-        if item.parts().next().is_none() {
-            return false;
-        }
-        let observed: Vec<_> = item
-            .parts()
-            .map(|(_, part)| part)
-            .map(|part| {
-                part.ended().cloned().unwrap_or_else(|| {
-                    if item.kind() == ItemKind::Reasoning {
-                        Content::Reasoning {
-                            text: part.streamed().to_owned(),
-                        }
-                    } else {
-                        Content::Text {
-                            text: part.streamed().to_owned(),
-                        }
-                    }
-                })
-            })
-            .collect();
-        observed == parts
-    }
-
-    pub(super) fn snapshot_index(
-        &mut self,
-        native: NativeItem<'_>,
-        wire_index: Option<usize>,
-        alias_candidates: Option<&BTreeSet<usize>>,
-    ) -> Result<usize, ProviderError> {
-        let native_id = native.id;
-        if let Some(id) = self.item_by_id(native_id) {
-            self.bind_wire_index(id, wire_index)?;
-            return Ok(id);
-        }
-        let candidates: Vec<_> = self
-            .items
-            .iter()
-            .filter_map(|(id, item)| {
-                let eligible = alias_candidates.map_or_else(
-                    || wire_index.is_some_and(|wire| item.wire_index == Some(wire)),
-                    |candidates| candidates.contains(id),
-                );
-                (eligible && self.equivalent_snapshot(item, native)).then_some(*id)
-            })
-            .collect();
-        if candidates.len() > 1 {
-            return Err(protocol("ambiguous final output item identity"));
-        }
-        if let Some(&id) = candidates.first() {
-            self.bind_wire_index(id, wire_index)?;
-            self.items
-                .get_mut(&id)
-                .expect("matched item")
-                .aliases
-                .insert(native_id.into());
-            return Ok(id);
-        }
-        let id = self.vacant_index(wire_index)?;
-        self.start(id, native)?;
-        self.items.get_mut(&id).expect("started item").wire_index = wire_index;
-        Ok(id)
-    }
-
-    /// Admit raw wire fields and resolve references exactly once. The resulting
-    /// event contains no synthetic JSON bookkeeping for dispatch to re-read.
+    /// Admit raw wire fields. The resulting event contains no synthetic JSON
+    /// bookkeeping for dispatch to re-read.
     pub(super) fn normalize_event<'a>(
         &mut self,
         event: &'a Value,
     ) -> Result<NormalizedEvent<'a>, ProviderError> {
         let wire = optional_index(event, "output_index")?;
-        let name = string(event, "type")?;
-        if matches!(
-            name,
-            "response.output_item.added" | "response.output_item.done"
-        ) && event.get("item").is_some_and(super::native::is_foreign)
-        {
+        let name = NATIVE.string(event, "type")?;
+        // New event types (hosted tools, progress, ...) carry nothing we use.
+        let Some(kind) = Event::parse(name) else {
             return Ok(NormalizedEvent::Ignored);
-        }
-        if name == "response.output_item.added" {
-            let index = self.vacant_index(wire)?;
-            let native =
-                NativeItem::parse(event.get("item").ok_or_else(|| protocol("missing item"))?)?;
-            return Ok(NormalizedEvent::ItemAdded {
-                index,
-                wire,
-                native,
-            });
-        }
-        if name == "response.output_item.done" {
-            let native =
-                NativeItem::parse(event.get("item").ok_or_else(|| protocol("missing item"))?)?;
-            let index = self.snapshot_index(native, wire, None)?;
-            return Ok(NormalizedEvent::ItemDone { index, native });
-        }
-        let reference = self.resolve_reference(event, name, wire)?;
-        // The resolver checks identities and wire/local-index contradictions.
-        // This final state check is shared by every consumed live-item event.
-        let active = |expected| -> Result<(usize, usize), ProviderError> {
-            let reference = reference.ok_or_else(|| protocol("missing resolved item reference"))?;
-            let item = &self.items[&reference.item];
-            if item.snapshot().is_some() {
-                return Err(protocol("event after output item ended"));
-            }
-            if reference.kind != expected {
-                return Err(protocol("event does not match output item kind"));
-            }
-            Ok((reference.item, reference.part))
         };
-        let text_content = |kind, text: &str| {
-            if kind == ItemKind::Reasoning {
-                Content::Reasoning { text: text.into() }
-            } else {
-                Content::Text { text: text.into() }
-            }
+        let signals = self.errors;
+        let failure = |native| {
+            let reading = openai::read::<Code>(native);
+            errors::classify(None, native, reading, signals, None)
         };
-        match name {
-            "response.created" | "response.in_progress" | "response.queued" => {
+        match kind {
+            Event::ItemAdded | Event::ItemDone => {
+                let item = event
+                    .get("item")
+                    .ok_or_else(|| NATIVE.error("missing item"))?;
+                if is_foreign(item) {
+                    return Ok(NormalizedEvent::Ignored);
+                }
+                let native = NativeItem::parse(item)?;
+                if kind == Event::ItemAdded {
+                    let index = self.vacant_index(wire)?;
+                    return Ok(NormalizedEvent::ItemAdded {
+                        index,
+                        wire,
+                        native,
+                    });
+                }
+                let index = self.snapshot_index(native, wire, None)?;
+                Ok(NormalizedEvent::ItemDone { index, native })
+            }
+            Event::Created | Event::InProgress | Event::Queued => {
                 if !event.get("response").is_some_and(Value::is_object) {
-                    return Err(protocol("missing response object"));
+                    return Err(NATIVE.error("missing response object"));
                 }
                 Ok(NormalizedEvent::Ignored)
             }
-            "response.output_text.delta" | "response.refusal.delta" => Ok(NormalizedEvent::Delta {
-                part: active(ItemKind::Text)?,
-                text: string(event, "delta")?,
-            }),
-            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
-                Ok(NormalizedEvent::Delta {
-                    part: active(ItemKind::Reasoning)?,
-                    text: string(event, "delta")?,
-                })
+            Event::TextDelta
+            | Event::RefusalDelta
+            | Event::ReasoningDelta
+            | Event::SummaryDelta => {
+                let part = self.live_part(event, kind, wire)?.part();
+                let text = NATIVE.string(event, "delta")?;
+                Ok(NormalizedEvent::Delta { part, text })
             }
-            "response.function_call_arguments.delta" => Ok(NormalizedEvent::ArgumentsDelta {
-                item: active(ItemKind::ToolCall)?.0,
-                text: string(event, "delta")?,
+            Event::ArgumentsDelta => Ok(NormalizedEvent::ArgumentsDelta {
+                item: self.live_part(event, kind, wire)?.item,
+                text: NATIVE.string(event, "delta")?,
             }),
-            "response.function_call_arguments.done" => Ok(NormalizedEvent::ArgumentsDone {
-                item: active(ItemKind::ToolCall)?.0,
-                text: string(event, "arguments")?,
+            Event::ArgumentsDone => Ok(NormalizedEvent::ArgumentsDone {
+                item: self.live_part(event, kind, wire)?.item,
+                text: NATIVE.string(event, "arguments")?,
             }),
-            "response.output_text.done"
-            | "response.refusal.done"
-            | "response.reasoning_text.done"
-            | "response.reasoning_summary_text.done" => {
-                let kind = if name.starts_with("response.reasoning_") {
-                    ItemKind::Reasoning
-                } else {
-                    ItemKind::Text
-                };
-                let part = active(kind)?;
-                let text = if name == "response.reasoning_text.done" {
-                    reasoning_text(event)?
-                } else {
-                    string(
-                        event,
-                        if name == "response.refusal.done" {
-                            "refusal"
-                        } else {
-                            "text"
-                        },
-                    )?
+            Event::TextDone | Event::RefusalDone | Event::ReasoningDone | Event::SummaryDone => {
+                let reference = self.live_part(event, kind, wire)?;
+                let text = match kind {
+                    Event::ReasoningDone => reasoning_text(event)?,
+                    Event::RefusalDone => NATIVE.string(event, "refusal")?,
+                    _ => NATIVE.string(event, "text")?,
                 };
                 Ok(NormalizedEvent::PartEnded {
-                    part,
-                    content: text_content(kind, text),
+                    part: reference.part(),
+                    content: reference.content(text),
                 })
             }
-            "response.content_part.added"
-            | "response.content_part.done"
-            | "response.reasoning_part.added"
-            | "response.reasoning_part.done"
-            | "response.reasoning_summary_part.added"
-            | "response.reasoning_summary_part.done" => {
-                let reference =
-                    reference.ok_or_else(|| protocol("missing resolved item reference"))?;
-                let kind = reference.kind;
-                if kind == ItemKind::ToolCall {
-                    return Err(protocol("content part on function item"));
-                }
-                let resolved = active(kind)?;
+            Event::PartAdded
+            | Event::PartDone
+            | Event::ReasoningPartAdded
+            | Event::ReasoningPartDone
+            | Event::SummaryPartAdded
+            | Event::SummaryPartDone => {
+                let reference = self.live_part(event, kind, wire)?;
                 let part = event
                     .get("part")
-                    .ok_or_else(|| protocol("missing content part"))?;
-                let text = if kind == ItemKind::Reasoning {
-                    readable_reasoning(part, name.starts_with("response.reasoning_summary_part."))?
-                } else {
-                    match string(part, "type")? {
-                        "output_text" => string(part, "text")?,
-                        "refusal" => string(part, "refusal")?,
-                        _ => return Err(protocol("unsupported content part")),
+                    .ok_or_else(|| NATIVE.error("missing content part"))?;
+                let text = match (reference.kind, tagged(part)) {
+                    (ItemKind::ToolCall, _) => {
+                        return Err(NATIVE.error("content part on function item"));
                     }
+                    (ItemKind::Reasoning, _) => readable_reasoning(part, kind.is_summary())?,
+                    (ItemKind::Text, Some(PartType::OutputText)) => NATIVE.string(part, "text")?,
+                    (ItemKind::Text, Some(PartType::Refusal)) => NATIVE.string(part, "refusal")?,
+                    (ItemKind::Text, _) => return Err(NATIVE.error("unsupported content part")),
                 };
-                if name.ends_with(".done") {
-                    Ok(NormalizedEvent::PartEnded {
-                        part: resolved,
-                        content: text_content(kind, text),
-                    })
+                Ok(if kind.is_done() {
+                    NormalizedEvent::PartEnded {
+                        part: reference.part(),
+                        content: reference.content(text),
+                    }
                 } else {
-                    Ok(NormalizedEvent::PartAdded {
-                        part: resolved,
+                    NormalizedEvent::PartAdded {
+                        part: reference.part(),
                         text,
-                    })
-                }
+                    }
+                })
             }
-            "response.output_text.annotation.added" => {
-                active(ItemKind::Text)?;
-                index(event, "annotation_index")?;
+            Event::Annotation => {
+                self.live_part(event, kind, wire)?;
+                NATIVE.index(event, "annotation_index")?;
                 if !event.get("annotation").is_some_and(Value::is_object) {
-                    return Err(protocol("missing annotation object"));
+                    return Err(NATIVE.error("missing annotation object"));
                 }
                 Ok(NormalizedEvent::Ignored)
             }
-            "response.completed" | "response.incomplete" => self.normalize_terminal(event, name),
+            Event::Completed | Event::Incomplete => self.normalize_terminal(event, kind),
             // The failed response is the envelope around its `error`, which a
             // server may annotate beside it.
-            "response.failed" => {
+            Event::Failed => {
                 let response = event
                     .get("response")
-                    .ok_or_else(|| protocol("missing failed response"))?;
+                    .ok_or_else(|| NATIVE.error("missing failed response"))?;
                 if response.get("error").is_none() {
-                    return Err(protocol("missing response error"));
+                    return Err(NATIVE.error("missing response error"));
                 }
-                Err(api_error(response, self.errors))
+                Err(failure(response))
             }
-            "error" | "response.error" => Err(api_error(event, self.errors)),
+            Event::Error => Err(failure(event)),
             // A top-level event ending the response abnormally must not be
             // mistaken for progress, or the stream would appear to stall.
-            "response.aborted"
-            | "response.cancelled"
-            | "response.canceled"
-            | "response.interrupted" => Err(protocol(format!("response ended abnormally: {name}"))),
-            // New event types (hosted tools, progress, ...) carry nothing we use.
-            _ => Ok(NormalizedEvent::Ignored),
+            Event::Aborted => Err(NATIVE.error(format_args!("response ended abnormally: {name}"))),
         }
     }
 
-    fn normalize_terminal<'a>(
-        &self,
-        event: &'a Value,
-        name: &str,
-    ) -> Result<NormalizedEvent<'a>, ProviderError> {
-        let response = event
-            .get("response")
-            .ok_or_else(|| protocol("missing final response"))?;
-        let finish = match string(response, "status")? {
-            "incomplete" => match response
-                .get("incomplete_details")
-                .and_then(|details| details.get("reason"))
-                .and_then(Value::as_str)
-            {
-                Some("max_output_tokens") => Finish::Cut(CutReason::MaxTokens),
-                Some("content_filter") => Finish::Cut(CutReason::Refusal),
-                _ => Finish::Cut(CutReason::Incomplete),
-            },
-            "completed" if name == "response.completed" => Finish::Normal,
-            _ => return Err(protocol("terminal response status disagrees with event")),
-        };
-        let output = if self.terminal_output == TerminalOutput::StreamedOnly
-            && response.get("output").is_none()
-        {
-            &[][..]
-        } else {
-            array(response, "output")?.as_slice()
-        };
-        let usage = response
-            .get("usage")
-            .filter(|u| !u.is_null())
-            .map(|usage| {
-                let count = |key: &str| {
-                    usage
-                        .get(key)
-                        .and_then(Value::as_u64)
-                        .ok_or_else(|| protocol(format!("missing or invalid usage.{key}")))
-                };
-                let details = usage.get("input_tokens_details").filter(|v| !v.is_null());
-                let detail = |key: &str, what: &str| match details {
-                    Some(details) if !details.get(key).is_none_or(Value::is_null) => details
-                        .get(key)
-                        .and_then(Value::as_u64)
-                        .map(Some)
-                        .ok_or_else(|| protocol(format!("invalid {what} input token usage"))),
-                    _ => Ok(None),
-                };
-                let cached = detail("cached_tokens", "cached")?.unwrap_or(0);
-                let input = count("input_tokens")?
-                    .checked_sub(cached)
-                    .ok_or_else(|| protocol("cached tokens exceed input tokens"))?;
-                let written = detail("cache_write_tokens", "cache-write")?.unwrap_or(0);
-                if written > input {
-                    return Err(protocol("cache-write tokens exceed uncached input tokens"));
-                }
-                Ok(Usage {
-                    input_tokens: input,
-                    cached_input_tokens: cached,
-                    cache_write_input_tokens: written,
-                    output_tokens: count("output_tokens")?,
-                })
-            })
-            .transpose()?;
-        Ok(NormalizedEvent::Terminal {
-            output,
-            usage,
-            finish,
-        })
+    /// The live item and part an event addresses.
+    fn live_part(
+        &mut self,
+        event: &Value,
+        kind: Event,
+        wire: Option<usize>,
+    ) -> Result<ResolvedReference, ProviderError> {
+        let reference = self.resolve_reference(event, kind, wire)?;
+        if self.items[&reference.item].snapshot().is_some() {
+            return Err(NATIVE.error("event after output item ended"));
+        }
+        Ok(reference)
     }
 
     /// Resolve omitted wire references once without mutating the vendor event.
@@ -476,36 +240,22 @@ impl Decoder {
     fn resolve_reference(
         &mut self,
         event: &Value,
-        name: &str,
+        kind: Event,
         wire: Option<usize>,
-    ) -> Result<Option<ResolvedReference>, ProviderError> {
-        let wire_owner = wire.and_then(|wire| {
-            self.items
-                .iter()
-                .find_map(|(id, item)| (item.wire_index == Some(wire)).then_some(*id))
-        });
-        let fixed = if name.starts_with("response.reasoning_") {
-            Some(ItemKind::Reasoning)
-        } else if name.starts_with("response.function_call_arguments.") {
-            Some(ItemKind::ToolCall)
-        } else if name.starts_with("response.output_text.") || name.starts_with("response.refusal.")
-        {
-            Some(ItemKind::Text)
-        } else if name.starts_with("response.content_part.") {
-            None
-        } else {
-            return Ok(None);
-        };
+    ) -> Result<ResolvedReference, ProviderError> {
+        let wire_owner = wire.and_then(|wire| self.wires.get(&wire).copied());
         let native_id = optional_id(event, "item_id")?;
         // Generic part events can also address reasoning items. Identity,
         // not a provider label, disambiguates output_text inside reasoning.
-        let expected = fixed.unwrap_or_else(|| {
+        let expected = kind.item_kind().unwrap_or_else(|| {
             native_id
                 .and_then(|id| self.item_by_id(id))
                 .or(wire_owner)
                 .map_or_else(
-                    || match event.pointer("/part/type").and_then(Value::as_str) {
-                        Some("reasoning_text" | "summary_text") => ItemKind::Reasoning,
+                    || match event.get("part").and_then(tagged) {
+                        Some(PartType::ReasoningText | PartType::SummaryText) => {
+                            ItemKind::Reasoning
+                        }
                         _ => ItemKind::Text,
                     },
                     |id| self.items[&id].kind(),
@@ -515,18 +265,17 @@ impl Decoder {
         let id = if let Some(id) = known {
             let item = &self.items[&id];
             if item.kind() != expected {
-                return Err(protocol("event does not match output item kind"));
+                return Err(NATIVE.error("event does not match output item kind"));
             }
             self.bind_wire_index(id, wire)?;
             id
         } else if let Some(native_id) = native_id {
             let id = self.vacant_index(wire)?;
-            self.start_item(id, native_id, expected, (None, None))?;
-            self.items.get_mut(&id).expect("started item").wire_index = wire;
+            self.start_item(id, wire, native_id, expected, (None, None))?;
             id
         } else if let Some(id) = wire_owner {
             if self.items[&id].kind() != expected {
-                return Err(protocol("event does not match output item kind"));
+                return Err(NATIVE.error("event does not match output item kind"));
             }
             id
         } else {
@@ -541,19 +290,19 @@ impl Decoder {
                 })
                 .collect();
             if candidates.len() != 1 {
-                return Err(protocol("ambiguous or missing output item reference"));
+                return Err(NATIVE.error("ambiguous or missing output item reference"));
             }
             self.bind_wire_index(candidates[0], wire)?;
             candidates[0]
         };
         if expected == ItemKind::ToolCall {
-            return Ok(Some(ResolvedReference {
+            return Ok(ResolvedReference {
                 item: id,
                 kind: expected,
                 part: 0,
-            }));
+            });
         }
-        let summary = name.starts_with("response.reasoning_summary_");
+        let summary = kind.is_summary();
         let key = if summary {
             "summary_index"
         } else {
@@ -577,7 +326,7 @@ impl Decoder {
                 match positions.as_slice() {
                     [] => 0,
                     [only] => *only,
-                    _ => return Err(protocol("ambiguous missing content index")),
+                    _ => return Err(NATIVE.error("ambiguous missing content index")),
                 }
             }
         };
@@ -586,11 +335,11 @@ impl Decoder {
         } else {
             position
         };
-        Ok(Some(ResolvedReference {
+        Ok(ResolvedReference {
             item: id,
             kind: expected,
             part: position,
-        }))
+        })
     }
 }
 
@@ -599,7 +348,6 @@ mod tests {
     use super::super::tests::*;
     use super::*;
     use crate::provider::ProviderErrorKind;
-    use crate::provider::protocol::Position;
 
     #[test]
     fn lifecycle_events_require_a_response_and_failed_events_are_errors() {
@@ -611,7 +359,7 @@ mod tests {
         }
         let failed = json!({"type":"response.failed", "response":{"error":{"code":"invalid_request_error"}}});
         let error = decoder().feed(failed).unwrap_err();
-        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
+        assert_eq!(error.kind(), ProviderErrorKind::InvalidRequest);
     }
 
     #[test]
@@ -832,142 +580,6 @@ mod tests {
         }
     }
 
-    fn delta(item_id: &str, text: &str) -> Value {
-        json!({"type":"response.output_text.delta", "item_id":item_id, "delta":text})
-    }
-
-    fn unindexed_added(item: Value) -> Value {
-        json!({"type":"response.output_item.added", "item":item})
-    }
-
-    fn unindexed_done(item: Value) -> Value {
-        json!({"type":"response.output_item.done", "item":item})
-    }
-
-    #[test]
-    fn compatible_references_assemble_distinct_items_in_order() {
-        let same = |id| message(id, "same");
-        let pair = |a, b| vec![same(a), same(b)];
-        let (first, second) = (
-            message("message-a", "first"),
-            message("message-b", "second"),
-        );
-        let (retained, fresh) = (same("retained"), same("fresh"));
-        // Expected (id, position when asserted, text).
-        let cases = vec![
-            // Missing output indices preserve distinct identity and order.
-            (
-                vec![
-                    unindexed_added(message("message-a", "")),
-                    unindexed_added(message("message-b", "")),
-                    delta("message-b", "second"),
-                    delta("message-a", "first"),
-                    unindexed_done(second.clone()),
-                    unindexed_done(first.clone()),
-                    completed(vec![first, second]),
-                ],
-                vec![
-                    ("message-a", Some(0), "first"),
-                    ("message-b", Some(1), "second"),
-                ],
-            ),
-            // A lazy text start from a delta needs no added event.
-            (
-                vec![
-                    json!({"type":"response.output_text.delta", "output_index":0,
-                        "item_id":"lazy-message", "delta":"hello "}),
-                    delta("lazy-message", "world"),
-                    completed(vec![message("lazy-message", "hello world")]),
-                ],
-                vec![("lazy-message", None, "hello world")],
-            ),
-            // An omitted output index can be established later by identity.
-            (
-                vec![
-                    unindexed_added(message("msg", "")),
-                    json!({"type":"response.output_text.delta","item_id":"msg","output_index":7,"delta":"hello"}),
-                    done(7, message("msg", "hello")),
-                    completed(vec![message("msg", "hello")]),
-                ],
-                vec![("msg", Some(0), "hello")],
-            ),
-            // An explicit wire owner precedes unbound items.
-            (
-                vec![
-                    added(0, message("first", "")),
-                    unindexed_added(message("second", "")),
-                    json!({"type":"response.output_text.delta","output_index":0,"delta":"hello"}),
-                    done(0, message("first", "hello")),
-                    unindexed_done(message("second", "world")),
-                    completed(vec![message("first", "hello"), message("second", "world")]),
-                ],
-                vec![("first", None, "hello"), ("second", None, "world")],
-            ),
-            // Equal terminal-only, done-only (with or without indices) and
-            // unchanged streamed items remain distinct.
-            (
-                vec![completed(pair("first", "second"))],
-                vec![("first", None, "same"), ("second", None, "same")],
-            ),
-            (
-                vec![
-                    done(0, same("first")),
-                    done(1, same("second")),
-                    completed(pair("first", "second")),
-                ],
-                vec![("first", None, "same"), ("second", None, "same")],
-            ),
-            (
-                vec![
-                    unindexed_done(same("first")),
-                    unindexed_done(same("second")),
-                    completed(pair("first", "second")),
-                ],
-                vec![("first", None, "same"), ("second", None, "same")],
-            ),
-            (
-                vec![
-                    added(0, same("first")),
-                    done(0, same("first")),
-                    added(1, same("second")),
-                    done(1, same("second")),
-                    completed(pair("first", "second")),
-                ],
-                vec![("first", None, "same"), ("second", None, "same")],
-            ),
-            // Stable terminal ids are reserved before semantic alias matching.
-            (
-                vec![
-                    added(0, retained.clone()),
-                    done(0, retained.clone()),
-                    completed(vec![fresh.clone(), retained.clone()]),
-                ],
-                vec![("retained", None, "same"), ("fresh", None, "same")],
-            ),
-            (
-                vec![
-                    added(0, retained.clone()),
-                    done(0, retained.clone()),
-                    completed(vec![retained, fresh]),
-                ],
-                vec![("retained", None, "same"), ("fresh", None, "same")],
-            ),
-        ];
-        for (index, (events, expected)) in cases.into_iter().enumerate() {
-            let reduced = assemble(events).unwrap();
-            assert_eq!(reduced.completion.outcome(), Outcome::Answer);
-            let items = reduced.items();
-            assert_eq!(items.len(), expected.len(), "case {index}");
-            for (item, (id, position, text)) in items.iter().zip(expected) {
-                assert_eq!(item.id().as_str(), id, "case {index}");
-                assert_eq!(item.text_content().as_deref(), Some(text), "case {index}");
-                if let Some(position) = position {
-                    assert_eq!(item.position(), Position::from(position), "case {index}");
-                }
-            }
-        }
-    }
-
     #[test]
     fn missing_single_part_indices_work_for_text_and_reasoning_summaries() {
         for (native, family, part_family, part) in [
@@ -1029,24 +641,6 @@ mod tests {
     }
 
     #[test]
-    fn lazy_item_done_starts_all_supported_item_kinds() {
-        let output = vec![
-            reasoning("reason", "plan"),
-            message("text", "checking"),
-            function("function", "call-stable", r#"{"key":"value"}"#),
-        ];
-        let mut events: Vec<_> = output.iter().cloned().map(unindexed_done).collect();
-        events.push(completed(output));
-        let reduced = assemble(events).unwrap();
-        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
-        let items = reduced.items();
-        assert_eq!(items.len(), 3);
-        assert_eq!(items[0].reasoning_text().as_deref(), Some("plan"));
-        assert_eq!(items[1].text_content().as_deref(), Some("checking"));
-        assert_eq!(items[2].call().unwrap().id(), "call-stable");
-    }
-
-    #[test]
     fn tool_argument_events_resolve_by_native_item_id() {
         let call = function("function", "call-stable", r#"{"key":"value"}"#);
         let arguments = |kind: &str, field: &str, value: Value| json!({"type":format!("response.function_call_arguments.{kind}"), "item_id":"function", field:value});
@@ -1072,46 +666,13 @@ mod tests {
         );
     }
 
-    #[test]
-    fn terminal_regenerated_ids_preserve_streamed_identity_without_duplicate_items() {
-        let streamed = [
-            reasoning("reason-stream", "plan"),
-            message("text-stream", "checking"),
-            function("function-stream", "call-stable", r#"{"a":1,"b":2}"#),
-        ];
-        let mut terminal = vec![
-            reasoning("reason-terminal", "plan"),
-            message("text-terminal", "checking"),
-            function("function-terminal", "call-stable", r#"{ "b": 2, "a": 1 }"#),
-        ];
-        terminal[1]["content"][0]["annotations"] =
-            json!([{"type":"url_citation", "url":"https://example.invalid/"}]);
-        let mut events = Vec::new();
-        for (position, item) in streamed.iter().enumerate() {
-            events.push(added(position, item.clone()));
-            events.push(done(position, item.clone()));
-        }
-        events.push(completed(terminal));
-        let reduced = assemble(events).unwrap();
-        assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
-        let items = reduced.items();
-        let ids: Vec<_> = items.iter().map(|item| item.id().as_str()).collect();
-        assert_eq!(ids, ["reason-stream", "text-stream", "function-stream"]);
-        let call = items[2].call().unwrap();
-        assert_eq!(call.id(), "call-stable");
-        assert_eq!(
-            Value::Object(call.arguments().clone()),
-            json!({"a":1, "b":2})
-        );
-    }
-
     /// Feeds events without calling finish: an unrelated missing-terminal error could
     /// mask accidental acceptance of the invalid reference under test.
     fn fails_while_feeding(events: Vec<Value>) -> bool {
         let mut decoder = decoder();
         events.into_iter().any(|event| match decoder.feed(event) {
             Err(error) => {
-                assert_eq!(error.kind, ProviderErrorKind::Protocol, "{error:?}");
+                assert_eq!(error.kind(), ProviderErrorKind::Protocol, "{error:?}");
                 true
             }
             Ok(_) => false,
@@ -1133,15 +694,7 @@ mod tests {
             events.push(completed(terminal));
             events
         };
-        let mut overcached = completed(vec![]);
-        overcached["response"]["usage"]["input_tokens_details"]["cached_tokens"] = json!(21);
-        let mut overwritten = completed(vec![]);
-        overwritten["response"]["usage"]["input_tokens_details"]["cache_write_tokens"] = json!(9);
         let mut cases = vec![
-            // Cache reads and writes are disjoint parts of the prompt, so more
-            // of them than input is inconsistent.
-            vec![overcached],
-            vec![overwritten],
             // Regenerated terminal ids cannot replace changed text, disambiguate
             // equivalent items, or take an id owned by another item kind.
             with(

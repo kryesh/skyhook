@@ -12,18 +12,42 @@ const MESSAGE_BATCH_COUNT: usize = 128;
 pub(super) enum Publish {
     /// A foreground child's replies are read through its result.
     Record,
-    /// Queue it now and wake the owner.
+    /// Progress beside tool calls: queue it now and wake the owner.
     Wake,
-    /// Queue it when the invocation resolves.
+    /// A text-only turn may be the invocation's answer, which is the job's result:
+    /// hold it until the invocation resolves.
     Withhold,
 }
 
-/// The child reply this record projects; empty for a whitespace-only turn.
-pub(super) fn visible_text(message: &Message) -> Option<String> {
-    let Message::Assistant(items) = message else {
-        return None;
-    };
-    Some(crate::provider::protocol::visible_text(items))
+/// The child reply a committed assistant turn projects.
+pub(super) struct Reply {
+    /// Empty for a whitespace-only turn.
+    pub(super) text: String,
+    /// The turn made tool calls, so it cannot be the invocation's answer.
+    pub(super) progress: bool,
+}
+
+impl Reply {
+    pub(super) fn of(message: &Message) -> Option<Self> {
+        let Message::Assistant(items) = message else {
+            return None;
+        };
+        Some(Self {
+            text: crate::provider::protocol::visible_text(items),
+            progress: items.iter().any(|item| item.call().is_some()),
+        })
+    }
+
+    /// Live commits and replay decide alike, from the committed turn itself.
+    pub(super) fn publish(&self, jobs: &HashMap<JobId, JobEntry>, job: JobId) -> Publish {
+        if !views::effectively_background(jobs, job) {
+            Publish::Record
+        } else if self.progress {
+            Publish::Wake
+        } else {
+            Publish::Withhold
+        }
+    }
 }
 
 impl JobEntry {
@@ -35,10 +59,7 @@ impl JobEntry {
     pub(super) fn pending_since(&self, floor: u64) -> bool {
         self.child()
             .is_some_and(|child| !child.messages.is_empty() && child.message_stamp > floor)
-            || (self.background
-                && self.deliverable()
-                && self.delivery == DeliveryState::Pending
-                && self.delivery_stamp > floor)
+            || self.lifecycle_pending().is_some_and(|stamp| stamp > floor)
     }
 
     /// Record a child reply; reports whether it was queued for delivery. A blank
@@ -50,15 +71,18 @@ impl JobEntry {
         text: String,
         publish: Publish,
     ) -> bool {
-        let name = self.name.clone().map(String::from);
+        let name = self.name.clone();
         let finished = self.end().is_some();
         let Some(child) = self.child_mut() else {
             return false;
         };
+        // A later turn means the answer did not resolve its invocation; replies
+        // deliver oldest first. Live, `notify_owner` has usually released it already.
+        child.release();
+        child.answer = None;
         if text.is_empty() {
             return false;
         }
-        child.last_message = Some(sequence);
         let message = AgentMessage {
             id,
             name,
@@ -67,12 +91,10 @@ impl JobEntry {
         };
         match publish {
             Publish::Record => false,
-            // A finished job has already released what it withheld; a reply that
-            // lands after its end is delivered on its own.
+            // A finished job has already resolved; a reply that lands after its end
+            // is delivered on its own.
             Publish::Withhold if !finished => {
-                // Replies deliver oldest first: an earlier withheld reply goes ahead.
-                child.release();
-                child.withheld = Some(message);
+                child.answer = Some(Answer::Held(message));
                 false
             }
             Publish::Wake | Publish::Withhold => {
@@ -82,10 +104,15 @@ impl JobEntry {
         }
     }
 
-    /// Drop the queued reply committed at `source`: its owner has it.
+    /// Drop the reply committed at `source`: its owner has it.
     pub(super) fn deliver_message(&mut self, source: MessageSeq) {
         if let Some(child) = self.child_mut() {
             child.messages.retain(|message| message.message != source);
+            // Replay holds a reply until a later turn; live may have released and
+            // delivered it before that turn.
+            child
+                .answer
+                .take_if(|answer| matches!(answer, Answer::Held(held) if held.message == source));
         }
     }
 }
@@ -95,100 +122,55 @@ impl JobManager {
     /// cancellation-shielded operation. The source sequence is the delivery ID.
     /// Empty visible text is committed to history but produces no delivery/wake.
     ///
-    /// `wake_owner` decides when the reply is delivered. A terminal reply passes
-    /// `false`: it is withheld until the job's completion (or
-    /// [`JobManager::notify_owner`]) presents it in the same delivery batch as the
-    /// completion envelope, so no request boundary in between shows it alone. A
-    /// reply committed after the job already finished wakes the owner at once.
+    /// A text-only turn is held: completing the job makes it the result, and an
+    /// invocation that goes on releases it through [`JobManager::notify_owner`].
+    /// A turn with tool calls is progress and wakes the owner at once, as does
+    /// a reply committed after the job already finished.
     pub(crate) async fn commit_child_message(
         &self,
         child: &AgentId,
         job: JobId,
         message: Message,
         text: String,
-        wake_owner: bool,
         follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
     ) -> Result<MessageSeq, JobError> {
         // Refuse a projection that replay could not reproduce (including reasoning).
-        if visible_text(&message).as_deref() != Some(text.as_str()) {
-            return Err(JobError::ChildTextMismatch);
-        }
-        let manager = self.clone();
+        let reply = Reply::of(&message)
+            .filter(|reply| reply.text == text)
+            .ok_or(JobError::ChildTextMismatch)?;
         let child = child.clone();
-        tokio::spawn(async move {
+        // Spawned before taking the gate: a caller cancelled while it waits still commits.
+        self.spawn_owned((), "child message delivery", move |manager| async move {
             let _delivery = manager.inner.delivery_operation.lock().await;
-            let (owner, associated) = {
+            let owner = {
                 let jobs = manager.inner.jobs.lock().await;
                 let entry = jobs.get(&job).ok_or(JobError::Unknown(job))?;
                 let launched = entry.child().ok_or(JobError::NoChild(job))?;
-                (entry.agent.clone(), launched.agent.clone())
+                if launched.agent.as_ref() != Some(&child) {
+                    return Err(JobError::ChildOwnerMismatch(job));
+                }
+                entry.agent.clone()
             };
-            if child.parent().as_ref() != Some(&owner) {
-                return Err(JobError::ChildOwnerMismatch(job));
-            }
-            let valid = if let Some(associated) = associated {
-                associated == child
-            } else {
-                let mut valid = false;
-                manager
-                    .inner
-                    .store
-                    .visit_records_after(RecordSeq::default(), |records| {
-                        valid = records.iter().any(|record| {
-                            record.agent == child
-                                && matches!(&record.event, SessionEvent::AgentStarted {
-                                owner_job: Some(owner_job), ..
-                            } if *owner_job == job)
-                        });
-                    })
-                    .await;
-                valid
-            };
-            if !valid {
-                return Err(JobError::ChildOwnerMismatch(job));
-            }
             let record = manager
                 .inner
                 .store
-                .append_then(
-                    child.clone(),
-                    SessionEvent::MessageCommitted { message },
-                    follow,
-                )
+                .append_then(child, SessionEvent::MessageCommitted { message }, follow)
                 .await?
                 .swap_remove(0);
             let mut jobs = manager.inner.jobs.lock().await;
-            let publish = if !views::effectively_background(&jobs, job) {
-                Publish::Record
-            } else if wake_owner {
-                Publish::Wake
-            } else {
-                Publish::Withhold
-            };
+            let publish = reply.publish(&jobs, job);
             let entry = jobs.get_mut(&job).ok_or(JobError::Unknown(job))?;
-            if let Some(launched) = entry.child_mut() {
-                launched.agent = Some(child);
-            }
             let sequence = record.sequence.message();
-            let published = entry.publish_message(job, sequence, text, publish);
-            if published {
-                let _ = manager
-                    .inner
-                    .completions
-                    .send(JobCompletion { agent: owner, job });
+            if entry.publish_message(job, sequence, reply.text, publish) {
+                manager.wake(owner, job);
             }
             Ok(sequence)
         })
         .await
-        .map_err(|error| JobError::OwnerLost {
-            owner: "child message delivery",
-            reason: error.to_string(),
-        })?
     }
 
-    /// Deliver the reply `commit_child_message(.., wake_owner: false)` withheld and
-    /// wake the owner for it, for invocations that resolve without finishing the
-    /// owning job.
+    /// Queue the reply `commit_child_message` held and wake the owner for it, for
+    /// invocations that resolve without finishing the owning job.
     pub(crate) async fn notify_owner(&self, job: JobId) {
         let mut jobs = self.inner.jobs.lock().await;
         let Some(entry) = jobs.get_mut(&job) else {
@@ -199,22 +181,9 @@ impl JobManager {
             return;
         };
         child.release();
-        if child.messages.is_empty() {
-            return;
+        if !child.messages.is_empty() {
+            self.wake(entry.agent.clone(), job);
         }
-        let _ = self.inner.completions.send(JobCompletion {
-            agent: entry.agent.clone(),
-            job,
-        });
-    }
-
-    /// Last committed *visible* child message, even after acknowledgement/resume.
-    #[cfg(test)]
-    pub(crate) async fn last_agent_message(
-        &self,
-        job: JobId,
-    ) -> Result<Option<MessageSeq>, JobError> {
-        self.entry(job, |entry| entry.child()?.last_message).await
     }
 }
 
@@ -299,6 +268,7 @@ mod tests {
         };
         let job = manager.test_running(spec).await.into_test_id();
         let child = session.start_child(owner, index, Some(job)).await;
+        manager.set_child_agent(job, child.clone()).await.unwrap();
         (child, job)
     }
 
@@ -309,12 +279,6 @@ mod tests {
             ..JobSpec::test(owner.clone(), "exec")
         };
         manager.test_running(spec).await.into_test_id()
-    }
-
-    /// A saved result too large to present inline.
-    async fn finish_bulky(manager: &JobManager, job: JobId) {
-        let result = serde_json::json!("y".repeat(2 * output::PAGE_BYTES));
-        manager.test_finish(job, result).await;
     }
 
     fn envelope_ids(receipt: &PendingDelivery) -> Vec<JobId> {
@@ -329,10 +293,27 @@ mod tests {
         Message::Assistant(vec![AssistantItem::text("text", 0, text)])
     }
 
-    async fn commit(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> MessageSeq {
+    /// A text-only turn, which may be its invocation's answer.
+    async fn answer(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> MessageSeq {
         let message = assistant(text);
         manager
-            .commit_child_message(child, job, message, text.into(), true, |_| Vec::new())
+            .commit_child_message(child, job, message, text.into(), |_| Vec::new())
+            .await
+            .unwrap()
+    }
+
+    /// Progress: a turn with a tool call beside its text.
+    fn progress(text: &str) -> Message {
+        let call = crate::provider::protocol::ToolCall::new("call", "todo", serde_json::json!({}));
+        Message::Assistant(vec![
+            AssistantItem::text("text", 0, text),
+            AssistantItem::tool_call("call", 1, call.unwrap()),
+        ])
+    }
+
+    async fn commit(manager: &JobManager, child: &AgentId, job: JobId, text: &str) -> MessageSeq {
+        manager
+            .commit_child_message(child, job, progress(text), text.into(), |_| Vec::new())
             .await
             .unwrap()
     }
@@ -375,7 +356,7 @@ mod tests {
     async fn foreground_replies_are_consumed_by_the_result() {
         let (_root, manager, owner, child, job) = child_job(false).await;
         commit(&manager, &child, job, "first").await;
-        let second = commit(&manager, &child, job, "second").await;
+        answer(&manager, &child, job, "second").await;
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         assert!(receipt.messages().is_empty() && receipt.envelopes().is_empty());
         drop(receipt);
@@ -383,7 +364,6 @@ mod tests {
         manager.claim(job).await.unwrap();
         for state in [manager.clone(), manager.test_replay().await] {
             assert!(!state.has_pending(&owner).await);
-            assert_eq!(state.last_agent_message(job).await.unwrap(), Some(second));
             let output = state.snapshot(job).await.unwrap().output;
             assert_eq!(output, Some(serde_json::json!("saved result")));
         }
@@ -418,10 +398,6 @@ mod tests {
         receipt.commit(message).await.unwrap();
         let restored = manager.test_replay().await;
         assert!(!restored.has_pending(&owner).await);
-        assert_eq!(
-            restored.last_agent_message(job).await.unwrap(),
-            Some(source)
-        );
     }
 
     #[tokio::test]
@@ -488,36 +464,6 @@ mod tests {
         }
     }
 
-    /// A completed child agent's envelope is budgeted as the metadata it presents,
-    /// not as the saved result it references. The replies are acknowledged first
-    /// so that pinning cannot mask the cost of the envelopes.
-    #[tokio::test]
-    async fn referenced_completions_are_budgeted_as_metadata() {
-        let (session, manager, owner) = owner_session().await;
-        // More children than whole-page envelopes the lifecycle budget would admit.
-        let count = LIFECYCLE_BATCH_BYTES / output::PAGE_BYTES + 4;
-        let mut jobs = Vec::new();
-        for index in 0..count {
-            let (child, job) = agent_job(&session, &manager, &owner, index as u32 + 1, true).await;
-            commit(&manager, &child, job, "small reply").await;
-            jobs.push(job);
-        }
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert_eq!(receipt.messages().len(), count);
-        assert!(receipt.envelopes().is_empty());
-        ack(receipt).await;
-        // The reference survives acknowledgement, so the envelopes stay metadata.
-        for job in &jobs {
-            finish_bulky(&manager, *job).await;
-        }
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert!(receipt.messages().is_empty());
-        assert_eq!(envelope_ids(&receipt), jobs);
-        ack(receipt).await;
-        assert!(!manager.has_pending(&owner).await);
-        assert!(!manager.test_replay().await.has_pending(&owner).await);
-    }
-
     /// The lifecycle budget is denominated in the bytes presentation really emits,
     /// so a fan-in of untruncatable results is bounded instead of concatenated.
     #[tokio::test]
@@ -542,9 +488,7 @@ mod tests {
                     output::OutputArgs::new(*job),
                     crate::job::CancellationToken::new(),
                     &capabilities,
-                    output::OutputOptions::Host {
-                        presentation: OutputPresentation::Automatic,
-                    },
+                    output::OutputOptions::Host,
                 )
                 .await
                 .unwrap();
@@ -590,97 +534,31 @@ mod tests {
         assert!(manager.has_pending(&owner).await);
     }
 
-    /// A reply in the batch pins the completion that references it even when
-    /// earlier completions have exhausted the lifecycle budget.
+    /// A text-only reply is held: completing the job makes it the result, so the
+    /// completion is the only delivery, live and on replay. An invocation that goes
+    /// on, a later turn or any other end releases it as a reply.
     #[tokio::test]
-    async fn reply_pins_its_completion_when_the_lifecycle_budget_is_full() {
-        let (session, manager, owner) = owner_session().await;
-        // One more whole-page envelope than the budget admits, all created before
-        // the child job so their lower IDs consume the budget first.
-        let fillers = LIFECYCLE_BATCH_BYTES / output::PAGE_BYTES + 1;
-        let mut crowd = Vec::new();
-        for _ in 0..fillers {
-            crowd.push(tool_job(&manager, &owner).await);
-        }
-        let (child, job) = agent_job(&session, &manager, &owner, 1, true).await;
-        let sequence = commit(&manager, &child, job, "small reply").await;
-        finish(&manager, job).await;
-        for filler in &crowd {
-            finish_bulky(&manager, *filler).await;
-        }
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert_eq!(sequences(&receipt), [sequence]);
-        // How many fillers fit depends on the budget, so assert the invariant: the
-        // batch is full, yet the completion referencing this batch's reply is in it.
-        let admitted = envelope_ids(&receipt);
-        assert!(admitted.len() <= crowd.len(), "admitted {admitted:?}");
-        assert!(admitted.contains(&job), "admitted {admitted:?}");
-        ack(receipt).await;
-        // Every crowded-out filler still arrives, in later batches.
-        let mut deferred: Vec<_> = crowd
-            .iter()
-            .copied()
-            .filter(|filler| !admitted.contains(filler))
-            .collect();
-        assert!(!deferred.is_empty());
-        while !deferred.is_empty() {
-            let receipt = manager.pending_delivery(&owner).await.unwrap();
-            assert!(receipt.messages().is_empty());
-            let batch = envelope_ids(&receipt);
-            assert!(!batch.is_empty(), "no progress with {deferred:?} deferred");
-            deferred.retain(|filler| !batch.contains(filler));
-            ack(receipt).await;
-        }
-        assert!(!manager.has_pending(&owner).await);
-        assert!(!manager.test_replay().await.has_pending(&owner).await);
-    }
-
-    /// A terminal child reply is durable but withheld from delivery, so the job's
-    /// own completion is the single wake that presents both items in one batch and
-    /// no owner request boundary in between shows the reply alone.
-    #[tokio::test]
-    async fn deferred_reply_waits_for_its_completion_and_notify_owner_covers_the_rest() {
+    async fn held_answer_is_the_result_unless_its_invocation_goes_on() {
         let (session, manager, owner) = owner_session().await;
         let (child, job) = agent_job(&session, &manager, &owner, 1, true).await;
         let mut wakes = manager.subscribe_completions();
-        let message = assistant("terminal answer");
-        let sequence = manager
-            .commit_child_message(
-                &child,
-                job,
-                message,
-                "terminal answer".into(),
-                false,
-                |_| Vec::new(),
-            )
-            .await
-            .unwrap();
+        answer(&manager, &child, job, "saved result").await;
         // Durable, but neither pending nor a wake until the invocation resolves.
         assert!(!manager.has_pending(&owner).await);
         assert!(wakes.try_recv().is_err());
-        assert_eq!(
-            manager.last_agent_message(job).await.unwrap(),
-            Some(sequence)
-        );
-
-        // The completion wake presents reply and envelope as one receipt.
         finish(&manager, job).await;
         assert_eq!(wakes.try_recv().unwrap().job, job);
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert_eq!(sequences(&receipt), [sequence]);
-        assert_eq!(receipt.envelopes().len(), 1);
-        ack(receipt).await;
+        for state in [manager.clone(), manager.test_replay().await] {
+            let receipt = state.pending_delivery(&owner).await.unwrap();
+            assert!(receipt.messages().is_empty());
+            assert_eq!(envelope_ids(&receipt), [job]);
+        }
+        ack(manager.pending_delivery(&owner).await.unwrap()).await;
         assert!(!manager.has_pending(&owner).await);
 
         // An invocation that does not finish releases the reply explicitly instead.
         let (child, job) = agent_job(&session, &manager, &owner, 2, true).await;
-        let message = assistant("kept going");
-        let sequence = manager
-            .commit_child_message(&child, job, message, "kept going".into(), false, |_| {
-                Vec::new()
-            })
-            .await
-            .unwrap();
+        let sequence = answer(&manager, &child, job, "kept going").await;
         assert!(!manager.has_pending(&owner).await);
         manager.notify_owner(job).await;
         assert_eq!(wakes.try_recv().unwrap().job, job);
@@ -702,26 +580,49 @@ mod tests {
         assert!(!manager.has_pending(&owner).await);
 
         // A shielded commit that lands after the job finished is delivered on its
-        // own: nothing later would release a withheld reply.
+        // own: nothing later would release a held reply.
         let (child, job) = agent_job(&session, &manager, &owner, 3, true).await;
         finish(&manager, job).await;
         ack(manager.pending_delivery(&owner).await.unwrap()).await;
         while wakes.try_recv().is_ok() {}
-        let message = assistant("late answer");
-        let sequence = manager
-            .commit_child_message(&child, job, message, "late answer".into(), false, |_| {
-                Vec::new()
-            })
-            .await
-            .unwrap();
+        let sequence = answer(&manager, &child, job, "late answer").await;
         assert_eq!(wakes.try_recv().unwrap().job, job);
         assert_eq!(
             sequences(&manager.pending_delivery(&owner).await.unwrap()),
             [sequence]
         );
         ack(manager.pending_delivery(&owner).await.unwrap()).await;
+
+        // Replay has no `notify_owner`: a later turn releases the held reply there,
+        // and an end other than completion releases the last one.
+        let (child, job) = agent_job(&session, &manager, &owner, 4, true).await;
+        let first = answer(&manager, &child, job, "first answer").await;
+        manager.notify_owner(job).await;
+        let second = answer(&manager, &child, job, "second answer").await;
+        let failure = crate::tool::ToolError::failed("stopped");
+        manager.finish(job, failure.into()).await.unwrap();
+        for state in [manager.clone(), manager.test_replay().await] {
+            let receipt = state.pending_delivery(&owner).await.unwrap();
+            assert_eq!(sequences(&receipt), [first, second]);
+            assert_eq!(envelope_ids(&receipt), [job]);
+        }
+        ack(manager.pending_delivery(&owner).await.unwrap()).await;
         assert!(!manager.has_pending(&owner).await);
         assert!(!manager.test_replay().await.has_pending(&owner).await);
+
+        // Completion withdraws an answer released but not yet delivered, which
+        // replay never queued: the result is its only delivery, however many
+        // notifications released it.
+        let (child, job) = agent_job(&session, &manager, &owner, 5, true).await;
+        answer(&manager, &child, job, "released answer").await;
+        manager.notify_owner(job).await;
+        manager.notify_owner(job).await;
+        finish(&manager, job).await;
+        for state in [manager.clone(), manager.test_replay().await] {
+            let receipt = state.pending_delivery(&owner).await.unwrap();
+            assert!(receipt.messages().is_empty());
+            assert_eq!(envelope_ids(&receipt), [job]);
+        }
     }
 
     #[tokio::test]
@@ -761,10 +662,6 @@ mod tests {
         drop(receipt);
         finish(&manager, job).await;
         let restored = manager.test_replay().await;
-        assert_eq!(
-            restored.last_agent_message(job).await.unwrap(),
-            Some(second)
-        );
         assert_eq!(first_pending(&restored, &owner).await.message, second);
     }
 
@@ -773,29 +670,20 @@ mod tests {
         let (_root, manager, owner, child, job) = child_job(true).await;
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         let mut wakes = manager.subscribe_completions();
-        let message = assistant("survives");
         let mut pending = Box::pin(manager.commit_child_message(
             &child,
             job,
-            message,
+            progress("survives"),
             "survives".into(),
-            true,
             |_| Vec::new(),
         ));
         // Poll through the internal spawn, then cancel the caller while the spawned
         // transaction is waiting on the receipt's delivery gate.
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), pending.as_mut())
-                .await
-                .is_err()
-        );
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
         drop(pending);
         assert!(wakes.try_recv().is_err());
         drop(receipt);
-        tokio::time::timeout(Duration::from_secs(2), wakes.recv())
-            .await
-            .unwrap()
-            .unwrap();
+        crate::tests::bounded(wakes.recv()).await.unwrap();
         assert_eq!(first_pending(&manager, &owner).await.text, "survives");
         finish(&manager, job).await;
         assert_eq!(
@@ -822,19 +710,13 @@ mod tests {
             let projection = crate::provider::protocol::visible_text(&items);
             assert_eq!(projection, "", "blank text {blank:?}");
             manager
-                .commit_child_message(
-                    &child,
-                    job,
-                    Message::Assistant(items),
-                    projection,
-                    true,
-                    |_| Vec::new(),
-                )
+                .commit_child_message(&child, job, Message::Assistant(items), projection, |_| {
+                    Vec::new()
+                })
                 .await
                 .unwrap();
             // Committed to history, but not as a reply.
             assert_eq!(manager.store().records().await.len(), before + 1);
-            assert_eq!(manager.last_agent_message(job).await.unwrap(), None);
             assert!(!manager.has_pending(&owner).await);
             assert!(wakes.try_recv().is_err(), "blank reply woke the owner");
             assert!(
@@ -847,7 +729,6 @@ mod tests {
             );
             // Replay agrees. (It delivers the job as interrupted, so assert on replies.)
             let replayed = manager.test_replay().await;
-            assert_eq!(replayed.last_agent_message(job).await.unwrap(), None);
             assert!(
                 replayed
                     .pending_delivery(&owner)
@@ -886,14 +767,9 @@ mod tests {
             ),
         ] {
             let message = assistant(text);
-            let result = manager.commit_child_message(
-                &author,
-                job,
-                message,
-                projection.into(),
-                true,
-                |_| Vec::new(),
-            );
+            let result =
+                manager
+                    .commit_child_message(&author, job, message, projection.into(), |_| Vec::new());
             let failure = result.await.unwrap_err();
             assert_eq!(
                 std::mem::discriminant(&failure),

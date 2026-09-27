@@ -1,6 +1,6 @@
 //! Metadata-only request rows and request timing.
 
-use super::{Entry, EntryBody, clean, number};
+use super::{Entry, clean, number};
 use skyhook::provider::protocol::Usage;
 use skyhook::session::{ModelPurpose, RequestPhase, RequestRecord, RequestSeq};
 
@@ -46,7 +46,11 @@ impl RequestRow {
     pub fn metadata(&self) -> [String; 4] {
         [
             format!("Request #{}", self.sequence),
-            format!("{:?}", self.purpose),
+            match self.purpose {
+                ModelPurpose::Agent => "Agent",
+                ModelPurpose::Compaction => "Compaction",
+            }
+            .into(),
             self.model.clone(),
             self.status.label().into(),
         ]
@@ -71,7 +75,7 @@ pub(super) fn request_entry(sequence: RequestSeq, record: &RequestRecord) -> Ent
     let row = RequestRow {
         sequence,
         purpose: record.purpose,
-        model: clean(&record.profile.profile.model).replace('\n', " "),
+        model: clean(record.profile.profile.model.as_str()).replace('\n', " "),
         status,
         usage: reported(record.usage),
         elapsed_tenths: request_elapsed(record),
@@ -85,7 +89,7 @@ fn request_status(phase: &RequestPhase) -> RequestStatus {
     match phase {
         RequestPhase::Requested | RequestPhase::Open { .. } => RequestStatus::Running,
         RequestPhase::Retrying { .. } => RequestStatus::Retrying,
-        RequestPhase::Failed { .. } | RequestPhase::Refused { .. } => RequestStatus::Failed,
+        RequestPhase::Failed { .. } => RequestStatus::Failed,
         RequestPhase::Interrupted { .. } => RequestStatus::Interrupted,
         RequestPhase::Completed { .. } => RequestStatus::Completed,
     }
@@ -96,44 +100,16 @@ fn reported(usage: Usage) -> Option<Usage> {
     (usage != Usage::default()).then_some(usage)
 }
 
-/// Update a request row's time-dependent fields in place; the result is
-/// identical to rebuilding it with `request_entry`. Returns whether it changed.
-pub(super) fn refresh_request_entry(entry: &mut Entry, record: &RequestRecord) -> bool {
-    let EntryBody::Request { row, text } = &mut entry.body else {
-        return false;
-    };
-    let status = request_status(&record.phase);
-    let usage = reported(record.usage);
-    let elapsed_tenths = request_elapsed(record);
-    if entry.running == status.running()
-        && row.status == status
-        && row.usage == usage
-        && row.elapsed_tenths == elapsed_tenths
-    {
-        return false;
-    }
-    entry.running = status.running();
-    row.usage = usage;
-    row.elapsed_tenths = elapsed_tenths;
-    if row.status != status {
-        row.status = status;
-        *text = row.metadata().join(" · ");
-    }
-    true
-}
-
 /// Tenths of a second from the request until it settled, or until now while it
 /// is still pending.
 pub(super) fn request_elapsed(record: &RequestRecord) -> Option<u64> {
     let start = record.requested_millis;
-    let end = if record.phase.pending() {
+    let end = record.phase.settled_at().unwrap_or_else(|| {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(start, |duration| {
                 duration.as_millis().min(i64::MAX as u128) as i64
             })
-    } else {
-        record.finished_millis?
-    };
+    });
     Some(end.saturating_sub(start).max(0) as u64 / 100)
 }

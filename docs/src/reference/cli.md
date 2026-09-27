@@ -131,7 +131,8 @@ row, then totals per model and per tool.
 - **`markdown`** prints that document as Markdown headings and tables.
 - **`tree`** lists the agents as `tree` would, each line carrying that agent's figures, followed
   by a one-line total.
-- **`json`** writes one JSON document with every figure: per agent, its outcome, start and
+- **`json`** writes one JSON document with every figure: per agent, its outcome (a failure
+  as `{"kind", "provider", "message"}`, with `provider` only for a provider failure), start and
   final finish times (a resumed child counts only its last completion),
   usage, request counts (requested, completed, failed, interrupted, attempts), compactions, jobs
   created by role, and calls, errors, and unanswered calls per tool; plus per-model and

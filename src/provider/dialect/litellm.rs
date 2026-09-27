@@ -6,38 +6,30 @@
 //! virtual key as a bearer token; session affinity and spend logs key on
 //! `x-litellm-session-id`; deployment tags ride `x-litellm-tags`.
 
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 
 use super::{Common, Dialect, DialectConfig, DialectError, Profile};
 use crate::{
     named_enum::named_enum,
+    newtype::string_newtype,
     provider::{
+        ProviderErrorKind,
         codec::{
-            Codec, CodecName, Identity, SchemaConstraint, ToolNames,
+            Codec, CodecName, SchemaConstraint, ToolNames,
             chat_completions::{self, Cache, EmptyContent, ReasoningReplay},
-            header, messages, path, responses,
+            header, messages, path,
         },
         http::{
             Transport,
-            errors::{ErrorRule, ErrorSignals, Field, RuleKind},
-            headers::Value,
+            errors::{ErrorRule, ErrorSignals, Field},
         },
     },
 };
 
-const SESSION_HEADER: &str = "x-litellm-session-id";
-
-const fn session() -> Identity {
-    Identity {
-        cache_key: header(SESSION_HEADER),
-        user_id: None,
-    }
-}
-
 named_enum! {
     /// The family behind an alias.
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum Upstream {
         Openai = "openai",
         Anthropic = "anthropic",
@@ -63,7 +55,6 @@ fn chat_openai() -> chat_completions::Dialect {
         empty_content: EmptyContent::Null,
         tool_names: ToolNames::OpenAi,
         schema: SchemaConstraint::OpenAiStrict,
-        identity: session(),
         ..chat_completions::Dialect::compatible()
     }
 }
@@ -76,24 +67,7 @@ fn chat_claude() -> chat_completions::Dialect {
         empty_content: EmptyContent::Null,
         tool_names: ToolNames::OpenAi,
         cache: Cache::ContentPartBreakpoints { ttl: None },
-        identity: session(),
         ..chat_completions::Dialect::compatible()
-    }
-}
-
-/// The bridge to Claude may drop `prompt_cache_key`, so affinity travels as a
-/// header whatever the upstream.
-fn responses() -> responses::Dialect {
-    responses::Dialect {
-        identity: session(),
-        ..super::openai::responses()
-    }
-}
-
-fn messages() -> messages::Dialect {
-    messages::Dialect {
-        identity: session(),
-        ..messages::Dialect::anthropic()
     }
 }
 
@@ -103,11 +77,11 @@ const ERRORS: ErrorSignals = ErrorSignals {
     rules: &[
         ErrorRule {
             message: Some("ContextWindowExceededError"),
-            ..ErrorRule::kind(RuleKind::ContextWindowExceeded)
+            ..ErrorRule::kind(ProviderErrorKind::ContextWindowExceeded)
         },
         ErrorRule {
             field: Some(Field::Equals("type", "budget_exceeded")),
-            ..ErrorRule::kind(RuleKind::Billing)
+            ..ErrorRule::kind(ProviderErrorKind::Billing)
         },
     ],
     ..ErrorSignals::NONE
@@ -120,48 +94,48 @@ fn transport() -> Transport {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("tags must be nonblank, without commas or control characters")]
+pub struct InvalidTag;
+
+string_newtype! {
+    /// A deployment tag. Tags travel comma-separated in one header.
+    pub struct Tag(InvalidTag) = |tag| {
+        let valid = !tag.trim().is_empty() && !tag.contains(',');
+        HeaderValue::from_str(tag).ok().filter(|_| valid).map(drop).ok_or(InvalidTag)
+    };
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     pub upstream: Upstream,
     /// Sent as `x-litellm-tags`, for tag-based routing and spend logs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<String>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum Error {
-    #[error("tags must be nonblank, without commas or control characters")]
-    Tags,
+    pub tags: Vec<Tag>,
 }
 
 impl DialectConfig for Config {
+    /// The bridge to Claude may drop `prompt_cache_key`, so affinity travels as
+    /// a header whatever the upstream and codec.
     fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
         let claude = self.upstream.is_claude();
-        let conventions = match codec {
+        let mut conventions = match codec {
             CodecName::ChatCompletions => {
                 Codec::ChatCompletions(if claude { chat_claude() } else { chat_openai() })
             }
-            CodecName::Responses => Codec::Responses(responses()),
-            CodecName::Messages => Codec::Messages(messages()),
+            CodecName::Responses => Codec::Responses(super::openai::responses()),
+            CodecName::Messages => Codec::Messages(messages::Dialect::anthropic()),
         };
+        conventions.identity_mut().cache_key = header("x-litellm-session-id");
         let mut profile = Profile {
             scope: self.upstream.scope(),
             ..Profile::new(conventions, transport(), Dialect::Litellm)
         };
         if !self.tags.is_empty() {
-            let valid = self
-                .tags
-                .iter()
-                .all(|tag| !tag.trim().is_empty() && !tag.contains(','));
-            let value = HeaderValue::from_str(&self.tags.join(","))
-                .ok()
-                .filter(|_| valid)
-                .ok_or(Error::Tags)?;
-            profile.headers.insert(
-                HeaderName::from_static("x-litellm-tags"),
-                Value::Fixed(value),
-            );
+            let tags: Vec<_> = self.tags.iter().map(Tag::as_str).collect();
+            let value = HeaderValue::from_str(&tags.join(",")).expect("tags join into header text");
+            profile.fixed("x-litellm-tags", value);
         }
         Ok(profile)
     }
@@ -174,10 +148,8 @@ mod tests {
 
     #[tokio::test]
     async fn virtual_key_session_and_tags_ride_every_request() {
-        let config = Config {
-            upstream: Upstream::Bedrock,
-            tags: vec!["team-a".into(), "prod".into()],
-        };
+        let config: Config =
+            crate::yaml::parse("{upstream: bedrock, tags: [team-a, prod]}").unwrap();
         let chat = head(&config, CodecName::ChatCompletions, "sk-virtual").await;
         assert_eq!(header_values(&chat, "authorization"), ["Bearer sk-virtual"]);
         assert_eq!(header_values(&chat, "x-litellm-session-id"), ["ctx"]);
@@ -190,15 +162,7 @@ mod tests {
         let responses = head(&openai, CodecName::Responses, "k").await;
         assert_eq!(header_values(&responses, "x-litellm-session-id"), ["ctx"]);
         assert_eq!(Upstream::Bedrock.scope(), "litellm:bedrock");
-        let bad = Config {
-            upstream: Upstream::Openai,
-            tags: vec!["a,b".into()],
-        };
-        assert_eq!(
-            bad.admit(&Common::default(), CodecName::ChatCompletions)
-                .unwrap_err(),
-            Error::Tags.into()
-        );
+        assert!(crate::yaml::parse::<Config>("{upstream: openai, tags: ['a,b']}").is_err());
     }
 
     /// The proxy names an overflow only in its message, and a spent budget by

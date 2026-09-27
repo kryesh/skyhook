@@ -9,8 +9,9 @@ use skyhook::execution::ExecutionLocation;
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobRole, JobState, JobTransition};
 use skyhook::provider::protocol::Usage;
-use skyhook::session::{MessageSeq, RecordSeq, RequestLedger, SessionEvent};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use skyhook::session::{MessageSeq, RecordSeq, SessionEvent};
+use skyhook::target::TargetRef;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
 use std::time::{Duration, Instant};
 
@@ -109,9 +110,9 @@ pub struct AgentInfo {
     /// The model the agent runs on; none for a tool-only agent.
     pub model: Option<skyhook::provider::profile::ModelRef>,
     /// The root agent's applied mode.
-    pub mode: Option<String>,
+    pub mode: Option<skyhook::tool::policy::ModeName>,
     pub capabilities: Vec<skyhook::tool::policy::Capability>,
-    pub target: String,
+    pub target: TargetRef,
     pub owner: Option<JobId>,
     pub lifecycle: AgentLifecycle,
 }
@@ -121,12 +122,6 @@ impl AgentInfo {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum JobActivity {
-    Work,
-    Wait,
-}
-
 #[derive(Clone)]
 pub struct JobInfo {
     pub id: JobId,
@@ -134,7 +129,6 @@ pub struct JobInfo {
     pub name: Option<String>,
     pub tool: String,
     pub role: JobRole,
-    pub(super) activity: JobActivity,
     pub args: Value,
     pub parent: Option<JobId>,
     pub state: JobState,
@@ -143,10 +137,6 @@ pub struct JobInfo {
 }
 
 impl JobInfo {
-    pub fn target(&self) -> &str {
-        self.location.target.as_str()
-    }
-
     pub fn location_label(&self) -> String {
         format!(
             "{} · {}",
@@ -163,19 +153,25 @@ impl JobInfo {
 #[derive(Default)]
 pub struct Projection {
     pub agents: Vec<AgentInfo>,
-    pub jobs: BTreeMap<JobId, JobInfo>,
+    /// Written only through the record fold, which keeps `open_jobs` in step.
+    jobs: BTreeMap<JobId, JobInfo>,
+    /// Each agent's unfinished jobs.
+    open_jobs: HashMap<AgentId, BTreeSet<JobId>>,
     pub usage: Usage,
     pub agent_usage: HashMap<AgentId, Usage>,
     pub todos: HashMap<AgentId, Vec<TodoItem>>,
     pub(super) through: RecordSeq,
     pub(super) records_by_agent: HashMap<AgentId, Vec<RecordSeq>>,
-    pub(super) ledger: RequestLedger,
     /// Calls that admitted a job, so the job card stands in for the call.
     pub(super) tool_origins: HashSet<(AgentId, MessageSeq, String)>,
     /// What records folded since the last `take_changes` touched.
     changes: HashSet<Dep>,
 }
 impl Projection {
+    pub fn jobs(&self) -> &BTreeMap<JobId, JobInfo> {
+        &self.jobs
+    }
+
     pub(super) fn agent_name(&self, agent: &AgentId) -> &str {
         let info = self.agents.iter().find(|info| &info.id == agent);
         info.map_or("Agent", |info| info.name.as_str())
@@ -213,7 +209,23 @@ impl Projection {
         std::mem::take(&mut self.changes)
     }
 
+    /// Every job state change goes through here, so the open index follows each
+    /// transition, including a finished child resumed under its own job.
+    fn set_job_state(&mut self, job: JobId, state: JobState) -> Option<&mut JobInfo> {
+        let info = self.jobs.get_mut(&job)?;
+        info.state = state;
+        let open = self.open_jobs.entry(info.agent.clone()).or_default();
+        if state.is_terminal() {
+            open.remove(&job);
+        } else {
+            open.insert(job);
+        }
+        Some(info)
+    }
+
     pub fn rebuild(&mut self, snapshot: &ObservationSnapshot) {
+        let requests = snapshot.ledger.changed_after(self.through);
+        self.changes.extend(requests.map(Dep::Request));
         let after = (Bound::Excluded(self.through), Bound::Unbounded);
         for (_, record) in snapshot.records.range(after) {
             self.through = record.sequence;
@@ -221,8 +233,6 @@ impl Projection {
                 .entry(record.agent.clone())
                 .or_default()
                 .push(record.sequence);
-            let requests = self.ledger.observe(record).into_iter();
-            self.changes.extend(requests.map(Dep::Request));
             match &record.event {
                 SessionEvent::AgentStarted {
                     profile,
@@ -245,7 +255,7 @@ impl Projection {
                         model: profile.as_ref().map(|profile| profile.name.clone()),
                         mode: mode.as_ref().map(|mode| mode.name.clone()),
                         capabilities: capabilities.clone(),
-                        target: location.target.to_string(),
+                        target: location.target.clone(),
                         owner: *owner_job,
                         lifecycle: AgentLifecycle::Active,
                     });
@@ -279,10 +289,6 @@ impl Projection {
                             name: name.clone().map(String::from),
                             tool: tool.clone(),
                             role: *role,
-                            activity: match (role, tool.as_str()) {
-                                (JobRole::Tool, "wait") => JobActivity::Wait,
-                                _ => JobActivity::Work,
-                            },
                             args: arguments.clone(),
                             parent: *parent,
                             state: JobState::Queued,
@@ -290,12 +296,11 @@ impl Projection {
                             error: None,
                         },
                     );
+                    self.set_job_state(*job, JobState::Queued);
                 }
                 SessionEvent::JobStateChanged { job, state } => {
                     self.changes.insert(Dep::Job(*job));
-                    if let Some(info) = self.jobs.get_mut(job) {
-                        info.state = (*state).into();
-                    }
+                    self.set_job_state(*job, (*state).into());
                     // Resuming a retained child reuses its owner job and does not
                     // emit AgentStarted again. Reopen its tree row on that job's
                     // Running event, not on ordinary model/tool activity updates.
@@ -322,8 +327,7 @@ impl Projection {
                         .find(|agent| agent.id == record.agent)
                         .map(|agent| agent.capabilities.iter().copied().collect())
                         .unwrap_or_else(skyhook::tool::policy::CapabilitySet::empty);
-                    if let Some(info) = self.jobs.get_mut(job) {
-                        info.state = (*state).into();
+                    if let Some(info) = self.set_job_state(*job, (*state).into()) {
                         info.error = diagnostic
                             .as_ref()
                             .map(|diagnostic| diagnostic.render(&capabilities));
@@ -377,42 +381,54 @@ impl Projection {
             .iter()
             .any(|agent| !agent.id.path().is_empty() && !agent.terminal())
     }
-    pub(super) fn child_target<'a>(&'a self, caller: &AgentId, arguments: &'a Value) -> &'a str {
-        arguments
-            .get("target")
-            .and_then(Value::as_str)
-            .or_else(|| {
-                self.agents
-                    .iter()
-                    .find(|agent| &agent.id == caller)
-                    .map(|agent| agent.target.as_str())
-            })
-            .unwrap_or("root")
+    /// Where a child of `caller` runs, given the agent call's `target` argument;
+    /// a requested target that does not parse is returned as given.
+    pub(super) fn child_target<'a>(
+        &self,
+        caller: &AgentId,
+        target: Option<&'a Value>,
+    ) -> Result<TargetRef, &'a str> {
+        match target.and_then(Value::as_str) {
+            Some(requested) => requested.parse().map_err(|_| requested),
+            None => Ok(self
+                .agents
+                .iter()
+                .find(|agent| &agent.id == caller)
+                .map_or(TargetRef::Root, |agent| agent.target.clone())),
+        }
     }
-    pub(super) fn job_target<'a>(&'a self, job: &'a JobInfo) -> &'a str {
+    pub(super) fn job_target<'a>(&self, job: &'a JobInfo) -> Result<TargetRef, &'a str> {
         if job.role == JobRole::Agent {
             self.agents
                 .iter()
                 .find(|agent| agent.owner == Some(job.id))
                 .map_or_else(
-                    || self.child_target(&job.agent, &job.args),
-                    |agent| agent.target.as_str(),
+                    || self.child_target(&job.agent, job.args.get(skyhook::tool::TARGET)),
+                    |agent| Ok(agent.target.clone()),
                 )
         } else {
-            job.target()
+            Ok(job.location.target.clone())
         }
     }
-    pub fn visible(&self, selected: &AgentId) -> Vec<AgentInfo> {
-        self.agents
-            .iter()
-            .filter(|a| {
-                a.id.path().is_empty()
-                    || !a.terminal()
-                    || selected.is_within(&a.id)
-                    || a.lifecycle.within_grace()
-            })
-            .cloned()
-            .collect()
+    /// An agent's footer statistics.
+    pub fn agent_stats(&self, snapshot: &ObservationSnapshot, agent: &AgentId) -> [String; 3] {
+        let usage = self.agent_usage.get(agent).copied().unwrap_or_default();
+        let context = snapshot.context.get(agent);
+        super::super::format::footer_stats(usage, context.map(|c| (c.tokens, c.capacity)))
+    }
+    pub fn has_open_jobs(&self) -> bool {
+        self.open_jobs.values().any(|jobs| !jobs.is_empty())
+    }
+    /// Indices of the agents the live tree shows.
+    pub fn visible<'a>(&'a self, selected: &'a AgentId) -> impl Iterator<Item = usize> + 'a {
+        let shown = |a: &AgentInfo| {
+            a.id.path().is_empty()
+                || !a.terminal()
+                || selected.is_within(&a.id)
+                || a.lifecycle.within_grace()
+        };
+        let agents = self.agents.iter().enumerate();
+        agents.filter_map(move |(index, agent)| shown(agent).then_some(index))
     }
     pub fn status(&self, agent: &AgentInfo, snapshot: &ObservationSnapshot) -> AgentDisplayState {
         use AgentDisplayState as State;
@@ -441,11 +457,8 @@ impl Projection {
             Some(AgentActivity::Stopped(_)) => State::Job(JobState::Failed),
             Some(AgentActivity::WaitingChildren) => State::Waiting(WaitReason::Child),
             activity => {
-                let jobs: Vec<_> = self
-                    .jobs
-                    .values()
-                    .filter(|j| j.agent == agent.id && !j.state.is_terminal())
-                    .collect();
+                let open = self.open_jobs.get(&agent.id).into_iter().flatten();
+                let jobs: Vec<_> = open.filter_map(|id| self.jobs.get(id)).collect();
                 if !jobs.is_empty() && jobs.iter().all(|j| j.state == JobState::AwaitingApproval) {
                     State::Waiting(WaitReason::Permission)
                 } else if jobs
@@ -455,7 +468,7 @@ impl Projection {
                     State::Waiting(WaitReason::Input)
                 } else if jobs
                     .iter()
-                    .any(|j| j.activity == JobActivity::Wait && j.state == JobState::Running)
+                    .any(|j| j.role == JobRole::Wait && j.state == JobState::Running)
                 {
                     // A wait pauses the agent even while its background jobs keep running.
                     State::Waiting(WaitReason::Event)
@@ -471,212 +484,132 @@ impl Projection {
     }
 }
 
-pub fn agent_footer(
-    snapshot: &ObservationSnapshot,
-    projection: &Projection,
-    agent: &AgentId,
-) -> String {
-    agent_footer_stats(snapshot, projection, agent).join(" · ")
-}
-pub fn agent_footer_stats(
-    snapshot: &ObservationSnapshot,
-    projection: &Projection,
-    agent: &AgentId,
-) -> [String; 3] {
-    super::super::format::footer_stats(
-        projection
-            .agent_usage
-            .get(agent)
-            .copied()
-            .unwrap_or_default(),
-        snapshot
-            .context
-            .get(agent)
-            .map(|context| (context.tokens, context.capacity)),
-    )
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::tests::Journal;
+    use super::super::tests::{Journal, created, finished};
     use super::*;
-    use skyhook::identity::SessionId;
 
-    fn agent() -> AgentInfo {
+    fn agent(id: AgentId) -> AgentInfo {
         AgentInfo {
-            id: AgentId::root(SessionId::from_bytes([1; 16])),
+            id,
             name: "Failed Waiting for permission".into(),
             model: Some("test/test".parse().unwrap()),
             mode: None,
             capabilities: Vec::new(),
-            target: "root".into(),
+            target: TargetRef::Root,
             owner: None,
             lifecycle: AgentLifecycle::Active,
         }
     }
 
-    fn job(agent: &AgentInfo, id: u64, role: JobRole, state: JobState) -> JobInfo {
-        // Deliberately misleading: behavior comes from role, not this label.
-        JobInfo {
-            tool: "agent".into(),
-            ..super::super::tests::job_info(&agent.id, id, role, state)
-        }
+    fn changed(id: u64, state: JobTransition) -> SessionEvent {
+        let job = JobId::new(id).unwrap();
+        SessionEvent::JobStateChanged { job, state }
     }
 
-    #[test]
-    fn display_precedence_preserves_terminal_owner_activity_and_job_order() {
+    fn status(
+        journal: &Journal,
+        projection: &mut Projection,
+        agent: &AgentInfo,
+    ) -> AgentDisplayState {
+        projection.rebuild(&journal.snapshot);
+        projection.status(agent, &journal.snapshot)
+    }
+
+    #[tokio::test]
+    async fn display_precedence_preserves_terminal_owner_activity_and_job_order() {
         use AgentDisplayState as State;
-        let mut agent = agent();
+        use JobTransition::{AwaitingApproval, Running, WaitingInput};
+        let mut journal = Journal::new().await;
+        let root = journal.agent();
+        let id = root.child(1);
+        let mut agent = agent(id.clone());
         let mut projection = Projection::default();
-        let mut snapshot = ObservationSnapshot::default();
-        let reconnecting = AgentActivity::Reconnecting { attempt: 2 };
-        snapshot.activity.insert(agent.id.clone(), reconnecting);
+        let activity = |journal: &mut Journal, activity| {
+            journal.snapshot.activity.insert(id.clone(), activity);
+        };
+        activity(&mut journal, AgentActivity::Reconnecting { attempt: 2 });
         // Recovery is active without any job.
-        assert_eq!(
-            projection.status(&agent, &snapshot),
-            State::Reconnecting { attempt: 2 }
-        );
-        let owner = job(&agent, 1, JobRole::Agent, JobState::WaitingInput);
-        agent.owner = Some(owner.id);
-        projection.jobs.insert(owner.id, owner);
-        snapshot
-            .activity
-            .insert(agent.id.clone(), AgentActivity::Working);
-        assert_eq!(
-            projection.status(&agent, &snapshot),
-            State::Waiting(WaitReason::ParentInput)
-        );
+        let state = status(&journal, &mut projection, &agent);
+        assert_eq!(state, State::Reconnecting { attempt: 2 });
+        // Behavior comes from roles, not the deliberately misleading tool names.
+        journal
+            .record(&root, created(1, "agent", JobRole::Agent))
+            .await;
+        journal.record(&root, changed(1, WaitingInput)).await;
+        agent.owner = JobId::new(1).ok();
+        journal.record(&id, start(agent.owner)).await;
+        activity(&mut journal, AgentActivity::Working);
+        let state = status(&journal, &mut projection, &agent);
+        assert_eq!(state, State::Waiting(WaitReason::ParentInput));
         agent.lifecycle.complete(Instant::now());
-        assert_eq!(
-            projection.status(&agent, &snapshot),
-            State::Job(JobState::WaitingInput)
-        );
+        let state = status(&journal, &mut projection, &agent);
+        assert_eq!(state, State::Job(JobState::WaitingInput));
         agent.lifecycle = AgentLifecycle::Active;
         agent.owner = None;
-        assert_eq!(projection.status(&agent, &snapshot), State::Working);
-        snapshot.activity.clear();
-        projection.jobs.clear();
-        let tool = job(&agent, 2, JobRole::Tool, JobState::Running);
-        projection.jobs.insert(tool.id, tool);
-        assert_eq!(projection.status(&agent, &snapshot), State::RunningTools);
-        projection
-            .jobs
-            .get_mut(&JobId::new(2).unwrap())
-            .unwrap()
-            .role = JobRole::Agent;
+        assert_eq!(status(&journal, &mut projection, &agent), State::Working);
+        journal.snapshot.activity.clear();
+        journal
+            .record(&id, created(2, "agent", JobRole::Tool))
+            .await;
+        journal.record(&id, changed(2, Running)).await;
         assert_eq!(
-            projection.status(&agent, &snapshot),
-            State::Waiting(WaitReason::Child)
+            status(&journal, &mut projection, &agent),
+            State::RunningTools
         );
-        let wait = JobInfo {
-            activity: JobActivity::Wait,
-            ..job(&agent, 4, JobRole::Tool, JobState::Running)
-        };
-        projection.jobs.insert(wait.id, wait);
-        assert_eq!(
-            projection.status(&agent, &snapshot),
-            State::Waiting(WaitReason::Event)
-        );
-        let question = job(&agent, 3, JobRole::Question, JobState::Running);
-        projection.jobs.insert(question.id, question);
-        assert_eq!(
-            projection.status(&agent, &snapshot),
-            State::Waiting(WaitReason::Input)
-        );
-        for job in projection.jobs.values_mut() {
-            job.state = JobState::AwaitingApproval;
+        journal.record(&id, finished(2)).await;
+        journal
+            .record(&id, created(3, "agent", JobRole::Agent))
+            .await;
+        let state = status(&journal, &mut projection, &agent);
+        assert_eq!(state, State::Waiting(WaitReason::Child));
+        journal.record(&id, created(4, "wait", JobRole::Wait)).await;
+        journal.record(&id, changed(4, Running)).await;
+        let state = status(&journal, &mut projection, &agent);
+        assert_eq!(state, State::Waiting(WaitReason::Event));
+        journal
+            .record(&id, created(5, "agent", JobRole::Question))
+            .await;
+        let state = status(&journal, &mut projection, &agent);
+        assert_eq!(state, State::Waiting(WaitReason::Input));
+        for job in [3, 4, 5] {
+            journal.record(&id, changed(job, AwaitingApproval)).await;
         }
-        assert_eq!(
-            projection.status(&agent, &snapshot),
-            State::Waiting(WaitReason::Permission)
-        );
-        snapshot
-            .activity
-            .insert(agent.id.clone(), AgentActivity::WaitingChildren);
-        assert_eq!(
-            projection.status(&agent, &snapshot),
-            State::Waiting(WaitReason::Child)
-        );
+        let state = status(&journal, &mut projection, &agent);
+        assert_eq!(state, State::Waiting(WaitReason::Permission));
+        activity(&mut journal, AgentActivity::WaitingChildren);
+        let state = status(&journal, &mut projection, &agent);
+        assert_eq!(state, State::Waiting(WaitReason::Child));
     }
 
     #[tokio::test]
     async fn wait_tool_status_tracks_classification_and_settlement() {
         use AgentDisplayState as State;
         let waiting = State::Waiting(WaitReason::Event);
-        assert_eq!(waiting.label(), "Waiting");
         for (tool, role, running) in [
-            ("wait", JobRole::Tool, waiting),
+            ("wait", JobRole::Wait, waiting),
             ("exec", JobRole::Tool, State::RunningTools),
-            ("wait_fixture", JobRole::Tool, State::RunningTools),
-            ("wait", JobRole::Script, State::RunningTools),
         ] {
             let mut journal = Journal::new().await;
-            let agent = AgentInfo {
-                id: journal.agent(),
-                ..agent()
-            };
+            let agent = agent(journal.agent());
             let mut projection = Projection::default();
             // A wait pauses the agent even with other owned work still running.
-            let work = job(&agent, 1, JobRole::Tool, JobState::Running);
-            projection.jobs.insert(work.id, work);
-            let candidate = job(&agent, 2, role, JobState::Queued);
+            let work = [
+                created(1, "exec", JobRole::Tool),
+                changed(1, JobTransition::Running),
+            ];
+            for event in work.into_iter().chain([created(2, tool, role)]) {
+                journal.record(&agent.id, event).await;
+            }
+            let state = status(&journal, &mut projection, &agent);
+            assert_eq!(state, State::RunningTools, "{tool}");
             journal
-                .record(
-                    &agent.id,
-                    SessionEvent::JobCreated {
-                        job: candidate.id,
-                        parent: None,
-                        origin: None,
-                        tool: tool.into(),
-                        role,
-                        name: None,
-                        arguments: candidate.args,
-                        output_schema: None,
-                        accepts_input: false,
-                        background: false,
-                        location: candidate.location,
-                    },
-                )
+                .record(&agent.id, changed(2, JobTransition::Running))
                 .await;
-            projection.rebuild(&journal.snapshot);
-            assert_eq!(
-                projection.status(&agent, &journal.snapshot),
-                State::RunningTools,
-                "{tool}"
-            );
-            journal
-                .record(
-                    &agent.id,
-                    SessionEvent::JobStateChanged {
-                        job: candidate.id,
-                        state: JobTransition::Running,
-                    },
-                )
-                .await;
-            projection.rebuild(&journal.snapshot);
-            assert_eq!(
-                projection.status(&agent, &journal.snapshot),
-                running,
-                "{tool}"
-            );
-            journal
-                .record(
-                    &agent.id,
-                    SessionEvent::JobFinished {
-                        job: candidate.id,
-                        state: skyhook::job::JobEnd::Completed,
-                        diagnostic: None,
-                        output_diagnostic: None,
-                        images: Vec::new(),
-                    },
-                )
-                .await;
-            projection.rebuild(&journal.snapshot);
-            assert_eq!(
-                projection.status(&agent, &journal.snapshot),
-                State::RunningTools,
-                "{tool}"
-            );
+            assert_eq!(status(&journal, &mut projection, &agent), running, "{tool}");
+            journal.record(&agent.id, finished(2)).await;
+            let state = status(&journal, &mut projection, &agent);
+            assert_eq!(state, State::RunningTools, "{tool}");
         }
     }
 
@@ -697,41 +630,27 @@ mod tests {
         let root = journal.agent();
         let child = root.child(1);
         let mut projection = Projection::default();
-        let owner = job(&agent(), 1, JobRole::Agent, JobState::WaitingInput);
-        let owner_id = owner.id;
         journal
-            .record(
-                &root,
-                SessionEvent::JobCreated {
-                    job: owner_id,
-                    parent: None,
-                    origin: None,
-                    tool: "agent".into(),
-                    role: JobRole::Agent,
-                    name: None,
-                    arguments: owner.args.clone(),
-                    output_schema: None,
-                    accepts_input: true,
-                    background: false,
-                    location: owner.location.clone(),
-                },
-            )
+            .record(&root, created(1, "agent", JobRole::Agent))
             .await;
-        projection.jobs.insert(owner_id, owner);
+        journal
+            .record(&root, changed(1, JobTransition::WaitingInput))
+            .await;
+        let owner_id = JobId::new(1).unwrap();
         journal.record(&child, start(Some(owner_id))).await;
         journal.record(&child, SessionEvent::AgentCompleted).await;
         projection.rebuild(&journal.snapshot);
         assert!(projection.agents[0].terminal());
         assert!(!projection.has_active_children());
-        assert_eq!(projection.visible(&root).len(), 1);
+        assert_eq!(projection.visible(&root).count(), 1);
         let initial = projection.agents[0].lifecycle;
         projection.complete_agent(&child);
         assert_eq!(projection.agents[0].lifecycle, initial);
         projection.agents[0].lifecycle = expired_grace();
         assert!(projection.retire_completed_grace());
         assert!(!projection.retire_completed_grace());
-        assert!(projection.visible(&root).is_empty());
-        assert_eq!(projection.visible(&child.child(2)).len(), 1);
+        assert_eq!(projection.visible(&root).count(), 0);
+        assert_eq!(projection.visible(&child.child(2)).count(), 1);
         // Ordinary activity cannot reopen a completed agent with a waiting owner.
         journal
             .snapshot
@@ -740,23 +659,25 @@ mod tests {
         projection.rebuild(&journal.snapshot);
         assert!(projection.agents[0].terminal());
         journal
-            .record(
-                &child,
-                SessionEvent::JobStateChanged {
-                    job: owner_id,
-                    state: JobTransition::Running,
-                },
-            )
+            .record(&child, changed(1, JobTransition::Running))
             .await;
         projection.rebuild(&journal.snapshot);
         assert!(!projection.agents[0].terminal());
         assert!(projection.has_active_children());
-        projection.jobs.get_mut(&owner_id).unwrap().state = JobState::Completed;
+        journal.record(&root, finished(1)).await;
         projection.rebuild(&journal.snapshot);
         assert!(projection.agents[0].terminal());
         // Explicit repeated completion, unlike owner reconciliation, renews grace.
         projection.complete_agent(&child);
-        assert_eq!(projection.visible(&root).len(), 1);
+        assert_eq!(projection.visible(&root).count(), 1);
+        // A retained child resumes under its finished owner job, which is open work.
+        journal
+            .record(&child, changed(1, JobTransition::Running))
+            .await;
+        projection.rebuild(&journal.snapshot);
+        assert!(projection.has_open_jobs());
+        let owner = projection.status(&agent(root), &journal.snapshot);
+        assert_eq!(owner, AgentDisplayState::Waiting(WaitReason::Child));
     }
 
     fn expired_grace() -> AgentLifecycle {

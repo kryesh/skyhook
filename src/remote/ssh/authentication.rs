@@ -1,13 +1,21 @@
 //! Session-owned OpenSSH agent and per-process authentication environment.
-use super::askpass::AskpassServer;
-use crate::remote::backend::ProcessEnvironment;
-use crate::remote::{RemoteError, SensitivePromptHandler};
-use crate::target::TargetDefinition;
-use std::{process::Stdio, sync::Arc};
+use super::{AUTH_SOCK, askpass::AskpassServer};
+use crate::remote::{
+    backend::ProcessEnvironment,
+    error::{RemoteError, SshError},
+    prompt::SensitivePromptHandler,
+};
+use crate::target::Route;
+use std::{process::Stdio, sync::Arc, time::Duration};
 use tokio::{
     process::{Child, Command},
     sync::Mutex,
 };
+
+/// How long the managed ssh-agent may take to accept connections.
+const AGENT_START_TIMEOUT: Duration = Duration::from_secs(5);
+/// ssh-agent announces nothing when its socket is ready, so startup polls it.
+const AGENT_READY_POLL: Duration = Duration::from_millis(10);
 
 pub(crate) struct Authentication {
     prompts: Arc<dyn SensitivePromptHandler>,
@@ -40,10 +48,10 @@ impl Authentication {
                 .prefix("skyhook-agent-")
                 .tempdir()?;
             let socket = directory.path().join("agent.sock");
-            let askpass = AskpassServer::start(self.prompts.clone())?;
+            let askpass = AskpassServer::start(self.prompts.clone(), None)?;
             let mut environment = askpass.environment();
             environment.insert(
-                "SSH_AUTH_SOCK".into(),
+                AUTH_SOCK.into(),
                 super::config::wire_path(std::path::Path::new(&socket))?.to_owned(),
             );
             let mut child = Command::new("ssh-agent")
@@ -67,14 +75,12 @@ impl Authentication {
                             "managed ssh-agent exited during startup",
                         ));
                     }
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    tokio::time::sleep(AGENT_READY_POLL).await;
                 }
             };
-            tokio::time::timeout(std::time::Duration::from_secs(5), ready)
+            tokio::time::timeout(AGENT_START_TIMEOUT, ready)
                 .await
-                .map_err(|_| {
-                    RemoteError::ConnectionTask("managed ssh-agent startup timed out".into())
-                })??;
+                .map_err(|_| SshError::AgentTimeout)??;
             *agent = Some(Agent {
                 child,
                 _directory: directory,
@@ -93,7 +99,7 @@ impl Authentication {
     /// own SSH_AUTH_SOCK.
     pub async fn route_environment(
         &self,
-        route: &[TargetDefinition],
+        route: &Route,
     ) -> Result<ProcessEnvironment, RemoteError> {
         if route.iter().all(|hop| hop.ssh.external_agent) {
             return Ok(ProcessEnvironment::new());
@@ -120,16 +126,16 @@ pub(crate) struct WorkerAuthentication {
 impl WorkerAuthentication {
     pub(crate) fn new(prompts: Arc<dyn SensitivePromptHandler>) -> Result<Self, std::io::Error> {
         let agent = Arc::new(Authentication::new(prompts.clone()));
-        let askpass = AskpassServer::start(prompts)?;
+        let askpass = AskpassServer::start(prompts, None)?;
         let mut environment = askpass.environment();
         // OpenSSH already owns a private forwarded socket for this connection.
         // Pass it through; a second forwarding listener adds no isolation or lifetime.
         // A socket path SSH configuration cannot represent only disables agent
         // authentication; password and key authentication still work.
         if let Some(socket) =
-            std::env::var_os("SSH_AUTH_SOCK").and_then(|socket| socket.into_string().ok())
+            std::env::var_os(AUTH_SOCK).and_then(|socket| socket.into_string().ok())
         {
-            environment.insert("SSH_AUTH_SOCK".into(), socket);
+            environment.insert(AUTH_SOCK.into(), socket);
         }
         Ok(Self {
             _askpass: askpass,
@@ -154,9 +160,13 @@ mod tests {
     #[tokio::test]
     async fn routes_using_only_external_agents_never_start_the_private_agent() {
         let authentication = Authentication::new(Arc::new(crate::remote::RejectSensitivePrompts));
-        let mut hop = TargetDefinition::test("external", ".", None);
-        hop.ssh.external_agent = true;
-        let environment = authentication.route_environment(&[hop]).await.unwrap();
+        let mut destination = crate::target::TargetDefinition::test("external", ".", None);
+        destination.ssh.external_agent = true;
+        let route = Route {
+            hops: Vec::new(),
+            destination,
+        };
+        let environment = authentication.route_environment(&route).await.unwrap();
         assert!(environment.is_empty());
         assert!(authentication.agent.lock().await.is_none());
     }

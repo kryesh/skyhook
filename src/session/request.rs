@@ -43,18 +43,16 @@ pub struct Projection {
 }
 
 impl Projection {
-    /// The committed message sources after the checkpoint, as a request names them.
+    /// The last committed message after the checkpoint, which bounds a request's history.
     #[must_use]
-    pub fn sources(&self) -> Vec<MessageSeq> {
+    pub fn through(&self) -> Option<MessageSeq> {
         let start = usize::from(self.checkpoint.is_some());
-        self.messages[start..]
-            .iter()
-            .map(|(sequence, _)| sequence.message())
-            .collect()
+        let (sequence, _) = self.messages[start..].last()?;
+        Some(sequence.message())
     }
 
-    pub fn history(&self) -> impl Iterator<Item = Message> + '_ {
-        self.messages.iter().map(|(_, message)| message.clone())
+    pub fn history(&self) -> impl Iterator<Item = &Message> {
+        self.messages.iter().map(|(_, message)| message)
     }
 }
 
@@ -62,14 +60,14 @@ impl Projection {
 /// message per call as each call finishes; providers receive one tool message per
 /// exchange, ordered like the calls that produced it.
 #[must_use]
-pub fn render_history(
-    messages: impl IntoIterator<Item = Message>,
+pub fn render_history<M: std::borrow::Borrow<Message>>(
+    messages: impl IntoIterator<Item = M>,
 ) -> Vec<crate::provider::protocol::Message> {
     use crate::provider::protocol::Message;
     let mut merged: Vec<Message> = Vec::new();
     let mut calls: Vec<String> = Vec::new();
     for message in messages {
-        match message.render() {
+        match message.borrow().render() {
             Message::Tool(results) => {
                 if let Some(Message::Tool(previous)) = merged.last_mut() {
                     previous.extend(results);
@@ -104,7 +102,7 @@ pub fn render_history(
 /// records, so what a store hands out always projects.
 pub(super) fn admit_records(records: Vec<EventRecord>) -> Result<Vec<EventRecord>, SessionError> {
     for (index, record) in records.iter().enumerate() {
-        validate_compaction(&records[..index], record)?;
+        validate(&records[..index], &[], record)?;
     }
     Ok(records)
 }
@@ -127,9 +125,7 @@ pub fn project_history(records: &[EventRecord], agent: &AgentId) -> Projection {
             .messages
             .push((record.sequence, checkpoint.message.clone()));
         for sequence in &checkpoint.retained {
-            let source = records[..index]
-                .iter()
-                .find(|source| source.sequence == RecordSeq::from(*sequence))
+            let source = record_at(&records[..index], (*sequence).into())
                 .expect("retained sources were validated when the checkpoint was appended");
             let SessionEvent::MessageCommitted { message } = &source.event else {
                 unreachable!()
@@ -169,27 +165,58 @@ fn mode_boundary(records: &[EventRecord], agent: &AgentId) -> RecordSeq {
     switched.map_or(RecordSeq::default(), |record| record.sequence)
 }
 
-pub(super) fn validate_compaction(
-    preceding: &[EventRecord],
+crate::named_enum::named_enum! {
+    /// Why a compaction checkpoint cannot replace its agent's history.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error, serde::Serialize)]
+    pub error enum CheckpointError {
+        #[error("compaction cannot overwrite newer todo state")]
+        StaleTodos = "stale_todos",
+        #[error("compaction message must use the user role")]
+        MessageRole = "message_role",
+        #[error("compaction frontier must precede its event")]
+        Frontier = "frontier",
+        #[error(
+            "compaction request must be a summary request that follows its frontier, precedes its event and belongs to the same agent"
+        )]
+        SummaryRequest = "summary_request",
+        #[error("retained messages must be unique, chronological and covered by the frontier")]
+        RetainedOrder = "retained_order",
+        #[error("retained source must be an original message of the same agent")]
+        RetainedSource = "retained_source",
+        #[error("retained tool exchange is incomplete")]
+        IncompleteExchange = "incomplete_exchange",
+        #[error("retained tool call and results do not match")]
+        MismatchedExchange = "mismatched_exchange",
+    }
+}
+
+/// Validate a request's or checkpoint's references against the records before it:
+/// `committed`, then `batch`.
+pub(super) fn validate(
+    committed: &[EventRecord],
+    batch: &[EventRecord],
     record: &EventRecord,
 ) -> Result<(), SessionError> {
-    let invalid = |reason| SessionError::ModelRequestReplay {
-        sequence: record.sequence.get(),
+    let at = |sequence| record_at(batch, sequence).or_else(|| record_at(committed, sequence));
+    let checkpoint = match &record.event {
+        SessionEvent::Compaction { checkpoint } => checkpoint,
+        SessionEvent::ModelRequested { .. } => {
+            return request_history(record, at).map(drop).map_err(|reason| {
+                SessionError::ModelRequestReplay {
+                    sequence: record.sequence.request(),
+                    reason,
+                }
+            });
+        }
+        _ => return Ok(()),
+    };
+    let invalid = |reason| SessionError::InvalidCompaction {
+        sequence: record.sequence,
         reason,
     };
-    let SessionEvent::Compaction { checkpoint } = &record.event else {
-        return Ok(());
-    };
-    if checkpoint
-        .todos
-        .iter()
-        .any(|item| item.text.trim().is_empty())
-    {
-        return Err(invalid("compaction todo text cannot be blank"));
-    }
-    // Live commits hold the todo-store lock and check its revision first. This
-    // check enforces the same invariant for journal replay and direct appends.
-    if preceding.iter().any(|source| {
+    let preceding = || committed.iter().chain(batch);
+    // Todos replaced after the frontier are newer than the summary reconciled.
+    if preceding().any(|source| {
         source.agent == record.agent
             && source.sequence > checkpoint.frontier
             && matches!(
@@ -197,54 +224,42 @@ pub(super) fn validate_compaction(
                 SessionEvent::TodosReplaced { .. } | SessionEvent::Compaction { .. }
             )
     }) {
-        return Err(invalid("compaction cannot overwrite newer todo state"));
+        return Err(invalid(CheckpointError::StaleTodos));
     }
     if !matches!(checkpoint.message, Message::User(_)) {
-        return Err(invalid("compaction message must use the user role"));
+        return Err(invalid(CheckpointError::MessageRole));
     }
     if checkpoint.frontier >= record.sequence
         || checkpoint.frontier
-            > preceding
+            > batch
                 .last()
+                .or(committed.last())
                 .map_or(RecordSeq::default(), |r| r.sequence)
     {
-        return Err(invalid("compaction frontier must precede its event"));
+        return Err(invalid(CheckpointError::Frontier));
     }
-    let summary = preceding
-        .iter()
-        .find(|source| {
-            source.sequence == RecordSeq::from(checkpoint.attempt.request)
-                && source.agent == record.agent
-                && checkpoint.frontier < source.sequence
-        })
-        .and_then(|source| request_context(source, |sequence| record_at(preceding, sequence)));
+    let summary = at(checkpoint.attempt.request.into())
+        .filter(|source| source.agent == record.agent && checkpoint.frontier < source.sequence)
+        .and_then(|source| request_context(source, at));
     if summary.is_none_or(|context| context.purpose != ModelPurpose::Compaction) {
-        return Err(invalid(
-            "compaction request must be a summary request that follows its frontier, precedes its event and belongs to the same agent",
-        ));
+        return Err(invalid(CheckpointError::SummaryRequest));
     }
     let mut last = MessageSeq::default();
     for sequence in &checkpoint.retained {
         if *sequence <= last || RecordSeq::from(*sequence) > checkpoint.frontier {
-            return Err(invalid(
-                "retained messages must be unique, chronological and covered by the frontier",
-            ));
+            return Err(invalid(CheckpointError::RetainedOrder));
         }
-        if !preceding.iter().any(|source| {
-            source.sequence == RecordSeq::from(*sequence)
-                && source.agent == record.agent
+        if !at((*sequence).into()).is_some_and(|source| {
+            source.agent == record.agent
                 && matches!(source.event, SessionEvent::MessageCommitted { .. })
         }) {
-            return Err(invalid(
-                "retained source must be an original message of the same agent",
-            ));
+            return Err(invalid(CheckpointError::RetainedSource));
         }
         last = *sequence;
     }
     // References preserve whole messages, but a checkpoint must also preserve the
     // original assistant call and its complete run of per-call results.
-    let originals: Vec<_> = preceding
-        .iter()
+    let originals: Vec<_> = preceding()
         .filter(|source| {
             source.agent == record.agent
                 && source.sequence <= checkpoint.frontier
@@ -271,7 +286,7 @@ pub(super) fn validate_compaction(
                     .rev()
                     .find(|&index| !matches!(message(index), Message::Tool(_)))
                 else {
-                    return Err(invalid("retained tool exchange is incomplete"));
+                    return Err(invalid(CheckpointError::IncompleteExchange));
                 };
                 assistant
             }
@@ -284,11 +299,11 @@ pub(super) fn validate_compaction(
             .take_while(|&index| matches!(message(index), Message::Tool(_)))
             .collect();
         if !retained(assistant) || results.is_empty() || !results.iter().all(|&i| retained(i)) {
-            return Err(invalid("retained tool exchange is incomplete"));
+            return Err(invalid(CheckpointError::IncompleteExchange));
         }
         let tools: Vec<_> = results.into_iter().map(message).collect();
         if !valid_tool_pair(message(assistant), &tools) {
-            return Err(invalid("retained tool call and results do not match"));
+            return Err(invalid(CheckpointError::MismatchedExchange));
         }
     }
     Ok(())
@@ -319,6 +334,78 @@ fn valid_tool_pair(assistant: &Message, tools: &[&Message]) -> bool {
         && call_set == result_set
 }
 
+/// Why a `ModelRequested` record cannot be replayed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ReplayError {
+    #[error("event not found")]
+    NotFound,
+    #[error("event is not a model request")]
+    NotRequest,
+    #[error("context must be a model context that precedes the call")]
+    Context,
+    #[error("checkpoint must be a compaction of the same agent that precedes the call")]
+    Checkpoint,
+    #[error("message source must precede the call and belong to the same agent")]
+    Source,
+    #[error("referenced event does not contain a conversation message")]
+    NotMessage,
+    #[error("history must end at a message of the same agent's history under the checkpoint")]
+    Through,
+}
+
+/// The history a `ModelRequested` record names: its context, then its checkpoint's
+/// frontier and retained sources.
+struct RequestHistory<'a> {
+    context: &'a ModelContext,
+    frontier: Option<RecordSeq>,
+    retained: &'a [MessageSeq],
+}
+
+/// Resolve a request's references with `at`, which finds only records before it: its
+/// context and checkpoint belong to its agent, and `through` is a message the agent's
+/// history under that checkpoint holds.
+fn request_history<'a>(
+    record: &EventRecord,
+    at: impl Fn(RecordSeq) -> Option<&'a EventRecord>,
+) -> Result<RequestHistory<'a>, ReplayError> {
+    let SessionEvent::ModelRequested {
+        context,
+        checkpoint,
+        through,
+        ..
+    } = &record.event
+    else {
+        return Err(ReplayError::NotRequest);
+    };
+    let own = |source| at(source).filter(|found| found.agent == record.agent);
+    let Some(SessionEvent::ModelContext { context }) = own(*context).map(|found| &found.event)
+    else {
+        return Err(ReplayError::Context);
+    };
+    let (frontier, retained) = match checkpoint.map(&own) {
+        None => (None, &[][..]),
+        Some(Some(EventRecord {
+            event: SessionEvent::Compaction { checkpoint },
+            ..
+        })) => (Some(checkpoint.frontier), &checkpoint.retained[..]),
+        Some(_) => return Err(ReplayError::Checkpoint),
+    };
+    if let Some(through) = *through {
+        let projected = retained.contains(&through)
+            || frontier.is_none_or(|frontier| RecordSeq::from(through) > frontier);
+        let message = own(through.into())
+            .is_some_and(|found| matches!(found.event, SessionEvent::MessageCommitted { .. }));
+        if !(projected && message) {
+            return Err(ReplayError::Through);
+        }
+    }
+    Ok(RequestHistory {
+        context,
+        frontier,
+        retained,
+    })
+}
+
 /// Return the model the request was issued under and the exact request at a
 /// `ModelRequested` event.
 /// Records must be ordered by sequence, as returned by `SessionStore`.
@@ -328,60 +415,47 @@ pub fn reconstruct_model_request(
     records: &[EventRecord],
     sequence: RequestSeq,
 ) -> Result<(ModelRef, ModelRequest), SessionError> {
+    let invalid = |reason| SessionError::ModelRequestReplay { sequence, reason };
     let index = records
         .binary_search_by_key(&sequence.into(), |record| record.sequence)
-        .map_err(|_| SessionError::ModelRequestReplay {
-            sequence: sequence.get(),
-            reason: "event not found",
-        })?;
+        .map_err(|_| invalid(ReplayError::NotFound))?;
     let call = &records[index];
-    let invalid = |reason| SessionError::ModelRequestReplay {
-        sequence: sequence.get(),
-        reason,
-    };
     let SessionEvent::ModelRequested {
         checkpoint,
-        history: sources,
+        through,
         tail,
         history_lifetime,
         ..
     } = &call.event
     else {
-        return Err(invalid("event is not a model request"));
+        return Err(invalid(ReplayError::NotRequest));
     };
-    let lookup = |source: RecordSeq| record_at(&records[..index], source);
-    let context = request_context(call, lookup)
-        .ok_or_else(|| invalid("context must be a model context that precedes the call"))?;
-    let frontier = match checkpoint.map(lookup) {
-        None => None,
-        Some(Some(EventRecord {
-            event: SessionEvent::Compaction { checkpoint },
-            agent,
-            ..
-        })) if *agent == call.agent => Some(checkpoint.frontier),
-        Some(_) => {
-            return Err(invalid(
-                "checkpoint must be a compaction of the same agent that precedes the call",
-            ));
-        }
-    };
-    let switched = mode_boundary(&records[..index], &call.agent);
+    let earlier = &records[..index];
+    let lookup = |source: RecordSeq| record_at(earlier, source);
+    let RequestHistory {
+        context,
+        frontier,
+        retained,
+    } = request_history(call, lookup).map_err(invalid)?;
+    let after = |bound: RecordSeq| earlier.partition_point(|record| record.sequence <= bound);
+    let start = after(frontier.unwrap_or_default());
+    let end = through.map_or(start, |through| after(through.into()).max(start));
+    let later = earlier[start..end].iter().filter(|record| {
+        record.agent == call.agent && matches!(record.event, SessionEvent::MessageCommitted { .. })
+    });
+    let sources = (retained.iter().copied())
+        .chain(later.map(|record| record.sequence.message()))
+        .map(RecordSeq::from);
+    let switched = mode_boundary(earlier, &call.agent);
     let mut history = Vec::new();
-    let sources = sources.iter().map(|source| RecordSeq::from(*source));
     for source in checkpoint.iter().copied().chain(sources) {
         let record = lookup(source)
             .filter(|record| record.agent == call.agent)
-            .ok_or_else(|| {
-                invalid("message source must precede the call and belong to the same agent")
-            })?;
+            .ok_or(invalid(ReplayError::Source))?;
         let message = match &record.event {
             SessionEvent::MessageCommitted { message } => message,
             SessionEvent::Compaction { checkpoint } => &checkpoint.message,
-            _ => {
-                return Err(invalid(
-                    "referenced event does not contain a conversation message",
-                ));
-            }
+            _ => return Err(invalid(ReplayError::NotMessage)),
         };
         // As in projection and summaries, bound reasoning never enters a changed conversation.
         let changed = context.purpose == ModelPurpose::Compaction
@@ -436,7 +510,7 @@ mod tests {
         SessionEvent::ModelRequested {
             context,
             checkpoint,
-            history: history.iter().map(|source| source.message()).collect(),
+            through: history.last().map(|source| source.message()),
             tail: vec![text_message(tail)],
             history_lifetime,
         }
@@ -445,7 +519,7 @@ mod tests {
     fn context(purpose: ModelPurpose, provider: &str, model: &str, system: &str) -> SessionEvent {
         let mut profile = crate::session::tests::profile();
         profile.name.provider = provider.parse().unwrap();
-        profile.profile.model = model.into();
+        profile.profile.model = model.parse().unwrap();
         profile.profile.reasoning = Some("high".into());
         SessionEvent::ModelContext {
             context: crate::session::ModelContext {
@@ -470,7 +544,7 @@ mod tests {
 
     fn todo(text: &str) -> TodoItem {
         TodoItem {
-            text: text.into(),
+            text: text.parse().unwrap(),
             status: TodoStatus::Pending,
         }
     }
@@ -542,7 +616,7 @@ mod tests {
         let template = template.template();
         let context = append(&agent, original.clone()).await;
         let child_context = append(&child, original).await;
-        append(&child, committed(text_message("child only"))).await;
+        let child_message = append(&child, committed(text_message("child only"))).await;
         let history_lifetime = HistoryLifetime::Detached;
         let request = requested(
             context.sequence,
@@ -554,9 +628,23 @@ mod tests {
         let call = append(&agent, request).await;
         append(&agent, context_event_changed()).await;
         append(&agent, committed(text_message("future message"))).await;
-        // A request names only its own agent's context.
-        let foreign = requested(child_context.sequence, None, &[], "state", history_lifetime);
-        assert!(store.append(agent.clone(), foreign).await.is_err());
+        // A request names only its own agent's context and history.
+        for (context, history, expected) in [
+            (child_context.sequence, &[][..], ReplayError::Context),
+            (
+                context.sequence,
+                &[child_message.sequence],
+                ReplayError::Through,
+            ),
+            (context.sequence, &[context.sequence], ReplayError::Through),
+        ] {
+            let request = requested(context, None, history, "state", history_lifetime);
+            let rejected = store.append(agent.clone(), request).await;
+            assert!(
+                matches!(rejected, Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected),
+                "{expected}: {rejected:?}"
+            );
+        }
         let id = store.id();
         drop(store);
         let (store, records) = SessionStore::open(directory.path(), id).await.unwrap();
@@ -573,8 +661,9 @@ mod tests {
         // Value equality ignores key order and the sign of zero; the wire bytes must not.
         let wire = |request: &ModelRequest| serde_json::to_string(&request.history[1]).unwrap();
         assert_eq!(wire(&restored), wire(&expected));
-        store.load_blobs(&mut restored).await.unwrap();
-        store.load_blobs(&mut expected).await.unwrap();
+        let mut cache = crate::media::LoadedBlobs::default();
+        store.load_blobs(&mut restored, &mut cache).await.unwrap();
+        store.load_blobs(&mut expected, &mut cache).await.unwrap();
         assert_eq!(restored, expected);
         assert_eq!(restored.blobs.get(&image.blob).unwrap(), png.bytes());
         let crate::media::AttachmentRef::Text(notes) = notes else {
@@ -582,19 +671,15 @@ mod tests {
         };
         assert_eq!(restored.blobs.text(&notes).unwrap(), "notes");
 
-        // A history source must be a message; a context record is not one.
-        let index = records
-            .iter()
-            .position(|r| r.sequence == call.sequence)
-            .unwrap();
-        let mut invalid = records.clone();
-        let SessionEvent::ModelRequested { history, .. } = &mut invalid[index].event else {
-            unreachable!()
-        };
-        history[0] = child_context.sequence.message();
-        assert!(reconstruct_model_request(&invalid, call.sequence.request()).is_err());
-        assert!(reconstruct_model_request(&records, 0.into()).is_err());
-        assert!(reconstruct_model_request(&records, child_context.sequence.request()).is_err());
+        for (sequence, expected) in [
+            (0.into(), ReplayError::NotFound),
+            (child_context.sequence.request(), ReplayError::NotRequest),
+        ] {
+            assert!(matches!(
+                reconstruct_model_request(&records, sequence),
+                Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected
+            ));
+        }
     }
 
     fn context_event_changed() -> SessionEvent {
@@ -659,13 +744,7 @@ mod tests {
         let records = events
             .into_iter()
             .enumerate()
-            .map(|(index, event)| EventRecord {
-                id: crate::identity::EventId::generate().unwrap(),
-                sequence: (index as u64 + 1).into(),
-                timestamp_millis: 0,
-                agent: agent.clone(),
-                event,
-            })
+            .map(|(index, event)| crate::session::tests::record(&agent, index as u64 + 1, event))
             .collect();
         (agent, records)
     }
@@ -678,22 +757,18 @@ mod tests {
             .collect()
     }
 
-    fn messages(sources: &[MessageSeq]) -> Vec<u64> {
-        sources.iter().map(|source| source.get()).collect()
-    }
-
     #[test]
     fn projection_preserves_concurrent_messages_and_repeated_compaction() {
         let (agent, records) = projection_fixture();
         let early = project_history(&records[..6], &agent);
         assert_eq!((early.checkpoint, sequences(&early)), (None, vec![1, 2, 6]));
-        assert_eq!(messages(&early.sources()), [1, 2, 6]);
+        assert_eq!(early.through(), Some(RecordSeq::from(6).message()));
         let first = project_history(&records[..8], &agent);
         assert_eq!(
             (first.checkpoint, sequences(&first)),
             (Some(7.into()), vec![7, 1, 6, 8])
         );
-        assert_eq!(messages(&first.sources()), [1, 6, 8]);
+        assert_eq!(first.through(), Some(RecordSeq::from(8).message()));
         assert_eq!(
             (&first.messages[1].1, &first.messages[2].1),
             (
@@ -712,22 +787,36 @@ mod tests {
                 .messages
                 .is_empty()
         );
-        // Reconstruction resolves the same references and rejects broken ones.
-        for (checkpoint, source) in [(Some(3), 1u64), (Some(9), 1), (Some(7), 4), (Some(7), 9)] {
+        // Reconstruction resolves the same checkpoint and history bound, and rejects a
+        // checkpoint that is not the agent's, or a bound its history does not hold.
+        use ReplayError::{Checkpoint, Through};
+        for (checkpoint, through, expected) in [
+            (3u64, 8u64, Some(Checkpoint)),
+            (9, 8, Some(Checkpoint)),
+            (7, 1, None),
+            (7, 2, Some(Through)),
+            (7, 4, Some(Through)),
+            (7, 20, Some(Through)),
+        ] {
             let mut invalid = records.clone();
             let SessionEvent::ModelRequested {
                 checkpoint: named,
-                history,
+                through: bound,
                 ..
             } = &mut invalid[8].event
             else {
                 unreachable!()
             };
-            (*named, history[0]) = (
-                checkpoint.map(Into::into),
-                RecordSeq::from(source).message(),
-            );
-            assert!(reconstruct_model_request(&invalid, 9.into()).is_err());
+            *named = Some(checkpoint.into());
+            *bound = Some(RecordSeq::from(through).message());
+            let replayed = reconstruct_model_request(&invalid, 9.into());
+            match expected {
+                None => assert!(replayed.is_ok()),
+                Some(expected) => assert!(matches!(
+                    replayed,
+                    Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected
+                )),
+            }
         }
     }
 
@@ -808,47 +897,32 @@ mod tests {
         };
         let messages =
             |sources: &[RecordSeq]| sources.iter().map(|source| source.message()).collect();
-        for (reason, checkpoint) in [
-            ("duplicate retained", invalid(messages(&[calls, calls]))),
-            ("unordered retained", invalid(messages(&[first, calls]))),
+        use CheckpointError::*;
+        for (expected, checkpoint) in [
+            (RetainedOrder, invalid(messages(&[calls, calls]))),
+            (RetainedOrder, invalid(messages(&[first, calls]))),
+            (RetainedOrder, invalid(messages(&[agent_context]))),
+            (IncompleteExchange, invalid(messages(&[calls]))),
+            (IncompleteExchange, invalid(messages(&[first, second]))),
+            (SummaryRequest, checkpoint(summary, vec![], summary)),
             (
-                "retained after the frontier",
-                invalid(messages(&[agent_context])),
-            ),
-            ("call without its results", invalid(messages(&[calls]))),
-            (
-                "results without their call",
-                invalid(messages(&[first, second])),
-            ),
-            (
-                "frontier after the request",
-                checkpoint(summary, vec![], summary),
-            ),
-            (
-                "frontier in the future",
+                Frontier,
                 checkpoint((summary.get() + 5).into(), vec![], summary),
             ),
-            ("agent request", checkpoint(todos, vec![], request)),
+            (SummaryRequest, checkpoint(todos, vec![], request)),
             (
-                "assistant message",
+                MessageRole,
                 CompactionCheckpoint {
                     message: Message::Assistant(vec![]),
                     ..valid.clone()
                 },
             ),
-            (
-                "blank todo",
-                CompactionCheckpoint {
-                    todos: vec![todo(" ")],
-                    ..valid.clone()
-                },
-            ),
-            ("stale todos", checkpoint(research, vec![], summary)),
+            (StaleTodos, checkpoint(research, vec![], summary)),
         ] {
             let rejected = append(SessionEvent::Compaction { checkpoint }).await;
             assert!(
-                matches!(rejected, Err(SessionError::ModelRequestReplay { .. })),
-                "{reason}: {rejected:?}"
+                matches!(rejected, Err(SessionError::InvalidCompaction { reason, .. }) if reason == expected),
+                "{expected}: {rejected:?}"
             );
         }
         // A loaded journal is admitted by the same rules, so a checkpoint append
@@ -862,17 +936,23 @@ mod tests {
         corrupt.push(record);
         assert!(matches!(
             admit_records(corrupt),
-            Err(SessionError::ModelRequestReplay { .. })
+            Err(SessionError::InvalidCompaction { .. })
         ));
-        let installed = append(SessionEvent::Compaction { checkpoint: valid })
-            .await
-            .unwrap();
+        // A checkpoint may name a summary request committed in its own batch.
+        let owner = agent.clone();
+        let summary = requested(summary_context, None, &sources, "sum", detached);
+        let batch = store.append_then(agent.clone(), summary, move |request| {
+            let checkpoint = checkpoint(todos, vec![calls, first, second], request);
+            let compaction = SessionEvent::Compaction { checkpoint };
+            vec![(owner.clone(), attempt(request)), (owner, compaction)]
+        });
+        let installed = batch.await.unwrap().last().unwrap().sequence;
         let records = admit_records(store.records().await).unwrap();
         let projected = project_history(&records, agent);
         assert_eq!(projected.checkpoint, Some(installed));
         assert_eq!(
-            projected.sources(),
-            [calls, first, second].map(|source| source.message())
+            sequences(&projected),
+            [installed, calls, first, second].map(RecordSeq::get)
         );
     }
 
@@ -930,7 +1010,7 @@ mod tests {
         // A mode switch changes the conversation too: bound reasoning before it is
         // dropped from later requests, while the earlier request replays as sent.
         let mode = crate::session::ModeSelection {
-            name: "plan".into(),
+            name: "plan".parse().unwrap(),
             definition: None,
         };
         let capabilities = Vec::new();

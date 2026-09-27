@@ -1,7 +1,6 @@
 //! Host interactions go to the sole terminal owner, never independent stdin reads.
-use serde_json::Value;
 use skyhook::{
-    agent::{Question, QuestionError, QuestionHandler},
+    agent::{Question, QuestionError, QuestionFuture, QuestionHandler, QuestionReply},
     identity::AgentId,
     remote::{PromptAnswer, SensitivePrompt, SensitivePromptFuture, SensitivePromptHandler},
     target::TargetRef,
@@ -10,13 +9,9 @@ use skyhook::{
         PolicyFuture, ResourceId,
     },
 };
-use std::{
-    future::Future,
-    pin::Pin,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::{mpsc, oneshot};
 
@@ -29,7 +24,7 @@ pub enum PromptKind {
         agent: AgentId,
         questions: Vec<Question>,
         background: bool,
-        reply: Reply<Value>,
+        reply: Reply<QuestionReply>,
     },
     Authentication {
         prompt: SensitivePrompt,
@@ -116,7 +111,10 @@ fn requires_prompt(permission: &PermissionUse) -> bool {
         Capability::Exec | Capability::Targets | Capability::SshAgent | Capability::Network => true,
         Capability::Write => !matches!(
             &permission.resource,
-            ResourceId::Workspace { target, .. } if target == TargetRef::Root.as_str()
+            ResourceId::Workspace {
+                target: TargetRef::Root,
+                ..
+            }
         ),
     }
 }
@@ -191,12 +189,7 @@ impl Policy for HostApprovalPolicy {
 }
 
 impl QuestionHandler for UiInteraction {
-    fn ask(
-        &self,
-        agent: AgentId,
-        questions: Vec<Question>,
-        background: bool,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, QuestionError>> + Send + 'static>> {
+    fn ask(&self, agent: AgentId, questions: Vec<Question>, background: bool) -> QuestionFuture {
         let this = self.clone();
         Box::pin(async move {
             this.request(|reply| PromptKind::Questions {
@@ -255,8 +248,7 @@ pub(crate) mod tests {
                 session.run_script(script).await
             }
         });
-        let prompt = tokio::time::timeout(std::time::Duration::from_secs(10), rx.recv());
-        let prompt = prompt.await.unwrap().unwrap();
+        let prompt = crate::tests::bounded(rx.recv()).await.unwrap();
         let PromptKind::Approval { request, .. } = &prompt.kind else {
             panic!("expected approval");
         };
@@ -302,6 +294,8 @@ pub(crate) mod tests {
         SensitivePrompt {
             kind: skyhook::remote::SensitivePromptKind::Password,
             message: "password".into(),
+            target: None,
+            origin: TargetRef::Root,
         }
     }
 

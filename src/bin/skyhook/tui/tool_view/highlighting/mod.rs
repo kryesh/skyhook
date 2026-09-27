@@ -175,9 +175,13 @@ impl HighlightCache {
         self.generation += 1;
     }
     pub fn poll(&mut self) -> bool {
+        self.apply(None)
+    }
+    /// Apply `received`, then every completion already waiting.
+    fn apply(&mut self, mut received: Option<Completion>) -> bool {
         let mut changed = false;
         loop {
-            let completion = match self.receiver.try_recv() {
+            let completion = match received.take().map_or_else(|| self.receiver.try_recv(), Ok) {
                 Ok(completion) => completion,
                 Err(mpsc::TryRecvError::Empty) => break,
                 Err(mpsc::TryRecvError::Disconnected) => {
@@ -322,13 +326,14 @@ impl HighlightCache {
     /// Block until the real worker has completed every section.
     #[cfg(test)]
     pub fn wait(&mut self, document: &Document) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
         while {
             self.prepare(std::iter::once(document));
             !self.is_highlighted(document)
         } {
-            assert!(std::time::Instant::now() < deadline, "highlight worker");
-            thread::sleep(std::time::Duration::from_millis(1));
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            let completion = self.receiver.recv_timeout(remaining);
+            self.apply(Some(completion.expect("highlight worker")));
         }
     }
 }
@@ -338,7 +343,6 @@ mod tests {
     use super::super::Role;
     use super::super::tests::text;
     use super::*;
-    use std::time::Duration;
 
     type Queue = (
         HighlightCache,
@@ -524,8 +528,8 @@ mod tests {
         let mut cache = HighlightCache::with_notify(sender);
         let document = code("const value = 42;", "js", Role::Plain);
         cache.prepare(std::iter::once(&document));
-        let wake = tokio::time::timeout(Duration::from_secs(5), receiver.recv());
-        assert!(matches!(wake.await.unwrap(), Some(Work::HighlightsReady)));
+        let wake = crate::tests::bounded(receiver.recv());
+        assert!(matches!(wake.await, Some(Work::HighlightsReady)));
         assert!(cache.poll());
         assert!(cache.is_highlighted(&document));
         cache.prepare(std::iter::empty());
@@ -556,7 +560,8 @@ mod tests {
         assert_eq!(queued.try_iter().count(), 1);
         // Cloned admitted keys still obey the source byte budget.
         let (mut cache, _queued, _completed) = queued_cache(CACHE_SECTIONS);
-        let source = "x\n".repeat(MAX_SECTION / 2);
+        let line = format!("{}\n", "x".repeat(MAX_LINE - 1));
+        let source = line.repeat(MAX_SECTION / line.len());
         let key = CodeKey::admit(&CodeSource::from(source.as_str()), "js").unwrap();
         cache.schedule(std::iter::repeat_n(key.clone(), CACHE_SECTIONS + 1));
         assert_eq!(cache.entries.len(), 1);

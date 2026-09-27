@@ -12,6 +12,12 @@ pub(super) struct AgentStatsColumns {
 
 pub(super) const AGENT_STATS_HEADERS: [&str; 3] = ["Output", "Input (uncached)", "Context"];
 
+const SEP: &str = " · ";
+
+fn joined_width(widths: &[usize], separator: &str) -> usize {
+    widths.iter().sum::<usize>() + separator.width() * widths.len().saturating_sub(1)
+}
+
 fn right_aligned(value: &str, width: usize) -> String {
     format!("{}{value}", " ".repeat(width.saturating_sub(value.width())))
 }
@@ -20,6 +26,13 @@ fn join_right_aligned(values: &[String], widths: &[usize], separator: &str) -> S
     let values = values.iter().zip(widths);
     let values = values.map(|(value, width)| right_aligned(value, *width));
     values.collect::<Vec<_>>().join(separator)
+}
+
+/// Cells an agent row is indented per tree level, up to a third of the row.
+const AGENT_INDENT: u16 = 4;
+
+pub(super) fn agent_indent(agent: &model::AgentInfo, width: u16) -> u16 {
+    (agent.id.depth() as u16 * AGENT_INDENT).min(width / 3)
 }
 
 /// Columns shared by every row of an agent list, measured over all its agents.
@@ -31,11 +44,15 @@ pub(super) struct AgentColumns {
 }
 
 impl AgentColumns {
-    pub(super) fn new(agents: &[model::AgentInfo], width: u16, stats: AgentStatsColumns) -> Self {
+    pub(super) fn new<'a>(
+        agents: impl IntoIterator<Item = &'a model::AgentInfo>,
+        width: u16,
+        stats: AgentStatsColumns,
+    ) -> Self {
         // Identity space that keeps the deepest agent's name and target legible.
-        let minimum = agents.iter().map(|agent| {
-            let indent = (agent.id.depth() as u16 * 4).min(width / 3);
-            indent + 16.max(model::target_suffix(&agent.target).width() as u16 + 8)
+        let minimum = agents.into_iter().map(|agent| {
+            agent_indent(agent, width)
+                + 16.max(model::target_suffix(&agent.target).width() as u16 + 8)
         });
         Self::fit(width, minimum.max().unwrap_or(16), stats)
     }
@@ -94,13 +111,12 @@ impl AgentStatsColumns {
         }
         Self {
             widths,
-            separator: " · ",
+            separator: SEP,
         }
     }
 
     pub(super) fn width(&self) -> u16 {
-        let separators = self.separator.width() * (self.widths.len() - 1);
-        (self.widths.iter().sum::<usize>() + separators).min(u16::MAX as usize) as u16
+        joined_width(&self.widths, self.separator).min(u16::MAX as usize) as u16
     }
 
     /// A row outside the measured set is never truncated: it pads to the
@@ -159,7 +175,7 @@ impl RequestColumns {
     }
 
     fn statistics_width(&self) -> usize {
-        self.statistics.iter().sum::<usize>() + 9
+        joined_width(&self.statistics, SEP)
     }
 
     fn show_statistics(&self, width: u16) -> bool {
@@ -167,7 +183,7 @@ impl RequestColumns {
     }
 
     fn format_statistics(&self, values: &[String; 4]) -> String {
-        join_right_aligned(values, &self.statistics, " · ")
+        join_right_aligned(values, &self.statistics, SEP)
     }
 
     pub(super) fn header(&self, width: u16) -> Option<Line<'static>> {
@@ -197,7 +213,7 @@ impl RequestColumns {
         };
         let mut widths = self.metadata;
         // Clip the model column first so IDs, purpose and state remain visible.
-        let excess = (widths.iter().sum::<usize>() + 9).saturating_sub(left_width as usize);
+        let excess = joined_width(&widths, SEP).saturating_sub(left_width as usize);
         widths[2] = widths[2].saturating_sub(excess);
         let status = match row.status {
             model::RequestStatus::Completed => THEME.success,
@@ -214,7 +230,7 @@ impl RequestColumns {
             .enumerate()
         {
             if index > 0 {
-                fields.push(Span::raw(" · "));
+                fields.push(Span::raw(SEP));
             }
             let style = Style {
                 fg,

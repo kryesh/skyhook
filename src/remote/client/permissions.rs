@@ -1,24 +1,25 @@
 //! Validate and rebase remote authorization resources at the host boundary.
-use crate::remote::{ProtocolError, RemoteError};
-use crate::target::{TargetName, TargetRef};
+use crate::remote::error::{ProtocolError, RemoteError};
+use crate::target::TargetRef;
 use crate::tool::policy::PermissionUse;
 
-/// A forwarded permission's proposed grant is derived from its resource, so
-/// rebasing the resource rebases the proposal with it.
+/// A worker scopes permissions to its own machine, which the host knows as
+/// `target`. A forwarded permission's proposed grant is derived from its
+/// resource, so rebasing the resource rebases the proposal with it.
 pub(super) fn rebase_remote_permissions(
-    target: &TargetName,
+    target: &TargetRef,
     permissions: &mut [PermissionUse],
 ) -> Result<(), RemoteError> {
     for permission in permissions {
         let Some(origin) = permission.resource.execution_target_mut() else {
             continue;
         };
-        if !matches!(origin.parse::<TargetRef>(), Ok(TargetRef::Root)) {
+        if *origin != TargetRef::Root {
             return Err(RemoteError::Protocol(
-                ProtocolError::UnexpectedPermissionTarget(origin.to_owned()),
+                ProtocolError::UnexpectedPermissionTarget(origin.clone()),
             ));
         }
-        target.as_str().clone_into(origin);
+        origin.clone_from(target);
     }
     Ok(())
 }
@@ -35,29 +36,30 @@ mod tests {
             PathText::new("/workspace").unwrap(),
         );
         let origin = "https://example.test:8443";
-        let build: TargetName = "build".parse().unwrap();
+        let build: TargetRef = "build".parse().unwrap();
         let mut cases = vec![
             (
                 Capability::Read,
-                ResourceId::path(&crate::target::TargetRef::Root, &outside),
-                ResourceId::path(&"build".parse().unwrap(), &outside),
+                ResourceId::path(&TargetRef::Root, &outside),
+                ResourceId::path(&build, &outside),
             ),
             (
                 Capability::Write,
-                ResourceId::workspace(&crate::target::TargetRef::Root, &workspace),
-                ResourceId::workspace(&"build".parse().unwrap(), &workspace),
+                ResourceId::workspace(&TargetRef::Root, &workspace),
+                ResourceId::workspace(&build, &workspace),
             ),
             (
                 Capability::Network,
-                ResourceId::network(&crate::target::TargetRef::Root, origin),
-                ResourceId::network(&"build".parse().unwrap(), origin),
+                ResourceId::network(&TargetRef::Root, origin),
+                ResourceId::network(&build, origin),
             ),
         ];
         // Routes, sessions and MCP tools are not execution targets.
+        let jump: crate::target::TargetName = "jump".parse().unwrap();
         for (capability, resource) in [
             (
                 Capability::Targets,
-                ResourceId::route("root", vec![("root".into(), 1)]),
+                ResourceId::route(jump.clone(), vec![(jump, 1)]),
             ),
             (Capability::Read, ResourceId::session("root")),
             (Capability::Mcp, ResourceId::mcp("root", "tool")),
@@ -75,7 +77,7 @@ mod tests {
 
     #[test]
     fn forwarded_permissions_cannot_claim_another_target() {
-        let build: TargetName = "build".parse().unwrap();
+        let build: TargetRef = "build".parse().unwrap();
         for resource in [
             ResourceId::path(
                 &"other".parse().unwrap(),

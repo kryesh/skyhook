@@ -121,33 +121,18 @@ for (const manifest of __builders) {
 
 function __jobResponseError(response, message) {
   const error = new Error(message);
-  error.response = response;
-  error.output = response.result ?? null;
-  error.code = response.meta?.code ?? null;
-  error.executed = response.meta?.executed ?? null;
+  Object.defineProperties(error, {response: {value: response}, output: {value: response.result}});
+  if (response.id !== undefined) error.job = response.id;
+  if (response.meta?.code != null) error.code = response.meta.code;
   return error;
 }
 
 function __unwrapResponse(response) {
-  if (response.state === "completed") {
-    if (response.has_result !== true) {
-      throw __jobResponseError(
-        response,
-        `job ${response.id ?? "(unassigned)"} has no loaded result; inspect it with tool.jobs({job: id})`,
-      );
-    }
-    if (!Object.hasOwn(response, "result") || response.result === undefined) {
-      throw new TypeError("unwrap completed response requires a JSON result field (null is allowed)");
-    }
-    return response.result;
+  const state = response.state ?? "completed";
+  if (state === "completed") return response.result ?? null;
+  if (["failed", "cancelled", "interrupted"].includes(state)) {
+    throw __jobResponseError(response, response.error || `job ${response.id ?? "(unassigned)"} ${state}`);
   }
-  if (["failed", "cancelled", "interrupted"].includes(response.state)) {
-    throw __jobResponseError(
-      response,
-      response.error || `job ${response.id ?? "(unassigned)"} ${response.state}`,
-    );
-  }
-  const state = typeof response.state === "string" ? response.state : "unknown";
   throw __jobResponseError(
     response,
     `job ${response.id ?? "(unassigned)"} is not completed (state: ${state})`,
@@ -177,14 +162,14 @@ async function __request(request) {
   // Only tool calls produce JobViews. A received message or a nested payload
   // may look like one, but remains arbitrary user JSON without runtime methods.
   if (request.type === "call") {
-    // The Rust response type owns the schema. Guard only the object boundary
-    // needed to install a runtime method; do not duplicate its field list here.
-    if (response.value === null || typeof response.value !== "object" || Array.isArray(response.value)) {
+    // The Rust response type owns the schema; guard only the object boundary.
+    const view = response.value;
+    if (view === null || typeof view !== "object" || Array.isArray(view)) {
       throw new TypeError(`tool "${request.name}" returned an invalid JobView envelope: expected an object`);
     }
-    Object.defineProperty(response.value, "unwrap", {
+    Object.defineProperty(view, "unwrap", {
       enumerable: false,
-      value() { return __unwrapResponse(response.value); },
+      value() { return __unwrapResponse(view); },
     });
   }
   return response.value;
@@ -192,7 +177,7 @@ async function __request(request) {
 
 function __toolError(message, cause) {
   const error = new Error(message, { cause });
-  for (const key of ["output", "code", "executed"]) {
+  for (const key of ["job", "code"]) {
     if (cause && Object.hasOwn(cause, key)) error[key] = cause[key];
   }
   return error;

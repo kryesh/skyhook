@@ -1,6 +1,9 @@
 //! One owner for a job's cached presentation, selection and asynchronous refresh.
 use super::*;
-use crate::tui::tool_view::OutputView;
+use skyhook::job::JobView;
+
+/// A job's presented output, or why it could not be loaded.
+pub type LoadedOutput = Result<JobView, String>;
 
 #[derive(Default)]
 pub struct OutputStore {
@@ -8,7 +11,7 @@ pub struct OutputStore {
 }
 #[derive(Default)]
 struct OutputEntry {
-    cached: Option<OutputView>,
+    cached: Option<LoadedOutput>,
     query: Option<JobOutputQuery>,
     pending: Option<OutputAttempt>,
     final_output: bool,
@@ -26,7 +29,7 @@ impl OutputAttempt {
     }
 }
 impl OutputStore {
-    pub fn get(&self, job: &JobId) -> Option<&OutputView> {
+    pub fn get(&self, job: &JobId) -> Option<&LoadedOutput> {
         self.entries.get(job)?.cached.as_ref()
     }
     pub fn query(&self, job: JobId) -> Option<&JobOutputQuery> {
@@ -73,7 +76,7 @@ impl OutputStore {
         &mut self,
         attempt: OutputAttempt,
         finished: bool,
-        result: Result<OutputView, String>,
+        result: LoadedOutput,
     ) -> bool {
         let Some(entry) = self.entries.get_mut(&attempt.job) else {
             return false;
@@ -87,35 +90,22 @@ impl OutputStore {
         }
         entry.pending = None;
         entry.final_output = finished;
-        let value = result.unwrap_or_else(OutputView::error);
-        let changed = entry
-            .cached
-            .as_ref()
-            .is_none_or(|cached| cached.value() != value.value());
-        // Keep the canonical product even when its visible JSON is unchanged.
-        entry.cached = Some(value);
+        let changed = entry.cached.as_ref() != Some(&result);
+        entry.cached = Some(result);
         changed
-    }
-    #[cfg(test)]
-    pub fn insert_product(&mut self, job: JobId, value: OutputView) {
-        self.entries.entry(job).or_default().cached = Some(value);
-    }
-    #[cfg(test)]
-    pub fn clear_pending(&mut self) {
-        for entry in self.entries.values_mut() {
-            entry.pending = None;
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::tool_view::tests::view;
+    use serde_json::json;
     fn job() -> JobId {
         JobId::new(1).unwrap()
     }
-    fn value(s: &str) -> Result<OutputView, String> {
-        Ok(OutputView::historical(json!({"result":s})))
+    fn value(s: &str) -> LoadedOutput {
+        Ok(view(json!({"result": s})))
     }
     #[test]
     fn query_change_rejects_old_completion_before_clearing_current_attempt() {
@@ -147,7 +137,8 @@ mod tests {
         let (first, _) = store.begin(job()).unwrap();
         assert!(store.complete(first, false, value("cached")));
         let (refresh, _) = store.begin(job()).unwrap();
-        assert_eq!(store.get(&job()).unwrap().value()["result"], "cached");
+        let cached = store.get(&job()).unwrap().as_ref().unwrap();
+        assert_eq!(cached.result().unwrap(), "cached");
         assert!(!store.complete(refresh, true, value("cached")));
         assert!(store.is_final(job()));
         store.clear_query(job());

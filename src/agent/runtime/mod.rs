@@ -3,7 +3,7 @@ use std::{
     collections::{BTreeMap, HashMap, VecDeque},
     path::{Path, PathBuf},
     sync::{
-        Arc, OnceLock, RwLock as StdRwLock, Weak,
+        Arc, Mutex as StdMutex, OnceLock, PoisonError, RwLock as StdRwLock, Weak,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -34,14 +34,14 @@ use crate::{
     target::{TargetDefinition, TargetRegistry, TargetsConfig},
     tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
     tool::policy::{AllowAll, Policy},
-    tool::policy::{Capability, CapabilitySet, Mode},
+    tool::policy::{Capability, CapabilitySet, Mode, ModeName},
     tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
 };
 
-pub use super::error::{HarnessError, TurnFailure};
+pub use super::error::{Failure, HarnessError, TurnFailure};
 use super::interaction::{QuestionHandler, RuntimeEvent};
 use super::observation::RuntimeEvents;
-use super::{AgentActivity, Observation, Settlement};
+use super::{AgentActivity, ContextUsage, Observation, Settlement};
 use super::{TodoItem, todo::TodoStore};
 
 mod compact;
@@ -58,7 +58,6 @@ mod wait;
 use wait::AgentSender;
 
 const AGENT_CHANNEL_CAPACITY: usize = 64;
-/// Initial generation plus two reconnects. Compaction has its own additive budget.
 mod builder;
 mod dispatch;
 use dispatch::CreatedCall;
@@ -93,9 +92,9 @@ struct HarnessInner {
     max_child_depth: usize,
     /// The most a new session can hold.
     capabilities: CapabilitySet,
-    modes: indexmap::IndexMap<String, Mode>,
+    modes: indexmap::IndexMap<ModeName, Mode>,
     /// The mode a new session starts in; None when no modes are configured.
-    mode: Option<String>,
+    mode: Option<ModeName>,
     target_definitions: Vec<TargetDefinition>,
     shim_catalog: EmbeddedShimCatalog,
     sensitive_prompts: Arc<dyn SensitivePromptHandler>,
@@ -103,9 +102,9 @@ struct HarnessInner {
 
 impl SessionRuntime {
     /// What `mode` grants under the ceiling. Interaction follows the host, not the mode.
-    fn mode_capabilities(&self, name: &str) -> Result<CapabilitySet, HarnessError> {
+    fn mode_capabilities(&self, name: &ModeName) -> Result<CapabilitySet, HarnessError> {
         let mode = self.modes.get(name);
-        let mode = mode.ok_or_else(|| HarnessError::UnknownMode(name.to_owned()))?;
+        let mode = mode.ok_or_else(|| HarnessError::UnknownMode(name.clone()))?;
         Ok(self.granted_by(mode))
     }
 
@@ -173,7 +172,7 @@ pub struct SessionModel {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SessionMode {
     runtime: RuntimeInstance,
-    name: String,
+    name: ModeName,
 }
 
 /// Process-local identity of one runtime instance and its immutable catalog. A
@@ -197,7 +196,7 @@ impl SessionModel {
 
 impl SessionMode {
     #[must_use]
-    pub fn name(&self) -> &str {
+    pub fn name(&self) -> &ModeName {
         &self.name
     }
 }
@@ -210,7 +209,7 @@ struct SessionRuntime {
     capabilities: CapabilitySet,
     /// The harness modes, except that a mode the session has used keeps the
     /// definition it was used under.
-    modes: indexmap::IndexMap<String, Mode>,
+    modes: indexmap::IndexMap<ModeName, Mode>,
     store: SessionStore,
     jobs: JobManager,
     todos: TodoStore,
@@ -223,12 +222,12 @@ struct SessionRuntime {
     agents: StdRwLock<HashMap<AgentId, LiveAgent>>,
     child_counters: RwLock<HashMap<AgentId, u32>>,
     questions: Arc<questions::QuestionCoordinator>,
-    usage: Mutex<Usage>,
     events: RuntimeEvents,
-    // Fully replayed journal prefix, not the highest (possibly out-of-order) live event.
+    // Fully replayed journal prefix, which live forwarding may already have passed.
     caught_up_sequence: Mutex<RecordSeq>,
+    /// Pauses the store and job-completion forwarders.
     #[cfg(test)]
-    store_forwarding_gate: Arc<Mutex<()>>,
+    forwarding_gate: Arc<Mutex<()>>,
     shutting_down: std::sync::atomic::AtomicBool,
 }
 
@@ -246,19 +245,78 @@ struct LiveAgent {
 #[derive(Clone)]
 struct AgentControl {
     retryable_interrupt: Arc<AtomicBool>,
-    completion_gate: Arc<Mutex<bool>>,
+    /// Held across a child's final mailbox check, serializing it with owner forwarding.
+    invocation: Arc<Mutex<Invocation>>,
+    turn: Arc<StdMutex<TurnState>>,
+}
+
+/// Where owner input to a child goes: into its open invocation, or, once that
+/// resolved, into a new one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Invocation {
+    Open,
+    Resolved,
+}
+
+/// Where an agent's command loop is, as interrupt and continue read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TurnState {
+    Idle,
+    Busy,
+    /// The last turn failed or was interrupted: only input resumes it, and
+    /// notifications wait for that input's request.
+    Parked,
+    /// An interrupted turn still waiting on the retained children it holds, which
+    /// `continue` restarts together with it.
+    Held,
 }
 
 impl AgentControl {
-    fn new() -> Self {
+    fn new(turn: TurnState) -> Self {
         Self {
             retryable_interrupt: Arc::new(AtomicBool::new(false)),
-            completion_gate: Arc::new(Mutex::new(true)),
+            invocation: Arc::new(Mutex::new(Invocation::Open)),
+            turn: Arc::new(StdMutex::new(turn)),
         }
+    }
+
+    fn turn(&self) -> TurnState {
+        *self.turn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set_turn(&self, turn: TurnState) {
+        *self.turn.lock().unwrap_or_else(PoisonError::into_inner) = turn;
+    }
+
+    /// Move a turn in one of the states `from` to `to`; one that moved on meanwhile
+    /// keeps its state.
+    fn turn_from(&self, from: &[TurnState], to: TurnState) -> bool {
+        let mut turn = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
+        let moved = from.contains(&turn);
+        if moved {
+            *turn = to;
+        }
+        moved
     }
 }
 
-type RequestCompletion = oneshot::Sender<Result<String, TurnFailure>>;
+type ChildCompletion = oneshot::Sender<Result<String, TurnFailure>>;
+
+/// Who waits for an input's answer: the session's own prompt, which receives the
+/// full error, or an owning job's waiter.
+enum RequestCompletion {
+    Root(oneshot::Sender<Result<String, HarnessError>>),
+    Child(ChildCompletion),
+}
+
+impl RequestCompletion {
+    fn settle(self, result: Result<String, HarnessError>) {
+        match self {
+            Self::Root(done) => drop(done.send(result)),
+            Self::Child(done) => drop(done.send(result.map_err(|error| (&error).into()))),
+        }
+    }
+}
 
 enum AgentCommand {
     QueuedInputs(Vec<queue::QueuedInput>),
@@ -271,18 +329,28 @@ enum AgentCommand {
     Shutdown,
 }
 
-struct AgentLaunch {
-    id: AgentId,
-    owner_job: Option<JobId>,
-    /// The model to start under; None resumes the agent's journaled contract.
-    model: Option<ModelRef>,
-    todos: Option<Vec<TodoItem>>,
-    available_depth: usize,
-    location: crate::execution::ExecutionLocation,
-    /// The agent's mode; a child has one only when its parent chose it.
-    mode: Option<String>,
-    /// The most this agent may hold: its mode's set, or its parent's current set.
-    capabilities: CapabilitySet,
+enum AgentLaunch {
+    /// An agent journaled as it starts.
+    New {
+        model: ModelRef,
+        todos: Option<Vec<TodoItem>>,
+        available_depth: usize,
+        location: crate::execution::ExecutionLocation,
+        /// The agent's mode; a child has one only when its parent chose it.
+        mode: Option<ModeName>,
+        /// The most this agent may hold: its mode's set, or its parent's current set.
+        capabilities: CapabilitySet,
+    },
+    /// An agent that started before, under its journaled contract narrowed to the
+    /// live configuration.
+    Resume(Resumed),
+}
+
+/// The turn state an agent resumes in.
+enum Resumed {
+    Idle,
+    /// Its journaled turn stopped short of an answer, for this reason.
+    Parked(TurnFailure),
 }
 
 struct AgentLoop {
@@ -298,7 +366,7 @@ struct AgentLoop {
 /// What an agent currently runs under; a consumed input may change any of it.
 struct AgentSettings {
     /// The agent's mode, when it runs in one. Only the root's can change.
-    mode: Option<String>,
+    mode: Option<ModeName>,
     capabilities: CapabilitySet,
 }
 
@@ -340,7 +408,9 @@ impl SessionRuntime {
 
     pub(super) async fn catch_up_store_events(&self) {
         // Serialize catchups so the cursor advances only after the entire prefix is
-        // published. Live forwarding may race ahead; RuntimeEvents deduplicates it.
+        // published. The store broadcasts in sequence order and forwarding keeps it,
+        // so a catch-up only repeats records forwarding sent or will send: the
+        // deduplicated feed stays in order, as the ledger fold requires.
         let mut sequence = self.caught_up_sequence.lock().await;
         self.store
             .visit_records_after(*sequence, |records| {
@@ -356,7 +426,7 @@ impl SessionRuntime {
     pub(super) fn forward_store_events(self: &Arc<Self>) {
         let mut source = self.store.subscribe();
         #[cfg(test)]
-        let forwarding_gate = self.store_forwarding_gate.clone();
+        let forwarding_gate = self.forwarding_gate.clone();
         let events = self.events.clone();
         let runtime = Arc::downgrade(self);
         tokio::spawn(async move {
@@ -382,10 +452,15 @@ impl SessionRuntime {
 
     pub(super) fn forward_job_completions(self: &Arc<Self>) {
         let mut completions = self.jobs.subscribe_completions();
+        #[cfg(test)]
+        let forwarding_gate = self.forwarding_gate.clone();
         let runtime = Arc::downgrade(self);
         tokio::spawn(async move {
             loop {
-                let completion = match completions.recv().await {
+                let received = completions.recv().await;
+                #[cfg(test)]
+                let _forwarding = forwarding_gate.lock().await;
+                let completion = match received {
                     Ok(completion) => completion,
                     Err(broadcast::error::RecvError::Lagged(_)) => {
                         let Some(runtime) = runtime.upgrade() else {
@@ -427,20 +502,12 @@ impl SessionRuntime {
         Ok(record.sequence.message())
     }
 }
-fn contains_images(messages: &[Message]) -> bool {
-    messages.iter().any(|message| match message {
-        Message::User(content) => content.iter().any(UserPart::is_image),
-        Message::Tool(results) => results.iter().any(|result| !result.images.is_empty()),
-        Message::Assistant(_) => false,
-    })
-}
 
 #[cfg(test)]
 mod tests {
     /// What a provider received, as distinct from what the session journals.
     pub(crate) use crate::provider::protocol::{Message as Sent, UserContent as SentPart};
     pub(super) use std::{
-        future::Future,
         sync::{
             Mutex as StdMutex,
             atomic::{AtomicUsize, Ordering},
@@ -455,11 +522,12 @@ mod tests {
         agent::Question,
         provider::codec::common::tests::envelope,
         provider::protocol::{
-            AssistantItem, Binding, BlockId, BlockRef, ContextId, ItemId, ItemKind, ReplayFormat,
-            ResponseEvent, ToolCall,
+            AssistantItem, Binding, BlockRef, ContextId, ItemKind, ReplayFormat, ResponseEvent,
+            ToolCall,
         },
         provider::{ProviderContext, ResponseStream},
         session::tests::usage,
+        tests::bounded,
     };
 
     /// A request as the scripted context that received it saw it.
@@ -566,9 +634,12 @@ mod tests {
     pub(super) struct Script {
         steps: Vec<Step>,
         served: StdMutex<Vec<(usize, ModelRequest)>>,
+        /// Midstream steps whose stream reached its held terminal event.
+        held: StdMutex<Vec<usize>>,
         changed: tokio::sync::Notify,
         pub(super) requests: Requests,
         pub(super) opened: AtomicUsize,
+        dropped: StdMutex<Vec<ContextId>>,
         this: Weak<Script>,
     }
 
@@ -577,30 +648,51 @@ mod tests {
             Arc::new_cyclic(|this| Self {
                 steps: steps.into_iter().collect(),
                 served: StdMutex::default(),
+                held: StdMutex::default(),
                 changed: tokio::sync::Notify::new(),
                 requests: requests.clone(),
                 opened: AtomicUsize::new(0),
+                dropped: StdMutex::default(),
                 this: this.clone(),
             })
         }
 
-        /// The request that `step` served, once it arrives.
-        pub(super) async fn request(&self, step: usize) -> ModelRequest {
+        /// What `found` yields, once it yields.
+        async fn when<T>(&self, found: impl Fn(&Self) -> Option<T>) -> T {
             bounded(async {
                 loop {
                     let notified = self.changed.notified();
-                    // Clone only the match, in a scope that ends the guard before awaiting.
-                    let found = {
-                        let served = self.served.lock().unwrap();
-                        served.iter().find(|(id, _)| *id == step).cloned()
-                    };
-                    if let Some((_, request)) = found {
-                        return request;
+                    if let Some(found) = found(self) {
+                        return found;
                     }
                     notified.await;
                 }
             })
             .await
+        }
+
+        /// The request that `step` served, once it arrives.
+        pub(super) async fn request(&self, step: usize) -> ModelRequest {
+            let served = |script: &Self| {
+                let served = script.served.lock().unwrap();
+                served
+                    .iter()
+                    .find(|(id, _)| *id == step)
+                    .map(|(_, request)| request.clone())
+            };
+            self.when(served).await
+        }
+
+        /// Once midstream `step` has streamed all but its held terminal event.
+        pub(super) async fn held(&self, step: usize) {
+            let held = |script: &Self| script.held.lock().unwrap().contains(&step).then_some(());
+            self.when(held).await;
+        }
+
+        /// Replace the response of `step`, before it is served.
+        pub(super) fn respond(&self, step: usize, events: Vec<ResponseEvent>) {
+            let events = events.into_iter().map(Ok).collect();
+            *self.steps[step].response.lock().unwrap() = Some(Ok(events));
         }
 
         pub(super) fn release(&self, step: usize) {
@@ -623,6 +715,16 @@ mod tests {
         pub(super) fn remaining(&self) -> usize {
             self.steps.len() - self.served.lock().unwrap().len()
         }
+
+        pub(super) fn dropped(&self, context: &ContextId) -> bool {
+            self.dropped.lock().unwrap().contains(context)
+        }
+
+        /// Once a context opened as `context` has been dropped.
+        pub(super) async fn released(&self, context: &ContextId) {
+            self.when(|script| script.dropped(context).then_some(()))
+                .await;
+        }
     }
 
     impl Provider for Script {
@@ -640,13 +742,21 @@ mod tests {
 
     struct ScriptContext(Arc<Script>, ContextId);
 
+    impl Drop for ScriptContext {
+        fn drop(&mut self) {
+            self.0.dropped.lock().unwrap().push(self.1.clone());
+            self.0.changed.notify_waiters();
+        }
+    }
+
     impl ProviderContext for ScriptContext {
         fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
             let script = self.0.clone();
             let step = {
                 let mut served = script.served.lock().unwrap();
                 let free = |(index, step): &(usize, &Step)| {
-                    step.model.is_none_or(|model| model == request.model)
+                    step.model
+                        .is_none_or(|model| request.model.as_str() == model)
                         && !served.iter().any(|(seen, _)| seen == index)
                 };
                 let (step, _) = script
@@ -685,6 +795,8 @@ mod tests {
                 let rest = events.split_off(split);
                 let held = stream::once(async move {
                     if midstream {
+                        script.held.lock().unwrap().push(step);
+                        script.changed.notify_waiters();
                         gate(script).await;
                     }
                     stream::iter(rest)
@@ -719,8 +831,12 @@ mod tests {
     pub(super) async fn ephemeral_session(harness: &Harness) -> SessionHandle {
         let store = SessionStore::create_ephemeral(&harness.inner.session_root);
         let store = store.await.unwrap();
-        let runtime = SessionRuntime::build(harness.inner.clone(), store, Vec::new());
-        runtime.await.unwrap().start_root(None).await.unwrap()
+        let runtime = SessionRuntime::build(harness.inner.clone(), store, &[]);
+        let runtime = runtime.await.unwrap();
+        runtime
+            .start_root(runtime.new_root().unwrap())
+            .await
+            .unwrap()
     }
 
     #[derive(Clone)]
@@ -730,7 +846,8 @@ mod tests {
     pub(super) struct RecordingQuestions {
         pub(super) batches: Arc<StdMutex<Vec<Vec<Question>>>>,
         pub(super) backgrounds: Arc<StdMutex<Vec<bool>>>,
-        pub(super) answer: serde_json::Value,
+        /// Every question's answer.
+        pub(super) answer: String,
         /// Fail every batch, as a host dismissing it would.
         pub(super) cancel: bool,
     }
@@ -756,8 +873,13 @@ mod tests {
                     "question cancelled".into(),
                 ))
             } else {
+                let answer = crate::agent::QuestionAnswer::Text(self.answer.clone());
+                let reply = questions
+                    .iter()
+                    .map(|q| (q.id.clone(), answer.clone()))
+                    .collect();
                 self.batches.lock().unwrap().push(questions);
-                Ok(self.answer.clone())
+                Ok(reply)
             };
             Box::pin(async move { answer })
         }
@@ -771,20 +893,48 @@ mod tests {
     /// A leaf child of the root on the default test profile, in the session workspace.
     pub(super) fn child_launch(
         session: &SessionHandle,
-        id: AgentId,
-        owner_job: Option<JobId>,
+        todos: Option<Vec<TodoItem>>,
     ) -> AgentLaunch {
         let workspace = session.runtime.harness.workspace.clone();
-        AgentLaunch {
-            id,
-            owner_job,
-            model: Some(session.runtime.harness.default_model.clone()),
-            todos: None,
+        AgentLaunch::New {
+            model: session.runtime.harness.default_model.clone(),
+            todos,
             available_depth: 0,
             location: crate::execution::ExecutionLocation::root(workspace),
             mode: None,
             capabilities: session.runtime.capabilities.clone(),
         }
+    }
+
+    /// Poll `future`, which stays pending throughout, until `ready` holds.
+    pub(super) async fn pending_until<F: Future + ?Sized>(
+        future: &mut std::pin::Pin<Box<F>>,
+        mut ready: impl AsyncFnMut() -> bool,
+    ) {
+        bounded(async {
+            loop {
+                assert!(futures_util::poll!(future.as_mut()).is_pending());
+                if ready().await {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
+    /// Every usage report the session journaled, as its requests' ledger folds it.
+    pub(super) async fn journaled_usage(session: &SessionHandle) -> Usage {
+        let ledger = session.observe().await.snapshot.ledger;
+        let mut usage = Usage::default();
+        for (_, request) in ledger.iter() {
+            usage.accumulate(request.usage);
+        }
+        usage
+    }
+
+    pub(super) fn turn(session: &SessionHandle, agent: &AgentId) -> TurnState {
+        session.runtime.agents()[agent].control.turn()
     }
 
     pub(super) fn assistant_commits(records: &[EventRecord]) -> usize {
@@ -820,7 +970,10 @@ mod tests {
         provider: Arc<dyn Provider>,
         supports_images: bool,
     ) -> HarnessBuilder {
-        let profile = ModelProfile::new("test", None, 128_000, 16_384, supports_images);
+        let profile = ModelProfile {
+            max_output: crate::tests::limit(16_384),
+            ..crate::tests::profile("test", supports_images)
+        };
         HarnessBuilder::new(workspace)
             .session_root(sessions)
             .provider(provider_name("test"), provider, models([("test", profile)]))
@@ -840,20 +993,26 @@ mod tests {
         )
     }
 
-    #[track_caller]
-    pub(super) fn bounded<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
-        let caller = std::panic::Location::caller();
-        async move {
-            tokio::time::timeout(Duration::from_secs(10), future)
-                .await
-                .unwrap_or_else(|_| panic!("test synchronization timed out at {caller}"))
-        }
-    }
-
     /// One step of a polling loop. A timer rather than a yield, because paused
     /// time only advances while every task is idle.
     pub(super) async fn poll() {
         tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+
+    /// Wait until the root is seen running tools or waiting on children: observed
+    /// activity trails the journal.
+    pub(super) async fn root_waiting(session: &SessionHandle) {
+        use crate::agent::AgentActivity::{Tools, WaitingChildren};
+        bounded(async {
+            let activity = async || session.observe().await.snapshot.activity;
+            while !matches!(
+                activity().await.get(&session.root),
+                Some(Tools | WaitingChildren)
+            ) {
+                poll().await;
+            }
+        })
+        .await;
     }
 
     pub(super) async fn until(
@@ -890,10 +1049,11 @@ mod tests {
     }
 
     /// A running Agent-role job owning retained children and their questions.
-    pub(super) async fn owner(session: &SessionHandle) -> JobId {
+    pub(super) async fn owner(session: &SessionHandle, background: bool) -> JobId {
         let jobs = &session.runtime.jobs;
         let spec = crate::job::JobSpec {
             accepts_input: true,
+            background,
             role: crate::job::JobRole::Agent,
             ..crate::job::JobSpec::test(session.root.clone(), "agent")
         };
@@ -947,6 +1107,10 @@ mod tests {
         .await;
     }
 
+    pub(super) fn mode_name(name: &str) -> ModeName {
+        name.parse().unwrap()
+    }
+
     /// A model under the `test` provider.
     pub(super) fn model_ref(name: &str) -> ModelRef {
         format!("test/{name}").parse().unwrap()
@@ -980,13 +1144,25 @@ mod tests {
         response(vec![AssistantItem::text("answer", 0, text)])
     }
 
-    /// A provisional text delta for block `block` of item `item`.
-    pub(super) fn delta(item: &str, block: &str, kind: ItemKind, text: &str) -> ResponseEvent {
+    pub(super) async fn next_recovery(
+        events: &mut tokio::sync::broadcast::Receiver<crate::agent::ObservedEvent>,
+    ) -> crate::session::EventRecord {
+        bounded(async {
+            loop {
+                if let RuntimeEvent::Record(record) = events.recv().await.unwrap().event
+                    && matches!(record.event, SessionEvent::ModelRecoveryScheduled { .. })
+                {
+                    return *record;
+                }
+            }
+        })
+        .await
+    }
+
+    /// A provisional delta into the single block of item `item`.
+    pub(super) fn delta(item: &str, kind: ItemKind, text: &str) -> ResponseEvent {
         ResponseEvent::Delta {
-            block: BlockRef {
-                item: ItemId::try_from(item.to_owned()).unwrap(),
-                block: BlockId::try_from(block.to_owned()).unwrap(),
-            },
+            block: BlockRef::single(item),
             kind,
             text: text.into(),
         }
@@ -1005,7 +1181,7 @@ mod tests {
 
     pub(super) fn todo(text: &str, status: crate::agent::TodoStatus) -> TodoItem {
         TodoItem {
-            text: text.to_owned(),
+            text: text.parse().unwrap(),
             status,
         }
     }
@@ -1020,6 +1196,10 @@ mod tests {
             results.push(receipt.await.unwrap_or(Err(HarnessError::AgentStopped)));
         }
         results
+    }
+
+    pub(super) fn recoverable() -> ProviderError {
+        crate::provider::ProviderErrorKind::Transport.error("scripted connection lost")
     }
 
     /// A valid, otherwise empty compaction continuation.
@@ -1044,7 +1224,7 @@ mod tests {
         let session = observation_session(root.path()).await;
         session.observe().await;
         // Pause forwarding rather than relying on scheduler luck.
-        let forwarding = session.runtime.store_forwarding_gate.lock().await;
+        let forwarding = session.runtime.forwarding_gate.lock().await;
         let store = &session.runtime.store;
         let first = store.append(session.root.clone(), SessionEvent::AgentInterrupted);
         let first = first.await.unwrap();
@@ -1074,7 +1254,7 @@ mod tests {
         let mut observation = session.observe().await;
         let initial_count = observation.snapshot.records.len();
         // 600 gated appends overflow the 512-slot channel, forcing the Lagged catch-up.
-        let forwarding = session.runtime.store_forwarding_gate.lock().await;
+        let forwarding = session.runtime.forwarding_gate.lock().await;
         let mut last = RecordSeq::default();
         for _ in 0..600 {
             let record = session

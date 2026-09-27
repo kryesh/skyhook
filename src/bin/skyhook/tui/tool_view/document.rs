@@ -1,28 +1,14 @@
-//! Build semantic documents from tool arguments and result envelopes.
-use super::output::OutputShape;
-use super::preview::{Pagination, PreviewView};
-use super::{CodeSource, Document, OutputView, Role, Run, Section};
+//! Build semantic documents from tool arguments and job views.
+use super::hints::{Hints, Syntax};
+use super::{CodeSource, Document, Role, Run, Section};
 use crate::tui::format::{Clean, clean, pretty};
+use serde::Deserialize;
 use serde_json::Value;
-use skyhook::job::omit_null_fields;
+use skyhook::agent::Question;
+use skyhook::job::{
+    FieldPointer, JobView, OutputPreview, Presentation, diagnostic_slot, omit_null_fields,
+};
 use unicode_width::UnicodeWidthStr;
-
-// Restrict deduplication to structured error/message fields, not arbitrary
-// stdout or source text that happens to contain the same words.
-fn contains_error(value: &Value, error: &str) -> bool {
-    value.as_str().is_some_and(|text| text == error)
-        || ["error", "message", "result", "output"].iter().any(|key| {
-            value
-                .get(key)
-                .is_some_and(|value| contains_error(value, error))
-        })
-}
-
-fn document_has_error(document: &Value, error: &Value) -> bool {
-    ["/error", "/result/error"]
-        .iter()
-        .any(|pointer| document.pointer(pointer) == Some(error))
-}
 
 impl Document {
     pub fn line(&mut self, text: impl Into<String>, role: Role) {
@@ -47,21 +33,17 @@ impl Document {
             role,
         });
     }
-    pub fn arguments(&mut self, tool: &str, args: &Value) {
+    pub fn arguments(&mut self, hints: Hints<'_>) {
         self.line("Arguments", Role::Heading);
-        if args.as_object().is_some_and(|v| v.is_empty()) {
+        if hints.args.as_object().is_some_and(|v| v.is_empty()) {
             self.line("  No arguments", Role::Muted);
         } else {
-            self.fields(args, 2, (tool, args), &ArgumentPolicy::Prose);
+            self.fields(hints.args, 2, hints, false);
         }
     }
-    fn fields(
-        &mut self,
-        value: &Value,
-        indent: usize,
-        context: (&str, &Value),
-        inherited: &ArgumentPolicy,
-    ) {
+    /// A literal ancestor keeps its descendants literal; lack of syntax never
+    /// turns literal data into prose.
+    fn fields(&mut self, value: &Value, indent: usize, hints: Hints<'_>, literal: bool) {
         let entries: Vec<(String, &Value)> = match value {
             Value::Object(values) => values
                 .iter()
@@ -74,7 +56,7 @@ impl Document {
                 .map(|(index, value)| (format!("{}.", index + 1), value))
                 .collect(),
             _ => {
-                self.argument_block(value, indent, inherited);
+                self.argument_block(value, indent, literal);
                 return;
             }
         };
@@ -86,42 +68,22 @@ impl Document {
             .min(24);
         for (name, value) in entries {
             let prefix = " ".repeat(indent);
-            let explicit = argument_policy(context.0, &name, context.1);
-            let policy = explicit.as_ref().unwrap_or(inherited);
-            if let Some(ArgumentPolicy::Literal {
-                language,
-                block: true,
-            }) = &explicit
-                && let Some(source) = value.as_str()
+            let source = hints.source(&name);
+            let literal = literal || source.is_some();
+            if let Some((language, role)) = source
+                && let Some(text) = value.as_str()
             {
-                let role = match name.as_str() {
-                    "old" => Role::Removed,
-                    "new" => Role::Added,
-                    _ => Role::Plain,
-                };
-                let label = match name.as_str() {
-                    "old" => "old (removed)",
-                    "new" => "new (added)",
-                    _ => &name,
+                let (label, gutter) = match role {
+                    Role::Removed => (format!("{name} (removed)"), Some("− ")),
+                    Role::Added => (format!("{name} (added)"), Some("+ ")),
+                    _ => (name, None),
                 };
                 self.line(format!("{prefix}{label}"), Role::Label);
-                let gutter = match role {
-                    Role::Removed => "− ",
-                    Role::Added => "+ ",
-                    _ => "",
-                };
-                let gutters = (!gutter.is_empty()).then(|| gutter.into());
-                self.code(
-                    source,
-                    language.as_deref().unwrap_or(""),
-                    indent + 2,
-                    gutters,
-                    role,
-                );
+                self.code(text, &language, indent + 2, gutter.map(Clean::from), role);
             } else if let Some((text, role)) = scalar(value) {
                 if text.contains('\n') {
                     self.line(format!("{prefix}{name}"), Role::Label);
-                    self.argument_block(value, indent + 2, policy);
+                    self.argument_block(value, indent + 2, literal);
                 } else {
                     let runs = vec![
                         Run::new(format!("{prefix}{name}"), Role::Label),
@@ -131,266 +93,185 @@ impl Document {
                         ),
                         Run::new(text, role),
                     ];
-                    self.sections.push(
-                        if value.is_string() && matches!(policy, ArgumentPolicy::Prose) {
-                            Section::Prose(runs)
-                        } else {
-                            Section::Line(runs)
-                        },
-                    );
+                    self.sections.push(if value.is_string() && !literal {
+                        Section::Prose(runs)
+                    } else {
+                        Section::Line(runs)
+                    });
                 }
             } else {
                 self.line(format!("{prefix}{name}"), Role::Label);
-                self.fields(value, indent + 2, context, policy);
+                self.fields(value, indent + 2, hints, literal);
             }
         }
     }
-    fn argument_block(&mut self, value: &Value, indent: usize, policy: &ArgumentPolicy) {
-        if value.is_string() && matches!(policy, ArgumentPolicy::Prose) {
-            if let Some((text, role)) = scalar(value) {
-                for line in text.split('\n') {
-                    self.sections.push(Section::Prose(vec![
-                        Run::new(" ".repeat(indent), Role::Plain),
-                        Run::new(line, role),
-                    ]));
-                }
-            }
+    /// Prose wraps at words, one logical line per source line.
+    fn prose(&mut self, text: &str, indent: usize, role: Role) {
+        for line in text.split('\n') {
+            self.sections.push(Section::Prose(vec![
+                Run::new(" ".repeat(indent), Role::Plain),
+                Run::new(line, role),
+            ]));
+        }
+    }
+    fn argument_block(&mut self, value: &Value, indent: usize, literal: bool) {
+        let Some((text, role)) = scalar(value) else {
+            return;
+        };
+        if value.is_string() && !literal {
+            self.prose(&text, indent, role);
         } else {
-            self.scalar_block(value, indent);
-        }
-    }
-    fn scalar_block(&mut self, value: &Value, indent: usize) {
-        if let Some((text, role)) = scalar(value) {
             self.code(&text, "", indent, None, role);
         }
     }
-    /// Historical output is borrowed: the shape is validated from the caller's
-    /// value without copying the whole result.
-    pub fn output(&mut self, tool: &str, args: &Value, output: &Value) {
-        let shape = OutputShape::wire(output);
-        self.output_section(tool, args, Some((output, &shape)), None);
-    }
     /// Error summaries belong to the expanded Output section, never the header.
-    /// Keep downloaded results intact and omit an identical summary already
-    /// represented by a structured error field in that result.
-    pub fn output_with_error(
-        &mut self,
-        tool: &str,
-        args: &Value,
-        output: Option<&OutputView>,
-        error: Option<&str>,
-    ) {
-        let output = output.map(|output| (output.value(), output.shape()));
-        self.output_section(tool, args, output, error);
-    }
-    fn output_section(
-        &mut self,
-        tool: &str,
-        args: &Value,
-        output: Option<(&Value, &OutputShape)>,
-        error: Option<&str>,
-    ) {
+    /// Each distinct error renders once, before the output it describes, unless
+    /// the whole result below already shows it.
+    pub fn output(&mut self, hints: Hints<'_>, view: Option<&JobView>, summaries: &[&str]) {
         self.line("Output", Role::Heading);
-        let preview = output.and_then(|(_, shape)| shape.preview.as_ref());
-        let whole_preview = preview.and_then(PreviewView::complete_document);
-        let value = output.map(|(value, _)| value);
-        let shown_summary = error.filter(|summary| {
-            !value.is_some_and(|output| contains_error(output, summary))
-                && !whole_preview.is_some_and(|preview| {
-                    ["/error", "/result/error"].iter().any(|pointer| {
-                        preview.pointer(pointer).and_then(Value::as_str) == Some(*summary)
-                    })
-                })
-        });
-        if let Some(error) = shown_summary {
-            self.error_text(error);
-        }
-        if let Some((value, shape)) = output {
-            self.output_body(tool, args, value, shape, shown_summary);
-        }
-    }
-    fn error(&mut self, error: &Value) {
-        if let Some(text) = error.as_str() {
-            self.error_text(text);
-        } else {
-            let mut error = error.clone();
-            omit_null_fields(&mut error);
-            self.code(&pretty(&error), "json", 2, None, Role::Error);
-        }
-    }
-    fn error_text(&mut self, text: &str) {
-        if let Some(value) = json_container(text) {
-            self.code(&pretty(&value), "json", 2, None, Role::Error);
-        } else {
-            self.code(text, "", 2, None, Role::Error);
-        }
-    }
-    fn output_body(
-        &mut self,
-        tool: &str,
-        args: &Value,
-        output: &Value,
-        shape: &OutputShape,
-        shown_summary: Option<&str>,
-    ) {
-        let preview = shape.preview.as_ref();
-        let whole_preview = preview.and_then(PreviewView::complete_document);
-        let captures = &shape.captures;
-        // Envelope notices describe the capture, not the selected payload.
-        // In particular, reaching the final preview page does not imply that
-        // the original output was captured completely.
-        let notice = output
-            .pointer("/presentation/notice")
-            .and_then(Value::as_str)
-            .filter(|notice| !notice.trim().is_empty());
-        if let Some(notice) = notice {
-            self.line("Notice", Role::Label);
-            self.code(notice, "", 2, None, Role::Muted);
-        }
-        // Only exact structured equality participates in error deduplication.
-        let mut shown_errors: Vec<Value> = shown_summary.map(Value::from).into_iter().collect();
-        for pointer in ["/error", "/result/error"] {
-            if let Some(error) = output.pointer(pointer).filter(|value| !value.is_null())
-                && !shown_errors.contains(error)
-                && !whole_preview.is_some_and(|preview| document_has_error(preview, error))
-            {
-                self.error(error);
-                shown_errors.push(error.clone());
-            }
-        }
-        let has_capture_previews = captures.iter().any(|capture| capture.preview.is_some());
-        if let Some(preview) = preview {
-            // Live output may have no saved whole document yet. The selected
-            // capture views are more useful than an empty Complete result pane.
-            let empty_whole_preview = preview.empty_whole();
-            if !has_capture_previews || !empty_whole_preview {
-                self.output_preview(tool, args, preview, whole_preview);
-            }
-        } else {
-            // Split literal text fields out of the display copy; the original Value is untouched.
-            let mut metadata = output.clone();
-            omit_null_fields(&mut metadata);
-            // `output` is a TUI-only selected-field view, not capture metadata.
-            if let Some(captures) = metadata
-                .pointer_mut("/presentation/captures")
-                .and_then(Value::as_array_mut)
-            {
-                for capture in captures {
-                    if let Some(capture) = capture.as_object_mut() {
-                        capture.remove("output");
-                    }
-                }
-            }
-            if notice.is_some()
-                && let Some(object) = metadata
-                    .get_mut("presentation")
-                    .and_then(Value::as_object_mut)
-            {
-                object.remove("notice");
-            }
-            for pointer in ["/error", "/result/error"] {
-                if output
-                    .pointer(pointer)
-                    .is_some_and(|value| !value.is_null())
-                {
-                    let (parent, key) = pointer.rsplit_once('/').unwrap();
-                    if let Some(object) =
-                        metadata.pointer_mut(parent).and_then(Value::as_object_mut)
-                    {
-                        object.remove(key);
-                    }
-                }
-            }
-            let mut text_fields = Vec::new();
-            for (pointer, label) in [
-                ("/result/content", "File content"),
-                ("/result/stdout", "stdout"),
-                ("/result/stderr", "stderr"),
-                ("/result/console", "Console"),
-            ] {
-                if let Some(text) = output.pointer(pointer).and_then(Value::as_str) {
-                    let (parent, key) = pointer.rsplit_once('/').unwrap();
-                    if let Some(object) =
-                        metadata.pointer_mut(parent).and_then(Value::as_object_mut)
-                    {
-                        object.remove(key);
-                    }
-                    text_fields.push((pointer, label, text));
-                }
-            }
-            if let Some(text) = output.as_str() {
-                self.result_text(text, "");
-            } else if !metadata.as_object().is_some_and(|object| object.is_empty()) {
-                self.code(&pretty(&metadata), "json", 2, None, Role::Plain);
-            }
-            for (pointer, label, text) in text_fields {
-                self.line(label, Role::Label);
-                let language = output_language(tool, args, pointer);
-                if pointer == "/result/content" {
-                    self.code(text, &language, 2, None, Role::Plain);
-                } else {
-                    self.result_text(text, &language);
-                }
-            }
-        }
+        let whole = view.and_then(whole_diagnostic);
+        let mut shown: Vec<_> = whole.as_deref().into_iter().collect();
+        for error in summaries
+            .iter()
+            .copied()
+            .chain(view.and_then(JobView::error))
         {
-            for capture in captures {
-                let mut labeled_error = false;
-                for error in &capture.errors {
-                    if !shown_errors.contains(error)
-                        && !whole_preview.is_some_and(|preview| document_has_error(preview, error))
-                    {
-                        if !labeled_error {
-                            self.line(&capture.field, Role::Label);
-                            labeled_error = true;
-                        }
-                        self.error(error);
-                        shown_errors.push(error.clone());
-                    }
+            self.error(hints, error, &mut shown);
+        }
+        if let Some(view) = view {
+            self.job_view(hints, view, &mut shown);
+        }
+    }
+    /// A historical tool result is the JobView the model received; anything
+    /// else renders as the raw JSON it is. Every view field is optional and
+    /// unknown fields are ignored, so only a view that reproduces the value
+    /// exactly is one; `{"stdout": …}` would otherwise parse as an empty view.
+    pub fn historical_output(&mut self, hints: Hints<'_>, result: &Value) {
+        match JobView::deserialize(result) {
+            Ok(view) if serde_json::to_value(&view).is_ok_and(|value| value == *result) => {
+                self.output(hints, Some(&view), &[]);
+            }
+            _ => {
+                self.line("Output", Role::Heading);
+                self.code(&pretty(result), "json", 2, None, Role::Plain);
+            }
+        }
+    }
+    fn error<'a>(&mut self, hints: Hints<'_>, error: &'a str, shown: &mut Vec<&'a str>) {
+        if !shown.contains(&error) {
+            self.text(error, hints, Syntax::Detect, Role::Error);
+            shown.push(error);
+        }
+    }
+    fn job_view<'a>(&mut self, hints: Hints<'_>, view: &'a JobView, shown: &mut Vec<&'a str>) {
+        let presentation = view.presentation();
+        // Envelope notices describe the capture, not the selected payload.
+        // Reaching the final preview page does not imply that the original
+        // output was captured completely.
+        if let Some(notice) = presentation.and_then(Presentation::notice) {
+            self.line("Notice", Role::Label);
+            self.code(notice.as_str(), "", 2, None, Role::Muted);
+        }
+        self.questions(presentation.map_or(&[], Presentation::questions));
+        let captures = presentation.map_or(&[][..], Presentation::captures);
+        let pages = captures.iter().filter_map(|capture| {
+            let page = capture.output()?;
+            Some((
+                capture.field(),
+                page,
+                page.presentation().and_then(Presentation::preview),
+            ))
+        });
+        match presentation.and_then(Presentation::preview) {
+            // Live output may have no saved whole document yet. The capture
+            // pages are more useful than an empty complete result pane.
+            Some(preview)
+                if preview.field().is_some_and(FieldPointer::is_root)
+                    && preview.lines().is_empty()
+                    && pages.clone().any(|(.., page)| page.is_some()) => {}
+            Some(preview) => self.preview(hints, preview),
+            None => {
+                if let Some(result) = view.result() {
+                    self.result(hints, result);
                 }
-                if let Some(preview) = &capture.preview {
-                    // The parent owns capture notices; only independent read
-                    // failures above need additional envelope rendering.
-                    self.output_preview(tool, args, preview, None);
+                if presentation.is_some_and(|presentation| !presentation.truncated().is_empty()) {
+                    self.line("More saved output available", Role::Muted);
+                }
+            }
+        }
+        for (field, page, preview) in pages {
+            if let Some(error) = page.error().filter(|error| !shown.contains(error)) {
+                self.line(field.as_str(), Role::Label);
+                self.error(hints, error, shown);
+            }
+            if let Some(preview) = preview {
+                self.preview(hints, preview);
+            }
+        }
+        if let Some(envelope) = view.envelope() {
+            self.code(&pretty(&envelope), "", 2, None, Role::Muted);
+        }
+    }
+    /// A waiting child's question batch stands in for its result.
+    fn questions(&mut self, questions: &[Question]) {
+        for question in questions {
+            self.line("Question", Role::Label);
+            self.prose(&question.prompt, 2, Role::Plain);
+            // As in the prompt panel, a description starts on its own line.
+            for option in &question.options {
+                self.prose(&format!("• {}", option.label), 2, Role::Label);
+                if !option.description.is_empty() {
+                    self.prose(&option.description, 4, Role::Muted);
                 }
             }
         }
     }
-    fn output_preview(
-        &mut self,
-        tool: &str,
-        args: &Value,
-        preview: &PreviewView,
-        whole: Option<&Value>,
-    ) {
-        let field = preview.field().as_str();
-        self.line(
-            if field.is_empty() {
-                "Complete result"
-            } else {
-                field
-            },
-            Role::Muted,
-        );
-        let mut language = output_language(tool, args, field);
-        let formatted = if let Some(whole) = whole {
-            let mut value = whole.clone();
-            omit_null_fields(&mut value);
-            Some(pretty(&value))
-        } else if field != "/result/content" && (language.is_empty() || language == "json") {
-            pretty_json_preview(preview.source(), preview.pagination(), field)
-        } else {
-            None
+    /// Literal text fields are split out of the display copy of the result.
+    fn result(&mut self, hints: Hints<'_>, result: &Value) {
+        if let Some(text) = result.as_str() {
+            return self.text(text, hints, Syntax::Detect, Role::Plain);
+        }
+        let mut rest = result.clone();
+        omit_null_fields(&mut rest);
+        let mut texts = Vec::new();
+        if let Some(object) = rest.as_object_mut() {
+            for (field, label, syntax) in hints.texts() {
+                if let Some(Value::String(text)) = object.get(field) {
+                    texts.push((label, syntax, text.clone()));
+                    object.shift_remove(field);
+                }
+            }
+        }
+        if !rest.as_object().is_some_and(serde_json::Map::is_empty) {
+            self.code(&pretty(&rest), "json", 2, None, Role::Plain);
+        }
+        for (label, syntax, text) in texts {
+            self.line(label, Role::Label);
+            self.text(&text, hints, syntax, Role::Plain);
+        }
+    }
+    fn preview(&mut self, hints: Hints<'_>, preview: &OutputPreview) {
+        // A model page omits the field it was asked for.
+        let field = preview.field();
+        let root = field.is_some_and(FieldPointer::is_root);
+        let heading = match field {
+            Some(_) if root => "Complete result",
+            Some(field) => field.as_str(),
+            None => "Requested field",
         };
-        let source = if let Some(formatted) = &formatted {
-            language = "json".into();
-            formatted
-        } else {
-            preview.source()
-        };
-        self.code(source, &language, 2, None, Role::Plain);
+        self.line(heading, Role::Muted);
+        let source = preview.lines().join("\n");
+        let more = preview.continuation().is_some();
+        let syntax = field.map_or(Syntax::Detect, |field| hints.field_syntax(field));
+        let formatted = syntax
+            .detects_json()
+            .then(|| pretty_json_preview(&source, more, root));
+        match formatted.flatten() {
+            Some(formatted) => self.code(&formatted, "json", 2, None, Role::Plain),
+            None => self.code(&source, &hints.language(syntax), 2, None, Role::Plain),
+        }
         self.line(
-            if preview.pagination() != Pagination::End {
+            if more {
                 "More saved output available"
             } else {
                 "End of available output"
@@ -398,31 +279,49 @@ impl Document {
             Role::Muted,
         );
     }
-
-    fn result_text(&mut self, text: &str, language: &str) {
-        if let Some(value) = json_container(text) {
-            self.code(&pretty(&value), "json", 2, None, Role::Plain);
+    fn text(&mut self, text: &str, hints: Hints<'_>, syntax: Syntax, role: Role) {
+        if syntax.detects_json()
+            && let Some(value) = json_container(text)
+        {
+            self.code(&pretty(&value), "json", 2, None, role);
         } else {
-            self.code(text, language, 2, None, Role::Plain);
+            self.code(text, &hints.language(syntax), 2, None, role);
         }
+    }
+}
+/// The diagnostic a whole result shows in place: the result itself, or a
+/// complete preview of the saved `{"result": …}` document.
+fn whole_diagnostic(view: &JobView) -> Option<String> {
+    let slot = diagnostic_slot();
+    // The slot addresses the saved document; a bare result starts below `result`.
+    let diagnostic = |result: &Value| {
+        let message = (slot.segments().skip(1)).try_fold(result, |value, key| value.get(key))?;
+        Some(message.as_str()?.to_owned())
+    };
+    match view.presentation().and_then(Presentation::preview) {
+        None => diagnostic(view.result()?),
+        Some(preview)
+            if preview.field().is_some_and(FieldPointer::is_root)
+                && preview.continuation().is_none() =>
+        {
+            let document: Value = serde_json::from_str(&preview.lines().join("\n")).ok()?;
+            diagnostic(document.get("result")?)
+        }
+        Some(_) => None,
     }
 }
 /// Saved-output pages can stop inside a JSON container (or even a string).
 /// Format valid prefixes too, without completing them or changing saved source
 /// offsets. Non-JSON text and continuation pages that start mid-token stay raw.
-fn pretty_json_preview(text: &str, pagination: Pagination, field: &str) -> Option<String> {
+fn pretty_json_preview(text: &str, more: bool, root: bool) -> Option<String> {
     match serde_json::from_str::<Value>(text) {
         Ok(mut value @ (Value::Object(_) | Value::Array(_))) => {
-            if field.is_empty() {
+            if root {
                 omit_null_fields(&mut value);
             }
             Some(pretty(&value))
         }
-        Err(error)
-            if pagination != Pagination::End
-                && error.is_eof()
-                && text.trim_start().starts_with(['{', '[']) =>
-        {
+        Err(error) if more && error.is_eof() && text.trim_start().starts_with(['{', '[']) => {
             Some(format_json_container_prefix(text))
         }
         _ => None,
@@ -519,102 +418,28 @@ fn scalar(value: &Value) -> Option<(String, Role)> {
         _ => return None,
     })
 }
-fn file_language(args: &Value) -> String {
-    let path = args["path"].as_str().unwrap_or_default();
-    let name = std::path::Path::new(path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_default();
-    match name {
-        "Dockerfile" => "Dockerfile".into(),
-        "Makefile" => "Makefile".into(),
-        _ => name
-            .rsplit_once('.')
-            .map_or("", |(_, ext)| ext)
-            .to_ascii_lowercase(),
-    }
-}
-/// Recursive argument intent; lack of syntax never turns literal data into prose.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum ArgumentPolicy {
-    Prose,
-    /// `block` renders a string value as a labelled code block; argument-vector
-    /// strings stay inline like other scalars.
-    Literal {
-        language: Option<String>,
-        block: bool,
-    },
-}
-/// No field override means inherit the ancestor policy, not reset to prose.
-fn argument_policy(tool: &str, field: &str, args: &Value) -> Option<ArgumentPolicy> {
-    let language = match (tool, field) {
-        ("script", "source") => Some("js".into()),
-        ("exec", "command") if args["command"].is_string() => Some("sh".into()),
-        ("write", "content") | ("replace", "old" | "new") => {
-            let language = file_language(args);
-            (!language.is_empty()).then_some(language)
-        }
-        ("exec", "command") | (_, "commands") => {
-            return Some(ArgumentPolicy::Literal {
-                language: None,
-                block: false,
-            });
-        }
-        (_, "command" | "source" | "script" | "code" | "content" | "old" | "new") => None,
-        _ => return None,
-    };
-    Some(ArgumentPolicy::Literal {
-        language,
-        block: true,
-    })
-}
-fn output_language(tool: &str, args: &Value, field: &str) -> String {
-    match field {
-        "/result/content" if tool == "read" => file_language(args),
-        "" | "/result" => "json".into(),
-        _ => String::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::super::{THEME, Wrap};
+    use super::super::{THEME, Wrap, tests::view};
     use super::*;
     use serde_json::json;
 
-    fn with_error(output: &Value, error: Option<&str>) -> Document {
+    fn with_error(output: Value, error: Option<&str>) -> Document {
         let mut document = Document::default();
-        let output = OutputView::historical(output.clone());
-        document.output_with_error("exec", &Value::Null, Some(&output), error);
+        let hints = Hints::new("exec", &Value::Null);
+        document.output(hints, Some(&view(output)), &Vec::from_iter(error));
         document
     }
 
-    fn rendered(tool: &str, arguments: &Value, output: &Value) -> Document {
+    fn rendered(tool: &str, arguments: &Value, output: Value) -> Document {
         let mut document = Document::default();
-        document.output(tool, arguments, output);
+        document.output(Hints::new(tool, arguments), Some(&view(output)), &[]);
         document
-    }
-
-    /// Borrowed historical output must render exactly like an owned view.
-    #[test]
-    fn borrowed_historical_output_matches_owned_view() {
-        for output in [
-            json!({"presentation": {"preview": {"next_offset": 0, "field": "", "lines": ["{\"result\": {\"ok\": true}, \"error\": null}"], "total_lines": 1}}}),
-            json!({"result": {"stdout": "out", "content": "text"}, "error": "failed", "presentation": {"notice": "Output incomplete."}}),
-            json!({"presentation": {"preview": {"next_offset": 0, "field": "/result", "lines": ["[1,"], "next_start": 2}, "captures": [{"field": "/result/a", "output": {"error": "read failed", "presentation": {"preview": {"field": "/result/a", "lines": ["a"], "total_lines": 1}}}}]}}),
-            json!("plain text"),
-        ] {
-            let tool_args = json!({"path": "file.rs"});
-            let mut owned = Document::default();
-            let view = OutputView::historical(output.clone());
-            owned.output_with_error("read", &tool_args, Some(&view), None);
-            assert!(rendered("read", &tool_args, &output) == owned, "{output}");
-        }
     }
 
     fn arguments(tool: &str, arguments: Value) -> Document {
         let mut document = Document::default();
-        document.arguments(tool, &arguments);
+        document.arguments(Hints::new(tool, &arguments));
         document
     }
 
@@ -628,32 +453,6 @@ mod tests {
     fn has_source(document: &Document, expected: &str) -> bool {
         let expected = clean(expected);
         has_code(document, |source, _, _| source == expected)
-    }
-
-    fn error_sources(document: &Document) -> Vec<&str> {
-        let sections = document.sections.iter();
-        sections
-            .filter_map(|section| match section {
-                Section::Code {
-                    source,
-                    role: Role::Error,
-                    ..
-                } => Some(&**source),
-                _ => None,
-            })
-            .collect()
-    }
-
-    fn whole_output_preview(saved: &Value) -> Value {
-        let source = serde_json::to_string_pretty(saved).unwrap();
-        let lines: Vec<_> = source.lines().collect();
-        json!({"next_offset": 0, "field": "", "total_lines": lines.len(), "lines": lines})
-    }
-
-    fn displayed(saved: &Value) -> String {
-        let mut display = saved.clone();
-        omit_null_fields(&mut display);
-        serde_json::to_string_pretty(&display).unwrap()
     }
 
     #[test]
@@ -726,26 +525,23 @@ mod tests {
     }
 
     #[test]
-    fn error_outputs_keep_structured_details_and_exact_source_without_duplicate_summaries() {
-        let output = json!({"error": "Permission was denied", "result": {"stdout": "  exact\toutput\n\n", "error": "Permission was denied"}, "meta": {"code": "permission_denied", "executed": false}});
-        let before = output.clone();
-        let document = with_error(&output, Some("Permission was denied"));
+    fn errors_render_once_before_output_and_keep_exact_source() {
+        let output = json!({"error": "Permission was denied",
+            "result": {"stdout": "  exact\toutput\n\n"}});
+        let document = with_error(output, Some("Permission was denied"));
         let text = document.plain_text();
         assert!(text.starts_with("Output\n  Permission was denied"));
         assert_eq!(text.matches("Permission was denied").count(), 1);
-        assert!(text.contains("permission_denied") && text.contains("executed"));
         assert!(has_source(&document, "  exact\toutput\n\n"));
-        assert_eq!(output, before);
         let lines = document.lines(None);
         let error = lines
             .iter()
             .find(|line| line.to_string().contains("Permission was denied"));
         let color = error.unwrap().spans.last().unwrap().style.fg;
         assert_eq!(color, Some(THEME.error));
-        let output =
-            json!({"error": {"message": "validation failed", "details": ["argv is required"]}});
-        let text = rendered("exec", &Value::Null, &output).plain_text();
-        assert!(text.contains("validation failed") && text.contains("argv is required"));
+        let error = r#"{"message": "validation failed", "details": ["argv is required"]}"#;
+        let text = with_error(json!({"error": error}), None).plain_text();
+        assert!(text.contains("\"validation failed\"") && text.contains("\"argv is required\""));
     }
 
     #[test]
@@ -774,20 +570,18 @@ mod tests {
         ] {
             for byte_offset in [false, true] {
                 let mut output = json!({"presentation": {"preview": {
-                    "next_offset": 0, "field": field, "lines": source.split('\n').collect::<Vec<_>>(),
+                    "field": field, "lines": source.split('\n').collect::<Vec<_>>(),
                     "total_lines": 1000, "next_start": 10
                 }}});
                 if byte_offset {
                     output["presentation"]["preview"]["next_offset"] = json!(200);
                 }
-                let original = output.clone();
-                let document = rendered(tool, &Value::Null, &output);
+                let document = rendered(tool, &Value::Null, output);
                 let text = document.plain_text();
                 let json =
                     |source: &str, language: &str, _| source == expected && language == "json";
                 assert!(has_code(&document, json), "{tool}: {text}");
                 assert!(text.contains("More saved output available"));
-                assert_eq!(output, original);
             }
         }
     }
@@ -806,11 +600,7 @@ mod tests {
             let expected: Value = serde_json::from_str(&source).unwrap();
             for (end, _) in source.char_indices().skip(1) {
                 let prefix = &source[..end];
-                let more = Pagination::More {
-                    start: 1,
-                    offset: prefix.len(),
-                };
-                let formatted = pretty_json_preview(prefix, more, "");
+                let formatted = pretty_json_preview(prefix, true, true);
                 // A whitespace-only prefix is not a container; all prefixes
                 // beginning at its opening delimiter retain their exact tokens.
                 if prefix.trim().is_empty() {
@@ -826,27 +616,113 @@ mod tests {
 
     #[test]
     fn truncated_literal_source_and_non_json_pages_are_not_reformatted() {
-        for (tool, field, source, next) in [
-            ("read", "/result/content", "{\"items\":[1,2,", true),
-            ("read", "/result/content", "{\"items\":[1,2]}", false),
+        // Pages of a JSON document stay highlighted as JSON when they cannot be formatted.
+        for (tool, field, source, next, language) in [
+            ("read", "/result/content", "{\"items\":[1,2,", true, "toml"),
+            (
+                "read",
+                "/result/content",
+                "{\"items\":[1,2]}",
+                false,
+                "toml",
+            ),
             (
                 "exec",
                 "/result/stdout",
                 "  ordinary output\n  [not JSON",
                 true,
+                "",
             ),
-            ("script", "", "\"continuation\": [1, 2,", true),
-            ("script", "", "{\"malformed\": nope,", true),
-            ("script", "", "{\"unexpected EOF\": [", false),
+            ("script", "", "\"continuation\": [1, 2,", true, "json"),
+            ("script", "/result", "{\"malformed\": nope,", true, "json"),
+            ("script", "", "{\"unexpected EOF\": [", false, "json"),
         ] {
             let lines: Vec<_> = source.split('\n').collect();
-            let mut output = json!({"presentation": {"preview": {"next_offset": 0, "field": field, "lines": lines}}});
+            let mut output = json!({"presentation": {"preview": {"field": field, "lines": lines}}});
             if next {
                 output["presentation"]["preview"]["next_start"] = json!(2);
             }
-            let document = rendered(tool, &json!({"path": "data.json"}), &output);
-            assert!(has_source(&document, source), "{tool}: {source}");
+            let document = rendered(tool, &json!({"path": "data.toml"}), output);
+            let source = clean(source);
+            let page = |text: &str, highlight: &str, _| text == source && highlight == language;
+            assert!(has_code(&document, page), "{tool}: {source}");
         }
+    }
+
+    #[test]
+    fn a_whole_result_showing_the_error_takes_the_place_of_its_summary() {
+        let error = "Permission was denied";
+        let result = json!({"error": {"message": error}});
+        let saved = json!({"result": result}).to_string();
+        let page = json!({"field": "", "lines": [saved]});
+        for output in [
+            json!({"result": result}),
+            json!({"presentation": {"preview": page}}),
+        ] {
+            let text = with_error(output, Some(error)).plain_text();
+            assert_eq!(text.matches(error).count(), 1, "{text}");
+        }
+    }
+
+    /// The document painted 40 columns wide, one trimmed string per row.
+    fn rows(document: &Document) -> Vec<String> {
+        use ratatui::{buffer::Buffer, layout::Rect, widgets::Widget};
+        let lines = document.lines(None);
+        let area = Rect::new(0, 0, 40, lines.len() as u16);
+        let mut buffer = Buffer::empty(area);
+        ratatui::widgets::Paragraph::new(lines).render(area, &mut buffer);
+        (0..area.height)
+            .map(|y| {
+                let row: String = (0..area.width).map(|x| buffer[(x, y)].symbol()).collect();
+                row.trim_end().to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_settled_result_renders_no_envelope_and_a_non_view_renders_raw() {
+        for (result, expected) in [
+            (json!({}), vec!["Output"]),
+            (json!({"result": "done"}), vec!["Output", "  done"]),
+            (
+                json!({"stdout": "done"}),
+                vec!["Output", "  {", r#"    "stdout": "done""#, "  }"],
+            ),
+            (
+                json!({"state": "completed", "stdout": "done"}),
+                vec![
+                    "Output",
+                    "  {",
+                    r#"    "state": "completed","#,
+                    r#"    "stdout": "done""#,
+                    "  }",
+                ],
+            ),
+        ] {
+            let mut document = Document::default();
+            document.historical_output(Hints::new("replace", &Value::Null), &result);
+            assert_eq!(rows(&document), expected);
+        }
+    }
+
+    #[test]
+    fn a_waiting_childs_question_batch_renders_in_place_of_a_result() {
+        let question = json!({"id": "pick", "prompt": "Which one?",
+            "options": [{"label": "First", "description": "First step\nSecond step"}]});
+        let output = json!({"state": "waiting_input",
+            "presentation": {"question": {"questions": [question]}}});
+        let expected = [
+            "Output",
+            "Question",
+            "  Which one?",
+            "  • First",
+            "    First step",
+            "    Second step",
+            "  {",
+            "    \"state\": \"waiting_input\"",
+            "  }",
+        ];
+        assert_eq!(rows(&rendered("agent", &Value::Null, output)), expected);
     }
 
     #[test]
@@ -854,16 +730,17 @@ mod tests {
         for (preview, footer) in [
             (Value::Null, None),
             (
-                json!({"next_offset": 0, "field": "/result/stdout", "lines": ["payload"]}),
+                json!({"field": "/result/stdout", "lines": ["payload"]}),
                 Some("End of available output"),
             ),
             (
-                json!({"next_offset": 0, "field": "/result/stdout", "lines": ["payload"], "next_start": 2}),
+                json!({"field": "/result/stdout", "lines": ["payload"], "next_start": 2}),
                 Some("More saved output available"),
             ),
         ] {
-            let output = json!({"result": {"stdout": "payload"}, "presentation": {"notice": "Output incomplete.", "preview": preview}});
-            let text = rendered("exec", &Value::Null, &output).plain_text();
+            let output = json!({"result": {"stdout": "payload"},
+                "presentation": {"notice": "Output incomplete.", "preview": preview}});
+            let text = rendered("exec", &Value::Null, output).plain_text();
             assert_eq!(text.matches("Output incomplete.").count(), 1);
             assert_eq!(text.matches("payload").count(), 1);
             assert!(footer.is_none_or(|footer| text.contains(footer)));
@@ -872,19 +749,29 @@ mod tests {
 
     #[test]
     fn live_captures_keep_unique_read_errors_without_duplicate_envelopes_or_empty_panes() {
+        let incomplete = |preview: Value, captures: Value| json!({"notice": "Output incomplete.", "preview": preview, "captures": captures});
+        let capture = |field: &str, error: &str, presentation: Value| {
+            json!({"field": field, "complete": false, "output": {"state": "completed",
+                "error": error, "presentation": presentation}})
+        };
+        let page =
+            json!({"field": "/result/custom", "lines": ["  live payload\t"], "next_start": 2});
+        let captures = json!([
+            capture(
+                "/result/custom",
+                "parent failure",
+                incomplete(page, json!([]))
+            ),
+            capture("/result/missing", "field read failed", Value::Null),
+            capture("/result/duplicate", "field read failed", Value::Null),
+        ]);
         for preview in [
             Value::Null,
-            json!({"next_offset": 0, "field": "", "lines": [], "total_lines": 0}),
+            json!({"field": "", "lines": [], "total_lines": 0}),
         ] {
-            let output = json!({"state": "running", "result": null, "error": "parent failure", "presentation": {"preview": preview, "notice": "Output incomplete.", "captures": [{"field": "/result/custom", "kind": "text", "complete": false, "output": {"error": "parent failure", "presentation": {"notice": "Output incomplete.", "preview": {"field": "/result/custom", "lines": ["  live payload\t"], "next_start": 2, "next_offset": 0}}}}, {"field": "/result/missing", "output": {"error": "field read failed"}}, {"field": "/result/duplicate", "output": {"error": "field read failed"}}]}});
-            let mut document = Document::default();
-            let view = OutputView::historical(output);
-            document.output_with_error(
-                "custom_tool",
-                &Value::Null,
-                Some(&view),
-                Some("parent failure"),
-            );
+            let presentation = incomplete(preview, captures.clone());
+            let output = json!({"state": "running", "error": "parent failure", "presentation": presentation});
+            let document = with_error(output, Some("parent failure"));
             let text = document.plain_text();
             for marker in [
                 "Output incomplete.",
@@ -909,115 +796,5 @@ mod tests {
             }));
             assert!(has_source(&document, "  live payload\t"));
         }
-    }
-
-    #[test]
-    fn complete_whole_output_preview_owns_identical_error_summaries_without_losing_source() {
-        for error in [
-            json!("failed exactly"),
-            json!({"message": "failed exactly", "meta": {"code": 7}}),
-        ] {
-            for pointer in ["/error", "/result/error", "both"] {
-                let mut saved = json!({"error": null, "result": {
-                    "stdout": "  exact\toutput\n\n", "stderr": "retained diagnostics"
-                }});
-                if pointer != "/result/error" {
-                    saved["error"] = error.clone();
-                }
-                if pointer != "/error" {
-                    saved["result"]["error"] = error.clone();
-                }
-                let output = json!({"error": error, "result": {"error": error}, "presentation": {"preview": whole_output_preview(&saved)}});
-                let before = output.clone();
-                let document = with_error(&output, error.as_str());
-                assert!(error_sources(&document).is_empty(), "{pointer}: {error}");
-                // Repeated fields in the preview itself are source data, not summaries.
-                let repeated = if pointer == "both" { 2 } else { 1 };
-                assert_eq!(
-                    document.plain_text().matches("failed exactly").count(),
-                    repeated
-                );
-                assert!(has_source(&document, &displayed(&saved)));
-                assert_eq!(output, before);
-            }
-        }
-    }
-
-    #[test]
-    fn incomplete_or_unstructured_previews_keep_separate_error_summaries() {
-        let complete = whole_output_preview(&json!({"error": "failed exactly", "result": null}));
-        for (name, key, value) in [
-            ("partial page", "next_start", json!(2)),
-            ("byte continuation", "next_offset", json!(10)),
-            ("final or filtered page", "total_lines", json!(100)),
-            ("unknown total", "total_lines", Value::Null),
-            ("selected result", "field", json!("/result")),
-            ("selected stdout", "field", json!("/result/stdout")),
-            ("unknown field", "field", Value::Null),
-        ] {
-            let mut preview = complete.clone();
-            preview[key] = value;
-            let output = json!({"error": "failed exactly", "presentation": {"preview": preview}});
-            let document = with_error(&output, Some("failed exactly"));
-            assert_eq!(error_sources(&document), ["failed exactly"], "{name}");
-            // The preview remains visible even when it also contains the error.
-            let count = document.plain_text().matches("failed exactly").count();
-            assert_eq!(count, 2, "{name}");
-        }
-        for source in [
-            "{\"error\": \"failed exactly\"",      // Malformed JSON.
-            "failed exactly",                      // Prose, not a structured error field.
-            "[ {\"error\": \"failed exactly\"} ]", // Not a saved document.
-            "\"failed exactly\"",
-        ] {
-            let output = json!({"error": "failed exactly", "presentation": {"preview": {
-                "next_offset": 0, "field": "", "total_lines": 1, "lines": [source]
-            }}});
-            let document = rendered("exec", &Value::Null, &output);
-            assert_eq!(error_sources(&document), ["failed exactly"], "{source}");
-            assert_eq!(document.plain_text().matches("failed exactly").count(), 2);
-        }
-        // Without an envelope summary only a complete preview owns the error.
-        let mut output = json!({"presentation": {"preview": complete}});
-        let document = with_error(&output, Some("failed exactly"));
-        assert!(error_sources(&document).is_empty());
-        assert_eq!(document.plain_text().matches("failed exactly").count(), 1);
-        output["presentation"]["preview"]["next_start"] = json!(2);
-        let document = with_error(&output, Some("failed exactly"));
-        assert_eq!(error_sources(&document), ["failed exactly"]);
-        let mut document = Document::default();
-        document.output_with_error("exec", &Value::Null, None, Some("failed exactly"));
-        assert_eq!(error_sources(&document), ["failed exactly"]);
-    }
-
-    #[test]
-    fn whole_output_preview_matches_only_identical_structured_error_fields() {
-        for saved in [
-            json!({"error": "different error", "result": null}),
-            json!({"error": {"message": "failed exactly", "details": "different"}}),
-            json!({"result": {"stdout": "failed exactly", "stderr": "failed exactly"}}),
-            json!({"result": {"stdout": "{\"error\":\"failed exactly\"}"}}),
-            json!({"message": "failed exactly", "result": {"message": "failed exactly"}}),
-            json!({"result": "failed exactly"}),
-        ] {
-            let output = json!({"error": "failed exactly", "presentation": {"preview": whole_output_preview(&saved)}});
-            let document = rendered("exec", &Value::Null, &output);
-            assert_eq!(error_sources(&document), ["failed exactly"], "{saved}");
-            let source = displayed(&saved);
-            assert!(has_code(&document, |shown, _, role| shown == source
-                && role == Role::Plain));
-        }
-        let output = json!({"error": "outer error", "result": {"error": "inner error"}, "presentation": {"preview": whole_output_preview(&json!({"error": "outer error", "result": null}))}});
-        let document = with_error(&output, Some("third error"));
-        assert_eq!(error_sources(&document), ["third error", "inner error"]);
-        assert_eq!(document.plain_text().matches("outer error").count(), 1);
-        // Deduplication requires exact structured values, not similar messages.
-        let first = json!({"message": "read failed", "meta": {"code": 1}});
-        let second = json!({"message": "read failed", "meta": {"code": 2}});
-        let output = json!({"error": first, "result": {"error": first, "stdout": "read failed with extra source text"}, "presentation": {"captures": [{"field": "/result/stdout", "output": {"error": second}}]}});
-        let text = with_error(&output, Some("read failed")).plain_text();
-        assert_eq!(text.matches("\"code\": 1").count(), 1);
-        assert_eq!(text.matches("\"code\": 2").count(), 1);
-        assert!(text.contains("read failed with extra source text"));
     }
 }

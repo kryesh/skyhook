@@ -12,6 +12,7 @@ use crate::tool::{
     diagnostic::{Effects, Operation, PartialContext, Subject},
     policy::{Capability, CapabilitySet},
 };
+pub use catalog::DiscoveryLimit;
 use catalog::bounded_json_size;
 use connection::{Server, connect_one};
 use futures_util::{StreamExt, stream};
@@ -23,17 +24,22 @@ use rmcp::{
     service::{PeerRequestOptions, RequestHandle, ServiceError},
 };
 use serde_json::{Map, Value};
-use std::{collections::BTreeMap, time::Duration};
+use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
+const MAX_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
+const CANCEL_TIMEOUT: Duration = Duration::from_millis(100);
+const STARTUP_CONCURRENCY: usize = 4;
 
 #[derive(Debug, thiserror::Error)]
 pub enum McpError {
-    #[error("invalid MCP configuration: {0}")]
-    Configuration(String),
-    #[error("MCP startup failed: {0}")]
-    Startup(String),
+    #[error("invalid MCP header name")]
+    HeaderName,
+    #[error("MCP header environment variable {0:?} is missing or not Unicode")]
+    HeaderVariable(String),
+    #[error("invalid value in MCP header environment variable {0:?}")]
+    HeaderValue(String),
     #[error("MCP operation cancelled")]
     Cancelled,
     #[error("MCP operation timed out")]
@@ -41,7 +47,7 @@ pub enum McpError {
     #[error("MCP manager is shut down")]
     Closed,
     #[error("MCP tool is not in the startup catalog")]
-    UnknownTool { server: String, tool: String },
+    UnknownTool,
     #[error("MCP tool arguments exceed size limit")]
     ArgumentsTooLarge,
     #[error("MCP tool result exceeds size limit")]
@@ -79,11 +85,12 @@ impl From<McpError> for ToolError {
         match error {
             McpError::Cancelled => Self::cancelled(),
             McpError::Io(error) => Self::io(error),
-            error @ (McpError::Configuration(_)
-            | McpError::Startup(_)
+            error @ (McpError::HeaderName
+            | McpError::HeaderVariable(_)
+            | McpError::HeaderValue(_)
             | McpError::Timeout
             | McpError::Closed
-            | McpError::UnknownTool { .. }
+            | McpError::UnknownTool
             | McpError::ArgumentsTooLarge
             | McpError::ResultTooLarge
             | McpError::JsonRpc(_)
@@ -102,6 +109,17 @@ impl From<McpError> for ToolError {
     }
 }
 
+/// Why a configured server has no session.
+#[derive(Debug, thiserror::Error)]
+pub enum StartupError {
+    #[error(transparent)]
+    Mcp(#[from] McpError),
+    #[error("MCP tools/list discovery failed: {0}")]
+    Discovery(McpError),
+    #[error("MCP tools/list discovery rejected: {0}")]
+    Limit(#[from] DiscoveryLimit),
+}
+
 #[derive(Debug, Clone)]
 pub struct DiscoveredTool {
     pub(crate) server: String,
@@ -110,13 +128,20 @@ pub struct DiscoveredTool {
     pub(crate) capabilities: Vec<Capability>,
 }
 
+impl DiscoveredTool {
+    /// The catalog's sort order, which call lookup binary-searches.
+    fn key(&self) -> (&str, &str) {
+        (&self.server, &self.tool.name)
+    }
+}
+
 /// Startup outcome of one configured server, frozen with the catalog.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum McpServerStatus {
     Connected {
         tools: usize,
     },
-    Failed(String),
+    Failed(Arc<StartupError>),
     /// Never started: excluded by capability policy, or startup was cancelled.
     Skipped,
 }
@@ -124,7 +149,7 @@ pub enum McpServerStatus {
 /// One configured server: its live session, or why it has none.
 enum ServerEntry {
     Connected { server: Server, tools: usize },
-    Failed(String),
+    Failed(Arc<StartupError>),
     Skipped,
 }
 
@@ -138,7 +163,7 @@ impl Drop for CancelOnDrop {
         {
             runtime.spawn(async move {
                 let _ = tokio::time::timeout(
-                    Duration::from_millis(100),
+                    CANCEL_TIMEOUT,
                     handle.cancel(Some("Skyhook caller cancelled or timed out".into())),
                 )
                 .await;
@@ -149,7 +174,6 @@ impl Drop for CancelOnDrop {
 
 pub struct McpManager {
     catalog: Vec<DiscoveredTool>,
-    warnings: Vec<String>,
     servers: BTreeMap<String, ServerEntry>,
     closed: CancellationToken,
 }
@@ -165,7 +189,6 @@ impl McpManager {
     ) -> Self {
         let mut manager = Self {
             catalog: Vec::new(),
-            warnings: Vec::new(),
             servers: configs
                 .keys()
                 .map(|name| (name.clone(), ServerEntry::Skipped))
@@ -191,15 +214,16 @@ impl McpManager {
                 let cancel = cancel.clone();
                 async move {
                     let policy = config.capabilities().to_vec();
-                    (policy, connect_one(name, config, cancel).await)
+                    let deadline = tokio::time::sleep(config.startup_timeout());
+                    let result = connect_one(config, cancel, deadline).await?;
+                    Some((name, policy, result))
                 }
             })
             .collect();
-        let mut pending = stream::iter(futures).buffer_unordered(4);
-        while let Some((policy, result)) = pending.next().await {
-            let Some((name, result)) = result else {
-                continue;
-            };
+        let mut pending = stream::iter(futures)
+            .buffer_unordered(STARTUP_CONCURRENCY)
+            .filter_map(std::future::ready);
+        while let Some((name, policy, result)) = pending.next().await {
             let entry = match result {
                 Ok((tools, server)) => {
                     let entry = ServerEntry::Connected {
@@ -215,19 +239,11 @@ impl McpManager {
                         }));
                     entry
                 }
-                Err(error) => {
-                    manager
-                        .warnings
-                        .push(format!("MCP server {name:?} unavailable: {error}"));
-                    ServerEntry::Failed(error.to_string())
-                }
+                Err(error) => ServerEntry::Failed(Arc::new(error)),
             };
             manager.servers.insert(name, entry);
         }
-        manager
-            .catalog
-            .sort_by(|a, b| (&a.server, &a.tool.name).cmp(&(&b.server, &b.tool.name)));
-        manager.warnings.sort();
+        manager.catalog.sort_by(|a, b| a.key().cmp(&b.key()));
         manager
     }
 
@@ -236,8 +252,17 @@ impl McpManager {
     pub fn catalog(&self) -> &[DiscoveredTool] {
         &self.catalog
     }
-    pub fn warnings(&self) -> &[String] {
-        &self.warnings
+    /// One line per server whose startup failed.
+    pub fn warnings(&self) -> Vec<String> {
+        self.servers
+            .iter()
+            .filter_map(|(name, entry)| match entry {
+                ServerEntry::Failed(error) => {
+                    Some(format!("MCP server {name:?} unavailable: {error}"))
+                }
+                ServerEntry::Connected { .. } | ServerEntry::Skipped => None,
+            })
+            .collect()
     }
     /// Every configured server, including those that failed or were skipped.
     pub fn servers(&self) -> BTreeMap<String, McpServerStatus> {
@@ -266,22 +291,30 @@ impl McpManager {
         cancel: CancellationToken,
     ) -> Result<CallToolResult, ToolError> {
         let mut stage = (Operation::Prepare, Effects::NotStarted);
-        self.call_staged(server, tool, arguments, cancel, &mut stage)
-            .await
-            .map_err(|error| {
-                let subject = Subject::Label(format!("MCP server {server}, tool {tool}"));
-                ToolError::from(error)
-                    .context(PartialContext::new(stage.0, subject).effects(stage.1))
-            })
+        self.call_staged(
+            server,
+            tool,
+            arguments,
+            cancel,
+            tokio::time::sleep,
+            &mut stage,
+        )
+        .await
+        .map_err(|error| {
+            let subject = Subject::Label(format!("MCP server {server}, tool {tool}"));
+            ToolError::from(error).context(PartialContext::new(stage.0, subject).effects(stage.1))
+        })
     }
 
     /// `stage` names the step a failure interrupted and what it left behind.
-    async fn call_staged(
+    /// `deadline` turns the server's call timeout into the future that ends the call.
+    async fn call_staged<D: Future<Output = ()>>(
         &self,
         server: &str,
         tool: &str,
         arguments: Map<String, Value>,
         cancel: CancellationToken,
+        deadline: impl FnOnce(Duration) -> D,
         stage: &mut (Operation, Effects),
     ) -> Result<CallToolResult, McpError> {
         if self.closed.is_cancelled() {
@@ -292,21 +325,18 @@ impl McpManager {
         }
         let advertised = self
             .catalog
-            .iter()
-            .any(|entry| entry.server == server && entry.tool.name == tool);
+            .binary_search_by(|entry| entry.key().cmp(&(server, tool)))
+            .is_ok();
         let Some(ServerEntry::Connected { server, .. }) =
             self.servers.get(server).filter(|_| advertised)
         else {
-            return Err(McpError::UnknownTool {
-                server: server.into(),
-                tool: tool.into(),
-            });
+            return Err(McpError::UnknownTool);
         };
-        let deadline = tokio::time::Instant::now() + server.timeout;
-        let _permit = guarded(&self.closed, &cancel, deadline, server.calls.acquire())
+        let mut deadline = std::pin::pin!(deadline(server.timeout));
+        let _permit = guarded(&self.closed, &cancel, &mut deadline, server.calls.acquire())
             .await?
             .map_err(|_| McpError::Closed)?;
-        if bounded_json_size(&arguments, MAX_RESULT_BYTES).is_none() {
+        if bounded_json_size(&arguments, MAX_ARGUMENT_BYTES).is_none() {
             return Err(McpError::ArgumentsTooLarge);
         }
         let request = ClientRequest::CallToolRequest(CallToolRequest::new(
@@ -318,13 +348,13 @@ impl McpManager {
         // Once submission starts, neither cancellation nor a failed transport
         // proves that the server did not execute the request. Never replay it.
         *stage = (Operation::Send, Effects::MayHaveExecuted);
-        let handle = guarded(&self.closed, &cancel, deadline, send)
+        let handle = guarded(&self.closed, &cancel, &mut deadline, send)
             .await?
             .map_err(request_error)?;
         *stage = (Operation::Receive, Effects::MayHaveExecuted);
         let mut handle = CancelOnDrop(Some(handle));
         let response = &mut handle.0.as_mut().expect("active request").rx;
-        let result = match guarded(&self.closed, &cancel, deadline, response).await {
+        let result = match guarded(&self.closed, &cancel, &mut deadline, response).await {
             Ok(Ok(Ok(ServerResult::CallToolResult(result)))) => {
                 if bounded_json_size(&result, MAX_RESULT_BYTES).is_none() {
                     *stage = (Operation::Receive, Effects::OutputIncomplete);
@@ -369,14 +399,14 @@ impl Drop for McpManager {
 async fn guarded<T>(
     closed: &CancellationToken,
     cancel: &CancellationToken,
-    deadline: tokio::time::Instant,
+    deadline: &mut std::pin::Pin<&mut impl Future<Output = ()>>,
     future: impl Future<Output = T>,
 ) -> Result<T, McpError> {
     tokio::select! {
         biased;
         () = closed.cancelled() => Err(McpError::Closed),
         () = cancel.cancelled() => Err(McpError::Cancelled),
-        () = tokio::time::sleep_until(deadline) => Err(McpError::Timeout),
+        () = deadline => Err(McpError::Timeout),
         value = future => Ok(value),
     }
 }
@@ -401,6 +431,7 @@ fn request_error(error: ServiceError) -> McpError {
 mod tests {
     use super::*;
     use crate::mcp::{config::McpServerConfig, manager::McpManager};
+    use crate::tests::bounded;
     use crate::tool::diagnostic::Cause;
     use serde_json::{Map, Value, json};
     use std::{collections::BTreeMap, path::Path, time::Duration};
@@ -414,6 +445,7 @@ with open(os.environ['MCP_TEST_PID'] + '.tmp', 'w') as f:
     f.write(str(os.getpid()))
 os.replace(os.environ['MCP_TEST_PID'] + '.tmp', os.environ['MCP_TEST_PID'])
 lock = threading.Lock()
+limits = json.loads(os.environ['MCP_TEST_LIMITS'])
 def send(message):
     with lock:
         print(json.dumps(message), flush=True)
@@ -433,7 +465,7 @@ def handle(request):
         with open(os.environ['MCP_TEST_INITIALIZE'], 'w') as f:
             f.write(json.dumps(params))
         if os.environ.get('MCP_TEST_OVERSIZED_FRAME'):
-            sys.stdout.write('x' * (8 * 1024 * 1024 + 1))
+            sys.stdout.write('x' * (limits['frame'] + 1))
             sys.stdout.flush()
             return
         if os.environ.get('MCP_TEST_HANG_INITIALIZE') == '1':
@@ -446,11 +478,11 @@ def handle(request):
             f.write('called')
         mode = os.environ.get('MCP_TEST_DISCOVERY')
         if mode == 'oversized_schema':
-            result = {'tools': [dict(tool('huge'), description='x' * (256 * 1024))]}
+            result = {'tools': [dict(tool('huge'), description='x' * limits['tool'])]}
             send({'jsonrpc': '2.0', 'id': ident, 'result': result})
             return
         if mode == 'many_tools':
-            result = {'tools': [tool('tool_' + str(i)) for i in range(1025)]}
+            result = {'tools': [tool('tool_' + str(i)) for i in range(limits['tools'] + 1)]}
             send({'jsonrpc': '2.0', 'id': ident, 'result': result})
             return
         if mode == 'repeated_cursor':
@@ -459,8 +491,7 @@ def handle(request):
             return
         if mode == 'rpc_error':
             send({'jsonrpc': '2.0', 'id': ident,
-                  'error': {'code': -32602, 'message': 'private-discovery-message',
-                            'data': {'secret': 'private-discovery-payload'}}})
+                  'error': {'code': -32602, 'message': 'fixture discovery error'}})
             return
         cursor = params.get('cursor')
         if cursor is None:
@@ -474,7 +505,7 @@ def handle(request):
     elif method == 'tools/call':
         name = params['name']
         if os.environ.get('MCP_TEST_LARGE_RESULT') == '1':
-            send({'jsonrpc': '2.0', 'id': ident, 'result': {'content': [{'type': 'text', 'text': 'x' * (4 * 1024 * 1024)}]}})
+            send({'jsonrpc': '2.0', 'id': ident, 'result': {'content': [{'type': 'text', 'text': 'x' * limits['result']}]}})
             return
         if name == 'rpc_error':
             send({'jsonrpc': '2.0', 'id': ident,
@@ -529,9 +560,13 @@ for line in sys.stdin:
                 .map(|name| (format!("MCP_TEST_{}", name.to_uppercase()), self.path(name)))
                 .collect();
             env.insert("MCP_TEST_VALUE".into(), "configured child value".into());
+            let limits = json!({
+                "frame": crate::mcp::transport::MAX_MESSAGE_BYTES, "tools": catalog::MAX_TOOLS,
+                "tool": catalog::MAX_TOOL_BYTES, "result": MAX_RESULT_BYTES,
+            });
+            env.insert("MCP_TEST_LIMITS".into(), limits.to_string());
             serde_json::from_value(json!({
                 "transport": "stdio", "start_command": ["python3", "-u", "-c", FIXTURE],
-                "startup_timeout_secs": 5, "call_timeout_secs": 5,
                 "cwd": self.directory.path(), "env": env
             }))
             .unwrap()
@@ -564,9 +599,7 @@ for line in sys.stdin:
         let configs = BTreeMap::from([("fixture".into(), config)]);
         let capabilities = CapabilitySet::default();
         let connect = McpManager::connect(&configs, &capabilities, CancellationToken::new());
-        tokio::time::timeout(Duration::from_secs(10), connect)
-            .await
-            .expect("MCP startup is bounded")
+        bounded(connect).await
     }
 
     pub(super) async fn fixture_call(
@@ -587,27 +620,29 @@ for line in sys.stdin:
         error.diagnostic().cause == ToolError::from(expected).diagnostic().cause
     }
 
+    pub(super) fn failure(manager: &McpManager, name: &str) -> Arc<StartupError> {
+        match &manager.servers[name] {
+            ServerEntry::Failed(error) => error.clone(),
+            ServerEntry::Connected { .. } | ServerEntry::Skipped => panic!("{name} did not fail"),
+        }
+    }
+
     pub(super) async fn shutdown(manager: &McpManager) {
-        // Leave room for the client's five-second graceful-close deadline plus
-        // process teardown; this is a deadlock guard, not a timing assertion.
-        tokio::time::timeout(Duration::from_secs(10), manager.shutdown())
-            .await
-            .expect("MCP shutdown is bounded");
+        bounded(manager.shutdown()).await;
     }
 
     pub(super) async fn wait_for_file(path: &Path) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        bounded(async {
             while !path.exists() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("fixture received request");
+        .await;
     }
 
     #[cfg(unix)]
     pub(super) async fn assert_process_reaped(pid: libc::pid_t) {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        bounded(async {
             // SAFETY: signal zero only checks whether the recorded child exists.
             while unsafe { libc::kill(pid, 0) } != -1 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -615,8 +650,7 @@ for line in sys.stdin:
             let error = std::io::Error::last_os_error().raw_os_error();
             assert_eq!(error, Some(libc::ESRCH));
         })
-        .await
-        .expect("owned MCP child must be terminated and reaped, not left as a zombie");
+        .await;
     }
 
     #[tokio::test]
@@ -649,10 +683,8 @@ for line in sys.stdin:
             assert!(manager.catalog().is_empty());
             // Missing header resolution or command startup would produce a warning.
             assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
-            assert_eq!(
-                manager.servers().into_values().collect::<Vec<_>>(),
-                [McpServerStatus::Skipped, McpServerStatus::Skipped]
-            );
+            let mut servers = manager.servers().into_values();
+            assert!(servers.all(|status| matches!(status, McpServerStatus::Skipped)));
             assert!(!fixture.directory.path().join("pid").exists());
             let accepted = listener.accept().unwrap_err();
             assert_eq!(accepted.kind(), std::io::ErrorKind::WouldBlock);
@@ -722,7 +754,8 @@ for line in sys.stdin:
         let ServerEntry::Connected { server, .. } = &manager.servers["fixture"] else {
             panic!("fixture server is connected")
         };
-        let permits = server.calls.acquire_many(16).await.unwrap();
+        let all = connection::MAX_CONCURRENT_CALLS as u32;
+        let permits = server.calls.acquire_many(all).await.unwrap();
         let cancel = CancellationToken::new();
         let call = manager.call("fixture", "slow", Map::new(), cancel.clone());
         tokio::pin!(call);
@@ -734,11 +767,7 @@ for line in sys.stdin:
         assert!(!fixture.directory.path().join("started").exists());
         drop(permits);
         let error = fixture_call(&manager, "not-advertised").await.unwrap_err();
-        let unknown = McpError::UnknownTool {
-            server: "fixture".into(),
-            tool: "not-advertised".into(),
-        };
-        assert!(is(&error, unknown), "{error:?}");
+        assert!(is(&error, McpError::UnknownTool), "{error:?}");
         shutdown(&manager).await;
         let error = fixture_call(&manager, "echo").await.unwrap_err();
         assert!(is(&error, McpError::Closed), "{error:?}");
@@ -757,11 +786,7 @@ for line in sys.stdin:
             wait_for_file(Path::new(&started)).await;
             cancel.cancel();
         };
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(7), async {
-            tokio::join!(call, cancel_when_started)
-        })
-        .await
-        .expect("cancellation interrupts the pending tool call");
+        let (result, ()) = bounded(async { tokio::join!(call, cancel_when_started) }).await;
         let error = result.unwrap_err();
         let diagnostic = error.diagnostic();
         assert_eq!(diagnostic.cause, Cause::Cancelled);
@@ -795,29 +820,23 @@ for line in sys.stdin:
         let Some(fixture) = Fixture::new() else {
             return;
         };
-        let config = McpServerConfig::try_from(fixture.config()).unwrap();
-        let config = config.with_call_timeout(Duration::from_millis(250));
-        let manager = connect_admitted(config).await;
-        let call = fixture_call(&manager, "slow");
-        let result = tokio::time::timeout(Duration::from_secs(5), call)
-            .await
-            .expect("configured timeout must stop a pending call");
-        let error = result.unwrap_err();
-        assert!(is(&error, McpError::Timeout), "{error:?}");
-        assert_eq!(stage(error), (Operation::Receive, Effects::MayHaveExecuted));
-        // The timed-out call was already sent.
-        wait_for_file(&fixture.directory.path().join("started")).await;
-        // The session stays usable; under load an echo may itself exceed the short timeout.
-        let echo = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                match fixture_call(&manager, "echo").await {
-                    Err(error) if is(&error, McpError::Timeout) => {}
-                    other => break other,
-                }
-            }
-        });
-        let echo = echo.await.expect("session wedged after a timed-out call");
-        assert!(echo.is_ok(), "{echo:?}");
+        let manager = connect(fixture.config()).await;
+        // The deadline expires once the server has received the call.
+        let started = fixture.directory.path().join("started");
+        let mut reached = (Operation::Prepare, Effects::NotStarted);
+        let slow = manager.call_staged(
+            "fixture",
+            "slow",
+            Map::new(),
+            CancellationToken::new(),
+            |_| wait_for_file(&started),
+            &mut reached,
+        );
+        let error = bounded(slow).await.unwrap_err();
+        assert!(matches!(error, McpError::Timeout), "{error:?}");
+        assert_eq!(reached, (Operation::Receive, Effects::MayHaveExecuted));
+        // The session stays usable.
+        fixture_call(&manager, "echo").await.unwrap();
         shutdown(&manager).await;
         // Oversized results are rejected without exposing content.
         let mut config = fixture.config();
@@ -826,10 +845,7 @@ for line in sys.stdin:
             .insert("MCP_TEST_LARGE_RESULT".into(), "1".into());
         let manager = connect(config).await;
         let error = fixture_call(&manager, "echo").await.unwrap_err();
-        assert!(
-            error.to_string().contains("result exceeds size limit"),
-            "{error}"
-        );
+        assert!(is(&error, McpError::ResultTooLarge), "{error:?}");
         assert_eq!(
             stage(error),
             (Operation::Receive, Effects::OutputIncomplete)
@@ -850,9 +866,7 @@ for line in sys.stdin:
         ]);
         let capabilities = CapabilitySet::default();
         let connect = McpManager::connect(&configs, &capabilities, CancellationToken::new());
-        let manager = tokio::time::timeout(Duration::from_secs(10), connect)
-            .await
-            .expect("partial startup is bounded");
+        let manager = bounded(connect).await;
         assert_eq!(manager.catalog().len(), 4);
         assert!(
             manager
@@ -860,14 +874,15 @@ for line in sys.stdin:
                 .iter()
                 .all(|entry| entry.server == "fixture")
         );
-        let warnings = manager.warnings();
-        assert!(
-            warnings.iter().any(|warning| warning.contains("broken")),
-            "{warnings:?}"
-        );
+        assert!(matches!(
+            *failure(&manager, "broken"),
+            StartupError::Mcp(McpError::Io(_))
+        ));
         let servers = manager.servers();
-        assert!(matches!(servers["broken"], McpServerStatus::Failed(_)));
-        assert_eq!(servers["fixture"], McpServerStatus::Connected { tools: 4 });
+        assert!(matches!(
+            servers["fixture"],
+            McpServerStatus::Connected { tools: 4 }
+        ));
         shutdown(&manager).await;
     }
 

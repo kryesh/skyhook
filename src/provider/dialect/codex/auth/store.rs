@@ -1,9 +1,11 @@
 //! Private atomic credential persistence and cross-process refresh/login coordination.
-use super::{
-    AuthError, AuthManager, AuthStatus, Issuer, LoginRequired, MAX_BODY, blocking, error,
-    random_string,
-};
+use super::{AuthManager, AuthStatus, Issuer, LoginRequired, blocking, random_string};
 use crate::fs::{AtomicWriteStage, CommitMode, PermissionPolicy, StagedFile, sync_directory};
+use crate::newtype::string_newtype;
+use crate::provider::{
+    ProviderError,
+    ProviderErrorKind::{Authentication, Unavailable},
+};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -13,26 +15,77 @@ use std::{
     path::Path,
     time::Duration,
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
 /// The credential format; version 1 records predate issuer binding.
 const FORMAT: u32 = 2;
+pub(super) const STORE_FILE: &str = "codex-oauth.json";
+/// Held while credentials are read, refreshed or written, by every process.
+const LOCK_FILE: &str = "codex-oauth.lock";
+const MAX_STORE_BYTES: u64 = 1024 * 1024;
+const MAX_EPOCH_BYTES: u64 = 128;
+const MAX_TOKEN_BYTES: usize = 128 * 1024;
+const MAX_ACCOUNT_BYTES: usize = 256;
+const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
+const LOCK_POLL: Duration = Duration::from_millis(25);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid Codex token")]
+pub struct InvalidToken;
+
+/// An OAuth token: 1 byte to 128 KiB, without whitespace or control
+/// characters. Absent from Debug and wiped on drop.
+#[derive(Clone, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "String")]
+pub struct Token(Zeroizing<String>);
+
+impl Token {
+    pub(crate) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Token {
+    type Error = InvalidToken;
+
+    fn try_from(token: String) -> Result<Self, InvalidToken> {
+        let token = Zeroizing::new(token);
+        let valid = !token.is_empty()
+            && token.len() <= MAX_TOKEN_BYTES
+            && !token.chars().any(|c| c.is_whitespace() || c.is_control());
+        valid.then(|| Self(token)).ok_or(InvalidToken)
+    }
+}
+
+impl Serialize for Token {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.as_str())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("invalid ChatGPT account ID")]
+pub struct InvalidAccount;
+
+string_newtype! {
+    /// A ChatGPT account ID: 1 to 256 ASCII letters, digits, hyphens or underscores.
+    pub struct AccountId(InvalidAccount) = |account| {
+        let valid = !account.is_empty()
+            && account.len() <= MAX_ACCOUNT_BYTES
+            && account.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+        valid.then_some(()).ok_or(InvalidAccount)
+    };
+}
 
 /// The record of the current format; `write_store` adds the version.
 #[derive(Serialize, Deserialize)]
 pub(super) struct Stored {
     /// The issuer that granted these tokens; they are used with no other.
     pub(super) issuer: Issuer,
-    pub(super) access_token: String,
-    pub(super) refresh_token: String,
-    pub(super) account_id: String,
+    pub(super) access_token: Token,
+    pub(super) refresh_token: Token,
+    pub(super) account_id: AccountId,
     pub(super) expires_at: u64,
-}
-impl Drop for Stored {
-    fn drop(&mut self) {
-        self.access_token.zeroize();
-        self.refresh_token.zeroize();
-    }
 }
 
 /// What the credential file holds.
@@ -53,14 +106,13 @@ impl Saved {
 }
 
 impl AuthManager {
-    pub async fn status(&self) -> Result<AuthStatus, AuthError> {
+    pub async fn status(&self) -> Result<AuthStatus, ProviderError> {
         let (_lock, saved) = self.load().await?;
         Ok(match saved {
             Saved::Current(stored) if stored.issuer != self.inner.issuer => {
                 AuthStatus::LoginRequired(LoginRequired::OtherIssuer)
             }
             Saved::Current(stored) => AuthStatus::LoggedIn {
-                account_id: stored.account_id.clone(),
                 expires_at: stored.expires_at,
             },
             Saved::Absent => AuthStatus::LoginRequired(LoginRequired::LoggedOut),
@@ -68,7 +120,7 @@ impl AuthManager {
         })
     }
 
-    pub async fn logout(&self) -> Result<(), AuthError> {
+    pub async fn logout(&self) -> Result<(), ProviderError> {
         let directory = self.inner.directory.clone();
         blocking(move || {
             let mut lock = lock_store(&directory)?;
@@ -79,18 +131,18 @@ impl AuthManager {
                 .and_then(|_| lock.write_all(epoch.as_bytes()))
                 .and_then(|_| lock.set_len(epoch.len() as u64))
                 .and_then(|_| lock.sync_all())
-                .map_err(|_| error("Cannot invalidate in-progress Codex login"))?;
-            match fs::remove_file(directory.join("codex-oauth.json")) {
+                .map_err(|_| Authentication.error("Cannot invalidate in-progress Codex login"))?;
+            match fs::remove_file(directory.join(STORE_FILE)) {
                 Ok(()) => sync_directory(&directory).map_err(|_| directory_sync_error()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(_) => Err(error("Cannot remove Skyhook Codex credentials")),
+                Err(_) => Err(Authentication.error("Cannot remove Skyhook Codex credentials")),
             }
             // Do not remove the lock file: other processes may have its inode open.
         })
         .await
     }
 
-    pub(super) async fn load(&self) -> Result<(File, Saved), AuthError> {
+    pub(super) async fn load(&self) -> Result<(File, Saved), ProviderError> {
         let directory = self.inner.directory.clone();
         blocking(move || {
             let lock = lock_store(&directory)?;
@@ -100,7 +152,7 @@ impl AuthManager {
         .await
     }
 
-    pub(super) async fn save(&self, lock: File, stored: Stored) -> Result<(), AuthError> {
+    pub(super) async fn save(&self, lock: File, stored: Stored) -> Result<(), ProviderError> {
         let directory = self.inner.directory.clone();
         blocking(move || {
             let _lock = lock;
@@ -112,59 +164,55 @@ impl AuthManager {
 
 // OS locking is performed in spawn_blocking, never on a Tokio worker. Bounded
 // try-lock polling also bounds the lifetime of a cancelled blocking operation.
-pub(super) fn lock_store(directory: &Path) -> Result<File, AuthError> {
+pub(super) fn lock_store(directory: &Path) -> Result<File, ProviderError> {
     secure_directory(directory)?;
-    let file = private_open(&directory.join("codex-oauth.lock"), true)
-        .map_err(|_| error("Cannot open Skyhook Codex credential lock"))?;
+    let file = private_open(&directory.join(LOCK_FILE), true)
+        .map_err(|_| Authentication.error("Cannot open Skyhook Codex credential lock"))?;
     let start = std::time::Instant::now();
     loop {
         match file.try_lock_exclusive() {
             Ok(()) => return Ok(file),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    && start.elapsed() < Duration::from_secs(60) =>
-            {
-                std::thread::sleep(Duration::from_millis(25));
+            Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
+                return Err(Authentication.error("Cannot lock Skyhook Codex credentials"));
             }
-            Err(_) => {
-                return Err(error(
-                    "Cannot acquire Skyhook Codex credential lock; try again",
-                ));
+            Err(_) if start.elapsed() >= LOCK_TIMEOUT => {
+                let unavailable = Unavailable;
+                return Err(
+                    unavailable.error("Cannot acquire Skyhook Codex credential lock; try again")
+                );
             }
+            Err(_) => std::thread::sleep(LOCK_POLL),
         }
     }
 }
 
 #[cfg(unix)]
-fn secure_directory(directory: &Path) -> Result<(), AuthError> {
+fn secure_directory(directory: &Path) -> Result<(), ProviderError> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     let mut builder = fs::DirBuilder::new();
     builder.recursive(true).mode(0o700);
     builder
         .create(directory)
-        .map_err(|_| error("Cannot create Skyhook credential directory"))?;
+        .map_err(|_| Authentication.error("Cannot create Skyhook credential directory"))?;
     let metadata = fs::symlink_metadata(directory)
-        .map_err(|_| error("Cannot inspect Skyhook credential directory"))?;
+        .map_err(|_| Authentication.error("Cannot inspect Skyhook credential directory"))?;
     if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-        return Err(error(
-            "Skyhook credential directory must be an owned, non-symlink directory",
-        ));
+        return Err(Authentication
+            .error("Skyhook credential directory must be an owned, non-symlink directory"));
     }
     // Existing config directories may intentionally contain readable config.
     // Do not chmod unrelated configuration; private files protect token contents.
     if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(error(
-            "Skyhook credential directory must not be writable by other users",
-        ));
+        return Err(Authentication
+            .error("Skyhook credential directory must not be writable by other users"));
     }
     Ok(())
 }
 #[cfg(not(unix))]
-fn secure_directory(_directory: &Path) -> Result<(), AuthError> {
+fn secure_directory(_directory: &Path) -> Result<(), ProviderError> {
     // Do not pretend Unix mode bits provide a private ACL on another OS.
-    Err(error(
-        "Private Skyhook Codex credential storage is currently supported on Unix only",
-    ))
+    Err(Authentication
+        .error("Private Skyhook Codex credential storage is currently supported on Unix only"))
 }
 
 fn private_open(path: &Path, create: bool) -> std::io::Result<File> {
@@ -193,24 +241,25 @@ fn private_open(path: &Path, create: bool) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn read_store(directory: &Path) -> Result<Saved, AuthError> {
-    let file = match private_open(&directory.join("codex-oauth.json"), false) {
+fn read_store(directory: &Path) -> Result<Saved, ProviderError> {
+    let file = match private_open(&directory.join(STORE_FILE), false) {
         Ok(file) => file,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Saved::Absent),
         Err(_) => {
-            return Err(error(
+            return Err(Authentication.error(
                 "Cannot read Skyhook Codex credentials; require an owned private regular file",
             ));
         }
     };
     let mut bytes = Zeroizing::new(Vec::new());
-    file.take(MAX_BODY as u64 + 1)
+    file.take(MAX_STORE_BYTES + 1)
         .read_to_end(&mut bytes)
-        .map_err(|_| error("Cannot read Skyhook Codex credentials"))?;
-    if bytes.len() > MAX_BODY {
-        return Err(error("Skyhook Codex credential file is too large"));
+        .map_err(|_| Authentication.error("Cannot read Skyhook Codex credentials"))?;
+    if bytes.len() as u64 > MAX_STORE_BYTES {
+        return Err(Authentication.error("Skyhook Codex credential file is too large"));
     }
-    let malformed = || error("Skyhook Codex credentials are malformed; log in again");
+    let malformed =
+        || Authentication.error("Skyhook Codex credentials are malformed; log in again");
     #[derive(Deserialize)]
     struct Version {
         version: u32,
@@ -220,17 +269,11 @@ fn read_store(directory: &Path) -> Result<Saved, AuthError> {
         Version { version: FORMAT } => {}
         Version { .. } => return Err(malformed()),
     }
-    let stored: Stored = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
-    if !valid_token(&stored.access_token)
-        || !valid_token(&stored.refresh_token)
-        || !valid_account(&stored.account_id)
-    {
-        return Err(error("Skyhook Codex credentials are invalid; log in again"));
-    }
+    let stored = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
     Ok(Saved::Current(stored))
 }
 
-pub(super) fn write_store(directory: &Path, stored: &Stored) -> Result<(), AuthError> {
+pub(super) fn write_store(directory: &Path, stored: &Stored) -> Result<(), ProviderError> {
     #[derive(Serialize)]
     struct Versioned<'a> {
         version: u32,
@@ -243,58 +286,41 @@ pub(super) fn write_store(directory: &Path, stored: &Stored) -> Result<(), AuthE
     };
     let bytes = Zeroizing::new(
         serde_json::to_vec(&versioned)
-            .map_err(|_| error("Cannot serialize Skyhook Codex credentials"))?,
+            .map_err(|_| Authentication.error("Cannot serialize Skyhook Codex credentials"))?,
     );
-    let mut staged = StagedFile::create(
-        &directory.join("codex-oauth.json"),
-        PermissionPolicy::Private,
-    )
-    .map_err(|_| error("Cannot create private Skyhook credential file"))?;
+    let mut staged = StagedFile::create(&directory.join(STORE_FILE), PermissionPolicy::Private)
+        .map_err(|_| Authentication.error("Cannot create private Skyhook credential file"))?;
     staged
         .write(&bytes)
-        .map_err(|_| error("Cannot write Skyhook Codex credentials"))?;
+        .map_err(|_| Authentication.error("Cannot write Skyhook Codex credentials"))?;
     staged
         .commit(CommitMode::Replace)
         .map_err(|failure| match failure.stage {
             AtomicWriteStage::OpenDirectory | AtomicWriteStage::SyncDirectory => {
                 directory_sync_error()
             }
-            _ => error("Cannot atomically save Skyhook Codex credentials"),
+            _ => Authentication.error("Cannot atomically save Skyhook Codex credentials"),
         })
 }
-fn directory_sync_error() -> AuthError {
-    error("Cannot sync Skyhook credential directory")
+fn directory_sync_error() -> ProviderError {
+    Authentication.error("Cannot sync Skyhook credential directory")
 }
-pub(super) fn read_epoch(mut lock: &File) -> Result<Vec<u8>, AuthError> {
+pub(super) fn read_epoch(mut lock: &File) -> Result<Vec<u8>, ProviderError> {
     lock.seek(SeekFrom::Start(0))
-        .map_err(|_| error("Cannot inspect Codex login generation"))?;
+        .map_err(|_| Authentication.error("Cannot inspect Codex login generation"))?;
     let mut epoch = Vec::new();
-    lock.take(128)
+    lock.take(MAX_EPOCH_BYTES)
         .read_to_end(&mut epoch)
-        .map_err(|_| error("Cannot read Codex login generation"))?;
+        .map_err(|_| Authentication.error("Cannot read Codex login generation"))?;
     Ok(epoch)
 }
 
 pub(super) fn store_fingerprint(stored: &Stored) -> Vec<u8> {
     let mut hash = Sha256::new();
-    hash.update(stored.access_token.as_bytes());
+    hash.update(stored.access_token.as_str());
     hash.update([0]);
-    hash.update(stored.refresh_token.as_bytes());
+    hash.update(stored.refresh_token.as_str());
     hash.finalize().to_vec()
-}
-
-pub(super) fn valid_token(token: &str) -> bool {
-    !token.is_empty()
-        && token.len() <= 128 * 1024
-        && !token.chars().any(char::is_whitespace)
-        && !token.chars().any(char::is_control)
-}
-pub(super) fn valid_account(account: &str) -> bool {
-    !account.is_empty()
-        && account.len() <= 256
-        && account
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
 #[cfg(all(test, unix))]
@@ -305,9 +331,9 @@ pub(super) mod tests {
     pub(in super::super) fn stored(issuer: &Issuer, expiry: u64) -> Stored {
         Stored {
             issuer: issuer.clone(),
-            access_token: "old-access".into(),
-            refresh_token: "old-refresh".into(),
-            account_id: "account-123".into(),
+            access_token: Token::try_from("old-access".to_owned()).unwrap(),
+            refresh_token: Token::try_from("old-refresh".to_owned()).unwrap(),
+            account_id: "account-123".parse().unwrap(),
             expires_at: expiry,
         }
     }
@@ -322,20 +348,16 @@ pub(super) mod tests {
             manager.status().await.unwrap(),
             AuthStatus::LoginRequired(LoginRequired::LoggedOut)
         );
-        assert!(
-            manager
-                .credentials()
-                .await
-                .unwrap_err()
-                .message
-                .contains("skyhook auth login codex")
+        assert_eq!(
+            manager.credentials().await.unwrap_err(),
+            LoginRequired::LoggedOut.into()
         );
         let (lock, _) = manager.load().await.unwrap();
         manager
             .save(lock, stored(&issuer, now().unwrap() + 3600))
             .await
             .unwrap();
-        let path = manager.inner.directory.join("codex-oauth.json");
+        let path = manager.inner.directory.join(STORE_FILE);
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
@@ -349,12 +371,13 @@ pub(super) mod tests {
             0o700
         );
         assert_eq!(
-            manager.credentials().await.unwrap().access_token,
+            manager.credentials().await.unwrap().access_token.as_str(),
             "old-access"
         );
-        assert!(
-            matches!(manager.status().await.unwrap(), AuthStatus::LoggedIn{account_id, ..} if account_id == "account-123")
-        );
+        assert!(matches!(
+            manager.status().await.unwrap(),
+            AuthStatus::LoggedIn { .. }
+        ));
         assert!(!format!("{:?}", manager.credentials().await.unwrap()).contains("old-access"));
         manager.logout().await.unwrap();
         let (lock, _) = manager.load().await.unwrap();
@@ -367,7 +390,7 @@ pub(super) mod tests {
         assert_ne!(epoch, read_epoch(&lock).unwrap());
         drop(lock);
         assert!(!path.exists());
-        assert!(manager.inner.directory.join("codex-oauth.lock").exists());
+        assert!(manager.inner.directory.join(LOCK_FILE).exists());
         assert_eq!(
             manager.status().await.unwrap(),
             AuthStatus::LoginRequired(LoginRequired::LoggedOut)
@@ -378,7 +401,7 @@ pub(super) mod tests {
     fn private_store_rejects_symlinks_permissive_files_and_invalid_json() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("codex-oauth.json");
+        let path = temp.path().join(STORE_FILE);
         let unrelated = temp.path().join("unrelated");
         fs::write(&unrelated, b"DO-NOT-READ").unwrap();
         symlink(&unrelated, &path).unwrap();

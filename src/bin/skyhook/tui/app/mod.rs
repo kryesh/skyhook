@@ -1,11 +1,11 @@
 pub use events::{Hit, Work};
-use input::InputTarget;
+pub use input::InputTarget;
 use lifecycle::{PendingStart, StartState};
-pub use menus::{ConfirmAction, Item, ItemRef, Menu, MenuId, MenuKind, SessionRef};
+pub use menus::{ConfirmAction, Item, ItemRef, MenuId, MenuKind, Overlay, SessionRef};
 use prompts::UiPrompt;
-use queue::QueueDelivery;
+use queue::{QueueDelivery, RowState};
 pub use queue::{QueuedInput, QueuedInputId};
-use skyhook::provider::profile::ModelRef;
+use skyhook::{provider::profile::ModelRef, tool::policy::ModeName};
 mod events;
 mod input;
 mod lifecycle;
@@ -15,37 +15,34 @@ pub use observation::PreparedObservation;
 mod menus;
 mod output;
 mod projection;
-use output::OutputAttempt;
 pub use output::OutputStore;
+use output::{LoadedOutput, OutputAttempt};
 mod prompts;
 mod queue;
 mod session;
-pub use session::{HostRequest, Peer};
+pub use session::{HostRequest, Peer, SlotKey};
 
 use super::{
     Launch,
     composer::{Composer, Submission},
-    editor::Editor,
-    keys::{COMMANDS, Command, KeyMap},
+    editor::{Editor, TextField},
+    keys::{Command, KeyMap},
     model::{self, Entry, Projection, Tab, View},
-    state,
 };
 use crate::interaction::{ApprovalReply, Prompt, PromptKind};
+use crate::{state, text::brief};
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers as M, MouseButton, MouseEventKind,
 };
 use ratatui::layout::Rect;
-use serde_json::Value;
-#[cfg(test)]
-use serde_json::json;
 use skyhook::media::Attachment;
 use skyhook::{
     agent::{
         AgentActivity, ObservationSnapshot, ObservedEvent, RuntimeEvent, SessionHandle, TurnFailure,
     },
     identity::{AgentId, JobId, SessionId},
-    job::{FieldPointer, JobOutputQuery},
-    session::{EventRecord, Message, RecordSeq, SessionEvent, SessionStore},
+    job::JobOutputQuery,
+    session::{EventRecord, Message, RecordSeq, SessionEvent},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -53,6 +50,17 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
+
+/// Characters of text kept for a session title or a menu row.
+const TITLE_CHARS: usize = 100;
+/// Rows a mouse wheel step scrolls.
+const SCROLL_STEP: isize = 3;
+/// How long a toast stays up.
+const TOAST_TTL: Duration = Duration::from_secs(2);
+/// How often expanded, unsettled job output is refreshed.
+const OUTPUT_POLL: Duration = Duration::from_millis(500);
+/// Pasted text with more lines than this becomes one inline paste item.
+const PASTE_COLLAPSE_LINES: usize = 12;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
@@ -125,9 +133,9 @@ pub struct App {
     /// UI-only choice, captured by each submitted user message.
     pub model: ModelRef,
     /// UI-only choice like `model`; a new session starts in it.
-    pub mode: String,
+    pub mode: ModeName,
     remembered_model: Option<ModelRef>,
-    remembered_mode: Option<String>,
+    remembered_mode: Option<ModeName>,
     pub sidebar: bool,
     pub snapshot: ObservationSnapshot,
     pub projection: Projection,
@@ -151,12 +159,11 @@ pub struct App {
     pub paused: bool,
     pub operation: bool,
     pub prompts: VecDeque<UiPrompt>,
-    pub prompt_active: bool,
     pub prompt_body_rect: Rect,
     pub prompt_options_rect: Rect,
     pub prompt_body_rows: usize,
     pub prompt_option_rows: usize,
-    pub menu: Option<Menu>,
+    pub overlay: Option<Overlay>,
     /// Taken by the host after each event.
     pub host: Option<HostRequest>,
     /// Every open session, this one included; kept current by the host.
@@ -190,33 +197,12 @@ pub struct App {
     pub composer_rect: Rect,
     pub selection: Option<(super::render::TextPosition, super::render::TextPosition)>,
     pressed_entry: Option<model::EntryKey>,
-    pub search_editor: Option<Editor>,
     pub hover: Option<(u16, u16)>,
     pub render: super::render::RenderState,
 }
 impl App {
     pub fn entries(&self) -> &[Entry] {
         self.content_cache.entries()
-    }
-
-    #[cfg(test)]
-    pub(super) fn install_entries(&mut self, entries: Vec<Entry>) {
-        let view = View::default();
-        let changes = self.content_cache.update(
-            &ObservationSnapshot::default(),
-            &mut Projection::default(),
-            model::EntryView {
-                agent: &self.selected,
-                tab: self.tab,
-                view: &view,
-                all_details: false,
-            },
-            &OutputStore::default(),
-            0,
-            entries,
-        );
-        self.render.dirty.extend(changes);
-        self.content_dirty = false;
     }
 
     fn advance_draft(&mut self) {
@@ -229,12 +215,13 @@ impl App {
         self.history_browse = None;
     }
 
-    /// `mode` is what a new session starts in; an opened session's root supplies
-    /// its own where the session still has it.
+    /// A new session starts in `mode` when the modes on offer have it, and in
+    /// the configured default otherwise. An opened session's root keeps its own
+    /// mode where the session still offers it.
     pub fn new(
         observation: Option<PreparedObservation>,
         launch: Launch,
-        mode: String,
+        mode: &ModeName,
         saved: state::SavedState,
         tx: mpsc::UnboundedSender<Work>,
     ) -> Self {
@@ -244,7 +231,7 @@ impl App {
                     observation: active,
                     attached_draft: None,
                 },
-                snapshot,
+                *snapshot,
             ),
             None => (
                 Phase::Draft { root: draft_root() },
@@ -257,7 +244,7 @@ impl App {
         };
         let mut app = Self {
             model: launch.model.name(),
-            mode,
+            mode: launch.model.config().default_mode().clone(),
             remembered_model: saved.model,
             remembered_mode: saved.mode,
             sidebar: saved.sidebar,
@@ -283,12 +270,11 @@ impl App {
             paused: false,
             operation: false,
             prompts: VecDeque::new(),
-            prompt_active: false,
             prompt_body_rect: Rect::default(),
             prompt_options_rect: Rect::default(),
             prompt_body_rows: 0,
             prompt_option_rows: 0,
-            menu: None,
+            overlay: None,
             host: None,
             peers: Vec::new(),
             next_menu_id: MenuId::default(),
@@ -317,23 +303,20 @@ impl App {
             composer_rect: Rect::default(),
             selection: None,
             pressed_entry: None,
-            search_editor: None,
             hover: None,
             render: super::render::RenderState::new(selected, tx),
         };
         app.refresh();
-        if let Some(root) = app.projection.agents.iter().find(|a| a.id == app.selected) {
-            if let Some(model) = &root.model {
-                app.model.clone_from(model);
-            }
-            // A recorded mode that is no longer configured cannot be sent again.
-            if let Some(mode) = root
-                .mode
-                .as_ref()
-                .filter(|mode| app.modes().contains_key(*mode))
-            {
-                app.mode.clone_from(mode);
-            }
+        app.select_mode(mode);
+        let mut agents = app.projection.agents.iter();
+        let root = agents.find(|agent| agent.id == app.selected);
+        let (model, mode) =
+            root.map_or((None, None), |root| (root.model.clone(), root.mode.clone()));
+        if let Some(model) = model {
+            app.model = model;
+        }
+        if let Some(mode) = mode {
+            app.select_mode(&mode);
         }
         app.show_warnings();
         app
@@ -344,11 +327,45 @@ impl App {
 pub(super) mod tests {
     use super::*;
     use crate::interaction::UiInteraction;
-    pub(super) use skyhook::agent::{Question, QuestionOption};
+    pub(super) use crate::tests::bounded;
+    pub(super) use serde_json::json;
+    pub(super) use skyhook::agent::{Question, QuestionAnswer, QuestionOption, QuestionReply};
     use skyhook::remote::EmbeddedShimCatalog;
-    use skyhook::session::{RecordSeq, SessionEvent};
+    use skyhook::session::{
+        Message, ModelContext, ModelPurpose, ProfileSnapshot, RecordSeq, SessionEvent,
+    };
     use std::sync::Arc;
     pub(super) use tokio::sync::oneshot;
+
+    /// An agent model context for `profile`, with no system prompt or tools.
+    pub(in crate::tui) fn model_context(profile: ProfileSnapshot) -> SessionEvent {
+        let context = ModelContext {
+            purpose: ModelPurpose::Agent,
+            profile,
+            system: Vec::new(),
+            tools: Vec::new(),
+            response_schema: None,
+        };
+        SessionEvent::ModelContext { context }
+    }
+
+    /// The launch model's [`model_context`].
+    pub(in crate::tui) fn launch_context(app: &App) -> SessionEvent {
+        let name = app.launch.model.name();
+        let profile = app.launch.model.profile().clone();
+        model_context(ProfileSnapshot { name, profile })
+    }
+
+    pub(in crate::tui) fn requested(context: RecordSeq, tail: Vec<Message>) -> SessionEvent {
+        SessionEvent::ModelRequested {
+            context,
+            checkpoint: None,
+            through: None,
+            tail,
+            history_lifetime: Default::default(),
+        }
+    }
+
     pub(in super::super) async fn draft_fixture() -> (tempfile::TempDir, App) {
         let root = tempfile::tempdir().unwrap();
         let config = crate::interaction::tests::test_config();
@@ -359,18 +376,18 @@ pub(super) mod tests {
                 .unwrap()
                 .select_model(&"test/first".parse().unwrap())
                 .unwrap(),
-            permissions: crate::launch::Permissions::Mode("general".into()),
+            permissions: crate::launch::Permissions::Mode("general".parse().unwrap()),
             workspace: root.path().to_path_buf(),
             sessions: root.path().join(".skyhook/sessions"),
             catalog: EmbeddedShimCatalog::default(),
             interaction: Some(Arc::new(interaction)),
-            approve_all: false,
         };
         let (tx, _) = mpsc::unbounded_channel();
-        let mut app = App::new(None, launch, "general".into(), Default::default(), tx);
+        let general = "general".parse().unwrap();
+        let mut app = App::new(None, launch, &general, Default::default(), tx);
         // Unit fixtures must not change the user's global model preference.
         app.remembered_model = Some("test/first".parse().unwrap());
-        app.remembered_mode = Some("general".into());
+        app.remembered_mode = Some("general".parse().unwrap());
         (root, app)
     }
     pub(in super::super) async fn fixture() -> (tempfile::TempDir, App) {
@@ -384,8 +401,35 @@ pub(super) mod tests {
         let store = app.session().unwrap().store();
         let record = store.append(app.selected.clone(), event).await.unwrap();
         let sequence = record.sequence;
-        app.snapshot.records.insert(sequence, record);
+        app.snapshot.apply(ObservedEvent {
+            revision: app.snapshot.revision + 1,
+            event: RuntimeEvent::Record(Box::new(record)),
+        });
         sequence
+    }
+    /// Journal a child of the root agent, started as the root was.
+    pub(in crate::tui) async fn push_child(app: &mut App, index: u32) -> AgentId {
+        let root = app.root_agent().clone();
+        let mut records = app.snapshot.records.values();
+        let started = records.find(|record| {
+            record.agent == root && matches!(record.event, SessionEvent::AgentStarted { .. })
+        });
+        let started = started.unwrap().event.clone();
+        let child = root.child(index);
+        let store = app.session().unwrap().store();
+        let record = store.append(child.clone(), started).await.unwrap();
+        app.snapshot.records.insert(record.sequence, record);
+        app.refresh();
+        child
+    }
+    /// Refresh `job`'s output as the UI does, returning what it shows.
+    pub(in crate::tui) async fn fetch_output(app: &mut App, job: JobId) -> skyhook::job::JobView {
+        let mut rx = capture_work(app);
+        app.fetch_output(job);
+        let work = recv(&mut rx).await;
+        assert!(matches!(work, Work::Output { ref attempt, .. } if attempt.job() == job));
+        app.work(work);
+        app.outputs.get(&job).unwrap().clone().unwrap()
     }
     /// Replace a draft fixture with one opened on `session`.
     pub(super) async fn attach(app: &mut App, session: SessionHandle) {
@@ -411,10 +455,7 @@ pub(super) mod tests {
         impl ProviderContext for Rejected {
             fn invoke(&mut self, _: ModelRequest) -> ResponseStream {
                 Box::pin(futures_util::stream::once(async {
-                    Err(ProviderError {
-                        kind: ProviderErrorKind::Authentication,
-                        message: "fixture credentials rejected".into(),
-                    })
+                    Err(ProviderErrorKind::Authentication.error("fixture credentials rejected"))
                 }))
             }
         }
@@ -451,7 +492,7 @@ pub(super) mod tests {
         rx
     }
     pub(super) async fn next_lifecycle(rx: &mut mpsc::UnboundedReceiver<Work>) -> Work {
-        tokio::time::timeout(Duration::from_secs(10), async {
+        bounded(async {
             loop {
                 let work = rx.recv().await.expect("work channel open");
                 if matches!(work, Work::Started { .. } | Work::Stopped) {
@@ -460,7 +501,6 @@ pub(super) mod tests {
             }
         })
         .await
-        .expect("lifecycle task completed")
     }
     pub(super) fn key(app: &mut App, code: KeyCode, modifiers: M) {
         app.event(Event::Key(KeyEvent::new(code, modifiers)));
@@ -469,14 +509,22 @@ pub(super) mod tests {
         app: &mut App,
         prompt: String,
         options: Vec<QuestionOption>,
-    ) -> oneshot::Receiver<Result<Value, String>> {
+    ) -> oneshot::Receiver<Result<QuestionReply, String>> {
         questions(app, false, vec![("answer", &prompt, options)])
+    }
+    /// A reply answering each question id with plain text.
+    pub(super) fn texts(answers: &[(&str, &str)]) -> QuestionReply {
+        let answers = answers.iter();
+        let text = |text: &str| QuestionAnswer::Text(text.into());
+        answers
+            .map(|(id, answer)| (id.to_string(), text(answer)))
+            .collect()
     }
     pub(super) fn questions(
         app: &mut App,
         background: bool,
         questions: Vec<(&str, &str, Vec<QuestionOption>)>,
-    ) -> oneshot::Receiver<Result<Value, String>> {
+    ) -> oneshot::Receiver<Result<QuestionReply, String>> {
         let (reply, receiver) = oneshot::channel();
         let questions = questions.into_iter().map(|(id, prompt, options)| Question {
             id: id.into(),
@@ -530,8 +578,7 @@ pub(super) mod tests {
         mouse(app, rect, MouseEventKind::Up(MouseButton::Left));
     }
     pub(super) async fn recv(rx: &mut mpsc::UnboundedReceiver<Work>) -> Work {
-        let work = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
-        work.expect("work arrives").expect("work channel open")
+        bounded(rx.recv()).await.expect("work channel open")
     }
     pub(super) fn pending<T>(response: &mut oneshot::Receiver<T>) -> bool {
         matches!(
@@ -551,14 +598,14 @@ pub(super) mod tests {
         }
     }
     /// Run a script to completion and install the resulting journal snapshot.
-    pub(super) async fn run_script(app: &mut App, source: &str) {
+    pub(in crate::tui) async fn run_script(app: &mut App, source: &str) {
         let session = app.session().unwrap().clone();
         session.run_script(source).await.unwrap();
         app.snapshot = session.observe().await.snapshot;
         app.refresh();
     }
-    pub(super) fn job_named(app: &App, tool: &str) -> JobId {
-        let mut jobs = app.projection.jobs.values();
+    pub(in crate::tui) fn job_named(app: &App, tool: &str) -> JobId {
+        let mut jobs = app.projection.jobs().values();
         jobs.find(|job| job.tool == tool).unwrap().id
     }
     /// Select the content row that renders `job`.
@@ -568,7 +615,7 @@ pub(super) mod tests {
     }
     /// Reopen a session once the agent loops of its previous handle release it.
     pub(super) async fn reopen(app: &App, id: SessionId) -> SessionHandle {
-        tokio::time::timeout(Duration::from_secs(5), async {
+        bounded(async {
             loop {
                 match app.launch.create(Some(id)).await {
                     Ok(session) => break session,
@@ -584,7 +631,6 @@ pub(super) mod tests {
             }
         })
         .await
-        .expect("agent loops release the session after shutdown")
     }
     /// Startup warnings are shown once, survive rebuilds and are never journaled.
     async fn assert_startup_warnings_ui_only(app: &mut App) {
@@ -635,7 +681,7 @@ pub(super) mod tests {
         let mut initial = App::new(
             Some(observation),
             draft.launch.clone(),
-            "general".into(),
+            &"general".parse().unwrap(),
             Default::default(),
             tx,
         );

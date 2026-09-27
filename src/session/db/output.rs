@@ -8,13 +8,13 @@ use crate::{job::CaptureKind, tool::output::FieldPointer};
 
 /// Largest chunk row written; readers accept any length the schema allows.
 const CHUNK_BYTES: usize = 256 * 1024;
+/// Chunk rows one read fetches at most; short writes leave rows below `CHUNK_BYTES`.
+const CHUNK_WINDOW: usize = 16;
 
 pub(crate) struct CaptureRow {
     pub id: i64,
     pub pointer: FieldPointer,
     pub kind: CaptureKind,
-    /// Bytes stored so far, including a capture whose writer is still open.
-    pub bytes: u64,
     /// The saved terminal document references this capture as a result field.
     pub referenced: bool,
 }
@@ -25,6 +25,12 @@ pub(crate) struct CaptureExtent {
     pub bytes: u64,
     pub newlines: u64,
     pub ends_line: bool,
+}
+
+/// A saved result's length and the capture length of each field it references.
+pub(crate) struct OutputSizes {
+    pub result: u64,
+    pub fields: Vec<(FieldPointer, u64)>,
 }
 
 pub(crate) struct Presentation {
@@ -72,29 +78,6 @@ fn extent(db: &Db, capture: i64) -> DbResult<CaptureExtent> {
         .unwrap_or_default())
 }
 
-/// Every generation's saved result (as `{"result": ...}`) and capture bytes, as lossy text.
-pub(crate) fn output_text(db: &Db) -> DbResult<Vec<String>> {
-    let mut text = db.query(
-        "SELECT json_object('result', json(result)) FROM job_output ORDER BY job, generation",
-        Vec::new(),
-        |row| Ok(row.get::<String>(0)?),
-    )?;
-    let captures = db.query(
-        "SELECT id FROM job_capture ORDER BY job, generation, pointer",
-        Vec::new(),
-        |row| Ok(row.get::<i64>(0)?),
-    )?;
-    for capture in captures {
-        let chunks = db.query(
-            "SELECT data FROM job_capture_chunk WHERE capture = ?1 ORDER BY byte_offset",
-            params![capture],
-            |row| Ok(row.get::<Vec<u8>>(0)?),
-        )?;
-        text.push(String::from_utf8_lossy(&chunks.concat()).into_owned());
-    }
-    Ok(text)
-}
-
 impl SharedDb {
     /// Reserve `pointer` in the job's current generation; `None` if already reserved.
     pub(crate) fn create_capture(
@@ -110,7 +93,7 @@ impl SharedDb {
             "INSERT INTO job_capture (job, generation, pointer, capture_kind, rendered) \
              VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (job, generation, pointer) DO NOTHING \
              RETURNING id",
-            params![job, generation, pointer.as_str(), kind, rendered],
+            params![job, generation, pointer, kind, rendered],
             |row| Ok(row.get::<i64>(0)?),
         )
     }
@@ -126,7 +109,7 @@ impl SharedDb {
                ON g.job = c.job AND g.generation = c.generation \
              WHERE c.job = ?1 AND c.pointer = ?2 AND c.rendered = 1 \
                AND c.final_bytes IS NOT NULL",
-            params![job, pointer.as_str()],
+            params![job, pointer],
             |row| Ok(row.get::<i64>(0)?),
         )
     }
@@ -165,8 +148,6 @@ impl SharedDb {
     pub(crate) fn captures(&self, job: u64) -> Result<Vec<CaptureRow>, DbError> {
         self.lock().query(
             "SELECT c.id, c.pointer, c.capture_kind, \
-               (SELECT coalesce(sum(length(k.data)), 0) FROM job_capture_chunk k \
-                 WHERE k.capture = c.id), \
                EXISTS (SELECT 1 FROM job_output_field f WHERE f.capture = c.id) \
              FROM job_capture c JOIN job_generation g \
                ON g.job = c.job AND g.generation = c.generation \
@@ -177,8 +158,7 @@ impl SharedDb {
                     id: row.get(0)?,
                     pointer: pointer(row, 1)?,
                     kind: enum_column(row, 2)?,
-                    bytes: integer(row.get(3)?),
-                    referenced: row.get::<i64>(4)? != 0,
+                    referenced: row.get::<i64>(3)? != 0,
                 })
             },
         )
@@ -269,8 +249,8 @@ impl SharedDb {
             "SELECT byte_offset, data FROM job_capture_chunk WHERE capture = ?1 \
                AND byte_offset >= (SELECT coalesce(max(byte_offset), 0) FROM job_capture_chunk \
                  WHERE capture = ?1 AND byte_offset <= ?2) \
-             ORDER BY byte_offset LIMIT 16",
-            params![capture, offset],
+             ORDER BY byte_offset LIMIT ?3",
+            params![capture, offset, CHUNK_WINDOW],
             |row| Ok((integer(row.get(0)?), row.get::<Vec<u8>>(1)?)),
         )?;
         let mut total = 0;
@@ -357,6 +337,35 @@ impl SharedDb {
         }))
     }
 
+    /// The current generation's stored sizes, once the run finished.
+    pub(crate) fn output_sizes(&self, job: u64) -> Result<Option<OutputSizes>, DbError> {
+        let rows = self.lock().query(
+            "SELECT length(CAST(o.result AS BLOB)), c.pointer, \
+               (SELECT sum(length(k.data)) FROM job_capture_chunk k WHERE k.capture = c.id) \
+             FROM job_output o JOIN job_generation g \
+               ON g.job = o.job AND g.generation = o.generation \
+             LEFT JOIN job_output_field f ON f.output = o.id \
+             LEFT JOIN job_capture c ON c.id = f.capture WHERE o.job = ?1",
+            params![job],
+            |row| {
+                let bytes = |index| {
+                    row.get::<Option<i64>>(index)
+                        .map(|bytes| bytes.map_or(0, integer))
+                };
+                let field = match row.get::<Option<String>>(1)? {
+                    Some(_) => Some((pointer(row, 1)?, bytes(2)?)),
+                    None => None,
+                };
+                Ok((bytes(0)?, field))
+            },
+        )?;
+        let result = rows.first().map(|(result, _)| *result);
+        Ok(result.map(|result| OutputSizes {
+            result,
+            fields: rows.into_iter().filter_map(|(_, field)| field).collect(),
+        }))
+    }
+
     pub(crate) fn save_presentation(
         &self,
         job: u64,
@@ -373,7 +382,7 @@ impl SharedDb {
                 db.execute(
                     "INSERT INTO job_presentation (job, generation, pointer) \
                      VALUES (?1, ?2, ?3)",
-                    params![job, generation, pointer.as_str()],
+                    params![job, generation, pointer],
                 )?;
             }
             Ok(())

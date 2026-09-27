@@ -217,14 +217,14 @@ pub(super) fn update_entry_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::tool_view::{Role, Run, Section};
+    use super::super::super::tool_view::{Hints, Role, Run, Section};
     use super::super::tests::layout;
     use super::*;
 
     fn arguments(tool: &str, args: &serde_json::Value) -> Document {
         let mut document = Document::default();
         document.line(tool, Role::ToolName);
-        document.arguments(tool, args);
+        document.arguments(Hints::new(tool, args));
         document
     }
 
@@ -235,6 +235,8 @@ mod tests {
         };
         let mut entry = model::Entry::card(model::EntryKey::UnsavedStatus(1), header, Some(body));
         entry.compact_after = true;
+        let mut document = document.clone();
+        document.sections[0] = Section::Line(entry.header().unwrap().to_vec());
         for width in [0, 1, 2, 8, 12, 40, 120, 24] {
             let geometry = EntryGeometry::new(&entry, width, 0);
             let rows = layout(&entry, width);
@@ -344,18 +346,19 @@ mod tests {
     #[test]
     fn segmented_tool_headers_keep_roles_when_wrapped_or_in_documents() {
         let header = vec![
-            Run::new("▸", Role::Indicator),
-            Run::new(" read ", Role::ToolName),
+            Run::new("read ", Role::ToolName),
             Run::new("@remote", Role::Target),
             Run::new(" a long path ", Role::Plain),
             Run::new("· ", Role::Muted),
             Run::new("Completed", Role::Success),
             Run::new(" · #42", Role::Muted),
         ];
-        let text = header_line(&header).to_string();
         let key = model::EntryKey::UnsavedStatus(1);
         let entry = model::Entry::card(key.clone(), header.clone(), None);
-        assert_eq!(entry.text(), text);
+        assert_eq!(
+            entry.text(),
+            header_line(entry.header().unwrap()).to_string()
+        );
         let expanded = model::Entry::card(key, header, Some(Document::default()));
         // An expanded body only changes where the header wraps, not its styles.
         let styled = |rows: Vec<Row>| {
@@ -386,7 +389,8 @@ mod tests {
                     .iter()
                     .any(|span| span.content.contains("▸") && span.style.fg == Some(THEME.primary))
             );
-            assert_eq!(styled(rows), styled(layout(&expanded, width)));
+            // Past the disclosure glyph.
+            assert_eq!(styled(rows)[1..], styled(layout(&expanded, width))[1..]);
         }
     }
 

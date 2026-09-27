@@ -16,10 +16,7 @@ use crate::{
     agent::ModelEntry,
     provider::{
         codec::{Codec, CodecName},
-        dialect::{
-            AdmissionError, Common, Connection, Dialect, DialectSettings, Profile,
-            codex::auth::Issuer,
-        },
+        dialect::{AdmissionError, Common, Connection, Dialect, DialectSettings, Profile, codex},
         profile::{ModelName, ModelProfile, ProviderName},
     },
 };
@@ -142,8 +139,7 @@ pub struct EntryError {
     pub error: AdmissionError,
 }
 
-/// Admit every entry, in declaration order. Every codex entry names one
-/// issuer, since one credential store serves one.
+/// Admit every entry, in declaration order, and their shared codex issuer.
 pub(super) fn admit(
     providers: &IndexMap<ProviderName, RawProviderConfig>,
 ) -> Result<IndexMap<ProviderName, ProviderConfig>, ConfigError> {
@@ -157,17 +153,11 @@ pub(super) fn admit(
             Ok((name.clone(), admitted))
         })
         .collect::<Result<IndexMap<_, _>, EntryError>>()?;
-    let mut issuers = admitted
-        .iter()
-        .filter_map(|(name, entry)| Some((name, entry.codex_issuer()?)));
-    if let Some((first, issuer)) = issuers.next()
-        && let Some((second, _)) = issuers.find(|(_, other)| *other != issuer)
-    {
-        return Err(ConfigError::CodexIssuers {
-            first: first.clone(),
-            second: second.clone(),
-        });
-    }
+    codex::shared_issuer(
+        providers
+            .iter()
+            .map(|(name, entry)| (name, &entry.settings)),
+    )?;
     Ok(admitted)
 }
 
@@ -195,14 +185,6 @@ impl ProviderConfig {
     /// The models this entry serves, in declaration order.
     pub(crate) fn models(&self) -> &IndexMap<ModelName, AdmittedModel> {
         &self.models
-    }
-
-    /// The issuer of a codex entry.
-    pub(super) fn codex_issuer(&self) -> Option<Issuer> {
-        match &self.settings {
-            DialectSettings::Codex(codex) => Some(codex.issuer()),
-            _ => None,
-        }
     }
 
     /// Construct the provider and specialise it for each model's conventions.
@@ -368,25 +350,13 @@ providers:
             located.contains("`providers.local.models.local.max_context`"),
             "{located}"
         );
-        // Both limits are required, and the output fits inside the context.
+        // Both limits are required, and admission checks them.
         let limits = "max_context: 4096\n        max_output: 512";
         for (replacement, expected) in [
             ("max_output: 512", "max_context"),
             ("max_context: 4096", "max_output"),
             (
-                "max_context: 0\n        max_output: 1",
-                "max_context must be positive",
-            ),
-            (
-                "max_context: 4096\n        max_output: 0",
-                "max_output must be positive",
-            ),
-            (
                 "max_context: 4096\n        max_output: 4096",
-                "max_output must be smaller",
-            ),
-            (
-                "max_context: 4096\n        max_output: 4097",
                 "max_output must be smaller",
             ),
         ] {
@@ -497,8 +467,7 @@ providers:
     #[tokio::test]
     async fn model_overrides_specialise_the_provider_per_model() {
         use crate::provider::{
-            codec::common::tests::chat_request,
-            http::tests::{complete, serve},
+            http::tests::{chat_request, complete, serve},
             protocol::{Message, ToolResult, UserContent},
         };
         use serde_json::json;
@@ -529,7 +498,7 @@ providers:
             let user = Message::User(vec![UserContent::Text {
                 text: "find".into(),
             }]);
-            let model = &entry.profile.model;
+            let model = entry.profile.model.as_str();
             let reduced = complete(&mut *context, chat_request(model, vec![user.clone()])).await;
             let result = Message::Tool(vec![ToolResult {
                 call_id: "call_a".into(),

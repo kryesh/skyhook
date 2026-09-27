@@ -1,14 +1,17 @@
 //! Pending calls and admitted jobs rendered as structured tool cards.
 
-use crate::tui::app::OutputStore;
-
-use super::super::format::brief;
-use super::super::tool_view::{Document, Role, Run};
+use super::super::tool_view::{Document, Hints, Role, Run, starts_child};
 use super::{Entry, EntryKey, JobInfo, Projection, View};
+use crate::text::brief;
+use crate::tui::app::OutputStore;
 use serde_json::Value;
 use skyhook::identity::AgentId;
 use skyhook::job::JobState;
 use skyhook::provider::protocol::ToolResult;
+use skyhook::target::TargetRef;
+
+/// Characters of a card header's free-text detail, such as a command or name.
+pub(super) const HEADER_DETAIL: usize = 80;
 
 pub fn state_name(state: JobState) -> &'static str {
     match state {
@@ -22,7 +25,18 @@ pub fn state_name(state: JobState) -> &'static str {
         JobState::Interrupted => "Interrupted",
     }
 }
-pub(super) fn state_role(state: JobState) -> Role {
+pub fn state_glyph(state: JobState) -> &'static str {
+    match state {
+        JobState::Queued => "·",
+        JobState::AwaitingApproval => "◇",
+        JobState::Running => "●",
+        JobState::WaitingInput => "?",
+        JobState::Completed => "✓",
+        JobState::Failed => "×",
+        JobState::Cancelled | JobState::Interrupted => "■",
+    }
+}
+pub fn state_role(state: JobState) -> Role {
     match state {
         JobState::Running => Role::Indicator,
         JobState::AwaitingApproval | JobState::WaitingInput => Role::Warning,
@@ -32,12 +46,18 @@ pub(super) fn state_role(state: JobState) -> Role {
     }
 }
 
-pub fn target_suffix(target: &str) -> String {
-    if target == "root" {
-        String::new()
-    } else {
-        format!(" @{target}")
-    }
+pub fn target_suffix(target: &TargetRef) -> String {
+    target
+        .name()
+        .map_or_else(String::new, |name| format!(" @{name}"))
+}
+
+/// A child's target suffix; a request naming no valid target shows as given.
+fn requested_suffix(target: Result<TargetRef, &str>) -> String {
+    target.map_or_else(
+        |requested| format!(" @{requested}"),
+        |target| target_suffix(&target),
+    )
 }
 
 pub(super) fn call_entry(
@@ -51,65 +71,44 @@ pub(super) fn call_entry(
     projection: &Projection,
     open: bool,
 ) -> Entry {
-    let mut header = vec![
-        Run::new(if open { "▾" } else { "▸" }, Role::Indicator),
-        Run::new(" ", Role::Plain),
-    ];
-    if let Some(result) = result {
-        header.push(Run::new(
-            if result.is_error { "×" } else { "✓" },
-            if result.is_error {
-                Role::Error
-            } else {
-                Role::Success
-            },
-        ));
+    let state = result.map(|result| {
+        if result.is_error {
+            JobState::Failed
+        } else {
+            JobState::Completed
+        }
+    });
+    let mut header = Vec::new();
+    if let Some(state) = state {
+        header.push(Run::new(state_glyph(state), state_role(state)));
         header.push(Run::new(" ", Role::Plain));
     }
     header.push(Run::new(tool, Role::ToolName));
     // Unadmitted calls have only provider names/arguments, not a JobCreated
-    // role; admitted calls use job_entry instead. Decode the known agent
-    // argument schema solely for this target label, never lifecycle/ownership.
-    if tool == "agent"
+    // role; admitted calls use job_entry instead.
+    if starts_child(tool)
         && let Some(args) = args
     {
-        let target = args
-            .get("target")
-            .and_then(Value::as_str)
-            .unwrap_or_else(|| projection.child_target(agent, &Value::Null));
-        header.push(Run::new(target_suffix(target), Role::Target));
+        let target = projection.child_target(agent, args.get(skyhook::tool::TARGET));
+        header.push(Run::new(requested_suffix(target), Role::Target));
     }
-    if let Some(result) = result {
+    if let Some(state) = state {
         header.push(Run::new(" · ", Role::Muted));
-        header.push(Run::new(
-            if result.is_error {
-                "Failed"
-            } else {
-                "Completed"
-            },
-            if result.is_error {
-                Role::Error
-            } else {
-                Role::Success
-            },
-        ));
+        header.push(Run::new(state_name(state), state_role(state)));
     }
-    let document = if open {
-        // Do not allocate a Value for collapsed cards; only the existing
-        // Value-based structured formatters require this adapter.
-        let args_value = args.map(|args| Value::Object(args.clone()));
-        let args = args_value.as_ref();
+    let document = open.then(|| {
+        // Collapsed cards never allocate a Value copy of the arguments.
+        let args = args.map_or(Value::Null, |args| Value::Object(args.clone()));
+        let hints = Hints::new(tool, &args);
         let mut document = Document::default();
-        if let Some(args) = args {
-            document.arguments(tool, args);
+        if !args.is_null() {
+            document.arguments(hints);
         }
         if let Some(result) = result {
-            document.output(tool, args.unwrap_or(&Value::Null), &result.result);
+            document.historical_output(hints, &result.result);
         }
-        Some(document)
-    } else {
-        None
-    };
+        document
+    });
     Entry::card(key, header, document)
 }
 
@@ -121,59 +120,36 @@ pub(super) fn job_entry(
     all: bool,
 ) -> Entry {
     let key = EntryKey::Job(job.id);
-    let open = view.is_expanded(&key, all);
-    let detail = match job.tool.as_str() {
-        "exec" => match &job.args["command"] {
-            Value::String(command) => command.clone(),
-            Value::Array(argv) => argv
-                .iter()
-                .filter_map(Value::as_str)
-                .collect::<Vec<_>>()
-                .join(" "),
-            _ => String::new(),
-        },
-        "script" => "JavaScript workflow".into(),
-        _ => job
-            .args
-            .get("path")
-            .or_else(|| job.args.get("pattern"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .into(),
-    };
-    let symbol = match job.state {
-        JobState::Completed => "✓",
-        JobState::Failed => "×",
-        JobState::AwaitingApproval => "◇",
-        JobState::WaitingInput => "?",
-        JobState::Running => "●",
-        _ => "·",
-    };
+    let hints = Hints::new(&job.tool, &job.args);
     let header = vec![
-        Run::new(if open { "▾" } else { "▸" }, Role::Indicator),
-        Run::new(" ", Role::Plain),
-        Run::new(symbol, state_role(job.state)),
+        Run::new(state_glyph(job.state), state_role(job.state)),
         Run::new(" ", Role::Plain),
         Run::new(job.tool.clone(), Role::ToolName),
-        Run::new(target_suffix(projection.job_target(job)), Role::Target),
-        Run::new(format!(" {}", brief(&detail, 90)), Role::Plain),
+        Run::new(requested_suffix(projection.job_target(job)), Role::Target),
+        Run::new(
+            format!(" {}", brief(&hints.summary(), HEADER_DETAIL)),
+            Role::Plain,
+        ),
         Run::new(" · ", Role::Muted),
         Run::new(state_name(job.state), state_role(job.state)),
         Run::new(" · ", Role::Muted),
         Run::new(format!("#{}", job.id), Role::Muted),
     ];
-    let mut document = None;
-    if open {
+    let document = view.is_expanded(&key, all).then(|| {
         let mut body = Document::default();
         body.line(job.location_label(), Role::Muted);
-        body.arguments(&job.tool, &job.args);
-        if outputs.get(&job.id).is_some() || job.error.is_some() {
-            body.output_with_error(
-                &job.tool,
-                &job.args,
-                outputs.get(&job.id),
-                job.error.as_deref(),
-            );
+        body.arguments(hints);
+        let output = outputs.get(&job.id);
+        if output.is_some() || job.error.is_some() {
+            let failure = output.and_then(|output| output.as_ref().err());
+            let summaries: Vec<&str> = job
+                .error
+                .iter()
+                .chain(failure)
+                .map(String::as_str)
+                .collect();
+            let view = output.and_then(|output| output.as_ref().ok());
+            body.output(hints, view, &summaries);
         } else if job.remote() && !job.state.is_terminal() {
             body.line(
                 "Running remotely · output available after completion",
@@ -186,8 +162,8 @@ pub(super) fn job_entry(
             "[o] output fields / search / next page    [c] cancel job",
             Role::Muted,
         );
-        document = Some(body);
-    }
+        body
+    });
     Entry::card(key, header, document)
 }
 
@@ -195,11 +171,8 @@ pub(super) fn job_entry(
 mod tests {
     use super::super::super::tool_view::Section;
     use super::super::clean;
-    use super::super::tests::{header_text, job_info, root};
+    use super::super::tests::{header_text, job_info, loaded, root};
     use super::*;
-    use crate::tui::app::OutputStore;
-    use crate::tui::tool_view::OutputView;
-    use skyhook::execution::ExecutionLocation;
     use skyhook::job::JobRole;
     use skyhook::provider::protocol::ToolCall;
 
@@ -214,7 +187,7 @@ mod tests {
     fn expanded_jobs_and_historical_call_results_omit_null_object_fields() {
         let agent = root(1);
         let value = serde_json::json!({
-            "error": null, "result": {
+            "state": "completed", "result": {
                 "absent": null, "items": [null, {"absent": null, "keep": false}],
                 "stdout": "  literal null\t\n"
             }
@@ -228,9 +201,9 @@ mod tests {
         };
         let job = job_info(&agent, 42, JobRole::Tool, JobState::Completed);
         let (projection, mut outputs) = (Projection::default(), OutputStore::default());
-        outputs.insert_product(job.id, OutputView::historical(value.clone()));
+        loaded(&mut outputs, job.id, value.clone());
         let call = ("exec", None, Some(&result));
-        let kept = serde_json::json!({"result": {"items": [null, {"keep": false}]}});
+        let kept = serde_json::json!({"items": [null, {"keep": false}]});
         for entry in [
             call_entry(EntryKey::UnsavedStatus(0), call, &agent, &projection, true),
             job_entry(&job, &projection, &View::default(), &outputs, true),
@@ -242,73 +215,6 @@ mod tests {
             }));
         }
         assert_eq!(result.result, value);
-        assert_eq!(outputs.get(&job.id).unwrap().value(), &value);
-    }
-
-    #[test]
-    fn job_headers_preserve_historical_state_semantics() {
-        let projection = Projection::default();
-        let states = [
-            (JobState::Queued, "·", "Queued", Role::Muted),
-            (
-                JobState::AwaitingApproval,
-                "◇",
-                "Waiting for permission",
-                Role::Warning,
-            ),
-            (JobState::Running, "●", "Running", Role::Indicator),
-            (
-                JobState::WaitingInput,
-                "?",
-                "Waiting for input",
-                Role::Warning,
-            ),
-            (JobState::Completed, "✓", "Completed", Role::Success),
-            (JobState::Failed, "×", "Failed", Role::Error),
-            (JobState::Cancelled, "·", "Cancelled", Role::Muted),
-            (JobState::Interrupted, "·", "Interrupted", Role::Muted),
-        ];
-        for (state, symbol, name, role) in states {
-            for target in ["root", "build-host"] {
-                let job = JobInfo {
-                    args: serde_json::json!({"command":["echo", "Failed @fake Completed"]}),
-                    location: ExecutionLocation {
-                        target: target.parse().unwrap(),
-                        workspace: "/workspace".into(),
-                    },
-                    error: Some("Failure details\nsecond line".into()),
-                    ..job_info(&root(1), 42, JobRole::Tool, state)
-                };
-                let [collapsed, expanded] = [false, true].map(|open| {
-                    job_entry(
-                        &job,
-                        &projection,
-                        &View::default(),
-                        &OutputStore::default(),
-                        open,
-                    )
-                });
-                for (entry, arrow) in [(&collapsed, "▸"), (&expanded, "▾")] {
-                    let expected = format!(
-                        "{arrow} {symbol} exec{} echo Failed @fake Completed · {name} · #42",
-                        target_suffix(target)
-                    );
-                    let runs = entry.header().unwrap();
-                    assert_eq!(header_text(runs), expected);
-                    assert_eq!(entry.text().lines().next().unwrap(), expected);
-                    assert_eq!(
-                        (&runs[2], &runs[8]),
-                        (&Run::new(symbol, role), &Run::new(name, role))
-                    );
-                }
-                assert_eq!(collapsed.text(), header_text(collapsed.header().unwrap()));
-                assert!(collapsed.document().is_none());
-                assert_eq!(
-                    collapsed.header().unwrap()[1..],
-                    expanded.header().unwrap()[1..]
-                );
-            }
-        }
     }
 
     #[test]
@@ -320,14 +226,13 @@ mod tests {
         let projection = Projection::default();
         for output in [
             None,
-            Some(
-                serde_json::json!({"error": "failed exactly", "result": {"stdout": "  saved output\t\n"}}),
-            ),
+            Some(serde_json::json!({"error": "failed exactly",
+                "result": {"stdout": "  saved output\t\n"}})),
             Some(serde_json::json!({"result": {"stderr": "other details"}})),
         ] {
             let mut outputs = OutputStore::default();
             if let Some(output) = output.clone() {
-                outputs.insert_product(job.id, OutputView::historical(output));
+                loaded(&mut outputs, job.id, output);
             }
             let collapsed = job_entry(&job, &projection, &View::default(), &outputs, false);
             assert_eq!(collapsed.text().lines().count(), 1);
@@ -351,9 +256,14 @@ mod tests {
     fn pending_agent_calls_share_their_target_and_header_with_the_document() {
         let agent = root(3);
         let projection = Projection::default();
-        let call =
-            ToolCall::new("call", "agent", serde_json::json!({"target": "build-host"})).unwrap();
-        for open in [false, true] {
+        // A target that fails admission still shows as the call requested it.
+        for (target, open) in [
+            ("build-host", false),
+            ("build-host", true),
+            ("bad name", true),
+        ] {
+            let args = serde_json::json!({"target": target});
+            let call = ToolCall::new("call", "agent", args).unwrap();
             let fields = (call.name(), Some(call.arguments()), None);
             let entry = call_entry(
                 EntryKey::UnsavedStatus(0),
@@ -364,8 +274,9 @@ mod tests {
             );
             let header = entry.header().unwrap();
             let arrow = if open { "▾" } else { "▸" };
-            assert_eq!(header_text(header), format!("{arrow} agent @build-host"));
-            assert_eq!(header.last(), Some(&Run::new(" @build-host", Role::Target)));
+            assert_eq!(header_text(header), format!("{arrow} agent @{target}"));
+            let suffix = Run::new(format!(" @{target}"), Role::Target);
+            assert_eq!(header.last(), Some(&suffix));
             assert_eq!(entry.document().is_some(), open);
         }
     }

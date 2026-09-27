@@ -7,11 +7,13 @@ use crate::{
         ProviderContext,
         protocol::{ModelRequest, Usage},
     },
-    session::{AttemptRef, CompactionFailure, EventRecord, RecordSeq, SessionEvent},
+    session::{AttemptRef, CompactionFailure, EventRecord, ProfileSnapshot, SessionEvent},
 };
 
 /// Context/validation recovery is bounded independently of transient retries.
 pub(super) const MAX_COMPACTION_ATTEMPTS: u8 = 3;
+/// Each validation retry waits this much longer than the one before.
+const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 mod checkpoint;
 mod retention;
@@ -25,7 +27,7 @@ pub(super) async fn retry_delay(
 ) -> Result<(), HarnessError> {
     tokio::select! {
         () = cancellation.cancelled() => Err(HarnessError::Interrupted),
-        () = tokio::time::sleep(std::time::Duration::from_millis(100 * u64::from(attempt))) => Ok(()),
+        () = tokio::time::sleep(RETRY_BACKOFF * u32::from(attempt)) => Ok(()),
     }
 }
 
@@ -85,7 +87,7 @@ impl SessionRuntime {
         turn: &TurnContext<'_>,
         provider: &mut dyn ProviderContext,
         meter: &mut TokenMeter,
-        context: RecordSeq,
+        profile: &ProfileSnapshot,
         input: &ModelRequest,
         max_context: u64,
     ) -> Result<bool, HarnessError> {
@@ -100,7 +102,7 @@ impl SessionRuntime {
                     provider,
                     CompactionInput {
                         meter,
-                        context,
+                        profile,
                         request: input,
                         max_context,
                         model_attempt: &mut model_attempt,
@@ -128,14 +130,12 @@ impl SessionRuntime {
                             turn.agent.clone(),
                             SessionEvent::CompactionFailed {
                                 failure,
-                                error: format!(
-                                    "attempt {attempt}/{MAX_COMPACTION_ATTEMPTS}: {error}"
-                                ),
+                                error: (&error).into(),
                             },
                         )
                         .await?;
                     let retryable =
-                        request_sequence.is_some() && matches!(&error, HarnessError::Compaction(_));
+                        matches!(&error, HarnessError::Compaction(error) if error.retryable());
                     if !retryable || attempt == MAX_COMPACTION_ATTEMPTS {
                         return Err(error);
                     }
@@ -149,196 +149,111 @@ impl SessionRuntime {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
-    use std::time::Duration;
+    use std::sync::{Arc, atomic::Ordering};
 
-    use futures_util::{StreamExt, TryStreamExt, stream};
     use serde_json::json;
-    use tokio::sync::Notify;
     use tokio_util::sync::CancellationToken;
 
-    pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
     pub(super) use crate::agent::runtime::tests::{
-        count, delta, events, summary_json, test_builder, todo, usage,
+        Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta, events, models,
+        provider_name, recoverable, response, summary_json, test_builder, todo, usage,
     };
     use crate::agent::runtime::{HarnessError, SessionHandle, TurnContext, compaction, state};
+    use crate::provider::profile::StateMode;
     use crate::{
-        agent::TodoStatus,
+        agent::{CompactionFault, FaultKind, TodoStatus},
         execution::ExecutionLocation,
         provider::{
-            Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
+            Provider, ProviderErrorKind,
             protocol::{
-                AssistantItem, Completion, ContextId, CutReason, ItemKind, ModelRequest,
-                ResponseEvent, ToolCall, Usage,
+                AssistantItem, ContextId, CutReason, ItemKind, ModelRequest, ResponseEvent,
+                ToolCall, Usage,
             },
         },
         session::{Message, SessionEvent, UserPart, project_history},
         tool::policy::CapabilitySet,
     };
 
-    #[derive(Default)]
-    pub(super) struct ControlledProvider {
-        pub(super) opened: AtomicUsize,
-        pub(super) requests: StdMutex<Vec<ModelRequest>>,
-        pub(super) summary: StdMutex<String>,
-        pub(super) overflow: AtomicBool,
-        pub(super) truncate: AtomicBool,
-        pub(super) block: AtomicBool,
-        pub(super) agent_immediate_failures: AtomicUsize,
-        pub(super) agent_stream_failures: AtomicUsize,
-        pub(super) summary_immediate_failures: AtomicUsize,
-        pub(super) summary_stream_failures: AtomicUsize,
-        pub(super) summary_tools: AtomicBool,
-        pub(super) observed_failure_usage: StdMutex<Option<Usage>>,
-        pub(super) pause_stream_after_usage: AtomicBool,
-        pub(super) started: Notify,
-        pub(super) release: Notify,
+    /// A summary answer after reasoning, which must not enter the continuation.
+    pub(super) fn summary(text: impl std::fmt::Display) -> Vec<ResponseEvent> {
+        let reasoning =
+            "Reasoning before the answer is not JSON and must not enter the continuation.";
+        response(vec![
+            AssistantItem::reasoning("reasoning/0", 0, reasoning, None),
+            AssistantItem::text("text/1", 1, text.to_string()),
+        ])
     }
 
-    impl Provider for Arc<ControlledProvider> {
-        fn open_context(&self, _: ContextId) -> Result<Box<dyn ProviderContext>, ProviderError> {
-            self.opened.fetch_add(1, Ordering::SeqCst);
-            Ok(Box::new(self.clone()))
-        }
+    /// A stream that fails transiently after reporting `usage`, if any.
+    pub(super) fn failing_stream(usage: Option<Usage>) -> Step {
+        let usage = usage.map(|usage| Ok(ResponseEvent::Usage(usage)));
+        Step::stream(usage.into_iter().chain([Err(recoverable())]).collect())
     }
 
-    fn side_effect(id: &str) -> Vec<AssistantItem> {
-        let arguments = json!({"path":"must-not-exist", "content":"side effect"});
-        let call = ToolCall::new(id, "write", arguments).unwrap();
-        vec![AssistantItem::tool_call(id, 0, call)]
-    }
-
-    impl ProviderContext for Arc<ControlledProvider> {
-        fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
-            let provider = self.clone();
-            let started = async move {
-                let summary = request.tail.last() == Some(&compaction::directive().render());
-                provider.requests.lock().unwrap().push(request);
-                let counters = [
-                    (
-                        &provider.agent_immediate_failures,
-                        &provider.agent_stream_failures,
-                    ),
-                    (
-                        &provider.summary_immediate_failures,
-                        &provider.summary_stream_failures,
-                    ),
-                ];
-                let (immediate, streaming) = counters[usize::from(summary)];
-                let error = || ProviderError {
-                    kind: ProviderErrorKind::Transport,
-                    message: "deterministic transient failure".into(),
-                };
-                let usage = *provider.observed_failure_usage.lock().unwrap();
-                let usage = usage.map(|usage| Ok(ResponseEvent::Usage(usage)));
-                if provider.pause_stream_after_usage.load(Ordering::SeqCst) {
-                    let mut events = vec![usage.unwrap()];
-                    let arguments = json!({"path":"must-not-exist", "content":"side effect"});
-                    let call = "interrupted-tool";
-                    let started = delta(
-                        call,
-                        &format!("{call}:0"),
-                        ItemKind::ToolCall,
-                        &arguments.to_string(),
-                    );
-                    events.push(Ok(started));
-                    let tail = stream::once(async move {
-                        provider.started.notify_one();
-                        std::future::pending::<Result<ResponseEvent, ProviderError>>().await
-                    });
-                    return Ok(Box::pin(stream::iter(events).chain(tail)) as ResponseStream);
-                }
-                if consume_failure(immediate) {
-                    return Err(error());
-                }
-                if consume_failure(streaming) {
-                    let events = usage.into_iter().chain([Err(error())]);
-                    return Ok(Box::pin(stream::iter(events)) as ResponseStream);
-                }
-                let events = if summary {
-                    provider.started.notify_one();
-                    if provider.block.load(Ordering::SeqCst) {
-                        provider.release.notified().await;
-                    }
-                    if provider.summary_tools.load(Ordering::SeqCst) {
-                        response_chunks(Completion::finished(side_effect("never-execute")))
-                    } else {
-                        let reasoning = "Reasoning before the answer is not JSON and must not enter the continuation.";
-                        let text = provider.summary.lock().unwrap().clone();
-                        let items = vec![
-                            AssistantItem::reasoning("reasoning/0", 0, reasoning, None),
-                            AssistantItem::text("text/1", 1, text),
-                        ];
-                        let completion = if provider.truncate.load(Ordering::SeqCst) {
-                            Completion::cut(items, CutReason::MaxTokens)
-                        } else {
-                            Completion::answer(items)
-                        };
-                        response_chunks(completion)
-                    }
-                } else if provider.overflow.swap(false, Ordering::SeqCst) {
-                    vec![Err(ProviderError {
-                        kind: ProviderErrorKind::ContextWindowExceeded,
-                        message: "prompt is too long".into(),
-                    })]
-                } else {
-                    let done = vec![AssistantItem::text("text/0", 0, "done")];
-                    response_chunks(Completion::answer(done))
-                };
-                Ok(Box::pin(stream::iter(events)) as ResponseStream)
-            };
-            Box::pin(stream::once(started).try_flatten())
-        }
-    }
-
-    fn response_chunks(
-        completion: Result<Completion, crate::provider::protocol::CompletionError>,
-    ) -> Vec<Result<ResponseEvent, ProviderError>> {
-        vec![Ok(ResponseEvent::End(completion.unwrap()))]
-    }
-
-    fn consume_failure(counter: &AtomicUsize) -> bool {
-        let decrement = |remaining: usize| remaining.checked_sub(1);
-        counter
-            .try_update(Ordering::SeqCst, Ordering::SeqCst, decrement)
-            .is_ok()
+    /// Streams `usage` and a tool call's start, then holds until released.
+    pub(super) fn held_after(usage: Usage) -> Step {
+        let arguments = json!({"path":"must-not-exist", "content":"side effect"}).to_string();
+        let started = delta("interrupted-tool", ItemKind::ToolCall, &arguments);
+        let mut events = vec![ResponseEvent::Usage(usage), started];
+        events.extend(answer("never released"));
+        Step::new(events).midstream()
     }
 
     pub(super) struct Fixture {
         pub(super) workspace: tempfile::TempDir,
         pub(super) session: SessionHandle,
-        pub(super) provider: Arc<ControlledProvider>,
+        pub(super) script: Arc<Script>,
         pub(super) template: ModelRequest,
     }
 
     impl Fixture {
-        pub(super) async fn new() -> Self {
+        /// A session that answered one research prompt; `steps` serve what follows,
+        /// from step 1.
+        pub(super) async fn new(steps: impl IntoIterator<Item = Step>) -> Self {
+            Self::with_state_mode(steps, StateMode::default()).await
+        }
+
+        /// A fixture whose model receives runtime state as `state_mode` directs.
+        pub(super) async fn with_state_mode(
+            steps: impl IntoIterator<Item = Step>,
+            state_mode: StateMode,
+        ) -> Self {
             let workspace = tempfile::tempdir().unwrap();
-            let provider = Arc::new(ControlledProvider::default());
+            let steps = [Step::new(answer("done"))].into_iter().chain(steps);
+            let script = Script::new(steps, &Requests::default());
             let sessions = workspace.path().join("sessions");
-            let factory = Arc::new(provider.clone());
-            let builder = test_builder(workspace.path(), &sessions, factory, false);
+            let profile = crate::provider::profile::ModelProfile {
+                max_output: crate::tests::limit(16_384),
+                state_mode,
+                ..crate::tests::profile("test", false)
+            };
+            let builder = test_builder(workspace.path(), &sessions, script.clone(), false)
+                .provider(
+                    provider_name("test"),
+                    script.clone(),
+                    models([("test", profile)]),
+                );
             let session = builder.build().await.unwrap().new_session().await.unwrap();
             let research =
                 session.prompt("Research the existing task and preserve its constraints.");
             research.await.unwrap();
-            let mut template = provider.requests.lock().unwrap()[0].clone();
+            let mut template = script.request(0).await;
             (template.history, template.tail) = (Vec::new(), Vec::new());
             template.history_lifetime = Default::default();
-            *provider.summary.lock().unwrap() = summary_json().to_string();
             Self {
                 workspace,
                 session,
-                provider,
+                script,
                 template,
             }
         }
 
-        pub(super) fn set_summary(&self, summary: serde_json::Value) {
-            *self.provider.summary.lock().unwrap() = summary.to_string();
+        pub(super) fn requests(&self) -> Vec<ModelRequest> {
+            let requests = self.script.requests.lock().unwrap();
+            requests
+                .iter()
+                .map(|served| served.request.clone())
+                .collect()
         }
 
         pub(super) async fn add_history(&self, tokens: usize) {
@@ -367,25 +282,24 @@ mod tests {
         ) -> Result<(), HarnessError> {
             let runtime = &self.session.runtime;
             let agent = &self.session.root;
-            // Reuse the agent's journaled context, as a normal request would.
             let records = runtime.store.records().await;
-            let context = records
-                .iter()
-                .rev()
-                .find(|record| matches!(record.event, SessionEvent::ModelContext { .. }))
-                .map(|record| record.event.clone())
-                .expect("the fixture prompt journaled a model context");
-            let store = &runtime.store;
-            let sequence = store.append(agent.clone(), context).await.unwrap().sequence;
+            let profile = records.iter().find_map(|record| match &record.event {
+                SessionEvent::ModelContext { context } => Some(context.profile.clone()),
+                _ => None,
+            });
+            let profile = profile.expect("the fixture prompt journaled a model context");
             let mut input = self.template.clone();
-            let history = project_history(&runtime.store.records().await, agent);
+            let history = project_history(&records, agent);
             input.history = crate::session::render_history(history.history());
             let capabilities = CapabilitySet::default();
             let location = ExecutionLocation::root(self.workspace.path().to_path_buf());
             let (jobs, todos) = (&runtime.jobs, &runtime.todos);
             let state =
                 state::runtime_state_content(jobs, todos, agent, &capabilities, &location).await;
-            input.tail = vec![crate::session::Message::User(vec![state]).render()];
+            // As the agent's context builds it: only a stateless mode sends no tail.
+            if profile.profile.state_mode != StateMode::None {
+                input.tail = vec![crate::session::Message::User(vec![state]).render()];
+            }
             let turn = TurnContext {
                 agent,
                 owner_job: None,
@@ -393,23 +307,28 @@ mod tests {
                 location: &location,
                 capabilities: capabilities.clone(),
             };
-            let mut provider = self.provider.open_context(ContextId::from(agent))?;
+            let mut provider = self.script.open_context(ContextId::from(agent))?;
             let (provider, meter) = (provider.as_mut(), &mut Default::default());
             let compacted =
-                runtime.compact_history(&turn, provider, meter, sequence, &input, 128_000);
+                runtime.compact_history(&turn, provider, meter, &profile, &input, 128_000);
             compacted.await.map(drop)
         }
     }
 
     #[tokio::test]
     async fn stream_overflow_below_threshold_compacts_once() {
-        let fixture = Fixture::new().await;
+        let overflow = ProviderErrorKind::ContextWindowExceeded.error("prompt is too long");
+        let steps = [
+            Step::stream(vec![Err(overflow)]),
+            Step::new(summary(summary_json())),
+            Step::new(answer("done")),
+        ];
+        let fixture = Fixture::new(steps).await;
         fixture.add_history(20_000).await;
-        fixture.provider.overflow.store(true, Ordering::SeqCst);
         assert_eq!(fixture.session.prompt("Continue.").await.unwrap(), "done");
         // Summarization and retry retain the agent's context.
-        assert_eq!(fixture.provider.opened.load(Ordering::SeqCst), 1);
-        let requests = fixture.provider.requests.lock().unwrap().clone();
+        assert_eq!(fixture.script.opened.load(Ordering::SeqCst), 1);
+        let requests = fixture.requests();
         assert_eq!(requests.len(), 4); // initial response, rejected stream, summary, retry
         assert!(compaction::estimate_request(&requests[1]) < 128_000 * 4 / 5);
         let records = fixture.records().await;
@@ -419,28 +338,26 @@ mod tests {
 
     #[tokio::test]
     async fn cancelling_a_blocked_summarizer_does_not_activate_a_checkpoint() {
-        let fixture = Fixture::new().await;
+        let fixture = Fixture::new([Step::new(summary(summary_json())).gated()]).await;
         let runtime = &fixture.session.runtime;
         let agent = &fixture.session.root;
         fixture.add_history(20_000).await;
-        fixture.provider.block.store(true, Ordering::SeqCst);
         let todos = vec![todo("Keep on interruption", TodoStatus::InProgress)];
         runtime.todos.replace(agent, todos.clone()).await.unwrap();
         let before = project_history(&fixture.records().await, agent);
         let cancellation = CancellationToken::new();
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+        let (result, ()) = bounded(async {
             tokio::join!(fixture.compact(&cancellation), async {
-                fixture.provider.started.notified().await;
+                fixture.script.request(1).await;
                 cancellation.cancel();
             })
         })
-        .await
-        .unwrap();
+        .await;
         assert!(matches!(result, Err(HarnessError::Interrupted)));
         let records = fixture.records().await;
         assert_eq!(project_history(&records, agent), before);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
-        let found = runtime.todos.inspect(agent, None).await.unwrap().items;
+        let found = runtime.todos.inspect(agent, None).await.unwrap();
         assert_eq!(found, todos);
         fixture.session.shutdown().await.unwrap();
     }
@@ -448,52 +365,102 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn exhausted_summary_failures_preserve_history_and_never_execute_tools() {
         // Parser field cases live in compaction.rs; this covers rollback and tool contracts.
-        for failure in ["truncated", "tool_call", "blank_todo"] {
-            let fixture = Fixture::new().await;
+        let arguments = json!({"path":"must-not-exist", "content":"side effect"});
+        let call = ToolCall::new("never-execute", "write", arguments).unwrap();
+        let tool_call = response(vec![AssistantItem::tool_call("never-execute", 0, call)]);
+        let reasoning = AssistantItem::reasoning("reasoning/0", 0, "thinking", None);
+        let text = AssistantItem::text("text/1", 1, summary_json().to_string());
+        let truncated = cut(vec![reasoning, text], CutReason::MaxTokens);
+        let mut blank_todo = summary_json();
+        blank_todo["todos"] = json!([{"text":" \t", "status":"pending"}]);
+        let failures = [
+            (FaultKind::Truncated, truncated),
+            (FaultKind::ToolCall, tool_call),
+            (FaultKind::Continuation, summary(blank_todo)),
+        ];
+        for (fault, events) in failures {
+            let steps = (0..3).map(|_| Step::new(events.clone()));
+            let fixture = Fixture::new(steps).await;
             let (todos, agent) = (&fixture.session.runtime.todos, &fixture.session.root);
             fixture.add_history(20_000).await;
             let old_todos = vec![todo("Preserve unfinished work", TodoStatus::InProgress)];
             todos.replace(agent, old_todos.clone()).await.unwrap();
-            match failure {
-                "truncated" => fixture.provider.truncate.store(true, Ordering::SeqCst),
-                "tool_call" => fixture.provider.summary_tools.store(true, Ordering::SeqCst),
-                _ => {
-                    let mut invalid = summary_json();
-                    invalid["todos"] = json!([{"text":" \t", "status":"pending"}]);
-                    fixture.set_summary(invalid);
-                }
-            }
             let before = project_history(&fixture.records().await, agent);
-            let cancellation = CancellationToken::new();
-            let error = fixture.compact(&cancellation).await.unwrap_err();
+            let error = fixture
+                .compact(&CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert_eq!(CompactionFault::from(&error).kind(), fault);
             let records = fixture.records().await;
-            if failure == "truncated" {
-                assert!(error.to_string().contains("truncated"));
-                let failed = count!(&records, SessionEvent::CompactionFailed { failure, .. } if failure.request().is_some());
-                assert_ne!(failed, 0);
-            }
-            let requests = fixture.provider.requests.lock().unwrap().len();
+            let faults = events!(&records, SessionEvent::CompactionFailed { failure, error }
+                if failure.request().is_some() => error.kind());
+            assert!(
+                !faults.is_empty() && faults.iter().all(|kind| *kind == fault),
+                "{faults:?}"
+            );
+            let requests = fixture.requests().len();
             let unchanged = project_history(&records, agent) == before;
             let compactions = count!(&records, SessionEvent::Compaction { .. });
-            let kept_todos = todos.inspect(agent, None).await.unwrap().items == old_todos;
+            let kept_todos = todos.inspect(agent, None).await.unwrap() == old_todos;
             let outcome = (requests, unchanged, compactions, kept_todos);
-            assert_eq!(outcome, (4, true, 0, true), "{failure}");
+            assert_eq!(outcome, (4, true, 0, true), "{fault}");
             fixture.assert_no_tool_execution().await;
             fixture.session.shutdown().await.unwrap();
         }
     }
 
+    /// A summary selecting an unknown job, or one whose output cannot be
+    /// presented, may succeed on retry; a checkpoint the journal refuses, here
+    /// for an active job's unanswered call, cannot.
     #[tokio::test(start_paused = true)]
-    async fn invalid_selected_job_retries_without_installing_compaction() {
-        let fixture = Fixture::new().await;
-        fixture.add_history(20_000).await;
-        let mut summary = summary_json();
-        summary["jobs"] = json!([99999]);
-        fixture.set_summary(summary);
-        assert!(fixture.compact(&CancellationToken::new()).await.is_err());
-        let records = fixture.records().await;
-        assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
-        assert_eq!(count!(&records, SessionEvent::CompactionFailed { .. }), 3);
-        fixture.session.shutdown().await.unwrap();
+    async fn only_a_retryable_failure_retries_without_installing_compaction() {
+        for (journaled, invariant) in [(false, false), (true, false), (false, true)] {
+            let mut selected = summary_json();
+            if !invariant {
+                selected["jobs"] = json!([99999]);
+            }
+            let fixture = Fixture::new((0..3).map(|_| Step::new(summary(&selected)))).await;
+            fixture.add_history(20_000).await;
+            if journaled {
+                // Journaled but unknown to the job manager, so its output cannot be presented.
+                let (runtime, root) = (&fixture.session.runtime, &fixture.session.root);
+                let spec = crate::job::JobSpec::test(root.clone(), "read");
+                let created = SessionEvent::JobCreated {
+                    job: crate::identity::JobId::new(99999).unwrap(),
+                    parent: None,
+                    origin: None,
+                    tool: spec.tool,
+                    role: spec.role,
+                    name: None,
+                    arguments: spec.arguments,
+                    output_schema: None,
+                    accepts_input: false,
+                    background: false,
+                    location: spec.location,
+                };
+                runtime.store.append(root.clone(), created).await.unwrap();
+            }
+            if invariant {
+                let (runtime, root) = (&fixture.session.runtime, &fixture.session.root);
+                let call = ToolCall::new("unanswered", "read", json!({"path":"file"})).unwrap();
+                let call = Message::Assistant(vec![AssistantItem::tool_call("call", 0, call)]);
+                let message = runtime.commit(root, call).await.unwrap();
+                let call_id = "unanswered".into();
+                let spec = crate::job::JobSpec {
+                    origin: Some(crate::session::ModelCallOrigin { message, call_id }),
+                    ..crate::job::JobSpec::test(root.clone(), "read")
+                };
+                runtime.jobs.create(spec).await.unwrap().into_test_id();
+            }
+            let error = fixture
+                .compact(&CancellationToken::new())
+                .await
+                .unwrap_err();
+            let records = fixture.records().await;
+            assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
+            let failed = count!(&records, SessionEvent::CompactionFailed { .. });
+            assert_eq!(failed, if invariant { 1 } else { 3 }, "{error}");
+            fixture.session.shutdown().await.unwrap();
+        }
     }
 }

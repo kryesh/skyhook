@@ -1,13 +1,13 @@
 use super::*;
 use crate::launch::LaunchError;
-use crate::tui::tool_view::OutputView;
+use skyhook::job::PresentedOutput;
 
 // Query presence, capture selection and preview metadata belong to core.
-async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> Result<OutputView, String> {
+async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> LoadedOutput {
     session
         .inspect_output_with_captures(query)
         .await
-        .map(OutputView::from)
+        .map(PresentedOutput::into_job_view)
         .map_err(|error| error.to_string())
 }
 
@@ -19,12 +19,12 @@ pub enum Work {
         result: Result<(), skyhook::agent::HarnessError>,
     },
     Done {
-        result: Result<(), String>,
+        result: Result<(), crate::launch::OperationError>,
     },
     Output {
         attempt: OutputAttempt,
         finished: bool,
-        result: Box<Result<OutputView, String>>,
+        result: Box<LoadedOutput>,
     },
     MenuLoaded(menus::MenuLoaded),
     File {
@@ -34,10 +34,16 @@ pub enum Work {
         result: Result<Attachment, String>,
     },
     Started {
-        result: Result<SessionHandle, LaunchError>,
+        result: Result<PreparedObservation, LaunchError>,
     },
+    /// A notice from before the session existed: shown, never journaled.
+    LocalStatus {
+        agent: AgentId,
+        message: String,
+    },
+    /// A notice the session could not journal.
     StatusFailed {
-        session: Option<SessionId>,
+        session: SessionId,
         agent: AgentId,
         message: String,
     },
@@ -64,6 +70,9 @@ pub enum Hit {
 impl App {
     pub fn work(&mut self, work: Work) {
         match work {
+            Work::Started {
+                result: Ok(prepared),
+            } => self.session_started(prepared),
             Work::Started { result: Err(error) } => self.start_failed(error),
             Work::QueueCommitted {
                 id,
@@ -84,7 +93,7 @@ impl App {
                 self.operation = false;
                 self.initial_input = None;
                 if let Err(error) = result {
-                    self.root_notifier().send(error);
+                    self.root_notifier().send(error.to_string());
                     self.pause_queue();
                 }
             }
@@ -126,24 +135,25 @@ impl App {
                     Err(error) => self.notice(error),
                 }
             }
+            Work::LocalStatus { agent, message } => {
+                // The draft's notices move to the session that grew out of it.
+                if agent != *self.root_agent() && self.attached_draft() != Some(&agent) {
+                    return;
+                }
+                self.push_local(self.root_agent().clone(), message);
+            }
             Work::StatusFailed {
                 session,
                 agent,
                 message,
-            } if (session == self.session_id()
-                && (session.is_some() || agent == self.selected))
-                || (session.is_none() && self.attached_draft() == Some(&agent)) =>
-            {
-                let agent = if self.attached_draft() == Some(&agent) {
-                    self.root_agent().clone()
-                } else {
-                    agent
-                };
-                self.unsaved_status.push((agent, message));
-                self.invalidate_content();
+            } => {
+                if self.session_id() != Some(session) {
+                    return;
+                }
+                self.push_local(agent, message);
             }
             Work::Stopped => self.exit = true,
-            _ => {}
+            Work::HighlightsReady => {}
         }
         self.dirty = true;
     }
@@ -152,27 +162,19 @@ impl App {
         if self
             .toast
             .as_ref()
-            .is_some_and(|(_, t)| t.elapsed() > Duration::from_secs(2))
+            .is_some_and(|(_, t)| t.elapsed() > TOAST_TTL)
         {
             self.toast = None;
             self.dirty = true;
         }
-        let previous = self.prompts.front().map(|p| p.id);
-        self.prompts.retain(|p| !p.is_closed());
-        if previous != self.prompts.front().map(|p| p.id) {
-            self.dirty = true;
-            self.reset_prompt();
-        }
-        if self.prompts.is_empty() {
-            self.prompt_active = false;
-        }
+        self.take_prompts(|prompt| prompt.is_closed());
         self.deliver_queue();
-        if self.last_output.elapsed() >= Duration::from_millis(500) {
+        if self.last_output.elapsed() >= OUTPUT_POLL {
             self.last_output = Instant::now();
             let view = self.views.entry(self.selected.clone()).or_default();
             let jobs: Vec<_> = self
                 .projection
-                .jobs
+                .jobs()
                 .values()
                 .filter(|j| {
                     j.agent == self.selected
@@ -203,7 +205,7 @@ impl App {
         };
         let finished = self
             .projection
-            .jobs
+            .jobs()
             .get(&job)
             .is_some_and(|job| job.state.is_terminal());
         let tx = self.tx.clone();
@@ -227,7 +229,7 @@ impl App {
         if let Event::Mouse(mouse) = &event
             && mouse.kind == MouseEventKind::Moved
         {
-            if let Some(menu) = &mut self.menu {
+            if let Some(Overlay::Menu(menu)) = &mut self.overlay {
                 let point = (mouse.column, mouse.row);
                 self.hover = Some(point);
                 // Palettes own hover while open. Only real pointer movement
@@ -274,15 +276,16 @@ impl App {
             Event::Paste(text) => {
                 let text = model::clean(&text);
                 match self.input_target() {
-                    InputTarget::Menu => {
-                        if let Some(menu) = &mut self.menu {
+                    InputTarget::Menu | InputTarget::Search => match &mut self.overlay {
+                        Some(Overlay::Menu(menu)) => {
                             menu.input.insert(&text);
                             menu.selected = 0;
                         }
-                    }
-                    InputTarget::Search => {
-                        self.search_editor.as_mut().unwrap().insert(&text);
-                    }
+                        Some(Overlay::Search(editor)) => {
+                            editor.insert(&text);
+                        }
+                        None => {}
+                    },
                     InputTarget::Prompt
                         if self
                             .prompts
@@ -290,12 +293,12 @@ impl App {
                             .is_some_and(|prompt| prompt.takes_text()) =>
                     {
                         let outcome = self.prompt_input_mut().editor.insert(&text);
-                        if self.multiple_questions() && outcome.text_changed {
+                        if self.multiple_questions() && outcome.text_changed() {
                             self.set_question_editing(true);
                             self.invalidate_question_answer();
                         }
                     }
-                    InputTarget::Composer if text.lines().count() > 12 => {
+                    InputTarget::Composer if text.lines().count() > PASTE_COLLAPSE_LINES => {
                         self.editor.insert_paste(text);
                     }
                     InputTarget::Composer => {
@@ -308,43 +311,21 @@ impl App {
                 let point = (mouse.column, mouse.row);
                 match mouse.kind {
                     MouseEventKind::Moved => self.hover = Some(point),
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                        if self.menu.is_some() =>
-                    {
-                        self.menu_key(KeyEvent::new(
-                            if mouse.kind == MouseEventKind::ScrollUp {
-                                KeyCode::Up
-                            } else {
-                                KeyCode::Down
-                            },
-                            M::NONE,
-                        ));
-                    }
-                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
-                        if matches!(self.input_target(), InputTarget::Prompt)
-                            && self.composer_rect.contains(point.into()) =>
-                    {
-                        self.scroll_prompt(
-                            self.prompt_options_rect.contains(point.into()),
-                            if mouse.kind == MouseEventKind::ScrollUp {
-                                -3
-                            } else {
-                                3
-                            },
-                        );
-                    }
-                    MouseEventKind::ScrollUp => {
-                        if self.tree_rect.contains(point.into()) {
-                            self.tree_scroll = self.tree_scroll.saturating_sub(3);
+                    MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                        let up = mouse.kind == MouseEventKind::ScrollUp;
+                        let step = if up { -SCROLL_STEP } else { SCROLL_STEP };
+                        if self.menu().is_some() {
+                            let key = if up { KeyCode::Up } else { KeyCode::Down };
+                            self.menu_key(KeyEvent::new(key, M::NONE));
+                        } else if matches!(self.input_target(), InputTarget::Prompt)
+                            && self.composer_rect.contains(point.into())
+                        {
+                            let options = self.prompt_options_rect.contains(point.into());
+                            self.scroll_prompt(options, step);
+                        } else if self.tree_rect.contains(point.into()) {
+                            self.tree_scroll = self.tree_scroll.saturating_add_signed(step);
                         } else {
-                            self.scroll(-3);
-                        }
-                    }
-                    MouseEventKind::ScrollDown => {
-                        if self.tree_rect.contains(point.into()) {
-                            self.tree_scroll += 3;
-                        } else {
-                            self.scroll(3);
+                            self.scroll(step);
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
@@ -371,17 +352,12 @@ impl App {
                                     }
                                 }
                                 Hit::Menu(index) => {
-                                    if let Some(menu) = &mut self.menu {
+                                    if let Some(menu) = self.menu_mut() {
                                         menu.selected = index;
                                     }
                                     self.choose();
                                 }
-                                Hit::Tab(tab) => {
-                                    self.selection = None;
-                                    self.tab = tab;
-                                    self.view().scroll = None;
-                                    self.invalidate_content();
-                                }
+                                Hit::Tab(tab) => self.set_tab(tab),
                                 Hit::Composer => self.focus = Focus::Composer,
                                 Hit::Attachments => self.command(Command::Attachments),
                                 Hit::Attention => self.activate_prompt(),
@@ -411,18 +387,8 @@ impl App {
                             }
                         }
                         if select_text && let Some(position) = self.text_position(point) {
-                            let scroll = self
-                                .views
-                                .get(&self.selected)
-                                .and_then(|v| v.scroll)
-                                .unwrap_or(
-                                    self.render
-                                        .rows
-                                        .len()
-                                        .saturating_sub(self.content_rect.height as usize),
-                                );
                             // Hold the viewport still while selecting a streaming reply.
-                            self.view().scroll = Some(scroll);
+                            self.view().scroll = Some(self.scroll_offset());
                             self.focus = Focus::Content;
                             self.selection = Some((position, position));
                         }
@@ -476,17 +442,7 @@ impl App {
         if !self.content_rect.contains(point.into()) {
             return None;
         }
-        let scroll = self
-            .views
-            .get(&self.selected)
-            .and_then(|view| view.scroll)
-            .unwrap_or(
-                self.render
-                    .rows
-                    .len()
-                    .saturating_sub(self.content_rect.height as usize),
-            );
-        let row = (scroll + point.1.saturating_sub(self.content_rect.y) as usize)
+        let row = (self.scroll_offset() + point.1.saturating_sub(self.content_rect.y) as usize)
             .min(self.render.rows.len().checked_sub(1)?);
         if !self.render.rows[row].selectable {
             return None;
@@ -504,25 +460,13 @@ mod tests {
     use super::*;
     use skyhook::session::Message;
 
-    async fn fetch_output(app: &mut App, job: JobId) -> Value {
-        let mut rx = capture_work(app);
-        app.fetch_output(job);
-        let work = recv(&mut rx).await;
-        assert!(matches!(work, Work::Output { ref attempt, .. } if attempt.job() == job));
-        app.work(work);
-        app.outputs.get(&job).unwrap().value().clone()
-    }
-
-    fn capture_text(output: &Value, field: &str) -> String {
-        let mut captures = output["presentation"]["captures"]
-            .as_array()
-            .into_iter()
-            .flatten();
-        let capture = captures.find(|capture| capture["field"].as_str() == Some(field));
-        let lines = capture
-            .and_then(|capture| capture["output"]["presentation"]["preview"]["lines"].as_array());
-        let lines = lines.into_iter().flatten().filter_map(Value::as_str);
-        lines.collect::<Vec<_>>().join("\n")
+    fn capture_text(output: &skyhook::job::JobView, field: &str) -> String {
+        let captures = output.presentation().map_or(&[][..], |p| p.captures());
+        let capture = captures
+            .iter()
+            .find(|capture| capture.field().as_str() == field);
+        let page = capture.and_then(|capture| capture.output()?.presentation()?.preview());
+        page.map_or_else(String::new, |page| page.lines().join("\n"))
     }
 
     fn job_text(app: &App, job: JobId) -> String {
@@ -537,7 +481,9 @@ mod tests {
     #[tokio::test]
     async fn automatic_output_follows_live_captures_then_structured_completion() {
         let (_root, mut app) = draft_fixture().await;
-        app.launch.approve_all = true;
+        let mut config = app.launch.model.config().config().clone();
+        config.approve_all = true;
+        app.launch.model = config.into_runtime().unwrap().default_model();
         let session = app.launch.create(None).await.unwrap();
         attach(&mut app, session.clone()).await;
         let launched = session.run_script(format!("return await tool.exec({});", json!({
@@ -546,26 +492,24 @@ mod tests {
             "bg": true,
         }))).await.unwrap();
         let job: JobId = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
-        let live = |output: &Value| {
+        let live = |output: &skyhook::job::JobView| {
             capture_text(output, "/result/stdout").contains("live stdout")
                 && capture_text(output, "/result/stderr").contains("live stderr")
         };
-        tokio::time::timeout(Duration::from_secs(5), async {
+        bounded(async {
             while !live(
-                load_output(&session, JobOutputQuery::new(job))
+                &load_output(&session, JobOutputQuery::new(job))
                     .await
-                    .unwrap()
-                    .value(),
+                    .unwrap(),
             ) {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .unwrap();
+        .await;
         app.snapshot = session.observe().await.snapshot;
         app.refresh();
         assert!(live(&fetch_output(&mut app, job).await));
-        assert!(app.outputs.query(job).is_none());
+        assert!(app.outputs.query(job).is_none() && !app.outputs.is_final(job));
         app.command(Command::Details);
         draw(&mut app);
         let text = job_text(&app, job);
@@ -575,9 +519,9 @@ mod tests {
         );
 
         std::fs::write(app.launch.workspace.join("release"), "").unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
+        bounded(async {
             // The live job settles just after its journal commit.
-            while !app.projection.jobs[&job].state.is_terminal()
+            while !app.projection.jobs()[&job].state.is_terminal()
                 || !session
                     .inspect_jobs(session.root_agent())
                     .await
@@ -589,30 +533,25 @@ mod tests {
                 app.refresh();
             }
         })
-        .await
-        .unwrap();
+        .await;
         let complete = fetch_output(&mut app, job).await;
+        assert!(app.outputs.query(job).is_none() && app.outputs.is_final(job));
+        let complete = complete.result().unwrap();
         let result = json!({"exit_code": 1, "stdout": "live stdout\n", "stderr": "live stderr\n"});
         for field in ["exit_code", "stdout", "stderr"] {
-            assert_eq!(complete["result"][field], result[field]);
+            assert_eq!(complete[field], result[field]);
         }
-        assert!(app.outputs.query(job).is_none());
 
+        let stderr: skyhook::job::FieldPointer = "/result/stderr".parse().unwrap();
         let mut query = JobOutputQuery::new(job);
-        query.field = Some("/result/stderr".parse().unwrap());
+        query.field = Some(stderr.clone());
         app.outputs.set_query(query);
         let selected = fetch_output(&mut app, job).await;
-        assert_eq!(
-            selected["presentation"]["preview"]["field"],
-            "/result/stderr"
-        );
-        let mut captures = selected["presentation"]["captures"]
-            .as_array()
-            .into_iter()
-            .flatten();
-        assert!(captures.all(|capture| capture["output"].is_null()));
-        let field = app.outputs.query(job).unwrap().field.clone();
-        assert_eq!(field, Some("/result/stderr".parse().unwrap()));
+        let presentation = selected.presentation().unwrap();
+        assert_eq!(presentation.preview().unwrap().field(), Some(&stderr));
+        let captures = presentation.captures();
+        assert!(captures.iter().all(|capture| capture.output().is_none()));
+        assert_eq!(app.outputs.query(job).unwrap().field, Some(stderr));
         session.shutdown().await.unwrap();
     }
 
@@ -631,7 +570,7 @@ mod tests {
         let draft = app.draft_ticket.clone();
         app.info("Unrelated overlay", "Still the same draft".into());
         app.work(attachment(draft.clone()));
-        assert_eq!(app.editor.attachments(), std::slice::from_ref(&text));
+        assert_eq!(app.editor.attachments(), [text.clone().into()]);
         app.editor.take();
 
         // Queue without starting a session: even a queued submission consumes its draft.
@@ -660,7 +599,10 @@ mod tests {
         app.dirty = false;
         app.work(attachment(ticket));
         assert!(!app.dirty);
-        assert_eq!(app.editor.attachments(), [png_attachment("image.png")]);
+        assert_eq!(
+            app.editor.attachments(),
+            [png_attachment("image.png").into()]
+        );
     }
 
     #[tokio::test]
@@ -675,18 +617,21 @@ mod tests {
         mouse(&mut app, cell, MouseEventKind::Down(MouseButton::Left));
         app.event(Event::Resize(80, 24));
         assert!(app.prompts.is_empty());
-        assert!(!app.prompt_active);
     }
 
     #[tokio::test]
     async fn message_drag_selects_only_the_requested_text_including_unicode() {
+        use skyhook::{provider::protocol::AssistantItem, session::UserPart};
         for surface in [model::Surface::User, model::Surface::Agent] {
             for word in ["bravo", "e\u{301}界🙂"] {
                 let (_root, mut app) = fixture().await;
-                let text = format!("Sender\nAlpha **{word}** omega");
-                let entry = Entry::new(model::EntryKey::UnsavedStatus(0), text, surface);
-                app.install_entries(vec![entry]);
-                app.content_dirty = false;
+                let text = format!("Alpha **{word}** omega");
+                let message = match surface {
+                    model::Surface::User => Message::User(vec![UserPart::Text { text }]),
+                    _ => Message::Assistant(vec![AssistantItem::text("drag", 0, &text)]),
+                };
+                push_record(&mut app, SessionEvent::MessageCommitted { message }).await;
+                app.refresh();
                 let buffer = draw_buffer(&mut app);
                 let (x, y) = (0..24)
                     .find_map(|y| {
@@ -749,7 +694,8 @@ mod tests {
         let result = ToolResult {
             call_id: "denied-call".into(),
             name: "exec".into(),
-            result: json!({"error": "Permission was denied", "code": "permission_denied", "executed": false}),
+            result: json!({"state": "failed", "error": "Permission was denied",
+                "meta": {"code": "permission_denied"}}),
             images: vec![],
             is_error: true,
         };
@@ -784,64 +730,12 @@ mod tests {
             "Arguments",
             "Output",
             "Permission was denied",
-            "permission_denied",
+            "\"permission_denied\"",
         ] {
             assert!(cards[0].text().contains(part));
         }
         assert!(cards[0].document().is_some());
         toggle(&mut app);
-        assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
-    }
-
-    #[tokio::test]
-    async fn expanded_large_script_and_tool_results_use_structured_output() {
-        let (_root, mut app) = fixture().await;
-        for index in 0..250 {
-            let path = app.launch.workspace.join(format!("item-{index:03}.json"));
-            std::fs::write(path, "{}").unwrap();
-        }
-        run_script(&mut app, "return await tool.glob({pattern:'item-*.json'});").await;
-        let records = serde_json::to_vec(&app.snapshot.records).unwrap();
-        let mut jobs = Vec::new();
-        for tool in ["script", "glob"] {
-            let job = job_named(&app, tool);
-            app.fetch_output(job);
-            assert!(app.outputs.query(job).is_none());
-            let output = load_output(app.session().unwrap(), JobOutputQuery::new(job)).await;
-            let output = output.unwrap();
-            let value = output.value();
-            assert!(value.get("result").is_some(), "{tool}: {value}");
-            assert_eq!(
-                value.pointer("/presentation/preview"),
-                Some(&serde_json::Value::Null),
-                "{tool}: {value}"
-            );
-            // Script values keep their original envelope shape. The script's
-            // own truncation markers point into its independently saved return.
-            if tool == "script" {
-                assert!(value["result"]["value"]["meta"].is_null());
-                assert!(value["result"]["value"]["presentation"].is_null());
-                assert_eq!(
-                    value["presentation"]["truncated"][0]["field"],
-                    "/result/value/result/paths"
-                );
-            }
-            let truncated = value["presentation"]["truncated"].as_array();
-            assert!(
-                truncated.is_some_and(|fields| !fields.is_empty()),
-                "{tool}: {value}"
-            );
-            app.outputs.insert_product(job, output);
-            jobs.push(job);
-        }
-        app.outputs.clear_pending();
-        app.command(Command::Details);
-        draw(&mut app);
-        for job in jobs {
-            let text = job_text(&app, job);
-            assert!(text.contains("\"truncated\""), "{text}");
-            assert!(text.contains("\n    \"result\": {\n      \""), "{text}");
-        }
         assert_eq!(serde_json::to_vec(&app.snapshot.records).unwrap(), records);
     }
 
@@ -855,23 +749,14 @@ mod tests {
         std::fs::write(app.launch.workspace.join("example.rs"), &source).unwrap();
         run_script(&mut app, "return await tool.read({path:'example.rs'});").await;
         let job = job_named(&app, "read");
-        app.fetch_output(job);
-        assert!(app.outputs.query(job).is_none());
-        let session = app.session().unwrap().clone();
-        let output = session
-            .inspect_output(JobOutputQuery::new(job))
-            .await
-            .unwrap();
-        assert!(source.starts_with(output["result"]["content"].as_str().unwrap()));
-        let position = output["presentation"]["truncated"][0].clone();
-        app.outputs
-            .insert_product(job, OutputView::historical(output));
-        app.outputs.clear_pending();
+        let output = fetch_output(&mut app, job).await;
+        assert!(source.starts_with(output.result().unwrap()["content"].as_str().unwrap()));
+        let (field, start, offset) = output.continuation().unwrap();
         app.command(Command::Details);
         draw(&mut app);
         select_job(&mut app, job);
         app.output_menu();
-        let menu = app.menu.as_mut().unwrap();
+        let menu = app.menu_mut().unwrap();
         let MenuKind::Output(_, items) = &menu.kind else {
             panic!("output menu")
         };
@@ -881,12 +766,8 @@ mod tests {
         menu.selected = next.unwrap();
         app.choose();
         let query = app.outputs.query(job).unwrap().clone();
-        let at = |key: &str| position[key].as_u64().map(|value| value as usize);
-        assert!(query.start.is_some());
-        assert_eq!(
-            (query.start, query.offset.unwrap_or(0)),
-            (at("next_start"), at("next_offset").unwrap_or(0))
-        );
-        assert_eq!(query.field, Some("/result/content".parse().unwrap()));
+        assert_eq!((query.start, query.offset), (Some(start), offset));
+        assert_eq!(query.field.as_ref(), field);
+        assert_eq!(field.unwrap().as_str(), "/result/content");
     }
 }

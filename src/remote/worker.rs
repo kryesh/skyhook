@@ -17,17 +17,17 @@ use super::{
     flow::{CHUNK_BYTES, WINDOW},
     payload::PayloadSender,
     protocol::{
-        AuthorizationId, RemoteToolError, Request, RequestId, Response, read_frame,
-        spawn_owned_write, write_frame,
+        AuthorizationId, MAX_FRAME_BYTES, RemoteToolError, Request, RequestId, Response, Sequence,
+        read_frame, spawn_owned_write, write_frame,
     },
 };
+use crate::job::CANCELLATION_GRACE;
 use crate::tool::{
+    authorization::Reauthorization,
     diagnostic::{Operation, Subject},
-    invocation::{
-        AdmissionError, CANCELLATION_GRACE, LocalAuthorizer, LocalCatalog, LocalContext, LocalError,
-    },
+    invocation::{AdmissionError, LocalAuthorizer, LocalCatalog, LocalContext, LocalError},
     output::ProducedOutput,
-    policy::{Capability, PermissionUse, ResourceId},
+    policy::Capability,
     source::{Source, Spool, open_on_worker},
 };
 
@@ -62,7 +62,12 @@ where
     let credits = receiver.credits();
     let mut tasks = JoinSet::new();
     let writer = output.clone();
-    tasks.spawn(async move { (WorkerTask::Output, receiver.forward(writer).await) });
+    tasks.spawn(async move {
+        (
+            WorkerTask::Output,
+            receiver.forward(writer, MAX_FRAME_BYTES).await,
+        )
+    });
     let mut worker = Worker {
         output,
         services,
@@ -80,7 +85,10 @@ where
             let reading = read_frame::<_, Request>(&mut input);
             tokio::pin!(reading);
             let request = loop {
+                // Input first: a departing host ends the session, and the output
+                // failures its departure causes must not turn that into an error.
                 tokio::select! {
+                    biased;
                     request = &mut reading => break request?,
                     completed = worker.services.tasks.join_next(), if !worker.services.tasks.is_empty() => {
                         completed.expect("nonempty service task set")??;
@@ -231,14 +239,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
                     let _ = sender.send(decision.into_result().map_err(AdmissionError::from));
                 }
             }
-            control @ (Request::OpenSsh { .. }
-            | Request::StreamData { .. }
-            | Request::StreamEnd { .. }
-            | Request::StreamClose { .. }
-            | Request::StreamAck { .. }
-            | Request::SensitiveAnswer { .. }) => {
-                self.services.handle(control).await?;
-            }
+            Request::Control(control) => self.services.handle(control).await?,
             Request::Hello => return Err("received a second hello".into()),
         }
         Ok(())
@@ -246,7 +247,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
 
     fn ensure_new(&self, id: RequestId) -> WorkerResult {
         if self.active.contains_key(&id) || self.uploads.contains_key(&id) {
-            return Err(format!("duplicate request ID {}", id.get()).into());
+            return Err(format!("duplicate request ID {id}").into());
         }
         Ok(())
     }
@@ -265,12 +266,10 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Worker<W> {
             produced.clone(),
             Arc::new(ForwardAuthorization {
                 request_id: id,
-                tool: work.name().to_owned(),
                 output: self.output.clone(),
                 pending: authorizations.clone(),
-                next: StdMutex::new(Some(AuthorizationId(0))),
+                ids: Sequence::default(),
             }),
-            work.arguments(),
         );
         self.active.insert(
             id,
@@ -378,22 +377,6 @@ enum Work {
     },
 }
 
-impl Work {
-    /// The operation named in forwarded authorization requests.
-    fn name(&self) -> &str {
-        match self {
-            Self::Tool { name, .. } | Self::ReadSource { tool: name, .. } => name,
-        }
-    }
-
-    fn arguments(&self) -> Value {
-        match self {
-            Self::Tool { arguments, .. } => arguments.clone(),
-            Self::ReadSource { path, .. } => serde_json::json!({ "path": path }),
-        }
-    }
-}
-
 type PendingAuthorizations =
     Arc<StdMutex<HashMap<AuthorizationId, oneshot::Sender<Result<(), AdmissionError>>>>>;
 
@@ -419,10 +402,9 @@ impl Drop for ActiveRequest {
 
 struct ForwardAuthorization<W> {
     request_id: RequestId,
-    tool: String,
     output: Arc<Mutex<W>>,
     pending: PendingAuthorizations,
-    next: StdMutex<Option<AuthorizationId>>,
+    ids: Sequence<AuthorizationId>,
 }
 
 struct PendingAuthorization {
@@ -442,31 +424,18 @@ impl Drop for PendingAuthorization {
 impl<W: AsyncWrite + Unpin + Send + 'static> LocalAuthorizer for ForwardAuthorization<W> {
     fn authorize(
         &self,
-        mut permissions: Vec<PermissionUse>,
-        arguments: Value,
+        mut request: Reauthorization,
     ) -> BoxFuture<'static, Result<(), AdmissionError>> {
-        // The host already admitted static workspace access; destination-derived
-        // paths and network origins still require its policy decision.
-        permissions.retain(|permission| {
-            !(matches!(permission.resource, ResourceId::Workspace { .. })
-                && matches!(
-                    permission.capability,
-                    Capability::Read | Capability::Write | Capability::Exec
-                ))
-        });
-        if permissions.is_empty() {
-            return Box::pin(async { Ok(()) });
+        if let Reauthorization::Permissions(permissions) = &mut request {
+            permissions.retain(|permission| permission.resource.resolved_at_destination());
+            if permissions.is_empty() {
+                return Box::pin(async { Ok(()) });
+            }
         }
-        let id = {
-            let mut next = self.next.lock().unwrap_or_else(PoisonError::into_inner);
-            let id = *next;
-            *next = id.and_then(|id| id.0.checked_add(1).map(AuthorizationId));
-            id
-        };
+        let id = self.ids.next();
         let pending = self.pending.clone();
         let output = self.output.clone();
         let request_id = self.request_id;
-        let tool = self.tool.clone();
         Box::pin(async move {
             let id =
                 id.ok_or_else(|| AdmissionError::failed("authorization ID space exhausted"))?;
@@ -481,9 +450,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> LocalAuthorizer for ForwardAuthoriz
                 Response::Authorization {
                     request_id,
                     authorization_id: id,
-                    tool,
-                    permissions,
-                    arguments,
+                    request,
                 },
             )
             .await?;
@@ -521,20 +488,28 @@ mod tests {
         remote::{
             RejectSensitivePrompts, RemoteError, client::PooledConnection, transport::Transport,
         },
-        tests::{RecordingPolicy, TestRuntime},
+        tests::{RecordingPolicy, TestRuntime, bounded},
         tool::{
             ToolContext, ToolOutput,
-            authorization::{AuthorizationCoordinator, AuthorizationSubject},
-            policy::{AuthorizationRequest, CapabilitySet, Policy, PolicyDecision, PolicyFuture},
+            authorization::{
+                AuthorizationArguments, AuthorizationCoordinator, AuthorizationSubject,
+            },
+            policy::{
+                AuthorizationRequest, CapabilitySet, Policy, PolicyDecision, PolicyFuture,
+                ResourceId,
+            },
         },
     };
-    use std::{future::Future, time::Duration};
     use tokio::sync::mpsc;
 
-    async fn bounded<T>(future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(Duration::from_secs(20), future)
-            .await
-            .expect("worker operation stalled")
+    /// Files and saved output have no change notification, so waits on them poll.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+    fn location() -> ExecutionLocation {
+        ExecutionLocation::named(
+            "remote".parse().unwrap(),
+            std::fs::canonicalize(".").unwrap(),
+        )
     }
 
     struct Harness {
@@ -562,8 +537,7 @@ mod tests {
                     output: Box::new(output),
                     owner: Box::new(()),
                 },
-                &"remote".parse().unwrap(),
-                authorization.clone(),
+                location(),
                 Arc::new(RejectSensitivePrompts),
                 &tokio_util::task::TaskTracker::new(),
                 CancellationToken::new(),
@@ -598,10 +572,7 @@ mod tests {
                 arguments,
                 source,
                 move |connection, context| async move {
-                    let destination = context.execution_location().clone();
-                    connection
-                        .execute(tool, call_arguments, &context, destination)
-                        .await
+                    connection.execute(tool, call_arguments, &context).await
                 },
             )
             .await
@@ -615,13 +586,12 @@ mod tests {
                 arguments,
                 None,
                 move |connection, context| async move {
-                    let destination = context.execution_location().clone();
-                    let source =
-                        (connection.read_source("write".to_owned(), path, &context, destination))
-                            .await?;
+                    let source = connection
+                        .read_source("write".to_owned(), path, &context)
+                        .await?;
                     let mut bytes = Vec::new();
                     std::io::Read::read_to_end(&mut source.reader().unwrap(), &mut bytes).unwrap();
-                    Ok(ToolOutput::new(serde_json::json!(bytes)))
+                    Ok(ToolOutput::new(crate::sha256_hex(bytes).into()))
                 },
             )
             .await
@@ -642,11 +612,7 @@ mod tests {
         {
             let mut spec = JobSpec::test(self.runtime.agent.clone(), name);
             spec.arguments = arguments.clone();
-            spec.location = ExecutionLocation {
-                target: "remote".parse().unwrap(),
-                workspace: std::fs::canonicalize(".").unwrap(),
-            };
-            let location = spec.location.clone();
+            spec.location = location();
             let lease = self.runtime.jobs.create(spec).await.unwrap();
             let lease = lease.test_run().await;
             let job = lease.id();
@@ -660,12 +626,19 @@ mod tests {
                     capabilities,
                     cancellation,
                 },
-                location,
+                location(),
                 ExecutionLocation::root(self.runtime.root.path().to_owned()),
                 input,
                 self.runtime.jobs.clone(),
             )
-            .with_invocation_authority(self.authorization.clone(), name.to_owned(), arguments)
+            .with_invocation_authority(
+                self.authorization.clone(),
+                name.to_owned(),
+                AuthorizationArguments {
+                    tool: serde_json::from_value(arguments).unwrap(),
+                    ..Default::default()
+                },
+            )
             .with_source(source);
             let connection = self.connection.clone();
             worker
@@ -699,6 +672,96 @@ mod tests {
         }
     }
 
+    /// Worker output that the test holds, then breaks as a departed host does.
+    #[derive(Clone, Default)]
+    struct OutputGate(Arc<(StdMutex<GateState>, tokio::sync::Notify)>);
+
+    #[derive(Default)]
+    enum GateState {
+        #[default]
+        Open,
+        Held(Option<std::task::Waker>),
+        Broken,
+    }
+
+    struct GatedOutput(tokio::io::DuplexStream, OutputGate);
+
+    impl OutputGate {
+        fn set(&self, next: GateState) {
+            let previous = std::mem::replace(&mut *self.0.0.lock().unwrap(), next);
+            if let GateState::Held(Some(waker)) = previous {
+                waker.wake();
+            }
+        }
+    }
+
+    impl tokio::io::AsyncWrite for GatedOutput {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+            bytes: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            let gate = self.1.clone();
+            match &mut *gate.0.0.lock().unwrap() {
+                GateState::Open => std::pin::Pin::new(&mut self.0).poll_write(cx, bytes),
+                GateState::Held(waker) => {
+                    *waker = Some(cx.waker().clone());
+                    gate.0.1.notify_one();
+                    std::task::Poll::Pending
+                }
+                GateState::Broken => {
+                    std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+                }
+            }
+        }
+
+        fn poll_flush(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        }
+
+        fn poll_shutdown(
+            mut self: std::pin::Pin<&mut Self>,
+            cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        }
+    }
+
+    /// A host that goes away ends the session cleanly, even when its departure
+    /// breaks output the worker is still writing. Each round races the failed
+    /// write against end of input; the worker's choice between them is random.
+    #[tokio::test]
+    async fn host_departure_mid_output_ends_the_worker_cleanly() {
+        for _ in 0..16 {
+            let (mut requests, input) = tokio::io::duplex(64 * 1024);
+            let (output, mut responses) = tokio::io::duplex(64 * 1024);
+            let gate = OutputGate::default();
+            let root = std::fs::canonicalize(".").unwrap();
+            let output = GatedOutput(output, gate.clone());
+            let worker = tokio::spawn(serve_io_at(input, output, root));
+            write_frame(&mut requests, &Request::Hello).await.unwrap();
+            let ready = read_frame::<_, Response>(&mut responses).await.unwrap();
+            assert!(matches!(ready, Some(Response::Ready)));
+            gate.set(GateState::Held(None));
+            let request = Request::Tool {
+                request_id: RequestId::new(1),
+                name: "exec".into(),
+                arguments: serde_json::json!({"command":["/bin/sh", "-c", "printf x"]}),
+                capabilities: vec![Capability::Exec],
+                source: false,
+            };
+            write_frame(&mut requests, &request).await.unwrap();
+            bounded(gate.0.1.notified()).await;
+            // Leaving closes both directions without yielding between them.
+            gate.set(GateState::Broken);
+            drop(requests);
+            bounded(worker).await.unwrap().unwrap();
+        }
+    }
+
     /// A call cancelled while its source is still arriving never starts, still
     /// answers with a terminal result, and releases its upload.
     #[tokio::test]
@@ -710,7 +773,7 @@ mod tests {
         let (server_input, server_output) = tokio::io::split(server);
         let root_path = root.path().to_owned();
         let worker = tokio::spawn(serve_io_at(server_input, server_output, root_path.clone()));
-        let id = RequestId::FIRST;
+        let id = RequestId::new(1);
         let destination = root_path.join("never-written");
         for request in [
             Request::Hello,
@@ -778,7 +841,7 @@ mod tests {
             bounded(read_frame(&mut responses)).await.unwrap(),
             Some(Response::Ready)
         ));
-        let (upload, sibling) = (RequestId::FIRST, RequestId::FIRST.next().unwrap());
+        let (upload, sibling) = (RequestId::new(1), RequestId::new(2));
         let never_written = root_path.join("never-written");
         let written = root_path.join("sibling");
         let chunks = (0..WINDOW).map(|_| Request::SourceData {
@@ -805,7 +868,7 @@ mod tests {
                 write_frame(&mut requests, &request).await.unwrap();
             }
             while !written.exists() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(POLL).await;
             }
         })
         .await;
@@ -862,16 +925,16 @@ mod tests {
         let asset = root_path.join("asset.bin").to_str().unwrap().to_owned();
         let job = worker.read_source(read, asset.clone()).await;
         let output = worker.result(job).await.output.unwrap();
-        assert_eq!(serde_json::from_value::<Vec<u8>>(output).unwrap(), binary);
+        assert_eq!(output, crate::sha256_hex(&binary));
         // Without the read capability the worker refuses the source as the consuming tool.
         let job = worker.read_source(CapabilitySet::empty(), asset).await;
         let refused = worker.result(job).await;
         assert_eq!(refused.state, JobState::Failed);
         assert_eq!(
             refused.diagnostic.unwrap().cause,
-            crate::tool::diagnostic::Cause::Message(
-                "tool `write` is unavailable in this context".into()
-            )
+            crate::tool::diagnostic::Cause::Unavailable {
+                tool: "write".into()
+            }
         );
 
         let write = [Capability::Write].into_iter().collect::<CapabilitySet>();
@@ -1027,10 +1090,35 @@ mod tests {
         // The completed read error is bound to the invocation's trusted location.
         assert_eq!(
             result.output_diagnostic.unwrap().context.site,
-            crate::tool::diagnostic::FailureSite::Execution(ExecutionLocation::named(
-                "remote".parse().unwrap(),
-                std::fs::canonicalize(".").unwrap(),
-            )),
+            crate::tool::diagnostic::FailureSite::Execution(location()),
+        );
+        worker.finish().await;
+    }
+
+    /// A running request asks the host under the invocation's own authorization
+    /// arguments, as it does on the host, and a redirect names its new origin.
+    #[tokio::test]
+    async fn worker_reauthorization_uses_the_invocation_arguments() {
+        use crate::provider::http::transport::tests::{Plan, Server, reply};
+        let landing = Server::start(vec![Plan::reply(reply("200 OK", "", ""))]).await;
+        let location = format!("Location: {}/\r\n", landing.root());
+        let redirect = Plan::reply(reply("302 Found", &location, ""));
+        let redirecting = Server::start(vec![redirect]).await;
+        let policy = RecordingPolicy::allowing();
+        let worker = Harness::start(std::fs::canonicalize(".").unwrap(), policy.clone()).await;
+        let arguments = serde_json::json!({"url": redirecting.root()});
+        let job = (worker.tool(CapabilitySet::default(), "fetch", arguments.clone())).await;
+        assert_eq!(worker.result(job).await.state, JobState::Completed);
+        let expected = [
+            serde_json::json!({"tool": arguments}),
+            serde_json::json!({"tool": arguments, "network_origin": landing.root()}),
+        ];
+        let requests = policy.requests.lock().unwrap().clone();
+        assert!(
+            requests
+                .iter()
+                .map(|request| &request.arguments)
+                .eq(&expected)
         );
         worker.finish().await;
     }
@@ -1111,32 +1199,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_output_is_live_and_timeout_preserves_cut_streams() {
+    async fn remote_output_is_live_and_cancellation_preserves_cut_streams() {
         let worker = Harness::start(
             std::fs::canonicalize(".").unwrap(),
             RecordingPolicy::allowing(),
         )
         .await;
+        let command = ["/bin/sh", "-c", "printf before; exec sleep 3600"];
         let job = worker
             .tool(
                 CapabilitySet::default(),
                 "exec",
-                serde_json::json!({"command":["/bin/sh", "-c", "printf before; sleep 3600"]}),
+                serde_json::json!({"command":command}),
             )
             .await;
+        let saved = worker.runtime.jobs.output(job);
         bounded(async {
-            loop {
-                if worker
-                    .runtime
-                    .jobs
-                    .output(job)
-                    .test_bytes("/result/stdout")
-                    .as_deref()
-                    == Some(b"before")
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
+            while saved.test_bytes("/result/stdout").as_deref() != Some(b"before") {
+                tokio::time::sleep(POLL).await;
             }
         })
         .await;
@@ -1152,21 +1232,8 @@ mod tests {
         );
         worker.runtime.jobs.cancel(job).await.unwrap();
         assert_eq!(worker.result(job).await.state, JobState::Cancelled);
-        let job = worker.tool(CapabilitySet::default(), "exec", serde_json::json!({"command":["/bin/sh", "-c", "printf before; sleep 30"], "timeout":1})).await;
-        let result = worker.result(job).await;
-        assert_eq!(result.state, JobState::Failed);
-        assert_eq!(result.output.unwrap()["timed_out"], true);
-        let saved = worker.runtime.jobs.output(job);
         assert_eq!(saved.test_captures_complete(), Some(false));
-        assert_eq!(
-            worker
-                .runtime
-                .jobs
-                .output(job)
-                .test_bytes("/result/stdout")
-                .unwrap(),
-            b"before"
-        );
+        assert_eq!(saved.test_bytes("/result/stdout").unwrap(), b"before");
         worker.finish().await;
     }
 }

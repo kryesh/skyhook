@@ -7,6 +7,7 @@ use crate::{
     media::{AttachmentRef, ImageRef},
     named_enum::named_enum,
     newtype::{Blank, nonblank, string_newtype},
+    provider::protocol::BlockRef,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -131,7 +132,7 @@ pub struct TextBlock {
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum ItemKind {
         Text = "text",
         Reasoning = "reasoning",
@@ -177,7 +178,7 @@ pub struct Provenance {
 
 named_enum! {
     /// The native shape of a replay payload, which selects the encoder field it returns in.
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum ReplayFormat {
         /// Chat Completions reasoning text.
         ChatText = "chat_text",
@@ -200,7 +201,7 @@ string_newtype! {
 
 named_enum! {
     /// How tightly a replay is bound to the history that produced it.
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum Binding {
         /// Replays under any history with matching provenance.
         Free = "free",
@@ -218,7 +219,7 @@ impl AssistantItem {
         position: impl Into<Position>,
         text: impl Into<String>,
     ) -> Self {
-        let (id, block) = Self::single_ids(id.into());
+        let BlockRef { item: id, block } = BlockRef::single(id.into());
         Self::Text {
             id,
             position: position.into(),
@@ -236,7 +237,7 @@ impl AssistantItem {
         text: impl Into<String>,
         replay: Option<Replay>,
     ) -> Self {
-        let (id, block) = Self::single_ids(id.into());
+        let BlockRef { item: id, block } = BlockRef::single(id.into());
         Self::Reasoning {
             id,
             position: position.into(),
@@ -250,18 +251,11 @@ impl AssistantItem {
     }
 
     pub fn tool_call(id: impl Into<String>, position: impl Into<Position>, call: ToolCall) -> Self {
-        let (id, _) = Self::single_ids(id.into());
         Self::ToolCall {
-            id,
+            id: ItemId::try_from(id.into()).expect("item ids are nonblank"),
             position: position.into(),
             call,
         }
-    }
-
-    fn single_ids(id: String) -> (ItemId, BlockId) {
-        let block = BlockId::try_from(format!("{id}:0")).expect("suffixed id is nonblank");
-        let id = ItemId::try_from(id).expect("item ids are nonblank");
-        (id, block)
     }
 
     #[must_use]

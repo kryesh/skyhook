@@ -7,11 +7,10 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
 use crate::{
+    Prose,
     identity::{AgentId, JobId},
     named_enum::named_enum,
-    session::{
-        CompactionCheckpoint, EventRecord, RecordSeq, SessionError, SessionEvent, SessionStore,
-    },
+    session::{CompactionCheckpoint, EventRecord, SessionError, SessionEvent, SessionStore},
     tool::{
         ToolError,
         diagnostic::{Effects, Operation, Subject},
@@ -19,7 +18,7 @@ use crate::{
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
     pub enum TodoStatus {
         Pending = "pending",
         InProgress = "in_progress",
@@ -29,23 +28,17 @@ named_enum! {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub struct TodoItem {
+pub struct TodoItem<Text = Prose> {
     /// Instruction or step to carry out.
-    pub text: String,
+    #[schemars(with = "String")]
+    pub text: Text,
     pub status: TodoStatus,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
-pub struct TodoSnapshot {
-    pub agent: AgentId,
-    pub items: Vec<TodoItem>,
 }
 
 #[derive(Default)]
 struct AgentTodos {
     owner_job: Option<JobId>,
     items: Vec<TodoItem>,
-    revision: RecordSeq,
 }
 
 pub(super) struct TodoStore {
@@ -57,22 +50,17 @@ impl TodoStore {
     pub fn restore(store: SessionStore, records: &[EventRecord]) -> Self {
         let mut agents = BTreeMap::<AgentId, AgentTodos>::new();
         for record in records {
-            match &record.event {
+            let items = match &record.event {
                 SessionEvent::AgentStarted { owner_job, .. } => {
                     agents.entry(record.agent.clone()).or_default().owner_job = *owner_job;
+                    continue;
                 }
-                SessionEvent::TodosReplaced { items } => {
-                    let state = agents.entry(record.agent.clone()).or_default();
-                    state.items.clone_from(items);
-                    state.revision = record.sequence;
-                }
-                SessionEvent::Compaction { checkpoint } => {
-                    let state = agents.entry(record.agent.clone()).or_default();
-                    state.items.clone_from(&checkpoint.todos);
-                    state.revision = record.sequence;
-                }
-                _ => {}
-            }
+                SessionEvent::TodosReplaced { items } => items,
+                SessionEvent::Compaction { checkpoint } => &checkpoint.todos,
+                _ => continue,
+            };
+            let state = agents.entry(record.agent.clone()).or_default();
+            state.items.clone_from(items);
         }
         Self {
             store,
@@ -89,94 +77,53 @@ impl TodoStore {
         // Publish the job association and seed together so inspection cannot see an
         // empty list between registering the child and persisting its initial instructions.
         let mut agents = self.agents.lock().await;
-        let revision = if let Some(items) = &seed {
-            Some(
-                self.store
-                    .append(
-                        agent.clone(),
-                        SessionEvent::TodosReplaced {
-                            items: items.clone(),
-                        },
-                    )
-                    .await?
-                    .sequence,
-            )
-        } else {
-            None
-        };
+        if let Some(items) = &seed {
+            let seeded = SessionEvent::TodosReplaced {
+                items: items.clone(),
+            };
+            self.store.append(agent.clone(), seeded).await?;
+        }
         let state = agents.entry(agent).or_default();
         state.owner_job = owner_job;
         if let Some(items) = seed {
             state.items = items;
-            state.revision = revision.expect("seed was journaled");
         }
         Ok(())
     }
 
-    pub fn validate(items: &[TodoItem]) -> Result<(), ToolError> {
-        if let Some(index) = items.iter().position(|item| item.text.trim().is_empty()) {
-            return Err(ToolError::invalid_arguments("todo text cannot be blank")
-                .operation(
-                    Operation::Validate,
-                    Subject::Label(format!("todo item at index {index}")),
-                )
-                .effects(Effects::NotStarted));
-        }
-        Ok(())
-    }
-
-    pub async fn replace(
-        &self,
-        agent: &AgentId,
-        items: Vec<TodoItem>,
-    ) -> Result<TodoSnapshot, SessionError> {
+    pub async fn replace(&self, agent: &AgentId, items: Vec<TodoItem>) -> Result<(), SessionError> {
         // Hold the lock across persistence so published snapshots and replay agree on order.
         let mut agents = self.agents.lock().await;
-        let record = self
-            .store
-            .append(
-                agent.clone(),
-                SessionEvent::TodosReplaced {
-                    items: items.clone(),
-                },
-            )
-            .await?;
-        let state = agents.entry(agent.clone()).or_default();
-        state.items.clone_from(&items);
-        state.revision = record.sequence;
-        Ok(TodoSnapshot {
-            agent: agent.clone(),
-            items,
-        })
+        let replaced = SessionEvent::TodosReplaced {
+            items: items.clone(),
+        };
+        self.store.append(agent.clone(), replaced).await?;
+        agents.entry(agent.clone()).or_default().items = items;
+        Ok(())
     }
 
-    /// Journal and publish history and todos together. A newer todo mutation
-    /// invalidates the summary's snapshot and must be reconciled by a fresh attempt.
+    /// Journal and publish history and todos together. The journal refuses a
+    /// checkpoint that a newer todo mutation made stale; a fresh attempt reconciles it.
     pub(crate) async fn commit_compaction(
         &self,
         agent: &AgentId,
         checkpoint: CompactionCheckpoint,
-    ) -> Result<bool, SessionError> {
+    ) -> Result<(), SessionError> {
         let mut agents = self.agents.lock().await;
-        let state = agents.entry(agent.clone()).or_default();
-        if state.revision > checkpoint.frontier {
-            return Ok(false);
-        }
         let items = checkpoint.todos.clone();
-        let record = self
-            .store
+        self.store
             .append(agent.clone(), SessionEvent::Compaction { checkpoint })
             .await?;
-        state.items = items;
-        state.revision = record.sequence;
-        Ok(true)
+        agents.entry(agent.clone()).or_default().items = items;
+        Ok(())
     }
 
+    /// The caller's own list, or with `job` the list of the descendant it launched.
     pub async fn inspect(
         &self,
         caller: &AgentId,
         job: Option<JobId>,
-    ) -> Result<TodoSnapshot, ToolError> {
+    ) -> Result<Vec<TodoItem>, ToolError> {
         let agents = self.agents.lock().await;
         let agent = if let Some(job) = job {
             let agent = agents
@@ -198,12 +145,9 @@ impl TodoStore {
         } else {
             caller
         };
-        Ok(TodoSnapshot {
-            agent: agent.clone(),
-            items: agents
-                .get(agent)
-                .map_or_else(Vec::new, |state| state.items.clone()),
-        })
+        Ok(agents
+            .get(agent)
+            .map_or_else(Vec::new, |state| state.items.clone()))
     }
 }
 
@@ -212,17 +156,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn rejections_identify_the_blank_item_and_the_rejected_job() {
-        let item = |text: &str| TodoItem {
-            text: text.into(),
-            status: TodoStatus::Pending,
-        };
-        let blank = TodoStore::validate(&[item("task"), item("  ")]).unwrap_err();
-        assert_eq!(
-            blank.diagnostic().context.subject,
-            Subject::Label("todo item at index 1".into())
-        );
-
+    async fn rejections_identify_the_rejected_job() {
         let fixture = crate::session::tests::MemorySession::new().await;
         let todos = TodoStore::restore(fixture.store, &[]);
         let job = JobId::new(17).unwrap();

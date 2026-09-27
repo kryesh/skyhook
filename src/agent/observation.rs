@@ -4,7 +4,8 @@ use crate::{
     identity::AgentId,
     provider::protocol::{LiveBlock, LiveResponse, Step},
     session::{
-        EventRecord, Message, MessageSeq, ModelFailureKind, RecordSeq, RequestSeq, SessionEvent,
+        EventRecord, MessageSeq, ModelPurpose, RecordSeq, RequestLedger, RequestPhase, RequestSeq,
+        SessionEvent,
     },
 };
 use std::{
@@ -124,6 +125,8 @@ impl ObservedResponse {
 pub struct ObservationSnapshot {
     pub revision: u64,
     pub records: BTreeMap<RecordSeq, EventRecord>,
+    /// Every request's lifecycle, folded from `records`.
+    pub ledger: RequestLedger,
     pub responses: HashMap<(AgentId, RequestSeq), ObservedResponse>,
     pub activity: HashMap<AgentId, AgentActivity>,
     pub context: HashMap<AgentId, ContextUsage>,
@@ -136,148 +139,59 @@ impl ObservationSnapshot {
             return;
         }
         self.revision = update.revision;
-        self.reduce(update.event, true);
+        self.reduce(update.event);
     }
 
-    /// `live` is false only while replaying history on open, where records are the
-    /// sole source of activity. Live, the driver also emits activity directly.
-    fn reduce(&mut self, event: RuntimeEvent, live: bool) {
+    fn reduce(&mut self, event: RuntimeEvent) {
         match event {
             RuntimeEvent::Record(record) => {
                 if self.records.contains_key(&record.sequence) {
                     return;
                 }
+                let changed = self.ledger.observe(&record).into_iter().next().is_some();
+                let agent = &record.agent;
                 match &record.event {
-                    SessionEvent::ModelRecoveryScheduled { failure, .. } => {
-                        // ModelFailed settles only its response. Recovery keeps the
-                        // agent active without turning a transport failure into a
-                        // terminal agent/job failure.
-                        if let Some(SessionEvent::ModelFailed { attempt, .. }) =
-                            self.records.get(failure).map(|record| &record.event)
-                        {
-                            let attempt = attempt.attempt.saturating_add(1);
-                            self.activity.insert(
-                                record.agent.clone(),
-                                AgentActivity::Reconnecting { attempt },
-                            );
-                        }
-                    }
                     SessionEvent::ModelAttemptStarted(attempt) => {
                         // One logical request survives retries; native item/block
                         // IDs may be reused. Clear only the displayed response,
                         // never the journal's per-attempt audit records.
-                        self.responses.insert(
-                            (record.agent.clone(), attempt.request),
-                            ObservedResponse::default(),
-                        );
-                        let request = RecordSeq::from(attempt.request);
-                        let context = self.records.get(&request).and_then(|request| {
-                            crate::session::request_context(request, |sequence| {
-                                self.records.get(&sequence)
-                            })
-                        });
-                        let activity = if context.is_some_and(|context| {
-                            context.purpose == crate::session::ModelPurpose::Compaction
-                        }) {
-                            AgentActivity::Compacting
-                        } else {
-                            AgentActivity::Working
-                        };
-                        // Live, every attempt site emits this activity itself before
-                        // appending, and a late-forwarded record would regress newer
-                        // state (a root blocked in `Tools` shown as working). Only the
-                        // journal-only `Reconnecting` needs the record to end it.
-                        if !live
-                            || matches!(
-                                self.activity.get(&record.agent),
-                                None | Some(AgentActivity::Reconnecting { .. })
-                            )
-                        {
-                            self.activity.insert(record.agent.clone(), activity);
-                        }
-                    }
-                    SessionEvent::ModelRequested { .. }
-                        if matches!(
-                            self.activity.get(&record.agent),
-                            Some(AgentActivity::Reconnecting { .. })
-                        ) =>
-                    {
-                        self.activity
-                            .insert(record.agent.clone(), AgentActivity::Working);
+                        let key = (agent.clone(), attempt.request);
+                        self.responses.insert(key, ObservedResponse::default());
                     }
                     SessionEvent::AgentCompleted => {
-                        self.activity
-                            .insert(record.agent.clone(), AgentActivity::Idle);
+                        self.activity.insert(agent.clone(), AgentActivity::Idle);
                     }
                     SessionEvent::AgentInterrupted => {
-                        self.activity.insert(
-                            record.agent.clone(),
-                            AgentActivity::Stopped(TurnFailure::Interrupted),
-                        );
+                        let stopped = AgentActivity::Stopped(TurnFailure::Interrupted);
+                        self.activity.insert(agent.clone(), stopped);
                     }
-                    SessionEvent::AgentFailed { error } => {
-                        // Replaying this re-arms the host's retry affordance, so a
-                        // resumed session can continue a failed turn instead of
-                        // appearing idle. A later attempt/completion overrides it.
-                        // Live, the driver also emits the typed failure, in either
-                        // order with this record; the rendered one never replaces it.
-                        if !live
-                            || !self
-                                .activity
-                                .get(&record.agent)
-                                .is_some_and(AgentActivity::is_retryable)
-                        {
-                            self.activity.insert(
-                                record.agent.clone(),
-                                AgentActivity::Stopped(TurnFailure::Other(error.clone())),
-                            );
-                        }
+                    SessionEvent::AgentFailed { failure } => {
+                        let stopped = AgentActivity::Stopped(failure.clone().into());
+                        self.activity.insert(agent.clone(), stopped);
                     }
-                    SessionEvent::ModelFailed {
-                        attempt,
-                        error,
-                        kind,
-                    } => {
+                    SessionEvent::ModelFailed { attempt, failure } => {
                         // The runtime's own settlement is authoritative and may
                         // arrive before or after this record. An abort commits its
                         // partial message before journaling the failure: that
                         // commit is the attempt's settlement, and a committed
                         // response is retired, never revived as one that committed
                         // nothing.
-                        let key = (record.agent.clone(), attempt.request);
-                        // A request precedes its failure; a journal that says otherwise
-                        // has no partial commit to find.
-                        let request = RecordSeq::from(attempt.request);
-                        let after_request = request..record.sequence.max(request);
-                        let committed = self
-                            .records
-                            .range(after_request)
-                            .rev()
-                            .filter(|(_, earlier)| earlier.agent == record.agent)
-                            .take_while(|(_, earlier)| {
-                                !matches!(earlier.event, SessionEvent::ModelAttemptStarted(started)
-                                    if started == *attempt)
-                            })
-                            .any(|(_, earlier)| {
-                                matches!(
-                                    earlier.event,
-                                    SessionEvent::MessageCommitted {
-                                        message: Message::Assistant(_)
-                                    }
-                                )
-                            });
+                        let key = (agent.clone(), attempt.request);
+                        let committed = self.ledger.get(attempt.request).is_some_and(|request| {
+                            matches!(
+                                request.phase,
+                                RequestPhase::Failed {
+                                    message: Some(_),
+                                    ..
+                                }
+                            )
+                        });
                         if committed {
                             self.responses.remove(&key);
                         } else {
                             let response = self.responses.entry(key).or_default();
                             if response.settlement().is_none() {
-                                let failure = match kind {
-                                    ModelFailureKind::Refusal => {
-                                        TurnFailure::Refused(error.clone())
-                                    }
-                                    ModelFailureKind::Error => TurnFailure::Other(error.clone()),
-                                };
-                                response.settle(Settlement::Failed(failure));
+                                response.settle(Settlement::Failed(failure.clone().into()));
                             }
                         }
                     }
@@ -291,6 +205,9 @@ impl ObservationSnapshot {
                         });
                     }
                     _ => {}
+                }
+                if changed {
+                    self.follow_request(&record.agent);
                 }
                 self.records.insert(record.sequence, *record);
             }
@@ -332,16 +249,41 @@ impl ObservationSnapshot {
                 }
                 self.activity.insert(agent, activity);
             }
-            RuntimeEvent::Context {
-                agent,
-                tokens,
-                capacity,
-            } => {
-                self.context
-                    .insert(agent, ContextUsage { tokens, capacity });
+            RuntimeEvent::Context { agent, usage } => {
+                self.context.insert(agent, usage);
             }
             RuntimeEvent::TurnCompleted { .. } => {}
         }
+    }
+
+    /// Before the runtime reports an agent, and while it reports it in a model
+    /// request, the agent's pending request gives its activity: a scheduled recovery
+    /// reconnects and a compaction compacts. Records never move a reported agent into
+    /// or out of a request, so one forwarded late cannot regress newer activity.
+    fn follow_request(&mut self, agent: &AgentId) {
+        let in_request = self.activity.get(agent).is_none_or(|activity| {
+            matches!(
+                activity,
+                AgentActivity::Working
+                    | AgentActivity::Compacting
+                    | AgentActivity::Reconnecting { .. }
+            )
+        });
+        let open = self
+            .ledger
+            .open(agent)
+            .and_then(|request| self.ledger.get(request));
+        let (true, Some(request)) = (in_request, open) else {
+            return;
+        };
+        let activity = match (&request.phase, request.purpose) {
+            (RequestPhase::Retrying { attempt, .. }, _) => AgentActivity::Reconnecting {
+                attempt: attempt.saturating_add(1),
+            },
+            (_, ModelPurpose::Compaction) => AgentActivity::Compacting,
+            _ => AgentActivity::Working,
+        };
+        self.activity.insert(agent.clone(), activity);
     }
 }
 
@@ -356,6 +298,9 @@ pub struct Observation {
     pub updates: broadcast::Receiver<ObservedEvent>,
 }
 
+/// Updates an observer may fall behind by before it lags.
+const OBSERVATION_CAPACITY: usize = 1024;
+
 #[derive(Clone)]
 pub(crate) struct RuntimeEvents {
     inner: Arc<Mutex<ObservationSnapshot>>,
@@ -366,12 +311,12 @@ impl RuntimeEvents {
     pub fn new(records: &[EventRecord]) -> Self {
         let mut snapshot = ObservationSnapshot::default();
         for record in records {
-            snapshot.reduce(RuntimeEvent::Record(Box::new(record.clone())), false);
+            snapshot.reduce(RuntimeEvent::Record(Box::new(record.clone())));
         }
-        snapshot.context = super::runtime::recorded_context(records);
+        snapshot.context = super::runtime::recorded_context(records, &snapshot.ledger);
         Self {
             inner: Arc::new(Mutex::new(snapshot)),
-            updates: broadcast::channel(1024).0,
+            updates: broadcast::channel(OBSERVATION_CAPACITY).0,
         }
     }
 
@@ -383,13 +328,9 @@ impl RuntimeEvents {
         }
     }
 
-    /// Whether the agent's last turn failed or was interrupted and can be continued.
-    pub(crate) fn retryable(&self, agent: &AgentId) -> bool {
-        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        state
-            .activity
-            .get(agent)
-            .is_some_and(AgentActivity::is_retryable)
+    /// Read the ledger folded from every record observed so far.
+    pub fn ledger<R>(&self, read: impl FnOnce(&RequestLedger) -> R) -> R {
+        read(&self.inner.lock().unwrap_or_else(|e| e.into_inner()).ledger)
     }
 
     pub fn send(&self, event: RuntimeEvent) {
@@ -400,7 +341,7 @@ impl RuntimeEvents {
             return;
         }
         state.revision += 1;
-        state.reduce(event.clone(), true);
+        state.reduce(event.clone());
         let _ = self.updates.send(ObservedEvent {
             revision: state.revision,
             event,
@@ -411,147 +352,51 @@ impl RuntimeEvents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{AttemptRef, Message};
+    use crate::agent::Failure;
+    use crate::session::{
+        AttemptRef, Message, ModelContext,
+        tests::{self, attempt, requested},
+    };
     use crate::{
         identity::SessionId,
-        provider::protocol::{BlockId, BlockRef, ItemId, ItemKind, ResponseEvent},
+        provider::protocol::{BlockRef, ItemKind, ResponseEvent},
     };
 
-    #[test]
-    fn replayed_agent_failure_re_arms_the_retry_gate_and_later_work_clears_it() {
-        use crate::session::{EventRecord, SessionEvent};
-        let id = SessionId::from_bytes([3; 16]);
-        let agent = AgentId::root(id);
-        let record = |sequence: u64, event: SessionEvent| EventRecord {
-            id: crate::identity::EventId::from_bytes([sequence as u8; 16]),
-            sequence: sequence.into(),
-            timestamp_millis: 0,
-            agent: agent.clone(),
-            event,
-        };
-        let failure = SessionEvent::AgentFailed {
-            error: "the model declined to respond: content filter".into(),
-        };
-        // A reopened session must observe the failure, or its retry affordance
-        // reports nothing to continue.
-        let records = vec![record(1, failure.clone())];
-        let snapshot = RuntimeEvents::new(&records).observe().snapshot;
-        let activity = snapshot.activity.get(&agent).cloned();
-        assert!(matches!(
-            activity,
-            Some(AgentActivity::Stopped(TurnFailure::Other(error))) if error.contains("declined to respond")
-        ));
-        // A later attempt supersedes it, so a continued turn is not stuck failed.
-        let records = vec![
-            record(1, failure),
-            record(
-                2,
-                SessionEvent::ModelAttemptStarted(AttemptRef {
-                    request: 1.into(),
-                    attempt: 1,
-                }),
-            ),
-        ];
-        let snapshot = RuntimeEvents::new(&records).observe().snapshot;
-        assert_eq!(snapshot.activity.get(&agent), Some(&AgentActivity::Working));
-        // Live, the driver's typed failure and the forwarded record arrive in either
-        // order; the typed one is what observers keep.
-        let typed = AgentActivity::Stopped(TurnFailure::Aborted);
-        let failed = SessionEvent::AgentFailed {
-            error: TurnFailure::Aborted.to_string(),
-        };
-        for record_first in [true, false] {
-            let hub = RuntimeEvents::new(&[]);
-            let activity = |activity| RuntimeEvent::Activity {
-                agent: agent.clone(),
-                activity,
-            };
-            hub.send(activity(AgentActivity::Working));
-            if record_first {
-                super::tests::record(&hub, &agent, 5, failed.clone());
-            }
-            hub.send(activity(typed.clone()));
-            if !record_first {
-                super::tests::record(&hub, &agent, 5, failed.clone());
-            }
-            assert_eq!(hub.observe().snapshot.activity.get(&agent), Some(&typed));
-        }
-    }
-
-    /// A late-forwarded attempt record must not regress newer live activity, but
-    /// still ends a journal-only `Reconnecting`.
-    #[test]
-    fn a_late_attempt_record_does_not_regress_newer_live_activity() {
-        use crate::session::{EventRecord, SessionEvent};
-        let agent = AgentId::root(SessionId::from_bytes([4; 16]));
-        let attempt = |sequence: u64| {
-            RuntimeEvent::Record(Box::new(EventRecord {
-                id: crate::identity::EventId::from_bytes([sequence as u8; 16]),
-                sequence: sequence.into(),
-                timestamp_millis: 0,
-                agent: agent.clone(),
-                event: SessionEvent::ModelAttemptStarted(AttemptRef {
-                    request: 1.into(),
-                    attempt: sequence,
-                }),
-            }))
-        };
-        let activity = |activity| RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity,
-        };
-        let hub = RuntimeEvents::new(&[]);
-        hub.send(activity(AgentActivity::Working));
-        hub.send(activity(AgentActivity::Tools));
-        hub.send(attempt(1));
-        let observed = hub.observe().snapshot;
-        assert_eq!(observed.activity.get(&agent), Some(&AgentActivity::Tools));
-        let recovering = AgentActivity::Reconnecting { attempt: 1 };
-        hub.send(activity(recovering));
-        hub.send(attempt(2));
-        let observed = hub.observe().snapshot;
-        assert_eq!(observed.activity.get(&agent), Some(&AgentActivity::Working));
-    }
-
-    fn emit(hub: &RuntimeEvents, agent: &AgentId, event: ResponseEvent) {
-        let (agent, request) = (agent.clone(), 7.into());
-        hub.send(RuntimeEvent::ResponseEvent {
-            agent,
-            request,
-            event,
-        });
-    }
-
-    /// Streams `text` into request 7's text block.
-    fn delta(hub: &RuntimeEvents, agent: &AgentId, text: &str) {
-        let block = BlockRef {
-            item: ItemId::try_from("text".to_owned()).unwrap(),
-            block: BlockId::try_from("text".to_owned()).unwrap(),
-        };
-        let kind = ItemKind::Text;
-        let text = text.into();
-        emit(hub, agent, ResponseEvent::Delta { block, kind, text });
-    }
-
     fn record(hub: &RuntimeEvents, agent: &AgentId, sequence: u64, event: SessionEvent) {
-        hub.send(RuntimeEvent::Record(Box::new(EventRecord {
-            id: crate::identity::EventId::generate().unwrap(),
-            sequence: sequence.into(),
-            timestamp_millis: 0,
-            agent: agent.clone(),
-            event,
-        })));
+        let record = tests::record(agent, sequence, event);
+        hub.send(RuntimeEvent::Record(Box::new(record)));
     }
 
-    /// A failure of request 7's attempt `attempt` and the recovery it schedules.
-    fn failed(attempt: u64) -> SessionEvent {
+    fn activity(hub: &RuntimeEvents, agent: &AgentId, activity: AgentActivity) {
+        let agent = agent.clone();
+        hub.send(RuntimeEvent::Activity { agent, activity });
+    }
+
+    /// Journals request `request` for `purpose`, its context just before it.
+    fn request(hub: &RuntimeEvents, agent: &AgentId, request: u64, purpose: ModelPurpose) {
+        let context = ModelContext::test(purpose, tests::profile());
+        record(
+            hub,
+            agent,
+            request - 1,
+            SessionEvent::ModelContext { context },
+        );
+        record(hub, agent, request, requested((request - 1).into()));
+    }
+
+    /// Journals `request` and starts its first attempt just after it.
+    fn request_attempt(hub: &RuntimeEvents, agent: &AgentId, request: u64) {
+        self::request(hub, agent, request, ModelPurpose::Agent);
+        record(hub, agent, request + 1, attempt(request.into(), 1));
+    }
+
+    fn failed(request: u64, attempt: u64, error: &str) -> SessionEvent {
         SessionEvent::ModelFailed {
             attempt: AttemptRef {
-                request: 7.into(),
+                request: request.into(),
                 attempt,
             },
-            error: "connection lost".into(),
-            kind: crate::session::ModelFailureKind::Error,
+            failure: transport(error),
         }
     }
 
@@ -562,17 +407,86 @@ mod tests {
         }
     }
 
+    fn committed() -> SessionEvent {
+        SessionEvent::MessageCommitted {
+            message: Message::Assistant(vec![]),
+        }
+    }
+
+    /// A retryable failure, as the runtime schedules recoveries for.
+    fn transport(error: &str) -> Failure {
+        Failure::Provider(error.into(), crate::provider::ProviderErrorKind::Transport)
+    }
+
+    fn lost() -> Settlement {
+        Settlement::Failed(transport("connection lost").into())
+    }
+
+    /// Streams `text` into `request`'s text block.
+    fn delta(hub: &RuntimeEvents, agent: &AgentId, request: u64, text: &str) {
+        let block = BlockRef::single("text");
+        let (kind, text) = (ItemKind::Text, text.into());
+        hub.send(RuntimeEvent::ResponseEvent {
+            agent: agent.clone(),
+            request: request.into(),
+            event: ResponseEvent::Delta { block, kind, text },
+        });
+    }
+
+    #[test]
+    fn replay_shows_each_agents_last_journaled_outcome() {
+        let agent = AgentId::root(SessionId::from_bytes([3; 16]));
+        let refused = Failure::Refused("content filter".into());
+        let failure = SessionEvent::AgentFailed {
+            failure: refused.clone(),
+        };
+        let snapshot = RuntimeEvents::new(&[tests::record(&agent, 1, failure)])
+            .observe()
+            .snapshot;
+        assert_eq!(
+            snapshot.activity[&agent],
+            AgentActivity::Stopped(refused.into())
+        );
+    }
+
+    #[test]
+    fn records_refine_only_the_activity_of_a_model_request() {
+        let hub = RuntimeEvents::new(&[]);
+        let agent = AgentId::root(SessionId::from_bytes([4; 16]));
+        let current = || hub.observe().snapshot.activity[&agent].clone();
+        activity(&hub, &agent, AgentActivity::Working);
+        request(&hub, &agent, 2, ModelPurpose::Agent);
+        activity(&hub, &agent, AgentActivity::Tools);
+        record(&hub, &agent, 3, attempt(2.into(), 1));
+        assert_eq!(current(), AgentActivity::Tools);
+        activity(&hub, &agent, AgentActivity::Working);
+        record(&hub, &agent, 4, failed(2, 1, "connection lost"));
+        assert_eq!(current(), AgentActivity::Working);
+        record(&hub, &agent, 5, scheduled(4));
+        assert_eq!(current(), AgentActivity::Reconnecting { attempt: 2 });
+        record(&hub, &agent, 6, attempt(2.into(), 2));
+        assert_eq!(current(), AgentActivity::Working);
+        request(&hub, &agent, 8, ModelPurpose::Compaction);
+        assert_eq!(current(), AgentActivity::Compacting);
+        record(&hub, &agent, 9, attempt(8.into(), 1));
+        record(&hub, &agent, 10, failed(8, 1, "connection lost"));
+        record(&hub, &agent, 11, scheduled(10));
+        assert_eq!(current(), AgentActivity::Reconnecting { attempt: 2 });
+        record(&hub, &agent, 12, SessionEvent::AgentInterrupted);
+        assert_eq!(current(), AgentActivity::Stopped(TurnFailure::Interrupted));
+    }
+
     #[test]
     fn snapshot_handoff_and_commit_do_not_duplicate_streams() {
         let hub = RuntimeEvents::new(&[]);
         let agent = AgentId::root(SessionId::from_bytes([1; 16]));
         let key = (agent.clone(), 7.into());
-        delta(&hub, &agent, "hello");
+        delta(&hub, &agent, 7, "hello");
         let mut observation = hub.observe();
         let text =
             |snapshot: &ObservationSnapshot| snapshot.responses[&key].blocks()[0].text.clone();
         assert_eq!(text(&observation.snapshot), "hello");
-        delta(&hub, &agent, "!");
+        delta(&hub, &agent, 7, "!");
         let update = observation.updates.try_recv().unwrap();
         observation.snapshot.apply(update.clone());
         observation.snapshot.apply(update);
@@ -582,10 +496,7 @@ mod tests {
             request: 7.into(),
             settlement: Settlement::Committed(3.into()),
         });
-        let committed = SessionEvent::MessageCommitted {
-            message: Message::Assistant(vec![]),
-        };
-        record(&hub, &agent, 3, committed);
+        record(&hub, &agent, 3, committed());
         while let Ok(update) = observation.updates.try_recv() {
             observation.snapshot.apply(update.clone());
             observation.snapshot.apply(update);
@@ -596,7 +507,7 @@ mod tests {
     }
 
     #[test]
-    fn recovery_is_active_replayable_and_preserves_failed_partial_output() {
+    fn a_retry_keeps_the_failed_partial_output_until_its_next_attempt() {
         let hub = RuntimeEvents::new(&[]);
         let agent = AgentId::root(SessionId::from_bytes([2; 16]));
         let key = (agent.clone(), 7.into());
@@ -604,56 +515,37 @@ mod tests {
             let records: Vec<_> = snapshot.records.values().cloned().collect();
             RuntimeEvents::new(&records).observe().snapshot
         };
-        delta(&hub, &agent, "partial answer");
-        let activity = AgentActivity::Working;
-        hub.send(RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity,
-        });
-        record(&hub, &agent, 8, failed(1));
-        let found = &hub.observe().snapshot.activity[&agent];
-        assert_eq!(*found, AgentActivity::Working);
+        activity(&hub, &agent, AgentActivity::Working);
+        request(&hub, &agent, 7, ModelPurpose::Agent);
+        delta(&hub, &agent, 7, "partial answer");
+        record(&hub, &agent, 8, failed(7, 1, "connection lost"));
         record(&hub, &agent, 9, scheduled(8));
         let snapshot = hub.observe().snapshot;
         let reconnecting = AgentActivity::Reconnecting { attempt: 2 };
         assert_eq!(snapshot.activity[&agent], reconnecting);
-        let response = &snapshot.responses[&key];
-        let lost = Settlement::Failed(TurnFailure::Other("connection lost".into()));
-        assert_eq!(response.settlement(), Some(&lost));
-        let found = &response.blocks()[0].text;
-        assert_eq!(*found, "partial answer");
+        // Replay has no runtime to report the agent, so the journal alone does.
         assert_eq!(replayed(&snapshot).activity[&agent], reconnecting);
+        let response = &snapshot.responses[&key];
+        assert_eq!(response.settlement(), Some(&lost()));
+        assert_eq!(response.blocks()[0].text, "partial answer");
+        record(&hub, &agent, 10, attempt(7.into(), 2));
         // Duplicate journal delivery cannot roll a newer activity back.
-        let requested = SessionEvent::ModelRequested {
-            context: 1.into(),
-            checkpoint: None,
-            history: Vec::new(),
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
-        };
-        record(&hub, &agent, 10, requested);
-        hub.send(RuntimeEvent::Record(Box::new(
-            snapshot.records[&9.into()].clone(),
-        )));
-        let found = &hub.observe().snapshot.activity[&agent];
-        assert_eq!(*found, AgentActivity::Working);
-        let attempt = SessionEvent::ModelAttemptStarted(AttemptRef {
-            request: 7.into(),
-            attempt: 2,
-        });
-        record(&hub, &agent, 11, attempt);
+        let recovery = snapshot.records[&9.into()].clone();
+        hub.send(RuntimeEvent::Record(Box::new(recovery)));
         let started = hub.observe().snapshot;
-        let response = &started.responses[&key];
-        assert!(response.settlement().is_none());
-        assert!(response.blocks().is_empty());
+        assert_eq!(started.activity[&agent], AgentActivity::Working);
+        for response in [
+            &started.responses[&key],
+            &replayed(&started).responses[&key],
+        ] {
+            assert!(response.settlement().is_none());
+            assert!(response.blocks().is_empty());
+        }
         let json = |snapshot: &ObservationSnapshot| {
             serde_json::to_value(&snapshot.records[&8.into()]).unwrap()
         };
         assert_eq!(json(&started), json(&snapshot));
-        let replayed_response = &replayed(&started).responses[&key];
-        assert!(replayed_response.blocks().is_empty());
-        assert!(replayed_response.settlement().is_none());
-        record(&hub, &agent, 12, SessionEvent::AgentCompleted);
+        record(&hub, &agent, 11, SessionEvent::AgentCompleted);
         let completed = hub.observe().snapshot;
         assert_eq!(completed.activity[&agent], AgentActivity::Idle);
         assert_eq!(replayed(&completed).activity[&agent], AgentActivity::Idle);
@@ -672,127 +564,64 @@ mod tests {
                 settlement,
             });
         };
-        let failed_attempt = |request: u64, attempt, error: &str| SessionEvent::ModelFailed {
-            attempt: AttemptRef {
-                request: request.into(),
-                attempt,
-            },
-            error: error.into(),
-            kind: crate::session::ModelFailureKind::Error,
+        let response = |request: u64| {
+            let key = (agent.clone(), request.into());
+            hub.observe().snapshot.responses.get(&key).cloned()
         };
-        let failed = |request, error: &str| failed_attempt(request, 1, error);
-        let settlement = |request: u64| {
-            hub.observe().snapshot.responses[&(agent.clone(), request.into())]
-                .settlement()
-                .cloned()
-        };
+        let settlement = |request| response(request).and_then(|r| r.settlement().cloned());
         // An abort commits its partial message and journals ModelFailed together.
-        delta(&hub, &agent, "partial");
+        delta(&hub, &agent, 7, "partial");
         settle(7, Settlement::Aborted(3.into()));
-        record(&hub, &agent, 4, failed(7, "provider aborted response"));
+        record(&hub, &agent, 4, failed(7, 1, "provider aborted response"));
         assert_eq!(settlement(7), Some(Settlement::Aborted(3.into())));
-        let blocks = hub.observe().snapshot.responses[&(agent.clone(), 7.into())].blocks()[0]
-            .text
-            .clone();
-        assert_eq!(blocks, "partial");
+        assert_eq!(response(7).unwrap().blocks()[0].text, "partial");
         // A record-driven failure yields to the runtime's later settlement.
-        record(&hub, &agent, 5, failed(8, "connection lost"));
-        let lost = Settlement::Failed(TurnFailure::Other("connection lost".into()));
-        assert_eq!(settlement(8), Some(lost));
+        record(&hub, &agent, 5, failed(8, 1, "connection lost"));
+        assert_eq!(settlement(8), Some(lost()));
         settle(8, Settlement::Committed(6.into()));
         assert_eq!(settlement(8), Some(Settlement::Committed(6.into())));
         // A stop settles the open response but leaves settled ones alone.
-        hub.send(RuntimeEvent::ResponseEvent {
-            agent: agent.clone(),
-            request: 9.into(),
-            event: ResponseEvent::Delta {
-                block: BlockRef {
-                    item: ItemId::try_from("text".to_owned()).unwrap(),
-                    block: BlockId::try_from("text".to_owned()).unwrap(),
-                },
-                kind: ItemKind::Text,
-                text: "open".into(),
-            },
-        });
-        hub.send(RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity: AgentActivity::Stopped(TurnFailure::Interrupted),
-        });
+        delta(&hub, &agent, 9, "open");
+        let stopped = AgentActivity::Stopped(TurnFailure::Interrupted);
+        activity(&hub, &agent, stopped);
         let interrupted = Settlement::Failed(TurnFailure::Interrupted);
         assert_eq!(settlement(9), Some(interrupted));
         assert_eq!(settlement(7), Some(Settlement::Aborted(3.into())));
         assert_eq!(settlement(8), Some(Settlement::Committed(6.into())));
         // The commit the abort announced removes the response.
-        let committed = || SessionEvent::MessageCommitted {
-            message: Message::Assistant(vec![]),
-        };
         record(&hub, &agent, 3, committed());
-        let responses = hub.observe().snapshot.responses;
-        assert!(!responses.contains_key(&(agent.clone(), 7.into())));
-        assert!(responses.contains_key(&(agent.clone(), 8.into())));
+        assert!(response(7).is_none() && response(8).is_some());
         // The journal commits the partial message before the failure record of
         // the same transaction; the live settlement can land anywhere around
         // them. Whatever the order, a response that committed is retired, never
         // revived as a failure that committed nothing.
-        let started = |request: u64, attempt| {
-            SessionEvent::ModelAttemptStarted(AttemptRef {
-                request: request.into(),
-                attempt,
-            })
-        };
-        let aborted = |request: u64, sequence: u64, order: &str| {
-            record(&hub, &agent, request, started(request, 1));
+        for (request, order) in [(20, "settle commit fail"), (30, "commit settle fail")]
+            .into_iter()
+            .chain([(40, "commit fail settle")])
+        {
+            request_attempt(&hub, &agent, request);
+            let message = request + 2;
             for step in order.split(' ') {
                 match step {
-                    "settle" => settle(request, Settlement::Aborted(sequence.into())),
-                    "commit" => record(&hub, &agent, sequence, committed()),
-                    "fail" => record(&hub, &agent, sequence + 1, failed(request, "aborted")),
+                    "settle" => settle(request, Settlement::Aborted(message.into())),
+                    "commit" => record(&hub, &agent, message, committed()),
+                    "fail" => record(&hub, &agent, request + 3, failed(request, 1, "aborted")),
                     _ => unreachable!(),
                 }
             }
-            assert!(
-                !hub.observe()
-                    .snapshot
-                    .responses
-                    .contains_key(&(agent.clone(), request.into())),
-                "{order}"
-            );
-        };
-        aborted(10, 11, "settle commit fail");
-        aborted(13, 14, "commit settle fail");
-        aborted(16, 17, "commit fail settle");
+            assert!(response(request).is_none(), "{order}");
+        }
         // A failure record for a request never observed live still registers,
         // and a later attempt that committed nothing fails even though an
         // earlier attempt of the same request committed its partial response.
-        record(&hub, &agent, 19, failed(20, "connection lost"));
-        assert!(settlement(20).is_some());
-        record(&hub, &agent, 21, started(21, 1));
-        record(&hub, &agent, 22, committed());
-        record(&hub, &agent, 23, failed(21, "aborted"));
-        assert!(
-            !hub.observe()
-                .snapshot
-                .responses
-                .contains_key(&(agent.clone(), 21.into()))
-        );
-        record(&hub, &agent, 24, started(21, 2));
-        record(&hub, &agent, 25, failed_attempt(21, 2, "connection lost"));
-        let lost = Settlement::Failed(TurnFailure::Other("connection lost".into()));
-        assert_eq!(settlement(21), Some(lost));
-    }
-
-    #[test]
-    fn interruption_replaces_pending_recovery() {
-        let hub = RuntimeEvents::new(&[]);
-        let agent = AgentId::root(SessionId::from_bytes([3; 16]));
-        record(&hub, &agent, 1, failed(3));
-        record(&hub, &agent, 2, scheduled(1));
-        assert_eq!(
-            hub.observe().snapshot.activity[&agent],
-            AgentActivity::Reconnecting { attempt: 4 }
-        );
-        record(&hub, &agent, 3, SessionEvent::AgentInterrupted);
-        let found = &hub.observe().snapshot.activity[&agent];
-        assert_eq!(*found, AgentActivity::Stopped(TurnFailure::Interrupted));
+        record(&hub, &agent, 45, failed(46, 1, "connection lost"));
+        assert!(settlement(46).is_some());
+        request_attempt(&hub, &agent, 50);
+        record(&hub, &agent, 52, committed());
+        record(&hub, &agent, 53, failed(50, 1, "aborted"));
+        assert!(response(50).is_none());
+        record(&hub, &agent, 54, attempt(50.into(), 2));
+        record(&hub, &agent, 55, failed(50, 2, "connection lost"));
+        assert_eq!(settlement(50), Some(lost()));
     }
 }

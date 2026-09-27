@@ -160,6 +160,10 @@ The workspace path is centered in the top bar. The bottom bar shows the model ID
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
 (usually Shift-drag) and copy shortcut. Copy uses the terminal's OSC 52 clipboard support. `@` or `Ctrl+X F` attaches a workspace file
 (press `Esc` to keep a typed `@`): image files attach as images and other files as text.
+The picker lists up to 10,000 workspace files by path, leaving out what Git and ripgrep would:
+hidden files and directories (including `.skyhook`), paths matched by `.gitignore` (in a Git
+repository or not), `.ignore` files, and Git's global and repository excludes. It always skips
+`target` and `node_modules` directories, and does not follow symbolic links.
 Attachments are listed below the composer, and attached text is sent after the message. Pastes longer than 12 lines appear as inline items at the cursor. Type
 before, between, or after multiple paste items; move across, select, delete, and undo them as
 single editing units. Sending or copying expands their original contents in place. Shorter pastes

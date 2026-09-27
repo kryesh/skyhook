@@ -9,13 +9,13 @@ use reqwest::{
 };
 
 use super::diagnostics::DiagnosticMessage;
-use super::{Auth, FetchArgs, HeaderValues, MAX_BYTES, ResponseFormat};
+use super::{Auth, FetchArgs, HeaderValues, ResponseFormat};
 
 /// Request endpoints are not proxy endpoints: credentials are never accepted.
 #[derive(Clone, Debug)]
-pub(in crate::tool::builtins) struct HttpRequestUrl(Url);
+pub(super) struct HttpRequestUrl(Url);
 impl HttpRequestUrl {
-    pub(in crate::tool::builtins) fn parse(value: &str) -> Result<Self, AdmissionError> {
+    pub(super) fn parse(value: &str) -> Result<Self, AdmissionError> {
         let url = Url::parse(value)
             .map_err(|_| AdmissionError::invalid_arguments("invalid absolute URL"))?;
         Self::admit(url)
@@ -33,7 +33,7 @@ impl HttpRequestUrl {
             .map_err(|_| DiagnosticMessage::InvalidRedirectUrl)?;
         Self::admit(url).map_err(|_| DiagnosticMessage::RedirectUrlNotHttp)
     }
-    pub(in crate::tool::builtins) fn as_str(&self) -> &str {
+    pub(super) fn as_str(&self) -> &str {
         self.0.as_str()
     }
     pub(super) fn url(&self) -> &Url {
@@ -83,25 +83,6 @@ fn check_url(url: &Url) -> Result<(), AdmissionError> {
     Ok(())
 }
 fn validate_options(args: &FetchArgs) -> Result<(), AdmissionError> {
-    if args.timeout == 0
-        || args.timeout > 3600
-        || args.connect_timeout == 0
-        || args.connect_timeout > 3600
-    {
-        return Err(AdmissionError::invalid_arguments(
-            "timeouts must be between 1 and 3600 seconds",
-        ));
-    }
-    if args.max_bytes == 0 || args.max_bytes > MAX_BYTES {
-        return Err(AdmissionError::invalid_arguments(
-            "max_bytes must be between 1 and 104857600",
-        ));
-    }
-    if args.max_redirects > 20 {
-        return Err(AdmissionError::invalid_arguments(
-            "max_redirects must not exceed 20",
-        ));
-    }
     if args.text && (args.save_to.is_some() || args.response_format == ResponseFormat::Base64) {
         return Err(AdmissionError::invalid_arguments(
             "text conflicts with save_to and response_format base64",
@@ -188,45 +169,9 @@ pub(super) enum InlineMode {
 pub(super) enum OutputPlan {
     Inline(InlineMode),
     Download {
-        destination: std::path::PathBuf,
+        destination: String,
         overwrite: bool,
     },
-}
-
-pub(super) fn redirect_headers(
-    headers: &mut HeaderMap,
-    from: &HttpRequestUrl,
-    to: &HttpRequestUrl,
-    drop_body: bool,
-) {
-    headers.remove("host");
-    if from.origin() != to.origin() {
-        *headers = headers
-            .iter()
-            .filter(|(name, _)| {
-                matches!(
-                    name.as_str(),
-                    "accept"
-                        | "accept-language"
-                        | "accept-encoding"
-                        | "user-agent"
-                        | "content-type"
-                )
-            })
-            .map(|(name, value)| (name.clone(), value.clone()))
-            .collect();
-    }
-    if drop_body {
-        for name in [
-            "content-type",
-            "content-encoding",
-            "content-language",
-            "content-location",
-            "digest",
-        ] {
-            headers.remove(name);
-        }
-    }
 }
 
 /// The retained owner of validated execution inputs, separate from wire/schema DTOs.
@@ -237,34 +182,25 @@ pub(super) struct FetchPlan {
     pub(super) headers: HeaderMap,
     pub(super) client: ClientSettings,
     pub(super) max_bytes: u64,
-    pub(super) max_redirects: usize,
-    pub(super) redirects: super::RedirectPolicy,
+    pub(super) max_redirects: u64,
+    pub(super) redirects: super::redirects::RedirectPolicy,
     pub(super) output: OutputPlan,
     pub(super) body: Option<super::RequestBody>,
     pub(super) include_headers: bool,
 }
-/// Check everything a plan cannot take from its arguments unchanged: the URL,
-/// method and headers it returns, and the options.
-pub(super) fn check_request(
-    args: &FetchArgs,
-) -> Result<(HttpRequestUrl, Method, HeaderMap), AdmissionError> {
-    // Preserve the admission error ordering of URL, method, options and headers.
-    let url = HttpRequestUrl::parse(&args.url)?;
-    let method =
-        Method::from_bytes(args.method.as_bytes()).map_err(AdmissionError::invalid_arguments)?;
-    validate_options(args)?;
-    let headers = request_headers(args)?;
-    Ok((url, method, headers))
-}
-
 impl TryFrom<FetchArgs> for FetchPlan {
     type Error = AdmissionError;
     fn try_from(args: FetchArgs) -> Result<Self, AdmissionError> {
-        let (mut url, method, headers) = check_request(&args)?;
+        // Ranged arguments failed at parsing; the rest fail as URL, method, options, headers.
+        let mut url = HttpRequestUrl::parse(&args.url)?;
+        let method = Method::from_bytes(args.method.as_bytes())
+            .map_err(AdmissionError::invalid_arguments)?;
+        validate_options(&args)?;
+        let headers = request_headers(&args)?;
         url.append_query(&args.query);
         let output = match args.save_to {
             Some(destination) => OutputPlan::Download {
-                destination: destination.into(),
+                destination,
                 overwrite: args.overwrite,
             },
             None => OutputPlan::Inline(if args.text {
@@ -282,13 +218,13 @@ impl TryFrom<FetchArgs> for FetchPlan {
             method,
             headers,
             client: ClientSettings {
-                timeout: Duration::from_secs(args.timeout),
-                connect_timeout: Duration::from_secs(args.connect_timeout),
+                timeout: args.timeout.duration(),
+                connect_timeout: args.connect_timeout.duration(),
                 proxy: args.proxy,
                 insecure: args.insecure,
             },
-            max_bytes: args.max_bytes,
-            max_redirects: args.max_redirects,
+            max_bytes: args.max_bytes.into(),
+            max_redirects: args.max_redirects.into(),
             redirects: args.redirects,
             output,
             body: args.body,
@@ -299,8 +235,9 @@ impl TryFrom<FetchArgs> for FetchPlan {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{DEFAULT_MAX_BYTES, RedirectPolicy, tests::args};
+    use super::super::{MAX_BYTES, redirects::RedirectPolicy, tests::args};
     use super::*;
+    use crate::tool::diagnostic::{Subject, deserialize_arguments};
     use schemars::schema_for;
     use serde_json::json;
 
@@ -311,11 +248,8 @@ mod tests {
     #[test]
     fn defaults_and_validation() {
         let a = args(json!({"url":"https://example.org"}));
-        assert_eq!(
-            (a.method.as_str(), a.timeout, a.connect_timeout),
-            ("GET", 30, 10)
-        );
-        assert_eq!((a.max_bytes, a.max_redirects), (DEFAULT_MAX_BYTES, 5));
+        let timeouts = (u64::from(a.timeout), u64::from(a.connect_timeout));
+        assert_eq!((a.method.as_str(), timeouts), ("GET", (30, 10)));
         assert!(!a.insecure && !a.include_headers);
         assert_eq!(a.redirects, RedirectPolicy::Safe);
         FetchPlan::try_from(a).unwrap();
@@ -323,10 +257,6 @@ mod tests {
             json!({"url":"file:///etc/passwd"}),
             json!({"url":"https://user:secret@example.org"}),
             json!({"url":"http://example.org","method":"bad method"}),
-            json!({"url":"http://example.org","max_bytes":0}),
-            json!({"url":"http://example.org","max_bytes":MAX_BYTES+1}),
-            json!({"url":"http://example.org","timeout":0}),
-            json!({"url":"http://example.org","max_redirects":21}),
             json!({"url":"http://example.org","text":true,"save_to":"out"}),
             json!({"url":"http://example.org","text":true,"response_format":"base64"}),
             json!({"url":"http://example.org","overwrite":true}),
@@ -373,6 +303,14 @@ mod tests {
                 let input = json!({"url":"https://example.org", key: n});
                 let expected = n <= max && (n > 0 || key == "max_redirects");
                 assert_eq!(validator.is_valid(&input), expected, "schema {input}");
+                let admitted = deserialize_arguments::<FetchArgs>(input.as_object().unwrap());
+                match admitted {
+                    Ok(_) => assert!(expected, "{input}"),
+                    Err(error) => assert_eq!(
+                        (expected, error.diagnostic().context.subject),
+                        (false, Subject::argument([key]))
+                    ),
+                }
             }
         }
         for input in [

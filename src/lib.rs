@@ -21,7 +21,11 @@ pub mod target;
 pub mod tool;
 mod yaml;
 
-pub use {named_enum::UnknownName, newtype::Blank};
+pub use {
+    named_enum::UnknownName,
+    newtype::{Blank, Prose},
+    yaml::YamlError,
+};
 
 pub(crate) fn sha256_hex(bytes: impl AsRef<[u8]>) -> String {
     media::BlobDigest::of(bytes.as_ref()).to_string()
@@ -37,6 +41,7 @@ mod tests {
         execution::ExecutionLocation,
         identity::{AgentId, JobId},
         job::{JobLease, JobManager, JobWorker, stage},
+        provider::profile::ModelProfile,
         session::SessionStore,
         tool::{
             ToolContext, ToolRegistryBuilder,
@@ -45,6 +50,72 @@ mod tests {
             policy::{AllowAll, AuthorizationRequest, Policy, PolicyDecision, PolicyFuture},
         },
     };
+
+    /// Await `future`, failing the test at the caller if it stalls.
+    #[track_caller]
+    pub(crate) fn bounded<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
+        let caller = std::panic::Location::caller();
+        async move {
+            tokio::time::timeout(std::time::Duration::from_secs(20), future)
+                .await
+                .unwrap_or_else(|_| panic!("test synchronization timed out at {caller}"))
+        }
+    }
+
+    /// Drive `operation` until `reached` completes, then fire every timer due
+    /// within `limit` at once, so the deadline under test expires only after the
+    /// state it guards is reached, never racing real work. No other guard may be
+    /// pending meanwhile; the rest of `operation` is bounded. Current-thread only.
+    pub(crate) async fn expire<T, R>(
+        operation: impl Future<Output = T>,
+        reached: impl Future<Output = R>,
+        limit: std::time::Duration,
+    ) -> (T, R) {
+        let mut operation = std::pin::pin!(operation);
+        let reached = tokio::select! {
+            _ = &mut operation => panic!("finished before its deadline expired"),
+            reached = reached => reached,
+        };
+        tokio::time::pause();
+        tokio::time::advance(limit).await;
+        tokio::time::resume();
+        (bounded(operation).await, reached)
+    }
+
+    pub(crate) fn limit(tokens: u64) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(tokens).unwrap()
+    }
+
+    /// A profile with a 128k-token context and a 4k-token output limit.
+    pub(crate) fn profile(model: &str, supports_images: bool) -> ModelProfile {
+        ModelProfile::new(
+            model.parse().unwrap(),
+            None,
+            limit(128_000),
+            limit(4096),
+            supports_images,
+        )
+    }
+
+    /// A loopback port that refuses connections: bound, never listening. It stays
+    /// reserved while this lives, since a released port can be taken by a
+    /// concurrent test's server, which would then receive this test's requests.
+    /// On Unix a same-user process can still listen on it with `SO_REUSEPORT`.
+    pub(crate) struct RefusedPort(tokio::net::TcpSocket);
+
+    impl RefusedPort {
+        pub(crate) fn new() -> Self {
+            let socket = tokio::net::TcpSocket::new_v4().unwrap();
+            #[cfg(unix)]
+            socket.set_reuseport(true).unwrap();
+            socket.bind(([127, 0, 0, 1], 0).into()).unwrap();
+            Self(socket)
+        }
+
+        pub(crate) fn address(&self) -> std::net::SocketAddr {
+            self.0.local_addr().unwrap()
+        }
+    }
 
     /// A valid PNG image: the PNG signature followed by `tail`.
     pub(crate) fn png(tail: &[u8]) -> crate::media::Image {
@@ -156,5 +227,78 @@ mod tests {
             );
             (context, worker)
         }
+    }
+
+    /// A PNG, at `image.png` in an image runtime's workspace.
+    pub(crate) const IMAGE: &[u8] = b"\x89PNG\r\n\x1a\nattachment test";
+
+    /// An executor offering the filesystem, job-control and script tools, and
+    /// the slot through which its script tool reaches it.
+    pub(crate) fn tool_executor(
+        jobs: JobManager,
+        root: &std::path::Path,
+    ) -> (ToolExecutor, Arc<std::sync::OnceLock<ToolExecutor>>) {
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register_local(crate::tool::builtins::filesystem::register)
+            .unwrap();
+        crate::tool::builtins::jobs::register(&mut builder, jobs.clone()).unwrap();
+        let slot = Arc::new(std::sync::OnceLock::new());
+        crate::tool::builtins::install_script_tool(&mut builder, Arc::downgrade(&slot)).unwrap();
+        let executor = ToolExecutor::new(builder.build(), Arc::new(AllowAll), jobs, root.into());
+        assert!(slot.set(executor.clone()).is_ok());
+        (executor, slot)
+    }
+
+    /// A runtime whose workspace holds [`IMAGE`], with its [`tool_executor`].
+    pub(crate) async fn image_runtime() -> (
+        TestRuntime,
+        ToolExecutor,
+        Arc<std::sync::OnceLock<ToolExecutor>>,
+    ) {
+        let runtime = TestRuntime::new().await;
+        tokio::fs::write(runtime.root.path().join("image.png"), IMAGE)
+            .await
+            .unwrap();
+        let (executor, slot) = tool_executor(runtime.jobs.clone(), runtime.root.path());
+        (runtime, executor, slot)
+    }
+
+    /// Run `source` as a model's script call.
+    pub(crate) async fn script(
+        executor: &ToolExecutor,
+        agent: &AgentId,
+        source: String,
+        bg: bool,
+    ) -> crate::tool::executor::ExecutionResult {
+        let arguments = serde_json::json!({"source":source, "bg":bg});
+        executor
+            .run_model(agent, crate::tool::builtins::names::SCRIPT, arguments)
+            .await
+            .unwrap()
+    }
+
+    /// `images` is one PNG whose bytes a model request loads as [`IMAGE`].
+    pub(crate) async fn assert_loaded(store: &SessionStore, images: Vec<crate::media::ImageRef>) {
+        use crate::provider::protocol::{Message, ModelRequest, ToolResult};
+        assert_eq!(images.len(), 1);
+        assert_eq!(images[0].format, crate::media::ImageFormat::Png);
+        let blob = images[0].blob;
+        let mut request = ModelRequest {
+            history: vec![Message::Tool(vec![ToolResult {
+                call_id: "output".into(),
+                name: "jobs".into(),
+                result: serde_json::json!({}),
+                images,
+                is_error: false,
+            }])],
+            ..ModelRequest::test("image-test")
+        };
+        assert!(request.blobs.get(&blob).is_err());
+        store
+            .load_blobs(&mut request, &mut Default::default())
+            .await
+            .unwrap();
+        assert_eq!(request.blobs.get(&blob).unwrap(), IMAGE);
     }
 }

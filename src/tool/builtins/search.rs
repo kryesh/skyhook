@@ -1,6 +1,6 @@
 use crate::tool::ToolOptions;
 use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
-use crate::tool::invocation::{LocalCatalogBuilder, LocalError};
+use crate::tool::invocation::{LocalCatalogBuilder, LocalContext, LocalError};
 use crate::tool::output::ProducedOutput;
 use std::{
     collections::BTreeMap,
@@ -8,16 +8,18 @@ use std::{
 };
 
 use grep_matcher::Matcher as _;
-use grep_regex::RegexMatcherBuilder;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use ignore::{WalkBuilder, overrides::OverrideBuilder};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use super::workspace::relative_path;
+
+/// The longest line the searcher buffers.
+const MAX_LINE_BYTES: usize = 4 * 1024 * 1024;
 use crate::tool::output::{FinishedOutput, OutputWriter, PendingOutput};
 use crate::tool::{
-    PathKind, RegistryError,
+    PathArgument, PathKind, RegistryError,
     policy::{Capability, PathAccess},
 };
 
@@ -27,35 +29,16 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         "Search files with ripgrep regex, glob, and ignore semantics. Matches map file paths to arrays of \"line: text\" strings; details returns structured matches.",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
-            .default_path_argument("path", ".", PathAccess::Read, PathKind::Existing),
+            .argument_paths(|args: &mut SearchArgs| {
+                vec![PathArgument::new(&mut args.path, PathAccess::Read, PathKind::Existing)]
+            }),
         |context, args| async move {
-            let root = PathBuf::from(&args.path);
-            let capture = context
-                .pending_stream_capture(
-                    crate::tool::output::FieldPointer::result().property("matches"),
-                    crate::tool::output::CaptureKind::Json,
-                )
-                .await
-                .map_err(|error| {
-                    error.operation(
-                        Operation::CreateCapture,
-                        Subject::Label("search matches".into()),
-                    )
-                })?;
-            let workspace = context.execution_location().workspace.clone();
-            tokio::task::spawn_blocking(move || {
-                search_blocking(&workspace, &root, &args, capture, &context.cancellation_token())
+            let value = SearchOutput { matches: SearchMatches::Grouped(BTreeMap::new()) };
+            let value = serde_json::to_value(value)?;
+            run_walker(context, "search", "matches", value, move |workspace, capture, cancel| {
+                search_blocking(workspace, Path::new(&args.path), &args, capture, cancel)
             })
             .await
-            .map_err(|error| {
-                LocalError::failed(error)
-                    .operation(Operation::Wait, Subject::Label("search worker".into()))
-                    .effects(Effects::OutputIncomplete)
-            })?
-            .and_then(|capture| {
-                let output = SearchOutput { matches: SearchMatches::Grouped(BTreeMap::new()) };
-                Ok(ProducedOutput::new(serde_json::to_value(output)?).with_captures(vec![capture]))
-            })
         },
     )?;
     builder.register_product::<GlobArgs, GlobOutput, _, _>(
@@ -63,41 +46,65 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
         "Find files with ripgrep glob and ignore semantics.",
         ToolOptions::new(vec![Capability::Read])
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
-            .default_path_argument("path", ".", PathAccess::Read, PathKind::Existing),
+            .argument_paths(|args: &mut GlobArgs| {
+                vec![PathArgument::new(
+                    &mut args.path,
+                    PathAccess::Read,
+                    PathKind::Existing,
+                )]
+            }),
         |context, args| async move {
-            let root = PathBuf::from(&args.path);
-            let capture = context
-                .pending_stream_capture(
-                    crate::tool::output::FieldPointer::result().property("paths"),
-                    crate::tool::output::CaptureKind::Json,
-                )
-                .await
-                .map_err(|error| {
-                    error.operation(
-                        Operation::CreateCapture,
-                        Subject::Label("glob paths".into()),
-                    )
-                })?;
-            let workspace = context.execution_location().workspace.clone();
-            tokio::task::spawn_blocking(move || {
-                glob_blocking(
-                    &workspace,
-                    &root,
-                    &args,
-                    capture,
-                    &context.cancellation_token(),
-                )
-            })
+            let value = serde_json::json!({});
+            run_walker(
+                context,
+                "glob",
+                "paths",
+                value,
+                move |workspace, capture, cancel| {
+                    glob_blocking(workspace, Path::new(&args.path), &args, capture, cancel)
+                },
+            )
             .await
-            .map_err(|error| {
-                LocalError::failed(error)
-                    .operation(Operation::Wait, Subject::Label("glob worker".into()))
-                    .effects(Effects::OutputIncomplete)
-            })?
-            .map(|capture| ProducedOutput::new(serde_json::json!({})).with_captures(vec![capture]))
         },
     )?;
     Ok(())
+}
+
+/// Walk on a blocking thread, streaming the result's `field` into its capture.
+async fn run_walker(
+    context: LocalContext,
+    tool: &str,
+    field: &str,
+    value: serde_json::Value,
+    walk: impl FnOnce(
+        &Path,
+        PendingOutput,
+        &tokio_util::sync::CancellationToken,
+    ) -> Result<FinishedOutput, LocalError>
+    + Send
+    + 'static,
+) -> Result<ProducedOutput, LocalError> {
+    let capture = context
+        .pending_stream_capture(
+            crate::tool::output::FieldPointer::result().property(field),
+            crate::tool::output::CaptureKind::Json,
+        )
+        .await
+        .map_err(|error| {
+            let subject = Subject::Label(format!("{tool} {field}"));
+            error.operation(Operation::CreateCapture, subject)
+        })?;
+    let workspace = context.execution_location().workspace.clone();
+    let capture = tokio::task::spawn_blocking(move || {
+        walk(&workspace, capture, &context.cancellation_token())
+    })
+    .await
+    .map_err(|error| {
+        LocalError::failed(error)
+            .operation(Operation::Wait, Subject::Label(format!("{tool} worker")))
+            .effects(Effects::OutputIncomplete)
+    })??;
+    Ok(ProducedOutput::new(value).with_captures(vec![capture]))
 }
 
 fn walk_builder<'a>(
@@ -155,7 +162,7 @@ fn search_blocking(
     capture: PendingOutput,
     cancellation: &tokio_util::sync::CancellationToken,
 ) -> Result<FinishedOutput, LocalError> {
-    let mut matcher_builder = common_matcher();
+    let mut matcher_builder = crate::job::output::line_matcher();
     matcher_builder.fixed_strings(args.fixed).word(args.word);
     match args.case {
         Case::Smart => {
@@ -205,9 +212,14 @@ fn search_blocking(
     let mut searcher = SearcherBuilder::new()
         .line_number(true)
         .binary_detection(BinaryDetection::quit(b'\0'))
-        .heap_limit(Some(4 * 1024 * 1024))
+        .heap_limit(Some(MAX_LINE_BYTES))
         .build();
-    let mut matches = CapturedOutput::new(capture, !args.details)
+    let layout = if args.details {
+        Layout::List { count: 0 }
+    } else {
+        Layout::Grouped { open: None }
+    };
+    let mut matches = CapturedOutput::new(capture, layout)
         .map_err(|error| capture_error(error, Operation::WriteCapture))?;
     for path in files {
         if cancellation.is_cancelled() {
@@ -261,7 +273,7 @@ fn glob_blocking(
         args.no_ignore,
         std::iter::once((args.pattern.as_str(), Subject::argument(["pattern"]))),
     )?;
-    let mut paths = CapturedOutput::new(capture, false)
+    let mut paths = CapturedOutput::new(capture, Layout::List { count: 0 })
         .map_err(|error| capture_error(error, Operation::WriteCapture))?;
     for entry in walk.build() {
         if cancellation.is_cancelled() {
@@ -271,8 +283,9 @@ fn glob_blocking(
         }
         let entry = entry.map_err(|error| walk_error(error, root))?;
         if entry.depth() != 0 && entry.file_type().is_some_and(|kind| kind.is_file()) {
+            let path = relative_path(workspace, entry.path());
             paths
-                .push(relative_path(workspace, entry.path()))
+                .push(&path, &path)
                 .map_err(|error| capture_error(error, Operation::WriteCapture))?;
         }
     }
@@ -314,74 +327,88 @@ fn capture_error(error: std::io::Error, operation: Operation) -> LocalError {
 /// completed ownership evidence; the finalizer publishes the captured field.
 struct CapturedOutput {
     file: OutputWriter,
-    count: usize,
-    grouped: bool,
-    group: Option<String>,
+    layout: Layout,
 }
+
+/// How pushed values are arranged in the captured JSON.
+#[derive(Clone)]
+enum Layout {
+    /// An array of `count` values so far.
+    List { count: usize },
+    /// An object mapping each path to the values found in it; `open` is the
+    /// path whose array is still being written.
+    Grouped { open: Option<String> },
+}
+
+/// Where a rollback returns the capture to.
+struct Checkpoint {
+    position: u64,
+    layout: Layout,
+}
+
 impl CapturedOutput {
-    fn new(capture: PendingOutput, grouped: bool) -> std::io::Result<Self> {
+    fn new(capture: PendingOutput, layout: Layout) -> std::io::Result<Self> {
         use std::io::Write as _;
         let mut file = capture.open();
-        file.write_all(if grouped { b"{\n" } else { b"[\n" })?;
-        Ok(Self {
-            file,
-            count: 0,
-            grouped,
-            group: None,
-        })
+        file.write_all(match layout {
+            Layout::List { .. } => b"[\n",
+            Layout::Grouped { .. } => b"{\n",
+        })?;
+        Ok(Self { file, layout })
     }
-    fn push(&mut self, value: impl Serialize) -> std::io::Result<()> {
+    /// Append `value`, found in `path`: to the list, or to `path`'s group.
+    fn push(&mut self, path: &str, value: impl Serialize) -> std::io::Result<()> {
         use std::io::Write as _;
-        if self.count > 0 {
-            self.file.write_all(b",\n")?;
+        match &mut self.layout {
+            Layout::List { count } => {
+                if *count > 0 {
+                    self.file.write_all(b",\n")?;
+                }
+                *count += 1;
+            }
+            Layout::Grouped { open } if open.as_deref() == Some(path) => {
+                self.file.write_all(b",\n")?;
+            }
+            Layout::Grouped { open } => {
+                if open.is_some() {
+                    self.file.write_all(b"\n],\n")?;
+                }
+                serde_json::to_writer(&mut self.file, path)?;
+                self.file.write_all(b": [\n")?;
+                *open = Some(path.to_owned());
+            }
         }
         serde_json::to_writer(&mut self.file, &value)?;
-        self.count += 1;
         Ok(())
     }
-    fn checkpoint(&mut self) -> std::io::Result<(usize, u64, Option<String>)> {
+    fn checkpoint(&mut self) -> std::io::Result<Checkpoint> {
         use std::io::Seek as _;
-        Ok((self.count, self.file.stream_position()?, self.group.clone()))
+        Ok(Checkpoint {
+            position: self.file.stream_position()?,
+            layout: self.layout.clone(),
+        })
     }
-    fn rollback(&mut self, checkpoint: (usize, u64, Option<String>)) -> std::io::Result<()> {
+    fn rollback(&mut self, checkpoint: Checkpoint) -> std::io::Result<()> {
         use std::io::{Seek as _, Write as _};
-        self.count = checkpoint.0;
-        self.group = checkpoint.2;
+        self.layout = checkpoint.layout;
         self.file.flush()?;
-        self.file.truncate(checkpoint.1)?;
-        self.file.seek(std::io::SeekFrom::Start(checkpoint.1))?;
+        self.file.truncate(checkpoint.position)?;
+        self.file
+            .seek(std::io::SeekFrom::Start(checkpoint.position))?;
         Ok(())
     }
     fn finish(mut self) -> std::io::Result<FinishedOutput> {
         use std::io::Write as _;
-        if self.grouped {
-            if self.group.is_some() {
-                self.file.write_all(b"\n]")?;
+        match self.layout {
+            Layout::List { .. } => self.file.write_all(b"\n]")?,
+            Layout::Grouped { open } => {
+                if open.is_some() {
+                    self.file.write_all(b"\n]")?;
+                }
+                self.file.write_all(b"\n}")?;
             }
-            self.file.write_all(b"\n}")?;
-        } else {
-            self.file.write_all(b"\n]")?;
         }
         self.file.finish()
-    }
-    fn push_match(&mut self, value: SearchMatch) -> std::io::Result<()> {
-        use std::io::Write as _;
-        if !self.grouped {
-            return self.push(value);
-        }
-        if self.group.as_deref() == Some(&value.path) {
-            self.file.write_all(b",\n")?;
-        } else {
-            if self.group.is_some() {
-                self.file.write_all(b"\n],\n")?;
-            }
-            serde_json::to_writer(&mut self.file, &value.path)?;
-            self.file.write_all(b": [\n")?;
-            self.group = Some(value.path);
-        }
-        serde_json::to_writer(&mut self.file, &format!("{}: {}", value.line, value.text))?;
-        self.count += 1;
-        Ok(())
     }
 }
 
@@ -441,22 +468,27 @@ impl Sink for SearchSink<'_> {
             return Err(SearchStop::Cancelled);
         }
         let bytes = matched.bytes();
-        let first = self
-            .matcher
-            .find(bytes)
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-        if let Some(first) = first {
-            self.matches
-                .push_match(SearchMatch {
+        let line = matched.line_number().unwrap_or(1);
+        let text = String::from_utf8_lossy(bytes);
+        let text = text.trim_end_matches(['\r', '\n']);
+        let pushed = match self.matches.layout {
+            Layout::Grouped { .. } => {
+                (self.matches).push(&self.path, format_args!("{line}: {text}"))
+            }
+            Layout::List { .. } => {
+                let first = (self.matcher.find(bytes))
+                    .map_err(|error| std::io::Error::other(error.to_string()))?;
+                let Some(first) = first else { return Ok(true) };
+                let found = SearchMatch {
                     path: self.path.clone(),
-                    line: matched.line_number().unwrap_or(1),
+                    line,
                     column: first.start() + 1,
-                    text: String::from_utf8_lossy(bytes)
-                        .trim_end_matches(['\r', '\n'])
-                        .to_owned(),
-                })
-                .map_err(SearchStop::Capture)?;
-        }
+                    text: text.to_owned(),
+                };
+                self.matches.push(&self.path, found)
+            }
+        };
+        pushed.map_err(SearchStop::Capture)?;
         Ok(true)
     }
     fn binary_data(&mut self, _searcher: &Searcher, _offset: u64) -> Result<bool, Self::Error> {
@@ -553,27 +585,6 @@ struct GlobOutput {
     paths: Vec<String>,
 }
 
-fn common_matcher() -> RegexMatcherBuilder {
-    let mut builder = RegexMatcherBuilder::new();
-    builder
-        .line_terminator(Some(b'\n'))
-        .ban_byte(Some(b'\0'))
-        .size_limit(10 * 1024 * 1024)
-        .dfa_size_limit(10 * 1024 * 1024);
-    builder
-}
-
-pub(crate) fn output_matcher(
-    pattern: &str,
-) -> Result<grep_regex::RegexMatcher, crate::tool::invocation::AdmissionError> {
-    common_matcher().build(pattern).map_err(|_| {
-        crate::tool::invocation::AdmissionError::invalid_arguments(
-            "regular expression could not be compiled",
-        )
-        .operation(Operation::Validate, Subject::argument(["pattern"]))
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -612,11 +623,8 @@ mod tests {
         }
 
         fn settle(&self) -> std::io::Result<()> {
-            self.runtime.block_on(async {
-                tokio::time::timeout(std::time::Duration::from_secs(10), self.output.settle())
-                    .await
-                    .expect("capture settlement timed out")
-            })
+            self.runtime
+                .block_on(crate::tests::bounded(self.output.settle()))
         }
 
         fn pending(&self) -> PendingOutput {
@@ -723,7 +731,6 @@ mod tests {
                 .unwrap_err(),
                 "/pattern",
             ),
-            (output_matcher(invalid).unwrap_err().into(), "/pattern"),
         ] {
             let diagnostic = error.diagnostic();
             assert!(matches!(diagnostic.cause, Cause::InvalidArguments(_)));
@@ -868,7 +875,7 @@ mod tests {
             .unwrap();
         let lines = page["presentation"]["preview"]["lines"].as_array().unwrap();
         assert_eq!(lines.len(), 1);
-        assert!(lines[0].as_str().unwrap().contains("500: needle λ"));
+        assert!(lines[0]["text"].as_str().unwrap().contains("500: needle λ"));
     }
 
     #[test]

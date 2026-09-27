@@ -1,12 +1,12 @@
 //! Summarizer response assembly and cancellation-safe usage accounting.
 
 use super::{HarnessError, SessionRuntime, TurnContext, compaction};
+use crate::agent::CompactionError;
 use crate::provider::{
-    ProviderContext, ProviderError,
-    protocol::{LiveResponse, ModelRequest, Outcome, ResponseEvent, Step as LiveStep, Usage},
+    ProviderContext,
+    protocol::{Completion, CutReason, ModelRequest, Outcome, Usage, visible_text},
 };
-use crate::session::RequestSeq;
-use futures_util::StreamExt;
+use crate::session::{AttemptRef, RequestSeq, SessionEvent};
 
 impl SessionRuntime {
     pub(super) async fn summarize(
@@ -23,130 +23,117 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             *model_attempt = model_attempt.saturating_add(1);
-            let attempt = crate::session::AttemptRef {
+            let attempt = AttemptRef {
                 request: request_sequence,
                 attempt: *model_attempt,
             };
-            self.store
-                .append(
-                    turn.agent.clone(),
-                    crate::session::SessionEvent::ModelAttemptStarted(attempt),
-                )
-                .await?;
-            match self
-                .summarize_attempt(turn, provider, request.clone(), request_sequence)
-                .await
-            {
+            let started = SessionEvent::ModelAttemptStarted(attempt);
+            self.store.append(turn.agent.clone(), started).await?;
+            let stream = provider.invoke(request.clone());
+            match self.consume_stream(turn, attempt, stream, |_| {}).await? {
+                Ok((completion, usage)) => {
+                    self.record_model_usage(turn.agent, request_sequence, usage)
+                        .await?;
+                    return Ok((continuation(&completion)?, usage));
+                }
                 // The summary request stays frozen too, and transient failures do not
                 // consume the separate validation budget in `compact_history`.
-                Err(HarnessError::Provider(error)) => {
-                    let recovered = self
-                        .recover_model_failure(
-                            turn,
-                            (attempt, &mut transient_attempt),
-                            Usage::default(),
-                            error,
-                        )
-                        .await?;
-                    if let Some(error) = recovered {
+                Err((error, usage)) => {
+                    let attempt = (attempt, &mut transient_attempt);
+                    let recovered = self.recover_model_failure(turn, attempt, usage, error);
+                    if let Some(error) = recovered.await? {
                         return Err(error.into());
                     }
                 }
-                result => return result,
             }
         }
     }
+}
 
-    async fn summarize_attempt(
-        &self,
-        turn: &TurnContext<'_>,
-        provider: &mut dyn ProviderContext,
-        request: ModelRequest,
-        request_sequence: RequestSeq,
-    ) -> Result<(compaction::Continuation, Usage), HarnessError> {
-        let agent = turn.agent;
-        let mut stream = provider.invoke(request);
-        let mut live = LiveResponse::default();
-        let (completion, usage) = loop {
-            let event = tokio::select! {
-                event = stream.next() => event,
-                () = turn.cancellation.cancelled() => {
-                    self.record_model_usage(agent, request_sequence, live.usage()).await?;
-                    return Err(HarnessError::Interrupted);
-                },
-            };
-            let checked = |event: ResponseEvent| event.checked().map_err(ProviderError::from);
-            let event = match event.map(|event| event.and_then(checked)) {
-                Some(Ok(event)) => event,
-                Some(Err(error)) => {
-                    if live.usage() != Usage::default() {
-                        self.record_model_usage(agent, request_sequence, live.usage())
-                            .await?;
-                    }
-                    return Err(error.into());
-                }
-                None => {
-                    return Err(ProviderError::protocol("stream ended without completion").into());
-                }
-            };
-            match live.push(event) {
-                LiveStep::Open(open) => live = open,
-                LiveStep::Ended {
-                    completion, usage, ..
-                } => break (completion, usage),
-            }
-        };
-
-        self.record_model_usage(agent, request_sequence, usage)
-            .await?;
-        match completion.outcome() {
-            Outcome::Answer => {}
-            Outcome::Cut(_) => {
-                return Err(HarnessError::Compaction(
-                    "summarization was truncated; original history is retained".into(),
-                ));
-            }
-            Outcome::ToolUse => {
-                return Err(HarnessError::Compaction(
-                    "summarizer returned a tool call; no tools were executed".into(),
-                ));
-            }
+/// Only a cut-off summary is a truncated one, which a fresh summary may complete. A
+/// refusal is deterministic for the request and an abort is the provider's own
+/// failure: both fail the round as what they are.
+fn continuation(completion: &Completion) -> Result<compaction::Continuation, HarnessError> {
+    let text = visible_text(completion.items());
+    match completion.outcome() {
+        Outcome::Answer => {}
+        Outcome::Cut(CutReason::Refusal) => {
+            return Err(HarnessError::Refused(super::super::turn::refusal_detail(
+                &text,
+            )));
         }
-        let text = crate::provider::protocol::visible_text(completion.items());
-        let continuation = compaction::continuation(&text).map_err(HarnessError::Compaction)?;
-        Ok((continuation, usage))
+        Outcome::Cut(CutReason::Aborted) => return Err(HarnessError::ProviderAborted),
+        Outcome::Cut(CutReason::MaxTokens | CutReason::Incomplete) => {
+            return Err(CompactionError::Truncated.into());
+        }
+        Outcome::ToolUse => return Err(CompactionError::ToolCall.into()),
     }
+    Ok(compaction::continuation(&text)?)
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
+    use crate::agent::runtime::tests::{journaled_usage, next_recovery};
     use crate::{
         agent::runtime::HarnessError,
-        session::{Message, SessionEvent},
+        session::{Message, RequestPhase, SessionEvent},
     };
-    use std::{sync::atomic::Ordering, time::Duration};
     use tokio_util::sync::CancellationToken;
+
+    /// A cut-off summary is retried as truncated; a refused or aborted one fails the
+    /// round at once, diagnosed as what it was.
+    #[tokio::test(start_paused = true)]
+    async fn only_a_cut_off_summary_is_retried_as_truncated() {
+        use crate::agent::{CompactionFault, FailureKind};
+        use crate::provider::protocol::{AssistantItem, CutReason};
+        let cases = [
+            (CutReason::MaxTokens, 3, CompactionFault::Truncated),
+            (CutReason::Incomplete, 3, CompactionFault::Truncated),
+            (
+                CutReason::Refusal,
+                1,
+                CompactionFault::Summary(FailureKind::Refused),
+            ),
+            (
+                CutReason::Aborted,
+                1,
+                CompactionFault::Summary(FailureKind::Aborted),
+            ),
+        ];
+        for (reason, attempts, fault) in cases {
+            let partial = || vec![AssistantItem::text("text/0", 0, "partial")];
+            let steps = (0..3).map(|_| Step::new(cut(partial(), reason)));
+            let fixture = Fixture::new(steps).await;
+            fixture.add_history(20_000).await;
+            let error = fixture.compact(&CancellationToken::new()).await;
+            assert_eq!(CompactionFault::from(&error.unwrap_err()), fault);
+            assert_eq!(fixture.requests().len() - 1, attempts, "{reason:?}");
+            let records = fixture.records().await;
+            let faults =
+                events!(&records, SessionEvent::CompactionFailed { error, .. } => error.clone());
+            assert_eq!(faults, vec![fault; attempts]);
+            fixture.session.shutdown().await.unwrap();
+        }
+    }
 
     #[tokio::test(start_paused = true)]
     async fn summarizer_retries_frozen_requests_until_success() {
         for streaming in [false, true] {
             let failures = 4;
-            let fixture = Fixture::new().await;
-            fixture.add_history(20_000).await;
-            let before = fixture.provider.requests.lock().unwrap().len();
-            let counter = if streaming {
-                &fixture.provider.summary_stream_failures
-            } else {
-                &fixture.provider.summary_immediate_failures
+            let failure = || match streaming {
+                true => failing_stream(None),
+                false => Step::fail(recoverable()),
             };
-            counter.store(failures, Ordering::SeqCst);
+            let steps = (0..failures).map(|_| failure());
+            let fixture = Fixture::new(steps.chain([Step::new(summary(summary_json()))])).await;
+            fixture.add_history(20_000).await;
             fixture.compact(&CancellationToken::new()).await.unwrap();
-            let requests = fixture.provider.requests.lock().unwrap().clone();
-            let summaries = &requests[before..];
+            let requests = fixture.requests();
+            let summaries = &requests[1..];
             assert_eq!(summaries.len(), failures + 1);
             assert!(summaries.windows(2).all(|pair| pair[0] == pair[1]));
-            assert_eq!(counter.load(Ordering::SeqCst), 0);
+            assert_eq!(fixture.script.remaining(), 0);
             let records = fixture.records().await;
             assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
             let retries = count!(&records, SessionEvent::ModelRecoveryScheduled { .. });
@@ -158,37 +145,36 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn transient_retries_do_not_consume_the_three_validation_attempts() {
-        let fixture = Fixture::new().await;
+        let failures = (0..4).map(|_| Step::fail(recoverable()));
+        let invalid = (0..3).map(|_| Step::new(summary("not a valid continuation")));
+        let fixture = Fixture::new(failures.chain(invalid)).await;
         fixture.add_history(20_000).await;
-        let before = fixture.provider.requests.lock().unwrap().len();
-        let failures = &fixture.provider.summary_immediate_failures;
-        failures.store(4, Ordering::SeqCst);
-        *fixture.provider.summary.lock().unwrap() = "not a valid continuation".into();
         assert!(fixture.compact(&CancellationToken::new()).await.is_err());
-        assert_eq!(fixture.provider.requests.lock().unwrap().len() - before, 7);
+        assert_eq!(fixture.requests().len() - 1, 7);
         fixture.assert_no_tool_execution().await;
         fixture.session.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
     async fn observed_usage_is_counted_once_for_each_failed_agent_and_summary_attempt() {
-        let fixture = Fixture::new().await;
         let observed = usage(11, 7, 3);
-        *fixture.provider.observed_failure_usage.lock().unwrap() = Some(observed);
-        let provider = &fixture.provider;
-        provider.agent_stream_failures.store(4, Ordering::SeqCst);
+        let failures = || (0..4).map(|_| failing_stream(Some(observed)));
+        let steps = failures()
+            .chain([Step::new(answer("done"))])
+            .chain(failures())
+            .chain([Step::new(summary(summary_json()))]);
+        let fixture = Fixture::new(steps).await;
         assert!(fixture.session.prompt("Preserve usage.").await.is_ok());
-        assert_eq!(fixture.session.usage().await, usage(44, 28, 12));
+        assert_eq!(journaled_usage(&fixture.session).await, usage(44, 28, 12));
         fixture.add_history(20_000).await;
-        let before = fixture.session.usage().await;
-        provider.summary_stream_failures.store(4, Ordering::SeqCst);
+        let before = journaled_usage(&fixture.session).await;
         assert!(fixture.compact(&CancellationToken::new()).await.is_ok());
         let expected = usage(
             before.input_tokens + 44,
             before.cached_input_tokens + 28,
             before.output_tokens + 12,
         );
-        assert_eq!(fixture.session.usage().await, expected);
+        assert_eq!(journaled_usage(&fixture.session).await, expected);
         let records = fixture.records().await;
         assert_eq!(count!(&records, SessionEvent::ModelFailed { .. }), 8);
         let observed_usage =
@@ -200,34 +186,49 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cancellation_after_four_summary_failures_preserves_history() {
-        let fixture = Fixture::new().await;
+        let fixture = Fixture::new((0..5).map(|_| failing_stream(None))).await;
         fixture.add_history(20_000).await;
-        let failures = &fixture.provider.summary_stream_failures;
-        failures.store(5, Ordering::SeqCst);
         let root = &fixture.session.root;
         let before = crate::session::project_history(&fixture.records().await, root);
         let cancellation = CancellationToken::new();
         let mut events = fixture.session.runtime.events.observe().updates;
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(60), async {
+        let (result, ()) = bounded(async {
             tokio::join!(fixture.compact(&cancellation), async {
                 for _ in 0..4 {
-                    while !matches!(events.recv().await.unwrap().event,
-                        crate::agent::runtime::RuntimeEvent::Record(record)
-                            if matches!(record.event, SessionEvent::ModelRecoveryScheduled { .. }))
-                    {
-                    }
+                    next_recovery(&mut events).await;
                 }
                 cancellation.cancel();
             })
         })
-        .await
-        .unwrap();
+        .await;
         assert!(matches!(result, Err(HarnessError::Interrupted)));
-        assert_eq!(failures.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.script.remaining(), 1);
         let records = fixture.records().await;
         let found = crate::session::project_history(&records, root);
         assert_eq!(found, before);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
+        // The interruption settles the summary request, whether during a retry's
+        // backoff or before its first attempt.
+        let summary_phase = async || {
+            let ledger = fixture.session.observe().await.snapshot.ledger;
+            let summary = ledger.latest(root).and_then(|request| ledger.get(request));
+            summary.unwrap().phase.clone()
+        };
+        let phase = summary_phase().await;
+        assert!(matches!(
+            phase,
+            RequestPhase::Interrupted {
+                attempt: Some(4),
+                ..
+            }
+        ));
+        let result = fixture.compact(&cancellation).await;
+        assert!(matches!(result, Err(HarnessError::Interrupted)));
+        let phase = summary_phase().await;
+        assert!(matches!(
+            phase,
+            RequestPhase::Interrupted { attempt: None, .. }
+        ));
         fixture.assert_no_tool_execution().await;
         fixture.session.shutdown().await.unwrap();
     }
@@ -235,33 +236,27 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cancellation_journals_observed_usage_once_without_committing_or_executing_tools() {
         for summary in [false, true] {
-            let fixture = Fixture::new().await;
             let observed = usage(11, 7, 3);
-            *fixture.provider.observed_failure_usage.lock().unwrap() = Some(observed);
-            let pause = &fixture.provider.pause_stream_after_usage;
-            pause.store(true, Ordering::SeqCst);
-            let started = fixture.provider.started.notified();
+            let fixture = Fixture::new([held_after(observed)]).await;
             if summary {
                 fixture.add_history(20_000).await;
                 let cancellation = CancellationToken::new();
-                let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                let (result, ()) = bounded(async {
                     tokio::join!(fixture.compact(&cancellation), async {
-                        started.await;
+                        fixture.script.held(1).await;
                         cancellation.cancel();
                     })
                 })
-                .await
-                .unwrap();
+                .await;
                 assert!(matches!(result, Err(HarnessError::Interrupted)));
             } else {
-                let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+                let (result, ()) = bounded(async {
                     tokio::join!(fixture.session.prompt("Interrupt this turn."), async {
-                        started.await;
+                        fixture.script.held(1).await;
                         fixture.session.interrupt().await;
                     })
                 })
-                .await
-                .unwrap();
+                .await;
                 assert!(result.is_err());
             }
             let records = fixture.records().await;
@@ -271,7 +266,17 @@ mod tests {
             let requested = requested.unwrap().sequence.request();
             let observed_events = events!(&records, SessionEvent::Usage { request, usage } if *request == requested => *usage);
             assert_eq!(observed_events, vec![observed]);
-            assert_eq!(fixture.session.usage().await, observed);
+            let ledger = fixture.session.observe().await.snapshot.ledger;
+            let phase = &ledger.get(requested).unwrap().phase;
+            let at = phase.settled_at().unwrap();
+            assert_eq!(
+                *phase,
+                RequestPhase::Interrupted {
+                    attempt: Some(1),
+                    at
+                }
+            );
+            assert_eq!(journaled_usage(&fixture.session).await, observed);
             let committed = count!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(items) }
                 if items.iter().any(|item| item.id().as_str() == "interrupted-tool"));
             assert_eq!(committed, 0);

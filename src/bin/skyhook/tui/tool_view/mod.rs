@@ -1,16 +1,15 @@
 //! Presentation-only tool documents. Nothing here writes to session or tool state.
 mod document;
 mod highlighting;
-mod output;
-mod preview;
+mod hints;
 
-pub use output::OutputView;
+pub use hints::{Hints, starts_child};
 
 use super::{format::Clean, theme::THEME};
 use highlighting::CodeKey;
 pub use highlighting::{CodeSource, HighlightCache};
 use ratatui::{
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
 };
 
@@ -36,8 +35,8 @@ pub enum Role {
     Added,
 }
 impl Role {
-    fn style(self) -> Style {
-        let color = match self {
+    pub fn color(self) -> Color {
+        match self {
             Self::Plain | Self::ToolName => THEME.fg,
             Self::Indicator => THEME.primary,
             Self::Target => THEME.accent,
@@ -51,8 +50,11 @@ impl Role {
             Self::Constant => THEME.primary,
             Self::Muted => THEME.muted,
             Self::Removed => THEME.error,
-        };
-        let style = Style::default().fg(color);
+        }
+    }
+
+    fn style(self) -> Style {
+        let style = Style::default().fg(self.color());
         if matches!(self, Self::Heading | Self::Label | Self::ToolName) {
             style.add_modifier(Modifier::BOLD)
         } else {
@@ -202,8 +204,14 @@ impl Document {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+    use serde_json::Value;
+    use skyhook::job::JobView;
+
+    pub(crate) fn view(fields: Value) -> JobView {
+        serde_json::from_value(fields).unwrap()
+    }
 
     pub(super) fn text(lines: &[Line<'_>]) -> String {
         lines

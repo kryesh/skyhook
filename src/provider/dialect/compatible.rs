@@ -3,34 +3,21 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{
-    BuildError, Common, Connection, Dialect, DialectConfig, DialectError, Overrides, Pending,
-    Profile, Scheme, key,
-};
-use crate::provider::{
-    codec::CodecName,
-    http::{Headers, Transport},
-};
-
-pub use super::OverrideError as Error;
+use super::{Common, Dialect, DialectConfig, DialectError, Overrides, Profile, Scheme};
+use crate::provider::{codec::CodecName, http::Transport};
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(transparent)]
 pub struct Config(pub Overrides);
 
 impl DialectConfig for Config {
-    fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
-        let codec = self.0.apply(super::base(codec))?;
-        Ok(Profile::new(codec, Transport::plain(), Dialect::Compatible))
-    }
-
     /// A key travels as the codec's own.
-    fn credentials(
-        &self,
-        profile: &Profile,
-        connection: &Connection,
-    ) -> Result<Headers<Pending>, BuildError> {
-        Ok(key(connection, Scheme::standard(profile.codec.name())))
+    fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
+        let conventions = self.0.apply(super::base(codec))?;
+        Ok(Profile {
+            key: Scheme::standard(codec),
+            ..Profile::new(conventions, Transport::plain(), Dialect::Compatible)
+        })
     }
 }
 

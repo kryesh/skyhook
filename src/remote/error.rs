@@ -1,7 +1,7 @@
 //! Remote transport and authorization errors, with tool-facing conversion.
 use crate::{
     remote::{ArtifactError, Platform, ShimProtocol},
-    target::TargetError,
+    target::{TargetError, TargetName, TargetRef},
     tool::{
         AdmissionError, ToolError, ToolOutput,
         authorization::AuthorizationError,
@@ -25,8 +25,13 @@ pub(crate) enum RemoteError {
     Authorization(AuthorizationError),
     #[error("target connection was cancelled")]
     Cancelled,
-    #[error("remote connection startup task failed: {0}")]
-    ConnectionTask(String),
+    /// Display carries the join error because tool-facing conversion keeps only the message.
+    #[error("{task} task failed: {source}")]
+    TaskFailed {
+        task: &'static str,
+        #[source]
+        source: Arc<tokio::task::JoinError>,
+    },
     #[error("SSH failed: {0}")]
     Ssh(#[from] SshError),
     #[error("remote shim deployment failed: {0}")]
@@ -38,8 +43,6 @@ pub(crate) enum RemoteError {
         diagnostic: Box<PartialDiagnostic>,
         output: Option<Box<ToolOutput>>,
     },
-    #[error("target route is empty")]
-    EmptyRoute,
     #[error("{source}")]
     Io { source: Arc<io::Error> },
 }
@@ -58,6 +61,8 @@ pub(crate) enum DeploymentError {
         protocol: ShimProtocol,
         platform: Platform,
     },
+    #[error("embedded shim `{name}` could not be read")]
+    Unreadable { name: Box<str> },
     #[error("shim installation failed")]
     Install,
     #[error("upload name generation failed: {0}")]
@@ -70,11 +75,18 @@ pub(crate) enum SshError {
     #[error(
         "target `{target}` uses external_agent, but SSH_AUTH_SOCK is not set where its SSH connection starts"
     )]
-    ExternalAgentUnavailable { target: String },
+    ExternalAgentUnavailable { target: TargetName },
     #[error("SSH values cannot be empty or contain control characters")]
     InvalidValue,
-    #[error("{0}")]
-    Stream(String),
+    #[error("SSH exited with {status}: {stderr}")]
+    Exited {
+        status: std::process::ExitStatus,
+        stderr: String,
+    },
+    #[error("managed ssh-agent startup timed out")]
+    AgentTimeout,
+    #[error("native path cannot be represented losslessly over SSH")]
+    UnrepresentablePath,
 }
 
 /// The peer broke the frame contract; the connection is unusable.
@@ -83,9 +95,9 @@ pub(crate) enum ProtocolError {
     #[error("{0}")]
     Violation(&'static str),
     #[error("remote scoped permission used unexpected execution target `{0}`")]
-    UnexpectedPermissionTarget(String),
+    UnexpectedPermissionTarget(TargetRef),
     #[error("remote result could not be decoded: {0}")]
-    Decode(String),
+    Decode(#[source] Arc<serde_json::Error>),
 }
 
 impl RemoteError {
@@ -102,6 +114,13 @@ impl RemoteError {
     pub(crate) fn start(error: io::Error) -> Self {
         Self::Start {
             source: Arc::new(error),
+        }
+    }
+
+    pub(crate) fn task_failed(task: &'static str, source: tokio::task::JoinError) -> Self {
+        Self::TaskFailed {
+            task,
+            source: Arc::new(source),
         }
     }
 
@@ -128,17 +147,17 @@ impl RemoteError {
             Self::Ssh(error) => {
                 ToolError::failed(error).operation(Operation::Connect, Subject::Label("ssh".into()))
             }
-            error @ (Self::Artifact(_)
-            | Self::ConnectionTask(_)
-            | Self::Protocol(_)
-            | Self::EmptyRoute) => ToolError::failed(error),
+            error @ (Self::Artifact(_) | Self::TaskFailed { .. } | Self::Protocol(_)) => {
+                ToolError::failed(error)
+            }
         }
     }
 }
 
+/// A transport stream reports its producer's failure as its read error.
 impl From<io::Error> for RemoteError {
     fn from(error: io::Error) -> Self {
-        Self::io(error)
+        error.downcast().unwrap_or_else(Self::io)
     }
 }
 

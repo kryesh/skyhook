@@ -15,7 +15,7 @@ use tokio::{
 };
 
 use super::{CancellationToken, JobError, JobId, JobManager, JobOutcome, JobTransition};
-use crate::tool::{ToolError, ToolOutput};
+use crate::tool::ToolError;
 
 /// The stages a job lease passes through before its worker starts.
 pub mod stage {
@@ -86,8 +86,7 @@ impl<S> JobLease<S> {
             };
             tokio::select! {
                 () = cancellation.cancelled() => {
-                    let cancelled = ToolError::cancelled().into();
-                    crate::tool::executor::persist_completion(&jobs, id, cancelled).await;
+                    jobs.settle(id, ToolError::cancelled().into()).await;
                 }
                 () = finished => {}
             }
@@ -172,7 +171,7 @@ impl JobWorker {
 
     pub(crate) async fn start_supervised<F>(self, future: F) -> Result<(), JobError>
     where
-        F: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
+        F: Future<Output: Into<JobOutcome> + Send> + Send + 'static,
     {
         self.start(future, "tool handler panicked").await
     }
@@ -183,7 +182,7 @@ impl JobWorker {
         panic_message: &'static str,
     ) -> Result<(), JobError>
     where
-        F: Future<Output = Result<ToolOutput, ToolError>> + Send + 'static,
+        F: Future<Output: Into<JobOutcome> + Send> + Send + 'static,
     {
         let worker = WorkerGuard(tokio::spawn(future));
         self.owned()
@@ -195,8 +194,7 @@ impl JobWorker {
         // No suspension point between relinquishing the permit and supervising.
         spawn_completion(jobs, id, async move {
             match worker.join().await {
-                Ok(Ok(output)) => JobOutcome::Completed(output),
-                Ok(Err(error)) => error.into(),
+                Ok(outcome) => outcome.into(),
                 Err(error) if error.is_cancelled() => ToolError::cancelled().into(),
                 Err(_) => ToolError::failed(panic_message).into(),
             }
@@ -226,8 +224,7 @@ fn spawn_completion(
 ) -> JoinHandle<()> {
     let active = jobs.inner.supervision.enter();
     tokio::spawn(async move {
-        let outcome = outcome.await;
-        crate::tool::executor::persist_completion(&jobs, id, outcome).await;
+        jobs.settle(id, outcome.await).await;
         drop(jobs);
         drop(active);
     })
@@ -301,9 +298,8 @@ mod tests {
     use super::*;
     use crate::{
         job::{JobError, JobId, JobManager, JobSpec, JobState},
-        tool::policy::CapabilitySet,
+        tool::{ToolOutput, policy::CapabilitySet},
     };
-    use std::time::Duration;
     use tokio::sync::oneshot;
 
     struct Stopped(Option<oneshot::Sender<()>>);
@@ -341,10 +337,7 @@ mod tests {
             .await;
         assert!(matches!(attached, Err(JobError::Unknown(_))));
         drop(worker);
-        tokio::time::timeout(Duration::from_secs(1), stopping)
-            .await
-            .unwrap()
-            .unwrap();
+        crate::tests::bounded(stopping).await.unwrap();
     }
 
     /// Every startup obligation is consumed exactly once: abandonment at any
@@ -375,7 +368,7 @@ mod tests {
                 "panic" => {
                     let (_input, worker) = lease.test_run().await.split();
                     worker
-                        .start_supervised(async { panic!("handler panic") })
+                        .start_supervised(async { panic!("handler panic") as JobOutcome })
                         .await
                         .unwrap();
                 }
@@ -421,13 +414,11 @@ mod tests {
             Ok(ToolOutput::new(serde_json::json!({"done": true})))
         };
         worker.start_supervised(work).await.unwrap();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(10), jobs.drain_supervisors())
-                .await
-                .is_err()
-        );
+        let drain = jobs.drain_supervisors();
+        tokio::pin!(drain);
+        assert!(futures_util::poll!(&mut drain).is_pending());
         release.send(()).unwrap();
-        jobs.drain_supervisors().await;
+        crate::tests::bounded(drain).await;
         assert_eq!(state(&jobs, id).await, JobState::Completed);
     }
 
@@ -447,10 +438,7 @@ mod tests {
         start.abort();
         assert!(start.await.unwrap_err().is_cancelled());
         drop(map);
-        tokio::time::timeout(Duration::from_secs(1), stopping)
-            .await
-            .unwrap()
-            .unwrap();
+        crate::tests::bounded(stopping).await.unwrap();
         jobs.drain_supervisors().await;
         assert_eq!(state(&jobs, id).await, JobState::Cancelled);
     }

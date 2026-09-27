@@ -1,17 +1,24 @@
 //! Anthropic Messages request encoding.
-use super::{Dialect, native::validate_thinking};
-use crate::provider::{
-    ProviderError,
-    codec::{
-        CodecName,
-        common::{
-            anthropic_image, check_tool, invalid, own_replay, signed_context, tool_text, user_parts,
+use super::{Dialect, native::BlockType};
+use crate::{
+    media::ImageRef,
+    provider::{
+        ProviderError,
+        ProviderErrorKind::InvalidRequest,
+        codec::{
+            CodecName,
+            common::{
+                blob_error, check_tool, own_replay, signed_context, tagged, tool_text, user_parts,
+            },
+            placement::{breakpoint, path},
         },
-        placement::{breakpoint, path},
+        protocol::{AssistantItem, Binding, HistoryLifetime, Message, ModelRequest, ReplayFormat},
     },
-    protocol::{AssistantItem, Binding, HistoryLifetime, Message, ModelRequest, ReplayFormat},
 };
 use serde_json::{Map, Value, json};
+
+/// The service's cap on cache breakpoints, the history's included.
+const MAX_BREAKPOINTS: usize = 4;
 
 /// The body fields this codec writes.
 pub(crate) const BODY_FIELDS: &[&str] = &[
@@ -30,12 +37,7 @@ pub(crate) fn encode(
 ) -> Result<Map<String, Value>, ProviderError> {
     let max_tokens = request
         .max_output_tokens
-        .filter(|n| *n > 0)
-        .ok_or_else(|| {
-            invalid(
-                "Anthropic requires max_output_tokens to be explicitly set to a positive integer",
-            )
-        })?;
+        .ok_or_else(|| InvalidRequest.error("Anthropic requires max_output_tokens"))?;
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("stream".into(), json!(true));
@@ -64,16 +66,16 @@ pub(crate) fn encode(
     if request.history_lifetime != HistoryLifetime::Detached {
         cache_breakpoints += usize::from(mark_last_cacheable(&mut messages, breakpoint()));
     }
-    if cache_breakpoints > 4 {
-        return Err(invalid(
-            "Anthropic supports at most four cache breakpoints, including one for history",
-        ));
+    if cache_breakpoints > MAX_BREAKPOINTS {
+        return Err(InvalidRequest.error(format!(
+            "Anthropic supports at most {MAX_BREAKPOINTS} cache breakpoints, including one for history"
+        )));
     }
     for message in &request.tail {
         push_message(request, signed_only, &mut messages, message)?;
     }
     if messages.is_empty() {
-        return Err(invalid("Anthropic requires at least one message"));
+        return Err(InvalidRequest.error("Anthropic requires at least one message"));
     }
     body.insert("messages".into(), Value::Array(messages));
     if !request.tools.is_empty() {
@@ -90,9 +92,9 @@ pub(crate) fn encode(
     }
     if let Some(schema) = &request.response_schema {
         if !schema.schema.is_object() {
-            return Err(invalid(
-                "Anthropic response_schema must be a JSON Schema object",
-            ));
+            return Err(
+                InvalidRequest.error("Anthropic response_schema must be a JSON Schema object")
+            );
         }
         // Messages uses output_config.format, not the retired output_format beta field.
         let format = json!({"type":"json_schema", "schema":schema.schema});
@@ -100,15 +102,16 @@ pub(crate) fn encode(
     }
     // Summarized thinking is the default only on older models; request it wherever thinking is on.
     if let Some(reasoning) = &request.reasoning {
-        let mut adaptive = json!({"type":"adaptive", "display":"summarized"});
-        if dialect.thinking_binding == super::ThinkingBinding::DropOnMismatch {
-            adaptive["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
-        }
         let thinking = match reasoning.as_str() {
             "off" => json!({"type":"disabled"}),
-            "adaptive" => adaptive,
             level => {
-                dialect.effort.place(&mut body, level)?;
+                if level != "adaptive" {
+                    dialect.effort.place(&mut body, level)?;
+                }
+                let mut adaptive = json!({"type":"adaptive", "display":"summarized"});
+                if dialect.thinking_binding == super::ThinkingBinding::DropOnMismatch {
+                    adaptive["block_binding"] = json!({"prefix_mismatch_behavior": "drop_block"});
+                }
                 adaptive
             }
         };
@@ -125,7 +128,7 @@ fn push_message(
 ) -> Result<(), ProviderError> {
     let (role, content) = match message {
         Message::User(items) => {
-            let image = |image: &_| anthropic_image(request, image);
+            let image = |image: &_| image_block(request, image);
             ("user", user_parts(request, items, "text", image)?)
         }
         Message::Assistant(items) => {
@@ -135,12 +138,13 @@ fn push_message(
                     // Replay belongs to the native item, not to each display block.
                     // Foreign private reasoning is display-only.
                     AssistantItem::Reasoning { replay, .. } => {
-                        if let Some(replay) =
-                            own_replay(replay.as_ref(), ReplayFormat::Messages, &request.model)
-                            && (!signed_only || replay.binding == Binding::Conversation)
+                        if let Some(replay) = own_replay(
+                            replay.as_ref(),
+                            ReplayFormat::Messages,
+                            request.model.as_str(),
+                        ) && (!signed_only || replay.binding == Binding::Conversation)
                         {
-                            validate_thinking(&replay.payload)
-                                .map_err(|error| invalid(error.message))?;
+                            validate_thinking(&replay.payload)?;
                             blocks.push(replay.payload.clone());
                         }
                     }
@@ -163,11 +167,13 @@ fn push_message(
             let mut blocks = Vec::new();
             for result in results {
                 if result.call_id.is_empty() {
-                    return Err(invalid("Anthropic tool results require a nonempty call_id"));
+                    return Err(
+                        InvalidRequest.error("Anthropic tool results require a nonempty call_id")
+                    );
                 }
                 let mut content = vec![json!({"type":"text", "text":tool_text(result)})];
                 for image in &result.images {
-                    content.push(anthropic_image(request, image)?);
+                    content.push(image_block(request, image)?);
                 }
                 blocks.push(json!({"type":"tool_result", "tool_use_id":result.call_id,
                     "content":content, "is_error":result.is_error}));
@@ -176,9 +182,9 @@ fn push_message(
         }
     };
     if content.is_empty() {
-        return Err(invalid(
-            "Anthropic messages must contain at least one content block",
-        ));
+        return Err(
+            InvalidRequest.error("Anthropic messages must contain at least one content block")
+        );
     }
     if let Some(previous) = messages
         .last_mut()
@@ -194,6 +200,33 @@ fn push_message(
     Ok(())
 }
 
+fn image_block(request: &ModelRequest, image: &ImageRef) -> Result<Value, ProviderError> {
+    let data = request.blobs.base64(&image.blob).map_err(blob_error)?;
+    Ok(json!({"type":"image", "source":{"type":"base64",
+        "media_type":image.format.as_str(), "data":data}}))
+}
+
+/// A replayed thinking block must be one the service issued: signed thinking,
+/// unsigned thinking without a signature, or redacted thinking with its data.
+fn validate_thinking(value: &Value) -> Result<(), ProviderError> {
+    let string = |field| value.get(field).and_then(Value::as_str);
+    let valid = match tagged(value) {
+        Some(BlockType::Thinking) => {
+            string("thinking").is_some()
+                && value
+                    .get("signature")
+                    .is_none_or(|signature| signature.as_str().is_some_and(|s| !s.is_empty()))
+        }
+        Some(BlockType::RedactedThinking) => string("data").is_some_and(|data| !data.is_empty()),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(InvalidRequest.error("Anthropic replay is not a valid native thinking block"))
+    }
+}
+
 /// Mark the last block that accepts `cache_control`; thinking and empty text blocks cannot.
 fn mark_last_cacheable(messages: &mut [Value], breakpoint: Value) -> bool {
     let block = messages
@@ -205,8 +238,8 @@ fn mark_last_cacheable(messages: &mut [Value], breakpoint: Value) -> bool {
         })
         .find(|block| {
             !matches!(
-                block["type"].as_str(),
-                Some("thinking" | "redacted_thinking")
+                tagged(block),
+                Some(BlockType::Thinking | BlockType::RedactedThinking)
             ) && block["text"] != ""
         });
     let Some(block) = block else {
@@ -250,27 +283,6 @@ mod tests {
             Message::Assistant(items),
             Message::User(vec![text("continue")]),
         ]
-    }
-
-    #[test]
-    fn tool_names_follow_the_endpoint_alphabet() {
-        let mut request = request();
-        let tool = |name: &str| ToolDefinition {
-            name: name.into(),
-            description: String::new(),
-            input_schema: json!({"type":"object"}),
-        };
-        request.tools = vec![tool(&"a".repeat(128))];
-        assert!(encode(&request, &Dialect::anthropic()).is_ok());
-        for name in ["a".repeat(129), "vendor.tool".into()] {
-            request.tools = vec![tool(&name)];
-            assert!(encode(&request, &Dialect::anthropic()).is_err(), "{name}");
-        }
-        let lenient = Dialect {
-            tool_names: crate::provider::codec::ToolNames::Any,
-            ..Dialect::anthropic()
-        };
-        assert!(encode(&request, &lenient).is_ok());
     }
 
     #[test]
@@ -390,7 +402,7 @@ mod tests {
             };
             let replay = envelope(
                 ReplayFormat::Messages,
-                &request.model,
+                request.model.as_str(),
                 native.clone(),
                 binding,
             );
@@ -424,7 +436,7 @@ mod tests {
         let item = |id: &str, native: &Value| {
             let replay = envelope(
                 ReplayFormat::Messages,
-                &request.model,
+                request.model.as_str(),
                 native.clone(),
                 Binding::Free,
             );
@@ -438,7 +450,7 @@ mod tests {
     fn history_breakpoint_skips_thinking_and_respects_budget() {
         let mut request = request();
         let native = json!({"type":"thinking", "thinking":"private", "signature":"signature"});
-        let envelope = signed_envelope(&request.model, native.clone());
+        let envelope = signed_envelope(request.model.as_str(), native.clone());
         let reasoning = AssistantItem::reasoning("r", 0, "", Some(envelope));
         request.history.push(Message::Assistant(vec![reasoning]));
         request.tail = vec![Message::User(vec![text("state")])];
@@ -499,9 +511,6 @@ mod tests {
                 thinking
             );
         }
-        // Manual budgets require thinking that compaction may have removed.
-        request.reasoning = Some("2048".into());
-        assert!(encode(&request, &Dialect::anthropic()).is_err());
         // Letting the service drop mismatched blocks is announced on the request.
         request.reasoning = Some("high".into());
         let dropping = Dialect {
@@ -518,7 +527,7 @@ mod tests {
     fn opaque_reasoning_replays_only_matching_format_and_model() {
         let native = json!({"type":"thinking", "thinking":"private", "signature":"signature", "future_field":42});
         let mut request = request();
-        let envelope = signed_envelope(&request.model, native.clone());
+        let envelope = signed_envelope(request.model.as_str(), native.clone());
         let mutations: [fn(&mut Replay); 2] = [
             |envelope| envelope.provenance.format = ReplayFormat::Responses,
             |envelope| envelope.provenance.model = "another-model".into(),

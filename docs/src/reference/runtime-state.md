@@ -3,7 +3,8 @@
 ## Todo lists
 
 Every agent has an ordered advisory todo list. `todo()` reads the caller's list;
-`todo({items:[...]})` replaces the whole list and returns `{updated:true}`; an empty array clears it.
+`todo({items:[...]})` replaces the whole list and completes without a result; an empty array
+clears it.
 Each item has `text` and a `status` of `pending`, `in_progress`, or `completed`. Multiple items may
 be in progress. Unfinished items do not prevent an agent from finishing.
 

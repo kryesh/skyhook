@@ -9,7 +9,7 @@ use crate::{
     mcp::config::McpServerConfig,
     provider::profile::{ModelRef, ProviderName},
     target::TargetsConfig,
-    tool::policy::{Capability, CapabilitySet, Mode},
+    tool::policy::{Capability, CapabilitySet, Mode, ModeName},
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -22,9 +22,9 @@ mod runtime;
 pub use providers::{EntryError, RawProviderConfig};
 pub use runtime::{ConfiguredModel, RuntimeConfig, SelectionError};
 
-pub use loader::{ConfigDiagnostic, ConfigReport, ResolvedConfig};
-pub use paths::workspace_session_root;
+pub use loader::{ConfigDiagnostic, ConfigReport, ResolutionStage, ResolvedConfig};
 pub(crate) use paths::{user_config_directories, user_config_directory};
+pub use paths::{workspace_directory, workspace_session_root};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -39,11 +39,11 @@ pub struct Config {
     pub approve_all: bool,
     /// The mode a new session starts in: `general` or a declared mode.
     #[serde(default = "default_mode")]
-    pub default_mode: String,
+    pub default_mode: ModeName,
     /// Named permission presets in declaration order, after the built-in `general`
     /// unless that name is declared.
     #[serde(default = "default_modes", deserialize_with = "deserialize_modes")]
-    pub modes: indexmap::IndexMap<String, Mode>,
+    pub modes: indexmap::IndexMap<ModeName, Mode>,
     /// Providers in declaration order, each with the models served through it.
     #[serde(default)]
     pub providers: indexmap::IndexMap<ProviderName, RawProviderConfig>,
@@ -60,26 +60,32 @@ pub struct Config {
     pub max_child_depth: usize,
 }
 
+pub(crate) const DEFAULT_MAX_CHILD_DEPTH: usize = 4;
+
 const fn default_child_depth() -> usize {
-    4
+    DEFAULT_MAX_CHILD_DEPTH
 }
 
-fn default_mode() -> String {
-    "general".to_owned()
+fn default_mode() -> ModeName {
+    "general"
+        .parse()
+        .expect("the built-in mode name is nonblank")
 }
 
-fn deserialize_modes<'de, D>(deserializer: D) -> Result<indexmap::IndexMap<String, Mode>, D::Error>
+fn deserialize_modes<'de, D>(
+    deserializer: D,
+) -> Result<indexmap::IndexMap<ModeName, Mode>, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let mut modes = default_modes();
-    modes.extend(indexmap::IndexMap::<String, Mode>::deserialize(
+    modes.extend(indexmap::IndexMap::<ModeName, Mode>::deserialize(
         deserializer,
     )?);
     Ok(modes)
 }
 
-fn default_modes() -> indexmap::IndexMap<String, Mode> {
+fn default_modes() -> indexmap::IndexMap<ModeName, Mode> {
     let capabilities = CapabilitySet::default()
         .iter()
         .filter(|capability| *capability != Capability::Interactive)
@@ -130,85 +136,61 @@ impl Config {
     /// Parse and admit a single YAML document, as a loaded layer is, without
     /// discovery or merging.
     pub fn from_yaml(text: &str) -> Result<Self, ConfigError> {
-        let value = crate::yaml::from_str(text)
-            .map_err(|error| ConfigError::Structure(format!("invalid YAML: {error}")))?;
-        Self::from_value(&value)
+        Self::from_value(&crate::yaml::from_str(text).map_err(ConfigError::Syntax)?)
     }
 
-    /// Typed extraction naming the offending field, so a rejected value reads
-    /// `` `providers.local.models.main.max_context`: ... ``, then admission.
+    /// Typed extraction naming the offending field, then admission.
     fn from_value(value: &serde_json::Value) -> Result<Self, ConfigError> {
-        let config: Self = serde_path_to_error::deserialize(value).map_err(|error| {
-            let path = error.path().to_string();
-            let inner = error.into_inner();
-            ConfigError::Structure(if path == "." {
-                inner.to_string()
-            } else {
-                format!("`{path}`: {inner}")
-            })
-        })?;
+        let config: Self =
+            serde_path_to_error::deserialize(value).map_err(ConfigError::Structure)?;
         config.admit()?;
         Ok(config)
     }
 
-    /// Admit targets, mode text and every provider entry, without model
-    /// selection or external resources. Loading checks each layer and the
-    /// merged result with this; sealing keeps the admitted entries.
+    /// Admit targets and every provider entry, without model selection or
+    /// external resources. Loading checks each layer and the merged result
+    /// with this; sealing keeps the admitted entries.
     fn admit(
         &self,
     ) -> Result<indexmap::IndexMap<ProviderName, providers::ProviderConfig>, ConfigError> {
         self.targets.validate_structure()?;
-        for (name, mode) in &self.modes {
-            for (field, text) in [("instructions", &mode.instructions), ("hint", &mode.hint)] {
-                if text.as_deref().is_some_and(|text| text.trim().is_empty()) {
-                    return Err(ConfigError::Mode(
-                        name.clone(),
-                        format!("{field} must not be empty"),
-                    ));
-                }
-            }
-        }
         providers::admit(&self.providers)
     }
 
-    /// The OAuth issuer every codex entry shares, as admission proves; OpenAI's
-    /// when no entry names one.
+    /// The OAuth issuer every codex entry shares; OpenAI's when no entry
+    /// names one.
     pub fn codex_issuer(
         &self,
     ) -> Result<crate::provider::dialect::codex::auth::Issuer, ConfigError> {
-        let providers = self.admit()?;
-        Ok(providers
-            .values()
-            .find_map(providers::ProviderConfig::codex_issuer)
-            .unwrap_or_default())
+        let entries = self.providers.iter();
+        let settings = entries.map(|(name, entry)| (name, &entry.settings));
+        Ok(crate::provider::dialect::codex::shared_issuer(settings)?)
     }
 }
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    #[error("{message}{report}")]
+    #[error("{stage}{report}")]
     Resolution {
-        message: String,
+        stage: ResolutionStage,
         report: ConfigReport,
     },
     #[error("could not serialize configuration: {0}")]
-    Serialize(String),
-    #[error("invalid configuration: {0}")]
-    Structure(String),
+    Serialize(crate::yaml::YamlError),
+    #[error("invalid configuration: invalid YAML: {0}")]
+    Syntax(serde_saphyr::Error),
+    #[error("invalid configuration: {}", located(.0))]
+    Structure(serde_path_to_error::Error<serde_json::Error>),
+    #[error("invalid configuration: configuration is empty")]
+    Empty,
     #[error("invalid configuration: {0}")]
     Admission(#[from] EntryError),
     #[error("invalid configuration: {0}")]
     Targets(#[from] crate::target::TargetError),
     #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.yaml{0}")]
     Missing(ConfigReport),
-    #[error(
-        "invalid configuration: codex providers `{first}` and `{second}` name different auth_url \
-         issuers, but Skyhook keeps one Codex login; give them the same auth_url"
-    )]
-    CodexIssuers {
-        first: ProviderName,
-        second: ProviderName,
-    },
+    #[error("invalid configuration: {0}")]
+    CodexIssuers(#[from] crate::provider::dialect::codex::IssuerConflict),
     #[error("provider `{provider}` could not be initialized: {error}")]
     Provider {
         provider: ProviderName,
@@ -226,8 +208,25 @@ pub enum ConfigError {
         model: ModelRef,
         error: SelectionError,
     },
-    #[error("invalid mode `{0}`: {1}")]
-    Mode(String, String),
+    #[error("invalid mode `{name}`: {error}")]
+    Mode { name: ModeName, error: ModeError },
+}
+
+/// A rejected value reads `` `providers.local.models.main.max_context`: ... ``.
+fn located(error: &serde_path_to_error::Error<serde_json::Error>) -> String {
+    match error.path().to_string().as_str() {
+        "." => error.inner().to_string(),
+        path => format!("`{path}`: {}", error.inner()),
+    }
+}
+
+/// Why a mode name selects no configured mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ModeError {
+    #[error("default_mode is not a declared mode")]
+    Undeclared,
+    #[error("mode is not configured")]
+    Unknown,
 }
 
 impl ConfigError {
@@ -337,8 +336,9 @@ providers:
                 text.replace('\n', "\n    ")
             ))
         };
+        let names = |config: &Config| Vec::from_iter(config.modes.keys().map(ModeName::to_string));
         let general = parse("{}").unwrap();
-        assert_eq!(general.modes.keys().collect::<Vec<_>>(), ["general"]);
+        assert_eq!(names(&general), ["general"]);
         let expected = [
             Capability::Read,
             Capability::Write,
@@ -355,16 +355,13 @@ providers:
         );
         // Declared modes follow the built-in one, in declaration order.
         let declared = parse("modes:\n  z:\n    capabilities: []\n  a:\n    capabilities: [read, targets]\n    instructions: look").unwrap();
-        assert_eq!(
-            declared.modes.keys().collect::<Vec<_>>(),
-            ["general", "z", "a"]
-        );
+        assert_eq!(names(&declared), ["general", "z", "a"]);
         assert_eq!(declared.modes["general"], general.modes["general"]);
         // A declaration of that name replaces it.
         let replaced =
             parse("modes:\n  z:\n    capabilities: []\n  general:\n    capabilities: [targets]")
                 .unwrap();
-        assert_eq!(replaced.modes.keys().collect::<Vec<_>>(), ["general", "z"]);
+        assert_eq!(names(&replaced), ["general", "z"]);
         assert_eq!(
             replaced.modes["general"].capabilities,
             [Capability::Targets]
@@ -373,15 +370,18 @@ providers:
             declared.modes["a"].capabilities,
             [Capability::Read, Capability::Targets]
         );
-        assert_eq!(declared.modes["a"].instructions.as_deref(), Some("look"));
+        assert_eq!(
+            declared.modes["a"].instructions,
+            Some("look".parse().unwrap())
+        );
         let hinted = mode("capabilities: []\nhint: Thinks").unwrap();
-        assert_eq!(hinted.modes["m"].hint.as_deref(), Some("Thinks"));
+        assert_eq!(hinted.modes["m"].hint, Some("Thinks".parse().unwrap()));
         for blank in ["instructions", "hint"] {
             let error = mode(&format!("capabilities: []\n{blank}: ' '"))
                 .unwrap_err()
                 .to_string();
             assert!(
-                error.contains(&format!("{blank} must not be empty")),
+                error.contains(&format!("`modes.m.{blank}`: text must not be blank")),
                 "{error}"
             );
         }
@@ -428,14 +428,24 @@ providers:
         };
         let two = "modes:\n  first:\n    capabilities: []\n  second:\n    capabilities: [read]\n";
         let config = runtime("default_mode: second", two).unwrap();
-        assert_eq!(config.select_mode(None).unwrap(), "second");
-        assert_eq!(config.default_mode(), "second");
-        assert_eq!(config.select_mode(Some("first")).unwrap(), "first");
-        assert!(config.select_mode(Some("missing")).is_err());
+        assert_eq!(config.select_mode(None).unwrap().as_str(), "second");
+        assert_eq!(config.default_mode().as_str(), "second");
+        let name = |name: &str| name.parse::<ModeName>().unwrap();
+        assert_eq!(
+            config.select_mode(Some(&name("first"))).unwrap(),
+            &name("first")
+        );
+        assert!(matches!(
+            config.select_mode(Some(&name("missing"))),
+            Err(ConfigError::Mode {
+                error: ModeError::Unknown,
+                ..
+            })
+        ));
         // `general` stays the default, and declared, until the config says otherwise.
         for (top, modes) in [("", ""), ("", two), ("modes: {}", "")] {
             let config = runtime(top, modes).unwrap();
-            assert_eq!(config.select_mode(None).unwrap(), "general");
+            assert_eq!(config.select_mode(None).unwrap().as_str(), "general");
         }
         for (top, modes) in [
             ("default_mode: missing", two),

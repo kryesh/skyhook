@@ -1,14 +1,32 @@
 //! Parse native SSE envelopes into the one Chat choice this codec follows.
-use super::super::wire;
+use super::super::{Code, NATIVE, wire};
 use crate::provider::{
     ProviderError,
-    codec::common::lenient_u64,
+    codec::{
+        common::lenient_u64,
+        openai,
+        usage::{Observed, Spelling},
+    },
     http::{
         errors::{self, ErrorSignals},
         transport::SseEvent,
     },
 };
 use serde_json::Value;
+
+/// The OpenAI spelling, with the Messages one some servers pass through.
+const USAGE: Spelling = Spelling {
+    input: &["/prompt_tokens", "/input_tokens"],
+    cached: &[
+        "/prompt_tokens_details/cached_tokens",
+        "/cache_read_input_tokens",
+    ],
+    written: &[
+        "/prompt_tokens_details/cache_write_tokens",
+        "/cache_creation_input_tokens",
+    ],
+    output: &["/completion_tokens", "/output_tokens"],
+};
 
 /// `None` marks `[DONE]`. Chunks that carry no recognizable choice or usage
 /// decode as empty, so vendor keepalives and metadata packets are harmless.
@@ -19,23 +37,23 @@ pub(super) fn decode(
     let is_error_event = event.event.as_deref() == Some("error");
     if event.data.trim() == "[DONE]" {
         if is_error_event {
-            return Err(ProviderError::protocol("Chat error event contained [DONE]"));
+            return Err(NATIVE.error("error event contained [DONE]"));
         }
         return Ok(None);
     }
-    let value: Value = serde_json::from_str(&event.data)
-        .map_err(|_| ProviderError::protocol("Invalid Chat SSE JSON"))?;
+    let mut value: Value =
+        serde_json::from_str(&event.data).map_err(|_| NATIVE.error("invalid SSE JSON"))?;
     if value.get("error").is_some_and(|value| !value.is_null()) || is_error_event {
-        let reading = super::super::read_error(&value);
+        let reading = openai::read::<Code>(&value);
         return Err(errors::classify(None, &value, reading, signals, None));
     }
     // Follow choice zero; servers may omit its index or send extra choices.
     let choice = value
-        .get("choices")
-        .and_then(Value::as_array)
+        .get_mut("choices")
+        .and_then(Value::as_array_mut)
         .and_then(|choices| {
             choices
-                .iter()
+                .iter_mut()
                 .filter(|choice| choice.is_object())
                 .find(|choice| match choice.get("index") {
                     None | Some(Value::Null) => true,
@@ -43,14 +61,13 @@ pub(super) fn decode(
                 })
         })
         .map(|choice| {
-            serde_json::from_value::<wire::Choice>(choice.clone())
-                .map_err(|_| ProviderError::protocol("Invalid Chat choice shape"))
+            serde_json::from_value::<wire::Choice>(choice.take())
+                .map_err(|_| NATIVE.error("invalid choice shape"))
         })
         .transpose()?;
     let usage = value
         .get("usage")
-        .filter(|usage| usage.is_object())
-        .and_then(wire::Usage::from_value);
+        .and_then(|usage| Observed::read(usage, &USAGE));
     let id = value
         .get("id")
         .and_then(Value::as_str)
@@ -147,11 +164,7 @@ mod tests {
             assert!(decoder.finish().is_err());
         }
         let mut decoder = decoder();
-        let invalid = crate::provider::http::transport::SseEvent {
-            event: None,
-            data: "{not json".into(),
-        };
-        assert!(decoder.decode(&invalid).is_err());
+        assert!(decoder.decode(&raw("{not json")).is_err());
     }
 
     #[test]
@@ -211,7 +224,7 @@ mod tests {
         for frame in [event(json!({ "error": error })), named] {
             let mut decoder = decoder();
             let error = decoder.decode(&frame).unwrap_err();
-            assert_eq!(error.kind, ProviderErrorKind::ContextWindowExceeded);
+            assert_eq!(error.kind(), ProviderErrorKind::ContextWindowExceeded);
             assert!(error.message.ends_with(": prompt too long"));
             assert!(decoder.finish().is_err());
         }

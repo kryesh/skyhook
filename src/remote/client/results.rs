@@ -4,8 +4,10 @@ use crate::{
     job::output::CaptureCollector,
     media::{Image, ImageRef, MAX_IMAGE_BYTES},
     remote::{
-        flow::{CHUNK_BYTES, Credits, WINDOW},
-        protocol::{ImageId, PayloadEvent, PayloadId, PayloadOpen, RemoteToolOutput},
+        flow::{CHUNK_BYTES, QUEUE},
+        protocol::{
+            ImageId, PayloadEvent, PayloadId, PayloadOpen, RemoteToolOutput, RemoteToolResult,
+        },
     },
     tool::{
         diagnostic::{FailureSite, Operation, PartialContext, Subject},
@@ -15,9 +17,6 @@ use crate::{
     },
 };
 use tokio::{sync::mpsc, task::JoinSet};
-
-#[derive(Debug)]
-pub(super) struct ReceivedResult(pub(super) Result<Received, RemoteError>);
 
 /// A completed remote call, with the spooled contents of a source read.
 #[derive(Debug)]
@@ -41,14 +40,16 @@ pub(super) struct Results {
     transfers: HashMap<RequestId, Transfer>,
     admission: Credits,
     stopped: tokio_util::sync::CancellationToken,
-    pub(super) tasks: JoinSet<(RequestId, Result<ReceivedResult, RemoteError>)>,
+    /// Each ingestion ends with its call's result, or fails the connection.
+    pub(super) tasks: JoinSet<(RequestId, Result<PendingResult, RemoteError>)>,
 }
 
 impl Results {
     pub(super) async fn payload(
         &mut self,
         state: &Mutex<ConnectionState>,
-        writer: &Arc<Mutex<RequestWriter>>,
+        writer: &Arc<Mutex<Writer>>,
+        location: &ExecutionLocation,
         request_id: RequestId,
         event: PayloadEvent,
     ) -> Result<(), RemoteError> {
@@ -69,19 +70,19 @@ impl Results {
             .reserve()
             .map_err(|_| protocol("payload flow-control overflow"))?;
         if let std::collections::hash_map::Entry::Vacant(entry) = self.transfers.entry(request_id) {
-            let (context, destination) = state
+            let context = state
                 .lock()
                 .await
                 .pending
                 .get(&request_id)
-                .map(|pending| (pending.context.clone(), pending.destination.clone()))
+                .map(|pending| pending.context.clone())
                 .ok_or_else(|| protocol("payload for unknown request"))?;
-            let (sender, receiver) = mpsc::channel(WINDOW + 1);
-            let writer = writer.clone();
+            let (sender, receiver) = mpsc::channel(QUEUE);
+            let (writer, location) = (writer.clone(), location.clone());
             let stopped = self.stopped.clone();
             self.tasks.spawn(async move {
                 let result = Ingestion::new(&context)
-                    .run(context, destination, writer, receiver, stopped)
+                    .run(context, location, writer, receiver, stopped)
                     .await
                     .map_err(|error| host_output_error(error, Operation::Receive));
                 (request_id, result)
@@ -119,11 +120,11 @@ impl Results {
     pub(super) async fn complete(
         &mut self,
         state: &Mutex<ConnectionState>,
-        completed: Result<(RequestId, Result<ReceivedResult, RemoteError>), tokio::task::JoinError>,
+        completed: Result<(RequestId, Result<PendingResult, RemoteError>), tokio::task::JoinError>,
     ) -> Result<(), RemoteError> {
-        let (request_id, result) = completed.map_err(|_| {
+        let (request_id, result) = completed.map_err(|error| {
             host_output_error(
-                RemoteError::ConnectionTask("remote output persistence task failed".into()),
+                RemoteError::task_failed("remote output persistence", error),
                 Operation::Receive,
             )
         })?;
@@ -135,7 +136,7 @@ impl Results {
             .pending
             .remove(&request_id)
             .ok_or_else(|| protocol("response for unknown request"))?;
-        let _ = pending.sender.send(Ok(result));
+        let _ = pending.sender.send(result);
         Ok(())
     }
 }
@@ -160,27 +161,50 @@ enum ImagePayload {
     Finished(Option<ImageRef>),
 }
 
+/// A payload spooled to a file as it arrives, then read as `T`.
 #[derive(Default)]
-enum ResultPayload {
+enum SpooledPayload<T> {
     #[default]
     Absent,
     Receiving(Spool),
-    Finished(RemoteToolResult),
+    Finished(T),
 }
 
-#[derive(Default)]
-enum SourcePayload {
-    #[default]
-    Absent,
-    Receiving(Spool),
-    Finished(Source),
+impl<T> SpooledPayload<T> {
+    async fn open(&mut self) -> Result<(), RemoteError> {
+        if !matches!(self, Self::Absent) {
+            return Err(protocol("duplicate payload"));
+        }
+        *self = Self::Receiving(Spool::new().await?);
+        Ok(())
+    }
+
+    async fn append(&mut self, data: &[u8]) -> Result<(), RemoteError> {
+        let Self::Receiving(spool) = self else {
+            return Err(protocol("data for inactive payload"));
+        };
+        spool
+            .append(data)
+            .await
+            .map_err(|error| host_output_error(error, Operation::Write))
+    }
+
+    async fn finish(&mut self) -> Result<Source, RemoteError> {
+        let Self::Receiving(spool) = std::mem::take(self) else {
+            return Err(protocol("finish for inactive payload"));
+        };
+        spool
+            .finish()
+            .await
+            .map_err(|error| host_output_error(error, Operation::Write))
+    }
 }
 
 struct Ingestion {
     captures: Arc<CaptureCollector>,
     images: HashMap<ImageId, ImagePayload>,
-    source: SourcePayload,
-    result: ResultPayload,
+    source: SpooledPayload<Source>,
+    result: SpooledPayload<RemoteToolResult>,
 }
 
 impl Ingestion {
@@ -191,19 +215,19 @@ impl Ingestion {
                 context.job(),
             )),
             images: HashMap::new(),
-            source: SourcePayload::Absent,
-            result: ResultPayload::Absent,
+            source: SpooledPayload::default(),
+            result: SpooledPayload::default(),
         }
     }
 
     async fn run(
         mut self,
         context: ToolContext,
-        destination: ExecutionLocation,
-        writer: Arc<Mutex<RequestWriter>>,
+        location: ExecutionLocation,
+        writer: Arc<Mutex<Writer>>,
         mut receiver: mpsc::Receiver<Message>,
         stopped: tokio_util::sync::CancellationToken,
-    ) -> Result<ReceivedResult, RemoteError> {
+    ) -> Result<PendingResult, RemoteError> {
         while let Some(message) = receiver.recv().await {
             match message {
                 Message::Payload(event, permit) => {
@@ -211,7 +235,7 @@ impl Ingestion {
                     let acknowledging = async {
                         let mut writer = writer.lock().await;
                         drop(permit);
-                        write_frame(&mut writer.input, &Request::PayloadAck).await
+                        write_frame(&mut *writer, &Request::PayloadAck).await
                     };
                     let acknowledgement = tokio::select! {
                         biased;
@@ -228,7 +252,7 @@ impl Ingestion {
                         return Err(transport_error(error, Operation::Send));
                     }
                 }
-                Message::Terminal => return self.finish(&destination),
+                Message::Terminal => return self.finish(&location),
             }
         }
         Err(protocol("payload stream closed before terminal response"))
@@ -251,11 +275,9 @@ impl Ingestion {
                 let captures = self.captures.clone();
                 tokio::task::spawn_blocking(move || captures.send(OutputEvent::Capture(event)))
                     .await
-                    .map_err(|_| {
+                    .map_err(|error| {
                         host_output_error(
-                            RemoteError::ConnectionTask(
-                                "remote capture persistence task failed".into(),
-                            ),
+                            RemoteError::task_failed("remote capture persistence", error),
                             Operation::Capture,
                         )
                     })?
@@ -296,83 +318,38 @@ impl Ingestion {
                 };
                 self.images.insert(id, ImagePayload::Finished(image));
             }
-            PayloadEvent::Open(PayloadOpen::Source) => {
-                if !matches!(self.source, SourcePayload::Absent) {
-                    return Err(protocol("duplicate source payload"));
-                }
-                self.source = SourcePayload::Receiving(Spool::new().await?);
-            }
+            PayloadEvent::Open(PayloadOpen::Source) => self.source.open().await?,
             PayloadEvent::Data {
                 id: PayloadId::Source,
                 data,
-            } => {
-                let SourcePayload::Receiving(spool) = &mut self.source else {
-                    return Err(protocol("data for inactive source"));
-                };
-                spool
-                    .append(&data)
-                    .await
-                    .map_err(|error| host_output_error(error, Operation::Write))?;
-            }
+            } => self.source.append(&data).await?,
             PayloadEvent::Finish {
                 id: PayloadId::Source,
-            } => {
-                let SourcePayload::Receiving(spool) = std::mem::take(&mut self.source) else {
-                    return Err(protocol("finish for inactive source"));
-                };
-                let source = spool
-                    .finish()
-                    .await
-                    .map_err(|error| host_output_error(error, Operation::Write))?;
-                self.source = SourcePayload::Finished(source);
-            }
-            PayloadEvent::Open(PayloadOpen::Result) => {
-                if !matches!(self.result, ResultPayload::Absent) {
-                    return Err(protocol("duplicate result payload"));
-                }
-                self.result = ResultPayload::Receiving(Spool::new().await?);
-            }
+            } => self.source = SpooledPayload::Finished(self.source.finish().await?),
+            PayloadEvent::Open(PayloadOpen::Result) => self.result.open().await?,
             PayloadEvent::Data {
                 id: PayloadId::Result,
                 data,
-            } => {
-                let ResultPayload::Receiving(spool) = &mut self.result else {
-                    return Err(protocol("data for inactive result"));
-                };
-                spool
-                    .append(&data)
-                    .await
-                    .map_err(|error| host_output_error(error, Operation::WriteCapture))?;
-            }
+            } => self.result.append(&data).await?,
             PayloadEvent::Finish {
                 id: PayloadId::Result,
             } => {
-                let ResultPayload::Receiving(spool) = std::mem::take(&mut self.result) else {
-                    return Err(protocol("finish for inactive result"));
-                };
-                let file = spool
-                    .finish()
-                    .await
-                    .map_err(|error| host_output_error(error, Operation::FinishCapture))?
-                    .reader()
-                    .map_err(|error| host_output_error(error, Operation::ReadCapture))?;
+                let file = (self.result.finish().await?.reader())
+                    .map_err(|error| host_output_error(error, Operation::Read))?;
                 let result = tokio::task::spawn_blocking(move || {
                     serde_json::from_reader(std::io::BufReader::new(file))
                 })
                 .await
-                .map_err(|_| {
+                .map_err(|error| {
                     host_output_error(
-                        RemoteError::ConnectionTask("remote result decoding task failed".into()),
+                        RemoteError::task_failed("remote result decoding", error),
                         Operation::Deserialize,
                     )
                 })?
                 .map_err(|error| {
-                    host_output_error(
-                        ProtocolError::Decode(error.to_string()),
-                        Operation::Deserialize,
-                    )
+                    host_output_error(ProtocolError::Decode(error.into()), Operation::Deserialize)
                 })?;
-                self.result = ResultPayload::Finished(result);
+                self.result = SpooledPayload::Finished(result);
             }
         }
         Ok(())
@@ -404,7 +381,7 @@ impl Ingestion {
         Ok(local)
     }
 
-    fn finish(mut self, location: &ExecutionLocation) -> Result<ReceivedResult, RemoteError> {
+    fn finish(mut self, location: &ExecutionLocation) -> Result<PendingResult, RemoteError> {
         if self
             .images
             .values()
@@ -412,24 +389,24 @@ impl Ingestion {
         {
             return Err(protocol("terminal response before image completion"));
         }
-        let ResultPayload::Finished(result) = std::mem::take(&mut self.result) else {
+        let SpooledPayload::Finished(result) = std::mem::take(&mut self.result) else {
             return Err(protocol(
                 "terminal response without completed result payload",
             ));
         };
         // A failed read may stop its source mid-stream; the partial spool is discarded.
         let source = match (std::mem::take(&mut self.source), result.is_ok()) {
-            (SourcePayload::Absent, _) | (SourcePayload::Receiving(_), false) => None,
-            (SourcePayload::Receiving(_), true) => {
+            (SpooledPayload::Absent, _) | (SpooledPayload::Receiving(_), false) => None,
+            (SpooledPayload::Receiving(_), true) => {
                 return Err(protocol("terminal response before source completion"));
             }
-            (SourcePayload::Finished(file), _) => Some(file),
+            (SpooledPayload::Finished(file), _) => Some(file),
         };
         Ok(match result {
-            Ok(output) => ReceivedResult(Ok(Received {
+            Ok(output) => Ok(Received {
                 output: self.output(output, location)?,
                 source,
-            })),
+            }),
             Err(mut error) => {
                 let error_output = error
                     .output
@@ -439,10 +416,10 @@ impl Ingestion {
                 // A shim's internal root (and any other claimed site) is relative
                 // to this routed invocation, not evidence of a host-side location.
                 error.diagnostic.bind_worker(location);
-                ReceivedResult(Err(RemoteError::Remote {
+                Err(RemoteError::Remote {
                     diagnostic: Box::new((*error.diagnostic).into()),
                     output: error_output.map(Box::new),
-                }))
+                })
             }
         })
     }
@@ -450,20 +427,16 @@ impl Ingestion {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{fixture_context, route_fixture, test_connection, write_result};
+    use super::super::tests::{fixture_context, route_fixture, wired_connection, write_result};
     use super::*;
     use crate::{
         job::output::CaptureKind,
         media::BlobRef,
+        remote::protocol::RemoteToolError,
+        tests::bounded,
         tool::{StreamEnd, output::CaptureId},
     };
     use serde_json::json;
-
-    async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(5), future)
-            .await
-            .unwrap()
-    }
 
     fn open(id: u64, field: &str) -> PayloadEvent {
         PayloadEvent::Capture(CaptureEvent::Open {
@@ -510,7 +483,7 @@ mod tests {
                 captures: Vec::new(),
                 streams: StreamEnd::Finished,
             };
-            ingest.result = ResultPayload::Finished(if failed {
+            ingest.result = SpooledPayload::Finished(if failed {
                 Err(crate::remote::worker::remote_error(
                     crate::tool::invocation::LocalError::cancelled(),
                 ))
@@ -519,7 +492,7 @@ mod tests {
             });
             let received = ingest.finish(context.execution_location());
             if failed {
-                assert!(matches!(received, Ok(ReceivedResult(Err(_)))));
+                assert!(matches!(received, Ok(Err(_))));
             } else {
                 assert!(
                     received.is_err(),
@@ -577,10 +550,10 @@ mod tests {
                     Ok(output)
                 };
                 let mut ingest = Ingestion::new(&context);
-                ingest.result = ResultPayload::Finished(
+                ingest.result = SpooledPayload::Finished(
                     serde_json::from_slice(&serde_json::to_vec(&result).unwrap()).unwrap(),
                 );
-                let output = match ingest.finish(&trusted).unwrap().0 {
+                let output = match ingest.finish(&trusted).unwrap() {
                     Ok(received) => received.output,
                     Err(error) => {
                         let (diagnostic, output) = error.into_tool_error().into_parts();
@@ -662,7 +635,7 @@ mod tests {
                 format: png.format(),
                 blob: BlobRef::of(b"not an image"),
             };
-            let id = |id| ImageId(std::num::NonZeroU64::new(id).unwrap());
+            let id = ImageId::new;
             let mut payloads = vec![
                 (valid.file.clone(), png.bytes().to_vec()),
                 (None, b"not an image".to_vec()),
@@ -700,8 +673,9 @@ mod tests {
                     .await
                     .unwrap();
             }
+            // A failure's output spans several payload chunks.
             let large = if failed {
-                "x".repeat(17 * 1024 * 1024)
+                "x".repeat(3 * CHUNK_BYTES)
             } else {
                 String::new()
             };
@@ -755,7 +729,7 @@ mod tests {
                 assert!(received.is_err());
                 continue;
             }
-            let output = match received.unwrap().0 {
+            let output = match received.unwrap() {
                 Ok(received) if !failed => received.output,
                 Err(RemoteError::Remote {
                     output: Some(output),
@@ -798,20 +772,11 @@ mod tests {
                 .await;
             let context = fixture_context(&runtime);
             let saved = runtime.jobs.output(context.job());
-            let connection = Arc::new(test_connection().await);
-            let (input, mut requests) = tokio::io::duplex(4096);
-            connection.writer.lock().await.input = Box::new(input);
+            let (connection, mut requests) = wired_connection(4096).await;
             let call_connection = connection.clone();
             let call_context = context.clone();
             let call = tokio::spawn(async move {
-                call_tool(
-                    &call_connection,
-                    "read".into(),
-                    json!({}),
-                    &call_context,
-                    call_context.execution_location().clone(),
-                )
-                .await
+                (call_connection.execute("read".into(), json!({}), &call_context)).await
             });
             assert!(matches!(
                 bounded(read_frame::<_, Request>(&mut requests))
@@ -836,17 +801,16 @@ mod tests {
                     .lock()
                     .await
                     .pending
-                    .contains_key(&RequestId::FIRST)
+                    .contains_key(&RequestId::new(1))
             );
             let (mut peer, responses) = tokio::io::duplex(4096);
             let state = connection.state.clone();
-            let route =
-                tokio::spawn(async move { route_fixture(responses, &state, "fixture").await });
+            let route = tokio::spawn(async move { route_fixture(responses, &state).await });
             for event in [open(1, "/result/content"), data(1, b"late accepted prefix")] {
                 write_frame(
                     &mut peer,
                     &Response::Payload {
-                        request_id: RequestId::FIRST,
+                        request_id: RequestId::new(1),
                         event,
                     },
                 )
@@ -856,7 +820,7 @@ mod tests {
             if terminal {
                 write_result(
                     &mut peer,
-                    RequestId::FIRST,
+                    RequestId::new(1),
                     Ok(RemoteToolOutput {
                         diagnostic: None,
                         value: json!({}),
@@ -875,5 +839,15 @@ mod tests {
                 b"late accepted prefix"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_panicked_ingestion_reports_its_panic() {
+        let mut results = Results::default();
+        results.tasks.spawn(async { panic!("ingestion exploded") });
+        let completed = results.tasks.join_next().await.unwrap();
+        let state = Mutex::new(ConnectionState::default());
+        let error = results.complete(&state, completed).await.unwrap_err();
+        assert!(error.to_string().contains("ingestion exploded"), "{error}");
     }
 }

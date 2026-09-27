@@ -7,7 +7,7 @@ use reqwest::header::HeaderName;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::provider::{ProviderError, codec::common};
+use crate::provider::{ProviderError, ProviderErrorKind::InvalidRequest};
 
 /// A dot path into a request object, naming where a dialect places a value.
 /// Segments are nonempty, without whitespace, and never contain a dot. Presets use [`path`];
@@ -104,7 +104,7 @@ impl BodyPath {
                 .or_insert_with(|| Value::Object(Map::new()))
                 .as_object_mut()
                 .ok_or_else(|| {
-                    common::invalid(format!("request field `{}` is not an object", self.0))
+                    InvalidRequest.error(format!("request field `{}` is not an object", self.0))
                 })?;
         }
         Ok(())
@@ -201,7 +201,7 @@ mod tests {
         );
         let error = path("a.child").set(&mut root, json!(2)).unwrap_err();
         assert_eq!(
-            error.kind,
+            error.kind(),
             crate::provider::ProviderErrorKind::InvalidRequest
         );
         assert_eq!(serde_json::to_value(path("x.y")).unwrap(), "x.y");

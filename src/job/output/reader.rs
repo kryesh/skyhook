@@ -7,6 +7,8 @@ use std::{
 };
 
 const READ_AHEAD: usize = 256 * 1024;
+/// The longest source line a pattern is matched against.
+const REGEX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
 /// A pageable field: a stored capture, or a value rendered on demand.
 pub(crate) enum Source {
@@ -222,11 +224,21 @@ fn check_cancelled(cancellation: &super::super::CancellationToken) -> Result<(),
     }
 }
 
+pub(super) fn not_utf8() -> ToolError {
+    ToolError::failed("saved output is not UTF-8")
+}
+
+/// A line's text without its LF or CRLF terminator.
+fn without_terminator(line: &str) -> &str {
+    line.strip_suffix('\n')
+        .map_or(line, |line| line.strip_suffix('\r').unwrap_or(line))
+}
+
 pub(super) fn empty(selection: &Selection, total: Option<usize>, terminal: bool) -> OutputPreview {
     response(
         selection,
         total,
-        Vec::new(),
+        PageLines::Text(Vec::new()),
         if terminal {
             None
         } else {
@@ -238,15 +250,15 @@ pub(super) fn empty(selection: &Selection, total: Option<usize>, terminal: bool)
 fn response(
     selection: &Selection,
     total: Option<usize>,
-    lines: Vec<String>,
+    lines: PageLines,
     next: Option<(usize, usize)>,
 ) -> OutputPreview {
     OutputPreview {
-        field: selection.field.to_string(),
+        field: Some(selection.field.clone()),
         lines,
         total_lines: total,
         next_start: next.map(|(start, _)| start),
-        next_offset: next.map_or(0, |(_, offset)| offset),
+        next_offset: next.map(|(_, offset)| offset).filter(|offset| *offset != 0),
     }
 }
 
@@ -300,12 +312,14 @@ fn read_piece(
 
 // Prefer a whole line, and only fragment on an otherwise empty page. Account for
 // actual JSON escaping, rather than assuming six output bytes per source byte.
+// `budget` is the page's content budget less any per-line framing.
 fn fit_line(
     text: &str,
     used: usize,
+    budget: usize,
     full_line: bool,
 ) -> Result<Option<(String, usize, usize)>, ToolError> {
-    let mut maximum = text.len().min(CONTENT_BYTES);
+    let mut maximum = text.len().min(budget);
     while !text.is_char_boundary(maximum) {
         maximum -= 1;
     }
@@ -313,7 +327,7 @@ fn fit_line(
     let text = &text[..maximum];
     if full_line {
         let size = serde_json::to_vec(text)?.len() + 1;
-        if used + size <= CONTENT_BYTES {
+        if used + size <= budget {
             return Ok(Some((text.to_owned(), text.len(), size)));
         }
     }
@@ -330,7 +344,7 @@ fn fit_line(
     while low < high {
         let middle = low + (high - low).div_ceil(2);
         let size = serde_json::to_vec(&text[..boundaries[middle]])?.len() + 1;
-        if size <= CONTENT_BYTES {
+        if size <= budget {
             low = middle;
         } else {
             high = middle - 1;
@@ -345,7 +359,6 @@ fn fit_line(
 pub(super) fn page(
     source: Option<Source>,
     selection: &Selection,
-    limit: usize,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
 ) -> Result<OutputPreview, ToolError> {
@@ -357,7 +370,7 @@ pub(super) fn page(
         ));
     };
     let index = source.index(cancellation)?;
-    let mut reader = BufReader::with_capacity(64 * 1024, source);
+    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, source);
     if selection.start > index.total_lines {
         if selection.offset != 0 {
             return Err(invalid_offset());
@@ -365,7 +378,7 @@ pub(super) fn page(
         return Ok(empty(selection, Some(index.total_lines), terminal));
     }
     if selection.matcher.is_some() {
-        return search(reader, &index, selection, limit, terminal, cancellation);
+        return search(reader, &index, selection, terminal, cancellation);
     }
     Source::seek_line(&mut reader, &index, selection.start, cancellation)?;
     seek_offset(&mut reader, selection.offset, index.bytes, cancellation)?;
@@ -373,7 +386,7 @@ pub(super) fn page(
     let mut offset = selection.offset;
     let mut lines = Vec::new();
     let mut used = 0;
-    while lines.len() < limit && reader.stream_position()? < index.bytes {
+    while lines.len() < selection.limit && reader.stream_position()? < index.bytes {
         check_cancelled(cancellation)?;
         let start = reader.stream_position()?;
         let mut raw = read_piece(&mut reader, index.bytes, CONTENT_BYTES + 4)?;
@@ -382,10 +395,10 @@ pub(super) fn page(
         let valid = match std::str::from_utf8(&raw) {
             Ok(_) => raw.len(),
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => return Err(ToolError::failed("saved output is not UTF-8")),
+            Err(_) => return Err(not_utf8()),
         };
         if terminal && full && valid < raw.len() {
-            return Err(ToolError::failed("saved output is not UTF-8"));
+            return Err(not_utf8());
         }
         // A live trailing CR may become part of CRLF. Keep the returned offset
         // valid if the LF arrives between requests.
@@ -400,16 +413,9 @@ pub(super) fn page(
             reader.seek(SeekFrom::Start(start))?;
             break;
         }
-        let text = std::str::from_utf8(&raw).expect("validated UTF-8");
-        let text = if newline {
-            text.strip_suffix('\n')
-                .unwrap()
-                .strip_suffix('\r')
-                .unwrap_or(text.strip_suffix('\n').unwrap())
-        } else {
-            text
-        };
-        let Some((value, count, size)) = fit_line(text, used, full && !deferred)? else {
+        let text = without_terminator(std::str::from_utf8(&raw).expect("validated UTF-8"));
+        let Some((value, count, size)) = fit_line(text, used, CONTENT_BYTES, full && !deferred)?
+        else {
             reader.seek(SeekFrom::Start(start))?;
             break;
         };
@@ -432,7 +438,7 @@ pub(super) fn page(
     Ok(response(
         selection,
         Some(index.total_lines),
-        lines,
+        PageLines::Text(lines),
         if exhausted && terminal {
             None
         } else {
@@ -445,7 +451,6 @@ fn search(
     mut reader: BufReader<Source>,
     index: &LineIndex,
     selection: &Selection,
-    limit: usize,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
 ) -> Result<OutputPreview, ToolError> {
@@ -467,26 +472,22 @@ fn search(
     let mut exhausted = false;
     loop {
         check_cancelled(cancellation)?;
-        if lines.len() >= limit {
+        if lines.len() >= selection.limit {
             break;
         }
         while lookahead.len() <= selection.context {
-            let raw = read_piece(&mut reader, index.bytes, 4 * 1024 * 1024 + 1)?;
-            if raw.len() > 4 * 1024 * 1024 {
-                return Err(ToolError::failed(
-                    "regex source line exceeds 4 MiB; read this field without a pattern",
-                ));
+            let raw = read_piece(&mut reader, index.bytes, REGEX_LINE_BYTES + 1)?;
+            if raw.len() > REGEX_LINE_BYTES {
+                return Err(ToolError::failed(format!(
+                    "regex source line exceeds {} MiB; read this field without a pattern",
+                    REGEX_LINE_BYTES >> 20
+                )));
             }
             if raw.is_empty() || (!terminal && !raw.ends_with(b"\n")) {
                 break;
             }
-            let raw = String::from_utf8(raw)
-                .map_err(|_| ToolError::failed("saved output is not UTF-8"))?;
-            let text = raw
-                .strip_suffix('\n')
-                .map(|s| s.strip_suffix('\r').unwrap_or(s))
-                .unwrap_or(&raw)
-                .to_owned();
+            let raw = String::from_utf8(raw).map_err(|_| not_utf8())?;
+            let text = without_terminator(&raw).to_owned();
             let matched = matcher
                 .is_match(text.as_bytes())
                 .map_err(ToolError::failed)?;
@@ -507,11 +508,17 @@ fn search(
             0
         };
         if line >= selection.start && selected {
-            let Some((value, count, size)) = fit_line(&text[offset..], used, true)? else {
+            let framing = serde_json::to_vec(&NumberedLine {
+                line,
+                text: String::new(),
+            })?
+            .len();
+            let budget = CONTENT_BYTES - framing;
+            let Some((fitted, count, size)) = fit_line(&text[offset..], used, budget, true)? else {
                 break;
             };
-            used += size;
-            lines.push(value);
+            used += size + framing;
+            lines.push(NumberedLine { line, text: fitted });
             if count < text.len() - offset {
                 offset += count;
                 break;
@@ -541,7 +548,7 @@ fn search(
     Ok(response(
         selection,
         Some(index.total_lines),
-        lines,
+        PageLines::Numbered(lines),
         if exhausted {
             None
         } else {
@@ -561,6 +568,7 @@ mod tests {
             context: 0,
             start,
             offset,
+            limit: DEFAULT_LIMIT,
         }
     }
 
@@ -576,39 +584,31 @@ mod tests {
             "b".repeat(CONTENT_BYTES / 2),
             "🦀\"\\".repeat(CONTENT_BYTES)
         );
-        let first = page(
-            saved(&text),
-            &selection(1, 0),
-            100,
-            true,
-            &Default::default(),
-        )
-        .unwrap();
-        assert_eq!(first.lines.len(), 1);
-        assert_eq!(first.next_start.unwrap(), 2);
-        assert_eq!(first.next_offset, 0);
+        let first = page(saved(&text), &selection(1, 0), true, &Default::default()).unwrap();
+        assert_eq!(first.lines(), [text.lines().next().unwrap()]);
+        assert_eq!((first.next_start, first.next_offset), (Some(2), None));
         let mut query = selection(1, 0);
         let mut reconstructed = String::new();
         let mut previous = 1;
         for _ in 0..100 {
-            let view = page(saved(&text), &query, 100, true, &Default::default()).unwrap();
+            let view = page(saved(&text), &query, true, &Default::default()).unwrap();
             assert!(serde_json::to_vec(&view).unwrap().len() <= PAGE_BYTES);
             assert_eq!(
                 view,
-                page(saved(&text), &query, 100, true, &Default::default()).unwrap()
+                page(saved(&text), &query, true, &Default::default()).unwrap()
             );
-            for (index, row) in view.lines.iter().enumerate() {
+            for (index, row) in view.lines().into_iter().enumerate() {
                 let number = (query.start + index) as u64;
                 if number != previous {
                     reconstructed.push('\n');
                 }
-                reconstructed.push_str(row.as_str());
+                reconstructed.push_str(row);
                 previous = number;
             }
             let Some(start) = view.next_start else {
                 break;
             };
-            query = selection(start, view.next_offset);
+            query = selection(start, view.next_offset.unwrap_or(0));
         }
         assert_eq!(reconstructed, text);
     }
@@ -616,30 +616,31 @@ mod tests {
     #[test]
     fn live_search_defers_unfinished_context_and_resumes_without_duplicates() {
         let mut query = selection(1, 0);
-        query.matcher = Some(std::sync::Arc::new(
-            crate::tool::builtins::search::output_matcher("ERROR").unwrap(),
-        ));
+        query.matcher = Some(super::super::args::pattern_matcher("ERROR").unwrap());
         query.context = 1;
         let live = "before\nERROR\npar";
-        let first = page(saved(live), &query, 100, false, &Default::default()).unwrap();
-        assert_eq!(first.lines.len(), 1);
-        assert_eq!(first.lines[0], "before");
+        let first = page(saved(live), &query, false, &Default::default()).unwrap();
+        let numbered = |line, text: &str| NumberedLine {
+            line,
+            text: text.into(),
+        };
+        assert_eq!(
+            first.lines,
+            PageLines::Numbered(vec![numbered(1, "before")])
+        );
         assert_eq!(first.next_start.unwrap(), 2);
         // The producer appends before the next page is read.
         let text = format!("{live}tial\nlast\n");
         query.start = 2;
-        let rest = page(saved(&text), &query, 100, true, &Default::default()).unwrap();
+        let rest = page(saved(&text), &query, true, &Default::default()).unwrap();
         assert_eq!(
-            rest.lines
-                .iter()
-                .map(|row| row.as_str())
-                .collect::<Vec<_>>(),
-            vec!["ERROR", "partial"]
+            rest.lines,
+            PageLines::Numbered(vec![numbered(2, "ERROR"), numbered(3, "partial")])
         );
         assert!(rest.next_start.is_none());
         query.start = 3;
         query.offset = 1;
-        let rest = page(saved(&text), &query, 100, true, &Default::default()).unwrap();
-        assert_eq!(rest.lines[0], "artial");
+        let rest = page(saved(&text), &query, true, &Default::default()).unwrap();
+        assert_eq!(rest.lines, PageLines::Numbered(vec![numbered(3, "artial")]));
     }
 }

@@ -1,6 +1,6 @@
 //! Live response cards, reasoning expansion, and stable native block identities.
 
-use super::{AgentDisplayState, Entry, EntryKey, Projection, ResponseRef, Surface, Title, View};
+use super::{AgentDisplayState, Entry, EntryKey, ResponseRef, Surface, Title, View};
 use skyhook::agent::{AgentActivity, ObservationSnapshot, ObservedResponse};
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::{BlockRef, ItemKind};
@@ -15,7 +15,6 @@ pub(super) enum ReasoningStatus {
 
 pub(super) fn working_entry(
     snapshot: &ObservationSnapshot,
-    projection: &Projection,
     agent: &AgentId,
     running: bool,
 ) -> Option<Entry> {
@@ -24,19 +23,12 @@ pub(super) fn working_entry(
     }
     // A request's own status card carries failure and recovery at its journal
     // position, including the short transition between the two.
-    let latest = projection
+    let latest = snapshot
         .ledger
         .latest(agent)
-        .and_then(|request| projection.ledger.get(request))
+        .and_then(|request| snapshot.ledger.get(request))
         .map(|record| &record.phase);
-    if matches!(
-        latest,
-        Some(
-            RequestPhase::Failed { .. }
-                | RequestPhase::Refused { .. }
-                | RequestPhase::Retrying { .. }
-        )
-    ) {
+    if latest.is_some_and(RequestPhase::has_status_card) {
         return None;
     }
     let state = match snapshot.activity.get(agent) {
@@ -108,23 +100,16 @@ pub(super) fn block_key(response: ResponseRef, block: &BlockRef) -> EntryKey {
 /// interruptions move it into the request's status card at its journal position.
 pub(super) fn live_tail_response<'a>(
     snapshot: &'a ObservationSnapshot,
-    projection: &Projection,
     agent: &AgentId,
     request: RequestSeq,
 ) -> Option<&'a ObservedResponse> {
-    let live = projection.ledger.get(request).is_some_and(|record| {
-        matches!(
-            record.phase,
-            RequestPhase::Requested | RequestPhase::Open { message: None, .. }
-        )
-    });
+    let live = (snapshot.ledger.get(request)).is_some_and(|record| record.phase.is_live_tail());
     live.then(|| snapshot.responses.get(&(agent.clone(), request)))
         .flatten()
 }
 
 pub(super) fn live_tail_responses<'a>(
     snapshot: &'a ObservationSnapshot,
-    projection: &Projection,
     agent: &AgentId,
 ) -> Vec<(RequestSeq, &'a ObservedResponse)> {
     let mut responses: Vec<_> = snapshot
@@ -133,8 +118,7 @@ pub(super) fn live_tail_responses<'a>(
         .filter(|(owner, _)| owner == agent)
         .filter_map(|(_, request)| {
             let request = *request;
-            live_tail_response(snapshot, projection, agent, request)
-                .map(|response| (request, response))
+            live_tail_response(snapshot, agent, request).map(|response| (request, response))
         })
         .collect();
     responses.sort_by_key(|(request, _)| *request);
@@ -191,7 +175,7 @@ pub(super) fn response_entries(
 mod tests {
     use super::super::tests::{root, update};
     use super::*;
-    use skyhook::agent::{RuntimeEvent, Settlement, TurnFailure};
+    use skyhook::agent::{Failure, RuntimeEvent, Settlement, TurnFailure};
     use skyhook::provider::protocol::{AssistantItem, BlockId, Completion, ItemId, ResponseEvent};
     use skyhook::session::{MessageSeq, RequestSeq};
 
@@ -261,7 +245,7 @@ mod tests {
             assert!(rows(&response(text)).is_empty());
         }
         let blocks = response("\n\n  Actual answer.\n").blocks().to_vec();
-        let disconnected = TurnFailure::Other("disconnected".into());
+        let disconnected = TurnFailure::from(Failure::Other("disconnected".into()));
         for (how, label, surface) in [
             (
                 Settlement::Committed(MessageSeq::default()),

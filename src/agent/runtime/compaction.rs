@@ -3,7 +3,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    agent::todo::TodoItem,
+    agent::{CompactionError, todo::TodoItem},
     provider::protocol::{AssistantItem, Message as ProviderMessage, ModelRequest},
     session::{Message, UserPart},
 };
@@ -94,13 +94,8 @@ Return a complete current todo list for this agent in todos. Start from the supp
 }
 
 /// Validate the final answer and render section contents without rewriting them.
-pub(crate) fn continuation(text: &str) -> Result<Continuation, String> {
-    let summary: Summary = serde_json::from_str(text).map_err(|error| {
-        format!("Compaction returned an invalid structured continuation: {error}")
-    })?;
-    if summary.todos.iter().any(|item| item.text.trim().is_empty()) {
-        return Err("Compaction returned a todo with blank text".into());
-    }
+pub(crate) fn continuation(text: &str) -> Result<Continuation, CompactionError> {
+    let summary: Summary = serde_json::from_str(text).map_err(CompactionError::Continuation)?;
     let sections = [
         ("Objective", summary.objective),
         ("User instructions", summary.user_instructions.join("\n\n")),
@@ -135,6 +130,9 @@ pub(crate) fn continuation(text: &str) -> Result<Continuation, String> {
     })
 }
 
+/// What an image is estimated to occupy, whatever its payload size.
+const IMAGE_TOKEN_ESTIMATE: u64 = 2_048;
+
 fn estimate_text(text: &str) -> u64 {
     (text.len() as u64).div_ceil(4)
 }
@@ -148,7 +146,7 @@ pub(crate) fn estimate_message(message: &ProviderMessage, model: &str) -> u64 {
             .iter()
             .map(|block| match block.text() {
                 Ok(text) => 4 + estimate_text(&text),
-                Err(crate::media::AttachmentRef::Image(_)) => 2_048,
+                Err(crate::media::AttachmentRef::Image(_)) => IMAGE_TOKEN_ESTIMATE,
                 Err(crate::media::AttachmentRef::Text(text)) => 4 + text.blob.bytes.div_ceil(4),
             })
             .sum::<u64>(),
@@ -179,7 +177,7 @@ pub(crate) fn estimate_message(message: &ProviderMessage, model: &str) -> u64 {
                 12 + estimate_text(&result.call_id)
                     + estimate_text(&result.name)
                     + estimate_text(&result.result.to_string())
-                    + result.images.len() as u64 * 2_048
+                    + result.images.len() as u64 * IMAGE_TOKEN_ESTIMATE
             })
             .sum::<u64>(),
     }
@@ -202,7 +200,7 @@ pub(crate) fn estimate_request(request: &ModelRequest) -> u64 {
             .sum::<u64>()
         + request
             .messages()
-            .map(|message| estimate_message(message, &request.model))
+            .map(|message| estimate_message(message, request.model.as_str()))
             .sum::<u64>()
         + request.response_schema.as_ref().map_or(0, |response| {
             8 + estimate_text(&response.name) + estimate_text(&response.schema.to_string())
@@ -319,7 +317,7 @@ mod tests {
         }
         let mut unknown = summary();
         unknown["unexpected"] = true.into();
-        // Beyond serde's structural checks: todo text is not blank, job ids are real.
+        // Parsing also checks todo text is not blank and job ids are real.
         let blank_todo = with("/todos/0/text", " \t\n".into());
         for value in [unknown, blank_todo, with("/jobs", json!([0]))] {
             let parsed = continuation(&value.to_string());

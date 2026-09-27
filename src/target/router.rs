@@ -1,5 +1,6 @@
 use std::{path::Path, sync::Arc};
 
+use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
 use crate::{
@@ -15,61 +16,71 @@ use crate::{
 
 use super::{TargetDefinition, TargetError, TargetName, TargetRef, TargetRegistry};
 
+/// The name and revision of each target in a [`Route`], in the same shape.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct RouteIdentity {
-    destination: TargetName,
-    pub hops: Vec<(String, u64)>,
+    hops: Vec<(TargetName, u64)>,
+    destination: (TargetName, u64),
 }
 
 impl RouteIdentity {
     pub fn destination(&self) -> &TargetName {
-        &self.destination
+        &self.destination.0
     }
 }
 
-/// A nonempty route snapshot; the registry may since have changed.
+/// The targets an SSH connection passes through, outermost first, and its destination.
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
+pub(crate) struct Route {
+    pub hops: Vec<TargetDefinition>,
+    pub destination: TargetDefinition,
+}
+
+impl Route {
+    pub fn iter(&self) -> impl Iterator<Item = &TargetDefinition> {
+        self.hops.iter().chain([&self.destination])
+    }
+}
+
+/// A route snapshot; the registry may since have changed.
 #[derive(Clone, Debug)]
 pub(crate) struct ResolvedRoute {
     identity: RouteIdentity,
-    definitions: Vec<TargetDefinition>,
+    route: Route,
 }
 
 impl ResolvedRoute {
-    /// Captures already validated definitions; `None` when empty.
-    pub fn from_definitions(definitions: Vec<TargetDefinition>) -> Option<Self> {
-        let destination = definitions.last()?.name.clone();
-        let hops = definitions
-            .iter()
-            .map(|hop| (hop.name.to_string(), hop.revision))
-            .collect();
-        Some(Self {
-            identity: RouteIdentity { destination, hops },
-            definitions,
-        })
+    /// Captures already validated definitions.
+    pub fn new(route: Route) -> Self {
+        let identity = |hop: &TargetDefinition| (hop.name.clone(), hop.revision);
+        Self {
+            identity: RouteIdentity {
+                hops: route.hops.iter().map(identity).collect(),
+                destination: identity(&route.destination),
+            },
+            route,
+        }
     }
 
     pub fn identity(&self) -> &RouteIdentity {
         &self.identity
     }
 
-    pub fn definitions(&self) -> &[TargetDefinition] {
-        &self.definitions
+    pub fn route(&self) -> &Route {
+        &self.route
     }
 
     pub fn destination(&self) -> &TargetDefinition {
-        self.definitions
-            .last()
-            .expect("resolved routes contain a destination")
+        &self.route.destination
     }
 
     /// Connecting needs target approval, plus ssh_agent approval when any hop
     /// forwards an agent Skyhook does not own.
     pub fn permissions(&self) -> Vec<PermissionUse> {
-        let resource = ResourceId::route(
-            self.identity.destination.to_string(),
-            self.identity.hops.clone(),
-        );
-        let external = self.definitions.iter().any(|hop| hop.ssh.external_agent);
+        let RouteIdentity { hops, destination } = &self.identity;
+        let targets = hops.iter().chain([destination]).cloned().collect();
+        let resource = ResourceId::route(destination.0.clone(), targets);
+        let external = self.route.iter().any(|hop| hop.ssh.external_agent);
         [Capability::Targets]
             .into_iter()
             .chain(external.then_some(Capability::SshAgent))
@@ -80,7 +91,7 @@ impl ResolvedRoute {
     pub fn authorization_arguments(&self) -> serde_json::Value {
         let destination = self.destination();
         let names = |external: bool| {
-            (self.definitions.iter())
+            (self.route.iter())
                 .filter(|hop| !external || hop.ssh.external_agent)
                 .map(|hop| &hop.name)
                 .collect::<Vec<_>>()
@@ -143,16 +154,16 @@ impl TargetRouter {
         if !subject.capabilities.contains(Capability::SshAgent) {
             if self.targets.needs_ssh_agent(&definition.name).await {
                 return Err(rejected(TargetError::NameUnavailable(
-                    definition.name.to_string(),
+                    definition.name.clone(),
                 )));
             }
             if let Some((edge, parent)) = definition.parent_edge()
                 && self.targets.needs_ssh_agent(parent).await
             {
                 return Err(rejected(TargetError::UnknownReference {
-                    target: definition.name.to_string(),
+                    target: definition.name.clone(),
                     edge,
-                    reference: parent.to_string(),
+                    reference: parent.clone(),
                 }));
             }
         }
@@ -186,7 +197,9 @@ impl TargetRouter {
                 .await
                 .map_err(|error| {
                     let effects = match &error {
-                        crate::session::SessionError::AppendIndeterminate(_) => Effects::Unknown,
+                        crate::session::SessionError::AppendIndeterminate { .. } => {
+                            Effects::Unknown
+                        }
                         _ => Effects::Unchanged,
                     };
                     registration_error(
@@ -200,16 +213,16 @@ impl TargetRouter {
                 .authorization
                 .revoke(|grant| {
                     matches!(&grant.resource, ResourceId::Route { destination, .. }
-                        if invalidated.iter().any(|name| name.as_str() == destination))
+                        if invalidated.contains(destination))
                 })
                 .await;
             router.remote.invalidate(&invalidated).await;
             Ok(destination)
         })
         .await
-        .map_err(|_| {
+        .map_err(|error| {
             registration_error(
-                RemoteError::ConnectionTask("target publication owner lost".into()),
+                RemoteError::task_failed("target publication", error),
                 Operation::Wait,
                 Effects::MayHaveExecuted,
             )
@@ -227,15 +240,13 @@ impl TargetRouter {
         target: &TargetName,
         capabilities: &CapabilitySet,
     ) -> Result<ResolvedRoute, TargetError> {
-        let definitions = self.targets.route(target).await?;
+        let route = self.targets.route(target).await?;
         if !capabilities.contains(Capability::SshAgent)
-            && definitions.iter().any(|hop| hop.ssh.external_agent)
+            && route.iter().any(|hop| hop.ssh.external_agent)
         {
-            return Err(TargetError::Unknown(target.to_string()));
+            return Err(TargetError::Unknown(target.clone()));
         }
-        // Successful registry resolution always includes the requested destination.
-        Ok(ResolvedRoute::from_definitions(definitions)
-            .expect("target registry resolves a nonempty route"))
+        Ok(ResolvedRoute::new(route))
     }
 
     pub async fn prepare(
@@ -293,13 +304,11 @@ impl TargetRouter {
         targets: TargetRegistry,
         policy: Arc<dyn crate::tool::policy::Policy>,
     ) -> Self {
-        let authorization = AuthorizationCoordinator::new(policy);
         let remote = RemoteManager::new(
             crate::remote::EmbeddedShimCatalog::default(),
             Arc::new(crate::remote::RejectSensitivePrompts),
-            authorization.clone(),
         );
-        Self::new(targets, remote, authorization)
+        Self::new(targets, remote, AuthorizationCoordinator::new(policy))
     }
 }
 
@@ -371,7 +380,7 @@ mod tests {
             ConnectionFactory, EmbeddedShimCatalog, PendingHandshakeFactory, RejectSensitivePrompts,
         },
         session::{AppendBoundary, SessionStore},
-        tests::RecordingPolicy,
+        tests::{RecordingPolicy, bounded},
         tool::authorization::AuthorizationError,
         tool::{
             diagnostic::{Cause, PartialDiagnostic},
@@ -428,22 +437,22 @@ mod tests {
         gateway.revision = 7;
         let mut destination = target("build", Some("gateway"));
         destination.revision = 19;
-        let definitions = vec![gateway, destination];
-        let route = ResolvedRoute::from_definitions(definitions.clone()).unwrap();
-        assert_eq!(route.definitions(), definitions.as_slice());
-        assert_eq!(route.destination(), &definitions[1]);
+        let mut definitions = Route {
+            hops: vec![gateway],
+            destination,
+        };
+        let route = ResolvedRoute::new(definitions.clone());
+        assert_eq!(route.route(), &definitions);
         assert_eq!(route.identity.destination(), &name("build"));
-        let hops = vec![("gateway".into(), 7), ("build".into(), 19)];
-        assert_eq!(route.identity.hops, hops);
-        let resource = ResourceId::route("build", hops);
+        let hops = vec![(name("gateway"), 7), (name("build"), 19)];
+        let resource = ResourceId::route(name("build"), hops);
         let permission = |capability| PermissionUse::exact(capability, resource.clone());
         assert_eq!(route.permissions(), [permission(Capability::Targets)]);
         let arguments = route.authorization_arguments();
         assert_eq!(arguments["route"], serde_json::json!(["gateway", "build"]));
         // Forwarding an external agent through any hop needs its own approval.
-        let mut definitions = definitions;
-        definitions[0].ssh.external_agent = true;
-        let route = ResolvedRoute::from_definitions(definitions).unwrap();
+        definitions.hops[0].ssh.external_agent = true;
+        let route = ResolvedRoute::new(definitions);
         let expected = [Capability::Targets, Capability::SshAgent].map(permission);
         assert_eq!(route.permissions(), expected);
         let arguments = route.authorization_arguments();
@@ -465,17 +474,8 @@ mod tests {
             assert!(matches!(resolved, Err(TargetError::Unknown(_))), "{hidden}");
             router.resolve(&name(hidden), &with).await.unwrap();
         }
-        let listed = |records: Vec<crate::target::TargetRecord>| {
-            records
-                .into_iter()
-                .map(|record| match record {
-                    crate::target::TargetRecord::Root => "root".to_owned(),
-                    crate::target::TargetRecord::Ssh { name, .. } => name.to_string(),
-                })
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(listed(router.targets.list(&without).await), ["root"]);
-        assert_eq!(listed(router.targets.list(&with).await).len(), 3);
+        assert!(router.targets.list(&without).await.is_empty());
+        assert_eq!(router.targets.list(&with).await.len(), 2);
         // Hidden targets can be neither replaced nor routed through.
         let (_directory, store) = ephemeral_store().await;
         let subject = subject_for(&store);
@@ -531,14 +531,13 @@ mod tests {
         policy: Arc<RecordingPolicy>,
         factory: Option<Arc<dyn ConnectionFactory>>,
     ) -> TargetRouter {
-        let authorization = AuthorizationCoordinator::new(policy);
         let catalog = EmbeddedShimCatalog::default();
         let prompts = Arc::new(RejectSensitivePrompts);
-        let mut remote = RemoteManager::new(catalog, prompts, authorization.clone());
+        let mut remote = RemoteManager::new(catalog, prompts);
         if let Some(factory) = factory {
             remote = remote.with_connection_factory(factory);
         }
-        TargetRouter::new(targets, remote, authorization)
+        TargetRouter::new(targets, remote, AuthorizationCoordinator::new(policy))
     }
 
     async fn prepare(
@@ -626,7 +625,6 @@ mod tests {
             .unwrap();
         assert_ne!(admitted.identity(), current.identity());
         assert_eq!(admitted.destination().revision, 1);
-        assert_eq!(admitted.identity.hops, [("build".into(), 1)]);
         // Invalidation removes pool reuse; it does not consume the admitted handle.
         assert!(!router.remote.is_current(&prepared).await);
         assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
@@ -714,14 +712,12 @@ mod tests {
             assert!(waiter.await.unwrap_err().is_cancelled());
             let held = router.mutation.try_read().is_err();
             assert!(held, "accepted owner retains publication gate");
-            let shutdown = tokio::spawn({
-                let router = router.clone();
-                async move { router.shutdown().await }
-            });
-            tokio::task::yield_now().await;
-            assert!(!shutdown.is_finished(), "shutdown must drain publication");
+            let shutdown = router.shutdown();
+            tokio::pin!(shutdown);
+            let draining = futures_util::poll!(&mut shutdown).is_pending();
+            assert!(draining, "shutdown must drain publication");
             resume.send(()).unwrap();
-            shutdown.await.unwrap();
+            bounded(shutdown).await;
             let saved = targets.get(&name("build")).await.unwrap();
             assert_eq!(saved.revision, 2);
             let records = store.records().await;
@@ -780,12 +776,12 @@ mod tests {
                 result => panic!("poisoned writer must require recovery on drain: {result:?}"),
             };
             assert_eq!(recovery.identity.session, store.id());
-            assert!(!recovery.reason.is_empty());
             assert_eq!(
                 diagnostic.cause,
-                PartialDiagnostic::session(&crate::session::SessionError::AppendIndeterminate(
-                    recovery
-                ))
+                PartialDiagnostic::session(&crate::session::SessionError::AppendIndeterminate {
+                    recovery,
+                    source: None,
+                })
                 .cause
             );
             router.shutdown().await;

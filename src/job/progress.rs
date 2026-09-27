@@ -22,7 +22,6 @@ pub struct AgentProgress {
 #[derive(Default)]
 pub(super) struct Progress {
     pub sequence: RecordSeq,
-    pub agents: HashMap<JobId, AgentId>,
     counts: HashMap<AgentId, AgentProgress>,
 }
 
@@ -33,12 +32,6 @@ impl Progress {
                 continue;
             }
             match &record.event {
-                SessionEvent::AgentStarted {
-                    owner_job: Some(job),
-                    ..
-                } => {
-                    self.agents.insert(*job, record.agent.clone());
-                }
                 SessionEvent::MessageCommitted {
                     message: Message::Assistant(_),
                 } => {
@@ -56,12 +49,8 @@ impl Progress {
         }
     }
 
-    pub fn for_job(&self, job: JobId) -> AgentProgress {
-        self.agents
-            .get(&job)
-            .and_then(|agent| self.counts.get(agent))
-            .copied()
-            .unwrap_or_default()
+    pub fn for_agent(&self, agent: &AgentId) -> AgentProgress {
+        self.counts.get(agent).copied().unwrap_or_default()
     }
 }
 
@@ -76,10 +65,11 @@ pub(super) fn active_job(
     path: &mut std::collections::HashSet<JobId>,
 ) -> StateJob {
     let entry = &jobs[&id];
-    let is_agent = entry.child().is_some();
+    let child = entry.child();
+    let launched = child.and_then(|child| child.agent.as_ref());
     let mut children = Vec::new();
     path.insert(id);
-    if is_agent && let Some(agent) = progress.agents.get(&id) {
+    if let Some(agent) = launched {
         let mut child_ids = jobs
             .iter()
             .filter(|(job, child)| {
@@ -105,16 +95,17 @@ pub(super) fn active_job(
     path.remove(&id);
     StateJob {
         job: id,
-        kind: if is_agent {
+        kind: if child.is_some() {
             StateJobKind::Agent {
-                progress: progress.for_job(id),
+                progress: launched
+                    .map_or_else(AgentProgress::default, |agent| progress.for_agent(agent)),
             }
         } else {
             StateJobKind::Tool {
                 tool: entry.tool.clone(),
             }
         },
-        name: entry.name.clone().map(String::from),
+        name: entry.name.clone(),
         state: entry.state().presented(),
         target: capabilities.visible_target(&entry.location.target).cloned(),
         workspace: entry.location.workspace.clone(),
@@ -138,12 +129,14 @@ mod tests {
         }
     }
 
+    fn location(target: &str) -> ExecutionLocation {
+        ExecutionLocation::named(target.parse().unwrap(), format!("/{target}/work").into())
+    }
+
     async fn started(jobs: &JobManager, agent: &AgentId, owner: JobId, target: &str) {
-        let location =
-            ExecutionLocation::named(target.parse().unwrap(), format!("/{target}/work").into());
-        let event = crate::session::tests::child_started(Some(owner), location.clone());
+        let event = crate::session::tests::child_started(Some(owner), location(target));
         jobs.test_append(agent.clone(), event).await;
-        jobs.set_agent_location(owner, location).await.unwrap();
+        jobs.set_child_agent(owner, agent.clone()).await.unwrap();
     }
 
     async fn committed(jobs: &JobManager, agent: &AgentId) {
@@ -160,10 +153,11 @@ mod tests {
         jobs.active_states(owner, &capabilities, i64::MAX).await
     }
 
-    fn agent_spec(agent: &AgentId, parent: Option<JobId>) -> JobSpec {
+    fn agent_spec(agent: &AgentId, parent: Option<JobId>, target: &str) -> JobSpec {
         JobSpec {
             parent,
             role: JobRole::Agent,
+            location: location(target),
             ..JobSpec::test(agent.clone(), "delegate")
         }
     }
@@ -180,7 +174,7 @@ mod tests {
         let grandchild = child.child(1);
         let great_grandchild = grandchild.child(1);
         let jobs = JobManager::new(store);
-        let delegated = jobs.test_lease(agent_spec(&root, None)).await;
+        let delegated = jobs.test_lease(agent_spec(&root, None, "child")).await;
         let ordinary = jobs.test_lease(JobSpec::test(root.clone(), "agent")).await;
         // Even queued agents without AgentStarted have zero counters; tools do not.
         let initial = snapshot(&jobs, &root, false).await;
@@ -201,17 +195,19 @@ mod tests {
         let nested = jobs.test_lease(spec).await;
         jobs.test_finish(nested.id(), Value::Null).await;
         let delegated_again = jobs
-            .test_approving(agent_spec(&child, Some(script.id())))
+            .test_approving(agent_spec(&child, Some(script.id()), "grandchild"))
             .await;
         started(&jobs, &grandchild, delegated_again.id(), "grandchild").await;
         committed(&jobs, &grandchild).await;
-        let deepest = jobs.test_lease(agent_spec(&grandchild, None)).await;
+        let deepest = jobs
+            .test_lease(agent_spec(&grandchild, None, "deepest"))
+            .await;
         started(&jobs, &great_grandchild, deepest.id(), "deepest").await;
         committed(&jobs, &great_grandchild).await;
         let _leaf = jobs
             .test_create(JobSpec::test(great_grandchild.clone(), "read"))
             .await;
-        let terminal = jobs.test_lease(agent_spec(&child, None)).await;
+        let terminal = jobs.test_lease(agent_spec(&child, None, "child")).await;
         jobs.test_finish(terminal.id(), Value::Null).await;
 
         let state = snapshot(&jobs, &root, false).await;
@@ -267,7 +263,7 @@ mod tests {
         let jobs = JobManager::new(store.clone());
         let spec = JobSpec {
             accepts_input: true,
-            ..agent_spec(&root, None)
+            ..agent_spec(&root, None, "child")
         };
         let delegated = jobs.test_lease(spec).await;
         started(&jobs, &child, delegated.id(), "child").await;
@@ -278,12 +274,16 @@ mod tests {
         };
         turn(jobs.clone(), child.clone()).await;
         let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let turned = Arc::new(Notify::new());
         let handler: ResumeHandler = Arc::new({
-            let (jobs, child, release) = (jobs.clone(), child.clone(), release.clone());
+            let (jobs, child) = (jobs.clone(), child.clone());
+            let (release, turned) = (release.clone(), turned.clone());
             move |_, _| {
-                let (jobs, child, release) = (jobs.clone(), child.clone(), release.clone());
+                let (jobs, child) = (jobs.clone(), child.clone());
+                let (release, turned) = (release.clone(), turned.clone());
                 Box::pin(async move {
                     turn(jobs, child).await;
+                    turned.notify_one();
                     release.acquire().await.unwrap().forget();
                     Ok(ToolOutput::default())
                 })
@@ -297,26 +297,18 @@ mod tests {
         jobs.test_finish(delegated.id(), Value::Null).await;
         assert!(snapshot(&jobs, &root, false).await.is_empty());
         jobs.send(delegated.id(), Value::Null).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while progress_of(&snapshot(&jobs, &root, false).await[0])
-                .map(|progress| progress.tool_calls)
-                != Some(2)
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        assert_eq!(turns(&snapshot(&jobs, &root, false).await), Some(2));
+        crate::tests::bounded(turned.notified()).await;
+        let resumed = progress_of(&snapshot(&jobs, &root, false).await[0]);
+        assert_eq!(resumed, progress(2, 2));
         release.add_permits(1);
-        jobs.wait(delegated.id(), Some(Duration::from_secs(5)), true)
+        crate::tests::bounded(jobs.wait(delegated.id(), None, true))
             .await
             .unwrap();
         jobs.clear_resume_handler(delegated.id()).await;
 
         let records = store.records().await;
         let restored = JobManager::restore(store, &records).await.unwrap();
-        let retained = async || restored.inner.progress.lock().await.for_job(delegated.id());
+        let retained = async || restored.inner.progress.lock().await.for_agent(&child);
         // Completed agents remain omitted after replay, but retain progress for resumption.
         assert!(snapshot(&restored, &root, false).await.is_empty());
         assert_eq!(retained().await, progress(2, 2).unwrap());

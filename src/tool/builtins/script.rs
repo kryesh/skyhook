@@ -14,7 +14,7 @@ pub(crate) fn install_script_tool(
     executor: Weak<OnceLock<ToolExecutor>>,
 ) -> Result<(), RegistryError> {
     builder.register_product::<ScriptArgs, crate::tool::javascript::ScriptResult, _, _>(
-        "script",
+        super::names::SCRIPT,
         SCRIPT_DESCRIPTION,
         ToolOptions::default()
             .job_role(crate::job::JobRole::Script)
@@ -48,9 +48,9 @@ struct ScriptArgs {
     source: String,
 }
 
-const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript body in QuickJS-ng with modern ECMAScript syntax, selected standard built-ins, and top-level await/return. Native script result is {value,console,failure}: value is the returned JSON (null without return), console is captured console.log text/JSON, and failure is null on success. The model receives a JobView with this script result. Read saved console at /result/console and returned-value fields under /result/value. No Node.js APIs or global `fetch` (use `tool.fetch(...)` for HTTP requests), `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`. No recursive script execution. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Return JSON-compatible values: convert BigInts, dates and typed arrays; undefined, non-finite numbers, functions and cycles fail serialization.
+const SCRIPT_DESCRIPTION: &str = r#"Run an async JavaScript body in QuickJS-ng with modern ECMAScript syntax, selected standard built-ins, and top-level await/return. Native script result is {value,console?,failure?}: value is the returned JSON (null without return), console is captured console.log text/JSON, and failure is absent on success. The model receives a JobView with this script result. Read saved console at /result/console and returned-value fields under /result/value. No Node.js APIs or global `fetch` (use `tool.fetch(...)` for HTTP requests), `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setInterval`. No recursive script execution. Built-ins include Date, RegExp, Map/Set, Proxy/Reflect, BigInt, ArrayBuffer, DataView and typed arrays; Uint8Array supports fromBase64/fromHex/toBase64/toHex. Return JSON-compatible values: convert BigInts, dates and typed arrays; undefined, non-finite numbers, functions and cycles fail serialization.
 
-Tool calls return JobView envelopes; operational failures are `failed` envelopes, not throws. The native result is in `.result`. `response.unwrap()` returns it for a completed response with `has_result === true`, and otherwise throws an error carrying `.response`, `.output`, `.code`, and `.executed`; inspect pending jobs with `tool.jobs({job:id})`. For example: `const response = await tool.read({path:"Cargo.toml"}); const file = response.unwrap();`. Builders also support `tool.read().path("Cargo.toml")` or `tool.read().set("path", "Cargo.toml")`. `.set(key, value)` accepts tool-schema argument names, including dynamically chosen keys; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Returning nested builders runs independent calls concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. Promise.all works; await ordinary promises before nesting results.
+Tool calls return JobView envelopes; operational failures are `failed` envelopes, not throws. The native result is in `.result`. `response.unwrap()` returns it (`null` when absent) for a completed response, and otherwise throws an error carrying `.response`, `.output`, and, when present, `.job` and `.code`; inspect pending jobs with `tool.jobs({job:id})`. In scripts, an absent optional field (`x?`) is `undefined`. For example: `const response = await tool.read({path:"Cargo.toml"}); const file = response.unwrap();`. Builders also support `tool.read().path("Cargo.toml")` or `tool.read().set("path", "Cargo.toml")`. `.set(key, value)` accepts tool-schema argument names, including dynamically chosen keys; omitted arguments keep schema defaults. Builders execute once when awaited/returned. Returning nested builders runs independent calls concurrently: `return {a:tool.read({path:"a"}),b:tool.read({path:"b"})};`. Promise.all works; await ordinary promises before nesting results.
 
 `await sleep(ms)`: finite nonnegative milliseconds within the host timer range; cancellation interrupts it. performance.now() measures elapsed milliseconds. Unawaited promises/sleeps do not keep scripts alive; use background jobs for lasting work.
 
@@ -62,7 +62,7 @@ for await (const {index, value: response} of new WorkPool(4).map(
   paths, path => tool.read({path})
 )) {
   const value = response.unwrap();
-  results.push({index, path: value.path, content: value.content});
+  results.push({index, path: paths[index], content: value.content});
 }
 return results;
 ```

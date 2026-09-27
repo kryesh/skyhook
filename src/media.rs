@@ -91,10 +91,6 @@ pub enum MediaError {
     InvalidBase64,
     #[error("blob exceeds its byte limit")]
     TooLarge,
-    #[error("blob does not match its byte length")]
-    LengthMismatch,
-    #[error("blob does not match its digest")]
-    HashMismatch,
     #[error("blob allocation failed: {0}")]
     Allocation(#[source] std::collections::TryReserveError),
 }
@@ -103,7 +99,7 @@ named_enum! {
     /// A supported image encoding, identified from the image bytes themselves and
     /// spelled as its media type.
     #[derive(
-        Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, JsonSchema,
+        Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, JsonSchema,
     )]
     pub enum ImageFormat {
         Png = "image/png",
@@ -126,10 +122,6 @@ impl ImageFormat {
         } else {
             None
         }
-    }
-
-    pub const fn media_type(self) -> &'static str {
-        self.as_str()
     }
 
     /// The conventional file extension for names shown to the model.
@@ -280,7 +272,11 @@ impl LoadedBlobs {
         self.0.contains_key(&blob.sha256)
     }
 
-    pub(crate) fn insert(&mut self, blob: BlobRef, bytes: Vec<u8>) {
+    pub(crate) fn shared(&self, blob: &BlobRef) -> Option<Arc<[u8]>> {
+        self.0.get(&blob.sha256).cloned()
+    }
+
+    pub(crate) fn insert(&mut self, blob: BlobRef, bytes: impl Into<Arc<[u8]>>) {
         self.0.insert(blob.sha256, bytes.into());
     }
 }
@@ -325,7 +321,7 @@ mod tests {
     use super::*;
     use crate::{
         provider::protocol::{Message, ModelRequest, ToolResult, UserContent},
-        session::SessionStore,
+        session::{BlobError, SessionError, SessionStore},
     };
 
     #[test]
@@ -436,17 +432,37 @@ mod tests {
                 request.blobs.get(&image.blob),
                 Err(MediaError::NotLoaded)
             ));
-            store.load_blobs(&mut request).await.unwrap();
+            let mut cache = LoadedBlobs::default();
+            store.load_blobs(&mut request, &mut cache).await.unwrap();
             assert_eq!(request.blobs.text(&text).unwrap(), "notes");
             assert_eq!(request.blobs.get(&image.blob).unwrap(), png.bytes());
             assert!(!serde_json::to_string(&request).unwrap().contains("blobs"));
             if durable {
-                let limit = MAX_IMAGE_BYTES as usize;
-                let digest = image.blob.sha256;
-                store.corrupt_blob(digest, Some(b"changed".to_vec())).await;
-                assert!(store.read_blob(&image.blob, limit).await.is_err());
-                store.corrupt_blob(digest, None).await;
-                assert!(store.read_blob(&image.blob, limit).await.is_err());
+                // A store read verifies the bytes; cached blobs were verified when read.
+                for (bytes, reason) in [
+                    (Some(b"changed".to_vec()), BlobError::HashMismatch),
+                    (None, BlobError::Missing),
+                ] {
+                    store.corrupt_blob(image.blob.sha256, bytes).await;
+                    let mut uncached = LoadedBlobs::default();
+                    let error = store.load_blobs(&mut request, &mut uncached).await;
+                    assert!(matches!(
+                        error.unwrap_err(),
+                        SessionError::Blob { digest, reason: found }
+                            if digest == image.blob.sha256 && found == reason
+                    ));
+                    store.load_blobs(&mut request, &mut cache).await.unwrap();
+                }
+            } else {
+                // An ephemeral session keeps its journal and blobs in memory.
+                let mut files = std::fs::read_dir(store.directory()).unwrap();
+                assert!(files.next().is_none());
+            }
+            // A reused request and its cache keep only what its history still references.
+            request.history.pop();
+            store.load_blobs(&mut request, &mut cache).await.unwrap();
+            for blobs in [&request.blobs, &cache] {
+                assert!(matches!(blobs.get(&image.blob), Err(MediaError::NotLoaded)));
             }
         }
     }

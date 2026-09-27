@@ -1,7 +1,7 @@
 use super::*;
 
 #[derive(Clone, Copy)]
-pub(super) enum InputTarget {
+pub enum InputTarget {
     Menu,
     Search,
     Prompt,
@@ -10,10 +10,10 @@ pub(super) enum InputTarget {
 }
 
 impl App {
-    /// The inspector tab before or after the shown one, wrapping.
-    pub(super) fn cycle_tab(&mut self, backwards: bool) {
+    /// Show an inspector tab at its latest activity.
+    pub(super) fn set_tab(&mut self, tab: Tab) {
         self.selection = None;
-        self.tab = self.tab.next(backwards);
+        self.tab = tab;
         self.view().scroll = None;
         self.invalidate_content();
     }
@@ -21,15 +21,18 @@ impl App {
     /// View the agent above or below the viewed one in the tree, wrapping, at its
     /// latest activity, and keep the tree focused for the next step.
     pub(super) fn step_agent(&mut self, backwards: bool) {
-        let agents = self.projection.visible(&self.selected);
-        let Some(current) = agents.iter().position(|agent| agent.id == self.selected) else {
+        let (agents, selected) = (&self.projection.agents, &self.selected);
+        let shown: Vec<_> = self.projection.visible(selected).collect();
+        let Some(current) = shown.iter().position(|&i| &agents[i].id == selected) else {
             return;
         };
-        let step = if backwards { agents.len() - 1 } else { 1 };
-        let next = agents[(current + step) % agents.len()].id.clone();
-        self.select(next);
-        let shown = self.projection.visible(&self.selected);
-        let cursor = shown.iter().position(|agent| agent.id == self.selected);
+        let step = if backwards { shown.len() - 1 } else { 1 };
+        self.select(agents[shown[(current + step) % shown.len()]].id.clone());
+        let (agents, selected) = (&self.projection.agents, &self.selected);
+        let cursor = self
+            .projection
+            .visible(selected)
+            .position(|i| &agents[i].id == selected);
         self.tree_cursor = cursor.unwrap_or(0);
         self.view().scroll = None;
         self.focus = Focus::Tree;
@@ -50,15 +53,25 @@ impl App {
         }
         self.dirty = true;
     }
+
+    /// Send in `mode` from the next message, if the modes on offer have it.
+    pub fn select_mode(&mut self, mode: &ModeName) -> bool {
+        let offered = self.modes().contains_key(mode);
+        if offered {
+            self.mode.clone_from(mode);
+        }
+        offered
+    }
 }
 
 impl App {
-    pub(super) fn input_target(&self) -> InputTarget {
-        if self.menu.is_some() {
-            InputTarget::Menu
-        } else if self.search_editor.is_some() {
-            InputTarget::Search
-        } else if self.prompt_active && !self.prompts.is_empty() {
+    pub fn input_target(&self) -> InputTarget {
+        if let Some(overlay) = &self.overlay {
+            match overlay {
+                Overlay::Menu(_) => InputTarget::Menu,
+                Overlay::Search(_) => InputTarget::Search,
+            }
+        } else if self.prompt_shown() {
             InputTarget::Prompt
         } else if !self.selected.path().is_empty() {
             InputTarget::None
@@ -75,13 +88,12 @@ impl App {
             self.menu_key(key);
             return;
         }
-        if matches!(target, InputTarget::Search) {
-            let editor = self.search_editor.as_mut().unwrap();
+        if let Some(Overlay::Search(editor)) = &mut self.overlay {
             match key.code {
-                KeyCode::Esc => self.search_editor = None,
+                KeyCode::Esc => self.overlay = None,
                 KeyCode::Enter => {
                     let query = editor.text().to_owned();
-                    self.search_editor = None;
+                    self.overlay = None;
                     self.view().query = query;
                     self.find(false);
                 }
@@ -92,7 +104,7 @@ impl App {
             return;
         }
         if matches!(target, InputTarget::Prompt) {
-            let options = self.prompt_options();
+            let options = self.prompt_options().len();
             let takes_text = self
                 .prompts
                 .front()
@@ -130,20 +142,14 @@ impl App {
                 KeyCode::Tab | KeyCode::BackTab if editing_question => {
                     self.set_question_editing(!self.question_editing());
                 }
-                KeyCode::Up | KeyCode::BackTab => {
+                KeyCode::Up | KeyCode::BackTab | KeyCode::Down | KeyCode::Tab => {
                     self.set_question_editing(false);
-                    if !options.is_empty() {
-                        self.prompt_input_mut().choice =
-                            (self.prompt_input().choice + options.len() - 1) % options.len();
-                        self.prompt_input_mut().options_scrolled = false;
-                    }
-                }
-                KeyCode::Down | KeyCode::Tab => {
-                    self.set_question_editing(false);
-                    if !options.is_empty() {
-                        self.prompt_input_mut().choice =
-                            (self.prompt_input().choice + 1) % options.len();
-                        self.prompt_input_mut().options_scrolled = false;
+                    if options > 0 {
+                        let back = matches!(key.code, KeyCode::Up | KeyCode::BackTab);
+                        let input = self.prompt_input_mut();
+                        let step = if back { options - 1 } else { 1 };
+                        input.choice = (input.choice + step) % options;
+                        input.options_scrolled = false;
                     }
                 }
                 KeyCode::Enter => self.answer(),
@@ -158,7 +164,7 @@ impl App {
                     {
                         self.set_question_editing(true);
                     }
-                    text_changed = self.prompt_input_mut().editor.handle(key).text_changed;
+                    text_changed = self.prompt_input_mut().editor.handle(key).text_changed();
                 }
             }
             if editing_question
@@ -291,20 +297,21 @@ impl App {
                     self.editor.handle(key);
                 }
             },
-            Focus::Tree => {
-                let agents = self.projection.visible(&self.selected);
-                match key.code {
-                    KeyCode::Up | KeyCode::Down => self.step_agent(key.code == KeyCode::Up),
-                    KeyCode::Enter => {
-                        if let Some(agent) = agents.get(self.tree_cursor) {
-                            self.select(agent.id.clone());
-                        }
+            Focus::Tree => match key.code {
+                KeyCode::Up | KeyCode::Down => self.step_agent(key.code == KeyCode::Up),
+                KeyCode::Enter => {
+                    let index = self
+                        .projection
+                        .visible(&self.selected)
+                        .nth(self.tree_cursor);
+                    if let Some(index) = index {
+                        self.select(self.projection.agents[index].id.clone());
                     }
-                    KeyCode::Left => self.command(Command::Parent),
-                    KeyCode::Right => self.command(Command::Child),
-                    _ => {}
                 }
-            }
+                KeyCode::Left => self.command(Command::Parent),
+                KeyCode::Right => self.command(Command::Child),
+                _ => {}
+            },
             Focus::Content => match key.code {
                 KeyCode::Home => self.view().scroll = Some(0),
                 KeyCode::End => self.view().scroll = None,
@@ -324,8 +331,10 @@ impl App {
                     }
                 }
                 KeyCode::Enter => self.toggle(),
-                KeyCode::Char('[' | ']') => self.cycle_tab(key.code == KeyCode::Char('[')),
-                KeyCode::Char('/') => self.search_editor = Some(Editor::default()),
+                KeyCode::Char('[' | ']') => {
+                    self.set_tab(self.tab.next(key.code == KeyCode::Char('[')));
+                }
+                KeyCode::Char('/') => self.overlay = Some(Overlay::Search(Editor::default())),
                 KeyCode::Char('n' | 'N') => self.find(key.code == KeyCode::Char('N')),
                 KeyCode::Char('y') => self.copy(),
                 KeyCode::Char('o') => self.output_menu(),
@@ -339,15 +348,22 @@ impl App {
             },
         }
     }
+    fn latest_row(&self) -> usize {
+        let rows = self.render.rows.len();
+        rows.saturating_sub(self.content_rect.height as usize)
+    }
+    /// The first transcript row in view: the pinned one, else the latest page.
+    pub(super) fn scroll_offset(&self) -> usize {
+        let view = self.views.get(&self.selected).and_then(|view| view.scroll);
+        view.unwrap_or(self.latest_row())
+    }
     pub(super) fn scroll(&mut self, delta: isize) {
-        let max = self
-            .render
-            .rows
-            .len()
-            .saturating_sub(self.content_rect.height as usize);
-        let old = self.view().scroll.unwrap_or(max);
-        let next = old.saturating_add_signed(delta).min(max);
-        self.view().scroll = if next == max { None } else { Some(next) };
+        let latest = self.latest_row();
+        let next = self
+            .scroll_offset()
+            .saturating_add_signed(delta)
+            .min(latest);
+        self.view().scroll = (next != latest).then_some(next);
     }
     pub(super) fn reveal_row(&mut self) {
         let row = self.view().row;
@@ -365,10 +381,10 @@ impl App {
             let job = entry.job_id();
             // An override from a toggle not yet rebuilt into the entries wins.
             let closing = self.views[&self.selected].is_expanded(&key, entry.open());
-            let view = self.view();
-            view.set_expanded(key, !closing);
+            self.view().set_expanded(key.clone(), !closing);
             self.selection = None;
-            self.invalidate_content();
+            self.content_cache.invalidate_entry(key);
+            self.content_dirty = true;
             if !closing && let Some(job) = job {
                 self.fetch_output(job);
             }
@@ -489,7 +505,8 @@ mod tests {
     async fn composer_pastes_submit_in_place_and_restore_history_drafts() {
         let (_root, mut app) = draft_fixture().await;
         // Keep the submitted message queued without starting a provider/session.
-        app.start = StartState::Creating(PendingStart::Script(PathBuf::from("pending.js")));
+        let (path, model, mode) = ("pending.js".into(), app.model.clone(), app.mode.clone());
+        app.start = StartState::Creating(PendingStart::Script { path, model, mode });
         let (first, second) = ("first\n".repeat(13), "second\n".repeat(14));
         app.editor.insert("before after");
         app.editor.set_cursor("before ".len());
@@ -528,7 +545,7 @@ mod tests {
         assert_eq!(app.editor.text(), "short\npaste");
         app.event(Event::Paste("long\n".repeat(13)));
         app.command(Command::Attachments);
-        assert_eq!(app.menu.as_ref().unwrap().kind.items().len(), 1);
+        assert_eq!(app.menu().unwrap().kind.items().len(), 1);
         key(&mut app, KeyCode::Delete, M::NONE);
         assert!(!app.editor.has_pastes());
         assert_eq!(app.editor.expanded_text(), "short\npaste");
@@ -574,16 +591,9 @@ mod tests {
         // A session offers the modes it was opened with.
         let session = app.launch.create(None).await.unwrap();
         attach(&mut app, session).await;
-        let entries = (0..12).map(|index| {
-            let text = format!("skyhook\nMessage {index}");
-            model::Entry::new(
-                model::EntryKey::UnsavedStatus(index),
-                text,
-                model::Surface::Agent,
-            )
-        });
-        app.install_entries(entries.collect());
-        app.content_dirty = false;
+        for index in 0..12 {
+            app.local_notice(format!("Message {index}"));
+        }
         let markers = |buffer: &ratatui::buffer::Buffer| {
             let cells = buffer.content.iter().filter(|cell| cell.symbol() == "▌");
             cells.map(|cell| cell.fg).collect::<Vec<_>>()
@@ -596,7 +606,8 @@ mod tests {
             (KeyCode::BackTab, "none"),
         ] {
             key(&mut app, code, M::NONE);
-            assert!(app.mode == mode && app.focus == Focus::Composer, "{mode}");
+            assert_eq!(app.mode.as_str(), mode);
+            assert!(app.focus == Focus::Composer, "{mode}");
         }
         assert!(draw(&mut app).contains("none · "));
         assert_eq!(app.view().row, 0);
@@ -611,14 +622,8 @@ mod tests {
             [ratatui::style::Color::Rgb(255, 255, 255)]
         );
 
-        let mut child = app.projection.agents[0].clone();
-        child.id = child.id.child(1);
-        app.projection.agents.push(child);
+        let (root, child) = (app.root_agent().clone(), push_child(&mut app, 1).await);
         draw(&mut app);
-        let (root, child) = (
-            app.projection.agents[0].id.clone(),
-            app.projection.agents[1].id.clone(),
-        );
         // In the tree, a step views the next agent at its latest activity, wrapping.
         app.focus = Focus::Tree;
         app.view().scroll = Some(0);

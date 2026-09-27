@@ -579,11 +579,11 @@ pub(in super::super) mod tests {
         lines.into_iter().map(|parsed| parsed.line).collect()
     }
 
-    fn rendered(text: &str, width: usize) -> Vec<Line<'static>> {
+    pub(in super::super) fn rendered(text: &str, width: usize) -> Vec<Line<'static>> {
         render(text, false, width)
     }
 
-    fn strings(lines: &[Line<'_>]) -> Vec<String> {
+    pub(in super::super) fn strings(lines: &[Line<'_>]) -> Vec<String> {
         lines.iter().map(ToString::to_string).collect()
     }
 

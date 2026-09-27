@@ -1,15 +1,15 @@
 //! The one HTTP provider: a codec, a transport dialect, the composed request
 //! headers with their credentials, and the timeouts. Dialect modules construct it.
 
-use std::{collections::VecDeque, time::Duration};
+use std::time::Duration;
 
-use futures_util::{StreamExt, TryStreamExt, stream};
+use futures_util::{TryStreamExt, stream};
 use reqwest::Url;
 
 use crate::provider::{
     Provider, ProviderContext, ProviderError, ResponseStream,
-    codec::{self, Codec, common},
-    protocol::{ContextId, ModelRequest, ResponseEvent, Scope},
+    codec::{self, Codec, CodecName},
+    protocol::{AssistantItem, ContextId, Message, ModelRequest, ResponseEvent, Scope},
 };
 
 pub(crate) mod auth;
@@ -82,8 +82,7 @@ pub(crate) struct Build<'a> {
     pub scope_tag: &'a str,
     pub endpoint: Url,
     pub codec: Codec,
-    pub session: Session,
-    pub errors: errors::ErrorSignals,
+    pub transport: Transport,
     /// Every source the entry composes, credentials and `Accept` last.
     pub headers: Headers,
     pub timeouts: Timeouts,
@@ -94,8 +93,7 @@ pub(crate) struct HttpProvider {
     client: reqwest::Client,
     endpoint: Url,
     codec: Codec,
-    session: Session,
-    errors: errors::ErrorSignals,
+    transport: Transport,
     headers: Headers,
     scope: Scope,
     timeouts: Timeouts,
@@ -104,7 +102,7 @@ pub(crate) struct HttpProvider {
 impl HttpProvider {
     /// Admission validated the timeouts; only the HTTP client can fail here.
     pub(crate) fn new(build: Build<'_>) -> Result<Self, ProviderError> {
-        let scope = common::reasoning_scope(
+        let scope = reasoning_scope(
             build.name,
             build.endpoint.as_str(),
             build.codec.name(),
@@ -114,8 +112,7 @@ impl HttpProvider {
             client: transport::client()?,
             endpoint: build.endpoint,
             codec: build.codec,
-            session: build.session,
-            errors: build.errors,
+            transport: build.transport,
             headers: build.headers,
             scope,
             timeouts: build.timeouts,
@@ -133,6 +130,30 @@ impl HttpProvider {
     #[cfg(test)]
     pub(crate) fn scope(&self) -> &Scope {
         &self.scope
+    }
+}
+
+/// Provider-bound provenance prevents replaying private reasoning to a different
+/// endpoint, codec or dialect even when protocol and model names happen to match.
+fn reasoning_scope(name: &str, endpoint: &str, codec: CodecName, dialect: &str) -> Scope {
+    let codec = codec.path_suffix();
+    let digest = crate::sha256_hex(format!("{name}\0{endpoint}\0{codec}\0{dialect}"));
+    Scope::try_from(digest).expect("digest is nonblank")
+}
+
+fn filter_reasoning_scope(request: &mut ModelRequest, scope: &Scope) {
+    for message in request.messages_mut() {
+        if let Message::Assistant(items) = message {
+            for item in items {
+                if let AssistantItem::Reasoning { replay, .. } = item
+                    && replay
+                        .as_ref()
+                        .is_some_and(|replay| replay.provenance.scope != *scope)
+                {
+                    *replay = None;
+                }
+            }
+        }
     }
 }
 
@@ -158,10 +179,7 @@ impl ProviderContext for Context {
         let context = self.context.clone();
         let session = self.session.clone();
         let started = async move {
-            if request.model.trim().is_empty() {
-                return Err(common::invalid("model must not be empty"));
-            }
-            common::filter_reasoning_scope(&mut request, &provider.scope);
+            filter_reasoning_scope(&mut request, &provider.scope);
             let encoded = provider.codec.encode(&request, &context)?;
             // The codec's placements, then the turn's session header, replace
             // the composed headers before any value is produced.
@@ -169,27 +187,28 @@ impl ProviderContext for Context {
             for (name, value) in &encoded.headers {
                 headers.insert(name.clone(), Value::Fixed(value.clone()));
             }
-            if let Some((name, value)) = session.prepare(&provider.session, &request) {
+            if let Some((name, value)) = session.prepare(&provider.transport.session, &request) {
                 headers.insert(name, Value::Fixed(value));
             }
             let headers = headers.resolve().await?;
+            let body = encoded.body.to_string();
             let decoder = provider.codec.decoder(
-                request.model,
+                request.model.into(),
                 provider.scope,
-                &encoded.body,
-                provider.errors,
+                body.as_bytes(),
+                provider.transport.errors,
             );
             let (response, events) = transport::post_sse(
                 &provider.client,
                 provider.endpoint.as_str(),
                 headers.map(),
-                &encoded.body,
+                body,
                 provider.timeouts,
             )
             .await
             .map_err(|failure| match failure {
                 transport::Failure::Rejected(rejection) => {
-                    let error = provider.codec.error(&rejection, provider.errors);
+                    let error = provider.codec.error(&rejection, provider.transport.errors);
                     if rejection.unauthorized() {
                         headers.unauthorized(error)
                     } else {
@@ -199,58 +218,30 @@ impl ProviderContext for Context {
                 transport::Failure::Other(error) => error,
             })?;
             headers.served();
-            session.observe(&provider.session, &response);
-            Ok(decode_stream(events, decoder))
+            session.observe(&provider.transport.session, &response);
+            Ok::<_, ProviderError>(transport::flatten(events, decoder))
         };
         Box::pin(stream::once(started).try_flatten())
     }
 }
 
-fn decode_stream(frames: transport::SseStream, decoder: codec::Decoder) -> ResponseStream {
-    struct State {
-        frames: transport::SseStream,
-        decoder: codec::Decoder,
-        pending: VecDeque<ResponseEvent>,
-        done: bool,
+impl transport::Batches for codec::Decoder {
+    type Input = transport::SseEvent;
+    type Output = ResponseEvent;
+
+    fn push(&mut self, event: transport::SseEvent) -> Result<Vec<ResponseEvent>, ProviderError> {
+        self.decode(&event)
     }
-    Box::pin(stream::unfold(
-        State {
-            frames,
-            decoder,
-            pending: VecDeque::new(),
-            done: false,
-        },
-        |mut state| async move {
-            loop {
-                if let Some(event) = state.pending.pop_front() {
-                    // Terminal protocol events close HTTP immediately rather than
-                    // waiting for an upstream connection to close or idle timeout.
-                    if matches!(event, ResponseEvent::End(_)) {
-                        state.done = true;
-                    }
-                    return Some((Ok(event), state));
-                }
-                if state.done {
-                    return None;
-                }
-                let result = match state.frames.next().await {
-                    Some(Ok(frame)) => state.decoder.decode(&frame),
-                    Some(Err(error)) => Err(error),
-                    None => {
-                        state.done = true;
-                        state.decoder.finish()
-                    }
-                };
-                match result {
-                    Ok(events) => state.pending.extend(events),
-                    Err(error) => {
-                        state.done = true;
-                        return Some((Err(error), state));
-                    }
-                }
-            }
-        },
-    ))
+
+    fn finish(&mut self) -> Result<Vec<ResponseEvent>, ProviderError> {
+        codec::Decoder::finish(self)
+    }
+
+    /// Terminal protocol events close HTTP immediately rather than waiting for
+    /// an upstream connection to close or idle timeout.
+    fn ends(event: &ResponseEvent) -> bool {
+        matches!(event, ResponseEvent::End(_))
+    }
 }
 
 #[cfg(test)]
@@ -259,10 +250,13 @@ pub(crate) mod tests {
     use crate::provider::{
         codec::{
             chat_completions,
-            common::tests::{Reduced, chat_request, reasoning_tool_request, reduce, scope},
+            common::{
+                self,
+                tests::{Reduced, reasoning_item, reduce, request, scope},
+            },
             responses,
         },
-        protocol::{Message, ModelRequest, Outcome},
+        protocol::{Binding, BlockId, Outcome, ReplayFormat, TextBlock, ToolCall, ToolResult},
     };
     use futures_util::StreamExt;
     use serde_json::{Value, json};
@@ -270,6 +264,112 @@ pub(crate) mod tests {
     use transport::tests::{Plan, Server, header_values, reply};
 
     type Events = Vec<Result<transport::SseEvent, ProviderError>>;
+
+    /// A Chat-shaped request with one tool, for provider round trips.
+    pub(crate) fn chat_request(model: &str, messages: Vec<Message>) -> ModelRequest {
+        ModelRequest {
+            history: messages,
+            tools: vec![crate::provider::protocol::ToolDefinition {
+                name: "lookup".into(),
+                description: "Find a value".into(),
+                input_schema: json!({"type":"object", "properties":{"q":{"type":"string"}}}),
+            }],
+            max_output_tokens: std::num::NonZeroU64::new(512),
+            ..request(model)
+        }
+    }
+
+    /// A tool loop whose assistant turn replays [`reasoning_item`] under `scope`.
+    pub(crate) fn reasoning_tool_request(scope: &Scope) -> ModelRequest {
+        let replay = common::replay(
+            ReplayFormat::Responses,
+            "gpt-5",
+            scope,
+            reasoning_item(),
+            Binding::Free,
+        );
+        // Native reasoning without a readable summary replays from its envelope alone.
+        let reasoning = AssistantItem::Reasoning {
+            id: "rs_1".to_owned().try_into().unwrap(),
+            position: 0.into(),
+            blocks: Vec::new(),
+            replay: Some(replay),
+        };
+        ModelRequest {
+            history: vec![
+                Message::Assistant(vec![
+                    reasoning,
+                    AssistantItem::tool_call(
+                        "fc_1",
+                        1,
+                        ToolCall::new("call_1", "inspect", json!({"path":"test"})).unwrap(),
+                    ),
+                ]),
+                Message::Tool(vec![ToolResult {
+                    call_id: "call_1".into(),
+                    name: "inspect".into(),
+                    result: json!({"ok":true}),
+                    images: vec![],
+                    is_error: false,
+                }]),
+            ],
+            max_output_tokens: std::num::NonZeroU64::new(100),
+            ..request("gpt-5")
+        }
+    }
+
+    #[test]
+    fn replay_scope_names_the_provider_endpoint_codec_and_dialect() {
+        let endpoint = "https://a.example/v1/responses";
+        let responses = CodecName::Responses;
+        let a = reasoning_scope("api", endpoint, responses, "compatible");
+        let b = reasoning_scope(
+            "api",
+            "https://b.example/v1/responses",
+            responses,
+            "compatible",
+        );
+        for other in [
+            b.clone(),
+            reasoning_scope("alias", endpoint, responses, "compatible"),
+            reasoning_scope("api", endpoint, CodecName::ChatCompletions, "compatible"),
+            reasoning_scope("api", endpoint, responses, "openai"),
+        ] {
+            assert_ne!(a, other);
+        }
+        let native = json!({"type":"reasoning","encrypted_content":"private"});
+        let replay = common::replay(
+            ReplayFormat::Responses,
+            "same-model",
+            &a,
+            native,
+            Binding::Free,
+        );
+        let mut item = AssistantItem::reasoning("reasoning-0", 0, "summary", Some(replay));
+        let AssistantItem::Reasoning { blocks, .. } = &mut item else {
+            unreachable!()
+        };
+        blocks.push(TextBlock {
+            id: BlockId::try_from("summary-1".to_owned()).unwrap(),
+            position: 1.into(),
+            text: "second summary".into(),
+        });
+        let expected_text = item.reasoning_text();
+        let request = ModelRequest {
+            history: vec![Message::Assistant(vec![item])],
+            ..request("same-model")
+        };
+        let mut matching = request.clone();
+        filter_reasoning_scope(&mut matching, &a);
+        assert_eq!(matching, request);
+        let mut foreign = request;
+        filter_reasoning_scope(&mut foreign, &b);
+        let Message::Assistant(parts) = &foreign.history[0] else {
+            unreachable!()
+        };
+        assert!(parts[0].replay().is_none());
+        assert_eq!(parts[0].reasoning_text(), expected_text);
+    }
 
     fn sse(frames: impl IntoIterator<Item = Value>) -> Events {
         let event = |data| Ok(transport::SseEvent { event: None, data });
@@ -282,10 +382,9 @@ pub(crate) mod tests {
     /// Reduce a response whose transport never reaches EOF.
     async fn reduce_without_eof(events: Events, decoder: codec::Decoder) -> Reduced {
         let events = Box::pin(stream::iter(events).chain(stream::pending()));
-        let decoded = decode_stream(events, decoder);
-        let events: Vec<_> = tokio::time::timeout(Duration::from_secs(1), decoded.collect())
-            .await
-            .expect("terminal response must not wait for HTTP EOF");
+        let decoded = transport::flatten(events, decoder);
+        // A terminal response must not wait for HTTP EOF.
+        let events: Vec<_> = crate::tests::bounded(decoded.collect()).await;
         reduce(events.into_iter().map(Result::unwrap))
     }
 
@@ -300,8 +399,9 @@ pub(crate) mod tests {
         let decoder = codec::Decoder::ChatCompletions(chat_completions::Decoder::new(
             "model".into(),
             scope(),
-            crate::provider::protocol::ReplayFormat::ChatText,
+            chat_completions::ReasoningFormat::Text,
             errors::ErrorSignals::NONE,
+            crate::media::BlobDigest::of(b""),
         ));
         let reduced = reduce_without_eof(events, decoder).await;
         assert_eq!(
@@ -328,8 +428,7 @@ pub(crate) mod tests {
             })
             .collect();
         let server = Server::start(plans).await;
-        let root = format!("{}/v1", server.url.trim_end_matches("/responses"));
-        (root, server)
+        (format!("{}/v1", server.root()), server)
     }
 
     /// One request through a context, reduced.
@@ -348,7 +447,7 @@ pub(crate) mod tests {
             dialect::{self, Overrides, Placement, Sourced, compatible},
             protocol::{Message, Outcome, ToolResult, UserContent},
         };
-        tokio::time::timeout(Duration::from_secs(10), async {
+        crate::tests::bounded(async {
             for (replay, field) in [
                 (None, Some("reasoning_content")),
                 (Some(Placement::Field(codec::path("reasoning"))), Some("reasoning")),
@@ -442,8 +541,7 @@ pub(crate) mod tests {
                 assert_eq!(requests[1]["messages"][2]["tool_call_id"], "call_a");
             }
         })
-        .await
-        .unwrap();
+        .await;
     }
 
     /// The transport's `Accept` displaces an entry's before any value is
@@ -486,7 +584,7 @@ pub(crate) mod tests {
         complete(&mut *context, request.clone()).await;
         let events: Vec<_> = context.invoke(request).collect().await;
         let error = events.into_iter().find_map(Result::err).unwrap();
-        assert_eq!(error.kind, ProviderErrorKind::Authentication);
+        assert_eq!(error.kind(), ProviderErrorKind::Authentication);
         for request in server.finish().await {
             assert_eq!(header_values(&request, "accept"), ["text/event-stream"]);
         }
@@ -495,8 +593,8 @@ pub(crate) mod tests {
 
     /// A Responses provider at `server` whose bearer key a command produces.
     fn keyed_by_command(server: &Server, session: Session, command: String) -> HttpProvider {
-        use headers::{CommandValue, Role};
-        let key = CommandValue::new(command, Some("Bearer "), Role::Credential);
+        use headers::{CommandValue, ValueField};
+        let key = CommandValue::new(command, Some("Bearer "), ValueField::ApiKey);
         let mut composed = Headers::default();
         composed.insert(reqwest::header::AUTHORIZATION, headers::Value::Command(key));
         HttpProvider::new(Build {
@@ -504,8 +602,10 @@ pub(crate) mod tests {
             scope_tag: "compatible",
             endpoint: Url::parse(&server.url).unwrap(),
             codec: codec::Codec::Responses(responses::Dialect::stateless()),
-            session,
-            errors: errors::ErrorSignals::NONE,
+            transport: Transport {
+                session,
+                ..Transport::plain()
+            },
             headers: composed,
             timeouts: Timeouts::default(),
         })
@@ -550,7 +650,7 @@ pub(crate) mod tests {
             failures.push(
                 events
                     .iter()
-                    .find_map(|event| event.as_ref().err().map(|error| error.kind)),
+                    .find_map(|event| event.as_ref().err().map(|error| error.kind())),
             );
         }
         assert_eq!(
@@ -599,9 +699,12 @@ pub(crate) mod tests {
         let turn = request.history.clone();
         // Neither an unpolled nor an invalid invocation resolves the credential.
         drop(context.invoke(request.clone()));
-        let mut empty_model = request.clone();
-        empty_model.model.clear();
-        assert!(context.invoke(empty_model).next().await.unwrap().is_err());
+        let mut unnamed = request.clone();
+        unnamed.response_schema = Some(crate::provider::protocol::ResponseSchema {
+            name: String::new(),
+            schema: json!({"type":"object"}),
+        });
+        assert!(context.invoke(unnamed).next().await.unwrap().is_err());
         assert!(!count.exists());
         request.history = vec![Message::User(vec![
             crate::provider::protocol::UserContent::Text {

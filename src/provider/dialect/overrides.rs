@@ -29,7 +29,7 @@ impl Placement {
 
 named_enum! {
     /// A placement dimension, as configuration spells it.
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum OverrideKey {
         OutputLimit = "output_limit",
         ReasoningEffort = "reasoning_effort",
@@ -104,14 +104,26 @@ impl Overrides {
     /// codec has no dimension for.
     pub(crate) fn apply(&self, mut codec: Codec) -> Result<Codec, OverrideError> {
         let family = codec.name();
-        let foreign = |key| OverrideError::Foreign { key, family };
+        if family != CodecName::ChatCompletions {
+            for (key, selected) in [
+                (
+                    OverrideKey::ReasoningReplay,
+                    self.reasoning_replay.is_some(),
+                ),
+                (OverrideKey::ToolStream, self.tool_stream.is_some()),
+            ] {
+                if selected {
+                    return Err(OverrideError::Foreign { key, family });
+                }
+            }
+        }
+        if let Some(effort) = &self.reasoning_effort {
+            codec.effort_mut().path = effort.clone();
+        }
         match &mut codec {
             Codec::ChatCompletions(dialect) => {
                 if let Some(limit) = &self.output_limit {
                     dialect.output_limit = limit.path();
-                }
-                if let Some(effort) = &self.reasoning_effort {
-                    dialect.effort.path = effort.clone();
                 }
                 if let Some(replay) = &self.reasoning_replay {
                     dialect.reasoning_replay = match replay.path() {
@@ -124,34 +136,16 @@ impl Overrides {
                 }
             }
             Codec::Responses(dialect) => {
-                if self.reasoning_replay.is_some() {
-                    return Err(foreign(OverrideKey::ReasoningReplay));
-                }
-                if self.tool_stream.is_some() {
-                    return Err(foreign(OverrideKey::ToolStream));
-                }
                 if let Some(limit) = &self.output_limit {
                     dialect.output_limit = limit.path();
                 }
-                if let Some(effort) = &self.reasoning_effort {
-                    dialect.effort.path = effort.clone();
-                }
             }
             Codec::Messages(dialect) => {
-                if self.reasoning_replay.is_some() {
-                    return Err(foreign(OverrideKey::ReasoningReplay));
-                }
-                if self.tool_stream.is_some() {
-                    return Err(foreign(OverrideKey::ToolStream));
-                }
                 if let Some(limit) = &self.output_limit {
                     dialect.output_limit = limit.path().ok_or(OverrideError::RequiresField {
                         key: OverrideKey::OutputLimit,
                         family,
                     })?;
-                }
-                if let Some(effort) = &self.reasoning_effort {
-                    dialect.effort.path = effort.clone();
                 }
             }
         }

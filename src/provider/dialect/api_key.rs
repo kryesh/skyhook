@@ -3,7 +3,7 @@
 use reqwest::header::{AUTHORIZATION, HeaderName};
 
 use super::{
-    Connection, ValueField,
+    ValueField,
     config::{Pending, Source},
 };
 use crate::provider::{codec::CodecName, http::Headers};
@@ -27,24 +27,14 @@ impl Scheme {
         }
     }
 
-    /// `key`, configured as `field`, in the header this scheme sends it in.
-    pub(crate) fn credential(self, key: &Source, field: ValueField) -> Headers<Pending> {
+    /// The configured `api_key` in the header this scheme sends it in.
+    pub(crate) fn credential(self, key: &Source) -> Headers<Pending> {
         let (header, prefix) = match self {
             Self::Bearer => (AUTHORIZATION, Some("Bearer ")),
             Self::XApiKey => (HeaderName::from_static("x-api-key"), None),
         };
         let mut headers = Headers::default();
-        headers.insert(header, key.header(field, prefix));
+        headers.insert(header, key.header(ValueField::ApiKey, prefix));
         headers
     }
-}
-
-/// The entry's `api_key` as `scheme` sends it; nothing for a keyless endpoint.
-pub(crate) fn key(connection: &Connection, scheme: Scheme) -> Headers<Pending> {
-    connection
-        .api_key
-        .as_ref()
-        .map_or_else(Headers::default, |key| {
-            scheme.credential(key, ValueField::ApiKey)
-        })
 }

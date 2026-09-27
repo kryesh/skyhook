@@ -29,7 +29,8 @@ use sidebar::*;
 use wrapping::*;
 
 use super::{
-    app::{App, Focus, Hit, MenuKind, SessionRef},
+    app::{App, Focus, Hit, InputTarget, MenuKind, Overlay, SessionRef},
+    editor::TextField,
     model::{self, Surface, Tab},
     theme::THEME,
 };

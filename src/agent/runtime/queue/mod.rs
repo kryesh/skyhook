@@ -259,7 +259,7 @@ mod tests {
             .into_iter()
             .chain((2..6).map(|index| Step::new(answer(index))));
         let tracking = Script::new(steps, &Default::default());
-        let profile = |model: &str| ModelProfile::new(model, None, 128_000, 4096, true);
+        let profile = |model: &str| crate::tests::profile(model, true);
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
             .provider(
@@ -421,7 +421,7 @@ mod tests {
         assert!(tokens.iter().all(QueuedPromptCancellation::is_claimed));
         let expected = ["test:first", "test:image", "test:last"];
         assert_eq!(texts(request.messages()), expected);
-        assert_eq!(request.model, "third-model");
+        assert_eq!(request.model.as_str(), "third-model");
         let file = file.display().to_string();
         assert!(request.messages().any(|message| matches!(message,
             Sent::User(blocks) if blocks.iter().any(|block| matches!(block,
@@ -482,7 +482,7 @@ mod tests {
                 Err(Interrupted)
             ]
         ));
-        assert_eq!(next.model, "second-model");
+        assert_eq!(next.model.as_str(), "second-model");
         let found = texts(next.messages());
         assert_eq!(found, ["test:initial", "test:one", "test:two"]);
         tracking.release(1);
@@ -613,7 +613,7 @@ mod tests {
         tracking.release(0);
         let next = tracking.request(1).await;
         let expected = ["test:initial", "test:dropped"];
-        assert_eq!(next.model, "second-model");
+        assert_eq!(next.model.as_str(), "second-model");
         assert_eq!(texts(next.messages()), expected);
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();

@@ -35,7 +35,7 @@ impl StatusLog {
                                 session.record_status(agent.clone(), message.clone()).await
                             {
                                 let _ = work.send(Work::StatusFailed {
-                                    session: Some(session.id()),
+                                    session: session.id(),
                                     agent,
                                     message: format!(
                                         "{message}\nCould not save this status: {error}"
@@ -44,11 +44,7 @@ impl StatusLog {
                             }
                         } else {
                             // Before the first message, notices are UI-only.
-                            let _ = work.send(Work::StatusFailed {
-                                session: None,
-                                agent,
-                                message,
-                            });
+                            let _ = work.send(Work::LocalStatus { agent, message });
                         }
                     }
                     Request::Flush(done) => {

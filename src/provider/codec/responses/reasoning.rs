@@ -1,5 +1,7 @@
 //! Readable reasoning namespaces and exact native replay reconciliation.
+use super::native::PartType;
 use super::*;
+use crate::provider::codec::common::tagged;
 
 /// Readable content and summaries are independent wire namespaces. Interleaved
 /// internal positions preserve both namespaces without exposing native state.
@@ -7,13 +9,14 @@ pub(super) fn reasoning_position(position: usize, content: bool) -> Result<usize
     position
         .checked_mul(2)
         .and_then(|position| position.checked_add(usize::from(content)))
-        .ok_or_else(|| protocol("reasoning part index overflow"))
+        .ok_or_else(|| NATIVE.error("reasoning part index overflow"))
 }
 
 pub(super) fn readable_reasoning(part: &Value, summary: bool) -> Result<&str, ProviderError> {
-    match (summary, string(part, "type")?) {
-        (true, "summary_text") | (false, "reasoning_text" | "output_text") => {}
-        _ => return Err(protocol("unsupported reasoning content part")),
+    match (summary, tagged(part)) {
+        (true, Some(PartType::SummaryText))
+        | (false, Some(PartType::ReasoningText | PartType::OutputText)) => {}
+        _ => return Err(NATIVE.error("unsupported reasoning content part")),
     }
     reasoning_text(part)
 }
@@ -24,12 +27,12 @@ pub(super) fn reasoning_text(value: &Value) -> Result<&str, ProviderError> {
     let field = |key| match value.get(key) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(text)) => Ok(Some(text.as_str())),
-        _ => Err(protocol("invalid readable reasoning text")),
+        _ => Err(NATIVE.error("invalid readable reasoning text")),
     };
     match (field("text")?, field("reasoning")?) {
         (Some(text), None) | (None, Some(text)) => Ok(text),
         (Some(text), Some(reasoning)) if text == reasoning => Ok(text),
-        _ => Err(protocol("missing or ambiguous readable reasoning text")),
+        _ => Err(NATIVE.error("missing or ambiguous readable reasoning text")),
     }
 }
 
@@ -39,7 +42,7 @@ pub(super) fn reasoning_parts(item: &Value) -> Result<BTreeMap<usize, Content>, 
         let values = match item.get(field) {
             None | Some(Value::Null) => continue,
             Some(Value::Array(values)) => values,
-            _ => return Err(protocol(format!("invalid reasoning {field}"))),
+            _ => return Err(NATIVE.error(format!("invalid reasoning {field}"))),
         };
         for (position, part) in values.iter().enumerate() {
             parts.insert(
@@ -54,29 +57,19 @@ pub(super) fn reasoning_parts(item: &Value) -> Result<BTreeMap<usize, Content>, 
 }
 
 /// Plaintext is reconciled separately against display blocks. Native replay is
-/// always an unchanged received snapshot, not a reconstruction from those blocks.
-pub(super) fn native_enrichment(previous: &Value, terminal: &Value) -> bool {
-    fn enrich(previous: &Value, terminal: &Value) -> bool {
-        if previous == terminal || previous.is_null() {
-            return true;
-        }
-        match (previous.as_object(), terminal.as_object()) {
-            (Some(previous), Some(terminal)) => previous.iter().all(|(key, value)| {
-                terminal.get(key).is_some_and(|next| {
-                    (key == "encrypted_content" && value.as_str() == Some("") && next.is_string())
-                        || enrich(value, next)
-                })
-            }),
-            _ => false,
-        }
+/// always an unchanged received snapshot, not a reconstruction from those
+/// blocks: `terminal` may only fill what `previous` left null or an empty
+/// `encrypted_content`, apart from the `skip`ped keys.
+pub(super) fn native_enrichment(previous: &Value, terminal: &Value, skip: &[&str]) -> bool {
+    if previous == terminal || previous.is_null() {
+        return true;
     }
     match (previous.as_object(), terminal.as_object()) {
         (Some(previous), Some(terminal)) => previous.iter().all(|(key, value)| {
-            // Identity aliases are checked by end(); status is lifecycle metadata.
-            matches!(key.as_str(), "summary" | "content" | "id" | "status")
+            skip.contains(&key.as_str())
                 || terminal.get(key).is_some_and(|next| {
                     (key == "encrypted_content" && value.as_str() == Some("") && next.is_string())
-                        || enrich(value, next)
+                        || native_enrichment(value, next, &[])
                 })
         }),
         _ => false,
@@ -88,9 +81,10 @@ impl Decoder {
         let supplied = reasoning_parts(native)?;
         let item = &self.items[&id];
         if let Some(previous) = item.snapshot()
-            && !native_enrichment(previous, native)
+            // Identity aliases are checked by end(); status is lifecycle metadata.
+            && !native_enrichment(previous, native, &["summary", "content", "id", "status"])
         {
-            return Err(protocol("conflicting final reasoning state"));
+            return Err(NATIVE.error("conflicting final reasoning state"));
         }
         // A migration alias is only valid while the snapshots present one
         // namespace. Once both are explicit, each needs its own display block.
@@ -491,12 +485,7 @@ mod tests {
             (Some("different"), "native", false),
             (None, "changed", true),
         ] {
-            let mut decoder = Decoder::new(
-                "model".into(),
-                super::super::tests::scope(),
-                &super::super::tests::streamed_only(),
-                ErrorSignals::NONE,
-            );
+            let mut decoder = super::super::tests::decoder_for(TerminalOutput::StreamedOnly);
             let result = feed(
                 &mut decoder,
                 vec![

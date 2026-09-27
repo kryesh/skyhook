@@ -2,7 +2,32 @@
 use super::diagnostics::{
     DiagnosticMessage, FetchDiagnostic, FetchError, FetchErrorKind, FetchPhase,
 };
-use reqwest::Method;
+use reqwest::{Method, header::HeaderMap};
+use schemars::JsonSchema;
+use serde::Deserialize;
+
+use super::validation::HttpRequestUrl;
+
+#[derive(Debug, Default, Clone, Copy, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum RedirectPolicy {
+    #[default]
+    Safe,
+    Follow,
+    Manual,
+}
+
+impl RedirectPolicy {
+    /// Whether a request with `method` follows a redirect: safe redirects follow
+    /// only GET and HEAD.
+    pub(super) fn follows(self, method: &Method) -> bool {
+        match self {
+            Self::Safe => method == Method::GET || method == Method::HEAD,
+            Self::Follow => true,
+            Self::Manual => false,
+        }
+    }
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct FollowableRedirectStatus(u16);
@@ -20,6 +45,42 @@ impl FollowableRedirectStatus {
     }
 }
 
+pub(super) fn redirect_headers(
+    headers: &mut HeaderMap,
+    from: &HttpRequestUrl,
+    to: &HttpRequestUrl,
+    drop_body: bool,
+) {
+    headers.remove("host");
+    if from.origin() != to.origin() {
+        *headers = headers
+            .iter()
+            .filter(|(name, _)| {
+                matches!(
+                    name.as_str(),
+                    "accept"
+                        | "accept-language"
+                        | "accept-encoding"
+                        | "user-agent"
+                        | "content-type"
+                )
+            })
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect();
+    }
+    if drop_body {
+        for name in [
+            "content-type",
+            "content-encoding",
+            "content-language",
+            "content-location",
+            "digest",
+        ] {
+            headers.remove(name);
+        }
+    }
+}
+
 pub(super) fn redirect_error(message: DiagnosticMessage) -> FetchError {
     FetchDiagnostic::classified(
         FetchPhase::Redirect,
@@ -32,10 +93,11 @@ pub(super) fn redirect_error(message: DiagnosticMessage) -> FetchError {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        tests::{args, executor, fetch, response, server},
-        validation::{FetchPlan, HttpRequestUrl, redirect_headers},
+        tests::{args, executor, fetch, server},
+        validation::FetchPlan,
     };
     use super::*;
+    use crate::provider::http::transport::tests::reply;
     use serde_json::json;
 
     #[test]
@@ -96,48 +158,45 @@ mod tests {
         let executor = executor(&runtime);
         let payload = json!({"kind":"text","value":"payload"});
         for policy in ["safe", "manual"] {
-            let (url, task) = server(vec![response(
-                "302 Found",
-                "Location: /next\r\n",
-                "redirect",
-            )])
-            .await;
+            let (url, task) =
+                server(vec![reply("302 Found", "Location: /next\r\n", "redirect")]).await;
             let arguments = json!({"url":url,"method":"POST","body":payload,"redirects":policy});
             let result = fetch(&runtime, &executor, arguments).await.unwrap();
-            assert_eq!(
-                (&result["status"], &result["redirects"]),
-                (&json!(302), &json!([]))
-            );
-            assert!(task.await.unwrap()[0].ends_with("payload"));
+            assert_eq!(result["status"], 302);
+            assert!(result.get("redirects").is_none());
+            assert!(task.finish().await[0].ends_with("payload"));
         }
-        let (end, end_task) = server(vec![response(
+        let (end, end_task) = server(vec![reply(
             "200 OK",
             "Content-Type: text/plain\r\n",
             "done",
         )])
         .await;
         let location = format!("Location: {end}/final\r\n");
-        let (start, start_task) = server(vec![response("303 See Other", &location, "")]).await;
+        let (start, start_task) = server(vec![reply("303 See Other", &location, "")]).await;
         let arguments = json!({
             "url":start, "method":"POST", "body":payload, "redirects":"follow",
             "auth":{"kind":"bearer","token":"secret"}, "headers":{"Cookie":"private=1","X-Api-Key":"custom-secret"}
         });
         let result = fetch(&runtime, &executor, arguments).await.unwrap();
-        assert_eq!(result["method"], "GET");
-        assert_eq!(result["redirects"].as_array().unwrap().len(), 1);
-        assert!(start_task.await.unwrap()[0].contains("authorization: Bearer secret"));
-        let request = &end_task.await.unwrap()[0];
+        let location = format!("{end}/final");
+        assert_eq!(
+            result["redirects"],
+            json!([{"status":303, "location":location, "method":"POST"}])
+        );
+        assert!(start_task.finish().await[0].contains("authorization: Bearer secret"));
+        let request = &end_task.finish().await[0];
         assert!(request.starts_with("GET /final HTTP/1.1"));
         for secret in ["secret", "private=1", "payload", "content-type"] {
             assert!(!request.contains(secret));
         }
         // An exhausted redirect limit fails without retries.
-        let (url, task) = server(vec![response("302 Found", "Location: /again\r\n", "")]).await;
+        let (url, task) = server(vec![reply("302 Found", "Location: /again\r\n", "")]).await;
         assert!(
             fetch(&runtime, &executor, json!({"url":url,"max_redirects":0}))
                 .await
                 .is_err()
         );
-        assert_eq!(task.await.unwrap().len(), 1);
+        assert_eq!(task.finish().await.len(), 1);
     }
 }

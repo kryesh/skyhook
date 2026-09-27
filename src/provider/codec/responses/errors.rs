@@ -1,20 +1,15 @@
 //! The error codes of the Responses API, over HTTP and in `error`,
 //! `response.error` and `response.failed` events. Dialects map their servers' own codes onto kinds
 //! with their error rules.
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
 
 use crate::{
     named_enum::named_enum,
-    provider::{
-        ProviderError, ProviderErrorKind,
-        codec::openai::{self, ErrorCode},
-        http::errors::{ErrorSignals, Reading},
-    },
+    provider::{ProviderErrorKind, codec::openai::ErrorCode},
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub(crate) enum Code {
         ContextLengthExceeded = "context_length_exceeded",
         InvalidApiKey = "invalid_api_key",
@@ -33,7 +28,7 @@ impl ErrorCode for Code {
             Self::ContextLengthExceeded => ProviderErrorKind::ContextWindowExceeded,
             Self::InvalidApiKey => ProviderErrorKind::Authentication,
             Self::InsufficientQuota => ProviderErrorKind::Billing,
-            Self::RateLimitExceeded => ProviderErrorKind::RateLimited { retry_after: None },
+            Self::RateLimitExceeded => ProviderErrorKind::RateLimited,
             Self::InvalidRequest => ProviderErrorKind::InvalidRequest,
             Self::ModelNotFound | Self::PreviousResponseNotFound | Self::ServerError => {
                 return None;
@@ -42,26 +37,13 @@ impl ErrorCode for Code {
     }
 }
 
-/// A Responses error body.
-pub(crate) fn read(native: &Value) -> Reading {
-    openai::read::<Code>(native)
-}
-
-/// The error an `error` event or a failed response carries, read from the
-/// envelope around it.
-pub(super) fn api_error(native: &Value, signals: ErrorSignals) -> ProviderError {
-    let reading = read(native);
-    let kind = reading.kind(None, native, signals, None);
-    let summary = format!("Responses request failed ({kind})");
-    ProviderError {
-        kind,
-        message: reading.describe(summary, native),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{
+        codec::openai::read,
+        http::errors::{ErrorSignals, classify},
+    };
     use serde_json::json;
 
     #[test]
@@ -72,24 +54,22 @@ mod tests {
                 "invalid_request_error",
                 ProviderErrorKind::InvalidRequest,
             ),
-            (
-                "code",
-                "server_error",
-                ProviderErrorKind::Unavailable { retry_after: None },
-            ),
+            ("code", "server_error", ProviderErrorKind::Unavailable),
             (
                 "code",
                 "unknown_error_SECRET",
-                ProviderErrorKind::Unavailable { retry_after: None },
+                ProviderErrorKind::Unavailable,
             ),
         ] {
-            let error = api_error(
-                &json!({field: identifier, "message": "rejected"}),
+            let native = json!({field: identifier, "message": "rejected"});
+            let error = classify(
+                None,
+                &native,
+                read::<Code>(&native),
                 ErrorSignals::NONE,
+                None,
             );
-            assert_eq!(error.kind, kind);
-            let prefix = format!("Responses request failed ({kind})");
-            assert!(error.message.starts_with(&prefix));
+            assert_eq!(error.kind(), kind);
             assert_eq!(
                 error.message.contains("[code="),
                 !identifier.contains("SECRET")

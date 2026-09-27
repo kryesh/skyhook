@@ -1,12 +1,89 @@
-//! Native streaming event dispatch.
+//! The native event types, and dispatch of their normalized form.
+
 use super::normalization::NormalizedEvent;
 use super::*;
+use crate::named_enum::named_enum;
+
+named_enum! {
+    /// The native event types this codec reads; others carry nothing it uses.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) parsed enum Event {
+        Created = "response.created",
+        InProgress = "response.in_progress",
+        Queued = "response.queued",
+        ItemAdded = "response.output_item.added",
+        ItemDone = "response.output_item.done",
+        TextDelta = "response.output_text.delta",
+        TextDone = "response.output_text.done",
+        Annotation = "response.output_text.annotation.added",
+        RefusalDelta = "response.refusal.delta",
+        RefusalDone = "response.refusal.done",
+        ReasoningDelta = "response.reasoning_text.delta",
+        ReasoningDone = "response.reasoning_text.done",
+        SummaryDelta = "response.reasoning_summary_text.delta",
+        SummaryDone = "response.reasoning_summary_text.done",
+        ArgumentsDelta = "response.function_call_arguments.delta",
+        ArgumentsDone = "response.function_call_arguments.done",
+        PartAdded = "response.content_part.added",
+        PartDone = "response.content_part.done",
+        ReasoningPartAdded = "response.reasoning_part.added",
+        ReasoningPartDone = "response.reasoning_part.done",
+        SummaryPartAdded = "response.reasoning_summary_part.added",
+        SummaryPartDone = "response.reasoning_summary_part.done",
+        Completed = "response.completed",
+        Incomplete = "response.incomplete",
+        Failed = "response.failed",
+        Error = "error" | "response.error",
+        Aborted = "response.aborted" | "response.cancelled" | "response.canceled"
+            | "response.interrupted",
+    }
+}
+
+impl Event {
+    /// The kind of item an event on a live item addresses; `None` for the
+    /// generic content-part events, whose item decides.
+    pub(super) fn item_kind(self) -> Option<ItemKind> {
+        match self {
+            Self::TextDelta
+            | Self::TextDone
+            | Self::Annotation
+            | Self::RefusalDelta
+            | Self::RefusalDone => Some(ItemKind::Text),
+            Self::ReasoningDelta
+            | Self::ReasoningDone
+            | Self::SummaryDelta
+            | Self::SummaryDone
+            | Self::ReasoningPartAdded
+            | Self::ReasoningPartDone
+            | Self::SummaryPartAdded
+            | Self::SummaryPartDone => Some(ItemKind::Reasoning),
+            Self::ArgumentsDelta | Self::ArgumentsDone => Some(ItemKind::ToolCall),
+            _ => None,
+        }
+    }
+
+    /// Whether the event addresses the summary namespace of a reasoning item.
+    pub(super) fn is_summary(self) -> bool {
+        matches!(
+            self,
+            Self::SummaryDelta | Self::SummaryDone | Self::SummaryPartAdded | Self::SummaryPartDone
+        )
+    }
+
+    /// Whether a content-part event ends its part rather than announcing it.
+    pub(super) fn is_done(self) -> bool {
+        matches!(
+            self,
+            Self::PartDone | Self::ReasoningPartDone | Self::SummaryPartDone
+        )
+    }
+}
 
 impl Decoder {
     /// Feed a native Responses event.
     pub(crate) fn feed(&mut self, event: Value) -> Result<Vec<ResponseEvent>, ProviderError> {
         if self.completed {
-            return Err(protocol("event after terminal response"));
+            return Err(NATIVE.error("event after terminal response"));
         }
         let mut events = Vec::new();
         match self.normalize_event(&event)? {
@@ -15,10 +92,7 @@ impl Decoder {
                 index,
                 wire,
                 native,
-            } => {
-                self.start(index, native)?;
-                self.items.get_mut(&index).expect("started item").wire_index = wire;
-            }
+            } => self.start(index, wire, native)?,
             NormalizedEvent::ItemDone { index, native } => {
                 self.end(index, native, false)?;
             }
@@ -35,7 +109,7 @@ impl Decoder {
                     .final_arguments
                     .is_some()
                 {
-                    return Err(protocol("arguments delta after done"));
+                    return Err(NATIVE.error("arguments delta after done"));
                 }
                 self.delta(id, 0, text, &mut events)?;
             }
@@ -50,7 +124,7 @@ impl Decoder {
                             .function_mut()?
                             .streaming_mut()?;
                         if item.final_arguments.is_some() {
-                            return Err(protocol("conflicting final function arguments"));
+                            return Err(NATIVE.error("conflicting final function arguments"));
                         }
                         item.final_arguments = Some(FinalArguments::Incomplete(text.into()));
                         return Ok(events);
@@ -71,7 +145,7 @@ impl Decoder {
                 if let (Some(call_id), Some(name)) = (&item.call_id, &item.name) {
                     let content = Content::ToolCall(
                         ToolCall::new(call_id.clone(), name.clone(), Value::Object(arguments))
-                            .map_err(|error| protocol(error.to_string()))?,
+                            .map_err(|error| NATIVE.error(error.to_string()))?,
                     );
                     self.close_part(id, 0, content)?;
                 }
@@ -88,7 +162,7 @@ impl Decoder {
             } => {
                 match self.part(id, position)? {
                     Part::Streaming { text, added } if !*added && text.is_empty() => *added = true,
-                    _ => return Err(protocol("duplicate or late content part added")),
+                    _ => return Err(NATIVE.error("duplicate or late content part added")),
                 }
                 if !text.is_empty() {
                     self.delta(id, position, text, &mut events)?;

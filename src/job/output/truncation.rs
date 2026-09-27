@@ -8,9 +8,9 @@ const ANNOTATION: &str = "x-skyhook-truncatable";
 
 /// Typed presentation assembled before the JobView is serialized.
 pub(super) struct Projected {
-    pub(super) result: Value,
+    pub(super) result: Option<Value>,
     pub(super) truncated: Vec<OutputTruncation>,
-    pub(super) notice: Option<String>,
+    pub(super) notice: Option<views::Notice>,
 }
 
 pub(super) fn project(
@@ -37,9 +37,9 @@ pub(super) fn project(
         schema,
     )?;
     Ok(Projected {
-        result: document["result"].take(),
+        result: product.result.is_some().then(|| document["result"].take()),
         truncated: projection.truncated,
-        notice: (!product.captures_complete).then(|| "Output incomplete.".into()),
+        notice: (!product.captures_complete).then_some(views::Notice::OutputIncomplete),
     })
 }
 
@@ -67,16 +67,7 @@ impl Projection<'_> {
         {
             let mut source = materialize_field(self.saved, field, value, self.cancellation)?;
             let mut bytes = Vec::new();
-            (&mut source)
-                .take((FIELD_BYTES + 1) as u64)
-                .read_to_end(&mut bytes)?;
-            let (prefix, end, shortened) = if value.is_string() {
-                string_prefix(&bytes)?
-            } else if value.is_array() {
-                array_prefix(&bytes)?
-            } else {
-                object_prefix(&bytes)?
-            };
+            let (prefix, end, shortened) = retained(value, &mut source, &mut bytes)?;
             *value = prefix;
             if shortened {
                 let index = source.index(self.cancellation)?;
@@ -86,10 +77,10 @@ impl Projection<'_> {
                     .rposition(|&b| b == b'\n')
                     .map_or(end, |last| end - last - 1);
                 self.truncated.push(OutputTruncation {
-                    field: field.to_string(),
+                    field: field.clone(),
                     total_lines: index.total_lines,
                     next_start: line,
-                    next_offset: offset,
+                    next_offset: (offset != 0).then_some(offset),
                 });
             }
             return Ok(());
@@ -118,9 +109,13 @@ impl Projection<'_> {
     }
 }
 
-/// Resolve the same annotations used by native projection, before crossing the JS
-/// bridge. Keep descendant annotations as well, since scripts can extract them.
-pub(crate) fn annotated_fields(value: &Value, schema: &Value) -> BTreeSet<FieldPointer> {
+/// Resolve the same annotations used by native projection for `value` at `field`.
+/// Keep descendant annotations as well, since scripts can extract them.
+pub(crate) fn annotated_fields(
+    value: &Value,
+    field: &FieldPointer,
+    schema: &Value,
+) -> BTreeSet<FieldPointer> {
     fn visit(
         value: &Value,
         field: &FieldPointer,
@@ -150,13 +145,7 @@ pub(crate) fn annotated_fields(value: &Value, schema: &Value) -> BTreeSet<FieldP
         }
     }
     let mut fields = BTreeSet::new();
-    visit(
-        value,
-        &FieldPointer::root(),
-        &[Node::root(schema)],
-        schema,
-        &mut fields,
-    );
+    visit(value, field, &[Node::root(schema)], schema, &mut fields);
     fields
 }
 
@@ -198,6 +187,24 @@ impl<'a> ApplicableSchemas<'a> {
     }
 }
 
+/// The prefix presentation keeps of a truncatable field shaped like `value`,
+/// read from its rendered `source` into `bytes`: the prefix, its end within
+/// them and whether it is shorter than the field.
+pub(super) fn retained(
+    value: &Value,
+    source: &mut Source,
+    bytes: &mut Vec<u8>,
+) -> Result<(Value, usize, bool), ToolError> {
+    source.take((FIELD_BYTES + 1) as u64).read_to_end(bytes)?;
+    if value.is_string() {
+        string_prefix(bytes)
+    } else if value.is_array() {
+        array_prefix(bytes)
+    } else {
+        object_prefix(bytes)
+    }
+}
+
 fn line_end(bytes: &[u8]) -> usize {
     bytes
         .iter()
@@ -212,7 +219,7 @@ fn string_prefix(bytes: &[u8]) -> Result<(Value, usize, bool), ToolError> {
     match std::str::from_utf8(&bytes[..end]) {
         Ok(_) => {}
         Err(error) if error.error_len().is_none() => end = error.valid_up_to(),
-        Err(_) => return Err(ToolError::failed("saved output is not UTF-8")),
+        Err(_) => return Err(reader::not_utf8()),
     }
     if end < bytes.len()
         && let Some(last) = bytes[..end].iter().rposition(|&b| b == b'\n')
@@ -280,6 +287,8 @@ fn object_prefix(bytes: &[u8]) -> Result<(Value, usize, bool), ToolError> {
         let value = stream.next()?.ok()?;
         Some((value, position + stream.byte_offset()))
     }
+    // Compact serialized size of `map` so far, braces included.
+    let mut size = 2;
     loop {
         skip(bytes, &mut position);
         if bytes.get(position) == Some(&b'}') {
@@ -296,52 +305,46 @@ fn object_prefix(bytes: &[u8]) -> Result<(Value, usize, bool), ToolError> {
         }
         position += 1;
         skip(bytes, &mut position);
+        // The key, its colon, and a separating comma.
+        let entry = serde_json::to_vec(&key)?.len() + 1 + usize::from(!map.is_empty());
         if bytes.get(position) == Some(&b'[') {
             position += 1;
             let mut items = Vec::new();
-            loop {
+            let mut group = entry + 2;
+            let closed = loop {
                 skip(bytes, &mut position);
                 if bytes.get(position) == Some(&b']') {
-                    map.insert(key.clone(), Value::Array(items));
                     position += 1;
-                    break;
+                    break true;
                 }
                 let Some((item, end)) = parse(bytes, position, maximum) else {
-                    if !items.is_empty() {
-                        map.insert(key, Value::Array(items));
-                    }
-                    return Ok((Value::Object(map), position.min(bytes.len()), true));
+                    break false;
                 };
+                let cost = serde_json::to_vec(&item)?.len() + usize::from(!items.is_empty());
+                if size + group + cost > FIELD_BYTES {
+                    break false;
+                }
                 items.push(item);
-                // Measure the candidate in place instead of cloning every item
-                // and earlier group. Restore even a duplicate key before rollback.
-                let previous = map.insert(key.clone(), Value::Array(items));
-                let oversized = serde_json::to_vec(&map)?.len() > FIELD_BYTES;
-                let Some(Value::Array(candidate)) = map.remove(&key) else {
-                    unreachable!("inserted array candidate");
-                };
-                items = candidate;
-                if let Some(previous) = previous {
-                    map.insert(key.clone(), previous);
-                }
-                if oversized {
-                    items.pop();
-                    if !items.is_empty() {
-                        map.insert(key, Value::Array(items));
-                    }
-                    return Ok((Value::Object(map), position, true));
-                }
+                group += cost;
                 position = end;
+            };
+            if closed || !items.is_empty() {
+                map.insert(key, Value::Array(items));
             }
+            if !closed {
+                return Ok((Value::Object(map), position.min(bytes.len()), true));
+            }
+            size += group;
         } else {
             let Some((value, end)) = parse(bytes, position, maximum) else {
                 return Ok((Value::Object(map), key_start, true));
             };
-            map.insert(key.clone(), value);
-            if serde_json::to_vec(&map)?.len() > FIELD_BYTES {
-                map.remove(&key);
+            let cost = entry + serde_json::to_vec(&value)?.len();
+            if size + cost > FIELD_BYTES {
                 return Ok((Value::Object(map), key_start, true));
             }
+            map.insert(key, value);
+            size += cost;
             position = end;
         }
     }

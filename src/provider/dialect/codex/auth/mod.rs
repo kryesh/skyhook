@@ -12,34 +12,29 @@ mod oauth;
 mod store;
 
 use store::Saved;
+pub use store::{AccountId, InvalidAccount, InvalidToken, Token};
 
-use crate::provider::{ProviderError, ProviderErrorKind};
+use crate::provider::{ProviderError, ProviderErrorKind::Authentication};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use oauth::{CLIENT_ID, TokenResponse, form_body, response_json};
 use std::{
     path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use zeroize::{Zeroize, Zeroizing};
+use zeroize::Zeroizing;
 
-pub type AuthError = ProviderError;
 /// OpenAI's OAuth issuer, unless a codex entry names another.
 const DEFAULT_ISSUER: &str = "https://auth.openai.com/";
-const MAX_BODY: usize = 1024 * 1024;
+/// Credentials this close to expiry are refreshed before use.
 const REFRESH_SKEW: u64 = 60;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(45);
 
-fn error(message: &'static str) -> AuthError {
-    ProviderError {
-        kind: ProviderErrorKind::Authentication,
-        message: message.into(),
-    }
-}
-fn now() -> Result<u64, AuthError> {
+fn now() -> Result<u64, ProviderError> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
-        .map_err(|_| error("System clock is invalid"))
+        .map_err(|_| Authentication.error("System clock is invalid"))
 }
 
 /// An OAuth issuer: HTTPS, or HTTP on a loopback host, without credentials,
@@ -127,27 +122,19 @@ pub enum LoginRequired {
 
 impl From<LoginRequired> for ProviderError {
     fn from(required: LoginRequired) -> Self {
-        Self {
-            kind: ProviderErrorKind::Authentication,
-            message: required.to_string(),
-        }
+        Authentication.error(required.to_string())
     }
 }
 
-/// Tokens are deliberately absent from Debug and are wiped on drop.
+/// The token is deliberately absent from Debug.
 #[derive(Clone)]
 pub struct Credentials {
-    pub access_token: String,
-    pub account_id: String,
+    pub access_token: Token,
+    pub account_id: AccountId,
 }
 impl std::fmt::Debug for Credentials {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("Credentials([redacted])")
-    }
-}
-impl Drop for Credentials {
-    fn drop(&mut self) {
-        self.access_token.zeroize();
     }
 }
 
@@ -156,7 +143,6 @@ pub enum AuthStatus {
     LoginRequired(LoginRequired),
     /// Local state only; status does not refresh or validate against the server.
     LoggedIn {
-        account_id: String,
         expires_at: u64,
     },
 }
@@ -174,19 +160,20 @@ struct Inner {
 impl AuthManager {
     /// Does not read credentials or perform network I/O. Login is deferred until
     /// explicitly requested; credentials() never launches an interactive flow.
-    pub fn new(issuer: Issuer) -> Result<Self, AuthError> {
-        let directory = crate::config::user_config_directory()
-            .ok_or_else(|| error("Cannot locate the Skyhook configuration directory"))?;
+    pub fn new(issuer: Issuer) -> Result<Self, ProviderError> {
+        let directory = crate::config::user_config_directory().ok_or_else(|| {
+            Authentication.error("Cannot locate the Skyhook configuration directory")
+        })?;
         Self::at(directory, issuer)
     }
 
-    fn at(directory: PathBuf, issuer: Issuer) -> Result<Self, AuthError> {
+    fn at(directory: PathBuf, issuer: Issuer) -> Result<Self, ProviderError> {
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(15))
-            .timeout(Duration::from_secs(45))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_TIMEOUT)
             .build()
-            .map_err(|_| error("Cannot initialize Codex OAuth HTTP client"))?;
+            .map_err(|_| Authentication.error("Cannot initialize Codex OAuth HTTP client"))?;
         Ok(Self {
             inner: Arc::new(Inner {
                 directory,
@@ -200,9 +187,9 @@ impl AuthManager {
     /// coordinated between clones AND separate Skyhook processes. The File lock
     /// remains owned across the network await and is released on cancellation.
     /// Credentials another issuer granted are never used or sent.
-    pub async fn credentials(&self) -> Result<Credentials, AuthError> {
+    pub async fn credentials(&self) -> Result<Credentials, ProviderError> {
         let (lock, saved) = self.load().await?;
-        let mut stored = match saved {
+        let stored = match saved {
             Saved::Absent => return Err(LoginRequired::LoggedOut.into()),
             Saved::Unbound => return Err(LoginRequired::Unbound.into()),
             Saved::Current(stored) if stored.issuer != self.inner.issuer => {
@@ -210,66 +197,51 @@ impl AuthManager {
             }
             Saved::Current(stored) => stored,
         };
-        if stored.expires_at <= now()?.saturating_add(REFRESH_SKEW) {
-            let response = self
-                .inner
-                .client
-                .post(self.inner.issuer.join("oauth/token"))
-                .header(
-                    reqwest::header::CONTENT_TYPE,
-                    "application/x-www-form-urlencoded",
-                )
-                .body(form_body(&[
-                    ("grant_type", "refresh_token"),
-                    ("client_id", CLIENT_ID),
-                    ("refresh_token", stored.refresh_token.as_str()),
-                ]))
-                .send()
-                .await
-                .map_err(|_| {
-                    error("Codex token refresh could not reach the authentication server")
-                })?;
-            let token: TokenResponse = response_json(response).await?;
-            stored = token.into_stored(&self.inner.issuer, Some(&stored))?;
-            let credentials = Credentials {
-                access_token: stored.access_token.clone(),
-                account_id: stored.account_id.clone(),
-            };
-            self.save(lock, stored).await?;
-            Ok(credentials)
-        } else {
-            Ok(Credentials {
-                access_token: stored.access_token.clone(),
-                account_id: stored.account_id.clone(),
-            })
+        if stored.expires_at > now()?.saturating_add(REFRESH_SKEW) {
+            return Ok(Credentials {
+                access_token: stored.access_token,
+                account_id: stored.account_id,
+            });
         }
+        let refresh = [
+            ("grant_type", "refresh_token"),
+            ("refresh_token", stored.refresh_token.as_str()),
+        ];
+        let token = self.token(&refresh).await?;
+        let stored = token.into_stored(&self.inner.issuer, Some(&stored))?;
+        let credentials = Credentials {
+            access_token: stored.access_token.clone(),
+            account_id: stored.account_id.clone(),
+        };
+        self.save(lock, stored).await?;
+        Ok(credentials)
     }
 }
 
-pub async fn login(issuer: Issuer, headless: bool) -> Result<(), AuthError> {
+pub async fn login(issuer: Issuer, headless: bool) -> Result<(), ProviderError> {
     AuthManager::new(issuer)?.login(headless).await
 }
 /// Local state only: whether stored credentials exist and serve `issuer`.
-pub async fn status(issuer: Issuer) -> Result<AuthStatus, AuthError> {
+pub async fn status(issuer: Issuer) -> Result<AuthStatus, ProviderError> {
     AuthManager::new(issuer)?.status().await
 }
 /// Removes Skyhook's local tokens only; does not revoke other sessions.
-pub async fn logout() -> Result<(), AuthError> {
+pub async fn logout() -> Result<(), ProviderError> {
     AuthManager::new(Issuer::default())?.logout().await
 }
 
 async fn blocking<T: Send + 'static>(
-    f: impl FnOnce() -> Result<T, AuthError> + Send + 'static,
-) -> Result<T, AuthError> {
+    f: impl FnOnce() -> Result<T, ProviderError> + Send + 'static,
+) -> Result<T, ProviderError> {
     tokio::task::spawn_blocking(f)
         .await
-        .map_err(|_| error("Codex credential storage task failed"))?
+        .map_err(|_| Authentication.error("Codex credential storage task failed"))?
 }
 
-fn random_string() -> Result<String, AuthError> {
+fn random_string() -> Result<String, ProviderError> {
     let mut bytes = Zeroizing::new([0u8; 32]);
     getrandom::fill(&mut *bytes)
-        .map_err(|_| error("Cannot obtain secure randomness for Codex login"))?;
+        .map_err(|_| Authentication.error("Cannot obtain secure randomness for Codex login"))?;
     Ok(URL_SAFE_NO_PAD.encode(*bytes))
 }
 
@@ -284,9 +256,9 @@ pub(super) fn test_manager(directory: PathBuf) -> AuthManager {
         &manager.inner.directory,
         &store::Stored {
             issuer,
-            access_token: "test-access-token".into(),
-            refresh_token: "test-refresh-token".into(),
-            account_id: "test-account-id".into(),
+            access_token: Token::try_from("test-access-token".to_owned()).unwrap(),
+            refresh_token: Token::try_from("test-refresh-token".to_owned()).unwrap(),
+            account_id: "test-account-id".parse().unwrap(),
             expires_at: now().unwrap() + 3600,
         },
     )
@@ -312,14 +284,17 @@ mod tests {
         let (lock, _) = one.load().await.unwrap();
         one.save(lock, stored(&issuer, 1)).await.unwrap();
         let (a, b) = tokio::join!(one.credentials(), two.credentials());
-        assert_eq!(a.unwrap().access_token, b.unwrap().access_token);
+        assert!(a.unwrap().access_token == b.unwrap().access_token);
         assert_eq!(count.load(Ordering::SeqCst), 1);
         let requests = server.await.unwrap();
         assert!(requests[0].starts_with("POST /tenant/oauth/token "));
         assert!(requests[0].contains("grant_type=refresh_token"));
         assert!(requests[0].contains("refresh_token=old-refresh"));
         let (_, saved) = one.load().await.unwrap();
-        assert_eq!(saved.current().unwrap().refresh_token, "rotated-refresh");
+        assert_eq!(
+            saved.current().unwrap().refresh_token.as_str(),
+            "rotated-refresh"
+        );
     }
 
     /// Credentials another issuer granted, fresh or due for refresh, and a
@@ -343,14 +318,13 @@ mod tests {
                 AuthStatus::LoginRequired(LoginRequired::OtherIssuer)
             );
         }
-        let path = temp.path().join("codex-oauth.json");
+        let path = temp.path().join(store::STORE_FILE);
         let unbound = serde_json::json!({"version": 1, "access_token": "old-access",
             "refresh_token": "old-refresh", "account_id": "account-123", "expires_at": 1});
         std::fs::write(&path, unbound.to_string()).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
         let error = manager.credentials().await.unwrap_err();
         assert_eq!(error, LoginRequired::Unbound.into());
-        assert!(error.message.contains("skyhook auth login codex"));
         assert_eq!(
             manager.status().await.unwrap(),
             AuthStatus::LoginRequired(LoginRequired::Unbound)
@@ -359,24 +333,40 @@ mod tests {
         server.abort();
     }
 
+    /// A failed refresh keeps the stored credentials and never echoes the
+    /// response. Its kind tells the runtime whether a retry can succeed.
     #[tokio::test]
-    async fn refresh_rejection_preserves_credentials_and_redacts_response() {
+    async fn refresh_failures_keep_credentials_and_carry_their_kind() {
+        use crate::provider::ProviderErrorKind::*;
         let temp = tempfile::tempdir().unwrap();
-        let (url, _, server) = mock(vec![(
-            401,
-            serde_json::json!({"error":"old-refresh TOP-SECRET"}),
-        )])
-        .await;
+        let secret = serde_json::json!({"error":"old-refresh TOP-SECRET"});
+        let replies = [400, 429, 503].map(|status| (status, secret.clone()));
+        let (url, _, server) = mock(replies.to_vec()).await;
         let issuer = Issuer::parse(&url).unwrap();
         let manager = AuthManager::at(temp.path().to_path_buf(), issuer.clone()).unwrap();
         let (lock, _) = manager.load().await.unwrap();
         manager.save(lock, stored(&issuer, 1)).await.unwrap();
-        let err = manager.credentials().await.unwrap_err();
-        assert_eq!(err.kind, ProviderErrorKind::Authentication);
-        assert!(!format!("{err:?}").contains("TOP-SECRET"));
-        assert!(!format!("{err:?}").contains("old-refresh"));
+        let mut kinds = Vec::new();
+        for _ in replies {
+            let err = manager.credentials().await.unwrap_err();
+            assert!(!format!("{err:?}").contains("TOP-SECRET"));
+            assert!(!format!("{err:?}").contains("old-refresh"));
+            kinds.push(err.kind());
+        }
         server.await.unwrap();
         let (_, saved) = manager.load().await.unwrap();
-        assert_eq!(saved.current().unwrap().refresh_token, "old-refresh");
+        assert_eq!(
+            saved.current().unwrap().refresh_token.as_str(),
+            "old-refresh"
+        );
+        let refused = crate::tests::RefusedPort::new();
+        let issuer = Issuer::parse(&format!("http://{}", refused.address())).unwrap();
+        let manager = AuthManager::at(temp.path().to_path_buf(), issuer.clone()).unwrap();
+        let (lock, _) = manager.load().await.unwrap();
+        manager.save(lock, stored(&issuer, 1)).await.unwrap();
+        kinds.push(manager.credentials().await.unwrap_err().kind());
+        let unavailable = Unavailable;
+        let limited = RateLimited;
+        assert_eq!(kinds, [Authentication, limited, unavailable, Transport]);
     }
 }

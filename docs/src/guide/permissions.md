@@ -28,7 +28,7 @@ the CLI; [library hosts](../development/embedding.md) can supply a different app
 
 Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
 queued job while authorization is pending. A denial preserves its reason and marks the rejected
-operation with `code: "permission_denied", executed: false`; it does not undo work that a
+operation with `code: "permission_denied"`; it does not undo work that a
 containing script already performed.
 Agents must not circumvent a denial through another tool or route. For programmatic failure
 handling, see the [JavaScript response contract](../reference/javascript.md#responseunwrap-and-native-results).

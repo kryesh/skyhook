@@ -1,8 +1,8 @@
 //! Read-only session reporting: aligned or Markdown tables, a `tree`-style listing, or JSON.
 
 use super::{
-    cli::{StatsFormat, StatsRequest},
-    tui::format::brief,
+    cli::{StatsFormat, StatsRequest, StatsTarget},
+    text::brief,
 };
 use chrono::{DateTime, Utc};
 use skyhook::{
@@ -29,19 +29,22 @@ pub(super) async fn run(request: StatsRequest) -> Result<(), Error> {
         .map_err(|error| format!("workspace {}: {error}", request.workspace.display()))?;
     let sessions = skyhook::config::workspace_session_root(&workspace);
     let mut stdout = io::stdout().lock();
-    let Some(session) = request.session else {
-        let listed = list(&sessions).await?;
-        return Ok(stdout.write_all(listing(&listed).as_bytes())?);
+    let (session, format) = match request.target {
+        StatsTarget::List => {
+            let listed = list(&sessions).await?;
+            return Ok(stdout.write_all(listing(&listed).as_bytes())?);
+        }
+        StatsTarget::Session(session, format) => (session, format),
     };
     let stats = read(&sessions, session)
         .await
         .map_err(|error| match error {
-            SessionError::Io(io) if io.kind() == io::ErrorKind::NotFound => {
+            SessionError::NotFound(_) => {
                 format!("session {session} not found under {}", sessions.display())
             }
             error => error.to_string(),
         })?;
-    match request.format {
+    match format {
         None => stdout.write_all(tables(&stats, false).as_bytes())?,
         Some(StatsFormat::Markdown) => stdout.write_all(tables(&stats, true).as_bytes())?,
         Some(StatsFormat::Tree) => stdout.write_all(tree(&stats).as_bytes())?,
@@ -81,7 +84,7 @@ async fn list(sessions: &Path) -> Result<Vec<SessionStats>, Error> {
         match result {
             Ok(stats) => listed.push(stats),
             Err(SessionError::UnsupportedVersion(_)) => {}
-            Err(SessionError::Io(io)) if io.kind() == io::ErrorKind::NotFound => {}
+            Err(SessionError::NotFound(_)) => {}
             Err(error) => eprintln!("skyhook stats: {session}: {}", escape_controls(error)),
         }
     }

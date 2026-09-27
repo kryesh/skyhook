@@ -1,41 +1,24 @@
-//! Validation and conversion of native Anthropic content fields.
-use crate::provider::{
-    ProviderError,
-    codec::common::{arguments_field, lenient_u64, parse_tool_arguments},
-    protocol::ToolCall,
+//! Native Anthropic content blocks: their types, and validation and
+//! conversion of tool blocks.
+use super::NATIVE;
+use crate::{
+    named_enum::named_enum,
+    provider::{
+        ProviderError,
+        codec::common::{arguments_field, parse_tool_arguments},
+        protocol::ToolCall,
+    },
 };
 use serde_json::Value;
 
-pub(super) fn protocol(message: impl Into<String>) -> ProviderError {
-    ProviderError::protocol(format!("Anthropic: {}", message.into()))
-}
-
-pub(super) fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str, ProviderError> {
-    value
-        .get(field)
-        .and_then(Value::as_str)
-        .ok_or_else(|| protocol(format!("missing or invalid string field {field}")))
-}
-
-pub(super) fn validate_thinking(value: &Value) -> Result<(), ProviderError> {
-    match string(value, "type")? {
-        "thinking" => {
-            string(value, "thinking")?;
-            if value
-                .get("signature")
-                .is_some_and(|signature| signature.as_str().is_none_or(str::is_empty))
-            {
-                return Err(protocol("thinking block has an empty signature"));
-            }
-        }
-        "redacted_thinking" => {
-            if string(value, "data")?.is_empty() {
-                return Err(protocol("redacted thinking block has empty data"));
-            }
-        }
-        _ => return Err(protocol("opaque reasoning is not a native thinking block")),
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) parsed enum BlockType {
+        Text = "text",
+        Thinking = "thinking",
+        RedactedThinking = "redacted_thinking",
+        ToolUse = "tool_use",
     }
-    Ok(())
 }
 
 /// The call's input from the start block and any streamed JSON. A streamed
@@ -47,55 +30,29 @@ pub(super) fn tool_content(
 ) -> Result<ToolCall, ProviderError> {
     let initial = initial_input(native)?;
     let streamed = partial_json
-        .map(|json| parse_tool_arguments(json).ok_or_else(|| protocol("invalid tool input JSON")))
+        .map(|json| {
+            parse_tool_arguments(json).ok_or_else(|| NATIVE.error("invalid tool input JSON"))
+        })
         .transpose()?;
     let arguments = match streamed {
         Some(streamed) if initial.is_empty() => streamed,
         Some(streamed) if streamed.is_empty() || streamed == initial => initial,
-        Some(_) => return Err(protocol("streamed tool input conflicts with start input")),
+        Some(_) => return Err(NATIVE.error("streamed tool input conflicts with start input")),
         None => initial,
     };
     ToolCall::new(
-        string(native, "id")?,
-        string(native, "name")?,
+        NATIVE.string(native, "id")?,
+        NATIVE.string(native, "name")?,
         Value::Object(arguments),
     )
-    .map_err(|error| protocol(error.to_string()))
+    .map_err(|error| NATIVE.error(error))
 }
 
 /// A `tool_use` start block's input.
 pub(super) fn initial_input(
     native: &Value,
 ) -> Result<serde_json::Map<String, Value>, ProviderError> {
-    arguments_field(native.get("input")).ok_or_else(|| protocol("invalid tool input"))
-}
-
-pub(super) fn index(value: &Value) -> Result<usize, ProviderError> {
-    value
-        .get("index")
-        .and_then(Value::as_u64)
-        .and_then(|index| usize::try_from(index).ok())
-        .ok_or_else(|| protocol("missing or invalid content block index"))
-}
-
-pub(super) fn append(value: &mut Value, field: &str, suffix: &str) -> Result<(), ProviderError> {
-    match value.get_mut(field) {
-        Some(Value::String(text)) => {
-            text.push_str(suffix);
-            Ok(())
-        }
-        _ => Err(protocol(format!("missing or invalid string field {field}"))),
-    }
-}
-
-/// A usage counter as reported, or None when absent; a present non-number is an error.
-pub(super) fn counter(value: &Value, key: &str) -> Result<Option<u64>, ProviderError> {
-    match value.get(key) {
-        None | Some(Value::Null) => Ok(None),
-        Some(number) => lenient_u64(number)
-            .map(Some)
-            .ok_or_else(|| protocol(format!("invalid usage counter {key}"))),
-    }
+    arguments_field(native.get("input")).ok_or_else(|| NATIVE.error("invalid tool input"))
 }
 
 #[cfg(test)]
@@ -117,7 +74,7 @@ mod tests {
             ("call", "tool", json!("[1]")),
         ] {
             let error = tool_content(&tool_block(id, name, input), None).unwrap_err();
-            assert_eq!(error.kind, crate::provider::ProviderErrorKind::Protocol);
+            assert_eq!(error.kind(), crate::provider::ProviderErrorKind::Protocol);
         }
     }
 
@@ -144,16 +101,6 @@ mod tests {
         }
         // Two different inputs conflict.
         assert!(tool_content(&started, Some("{\"x\":2}")).is_err());
-    }
-
-    #[test]
-    fn counters_are_lenient_about_spelling_but_not_type() {
-        let usage = json!({"a":5, "b":"9", "c":null});
-        assert_eq!(counter(&usage, "a").unwrap(), Some(5));
-        assert_eq!(counter(&usage, "b").unwrap(), Some(9));
-        assert_eq!(counter(&usage, "c").unwrap(), None);
-        assert_eq!(counter(&usage, "missing").unwrap(), None);
-        assert!(counter(&json!({"a":"x"}), "a").is_err());
     }
 
     #[test]

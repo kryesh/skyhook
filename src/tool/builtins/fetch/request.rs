@@ -9,37 +9,52 @@ use reqwest::{
     Method, Url,
     header::{HeaderMap, HeaderValue},
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use std::{io::SeekFrom, sync::Arc};
 
-use super::diagnostics::{DiagnosticMessage, FetchDiagnostic, FetchError, FetchPhase};
+use bytes::BytesMut;
+use futures_util::Stream;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::sync::Mutex;
+
+use super::diagnostics::{
+    DiagnosticMessage, FetchDiagnostic, FetchError, FetchPhase, UploadReadFailure,
+};
 use super::progress::FetchProgress;
-use super::redirects::{FollowableRedirectStatus, redirect_error};
+use super::redirects::{FollowableRedirectStatus, redirect_error, redirect_headers};
 use super::response::{collect_headers, read_body};
 use super::tls::client;
-use super::validation::{FetchPlan, HttpRequestUrl, OutputPlan, redirect_headers};
-use super::{
-    FetchOutput, LocalContext, LocalError, MAX_UPLOAD_BYTES, Redirect, RedirectPolicy, RequestBody,
-    invalid,
-};
+use super::validation::{FetchPlan, HttpRequestUrl, OutputPlan};
+use super::{FetchOutput, LocalContext, LocalError, MAX_UPLOAD_BYTES, Redirect, RequestBody};
+
+const UPLOAD_CHUNK: usize = 64 * 1024;
 
 struct PreparedBody {
     bytes: Bytes,
     content_type: Option<HeaderValue>,
 }
 struct FileUpload {
-    snapshot: tempfile::NamedTempFile,
+    /// Anonymous, so nothing else can name, change or outlive it.
+    snapshot: Arc<Mutex<tokio::fs::File>>,
     length: u64,
 }
 impl FileUpload {
-    fn len(&self) -> u64 {
-        self.length
-    }
-    async fn body(&self, progress: &mut FetchProgress) -> Result<reqwest::Body, LocalError> {
-        progress.local_io(Operation::ReadCapture, Subject::path(self.snapshot.path()));
-        let file = tokio::fs::File::open(self.snapshot.path()).await?;
-        Ok(reqwest::Body::wrap_stream(
-            tokio_util::io::ReaderStream::new(file),
-        ))
+    /// Each replay tracks its own offset: an earlier hop may still be sending
+    /// its body after its response arrived.
+    fn replay(&self) -> impl Stream<Item = Result<Bytes, UploadReadFailure>> + Send + 'static {
+        let snapshot = self.snapshot.clone();
+        futures_util::stream::try_unfold(0, move |offset| {
+            let snapshot = snapshot.clone();
+            async move {
+                let mut file = snapshot.lock().await;
+                let read = async {
+                    file.seek(SeekFrom::Start(offset)).await?;
+                    let mut chunk = BytesMut::with_capacity(UPLOAD_CHUNK);
+                    let read = file.read_buf(&mut chunk).await?;
+                    Ok((read > 0).then(|| (chunk.freeze(), offset + read as u64)))
+                };
+                read.await.map_err(UploadReadFailure)
+            }
+        })
     }
 }
 enum Upload {
@@ -57,40 +72,48 @@ async fn snapshot_file(
     let file = crate::fs::open_regular(path, remaining)
         .await
         .map_err(|error| match error {
-            RegularFileError::NotRegular => invalid("upload path must be a regular file"),
-            RegularFileError::TooLarge { .. } => invalid("upload exceeds 100 MiB limit"),
+            RegularFileError::NotRegular => {
+                LocalError::invalid_arguments("upload path must be a regular file")
+            }
+            RegularFileError::TooLarge { .. } => upload_too_large(),
             RegularFileError::Io(error) => error.into(),
         })?;
     let file = tokio::fs::File::from_std(file);
-    // Snapshot once, with a bounded streaming copy. Redirect replays reopen this
-    // immutable private snapshot, not a potentially changed source file.
+    // Snapshot once, with a bounded streaming copy. Redirect replays read this
+    // private snapshot, not a potentially changed source file.
     progress.local_io(
         Operation::CreateCapture,
         Subject::Label("upload snapshot".into()),
     );
-    let snapshot = tempfile::NamedTempFile::new()?;
-    let mut output = tokio::fs::File::from_std(snapshot.as_file().try_clone()?);
+    let mut snapshot = tokio::fs::File::from_std(tempfile::tempfile()?);
     progress.local_io(Operation::Copy, Subject::path(path));
-    let length = tokio::io::copy(&mut file.take(sentinel), &mut output).await?;
-    output.flush().await?;
+    let length = tokio::io::copy(&mut file.take(sentinel), &mut snapshot).await?;
+    snapshot.flush().await?;
     if length > remaining {
-        return Err(invalid("upload exceeds 100 MiB limit"));
+        return Err(upload_too_large());
     }
+    let snapshot = Arc::new(Mutex::new(snapshot));
     Ok(FileUpload { snapshot, length })
+}
+fn upload_too_large() -> LocalError {
+    LocalError::invalid_arguments(format!(
+        "upload exceeds {} MiB limit",
+        MAX_UPLOAD_BYTES >> 20
+    ))
 }
 fn check_upload_size(size: usize) -> Result<(), LocalError> {
     if size as u64 > MAX_UPLOAD_BYTES {
-        Err(invalid("upload exceeds 100 MiB limit"))
+        Err(upload_too_large())
     } else {
         Ok(())
     }
 }
 fn decode_base64(value: &str) -> Result<Vec<u8>, LocalError> {
     crate::media::decode_base64_bounded(value, MAX_UPLOAD_BYTES as usize).map_err(|error| {
-        invalid(match error {
-            crate::media::MediaError::TooLarge => "upload exceeds 100 MiB limit",
-            _ => "invalid base64 body",
-        })
+        match error {
+            crate::media::MediaError::TooLarge => upload_too_large(),
+            _ => LocalError::invalid_arguments("invalid base64 body"),
+        }
     })
 }
 async fn prepare_body(
@@ -104,7 +127,7 @@ async fn prepare_body(
             Some(HeaderValue::from_static("text/plain; charset=utf-8")),
         ),
         RequestBody::Json { value } => (
-            serde_json::to_vec(value).map_err(invalid)?,
+            serde_json::to_vec(value).map_err(LocalError::invalid_arguments)?,
             Some(HeaderValue::from_static("application/json")),
         ),
         RequestBody::Form { fields } => {
@@ -132,29 +155,23 @@ async fn prepare_body(
     })))
 }
 
-async fn apply_body(
-    mut request: reqwest::RequestBuilder,
+fn apply_body(
+    request: reqwest::RequestBuilder,
     body: Option<&Upload>,
     headers: &HeaderMap,
-    progress: &mut FetchProgress,
-) -> Result<reqwest::RequestBuilder, FetchError> {
+) -> reqwest::RequestBuilder {
     match body {
-        None => {}
-        Some(Upload::Bytes(body)) => {
-            if !headers.contains_key("content-type")
-                && let Some(content_type) = &body.content_type
-            {
-                request = request.header("content-type", content_type);
+        None => request,
+        Some(Upload::Bytes(body)) => match &body.content_type {
+            Some(content_type) if !headers.contains_key("content-type") => {
+                request.header("content-type", content_type)
             }
-            request = request.body(body.bytes.clone());
+            _ => request,
         }
-        Some(Upload::File(data)) => {
-            request = request
-                .header("content-length", data.len())
-                .body(data.body(progress).await.map_err(local_error)?);
-        }
+        .body(body.bytes.clone()),
+        Some(Upload::File(data)) => (request.header("content-length", data.length))
+            .body(reqwest::Body::wrap_stream(data.replay())),
     }
-    Ok(request)
 }
 
 /// A redirect consumes the complete request state, so method/header/body rewrites
@@ -174,11 +191,10 @@ impl RequestState {
     ) -> (Self, Redirect) {
         let hop = Redirect {
             status: status.get(),
-            url: self.url.as_str().into(),
             location: next.as_str().into(),
             method: self.method.to_string(),
         };
-        progress.redirect(status.get(), &self.url, &next, &self.method);
+        progress.redirect(status.get(), &next, &self.method);
         let drop_body = status.rewrites_to_get(&self.method);
         redirect_headers(&mut self.headers, &self.url, &next, drop_body);
         if drop_body {
@@ -204,10 +220,11 @@ pub(super) async fn execute(
         overwrite,
     } = &plan.output
     {
+        let destination = std::path::Path::new(destination);
         progress.download_io(Operation::Inspect, destination);
         if tokio::fs::try_exists(destination).await.map_err(local_io)? {
             if !overwrite {
-                return Err(local_error(invalid(
+                return Err(local_error(LocalError::invalid_arguments(
                     "save_to already exists; set overwrite to replace it",
                 )));
             }
@@ -216,7 +233,9 @@ pub(super) async fn execute(
                 .map_err(local_io)?
                 .is_file()
             {
-                return Err(local_error(invalid("save_to must be a regular file")));
+                return Err(local_error(LocalError::invalid_arguments(
+                    "save_to must be a regular file",
+                )));
             }
         }
     }
@@ -259,10 +278,7 @@ pub(super) async fn execute(
         let request = client
             .request(state.method.clone(), state.url.url().clone())
             .headers(state.headers.clone());
-        // Reopening a snapshot is local I/O, including an outer deadline that
-        // expires while open is pending; only the send is a network request.
-        progress.phase(FetchPhase::LocalIo);
-        let request = apply_body(request, state.body.as_ref(), &state.headers, progress).await?;
+        let request = apply_body(request, state.body.as_ref(), &state.headers);
         progress.request_started();
         let response = request
             .send()
@@ -272,18 +288,14 @@ pub(super) async fn execute(
         let Some(status) = FollowableRedirectStatus::new(response.status().as_u16()) else {
             break response;
         };
-        if plan.redirects == RedirectPolicy::Manual
-            || (plan.redirects == RedirectPolicy::Safe
-                && state.method != Method::GET
-                && state.method != Method::HEAD)
-        {
+        if !plan.redirects.follows(&state.method) {
             break response;
         }
         progress.phase(FetchPhase::Redirect);
         let Some(location) = response.headers().get("location") else {
             break response;
         };
-        if redirects.len() >= plan.max_redirects {
+        if redirects.len() as u64 >= plan.max_redirects {
             return Err(redirect_error(DiagnosticMessage::MaximumRedirectsExceeded));
         }
         let location = location
@@ -313,21 +325,19 @@ pub(super) async fn execute(
     .await?;
     Ok(FetchOutput {
         status: status.as_u16(),
-        ok: status.is_success(),
-        url: state.url.as_str().into(),
-        method: state.method.to_string(),
         headers,
         redirects,
         body,
-        received_bytes: progress.received_bytes,
-        elapsed_ms: progress.elapsed_ms(),
+        size: progress.received_bytes,
+        duration: progress.elapsed_ms(),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{executor, fetch, progress_for, response, server};
+    use super::super::tests::{executor, fetch, progress_for, server};
     use super::*;
+    use crate::provider::http::transport::tests::reply;
     use serde_json::json;
 
     const OK: &str = "Content-Type: text/plain\r\n";
@@ -369,7 +379,7 @@ mod tests {
             ),
             ("PUT", Some(file.clone()), "file payload"),
         ];
-        let (url, task) = server(cases.iter().map(|_| response("200 OK", OK, "")).collect()).await;
+        let (url, task) = server(cases.iter().map(|_| reply("200 OK", OK, "")).collect()).await;
         for (method, body, _) in &cases {
             let mut arguments = json!({"url":url,"method":method});
             if let Some(body) = body {
@@ -380,7 +390,7 @@ mod tests {
                 200
             );
         }
-        for (request, (method, _, expected)) in task.await.unwrap().iter().zip(cases) {
+        for (request, (method, _, expected)) in task.finish().await.iter().zip(cases) {
             assert!(
                 request.starts_with(&format!("{method} / HTTP/1.1\r\n")),
                 "{request}"
@@ -389,13 +399,13 @@ mod tests {
         }
         // A followed 307 replays the file upload with its method.
         let (url, task) = server(vec![
-            response("307 Temporary Redirect", "Location: /again\r\n", ""),
-            response("200 OK", OK, "done"),
+            reply("307 Temporary Redirect", "Location: /again\r\n", ""),
+            reply("200 OK", OK, "done"),
         ])
         .await;
         let arguments = json!({"url":url,"method":"PUT","redirects":"follow","body":file});
         fetch(&runtime, &executor, arguments).await.unwrap();
-        for request in task.await.unwrap() {
+        for request in task.finish().await {
             assert!(request.starts_with("PUT ") && request.ends_with("file payload"));
         }
     }
@@ -403,7 +413,7 @@ mod tests {
     #[tokio::test]
     async fn http_errors_query_repeated_headers_and_auth() {
         let headers = "Content-Type: text/plain\r\nSet-Cookie: one=1\r\nSet-Cookie: two=2\r\n";
-        let (url, task) = server(vec![response("404 Not Found", headers, "missing")]).await;
+        let (url, task) = server(vec![reply("404 Not Found", headers, "missing")]).await;
         let runtime = crate::tests::TestRuntime::new().await;
         let arguments = json!({
             "url":format!("{url}/p?z=0"), "query":[["q","a b"],["q","c"]], "include_headers":true,
@@ -412,20 +422,17 @@ mod tests {
         let output = fetch(&runtime, &executor(&runtime), arguments)
             .await
             .unwrap();
-        assert_eq!(
-            (&output["status"], &output["ok"]),
-            (&json!(404), &json!(false))
-        );
+        assert_eq!(output["status"], 404);
         assert_eq!(output["body"]["text"], "missing");
         assert_eq!(output["headers"]["set-cookie"], json!(["one=1", "two=2"]));
-        let requests = task.await.unwrap();
+        let requests = task.finish().await;
         assert!(requests[0].starts_with("GET /p?z=0&q=a+b&q=c HTTP/1.1"));
         assert!(requests[0].contains("authorization: Basic dTpw"));
         assert!(requests[0].contains("x-repeat: one\r\nx-repeat: two"));
     }
 
     #[tokio::test]
-    async fn upload_source_and_snapshot_failures_keep_actual_paths() {
+    async fn upload_source_and_snapshot_failures_are_local_io() {
         let root = tempfile::tempdir().unwrap();
         let source = root.path().join("source");
         let mut progress = progress_for(json!({"url":"http://example.org"})).1;
@@ -446,22 +453,27 @@ mod tests {
         );
         assert_eq!(output.value["diagnostic"]["os_error"]["kind"], "not_found");
 
-        tokio::fs::write(&source, b"body").await.unwrap();
-        let upload = snapshot_file(&source, 100, &mut progress).await.unwrap();
-        tokio::fs::remove_file(upload.snapshot.path())
-            .await
-            .unwrap();
-        let missing = upload.body(&mut progress).await.err().unwrap();
-        let error = progress.failure(local_error(missing));
-        assert_eq!(error.diagnostic().context.operation, Operation::ReadCapture);
+        // A snapshot read failing while the request streams is local IO, not the network.
+        let (url, _server) = server(vec![reply("200 OK", OK, "")]).await;
+        let write_only = std::fs::File::create(root.path().join("write-only")).unwrap();
+        let upload = Upload::File(FileUpload {
+            snapshot: Arc::new(Mutex::new(tokio::fs::File::from_std(write_only))),
+            length: 4,
+        });
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let request = apply_body(client.put(url), Some(&upload), &HeaderMap::new());
+        let error = request.send().await.unwrap_err();
+        let diagnostic = FetchDiagnostic::from_reqwest(&error, FetchPhase::Request);
+        assert_eq!(diagnostic.phase(), FetchPhase::LocalIo);
         assert_eq!(
-            error.diagnostic().context.subject,
-            Subject::path(upload.snapshot.path())
+            serde_json::to_value(&diagnostic).unwrap()["error_kind"],
+            serde_json::to_value(super::super::diagnostics::FetchErrorKind::LocalIo).unwrap()
         );
     }
 
     #[tokio::test]
-    async fn file_upload_snapshot_is_bounded_and_immutable() {
+    async fn file_upload_snapshot_is_bounded_private_and_replayable() {
+        use futures_util::TryStreamExt as _;
         let root = tempfile::tempdir().unwrap();
         let mut progress = progress_for(json!({"url":"http://example.org"})).1;
         assert!(
@@ -470,12 +482,26 @@ mod tests {
                 .is_err()
         );
         let source = root.path().join("source");
-        tokio::fs::write(&source, b"original").await.unwrap();
+        let original = (0..3 * UPLOAD_CHUNK).map(|i| i as u8).collect::<Vec<_>>();
+        tokio::fs::write(&source, &original).await.unwrap();
         assert!(snapshot_file(&source, 3, &mut progress).await.is_err());
-        let FileUpload { snapshot, length } =
-            snapshot_file(&source, 100, &mut progress).await.unwrap();
+        let upload = snapshot_file(&source, MAX_UPLOAD_BYTES, &mut progress)
+            .await
+            .unwrap();
         tokio::fs::write(&source, b"changed").await.unwrap();
-        assert_eq!(length, 8);
-        assert_eq!(tokio::fs::read(snapshot.path()).await.unwrap(), b"original");
+        assert_eq!(upload.length, original.len() as u64);
+        // No directory entry names the snapshot.
+        #[cfg(unix)]
+        {
+            let metadata = upload.snapshot.lock().await.metadata().await.unwrap();
+            assert_eq!(std::os::unix::fs::MetadataExt::nlink(&metadata), 0);
+        }
+        // Each replay reads the whole snapshot, even interleaved with another.
+        let mut first = Box::pin(upload.replay());
+        let head = first.try_next().await.unwrap().unwrap();
+        let second = upload.replay().try_collect::<Vec<_>>().await.unwrap();
+        let rest = first.try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(second.concat(), original);
+        assert_eq!([vec![head], rest].concat().concat(), original);
     }
 }

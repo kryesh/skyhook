@@ -51,7 +51,7 @@ mod tests {
                 input_schema: serde_json::json!({"type":"object"}),
             }],
             reasoning: Some("medium".into()),
-            max_output_tokens: Some(64),
+            max_output_tokens: std::num::NonZeroU64::new(64),
             ..ModelRequest::test("test")
         }
     }

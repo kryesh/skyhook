@@ -7,7 +7,6 @@ mod host;
 mod keys;
 mod model;
 mod render;
-pub mod state;
 mod status;
 mod theme;
 mod tool_view;
@@ -34,6 +33,9 @@ use std::{
 use tokio::{sync::mpsc, time::Instant};
 
 pub(crate) use super::launch::Launch;
+
+/// The period of toasts, output polling, prompt cleanup and animation.
+const TICK: Duration = Duration::from_millis(100);
 
 pub struct TerminalGuard;
 impl TerminalGuard {
@@ -78,7 +80,7 @@ pub async fn run(
         mode: explicit,
     } = request;
     let config = super::launch::load_config(&request.config, true).await?;
-    let (saved, warning) = state::load(&request.config.workspace);
+    let (saved, warning) = crate::state::load(&request.config.workspace);
     let model = super::launch::select_model(&config, request.model.as_ref(), saved.model.as_ref())?;
     // Like the model: an explicit mode, then the last one used, then the default. A
     // resumed session may know an explicit mode the configuration no longer has.
@@ -87,12 +89,10 @@ pub async fn run(
         Some(mode) => Some(config.select_mode(Some(mode))?),
         None => saved
             .mode
-            .as_deref()
+            .as_ref()
             .and_then(|mode| config.select_mode(Some(mode)).ok()),
     };
-    let mode = configured
-        .unwrap_or_else(|| config.default_mode())
-        .to_owned();
+    let mode = configured.unwrap_or_else(|| config.default_mode()).clone();
     let permissions = super::launch::Permissions::Mode(mode.clone());
     let launch = Launch::from_request(&request, model, permissions, None).await?;
     let (launch, prompts) = host::with_prompts(launch);
@@ -105,14 +105,12 @@ pub async fn run(
         None => None,
     };
     let (tx, rx) = mpsc::unbounded_channel();
-    let mut app = App::new(observation, launch, mode, saved, tx);
+    let mut app = App::new(observation, launch, &mode, saved, tx);
     // An explicit mode outranks the one a resumed session was last in, if it has it.
-    if let Some(mode) = explicit {
-        if app.modes().contains_key(&mode) {
-            app.mode = mode;
-        } else {
-            app.notice(format!("Unknown mode: {mode}"));
-        }
+    if let Some(mode) = explicit
+        && !app.select_mode(&mode)
+    {
+        app.notice(format!("Unknown mode: {mode}"));
     }
     if let Some(warning) = warning {
         app.notice(warning);
@@ -127,7 +125,7 @@ pub async fn run(
     let mut terminal = ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(output))?;
     terminal.clear()?;
     let mut input = EventStream::new();
-    let mut ticks = tokio::time::interval(Duration::from_millis(100));
+    let mut ticks = tokio::time::interval(TICK);
     ticks.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut pacer = frames::Pacer::default();
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;

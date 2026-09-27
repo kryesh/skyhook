@@ -1,19 +1,14 @@
 //! The error codes of the Chat Completions API. Dialects map their servers'
 //! own codes onto kinds with their error rules.
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde::Serialize;
 
 use crate::{
     named_enum::named_enum,
-    provider::{
-        ProviderErrorKind,
-        codec::openai::{self, ErrorCode},
-        http::errors::Reading,
-    },
+    provider::{ProviderErrorKind, codec::openai::ErrorCode},
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub(crate) enum Code {
         ContextLengthExceeded = "context_length_exceeded",
         InvalidApiKey = "invalid_api_key",
@@ -31,26 +26,30 @@ impl ErrorCode for Code {
             Self::ContextLengthExceeded => ProviderErrorKind::ContextWindowExceeded,
             Self::InvalidApiKey => ProviderErrorKind::Authentication,
             Self::InsufficientQuota => ProviderErrorKind::Billing,
-            Self::RateLimitExceeded => ProviderErrorKind::RateLimited { retry_after: None },
+            Self::RateLimitExceeded => ProviderErrorKind::RateLimited,
             Self::InvalidRequest => ProviderErrorKind::InvalidRequest,
             Self::ModelNotFound | Self::ServerError => return None,
         })
     }
 }
 
-/// A Chat error body, HTTP or in-stream.
-pub(crate) fn read(native: &Value) -> Reading {
-    openai::read::<Code>(native)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::http::errors::{ErrorSignals, classify};
-    use serde_json::json;
+    use crate::provider::{
+        codec::openai::read,
+        http::errors::{ErrorSignals, classify},
+    };
+    use serde_json::{Value, json};
 
     fn error(status: Option<u16>, native: &Value) -> crate::provider::ProviderError {
-        classify(status, native, read(native), ErrorSignals::NONE, None)
+        classify(
+            status,
+            native,
+            read::<Code>(native),
+            ErrorSignals::NONE,
+            None,
+        )
     }
 
     /// The specific code names the kind before the type category, over HTTP or
@@ -76,7 +75,7 @@ mod tests {
         ] {
             for status in [None, Some(400)] {
                 let error = error(status, &native);
-                assert_eq!(error.kind, kind, "{native}");
+                assert_eq!(error.kind(), kind, "{native}");
                 assert!(!error.message.contains("[code=unknown"));
             }
         }

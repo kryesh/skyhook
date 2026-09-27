@@ -21,6 +21,8 @@ pub(crate) enum ThinkingBinding {
     DropOnMismatch,
 }
 
+const ANTHROPIC_VERSION: &str = "2023-06-01";
+
 const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// Beta features a request announces: a list header, which configured and
@@ -59,7 +61,7 @@ impl Dialect {
         let mut headers = Headers::default();
         headers.insert(
             HeaderName::from_static("anthropic-version"),
-            Value::Fixed(HeaderValue::from_static("2023-06-01")),
+            Value::Fixed(HeaderValue::from_static(ANTHROPIC_VERSION)),
         );
         let betas =
             (self.thinking_binding == ThinkingBinding::DropOnMismatch).then_some(BINDING_BETA);
@@ -85,10 +87,10 @@ mod tests {
             dialect.headers().resolve().await.unwrap().map()
         };
         let bound = fixed(ThinkingBinding::DropOnMismatch).await;
-        assert_eq!(bound["anthropic-version"], "2023-06-01");
+        assert_eq!(bound["anthropic-version"], ANTHROPIC_VERSION);
         assert_eq!(bound[BETA_HEADER], BINDING_BETA);
         let plain = fixed(ThinkingBinding::Unenforced).await;
-        assert_eq!(plain["anthropic-version"], "2023-06-01");
+        assert_eq!(plain["anthropic-version"], ANTHROPIC_VERSION);
         assert!(!plain.contains_key(BETA_HEADER));
     }
 }

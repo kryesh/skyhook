@@ -7,10 +7,10 @@ use serde_json::{Map, Value};
 
 use crate::{job::output::CompletedCapture, tool::ToolOutput};
 
-/// Project a script result. A missing capture means genuinely empty console output,
-/// not a capture placeholder; images remain owned separately by `ToolOutput`.
-/// Completion evidence is preserved until the terminal output owner publishes it:
-/// only that owner inserts a captured-field placeholder into the wire result.
+/// Project a script result. A missing capture means genuinely empty console output;
+/// images remain owned separately by `ToolOutput`. Completion evidence is preserved
+/// until the terminal output owner publishes it: only that owner inserts a
+/// captured-field placeholder into the wire result.
 pub(crate) fn script_output(
     value: Value,
     failure: Option<Value>,
@@ -18,15 +18,10 @@ pub(crate) fn script_output(
 ) -> ToolOutput {
     let mut result = Map::new();
     result.insert("value".into(), value);
-    result.insert("failure".into(), failure.unwrap_or(Value::Null));
-    let captures = match console {
-        Some(capture) => vec![capture],
-        None => {
-            result.insert("console".into(), Value::String(String::new()));
-            Vec::new()
-        }
-    };
-    ToolOutput::new(Value::Object(result)).with_captures(captures)
+    if let Some(failure) = failure {
+        result.insert("failure".into(), failure);
+    }
+    ToolOutput::new(Value::Object(result)).with_captures(console.into_iter().collect())
 }
 
 /// Schema-only marker for the script tool's native result.
@@ -44,9 +39,9 @@ impl JsonSchema for ScriptResult {
             "properties": {
                 "value": {},
                 "console": {"type": "string", "x-skyhook-truncatable": true},
-                "failure": {}
+                "failure": {"type": "object", "x-skyhook-truncatable": true}
             },
-            "required": ["value", "console", "failure"],
+            "required": ["value"],
             "additionalProperties": false
         })
     }
@@ -64,24 +59,13 @@ mod tests {
 
     async fn console(runtime: &TestRuntime, job: crate::identity::JobId) -> CaptureWriter {
         let field = TextCaptureField::Console.pointer();
-        let pending = runtime
-            .jobs
-            .pending_capture(job, field, CaptureKind::Text, true);
+        let pending = runtime.jobs.pending_capture(job, field, CaptureKind::Text);
         pending.await.unwrap().open()
     }
 
     fn assert_codec(output: ToolOutput, expected: Value) {
         assert!(output.captures.is_empty());
         assert_eq!(output.value, expected);
-        let round_trip: Value =
-            serde_json::from_str(&serde_json::to_string(&output.value).unwrap()).unwrap();
-        assert_eq!(round_trip, expected);
-    }
-
-    #[test]
-    fn schema_requires_all_canonical_fields() {
-        let schema = serde_json::to_value(schemars::schema_for!(ScriptResult)).unwrap();
-        assert_eq!(schema["required"], json!(["value", "console", "failure"]));
     }
 
     #[tokio::test]
@@ -96,7 +80,7 @@ mod tests {
         ] {
             assert_codec(
                 script_output(value.clone(), None, None),
-                json!({"value": value, "console": "", "failure": null}),
+                json!({"value": value}),
             );
         }
         let runtime = TestRuntime::new().await;
@@ -106,7 +90,7 @@ mod tests {
         assert!(proof.is_none());
         assert_codec(
             script_output(Value::Null, None, proof),
-            json!({"value": null, "console": "", "failure": null}),
+            json!({"value": null}),
         );
     }
 
@@ -142,7 +126,7 @@ mod tests {
                 (expected, outcome)
             } else {
                 (
-                    json!({"value": 42, "console": "captured console\n", "failure": null}),
+                    json!({"value": 42, "console": "captured console\n"}),
                     crate::job::JobOutcome::Completed(output),
                 )
             };

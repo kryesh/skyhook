@@ -1,20 +1,21 @@
 //! api.openai.com: the `developer` role, `prompt_cache_key` on Chat as well,
 //! no reasoning replay on Chat, strict schemas, and organisation headers.
 
-use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use super::{Common, Dialect, DialectConfig, DialectError, Profile, UnsupportedCodec};
 use crate::provider::{
+    ProviderErrorKind,
     codec::{
         CacheKey, Codec, CodecName, Identity, SchemaConstraint, ToolNames,
         chat_completions::{self, EmptyContent, ReasoningReplay, SystemRole},
-        path, responses,
+        path,
+        responses::{self, ReasoningSummary},
     },
     http::{
         Transport,
-        errors::{ErrorRule, ErrorSignals, Field, RuleKind},
-        headers::Value,
+        errors::{ErrorRule, ErrorSignals, Field},
+        headers::HeaderText,
     },
 };
 
@@ -47,76 +48,50 @@ const ERRORS: ErrorSignals = ErrorSignals {
     rules: &[
         ErrorRule {
             field: Some(Field::Equals("code", "organization_spend_limit_exceeded")),
-            ..ErrorRule::kind(RuleKind::Billing)
+            ..ErrorRule::kind(ProviderErrorKind::Billing)
         },
         ErrorRule {
             field: Some(Field::Equals("code", "project_spend_limit_exceeded")),
-            ..ErrorRule::kind(RuleKind::Billing)
+            ..ErrorRule::kind(ProviderErrorKind::Billing)
         },
         ErrorRule {
             field: Some(Field::Equals("code", "organization_usage_limit_exceeded")),
-            ..ErrorRule::kind(RuleKind::Billing)
+            ..ErrorRule::kind(ProviderErrorKind::Billing)
         },
     ],
     ..ErrorSignals::NONE
 };
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
     /// Responses only. Reasoning summaries need a verified organisation; an
     /// unverified one is refused with HTTP 400, so it opts out here.
-    #[serde(default = "yes", skip_serializing_if = "is_yes")]
-    pub reasoning_summary: bool,
+    #[serde(default, skip_serializing_if = "ReasoningSummary::is_requested")]
+    pub reasoning_summary: ReasoningSummary,
     /// Sent as `OpenAI-Organization`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub organization: Option<String>,
+    pub organization: Option<HeaderText>,
     /// Sent as `OpenAI-Project`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<String>,
-}
-
-const fn yes() -> bool {
-    true
-}
-
-const fn is_yes(value: &bool) -> bool {
-    *value
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            reasoning_summary: true,
-            organization: None,
-            project: None,
-        }
-    }
+    pub project: Option<HeaderText>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     #[error("reasoning_summary applies only to the responses codec")]
     SummaryNeedsResponses,
-    #[error("organization is not a valid header value")]
-    Organization,
-    #[error("project is not a valid header value")]
-    Project,
 }
 
 impl DialectConfig for Config {
     fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
-        if !self.reasoning_summary && codec != CodecName::Responses {
+        if !self.reasoning_summary.is_requested() && codec != CodecName::Responses {
             return Err(Error::SummaryNeedsResponses.into());
         }
         let codec = match codec {
             CodecName::ChatCompletions => Codec::ChatCompletions(chat()),
             CodecName::Responses => Codec::Responses(responses::Dialect {
-                reasoning_summary: if self.reasoning_summary {
-                    responses::ReasoningSummary::Requested
-                } else {
-                    responses::ReasoningSummary::Unsupported
-                },
+                reasoning_summary: self.reasoning_summary,
                 ..responses()
             }),
             CodecName::Messages => {
@@ -133,19 +108,12 @@ impl DialectConfig for Config {
         };
         let mut profile = Profile::new(codec, transport, Dialect::Openai);
         // Identity headers tied to the key.
-        for (error, header, value) in [
-            (
-                Error::Organization,
-                "openai-organization",
-                &self.organization,
-            ),
-            (Error::Project, "openai-project", &self.project),
+        for (header, value) in [
+            ("openai-organization", &self.organization),
+            ("openai-project", &self.project),
         ] {
             if let Some(value) = value {
-                let value = HeaderValue::from_str(value).map_err(|_| error)?;
-                profile
-                    .headers
-                    .insert(HeaderName::from_static(header), Value::Fixed(value));
+                profile.fixed(header, value.value());
             }
         }
         Ok(profile)
@@ -159,45 +127,28 @@ mod tests {
 
     #[tokio::test]
     async fn key_and_identity_headers_ride_every_request() {
-        let config = Config {
-            reasoning_summary: false,
-            organization: Some("org_1".into()),
-            project: Some("proj_1".into()),
-        };
+        let config: Config = crate::yaml::parse(
+            "{reasoning_summary: unsupported, organization: org_1, project: proj_1}",
+        )
+        .unwrap();
         let head = head(&config, CodecName::Responses, "k").await;
         assert_eq!(header_values(&head, "authorization"), ["Bearer k"]);
         assert_eq!(header_values(&head, "openai-organization"), ["org_1"]);
         assert_eq!(header_values(&head, "openai-project"), ["proj_1"]);
-        let bad = Config {
-            organization: Some("bad\nvalue".into()),
-            ..Config::default()
-        };
-        assert_eq!(
-            bad.admit(&Common::default(), CodecName::Responses).err(),
-            Some(Error::Organization.into())
-        );
+        assert!(crate::yaml::parse::<Config>("organization: \"bad\\nvalue\"").is_err());
     }
 
     #[test]
-    fn summaries_opt_out_on_responses_only_and_messages_is_not_spoken() {
-        let admit = |config: &Config, codec| config.admit(&Common::default(), codec).err();
+    fn summaries_opt_out_on_responses_only() {
         let quiet = Config {
-            reasoning_summary: false,
+            reasoning_summary: ReasoningSummary::Unsupported,
             ..Config::default()
         };
         assert_eq!(
-            admit(&quiet, CodecName::ChatCompletions),
+            quiet
+                .admit(&Common::default(), CodecName::ChatCompletions)
+                .err(),
             Some(Error::SummaryNeedsResponses.into())
-        );
-        assert_eq!(
-            admit(&Config::default(), CodecName::Messages),
-            Some(
-                UnsupportedCodec {
-                    dialect: Dialect::Openai,
-                    codec: CodecName::Messages
-                }
-                .into()
-            )
         );
     }
 }

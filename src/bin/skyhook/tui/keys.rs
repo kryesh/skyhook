@@ -217,10 +217,9 @@ mod tests {
         assert!("/resume".parse::<Command>().is_err());
         assert!("resume later".parse::<Command>().is_err());
         assert_eq!("resume".parse::<Command>().unwrap(), Command::Resume);
-        assert_eq!("models".parse::<Command>().unwrap().to_string(), "model");
+        assert_eq!("models".parse::<Command>().unwrap(), Command::Model);
         assert_eq!("retry".parse::<Command>().unwrap(), Command::Retry);
         assert_eq!("continue".parse::<Command>().unwrap(), Command::Retry);
-        assert_eq!("continue".parse::<Command>().unwrap().to_string(), "retry");
     }
 
     #[test]
@@ -232,10 +231,6 @@ mod tests {
         assert_eq!(keys.binding(Command::Files).as_deref(), Some("Ctrl+X F"));
         assert_eq!(keys.action(Some(leader), key("c")), Some(Command::Retry));
         assert_eq!(keys.binding(Command::Retry).as_deref(), Some("Ctrl+X C"));
-        assert_eq!(
-            keys.binding(Command::Retry),
-            Some(display_sequence(parse_sequence("ctrl+x c")))
-        );
         assert_eq!(keys.action(None, key("ctrl+p")), Some(Command::Commands));
         assert!(keys.prefix(leader));
         assert_eq!(keys.binding(Command::Attachments), None);

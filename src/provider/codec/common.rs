@@ -1,24 +1,21 @@
-//! Shared model-facing input conversion and opaque reasoning provenance.
+//! Shared model-facing input conversion, native field access, finish settlement
+//! and opaque reasoning provenance.
+use std::fmt;
+
 use crate::{
     media::{AttachmentRef, ImageRef, MediaError, TextRef},
+    named_enum::{NamedEnum, named_enum},
     provider::{
         ProviderError, ProviderErrorKind,
         codec::{CodecName, ToolNames},
         protocol::{
-            AssistantItem, Binding, BlockId, BlockRef, Completion, CutReason, ItemId, ItemKind,
-            Message, ModelRequest, Position, Provenance, Replay, ReplayFormat, ResponseEvent,
-            Scope, TextBlock, ToolDefinition, ToolResult, UserContent,
+            AssistantItem, Binding, BlockRef, Completion, CutReason, ItemKind, Message,
+            ModelRequest, Position, Provenance, Replay, ReplayFormat, ResponseEvent, Scope,
+            ToolDefinition, ToolResult, UserContent,
         },
     },
 };
 use serde_json::{Map, Value, json};
-
-pub(crate) fn invalid(message: impl Into<String>) -> ProviderError {
-    ProviderError {
-        kind: ProviderErrorKind::InvalidRequest,
-        message: message.into(),
-    }
-}
 
 /// What every family requires of a tool definition: a name the endpoint
 /// accepts and an object schema. A codec adds its own constraints.
@@ -30,7 +27,7 @@ pub(crate) fn check_tool(
     if names.accepts(&tool.name) && tool.input_schema.is_object() {
         return Ok(());
     }
-    Err(invalid(format!(
+    Err(ProviderErrorKind::InvalidRequest.error(format!(
         "{codec} tools require {} and an object JSON Schema",
         names.rule()
     )))
@@ -70,6 +67,14 @@ pub(crate) fn lenient<'de, D: serde::Deserializer<'de>, T: serde::de::Deserializ
     Ok(T::deserialize(Value::deserialize(deserializer)?).ok())
 }
 
+/// A counter field read by [`lenient_u64`]; anything else reads as absent.
+pub(crate) fn lenient_count<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    use serde::Deserialize;
+    Ok(lenient_u64(&Value::deserialize(deserializer)?))
+}
+
 /// Read a non-negative counter that some servers encode as a float or string.
 pub(crate) fn lenient_u64(value: &Value) -> Option<u64> {
     match value {
@@ -84,22 +89,13 @@ pub(crate) fn lenient_u64(value: &Value) -> Option<u64> {
     }
 }
 
-fn blob_error(error: MediaError) -> ProviderError {
-    invalid(format!("attachment: {error}"))
+pub(crate) fn blob_error(error: MediaError) -> ProviderError {
+    ProviderErrorKind::InvalidRequest.error(format!("attachment: {error}"))
 }
 
 pub(crate) fn image_url(request: &ModelRequest, image: &ImageRef) -> Result<String, ProviderError> {
     let data = request.blobs.base64(&image.blob).map_err(blob_error)?;
-    Ok(format!("data:{};base64,{data}", image.format.media_type()))
-}
-
-pub(crate) fn anthropic_image(
-    request: &ModelRequest,
-    image: &ImageRef,
-) -> Result<Value, ProviderError> {
-    let data = request.blobs.base64(&image.blob).map_err(blob_error)?;
-    Ok(json!({"type":"image", "source":{"type":"base64",
-        "media_type":image.format.media_type(), "data":data}}))
+    Ok(format!("data:{};base64,{data}", image.format.as_str()))
 }
 
 /// Attached text as the model sees it: its source file, if any, then the content.
@@ -195,37 +191,66 @@ pub(crate) fn attach_runtime_tail(
     }
 }
 
-/// The wire identity of an index-addressed item.
-pub(crate) fn item_id(index: usize) -> ItemId {
-    ItemId::try_from(index.to_string()).expect("digits are nonblank")
+pub(crate) fn position(index: usize) -> Result<Position, ProviderError> {
+    Position::try_from(index).map_err(|error| ProviderErrorKind::Protocol.error(error.to_string()))
 }
 
-/// The single block of an index-addressed item.
-pub(crate) fn block_ref(index: usize) -> BlockRef {
-    BlockRef {
-        item: item_id(index),
-        block: BlockId::try_from("0".to_owned()).expect("literal is nonblank"),
+/// A family's own native JSON, whose missing or mistyped fields are that
+/// family's protocol errors.
+#[derive(Clone, Copy)]
+pub(crate) struct Native(pub CodecName);
+
+impl Native {
+    pub(crate) fn error(self, message: impl fmt::Display) -> ProviderError {
+        ProviderErrorKind::Protocol.error(format!("{}: {message}", self.0))
+    }
+
+    pub(crate) fn string<'a>(self, value: &'a Value, key: &str) -> Result<&'a str, ProviderError> {
+        value
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| self.error(format_args!("missing or invalid {key}")))
+    }
+
+    pub(crate) fn index(self, value: &Value, key: &str) -> Result<usize, ProviderError> {
+        value
+            .get(key)
+            .and_then(Value::as_u64)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| self.error(format_args!("missing or invalid {key}")))
     }
 }
 
-pub(crate) fn position(index: usize) -> Result<Position, ProviderError> {
-    Position::try_from(index).map_err(|error| ProviderError::protocol(error.to_string()))
+/// A native object's `type`, as the family's enum names it.
+pub(crate) fn tagged<T: NamedEnum>(value: &Value) -> Option<T> {
+    value.get("type").and_then(Value::as_str).and_then(T::parse)
 }
 
-/// The one text block of an index-addressed item, keyed like its deltas.
-pub(crate) fn single_block(index: usize, text: String) -> Vec<TextBlock> {
-    vec![TextBlock {
-        id: block_ref(index).block,
-        position: 0.into(),
-        text,
-    }]
-}
-
-pub(crate) fn delta(block: BlockRef, kind: ItemKind, text: impl Into<String>) -> ResponseEvent {
+/// A delta for the one block of an index-addressed item.
+pub(crate) fn delta(index: usize, kind: ItemKind, text: impl Into<String>) -> ResponseEvent {
     ResponseEvent::Delta {
-        block,
+        block: BlockRef::single(index),
         kind,
         text: text.into(),
+    }
+}
+
+named_enum! {
+    /// A finish reason as the families spell it, in any case.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) parsed enum StopReason {
+        Normal = "end_turn" | "stop" | "eos" | "stop_sequence" | "tool_use" | "tool_calls"
+            | "function_call",
+        MaxTokens = "max_tokens" | "length" | "max_output_tokens" | "model_length",
+        ContextWindow = "model_context_window_exceeded",
+        Aborted = "aborted" | "abort" | "cancelled" | "canceled",
+        Refusal = "refusal" | "content_filter" | "safety",
+    }
+}
+
+impl StopReason {
+    pub(crate) fn read(reason: &str) -> Option<Self> {
+        Self::parse(&reason.to_ascii_lowercase())
     }
 }
 
@@ -241,15 +266,107 @@ pub(crate) enum Finish {
 }
 
 impl Finish {
+    /// The finish a reason names. An unknown reason, like Messages'
+    /// `pause_turn` whose calls are not final, ends without executing tools.
+    pub(crate) fn of(reason: Option<StopReason>) -> Self {
+        match reason {
+            Some(StopReason::Normal) => Self::Normal,
+            Some(StopReason::MaxTokens) => Self::Cut(CutReason::MaxTokens),
+            Some(StopReason::Aborted) => Self::Cut(CutReason::Aborted),
+            Some(StopReason::Refusal) => Self::Cut(CutReason::Refusal),
+            // An overflow fails the attempt: its output is discarded and the context compacted.
+            Some(StopReason::ContextWindow) => {
+                Self::Error(ProviderErrorKind::ContextWindowExceeded)
+            }
+            None => Self::Cut(CutReason::Incomplete),
+        }
+    }
+
     pub(crate) fn complete(self, items: Vec<AssistantItem>) -> Result<Completion, ProviderError> {
         match self {
             Self::Normal => Ok(Completion::finished(items)?),
             Self::Cut(reason) => Ok(Completion::cut(items, reason)?),
-            Self::Error(kind) => Err(ProviderError {
-                kind,
-                message: format!("provider finished the response with {kind}"),
-            }),
+            Self::Error(kind) => {
+                Err(kind.error(format!("provider finished the response with {kind}")))
+            }
         }
+    }
+}
+
+/// Where a streamed response stands: producing output, settled on its finish
+/// while late frames may still refine usage, or ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Settlement {
+    Open,
+    Settled(Finish),
+    Ended,
+}
+
+/// The finish flow of a stream whose finish reason may precede its end: the
+/// first reason settles the response, later ones only revise it, and the end
+/// marker or EOF completes it.
+pub(crate) trait Settle {
+    fn settlement(&mut self) -> &mut Settlement;
+    fn has_tools(&self) -> bool;
+    /// Reject output that `finish` cannot complete; an error finish wins unadmitted.
+    fn admit(&self, finish: Finish) -> Result<(), ProviderError>;
+    fn completion(&mut self, finish: Finish) -> Result<Completion, ProviderError>;
+
+    /// A later abnormal reason retracts tool calls as a cut; nothing revives
+    /// them, and a response without calls keeps its settled finish. A late error
+    /// reason does not fail a response that already settled normally.
+    fn reason(&mut self, finish: Finish) -> Result<(), ProviderError> {
+        let settled = match (*self.settlement(), finish) {
+            (Settlement::Open, Finish::Error(_)) => finish,
+            (Settlement::Open, _) => {
+                self.admit(finish)?;
+                finish
+            }
+            (Settlement::Settled(Finish::Normal), Finish::Cut(reason)) if self.has_tools() => {
+                Finish::Cut(reason)
+            }
+            (Settlement::Settled(Finish::Normal), Finish::Error(_)) if self.has_tools() => {
+                Finish::Cut(CutReason::Incomplete)
+            }
+            _ => return Ok(()),
+        };
+        *self.settlement() = Settlement::Settled(settled);
+        Ok(())
+    }
+
+    /// The end marker completes the response, settled or not.
+    fn close(&mut self) -> Result<ResponseEvent, ProviderError> {
+        let finish = match *self.settlement() {
+            Settlement::Settled(finish) => finish,
+            _ => {
+                // Without a finish reason, tool calls are not provably complete.
+                let finish = if self.has_tools() {
+                    Finish::Cut(CutReason::Incomplete)
+                } else {
+                    Finish::Normal
+                };
+                self.admit(finish)?;
+                finish
+            }
+        };
+        self.complete(finish)
+    }
+
+    /// EOF completes a settled response; an open one fails with `unsettled`.
+    fn eof(
+        &mut self,
+        unsettled: impl FnOnce() -> ProviderError,
+    ) -> Result<Vec<ResponseEvent>, ProviderError> {
+        match *self.settlement() {
+            Settlement::Ended => Ok(Vec::new()),
+            Settlement::Settled(finish) => Ok(vec![self.complete(finish)?]),
+            Settlement::Open => Err(unsettled()),
+        }
+    }
+
+    fn complete(&mut self, finish: Finish) -> Result<ResponseEvent, ProviderError> {
+        *self.settlement() = Settlement::Ended;
+        Ok(ResponseEvent::End(self.completion(finish)?))
     }
 }
 
@@ -273,7 +390,7 @@ pub(crate) fn signed_context(request: &ModelRequest, format: ReplayFormat) -> bo
             _ => None,
         })
         .flatten()
-        .filter_map(|item| own_replay(item.replay(), format, &request.model))
+        .filter_map(|item| own_replay(item.replay(), format, request.model.as_str()))
         .any(|replay| replay.binding == Binding::Conversation)
 }
 
@@ -304,42 +421,12 @@ pub(crate) fn replay(
     }
 }
 
-/// Provider-bound provenance prevents replaying private reasoning to a different
-/// endpoint, codec or dialect even when protocol and model names happen to match.
-pub(crate) fn reasoning_scope(
-    name: &str,
-    endpoint: &str,
-    codec: super::CodecName,
-    dialect: &str,
-) -> Scope {
-    let codec = codec.path_suffix();
-    let digest = crate::sha256_hex(format!("{name}\0{endpoint}\0{codec}\0{dialect}"));
-    Scope::try_from(digest).expect("digest is nonblank")
-}
-
-pub(crate) fn filter_reasoning_scope(request: &mut ModelRequest, scope: &Scope) {
-    for message in request.messages_mut() {
-        if let Message::Assistant(items) = message {
-            for item in items {
-                if let AssistantItem::Reasoning { replay, .. } = item
-                    && replay
-                        .as_ref()
-                        .is_some_and(|replay| replay.provenance.scope != *scope)
-                {
-                    *replay = None;
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
     use crate::media::{BlobRef, ImageFormat};
     use crate::provider::protocol::{
-        AssistantItem, Completion, LiveBlock, LiveResponse, Message, ModelRequest, Step, TextBlock,
-        Usage,
+        AssistantItem, Completion, LiveBlock, LiveResponse, Message, ModelRequest, Step, Usage,
     };
 
     /// The scope test decoders issue replay under.
@@ -455,64 +542,11 @@ pub(crate) mod tests {
         }
     }
 
-    /// A Chat-shaped request with one tool, for provider round trips.
-    pub(crate) fn chat_request(model: &str, messages: Vec<Message>) -> ModelRequest {
-        ModelRequest {
-            history: messages,
-            tools: vec![crate::provider::protocol::ToolDefinition {
-                name: "lookup".into(),
-                description: "Find a value".into(),
-                input_schema: json!({"type":"object", "properties":{"q":{"type":"string"}}}),
-            }],
-            max_output_tokens: Some(512),
-            ..request(model)
-        }
-    }
-
-    /// A native Responses reasoning item with opaque private state.
+    /// A native Responses reasoning item with summaries and opaque private state.
     pub(crate) fn reasoning_item() -> Value {
-        json!({"type":"reasoning", "id":"rs_private", "summary":[],
-            "encrypted_content":"opaque+/=", "future_native":{"state":"keep"}})
-    }
-
-    /// A tool loop whose assistant turn replays [`reasoning_item`] under `scope`.
-    pub(crate) fn reasoning_tool_request(scope: &Scope) -> ModelRequest {
-        use crate::provider::protocol::{ItemId, ToolCall, ToolResult};
-        let replay = replay(
-            ReplayFormat::Responses,
-            "gpt-5",
-            scope,
-            reasoning_item(),
-            Binding::Free,
-        );
-        // Native reasoning without a readable summary replays from its envelope alone.
-        let reasoning = AssistantItem::Reasoning {
-            id: ItemId::try_from("rs_private".to_owned()).unwrap(),
-            position: 0.into(),
-            blocks: Vec::new(),
-            replay: Some(replay),
-        };
-        ModelRequest {
-            history: vec![
-                Message::Assistant(vec![
-                    reasoning,
-                    AssistantItem::tool_call(
-                        "fc_1",
-                        1,
-                        ToolCall::new("call_1", "inspect", json!({"path":"test"})).unwrap(),
-                    ),
-                ]),
-                Message::Tool(vec![ToolResult {
-                    call_id: "call_1".into(),
-                    name: "inspect".into(),
-                    result: json!({"ok":true}),
-                    images: vec![],
-                    is_error: false,
-                }]),
-            ],
-            max_output_tokens: Some(100),
-            ..request("gpt-5")
-        }
+        json!({"type":"reasoning", "id":"rs_1", "encrypted_content":"opaque+/=",
+            "summary":[{"type":"summary_text", "text":"first"}, {"type":"summary_text", "text":"second"}],
+            "future_native":{"state":"keep"}})
     }
 
     /// Minimal request shared by codec/provider tests; cases override only the
@@ -522,76 +556,9 @@ pub(crate) mod tests {
             history: vec![Message::User(vec![UserContent::Text {
                 text: "hello".into(),
             }])],
-            max_output_tokens: Some(8192),
+            max_output_tokens: std::num::NonZeroU64::new(8192),
             ..ModelRequest::test(model)
         }
-    }
-
-    #[test]
-    fn endpoint_scope_is_required_and_preserves_only_matching_private_state() {
-        let a = reasoning_scope(
-            "api",
-            "https://a.example/v1/responses",
-            crate::provider::codec::CodecName::Responses,
-            "compatible",
-        );
-        let b = reasoning_scope(
-            "api",
-            "https://b.example/v1/responses",
-            crate::provider::codec::CodecName::Responses,
-            "compatible",
-        );
-        assert_ne!(a, b);
-        // The provider name, the codec, and the dialect each scope replay too.
-        let endpoint = "https://a.example/v1/responses";
-        let responses = crate::provider::codec::CodecName::Responses;
-        assert_ne!(
-            a,
-            reasoning_scope("alias", endpoint, responses, "compatible")
-        );
-        assert_ne!(
-            a,
-            reasoning_scope(
-                "api",
-                endpoint,
-                crate::provider::codec::CodecName::ChatCompletions,
-                "compatible"
-            )
-        );
-        assert_ne!(a, reasoning_scope("api", endpoint, responses, "openai"));
-        let native = json!({"type":"reasoning","encrypted_content":"private"});
-        let replay = replay(
-            ReplayFormat::Responses,
-            "same-model",
-            &a,
-            native,
-            Binding::Free,
-        );
-        let mut item = AssistantItem::reasoning("reasoning-0", 0, "summary", Some(replay));
-        let AssistantItem::Reasoning { blocks, .. } = &mut item else {
-            unreachable!()
-        };
-        blocks.push(TextBlock {
-            id: BlockId::try_from("summary-1".to_owned()).unwrap(),
-            position: 1.into(),
-            text: "second summary".into(),
-        });
-        let expected_text = item.reasoning_text();
-        let messages = vec![Message::Assistant(vec![item])];
-        let request = ModelRequest {
-            history: messages,
-            ..request("same-model")
-        };
-        let mut matching = request.clone();
-        filter_reasoning_scope(&mut matching, &a);
-        assert_eq!(matching, request);
-        let mut foreign = request;
-        filter_reasoning_scope(&mut foreign, &b);
-        let Message::Assistant(parts) = &foreign.history[0] else {
-            unreachable!()
-        };
-        assert!(parts[0].replay().is_none());
-        assert_eq!(parts[0].reasoning_text(), expected_text);
     }
 
     #[test]
@@ -599,18 +566,13 @@ pub(crate) mod tests {
         let (image, text) = (image(), notes());
         let mut request = request("model");
         let missing = image_url(&request, &image).unwrap_err();
-        assert_eq!(missing.kind, ProviderErrorKind::InvalidRequest);
-        assert!(anthropic_image(&request, &image).is_err());
+        assert_eq!(missing.kind(), ProviderErrorKind::InvalidRequest);
         assert!(attachment_text(&request, &text).is_err());
         request.blobs.insert(image.blob, b"\x01\x02\x03".to_vec());
         request.blobs.insert(text.blob, b"notes".to_vec());
         assert_eq!(
             image_url(&request, &image).unwrap(),
             "data:image/png;base64,AQID"
-        );
-        assert_eq!(
-            anthropic_image(&request, &image).unwrap(),
-            json!({"type":"image", "source":{"type":"base64", "media_type":"image/png", "data":"AQID"}})
         );
         assert_eq!(
             attachment_text(&request, &text).unwrap(),

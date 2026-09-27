@@ -9,6 +9,11 @@ use crate::{
     newtype::{Blank, nonblank, string_newtype},
 };
 
+string_newtype! {
+    /// The model identifier a provider's API is sent: free-form, never blank.
+    pub struct WireModel(Blank) = |model| nonblank("model", model);
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SystemSegment {
     pub text: String,
@@ -18,7 +23,7 @@ pub struct SystemSegment {
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 pub struct ModelRequest {
-    pub model: String,
+    pub model: WireModel,
     pub system: Vec<SystemSegment>,
     /// Committed conversation. Within one context it is an unchanged prefix of every
     /// later request until compaction replaces it, so it is safe to cache.
@@ -33,7 +38,7 @@ pub struct ModelRequest {
     /// Optional JSON Schema for the final answer; reasoning remains a separate stream.
     pub response_schema: Option<ResponseSchema>,
     pub reasoning: Option<String>,
-    pub max_output_tokens: Option<u64>,
+    pub max_output_tokens: Option<std::num::NonZeroU64>,
     /// Blob contents this request references, loaded by the session store for
     /// provider encoding. Never serialized.
     #[serde(skip)]
@@ -45,7 +50,7 @@ impl ModelRequest {
     #[cfg(test)]
     pub(crate) fn test(model: &str) -> Self {
         Self {
-            model: model.into(),
+            model: model.parse().unwrap(),
             system: Vec::new(),
             history: Vec::new(),
             tail: Vec::new(),
@@ -70,7 +75,7 @@ impl ModelRequest {
 
 named_enum! {
     /// Whether later requests in this model context will extend this request's history.
-    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
     pub enum HistoryLifetime {
         /// Later requests in this context extend this history.
         #[default]

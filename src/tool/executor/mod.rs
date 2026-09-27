@@ -4,8 +4,9 @@ mod dispatch;
 mod planning;
 mod results;
 
-pub use results::{ExecutionError, ExecutionResult};
-pub(crate) use results::{StartedExecution, persist_completion};
+pub use results::ExecutionResult;
+pub(crate) use results::StartedExecution;
+pub(crate) use results::failure_response;
 
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
@@ -13,7 +14,7 @@ use std::{path::PathBuf, sync::Arc};
 use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, JobId},
-    job::{JobError, JobManager, JobOutcome, JobSpec, JobState},
+    job::{JobManager, JobSpec, JobState},
     remote::RemoteError,
     target::{ResolvedRoute, TargetRef, TargetRouter},
     tool::{
@@ -24,7 +25,7 @@ use crate::{
             Subject,
         },
         policy::{Capability, CapabilitySet, PermissionUse, Policy},
-        registry::{ExecutionEnvelope, JobLaunch, JobName},
+        registry::{Arguments, ExecutionEnvelope, JobLaunch},
     },
 };
 
@@ -39,8 +40,8 @@ enum InvocationKind {
 
 struct PreparedInvocation {
     tool: Arc<crate::tool::RegisteredTool>,
-    original_arguments: Value,
-    handler_arguments: Value,
+    original_arguments: Arguments,
+    handler_arguments: Arguments,
     envelope: ExecutionEnvelope,
 }
 
@@ -48,14 +49,19 @@ struct InvocationPlan {
     origin: Option<crate::session::ModelCallOrigin>,
     agent: AgentId,
     tool: Arc<crate::tool::RegisteredTool>,
-    original_arguments: Value,
-    authorization_arguments: Value,
+    original_arguments: Arguments,
+    authorization_arguments: crate::tool::authorization::AuthorizationArguments,
     caller_location: ExecutionLocation,
     execution_location: ExecutionLocation,
+    /// Where the job reports it acts: the execution location, unless the input
+    /// places it elsewhere.
+    job_location: ExecutionLocation,
     permissions: Vec<PermissionUse>,
     path_facts: Vec<PathFact>,
     parent: Option<JobId>,
     launch: JobLaunch,
+    /// Admitted on the host even when a remote destination runs the call.
+    result_policy: super::ToolResultPolicy,
     dispatch: InvocationDispatch<PlannedRemote>,
     source: Option<SourcePlan<PlannedRemote>>,
 }
@@ -74,26 +80,12 @@ enum SourcePlan<R> {
     },
 }
 
-impl InvocationPlan {
-    /// Only a locally admitted call can present another job's view.
-    fn result_policy(&self) -> super::ToolResultPolicy {
-        match &self.dispatch {
-            InvocationDispatch::Local(Ok(admitted)) => admitted.result_policy(),
-            _ => super::ToolResultPolicy::Value,
-        }
-    }
-}
-
 /// The remote payload is a planned route before authorization and a prepared
 /// connection afterwards; local dispatch is unchanged by that transition.
 enum InvocationDispatch<R> {
-    /// Admission failures are reported by the job, after approval, as a handler would.
-    Local(Result<super::registry::AdmittedInvocation, super::AdmissionError>),
+    Local(super::registry::AdmittedInvocation),
     ReadError(Box<ToolOutput>),
-    Remote {
-        remote: R,
-        arguments: Value,
-    },
+    Remote { remote: R, arguments: Arguments },
 }
 
 struct PlannedRemote {
@@ -110,13 +102,8 @@ pub(crate) struct CreatedInvocation {
 }
 
 impl CreatedInvocation {
-    /// The name the job was published under.
-    pub(crate) fn job_name(&self) -> Option<&JobName> {
-        self.plan.launch.name.as_ref()
-    }
-
     pub(crate) fn result_policy(&self) -> super::ToolResultPolicy {
-        self.plan.result_policy()
+        self.plan.result_policy
     }
 }
 
@@ -193,11 +180,6 @@ impl ToolExecutor {
         self
     }
 
-    #[must_use]
-    pub fn surface(&self) -> crate::tool::ToolSurface {
-        self.shared.registry.surface(&self.capabilities)
-    }
-
     /// Generate model and JavaScript tools for the receiving agent.
     #[must_use]
     pub fn surface_for_agent(&self, agent: &AgentId) -> crate::tool::ToolSurface {
@@ -232,7 +214,7 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<ExecutionResult, ToolError> {
         self.execute_as(InvocationKind::Host, agent, name, arguments, parent)
             .await
     }
@@ -244,7 +226,7 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<ExecutionResult, ToolError> {
         self.execute_as(InvocationKind::Model, agent, name, arguments, parent)
             .await
     }
@@ -256,7 +238,7 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<ExecutionResult, ToolError> {
         self.execute_as(InvocationKind::Script, agent, name, arguments, parent)
             .await
     }
@@ -268,7 +250,7 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<ExecutionResult, ToolError> {
         let created = self.create(kind, agent, name, arguments, parent).await?;
         self.run(created).await
     }
@@ -281,7 +263,7 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<CreatedInvocation, ExecutionError> {
+    ) -> Result<CreatedInvocation, ToolError> {
         self.create(InvocationKind::Model, agent, name, arguments, parent)
             .await
     }
@@ -293,7 +275,7 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<CreatedInvocation, ExecutionError> {
+    ) -> Result<CreatedInvocation, ToolError> {
         self.create(InvocationKind::Script, agent, name, arguments, parent)
             .await
     }
@@ -305,20 +287,17 @@ impl ToolExecutor {
         name: &str,
         arguments: Value,
         parent: Option<JobId>,
-    ) -> Result<CreatedInvocation, ExecutionError> {
+    ) -> Result<CreatedInvocation, ToolError> {
         let plan = self
             .plan_registered(kind, agent, name, arguments, parent)
             .await
             .map_err(|error| {
-                let host = self
-                    .shared
-                    .registry
-                    .get(name)
-                    .is_none_or(|tool| tool.placement() == ToolPlacement::Host);
-                let fallback =
+                let placement = (self.shared.registry.get(name))
+                    .map_or(ToolPlacement::Host, |tool| tool.placement());
+                error.or(
                     PartialContext::new(Operation::Validate, Subject::Tool(name.to_owned()))
-                        .at(FailureSite::bound(&self.caller_location, host));
-                error.or(fallback, &self.capabilities)
+                        .at(FailureSite::bound(&self.caller_location, placement)),
+                )
             })?;
         // The plan's borrow ends before the append: admitted handlers are not `Sync`.
         let (spec, fallback) = (self.job_spec(&plan), prepare_fallback(&plan));
@@ -327,7 +306,7 @@ impl ToolExecutor {
             .jobs
             .create(spec)
             .await
-            .map_err(|error| ExecutionError::from(error).or(fallback, &self.capabilities))?;
+            .map_err(|error| job_error(error).or(fallback))?;
         Ok(CreatedInvocation { kind, plan, lease })
     }
 
@@ -335,14 +314,14 @@ impl ToolExecutor {
     pub(crate) async fn run(
         &self,
         created: CreatedInvocation,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<ExecutionResult, ToolError> {
         let CreatedInvocation { kind, plan, lease } = created;
-        let result_policy = plan.result_policy();
+        let result_policy = plan.result_policy;
         let fallback = prepare_fallback(&plan);
         let started = self
             .start(plan, lease)
             .await
-            .map_err(|error| error.or(fallback, &self.capabilities))?;
+            .map_err(|error| error.or(fallback))?;
         match kind {
             InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
                 self.collect_model_started(started).await
@@ -355,6 +334,11 @@ impl ToolExecutor {
     }
 }
 
+/// Job state lives on the session host; the caller names the failed stage.
+fn job_error(error: crate::job::JobError) -> ToolError {
+    ToolError::from(error).or(PartialContext::default().at(FailureSite::Host))
+}
+
 fn prepare_fallback(plan: &InvocationPlan) -> PartialContext {
     PartialContext::new(
         Operation::Prepare,
@@ -362,6 +346,6 @@ fn prepare_fallback(plan: &InvocationPlan) -> PartialContext {
     )
     .at(FailureSite::bound(
         &plan.execution_location,
-        plan.tool.placement() == ToolPlacement::Host,
+        plan.tool.placement(),
     ))
 }

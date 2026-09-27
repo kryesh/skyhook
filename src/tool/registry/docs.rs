@@ -1,6 +1,9 @@
 //! Provider-facing definitions, script manifests, and compact schema documentation.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::LazyLock,
+};
 
 use serde::Serialize;
 use serde_json::Value;
@@ -8,45 +11,23 @@ use serde_json::Value;
 use crate::json_schema::{Node, Resolver};
 use crate::provider::protocol::ToolDefinition as ProviderToolDefinition;
 
-use super::{ScriptBinding, ToolExposure, ToolSpec, ToolSurface};
+use super::{JobViewResult, ResultSchema, ScriptBinding, ToolExposure, ToolSpec, ToolSurface};
 
-/// Sanitized job view schemas, as tool result schemas are stored.
-#[derive(Clone, Default)]
-pub(super) struct JobViewSchemas {
-    one: Value,
-    many: Value,
-}
+static JOB_VIEW_TYPE: LazyLock<String> = LazyLock::new(|| {
+    let schema = &crate::job::JOB_VIEW_SCHEMAS.one;
+    schema_type(schema, schema)
+});
 
-impl JobViewSchemas {
-    pub(super) fn new() -> Self {
-        let sanitized = |many| {
-            let mut schema = crate::job::presented_job_schema(many);
-            super::schema::sanitize_schema(&mut schema);
-            schema
-        };
-        Self {
-            one: sanitized(false),
-            many: sanitized(true),
-        }
-    }
-
-    /// Append a result type to `description`, unless it is plain JSON.
-    fn describe(&self, description: &str, label: &str, schema: Option<&Value>) -> String {
-        match schema.map(|schema| self.render(schema)) {
-            Some(result) if result != "JSON" => format!("{description} {label} `{result}`."),
-            _ => description.to_owned(),
-        }
-    }
-
-    /// Render a result type, naming job views rather than expanding them.
-    fn render(&self, schema: &Value) -> String {
-        if *schema == self.one {
-            "JobView".to_owned()
-        } else if *schema == self.many {
-            "JobView[]".to_owned()
-        } else {
-            result_type(schema)
-        }
+/// Append a result type to `description`, unless it is plain JSON.
+fn describe(description: &str, label: &str, result: Option<&ResultSchema>) -> String {
+    let rendered = result.map(|result| match result {
+        ResultSchema::Json(schema) => result_type(schema),
+        ResultSchema::JobViews(JobViewResult::One) => "JobView".to_owned(),
+        ResultSchema::JobViews(JobViewResult::Many) => "JobView[]".to_owned(),
+    });
+    match rendered {
+        Some(result) if result != "JSON" => format!("{description} {label} `{result}`."),
+        _ => description.to_owned(),
     }
 }
 
@@ -57,11 +38,8 @@ impl ToolSurface {
             .values()
             .filter(|tool| tool.exposure == ToolExposure::ModelVisible)
             .map(|tool| {
-                let description = self.job_views.describe(
-                    &tool.description,
-                    "Result:",
-                    tool.result_schema.as_ref(),
-                );
+                let description =
+                    describe(&tool.description, "Result:", tool.result_schema.as_ref());
                 let description = if tool.job_role == crate::job::JobRole::Script {
                     self.script_description(&description)
                 } else {
@@ -80,11 +58,8 @@ impl ToolSurface {
         let documented = self
             .tools
             .values()
-            .filter(|tool| {
-                tool.exposure == ToolExposure::ScriptOnly
-                    && tool.script_binding != ScriptBinding::Unavailable
-            })
-            .map(|tool| script_documentation(tool, &self.job_views))
+            .filter(|tool| tool.exposure == ToolExposure::ScriptOnly)
+            .filter_map(|tool| Some(ScriptManifest::from_tool(tool)?.documentation(tool)))
             .collect::<Vec<_>>();
         if documented.is_empty() {
             base.to_owned()
@@ -97,9 +72,8 @@ impl ToolSurface {
     }
 }
 
-pub(crate) fn job_view_type() -> String {
-    let schema = crate::job::presented_job_schema(false);
-    schema_type(&schema, &schema)
+pub(crate) fn job_view_type() -> &'static str {
+    &JOB_VIEW_TYPE
 }
 
 #[derive(Clone, Serialize)]
@@ -108,120 +82,78 @@ pub(crate) struct ScriptManifest {
     properties: Vec<String>,
     required: Vec<String>,
     #[serde(flatten)]
-    binding: ScriptManifestBinding,
-}
-
-#[derive(Clone, Serialize)]
-#[serde(tag = "binding", rename_all = "snake_case")]
-enum ScriptManifestBinding {
-    TopLevel,
-    JobMethod {
-        method: String,
-        job_argument: String,
-    },
+    binding: ScriptBinding,
 }
 
 impl ScriptManifest {
+    /// The script call for `tool`, whose arguments omit a job method's job.
     pub(super) fn from_tool(tool: &ToolSpec) -> Option<Self> {
-        let (binding, excluded) = match &tool.script_binding {
-            ScriptBinding::TopLevel => (ScriptManifestBinding::TopLevel, None),
-            ScriptBinding::JobMethod {
-                method,
-                job_argument,
-            } => (
-                ScriptManifestBinding::JobMethod {
-                    method: method.clone(),
-                    job_argument: job_argument.clone(),
-                },
-                Some(job_argument.as_str()),
-            ),
+        let excluded = match &tool.script_binding {
+            ScriptBinding::TopLevel => None,
+            ScriptBinding::JobMethod { job_argument, .. } => Some(*job_argument),
             ScriptBinding::Unavailable => return None,
         };
-        let properties = tool.input_schema["properties"]
-            .as_object()
-            .map(|properties| {
-                properties
-                    .keys()
-                    .filter(|property| Some(property.as_str()) != excluded)
-                    .cloned()
-                    .collect()
-            })
-            .unwrap_or_default();
-        let required = tool.input_schema["required"]
-            .as_array()
-            .map(|required| {
-                required
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .filter(|property| Some(*property) != excluded)
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default();
+        let included = |property: &&str| Some(*property) != excluded;
+        let schema = &tool.input_schema;
+        let properties = (schema["properties"].as_object().into_iter())
+            .flat_map(|properties| properties.keys().map(String::as_str))
+            .filter(included)
+            .map(str::to_owned)
+            .collect();
+        let required = (schema["required"].as_array().into_iter().flatten())
+            .filter_map(Value::as_str)
+            .filter(included)
+            .map(str::to_owned)
+            .collect();
         Some(Self {
             name: tool.name.clone(),
             properties,
             required,
-            binding,
+            binding: tool.script_binding.clone(),
         })
     }
-}
 
-fn script_documentation(tool: &ToolSpec, job_views: &JobViewSchemas) -> String {
-    let schema = &tool.input_schema;
-    let excluded = match &tool.script_binding {
-        ScriptBinding::JobMethod { job_argument, .. } => Some(job_argument.as_str()),
-        ScriptBinding::TopLevel | ScriptBinding::Unavailable => None,
-    };
-    let required = schema["required"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(Value::as_str)
-        .collect::<Vec<_>>();
-    let fields = schema["properties"]
-        .as_object()
-        .into_iter()
-        .flat_map(|properties| properties.iter())
-        .filter(|(name, _)| Some(name.as_str()) != excluded)
-        .map(|(name, field)| {
-            let optional = if required.contains(&name.as_str()) {
-                ""
-            } else {
-                "?"
-            };
-            let default = field
-                .get("default")
-                .map_or_else(String::new, |value| format!("={}", compact_json(value)));
-            format!("{name}{optional}: {}{default}", schema_type(field, schema))
-        })
-        .collect::<Vec<_>>();
-    let arguments = if fields.is_empty() {
-        "()".to_owned()
-    } else {
-        format!("({{{}}})", fields.join(", "))
-    };
-    let call = match &tool.script_binding {
-        ScriptBinding::TopLevel => format!("tool.{}{arguments}", tool.name),
-        ScriptBinding::JobMethod { method, .. } => format!("tool.job(id).{method}{arguments}"),
-        ScriptBinding::Unavailable => unreachable!(),
-    };
-    let field_docs = schema["properties"]
-        .as_object()
-        .into_iter()
-        .flat_map(|properties| properties.iter())
-        .filter(|(name, field)| {
-            Some(name.as_str()) != excluded && field.get("description").is_some()
-        })
-        .map(|(name, field)| {
-            format!(
-                " `{name}`: {}",
-                field["description"].as_str().unwrap_or_default()
-            )
-        })
-        .collect::<String>();
-    let description = job_views.describe(&tool.description, "Returns", tool.output_schema.as_ref());
-    format!("- `{call}` — {description}{field_docs}")
+    fn documentation(&self, tool: &ToolSpec) -> String {
+        let schema = &tool.input_schema;
+        let field = |name: &str| &schema["properties"][name];
+        let fields = (self.properties.iter())
+            .map(|name| {
+                let optional = if self.required.contains(name) {
+                    ""
+                } else {
+                    "?"
+                };
+                let default = (field(name).get("default"))
+                    .map_or_else(String::new, |value| format!("={}", compact_json(value)));
+                format!(
+                    "{name}{optional}: {}{default}",
+                    schema_type(field(name), schema)
+                )
+            })
+            .collect::<Vec<_>>();
+        let arguments = if fields.is_empty() {
+            "()".to_owned()
+        } else {
+            format!("({{{}}})", fields.join(", "))
+        };
+        let call = match &self.binding {
+            ScriptBinding::JobMethod { method, .. } => format!("tool.job(id).{method}{arguments}"),
+            ScriptBinding::TopLevel | ScriptBinding::Unavailable => {
+                format!("tool.{}{arguments}", self.name)
+            }
+        };
+        let field_docs = (self.properties.iter())
+            .filter_map(|name| {
+                let description = field(name).get("description")?;
+                Some(format!(
+                    " `{name}`: {}",
+                    description.as_str().unwrap_or_default()
+                ))
+            })
+            .collect::<String>();
+        let description = describe(&tool.description, "Returns", tool.result_schema.as_ref());
+        format!("- `{call}` — {description}{field_docs}")
+    }
 }
 
 fn schema_type<'a>(field: &'a Value, root: &'a Value) -> String {
@@ -443,7 +375,7 @@ mod tests {
         },"required":["children"]});
         assert_eq!(schema_type(&tree, &tree), "{children:Tree[]}");
         let view = job_view_type();
-        assert!(view.contains("has_result:boolean"));
+        assert!(view.contains("result?:JSON"));
         assert!(view.contains("JobView"));
         assert!(
             view.len() < 10_000,
@@ -452,7 +384,7 @@ mod tests {
     }
 
     #[test]
-    fn result_types_define_shared_definitions_once_and_name_job_views() {
+    fn result_types_define_shared_definitions_once() {
         let body =
             json!({"type":"object","properties":{"text":{"type":"string"}},"required":["text"]});
         let schema = json!({
@@ -466,8 +398,5 @@ mod tests {
             result_type(&schema),
             "{body:Body} | {body?:Body, once?:integer}` where `Body = {text:string}"
         );
-        let views = JobViewSchemas::new();
-        assert_eq!(views.render(&views.one), "JobView");
-        assert_eq!(views.render(&views.many), "JobView[]");
     }
 }

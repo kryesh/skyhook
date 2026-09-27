@@ -11,10 +11,9 @@ use skyhook::remote::{ArtifactError, EmbeddedShimCatalog};
 struct EmbeddedShims;
 
 pub(crate) fn catalog() -> Result<EmbeddedShimCatalog, ArtifactError> {
-    EmbeddedShimCatalog::from_embedded_assets(EmbeddedShims::iter().map(|name| {
-        let file = EmbeddedShims::get(&name).expect("an enumerated embedded shim must exist");
-        (name, file.data)
-    }))
+    EmbeddedShimCatalog::from_embedded_assets(EmbeddedShims::iter(), |name| {
+        EmbeddedShims::get(name).map(|file| file.data)
+    })
 }
 
 #[cfg(test)]
@@ -24,12 +23,9 @@ mod tests {
     #[test]
     fn every_staged_shim_is_a_valid_catalog_entry() {
         catalog().unwrap();
-        for name in EmbeddedShims::iter() {
-            assert!(!name.starts_with('.'));
-            let file = EmbeddedShims::get(&name).unwrap();
-            assert!(!file.data.is_empty());
-            // Validate every discovered filename without a second target list.
-            EmbeddedShimCatalog::from_embedded_assets([(name, file.data)]).unwrap();
-        }
+        assert!(EmbeddedShims::iter().all(|name| {
+            !name.starts_with('.')
+                && EmbeddedShims::get(&name).is_some_and(|file| !file.data.is_empty())
+        }));
     }
 }

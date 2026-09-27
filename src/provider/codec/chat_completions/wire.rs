@@ -2,22 +2,23 @@
 //! Deserialization is deliberately forgiving: compatible servers add vendor
 //! fields, vary placeholder types, and encode values loosely. Fields that carry
 //! output are decoded when their intent is unambiguous; everything else is ignored.
-use crate::provider::{
-    codec::common::{is_signed, lenient, lenient_u64},
-    protocol::ReplayFormat,
+use super::ReasoningFormat;
+use crate::provider::codec::{
+    common::{is_signed, lenient, lenient_count, lenient_u64},
+    usage::Observed,
 };
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 
-#[derive(Default)]
 pub(super) struct Chunk {
     /// The response ID shared by every chunk of one completion.
     pub id: Option<String>,
     pub choice: Option<Choice>,
-    pub usage: Option<Usage>,
+    pub usage: Option<Observed>,
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 pub(super) struct Choice {
     #[serde(default, deserialize_with = "delta_or_default")]
     pub delta: Delta,
@@ -59,36 +60,38 @@ impl Delta {
     /// The reasoning text this delta carries. `reasoning_content` is primary;
     /// `reasoning` and the thinking blocks' fragments are fallbacks for the same
     /// text. A completing block re-sends text already carried, so it adds none.
-    pub(super) fn reasoning_text(&self) -> Option<String> {
+    pub(super) fn reasoning_text(&self) -> Option<Cow<'_, str>> {
         [&self.reasoning_content, &self.reasoning]
             .into_iter()
             .filter_map(Option::as_deref)
             .find(|text| !text.is_empty())
-            .map(str::to_owned)
+            .map(Cow::Borrowed)
             .or_else(|| {
-                let text: String = self
-                    .thinking_blocks
-                    .iter()
-                    .flatten()
-                    .filter(|block| !block.view.completes())
-                    .filter_map(|block| block.view.text())
-                    .collect();
-                (!text.is_empty()).then_some(text)
+                let text: String = self.fragments().collect();
+                (!text.is_empty()).then_some(Cow::Owned(text))
             })
+    }
+
+    fn fragments(&self) -> impl Iterator<Item = &str> {
+        self.thinking_blocks
+            .iter()
+            .flatten()
+            .filter(|block| !block.view.completes())
+            .filter_map(|block| block.view.text())
     }
 
     /// Whether the native reasoning field `format` replays carries anything:
     /// thinking text or a block completion, or a detail entry of any kind.
-    fn has_native_reasoning(&self, format: ReplayFormat) -> bool {
+    fn has_native_reasoning(&self, format: ReasoningFormat) -> bool {
         match format {
-            ReplayFormat::ChatThinkingBlock => self.thinking_blocks.iter().flatten().any(|block| {
+            ReasoningFormat::ThinkingBlocks => self.thinking_blocks.iter().flatten().any(|block| {
                 block.view.completes() || block.view.text().is_some_and(|text| !text.is_empty())
             }),
-            ReplayFormat::ChatReasoningDetail => self
+            ReasoningFormat::Details => self
                 .reasoning_details
                 .as_ref()
                 .is_some_and(|details| !details.is_empty()),
-            _ => false,
+            ReasoningFormat::Text => false,
         }
     }
 
@@ -104,11 +107,12 @@ impl Delta {
     /// Whether this delta carries no output a decoder of `format` reads.
     /// Compatible servers vary between omitted, null, and empty placeholders,
     /// including repeated roles.
-    pub(super) fn is_noop(&self, format: ReplayFormat) -> bool {
+    pub(super) fn is_noop(&self, format: ReasoningFormat) -> bool {
         [&self.content, &self.refusal]
             .into_iter()
+            .chain([&self.reasoning_content, &self.reasoning])
             .all(|text| text.as_ref().is_none_or(String::is_empty))
-            && self.reasoning_text().is_none()
+            && self.fragments().all(str::is_empty)
             && !self.has_native_reasoning(format)
             && self.tool_calls.as_ref().is_none_or(Vec::is_empty)
             && self.function_call.is_none()
@@ -223,9 +227,9 @@ impl ParseNative for Detail {
     }
 }
 
-#[derive(Default, Deserialize)]
+#[derive(Deserialize)]
 pub(super) struct ToolDelta {
-    #[serde(default, deserialize_with = "lenient_index")]
+    #[serde(default, deserialize_with = "lenient_count")]
     pub index: Option<u64>,
     #[serde(default, deserialize_with = "lenient")]
     pub id: Option<String>,
@@ -240,34 +244,6 @@ pub(super) struct Function {
     /// Normally a JSON text fragment; some servers send the decoded value.
     #[serde(default, deserialize_with = "arguments_text")]
     pub arguments: Option<String>,
-}
-
-#[derive(Default)]
-pub(super) struct Usage {
-    pub prompt_tokens: Option<u64>,
-    pub completion_tokens: Option<u64>,
-    pub cached_tokens: Option<u64>,
-    pub cache_write_tokens: Option<u64>,
-}
-
-impl Usage {
-    pub(super) fn from_value(value: &Value) -> Option<Self> {
-        let counter = |key: &str| value.get(key).and_then(lenient_u64);
-        let detail = |key: &str| {
-            value
-                .get("prompt_tokens_details")
-                .and_then(|details| details.get(key))
-                .and_then(lenient_u64)
-        };
-        let usage = Self {
-            prompt_tokens: counter("prompt_tokens").or_else(|| counter("input_tokens")),
-            completion_tokens: counter("completion_tokens").or_else(|| counter("output_tokens")),
-            cached_tokens: detail("cached_tokens").or_else(|| counter("cache_read_input_tokens")),
-            cache_write_tokens: detail("cache_write_tokens")
-                .or_else(|| counter("cache_creation_input_tokens")),
-        };
-        (usage.prompt_tokens.is_some() || usage.completion_tokens.is_some()).then_some(usage)
-    }
 }
 
 /// An object that deserializes as `T`; anything else is absent.
@@ -323,10 +299,6 @@ fn lenient_objects<'de, D: Deserializer<'de>, T: ParseNative>(
 /// A typed view of a native reasoning object.
 trait ParseNative {
     fn parse(raw: &Map<String, Value>) -> Self;
-}
-
-fn lenient_index<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
-    Ok(lenient_u64(&Value::deserialize(deserializer)?))
 }
 
 fn arguments_text<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<String>, D::Error> {

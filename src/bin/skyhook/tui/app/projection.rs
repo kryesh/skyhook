@@ -46,6 +46,7 @@ impl App {
             RuntimeEvent::TurnCompleted { .. } => (false, true, false),
         };
         self.snapshot.apply(event);
+        self.refresh_menu();
         self.deliver_queue();
         self.dirty |= repaint;
         self.content_dirty |= content;
@@ -55,8 +56,13 @@ impl App {
         self.content_dirty = true;
         self.content_revision = self.content_revision.wrapping_add(1);
     }
-    pub fn refresh(&mut self) {
+    /// Fold new journal records into the projection.
+    pub fn rebuild_projection(&mut self) {
         self.projection.rebuild(&self.snapshot);
+        self.refresh_menu();
+    }
+    pub fn refresh(&mut self) {
+        self.rebuild_projection();
         self.dirty = true;
         self.invalidate_content();
     }
@@ -110,7 +116,7 @@ impl App {
             || self.stopping
             || self.operation
             || self.snapshot.revision < self.queue_activity_revision
-            || self.queue.iter().any(|input| input.in_flight.is_some())
+            || (self.queue.iter()).any(|input| matches!(input.state, RowState::InFlight(_)))
             || self
                 .snapshot
                 .activity
@@ -118,12 +124,7 @@ impl App {
                 .is_some_and(AgentActivity::is_busy)
     }
     pub(super) fn active_work(&self) -> bool {
-        self.busy()
-            || self
-                .projection
-                .jobs
-                .values()
-                .any(|j| !j.state.is_terminal())
+        self.busy() || self.projection.has_open_jobs()
     }
     pub fn agent_status(&self, agent: &model::AgentInfo) -> model::AgentDisplayState {
         let pending = self.prompts.iter().find(|prompt| match &prompt.kind {

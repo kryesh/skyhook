@@ -2,7 +2,7 @@
 //! see it rendered: runtime state and job events become text at that boundary,
 //! so the renderers here are part of the session format.
 
-use std::{borrow::Cow, fmt, path::PathBuf};
+use std::{fmt, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
 
@@ -14,6 +14,7 @@ use crate::{
     media::AttachmentRef,
     provider::protocol::{self, AssistantItem, ToolResult},
     target::TargetRef,
+    tool::registry::JobName,
 };
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -97,18 +98,6 @@ impl UserPart {
         )
     }
 
-    /// The text the model reads, or the attachment whose content is loaded separately.
-    pub fn text(&self) -> Result<Cow<'_, str>, &AttachmentRef> {
-        match self {
-            Self::Text { text } | Self::ParentInput { text } | Self::Compaction { text } => {
-                Ok(Cow::Borrowed(text))
-            }
-            Self::State { state } => Ok(Cow::Owned(state.to_string())),
-            Self::JobEvents { events } => Ok(Cow::Owned(job_events_text(events))),
-            Self::Attachment { attachment } => Err(attachment),
-        }
-    }
-
     fn render(&self) -> protocol::UserContent {
         match self {
             Self::Attachment { attachment } => protocol::UserContent::Attachment {
@@ -142,7 +131,7 @@ pub struct RuntimeState {
 pub struct StateJob {
     pub job: JobId,
     pub kind: StateJobKind,
-    pub name: Option<String>,
+    pub name: Option<JobName>,
     pub state: JobState,
     /// None when the agent may not see targets.
     pub target: Option<TargetRef>,
@@ -160,13 +149,10 @@ pub enum StateJobKind {
 }
 
 impl StateJobKind {
-    /// The tool name the state shows; every child agent runs the `agent` tool.
-    pub const AGENT: &'static str = "agent";
-
     #[must_use]
     pub fn tool(&self) -> &str {
         match self {
-            Self::Agent { .. } => Self::AGENT,
+            Self::Agent { .. } => crate::tool::builtins::names::AGENT,
             Self::Tool { tool } => tool,
         }
     }
@@ -202,7 +188,7 @@ impl fmt::Display for RuntimeState {
                     writeln!(f, "{}:", item.status)?;
                     previous = Some(item.status);
                 }
-                writeln!(f, "  {}", quoted(&item.text))?;
+                writeln!(f, "  {}", quoted(item.text.as_str()))?;
             }
         }
         f.write_str("</skyhook_state>")
@@ -222,7 +208,7 @@ fn render_jobs(
             job.job,
             parent.map_or_else(|| "-".to_owned(), |id| id.to_string()),
             cell(job.kind.tool()),
-            job.name.as_deref().map_or_else(|| "-".to_owned(), cell),
+            job.name.as_ref().map_or("-", JobName::as_str),
             job.state,
             job.age_seconds,
         )?;
@@ -287,7 +273,7 @@ mod tests {
     fn job(id: u64, tool: &str, workspace: &str) -> StateJob {
         StateJob {
             job: JobId::new(id).unwrap(),
-            kind: if tool == StateJobKind::AGENT {
+            kind: if tool == crate::tool::builtins::names::AGENT {
                 StateJobKind::Agent {
                     progress: AgentProgress::default(),
                 }
@@ -325,7 +311,7 @@ mod tests {
         ]
         .map(|(status, text)| TodoItem {
             status,
-            text: text.to_owned(),
+            text: text.parse().unwrap(),
         });
         assert_eq!(
             state(vec![], todos.to_vec(), location()),
@@ -343,7 +329,7 @@ mod tests {
     fn job_rows_keep_snapshot_locations_exact_counters_and_row_structure() {
         // Nested jobs use their own snapshot location, not the parent's.
         let mut parent = job(7, "agent", "/other");
-        parent.name = Some("runtime-review".to_owned());
+        parent.name = Some("runtime-review".parse().unwrap());
         parent.target = Some("remote".parse().unwrap());
         parent.kind = StateJobKind::Agent {
             progress: AgentProgress {
@@ -367,8 +353,7 @@ mod tests {
         same.target = Some("remote".parse().unwrap());
         let remote = ExecutionLocation::named("remote".parse().unwrap(), "/remote-project".into());
         // Arbitrary strings cannot change row structure.
-        let mut item = job(1, "custom\n\"tool\"", "/other\n\"dir\"");
-        item.name = Some("-".to_owned());
+        let item = job(1, "custom\n\"tool\"", "/other\n\"dir\"");
         let cases = [
             (
                 location(),
@@ -400,7 +385,7 @@ mod tests {
             (
                 location(),
                 vec![item],
-                "1 - \"custom\\n\\\"tool\\\"\" \"-\" running 12 - - workspace=\"/other\\n\\\"dir\\\"\"\n",
+                "1 - \"custom\\n\\\"tool\\\"\" - running 12 - - workspace=\"/other\\n\\\"dir\\\"\"\n",
             ),
         ];
         for (context, jobs, rows) in cases {

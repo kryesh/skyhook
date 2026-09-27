@@ -9,12 +9,13 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 
 use crate::{
+    agent::Failure,
     identity::{AgentId, JobId, SessionId},
     job::JobRole,
     provider::{profile::ModelRef, protocol::Usage},
     session::{
-        EventRecord, Message, ModelPurpose, RecordSeq, RequestLedger, RequestPhase, SessionEvent,
-        UserPart,
+        CompletedOutcome, EventRecord, Message, ModelPurpose, RequestLedger, RequestPhase,
+        SessionEvent, UserPart,
     },
 };
 
@@ -75,7 +76,7 @@ pub enum AgentOutcome {
     },
     Failed {
         at: DateTime<Utc>,
-        error: String,
+        failure: Failure,
     },
 }
 
@@ -214,21 +215,16 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     // Agents inside a turn: from a model request until a response ends it or the
     // agent completes or fails.
     let mut in_turn: HashSet<AgentId> = HashSet::new();
-    // Committed assistant messages that called tools: their response continues the turn.
-    let mut calling_messages: HashSet<RecordSeq> = HashSet::new();
-    // The text of the root's first user message, which may have carried none.
-    let initial_prompt = records
-        .iter()
-        .find_map(|record| match &record.event {
-            SessionEvent::MessageCommitted {
-                message: Message::User(parts),
-            } if record.agent.path().is_empty() => Some(parts.iter().find_map(|part| match part {
-                UserPart::Text { text } => Some(text.clone()),
-                _ => None,
-            })),
+    // As the session list's preview: the first text in the root's user messages.
+    let initial_prompt = records.iter().find_map(|record| match &record.event {
+        SessionEvent::MessageCommitted {
+            message: Message::User(parts),
+        } if record.agent.path().is_empty() => parts.iter().find_map(|part| match part {
+            UserPart::Text { text } => Some(text.clone()),
             _ => None,
-        })
-        .flatten();
+        }),
+        _ => None,
+    });
     for record in records {
         ledger.observe(record);
         let agent = &record.agent;
@@ -267,8 +263,8 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     in_turn.insert(agent.clone());
                 }
             }
-            SessionEvent::ResponseCompleted { message, .. } => {
-                if !calling_messages.contains(&RecordSeq::from(*message)) {
+            SessionEvent::ResponseCompleted { outcome, .. } => {
+                if *outcome != CompletedOutcome::ToolUse {
                     in_turn.remove(agent);
                 }
             }
@@ -295,11 +291,6 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     stats.compactions.failed += 1;
                 }
             }
-            SessionEvent::Usage { usage, .. } => {
-                if let Some(stats) = agents.get_mut(agent) {
-                    stats.usage.accumulate(*usage);
-                }
-            }
             SessionEvent::MessageCommitted {
                 message: Message::Assistant(items),
             } => {
@@ -307,7 +298,6 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     continue;
                 };
                 for call in items.iter().filter_map(|item| item.call()) {
-                    calling_messages.insert(record.sequence);
                     stats.tools.entry(call.name().to_owned()).or_default().calls += 1;
                     open_calls
                         .entry(agent.clone())
@@ -338,7 +328,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                 }
                 if let Some(stats) = agents.get_mut(agent) {
                     match role {
-                        JobRole::Tool => stats.jobs.tools += 1,
+                        JobRole::Tool | JobRole::Wait => stats.jobs.tools += 1,
                         JobRole::Agent => stats.jobs.agents += 1,
                         JobRole::Script => stats.jobs.scripts += 1,
                         JobRole::Question => stats.jobs.questions += 1,
@@ -365,10 +355,13 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     finish(&mut agents, record, outcome);
                 }
             }
-            SessionEvent::AgentFailed { error } => {
+            SessionEvent::AgentFailed { failure } => {
                 in_turn.remove(agent);
-                let error = error.clone();
-                finish(&mut agents, record, |at| AgentOutcome::Failed { at, error });
+                let failure = failure.clone();
+                finish(&mut agents, record, |at| AgentOutcome::Failed {
+                    at,
+                    failure,
+                });
             }
             _ => {}
         }
@@ -384,12 +377,14 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     for (_, request) in ledger.iter() {
         let model = models.entry(request.profile.name.clone()).or_default();
         model.usage.accumulate(request.usage);
+        let agent = agents.get_mut(&request.agent);
+        let agent = agent.map(|stats| {
+            stats.usage.accumulate(request.usage);
+            &mut stats.requests
+        });
         if request.purpose != ModelPurpose::Agent {
             continue;
         }
-        let agent = agents
-            .get_mut(&request.agent)
-            .map(|stats| &mut stats.requests);
         for stats in agent.into_iter().chain([&mut model.requests]) {
             stats.requested += 1;
             stats.attempts += request.attempts;
@@ -398,7 +393,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                 | RequestPhase::Open { .. }
                 | RequestPhase::Retrying { .. } => {}
                 RequestPhase::Completed { .. } => stats.completed += 1,
-                RequestPhase::Failed { .. } | RequestPhase::Refused { .. } => stats.failed += 1,
+                RequestPhase::Failed { .. } => stats.failed += 1,
                 RequestPhase::Interrupted { .. } => stats.interrupted += 1,
             }
         }
@@ -471,11 +466,10 @@ mod tests {
     use crate::{
         execution::ExecutionLocation,
         job::{JobEnd, JobRole},
-        provider::protocol::{AssistantItem, HistoryLifetime, ToolCall, ToolResult},
+        provider::protocol::{AssistantItem, ToolCall, ToolResult},
         session::{
-            AttemptRef, CompletedOutcome, MessageSeq, ModelContext, ModelFailureKind, ModelPurpose,
-            RequestSeq, SessionEvent,
-            tests::{self, MemorySession, usage},
+            AttemptRef, MessageSeq, ModelContext, ModelPurpose, RequestSeq, SessionEvent,
+            tests::{self, MemorySession, attempt, requested, usage},
         },
     };
     use serde_json::json;
@@ -488,25 +482,16 @@ mod tests {
         }
     }
 
-    fn requested(context: RecordSeq) -> SessionEvent {
-        SessionEvent::ModelRequested {
-            context,
-            checkpoint: None,
-            history: Vec::new(),
-            tail: Vec::new(),
-            history_lifetime: HistoryLifetime::default(),
-        }
-    }
-
-    fn attempt(request: RequestSeq, attempt: u64) -> SessionEvent {
-        SessionEvent::ModelAttemptStarted(AttemptRef { request, attempt })
-    }
-
-    fn answered(request: RequestSeq, attempt: u64, message: MessageSeq) -> SessionEvent {
+    fn completed(
+        request: RequestSeq,
+        attempt: u64,
+        message: MessageSeq,
+        outcome: CompletedOutcome,
+    ) -> SessionEvent {
         SessionEvent::ResponseCompleted {
             attempt: AttemptRef { request, attempt },
             message,
-            outcome: CompletedOutcome::Answer,
+            outcome,
         }
     }
 
@@ -568,8 +553,8 @@ mod tests {
         let first = session.start_child(root, 1, Some(job(1))).await;
         let second = session.start_child(root, 2, Some(job(2))).await;
         let context = append(root, context_event("big")).await;
-        // The root's turn continues through a message that called tools, whatever
-        // the stop reason says, and a failure is its final outcome.
+        // The root's turn continues through a response that called tools, and a
+        // failure is its final outcome.
         let request = append(root, requested(context)).await.request();
         append(root, attempt(request, 1)).await;
         let message = append(
@@ -580,12 +565,13 @@ mod tests {
         )
         .await
         .message();
-        append(root, answered(request, 1, message)).await;
+        let tool_use = completed(request, 1, message, CompletedOutcome::ToolUse);
+        append(root, tool_use).await;
         let mid_turn = session_stats(store.id(), &store.records().await);
         append(
             root,
             SessionEvent::AgentFailed {
-                error: "boom".into(),
+                failure: Failure::Other("boom".into()),
             },
         )
         .await;
@@ -594,14 +580,19 @@ mod tests {
         let request = append(&first, requested(child_context)).await.request();
         append(&first, attempt(request, 1)).await;
         let message = append(&first, reply("answered")).await.message();
-        append(&first, answered(request, 1, message)).await;
+        append(
+            &first,
+            completed(request, 1, message, CompletedOutcome::Answer),
+        )
+        .await;
         append(&second, SessionEvent::AgentCompleted).await;
         for agent in [&first, &second, root] {
             append(agent, SessionEvent::AgentInterrupted).await;
         }
         let stats = session_stats(store.id(), &store.records().await);
         let outcome = |index: usize| stats.agents[index].outcome.clone();
-        assert!(matches!(outcome(0), AgentOutcome::Failed { error, .. } if error == "boom"));
+        let boom = Failure::Other("boom".into());
+        assert!(matches!(outcome(0), AgentOutcome::Failed { failure, .. } if failure == boom));
         assert!(matches!(outcome(1), AgentOutcome::Interrupted { .. }));
         assert!(matches!(outcome(2), AgentOutcome::Completed { .. }));
         assert!(
@@ -643,8 +634,7 @@ mod tests {
                     request,
                     attempt: 1,
                 },
-                error: "flaky".into(),
-                kind: ModelFailureKind::Error,
+                failure: Failure::Other("flaky".into()),
             },
         )
         .await;
@@ -659,14 +649,7 @@ mod tests {
         .message();
         append(
             root,
-            SessionEvent::ResponseCompleted {
-                attempt: AttemptRef {
-                    request,
-                    attempt: 2,
-                },
-                message,
-                outcome: CompletedOutcome::ToolUse,
-            },
+            completed(request, 2, message, CompletedOutcome::ToolUse),
         )
         .await;
         append(
@@ -727,7 +710,7 @@ mod tests {
         append(&child, SessionEvent::AgentCompleted).await;
         append(&child, SessionEvent::AgentInterrupted).await;
         let retained = session_stats(store.id(), &store.records().await);
-        let completed = match retained.agents[1].outcome {
+        let completed_at = match retained.agents[1].outcome {
             AgentOutcome::Completed { at } => at,
             ref outcome => panic!("retained child reported {outcome:?}"),
         };
@@ -751,7 +734,7 @@ mod tests {
         let ended = append(root, requested(context)).await.request();
         append(root, attempt(ended, 1)).await;
         let message = append(root, reply("done")).await.message();
-        append(root, answered(ended, 1, message)).await;
+        append(root, completed(ended, 1, message, CompletedOutcome::Answer)).await;
         append(root, SessionEvent::AgentInterrupted).await;
 
         let records = store.records().await;
@@ -775,7 +758,9 @@ mod tests {
             ("test/test".parse().unwrap(), "test/big".parse().unwrap());
         assert_eq!(root_stats.model.as_ref(), Some(&current));
         assert!(matches!(root_stats.outcome, AgentOutcome::Completed { .. }));
-        assert!(matches!(child_stats.outcome, AgentOutcome::Interrupted { at } if at >= completed));
+        assert!(
+            matches!(child_stats.outcome, AgentOutcome::Interrupted { at } if at >= completed_at)
+        );
         assert!(child_stats.started >= stats.started && stats.finished >= root_stats.started);
         assert_eq!(
             root_stats.requests,

@@ -63,7 +63,8 @@ fn continues_turn(request: &ModelRequest) -> bool {
 mod tests {
     use super::*;
     use crate::provider::{
-        codec::common::tests::{reasoning_tool_request, scope},
+        codec::common::tests::scope,
+        http::tests::reasoning_tool_request,
         protocol::{AssistantItem, UserContent},
     };
 

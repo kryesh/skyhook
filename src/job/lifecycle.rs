@@ -2,13 +2,6 @@
 
 use super::*;
 
-/// What a journaled change hands back: the job's agent and whether its
-/// completions wake an owner.
-pub(super) struct Applied {
-    pub(super) agent: AgentId,
-    pub(super) background: bool,
-}
-
 impl JobManager {
     /// After stopping creation producers, wait for admitted creation owners to
     /// finish map publication and any abandoned-lease finalization.
@@ -113,45 +106,55 @@ impl JobManager {
             result
         })
         .await
-        .map_err(|error| JobError::OwnerLost {
-            owner,
-            reason: error.to_string(),
-        })?
+        .map_err(|source| JobError::OwnerLost { owner, source })?
     }
 
     /// Journal one change to a job and apply it, in the order every change keeps
-    /// under the job's operation lock: refused before the append when the phase
-    /// does not admit its step, applied and announced after. `event` is what the
-    /// journal records; a volatile change records nothing. `settle` runs on the
-    /// entry with the change applied.
+    /// under the job's operation lock: refused before the append, as `refused`
+    /// reports it, when the phase does not admit its step; applied and announced
+    /// after. `settle` runs on the entry with the change applied.
     pub(super) async fn journal_change<T>(
         &self,
         id: JobId,
         change: JobChange,
-        event: Option<SessionEvent>,
+        refused: fn(Rejected, JobId) -> JobError,
         settle: impl FnOnce(&mut JobEntry) -> T,
-    ) -> Result<(Applied, T), JobError> {
+    ) -> Result<T, JobError> {
         let agent = {
             let jobs = self.inner.jobs.lock().await;
             let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-            if !entry.admits(change.step()) {
-                return Err(JobError::AlreadyTerminal(id));
-            }
+            entry
+                .admits(change.step())
+                .map_err(|rejected| refused(rejected, id))?;
             entry.agent.clone()
         };
-        if let Some(event) = event {
-            self.inner.store.append(agent.clone(), event).await?;
-        }
-        let (notify, background, settled) = {
+        self.inner.store.append(agent, change.event(id)).await?;
+        self.apply_change(id, change, settle).await
+    }
+
+    /// Apply a change live and announce it.
+    async fn apply_change<T>(
+        &self,
+        id: JobId,
+        change: JobChange,
+        settle: impl FnOnce(&mut JobEntry) -> T,
+    ) -> Result<T, JobError> {
+        // A question or an outcome is delivered, so it wakes a background owner.
+        let wakes = matches!(change, JobChange::Ask(_) | JobChange::Finish(_));
+        let (notify, woken, settled) = {
             let mut jobs = self.inner.jobs.lock().await;
             let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
             entry
                 .apply(change)
                 .map_err(|rejected| rejected.journaled(id))?;
-            (entry.notify.clone(), entry.background, settle(entry))
+            let woken = (wakes && entry.background).then(|| entry.agent.clone());
+            (entry.notify.clone(), woken, settle(entry))
         };
         notify.notify_waiters();
-        Ok((Applied { agent, background }, settled))
+        if let Some(agent) = woken {
+            self.wake(agent, id);
+        }
+        Ok(settled)
     }
 
     /// A lease's startup transition. Its stage guarantees the order, so the only
@@ -162,14 +165,21 @@ impl JobManager {
             operation,
             "transition publication",
             move |manager| async move {
-                let event = SessionEvent::JobStateChanged { job: id, state };
                 manager
-                    .journal_change(id, JobChange::Advance(state), Some(event), |_| ())
-                    .await?;
-                Ok(())
+                    .journal_change(id, JobChange::Advance(state), Rejected::lifecycle, |_| ())
+                    .await
             },
         )
         .await
+    }
+
+    /// Publish a worker's outcome. A job finished underneath it keeps its own;
+    /// one the journal cannot record still fails live.
+    pub(crate) async fn settle(&self, id: JobId, outcome: JobOutcome) {
+        match self.finish(id, outcome).await {
+            Ok(()) | Err(JobError::AlreadyTerminal(_)) => {}
+            Err(error) => self.fail_volatile(id, error).await,
+        }
     }
 
     pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
@@ -182,27 +192,26 @@ impl JobManager {
                 let end = outcome.end();
                 let (output, mut diagnostic) = match outcome {
                     JobOutcome::Completed(output) => (Some(output), None),
+                    JobOutcome::NoResult => (None, None),
                     JobOutcome::Failed { diagnostic, output } => (output, Some(diagnostic)),
                 };
-                let capture_complete = output
-                    .as_ref()
-                    .is_some_and(|output| output.streams == crate::tool::StreamEnd::Finished);
+                // A job that completes without a result left nothing unfinished.
+                let capture_complete = output.as_ref().map_or(end == JobEnd::Completed, |output| {
+                    output.streams == crate::tool::StreamEnd::Finished
+                });
                 let (mut output, images, captures, output_diagnostic) =
-                    output.map_or((None, Vec::new(), Vec::new(), None), |mut output| {
-                        let captures = output.take_captures();
+                    output.map_or((None, Vec::new(), Vec::new(), None), |output| {
                         (
                             Some(output.value),
                             output.images,
-                            captures,
+                            output.captures,
                             output.diagnostic,
                         )
                     });
                 // Diagnostic facts, not an early capability-specific rendering, are
                 // authoritative. Saved documents keep only the registered slot.
                 if output_diagnostic.is_some()
-                    && let Some(message) = output
-                        .as_mut()
-                        .and_then(|output| output.pointer_mut("/error/message"))
+                    && let Some(message) = output.as_mut().and_then(output::diagnostic_slot_in)
                 {
                     *message = Value::Null;
                 }
@@ -215,9 +224,9 @@ impl JobManager {
                 let previous = {
                     let jobs = manager.inner.jobs.lock().await;
                     let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-                    if !entry.admits(JobStep::Finish(end)) {
-                        return Err(JobError::AlreadyTerminal(id));
-                    }
+                    entry
+                        .admits(JobStep::Finish(end))
+                        .map_err(|rejected| rejected.lifecycle(id))?;
                     entry.finished().cloned()
                 };
                 if let Some(previous) = previous {
@@ -240,23 +249,9 @@ impl JobManager {
                     .map_err(|error| JobError::Output(Box::new(error)))?;
                 }
                 finished.diagnostic = diagnostic.map(PartialDiagnostic::resolve);
-                let event = SessionEvent::JobFinished {
-                    job: id,
-                    state: end,
-                    diagnostic: finished.diagnostic.clone(),
-                    output_diagnostic: finished.output_diagnostic.clone(),
-                    images: finished.images.clone(),
-                };
-                let (applied, ()) = manager
-                    .journal_change(id, JobChange::Finish(finished), Some(event), |_| ())
-                    .await?;
-                if applied.background {
-                    let _ = manager.inner.completions.send(JobCompletion {
-                        agent: applied.agent,
-                        job: id,
-                    });
-                }
-                Ok(())
+                manager
+                    .journal_change(id, JobChange::Finish(finished), Rejected::lifecycle, |_| ())
+                    .await
             },
         )
         .await
@@ -281,10 +276,10 @@ impl JobManager {
         Ok(())
     }
 
-    /// Preserve a live, observable terminal result when durable finalization is
-    /// unavailable. Ordered after any finalization in flight, so it never ends a
-    /// job the journal has just ended differently.
-    pub(crate) async fn fail_volatile(&self, id: JobId, error: String) {
+    /// Preserve a live, observable terminal result when durable finalization
+    /// failed with `error`. Ordered after any finalization in flight, so it never
+    /// ends a job the journal has just ended differently.
+    pub(super) async fn fail_volatile(&self, id: JobId, error: JobError) {
         let Ok(operation) = self.operation(id).await else {
             return;
         };
@@ -294,7 +289,7 @@ impl JobManager {
             end: JobEnd::Failed,
             images: Vec::new(),
             diagnostic: Some(
-                crate::tool::ToolError::failed(error)
+                ToolError::from(error)
                     .operation(
                         crate::tool::diagnostic::Operation::Save,
                         crate::tool::diagnostic::Subject::Job(id),
@@ -304,18 +299,9 @@ impl JobManager {
             ),
             output_diagnostic: None,
         });
-        let Ok((applied, ())) = self
-            .journal_change(id, JobChange::Finish(failed), None, |_| ())
-            .await
-        else {
-            return;
-        };
-        if applied.background {
-            let _ = self.inner.completions.send(JobCompletion {
-                agent: applied.agent,
-                job: id,
-            });
-        }
+        let _ = self
+            .apply_change(id, JobChange::Finish(failed), |_| ())
+            .await;
     }
 }
 
@@ -399,18 +385,13 @@ mod tests {
         let runtime = TestRuntime::new().await;
         let release = Arc::new(Semaphore::new(0));
         let mut builder = ToolRegistryBuilder::default();
-        let options = ToolOptions::new(Vec::new()).background();
+        let options = || ToolOptions::new(Vec::new()).background();
         builder
-            .register::<NoArgs, String, _, _>(
-                "panic",
-                "panic",
-                options.clone(),
-                |_, _| async move {
-                    panic!("handler panic");
-                },
-            )
+            .register::<NoArgs, String, _, _>("panic", "panic", options(), |_, _| async move {
+                panic!("handler panic");
+            })
             .unwrap()
-            .register::<NoArgs, String, _, _>("blocked", "wait before completing", options, {
+            .register::<NoArgs, String, _, _>("blocked", "wait before completing", options(), {
                 let release = release.clone();
                 move |_context, _input| {
                     let release = release.clone();
@@ -422,11 +403,9 @@ mod tests {
             })
             .unwrap();
         let (jobs, executor) = (runtime.jobs.clone(), runtime.executor(builder));
-        let background = serde_json::json!({"bg": true});
-        for (tool, expected) in [
-            ("panic", "tool handler panicked"),
-            ("blocked", "could not be persisted"),
-        ] {
+        let background = serde_json::json!({crate::tool::registry::BACKGROUND: true});
+        use crate::tool::diagnostic::Operation;
+        for (tool, operation) in [("panic", Operation::Execute), ("blocked", Operation::Save)] {
             let running = executor
                 .run_host(&runtime.agent, tool, background.clone())
                 .await
@@ -438,23 +417,19 @@ mod tests {
                 );
                 release.add_permits(1);
             }
-            let wait =
-                tokio::time::timeout(Duration::from_secs(2), jobs.wait(running.job, None, true));
-            let failed = wait.await.expect("failure left the job waiting").unwrap();
+            let failed = crate::tests::bounded(jobs.wait(running.job, None, true))
+                .await
+                .unwrap();
             assert_eq!(failed.state, JobState::Failed);
-            assert!(
-                failed
-                    .rendered_error(&CapabilitySet::default())
-                    .is_some_and(|error| error.contains(expected)),
-                "{tool}"
-            );
+            let diagnostic = failed.diagnostic.unwrap();
+            assert_eq!(diagnostic.context.operation, operation, "{tool}");
         }
     }
 
     // Creation ownership and admission tests.
 
-    use crate::job::tests::terminal;
     use crate::session::AppendBoundary;
+    use crate::tests::bounded;
 
     async fn count(jobs: &JobManager, matches: impl Fn(&SessionEvent) -> bool) -> usize {
         let records = jobs.store().records().await;
@@ -475,13 +450,9 @@ mod tests {
     async fn cancellation_before_creation_gate_has_no_admitted_work() {
         let (_root, jobs, agent) = crate::job::tests::runtime().await;
         let operation = jobs.inner.creation_operation.write().await;
-        let creating = tokio::spawn({
-            let (jobs, agent) = (jobs.clone(), agent.clone());
-            async move { jobs.create(JobSpec::test(agent, "not-admitted")).await }
-        });
-        tokio::task::yield_now().await;
-        creating.abort();
-        assert!(matches!(creating.await, Err(error) if error.is_cancelled()));
+        let mut creating = Box::pin(jobs.create(JobSpec::test(agent.clone(), "not-admitted")));
+        assert!(futures_util::poll!(&mut creating).is_pending());
+        drop(creating);
         drop(operation);
         assert_eq!(creation_count(&jobs).await, 0);
         assert_eq!(
@@ -508,6 +479,7 @@ mod tests {
         let id = JobId::new(1).unwrap();
         let spec = JobSpec {
             accepts_input: true,
+            role: JobRole::Agent,
             ..JobSpec::test(agent.clone(), "owned")
         };
         let lease: Box<dyn Send> = match op {
@@ -582,7 +554,8 @@ mod tests {
             let case = format!("{op:?}");
             let (_root, jobs, agent, id, _lease) = owned_job(op).await;
             let state = async |jobs: &JobManager| jobs.metadata(id).await.ok().map(|m| m.state);
-            let delivery = async |jobs: &JobManager| jobs.inner.jobs.lock().await[&id].delivery;
+            let acknowledged =
+                async |jobs: &JobManager| !jobs.inner.jobs.lock().await[&id].unacknowledged();
             let before = state(&jobs).await;
             // Either boundary parks the owner on the same receipt; the session's own
             // tests cover what differs between them.
@@ -597,26 +570,20 @@ mod tests {
             let gate_held = match op {
                 Create => jobs.inner.creation_operation.try_write().is_err(),
                 Claim => {
-                    assert!(delivery(&jobs).await == DeliveryState::Pending);
+                    assert!(!acknowledged(&jobs).await);
                     jobs.inner.delivery_operation.try_lock().is_err()
                 }
                 _ => jobs.operation(id).await.unwrap().try_lock().is_err(),
             };
             assert!(gate_held, "{case}");
-            let drain = tokio::spawn({
-                let jobs = jobs.clone();
-                async move {
-                    jobs.drain_creations().await;
-                    jobs.drain_supervisors().await;
-                }
-            });
-            tokio::task::yield_now().await;
-            assert!(!drain.is_finished(), "{case}");
+            let drain = async {
+                jobs.drain_creations().await;
+                jobs.drain_supervisors().await;
+            };
+            tokio::pin!(drain);
+            assert!(futures_util::poll!(&mut drain).is_pending(), "{case}");
             resume.send(()).unwrap();
-            tokio::time::timeout(Duration::from_secs(3), drain)
-                .await
-                .unwrap()
-                .unwrap();
+            bounded(drain).await;
             let expected = match op {
                 Create => JobState::Cancelled,
                 Transition | ResumeInput => JobState::Running,
@@ -639,8 +606,8 @@ mod tests {
         };
             assert!(durable, "{case}");
             if op == Claim {
-                assert!(delivery(&jobs).await == DeliveryState::Claimed);
-                assert!(delivery(&replay).await == DeliveryState::Claimed);
+                assert!(acknowledged(&jobs).await);
+                assert!(acknowledged(&replay).await);
             }
             if op == Create {
                 assert_eq!(creation_count(&jobs).await, 1);
@@ -664,7 +631,8 @@ mod tests {
                 .fail_append_at(AppendBoundary::Publication)
                 .await;
             let error = run(op, jobs.clone(), agent.clone(), id).await.unwrap_err();
-            let JobError::Session(SessionError::AppendIndeterminate(recovery)) = error else {
+            let JobError::Session(SessionError::AppendIndeterminate { recovery, .. }) = error
+            else {
                 panic!("{op:?}: expected recovery-required failure: {error}");
             };
             assert_eq!(
@@ -683,7 +651,7 @@ mod tests {
                     assert_eq!(creation_count(&jobs).await, 0);
                 }
                 Op::Claim => {
-                    assert!(jobs.inner.jobs.lock().await[&id].delivery == DeliveryState::Pending);
+                    assert!(jobs.inner.jobs.lock().await[&id].unacknowledged());
                 }
                 _ => {
                     let expected = if op == Op::Transition {
@@ -717,17 +685,14 @@ mod tests {
             };
             async move { jobs.create(spec).await }
         });
-        tokio::time::timeout(Duration::from_secs(3), reached)
-            .await
-            .unwrap()
-            .unwrap();
+        bounded(reached).await.unwrap();
         // Cancellation does not need the creation gate or the session writer lock.
-        let cancel = tokio::time::timeout(Duration::from_secs(1), jobs.cancel(parent));
-        cancel.await.unwrap().unwrap();
+        bounded(jobs.cancel(parent)).await.unwrap();
         resume.send(()).unwrap();
         let child = creating.await.unwrap().unwrap();
         assert!(child.cancellation_token().is_cancelled());
-        assert_eq!(terminal(&jobs, child.id()).await.state, JobState::Cancelled);
+        let settled = bounded(jobs.wait(child.id(), None, false)).await;
+        assert_eq!(settled.unwrap().state, JobState::Cancelled);
         assert_eq!(creation_count(&jobs).await, 2);
     }
 }

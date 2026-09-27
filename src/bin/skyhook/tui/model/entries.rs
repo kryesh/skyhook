@@ -42,6 +42,8 @@ pub enum Dep {
     Job(JobId),
     /// A tool call's result, or the job it admitted.
     Call(MessageSeq, String),
+    /// The view's expansion of the entry with this key.
+    Entry(EntryKey),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -76,6 +78,10 @@ struct Segment {
     len: usize,
 }
 
+/// Job cards indent this many cells per level, up to `MAX_NESTING` levels.
+const NEST_INDENT: usize = 2;
+const MAX_NESTING: usize = 8;
+
 /// A job card's place and tool group, kept so its children can inherit them.
 struct Placed {
     place: Place,
@@ -91,6 +97,7 @@ struct Built {
 }
 impl Built {
     fn push(&mut self, entry: Entry, group: Option<ToolGroup>) {
+        self.deps.push(Dep::Entry(entry.key().clone()));
         self.entries.push(entry);
         self.groups.push(group);
     }
@@ -204,6 +211,8 @@ pub struct History {
     groups: Vec<Option<ToolGroup>>,
     /// Each job card's place and group.
     jobs: HashMap<JobId, Placed>,
+    /// How many entries are running.
+    pub(super) running: usize,
 }
 
 impl History {
@@ -215,7 +224,7 @@ impl History {
     pub fn build(inputs: Inputs<'_>) -> (Self, Vec<Entry>) {
         let mut history = Self::default();
         let mut entries = Vec::new();
-        let candidates = inputs.projection.jobs.keys().copied().collect();
+        let candidates = inputs.projection.jobs().keys().copied().collect();
         // Every record is folded before any segment is built: a call's segment
         // shows the result that arrives after it.
         let places = history.fold(inputs, candidates, &mut HashSet::new());
@@ -259,12 +268,6 @@ impl History {
         result
     }
 
-    /// The entries of a source, if it has any.
-    pub fn record_entries(&self, record: RecordSeq) -> Option<Range<usize>> {
-        let segment = &self.segments[*self.index.get(&Source::Record(record))?];
-        Some(segment.start..segment.start + segment.len)
-    }
-
     /// Places of new sources in order: the agent's unfolded records, or its jobs
     /// among `candidates` on the Jobs tab.
     fn fold(
@@ -284,7 +287,7 @@ impl History {
             let mut jobs: Vec<_> = candidates
                 .into_iter()
                 .filter(|job| !self.index.contains_key(&Source::Job(*job)))
-                .filter_map(|job| projection.jobs.get(&job))
+                .filter_map(|job| projection.jobs().get(&job))
                 .filter(|job| &job.agent == agent)
                 .collect();
             // IDs follow creation, so a script is placed before its children.
@@ -315,7 +318,7 @@ impl History {
                 SessionEvent::JobCreated { job, origin, .. }
                     if presentation.tab == Tab::Conversation =>
                 {
-                    projection.jobs.get(job).map(|job| (job, origin))
+                    projection.jobs().get(job).map(|job| (job, origin))
                 }
                 _ => None,
             };
@@ -367,7 +370,7 @@ impl History {
         let built = self.build_source(source, inputs);
         self.register(source, &built.deps);
         let len = built.entries.len();
-        entries.splice(start..start, built.entries);
+        self.splice(entries, start..start, built.entries);
         self.groups.splice(start..start, built.groups);
         self.segments
             .insert(position, Segment { place, start, len });
@@ -400,7 +403,7 @@ impl History {
         let built = self.build_source(source, inputs);
         self.register(source, &built.deps);
         let new_len = built.entries.len();
-        let old: Vec<_> = entries.splice(start..start + len, built.entries).collect();
+        let old = self.splice(entries, start..start + len, built.entries);
         self.groups.splice(start..start + len, built.groups);
         self.compact(
             inputs,
@@ -421,6 +424,21 @@ impl History {
             }
             result.shift(start);
         }
+    }
+
+    /// Every change to history's entries goes through here, so the running
+    /// count cannot drift from them.
+    fn splice(
+        &mut self,
+        entries: &mut Vec<Entry>,
+        range: Range<usize>,
+        new: Vec<Entry>,
+    ) -> Vec<Entry> {
+        let running = |entries: &[Entry]| entries.iter().filter(|entry| entry.running).count();
+        self.running += running(&new);
+        let old: Vec<_> = entries.splice(range, new).collect();
+        self.running -= running(&old);
+        old
     }
 
     fn register(&mut self, source: Source, deps: &[Dep]) {
@@ -463,20 +481,19 @@ impl History {
         built: &mut Built,
     ) -> Option<(Entry, ToolGroup)> {
         built.deps.push(Dep::Job(job));
-        let info = inputs.projection.jobs.get(&job)?;
+        let info = inputs.projection.jobs().get(&job)?;
         let placed = self.jobs.get(&job)?;
         let EntryView {
             view, all_details, ..
         } = inputs.presentation;
         let mut entry = job_entry(info, inputs.projection, view, inputs.outputs, all_details);
-        entry.indent = (placed.place.depth().min(8) * 2) as u16;
+        entry.indent = (placed.place.depth().min(MAX_NESTING) * NEST_INDENT) as u16;
         Some((entry, placed.group))
     }
 
     fn build_source(&self, source: Source, inputs: Inputs<'_>) -> Built {
         let Inputs {
             snapshot,
-            projection,
             presentation,
             ..
         } = inputs;
@@ -495,7 +512,7 @@ impl History {
                     if presentation.tab == Tab::Requests {
                         let request = sequence.request();
                         built.deps.push(Dep::Request(request));
-                        if let Some(record) = projection.ledger.get(request) {
+                        if let Some(record) = snapshot.ledger.get(request) {
                             built.push(request_entry(request, record), None);
                         }
                     } else {
@@ -526,17 +543,14 @@ impl History {
             SessionEvent::ModelRequested { .. } => {
                 let request = record.sequence.request();
                 built.deps.push(Dep::Request(request));
-                if let Some(entry) = super::retry::retry_entry(snapshot, projection, agent, request)
-                {
+                if let Some(entry) = super::retry::retry_entry(snapshot, agent, request) {
                     built.push(entry, None);
                 }
                 // A settled response no commit replaced (an interrupted attempt)
                 // stays at its journal position; a failure's is part of its card.
-                let phase = projection.ledger.get(request).map(|record| &record.phase);
-                if matches!(
-                    phase,
-                    Some(RequestPhase::Interrupted { .. } | RequestPhase::Completed { .. })
-                ) && let Some(response) = snapshot.responses.get(&(agent.clone(), request))
+                let phase = snapshot.ledger.get(request).map(|record| &record.phase);
+                if phase.is_some_and(RequestPhase::settled_in_place)
+                    && let Some(response) = snapshot.responses.get(&(agent.clone(), request))
                     && response.settlement().is_some()
                 {
                     for entry in response_entries(request, response, view, agent_name) {
@@ -645,8 +659,8 @@ impl History {
                 let text = format!("Compaction failed; previous context retained\n{error}");
                 built.push(Entry::new(key, text, Surface::Error), None);
             }
-            SessionEvent::CompactionSkipped { reason, .. } => {
-                let text = format!("Compaction skipped · {reason}");
+            SessionEvent::CompactionSkipped { .. } => {
+                let text = "Compaction skipped · a summary would not reduce context".to_owned();
                 built.push(Entry::new(key, text, Surface::Muted), None);
             }
             _ => {}
@@ -674,11 +688,11 @@ impl History {
         } = presentation;
         let agent_name = projection.agent_name(agent);
         let message = record.sequence.message();
-        let request = projection.ledger.request_of(message);
+        let request = snapshot.ledger.request_of(message);
         built.deps.extend(request.map(Dep::Request));
         let response = request.map_or(ResponseRef::Message(message), ResponseRef::Request);
         let footer = request
-            .and_then(|request| projection.ledger.get(request))
+            .and_then(|request| snapshot.ledger.get(request))
             .map(|request| Clean::from(request.profile.profile.model.as_str()));
         // The model footer sits under the last visible text of an answer; a working
         // turn (one with calls) has none.
@@ -767,12 +781,12 @@ pub fn entries(
     if include_live && presentation.tab == Tab::Conversation {
         let agent = presentation.agent;
         let agent_name = projection.agent_name(agent);
-        let responses = live_tail_responses(snapshot, projection, agent);
+        let responses = live_tail_responses(snapshot, agent);
         entries.extend(responses.into_iter().flat_map(|(request, response)| {
             response_entries(request, response, presentation.view, agent_name)
         }));
         let running = entries.iter().any(|entry| entry.running);
-        entries.extend(working_entry(snapshot, projection, agent, running));
+        entries.extend(working_entry(snapshot, agent, running));
     }
     entries
 }
@@ -827,9 +841,7 @@ mod tests {
         assert!(cards[0].text().starts_with("▾ ✓ exec · Completed"));
         assert!(cards[1].text().starts_with("▾ × exec · Failed"));
         assert_ne!(cards[0].key(), cards[1].key());
-        assert!(
-            cards[1].text().contains("Output") && cards[1].text().contains("permission_denied")
-        );
+        assert!(cards[1].text().contains("Output\n  Permission was denied"));
         assert!(cards.iter().all(|card| card.expandable()
             && card.job_id().is_none()
             && card.surface == Surface::Tool));
@@ -949,8 +961,7 @@ mod tests {
                 request: refused_request,
                 attempt: 1,
             },
-            error: error.clone(),
-            kind: skyhook::session::ModelFailureKind::Refusal,
+            failure: skyhook::agent::Failure::Refused(error.clone()),
         };
         journal.record(&agent, refused).await;
         let entries = render(&journal.snapshot, &agent, false);
@@ -973,8 +984,7 @@ mod tests {
                 request: failed_request,
                 attempt: 1,
             },
-            error: "Protocol: rejected".to_owned(),
-            kind: skyhook::session::ModelFailureKind::Error,
+            failure: skyhook::agent::Failure::Other("Protocol: rejected".to_owned()),
         };
         journal.record(&agent, failed).await;
         let entries = render(&journal.snapshot, &agent, false);
@@ -1003,8 +1013,7 @@ mod tests {
                 request: failed,
                 attempt: 1,
             },
-            error,
-            kind: skyhook::session::ModelFailureKind::Error,
+            failure: skyhook::agent::Failure::Other(error),
         };
         journal.record(&agent, event).await;
         let retry = journal.request(&agent, context).await.request;
@@ -1083,8 +1092,10 @@ mod tests {
                 request,
                 attempt: 1,
             },
-            error: error.clone(),
-            kind: skyhook::session::ModelFailureKind::Error,
+            failure: skyhook::agent::Failure::Provider(
+                error.clone(),
+                skyhook::provider::ProviderErrorKind::Unavailable,
+            ),
         };
         let failure = journal.record(&agent, failed).await;
         let scheduled = SessionEvent::ModelRecoveryScheduled {
@@ -1098,6 +1109,6 @@ mod tests {
         assert!(text.contains("attempt 2") && text.contains("HTTP 503 overloaded"));
         assert!(!text.contains('\u{1b}') && text.chars().count() < 320 && text.ends_with('…'));
         assert!(journal.snapshot.records.values().any(|r| matches!(&r.event,
-            SessionEvent::ModelFailed { error: stored, .. } if stored.as_str() == error)));
+            SessionEvent::ModelFailed { failure: skyhook::agent::Failure::Provider(stored, _), .. } if *stored == error)));
     }
 }

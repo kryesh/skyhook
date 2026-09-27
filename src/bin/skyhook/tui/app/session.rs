@@ -1,17 +1,26 @@
 use super::*;
 
+/// One open session's place in the host.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SlotKey(u64);
+impl SlotKey {
+    pub fn next(self) -> Self {
+        Self(self.0 + 1)
+    }
+}
+
 /// What the active session asks of the host that owns every open session.
 pub enum HostRequest {
     New,
     Open(SessionId),
-    Activate(u64),
+    Activate(SlotKey),
     Quit,
 }
 
 /// One open session as the others see it.
 #[derive(Clone, PartialEq)]
 pub struct Peer {
-    pub key: u64,
+    pub key: SlotKey,
     pub session: Option<SessionId>,
     /// The session on screen.
     pub current: bool,
@@ -36,16 +45,9 @@ impl App {
             // Connection diagnostics belong only to this host installation, not
             // the journal or the agent's context. Reuse the UI-only status tail
             // rather than notice(), which persists statuses for active sessions.
-            self.unsaved_status
-                .extend(session.startup_warnings().iter().map(|warning| {
-                    (
-                        session.root_agent().clone(),
-                        format!("Startup warning: {warning}"),
-                    )
-                }));
-            if !session.startup_warnings().is_empty() {
-                self.dirty = true;
-                self.invalidate_content();
+            for warning in session.startup_warnings() {
+                let message = format!("Startup warning: {warning}");
+                self.push_local(session.root_agent().clone(), message);
             }
         }
     }
@@ -53,7 +55,7 @@ impl App {
         let Some(session) = self.session().cloned() else {
             return;
         };
-        let title = crate::tui::format::brief(title, 100);
+        let title = brief(title, TITLE_CHARS);
         let notices = self.root_notifier();
         tokio::spawn(async move {
             if let Err(e) = session.set_title(title).await {
@@ -70,13 +72,15 @@ impl App {
     }
     /// A notice about the interface itself: shown here, never journaled.
     pub fn local_notice(&mut self, message: impl Into<String>) {
-        self.unsaved_status
-            .push((self.selected.clone(), message.into()));
+        self.push_local(self.selected.clone(), message.into());
+    }
+    pub(super) fn push_local(&mut self, agent: AgentId, message: String) {
+        self.unsaved_status.push((agent, message));
         self.dirty = true;
-        self.invalidate_content();
+        self.content_dirty = true;
     }
     /// The modes a message can be sent in: the session's once it exists.
-    pub fn modes(&self) -> &indexmap::IndexMap<String, skyhook::tool::policy::Mode> {
+    pub fn modes(&self) -> &indexmap::IndexMap<ModeName, skyhook::tool::policy::Mode> {
         match self.session() {
             Some(session) => session.modes(),
             None => &self.launch.model.config().config().modes,
@@ -96,17 +100,13 @@ impl App {
             mode: self.remembered_mode.clone(),
             sidebar: self.sidebar,
         };
-        let mut app = Self::new(observation, launch, self.mode.clone(), saved, tx);
+        let mut app = Self::new(observation, launch, &self.mode, saved, tx);
         if draft {
             app.model.clone_from(&self.model);
         }
-        // A session can hold a mode the configuration, and so a draft, no longer has.
-        if !app.modes().contains_key(&app.mode) {
-            app.mode = app.launch.model.config().default_mode().to_owned();
-        }
         app
     }
-    pub fn peer(&self, key: u64, current: bool) -> Peer {
+    pub fn peer(&self, key: SlotKey, current: bool) -> Peer {
         let root = self.root_agent();
         let agent = self.projection.agents.iter().find(|a| &a.id == root);
         Peer {
@@ -121,24 +121,5 @@ impl App {
                 ),
             working: !self.stopping && self.active_work(),
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::super::tests::*;
-    use super::*;
-    #[tokio::test]
-    async fn reconnecting_keeps_input_delivery_busy_until_interrupted() {
-        let (_root, mut app) = draft_fixture().await;
-        let agent = app.root_agent().clone();
-        app.snapshot
-            .activity
-            .insert(agent.clone(), AgentActivity::Reconnecting { attempt: 2 });
-        assert!(app.busy());
-        app.snapshot
-            .activity
-            .insert(agent, AgentActivity::Stopped(TurnFailure::Interrupted));
-        assert!(!app.busy());
     }
 }

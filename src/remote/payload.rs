@@ -1,7 +1,6 @@
 //! One bounded payload transport per connection; only the host persists output.
 use std::{
     io::{self, Write},
-    num::NonZeroU64,
     sync::Arc,
 };
 
@@ -11,10 +10,10 @@ use tokio::{
 };
 
 use crate::remote::{
-    flow::{CHUNK_BYTES, Credits, WINDOW},
+    flow::{self, CHUNK_BYTES, Credits, WINDOW},
     protocol::{
         ImageId, PayloadEvent, PayloadId, PayloadOpen, RemoteToolResult, RequestId, Response,
-        write_frame,
+        Sequence, write_frame_within,
     },
 };
 use crate::tool::output::{OutputContext, OutputEvent, OutputSink};
@@ -42,7 +41,7 @@ pub(crate) struct PayloadReceiver {
 pub(crate) struct RequestOutput {
     sender: PayloadSender,
     request_id: RequestId,
-    next_image: Arc<std::sync::Mutex<Option<ImageId>>>,
+    images: Arc<Sequence<ImageId>>,
 }
 
 impl PayloadSender {
@@ -61,7 +60,7 @@ impl PayloadSender {
         RequestOutput {
             sender: self.clone(),
             request_id,
-            next_image: Arc::new(std::sync::Mutex::new(Some(ImageId(NonZeroU64::MIN)))),
+            images: Arc::default(),
         }
     }
 }
@@ -101,26 +100,17 @@ impl RequestOutput {
     /// Every send happens on the calling task, so dropping it stops the stream
     /// before the request's terminal result is sent.
     pub(crate) async fn send_source(&self, file: std::fs::File) -> io::Result<()> {
-        use tokio::io::AsyncReadExt as _;
-        let mut file = tokio::fs::File::from_std(file);
         self.send_payload(PayloadEvent::Open(PayloadOpen::Source))
             .await?;
-        let mut buffer = vec![0; CHUNK_BYTES];
-        loop {
-            let read = file.read(&mut buffer).await?;
-            if read == 0 {
-                return self
-                    .send_payload(PayloadEvent::Finish {
-                        id: PayloadId::Source,
-                    })
-                    .await;
-            }
-            self.send_payload(PayloadEvent::Data {
-                id: PayloadId::Source,
-                data: buffer[..read].to_vec(),
-            })
-            .await?;
-        }
+        let id = PayloadId::Source;
+        flow::pump(tokio::fs::File::from_std(file), None, |data| async move {
+            let event = match data {
+                Some(data) => PayloadEvent::Data { id, data },
+                None => PayloadEvent::Finish { id },
+            };
+            self.send_payload(event).await
+        })
+        .await
     }
 
     async fn send_payload(&self, event: PayloadEvent) -> io::Result<()> {
@@ -150,15 +140,8 @@ impl OutputSink for RequestOutput {
         let event = match event {
             OutputEvent::Capture(event) => PayloadEvent::Capture(event),
             OutputEvent::Image { file, image } => {
-                let id = {
-                    let mut next = self
-                        .next_image
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let id = next.ok_or_else(|| io::Error::other("image ID space exhausted"))?;
-                    *next = id.0.checked_add(1).map(ImageId);
-                    id
-                };
+                let id = (self.images.next())
+                    .ok_or_else(|| io::Error::other("image ID space exhausted"))?;
                 self.payload(PayloadEvent::Open(PayloadOpen::Image { id, file }))?;
                 for data in image.bytes().chunks(CHUNK_BYTES) {
                     self.payload(PayloadEvent::Data {
@@ -180,17 +163,20 @@ impl PayloadReceiver {
         self.credits.clone()
     }
 
+    /// Write the queued payloads as frames of at most `frame_limit` bytes.
     pub(crate) async fn forward<W: AsyncWrite + Unpin + Send + 'static>(
         mut self,
         writer: Arc<Mutex<W>>,
+        frame_limit: usize,
     ) -> io::Result<()> {
         while let Some(event) = self.receiver.recv().await {
             match event {
                 Outgoing::Payload { request_id, event } => {
                     self.credits.take().await?;
-                    write_frame(
+                    write_frame_within(
                         &mut *writer.lock().await,
                         &Response::Payload { request_id, event },
+                        frame_limit,
                     )
                     .await?;
                 }
@@ -198,9 +184,9 @@ impl PayloadReceiver {
                     request_id,
                     delivered,
                 } => {
+                    let terminal = Response::Tool { request_id };
                     let result =
-                        write_frame(&mut *writer.lock().await, &Response::Tool { request_id })
-                            .await;
+                        write_frame_within(&mut *writer.lock().await, &terminal, frame_limit).await;
                     let receipt = result
                         .as_ref()
                         .copied()
@@ -239,14 +225,14 @@ impl Write for ChunkWriter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::remote::protocol::{PromptId, RemoteToolOutput, read_frame};
+    use crate::remote::protocol::{
+        MAX_FRAME_BYTES, PromptId, RemoteToolOutput, read_frame, write_frame,
+    };
+    use crate::tests::bounded;
     use crate::tool::output::{CaptureEvent, CaptureId};
 
-    async fn bounded<T>(future: impl std::future::Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(5), future)
-            .await
-            .unwrap()
-    }
+    /// Channel capacity has no change notification, so waits on it poll.
+    const POLL: std::time::Duration = std::time::Duration::from_millis(10);
 
     #[test]
     fn result_serialization_progresses_with_a_saturated_single_thread_blocking_pool() {
@@ -256,11 +242,13 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let bytes = CHUNK_BYTES + 1;
+        // The result is larger than a frame, so only chunking can carry it.
+        let frame_limit = 2 * CHUNK_BYTES;
+        let bytes = frame_limit + 1;
         runtime.block_on(async {
             let (sender, receiver) = PayloadSender::new();
-            let result = sender.request(RequestId::FIRST);
-            let competing = sender.request(RequestId::FIRST.next().unwrap());
+            let result = sender.request(RequestId::new(1));
+            let competing = sender.request(RequestId::new(2));
             let output = competing.context();
             let capture = output
                 .pending_stream_capture(
@@ -278,7 +266,7 @@ mod tests {
             })));
             bounded(async {
                 while sender.0.capacity() == WINDOW {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(POLL).await;
                 }
             })
             .await;
@@ -293,13 +281,14 @@ mod tests {
             // thread. Forwarding must drain it without another blocking task.
             bounded(async {
                 while sender.0.capacity() != 0 {
-                    tokio::task::yield_now().await;
+                    tokio::time::sleep(POLL).await;
                 }
             })
             .await;
             let credits = receiver.credits();
             let (input, mut peer) = tokio::io::duplex(4096);
-            let forward = tokio::spawn(receiver.forward(Arc::new(Mutex::new(input))));
+            let forward = receiver.forward(Arc::new(Mutex::new(input)), frame_limit);
+            let forward = tokio::spawn(forward);
             let received = tokio::spawn(async move {
                 let mut streamed_bytes = 0;
                 let mut terminal = false;
@@ -315,9 +304,7 @@ mod tests {
                             }
                             credits.acknowledge().unwrap();
                         }
-                        Response::Tool {
-                            request_id: RequestId::FIRST,
-                        } => {
+                        Response::Tool { request_id } if request_id == RequestId::new(1) => {
                             assert!(streamed_bytes > bytes);
                             terminal = true;
                         }
@@ -341,9 +328,10 @@ mod tests {
         let credits = receiver.credits();
         let (input, mut output) = tokio::io::duplex(4096);
         let writer = Arc::new(Mutex::new(input));
-        let forward = tokio::spawn(receiver.forward(writer.clone()));
+        let forward = receiver.forward(writer.clone(), MAX_FRAME_BYTES);
+        let forward = tokio::spawn(forward);
         let mut producers = Vec::new();
-        for request_id in [RequestId::FIRST, RequestId::FIRST.next().unwrap()] {
+        for request_id in [RequestId::new(1), RequestId::new(2)] {
             let producer = sender.request(request_id);
             producers.push(tokio::task::spawn_blocking(move || {
                 for _ in 0..WINDOW * 3 {
@@ -365,7 +353,7 @@ mod tests {
         }
         bounded(async {
             while sender.0.capacity() != 0 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(POLL).await;
             }
         })
         .await;
@@ -374,7 +362,7 @@ mod tests {
         write_frame(
             &mut *writer.lock().await,
             &Response::SensitiveCancelled {
-                prompt_id: PromptId(7),
+                prompt_id: PromptId::new(7),
             },
         )
         .await
@@ -383,9 +371,7 @@ mod tests {
             bounded(read_frame::<_, Response>(&mut output))
                 .await
                 .unwrap(),
-            Some(Response::SensitiveCancelled {
-                prompt_id: PromptId(7)
-            })
+            Some(Response::SensitiveCancelled { prompt_id }) if prompt_id == PromptId::new(7)
         ));
         forward.abort();
         assert!(bounded(forward).await.unwrap_err().is_cancelled());

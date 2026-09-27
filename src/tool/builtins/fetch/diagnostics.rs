@@ -5,7 +5,7 @@
 //! and fixed messages cross the tool boundary. In particular, no failure implies
 //! that a firewall or other policy caused it.
 
-use std::{error::Error, fmt, io};
+use std::{borrow::Cow, error::Error, fmt, io};
 
 use schemars::JsonSchema;
 use serde::Serialize;
@@ -15,8 +15,7 @@ use crate::tool::diagnostic::{Cause, IoKind};
 use super::LocalError;
 
 /// The operation which was in progress, not a guess at a transport substage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum FetchPhase {
     ClientPreparation,
     Request,
@@ -54,13 +53,26 @@ pub(super) enum FetchErrorKind {
     Unknown,
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(super) struct FetchOsError {
     /// OS on the execution target; numeric codes are not portable across OSes.
-    platform: String,
+    platform: &'static str,
+    #[schemars(with = "i32")]
     code: Option<i32>,
     #[schemars(with = "String")]
     kind: IoKind,
+}
+
+impl FetchOsError {
+    /// An error of this machine's OS.
+    fn new(code: Option<i32>, kind: IoKind) -> Self {
+        Self {
+            platform: std::env::consts::OS,
+            code,
+            kind,
+        }
+    }
 }
 
 /// Safe text is a closed vocabulary, never a caller-provided string or an error display.
@@ -69,7 +81,7 @@ pub(super) enum DiagnosticMessage {
     Standard,
     ResponseExceedsMaxBytes,
     TextExtractionUnsupported,
-    Extraction(super::fetch_text::ExtractionFailure),
+    Extraction(super::text::ExtractionFailure),
     MaximumRedirectsExceeded,
     InvalidRedirectLocationHeader,
     InvalidRedirectUrl,
@@ -84,38 +96,47 @@ pub(super) enum DiagnosticMessage {
 }
 
 impl DiagnosticMessage {
-    fn render(self, kind: FetchErrorKind, phase: FetchPhase) -> &'static str {
-        match self {
+    fn render(self, kind: FetchErrorKind, phase: FetchPhase) -> Cow<'static, str> {
+        use super::text::{
+            ExtractionFailure, MAX_DECODED_HTML_BYTES, MAX_HTML_ELEMENTS, MAX_RAW_HTML_BYTES,
+        };
+        let retry = "use text:false to retrieve the response without extraction.";
+        Cow::Borrowed(match self {
             Self::Standard => message(kind, phase),
             Self::ResponseExceedsMaxBytes => "response exceeds max_bytes",
             Self::TextExtractionUnsupported => {
                 "text extraction is unsupported for this binary content type"
             }
-            Self::Extraction(reason) => {
-                use super::fetch_text::ExtractionFailure;
-                match reason {
-                    ExtractionFailure::RawSizeLimit => {
-                        "HTML exceeds the 10 MiB extraction input limit; use text:false to retrieve the response without extraction."
-                    }
-                    ExtractionFailure::DecodedSizeLimit => {
-                        "Decoded HTML exceeds the 10 MiB extraction limit; use text:false to retrieve the response without extraction."
-                    }
-                    ExtractionFailure::ElementLimit => {
-                        "HTML exceeds the 50,000-element extraction limit; use text:false to retrieve the response without extraction."
-                    }
-                    ExtractionFailure::Parser => {
-                        "The HTML parser could not extract an article; use text:false to retrieve the original response."
-                    }
-                    ExtractionFailure::Empty => {
-                        "HTML extraction produced no readable text; use text:false to retrieve the original response."
-                    }
-                    ExtractionFailure::WorkerUnavailable => {
-                        "The HTML extraction worker is unavailable; retry or use text:false to retrieve the response without extraction."
-                    }
-                    ExtractionFailure::WorkerFailed => {
-                        "The HTML extraction worker did not complete; retry or use text:false to retrieve the response without extraction."
-                    }
-                }
+            Self::Extraction(ExtractionFailure::RawSizeLimit) => {
+                return Cow::Owned(format!(
+                    "HTML exceeds the {} MiB extraction input limit; {retry}",
+                    MAX_RAW_HTML_BYTES >> 20
+                ));
+            }
+            Self::Extraction(ExtractionFailure::DecodedSizeLimit) => {
+                return Cow::Owned(format!(
+                    "Decoded HTML exceeds the {} MiB extraction limit; {retry}",
+                    MAX_DECODED_HTML_BYTES >> 20
+                ));
+            }
+            Self::Extraction(ExtractionFailure::ElementLimit) => {
+                return Cow::Owned(format!(
+                    "HTML exceeds the {},{:03}-element extraction limit; {retry}",
+                    MAX_HTML_ELEMENTS / 1000,
+                    MAX_HTML_ELEMENTS % 1000
+                ));
+            }
+            Self::Extraction(ExtractionFailure::Parser) => {
+                "The HTML parser could not extract an article; use text:false to retrieve the original response."
+            }
+            Self::Extraction(ExtractionFailure::Empty) => {
+                "HTML extraction produced no readable text; use text:false to retrieve the original response."
+            }
+            Self::Extraction(ExtractionFailure::WorkerUnavailable) => {
+                "The HTML extraction worker is unavailable; retry or use text:false to retrieve the response without extraction."
+            }
+            Self::Extraction(ExtractionFailure::WorkerFailed) => {
+                "The HTML extraction worker did not complete; retry or use text:false to retrieve the response without extraction."
             }
             Self::MaximumRedirectsExceeded => "maximum redirects exceeded",
             Self::InvalidRedirectLocationHeader => "invalid redirect location header",
@@ -132,30 +153,40 @@ impl DiagnosticMessage {
             }
             Self::ProxyRejectedTunnel => "The HTTP proxy rejected the CONNECT tunnel.",
             Self::ProxyMissingHost => "The HTTP proxy tunnel destination is missing a host.",
-        }
+        })
     }
 }
 
 /// Unknown timeout evidence cannot accidentally acquire a configured limit.
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Copy, Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum TimeoutAttribution {
     Unknown,
-    Total { limit_ms: u64 },
-    Connect { limit_ms: Option<u64> },
+    Total {
+        limit_ms: u64,
+    },
+    Connect {
+        #[schemars(with = "u64")]
+        limit_ms: Option<u64>,
+    },
 }
 
 /// Internal evidence is not deserializable: only the typed constructors below
 /// populate it (rendering the closed message once), and serialization is the
-/// single wire projection.
+/// single wire projection. The phase and message reach the model in the error text.
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(super) struct FetchDiagnostic {
-    #[schemars(with = "String")]
+    #[serde(skip)]
     phase: FetchPhase,
     #[schemars(with = "String")]
     error_kind: FetchErrorKind,
-    message: &'static str,
+    #[serde(skip)]
+    message: Cow<'static, str>,
+    #[schemars(with = "FetchOsError")]
     os_error: Option<FetchOsError>,
+    #[schemars(with = "TimeoutAttribution")]
     timeout: Option<TimeoutAttribution>,
 }
 
@@ -185,14 +216,14 @@ impl FetchDiagnostic {
         self.phase
     }
 
-    pub fn message(&self) -> &'static str {
-        self.message
+    pub fn message(&self) -> &str {
+        &self.message
     }
 
     pub fn os_code(&self) -> Option<(&str, i32)> {
         self.os_error
             .as_ref()
-            .and_then(|os| os.code.map(|code| (os.platform.as_str(), code)))
+            .and_then(|os| os.code.map(|code| (os.platform, code)))
     }
 
     pub fn with_connect_limit(mut self, limit_ms: u64) -> Self {
@@ -219,16 +250,10 @@ impl FetchDiagnostic {
         // Reqwest's top-level display usually hides the useful connection cause.
         // Typed timeout/decode predicates and source downcasts are sufficient;
         // parsing display strings would both leak data and invent certainty.
-        let kind = if timed_out || evidence.timed_out {
+        let kind = if timed_out {
             FetchErrorKind::Timeout
-        } else if evidence.dns {
-            FetchErrorKind::DnsFailure
-        } else if evidence.tls {
-            FetchErrorKind::TlsFailure
-        } else if let Some(kind) = evidence.transport_kind {
+        } else if let Some(kind) = evidence.kind() {
             kind
-        } else if evidence.proxy.is_some() {
-            FetchErrorKind::ProxyFailure
         } else if error.is_builder() {
             FetchErrorKind::ClientConfiguration
         } else if error.is_redirect() {
@@ -254,19 +279,7 @@ impl FetchDiagnostic {
     pub fn from_io(error: &io::Error, phase: FetchPhase) -> Self {
         let evidence = Evidence::collect(error);
         let phase = evidence.refine_phase(phase, false);
-        let kind = if evidence.timed_out {
-            FetchErrorKind::Timeout
-        } else if evidence.dns {
-            FetchErrorKind::DnsFailure
-        } else if evidence.tls {
-            FetchErrorKind::TlsFailure
-        } else if let Some(kind) = evidence.transport_kind {
-            kind
-        } else if evidence.proxy.is_some() {
-            FetchErrorKind::ProxyFailure
-        } else {
-            fallback(phase)
-        };
+        let kind = evidence.kind().unwrap_or_else(|| fallback(phase));
         evidence.into_diagnostic(phase, kind)
     }
 }
@@ -306,11 +319,7 @@ impl FetchError {
                     transport_kind(kind).unwrap_or_else(|| fallback(phase))
                 };
                 FetchDiagnostic {
-                    os_error: Some(FetchOsError {
-                        platform: std::env::consts::OS.into(),
-                        code,
-                        kind,
-                    }),
+                    os_error: Some(FetchOsError::new(code, kind)),
                     ..FetchDiagnostic::new(phase, error_kind)
                 }
                 .into()
@@ -322,7 +331,16 @@ impl FetchError {
             | Cause::Interrupted
             | Cause::Denied(_)
             | Cause::InvalidArguments(_)
-            | Cause::InputClosed => Self::Passthrough(LocalError::from_facts(diagnostic, None)),
+            | Cause::InputClosed
+            | Cause::Unavailable { .. }
+            | Cause::UnknownTool { .. }
+            | Cause::ModelHidden { .. }
+            | Cause::ScriptUnavailable { .. }
+            | Cause::UnknownJob { .. }
+            | Cause::JobNotTerminal { .. }
+            | Cause::JobAlreadyTerminal { .. } => {
+                Self::Passthrough(LocalError::from_facts(diagnostic, None))
+            }
         }
     }
 
@@ -415,6 +433,12 @@ impl Error for DnsFailure {
     }
 }
 
+/// Explicit upload evidence: reading the request body's local snapshot failed,
+/// which is local IO however the transport reports it.
+#[derive(Debug, thiserror::Error)]
+#[error("reading the upload snapshot failed")]
+pub(super) struct UploadReadFailure(#[source] pub io::Error);
+
 // The tunnel error's defining module is private, but its concrete type is part
 // of Tunnel's public Service contract. Name it through that associated type so
 // real CONNECT failures remain typed evidence rather than display-string guesses.
@@ -426,6 +450,7 @@ type ProxyTunnelError = <hyper_util::client::legacy::connect::proxy::Tunnel<
 /// evidence: a single source chain can legitimately contain several.
 #[derive(Default)]
 struct Evidence {
+    upload: bool,
     dns: bool,
     proxy: Option<DiagnosticMessage>,
     tls: bool,
@@ -448,6 +473,23 @@ fn source_chain_is_bounded(error: &(dyn Error + 'static)) -> bool {
 }
 
 impl Evidence {
+    /// The kind the source chain proves, most specific first.
+    fn kind(&self) -> Option<FetchErrorKind> {
+        if self.upload {
+            Some(FetchErrorKind::LocalIo)
+        } else if self.timed_out {
+            Some(FetchErrorKind::Timeout)
+        } else if self.dns {
+            Some(FetchErrorKind::DnsFailure)
+        } else if self.tls {
+            Some(FetchErrorKind::TlsFailure)
+        } else if self.transport_kind.is_some() {
+            self.transport_kind
+        } else {
+            self.proxy.map(|_| FetchErrorKind::ProxyFailure)
+        }
+    }
+
     fn into_diagnostic(self, phase: FetchPhase, kind: FetchErrorKind) -> FetchDiagnostic {
         let message = if kind == FetchErrorKind::ResponseBodyFailure && self.unexpected_eof {
             DiagnosticMessage::UnexpectedBodyEof
@@ -468,7 +510,9 @@ impl Evidence {
         if phase != FetchPhase::Request {
             return phase;
         }
-        if self.dns {
+        if self.upload {
+            FetchPhase::LocalIo
+        } else if self.dns {
             FetchPhase::Resolve
         } else if self.proxy.is_some() {
             FetchPhase::Proxy
@@ -488,6 +532,7 @@ impl Evidence {
         let mut current = Some(error);
         for _ in 0..MAX_SOURCE_DEPTH {
             let Some(error) = current else { break };
+            evidence.upload |= error.is::<UploadReadFailure>();
             evidence.dns |= error.is::<DnsFailure>();
             if let Some(error) = error.downcast_ref::<ProxyTunnelError>() {
                 evidence.proxy = Some(match error {
@@ -517,11 +562,7 @@ impl Evidence {
                         .as_ref()
                         .is_none_or(|error| error.code.is_none())
                 {
-                    evidence.os_error = Some(FetchOsError {
-                        platform: std::env::consts::OS.into(),
-                        code: error.raw_os_error(),
-                        kind,
-                    });
+                    evidence.os_error = Some(FetchOsError::new(error.raw_os_error(), kind));
                 }
                 // io::Error::source can skip the wrapped error itself. Inspect
                 // get_ref first so a wrapped rustls::Error/marker is not lost.
@@ -598,44 +639,25 @@ mod tests {
                 (&json!("timeout"), &expected)
             );
         }
-        // Stable wire values; non-timeouts carry no timeout attribution.
+        // Stable wire values; non-timeouts carry no timeout attribution, and the
+        // phase and message are left to the error text.
         for (phase, kind, wire) in [
             (
                 FetchPhase::Connect,
                 FetchErrorKind::ConnectionRefused,
-                ["connect", "connection_refused"],
+                "connection_refused",
             ),
             (
                 FetchPhase::ResponseBody,
                 FetchErrorKind::ConnectionReset,
-                ["response_body", "connection_reset"],
+                "connection_reset",
             ),
         ] {
             let value =
                 serde_json::to_value(FetchDiagnostic::new(phase, kind).with_connect_limit(1234))
                     .unwrap();
-            assert_eq!(value["timeout"], serde_json::Value::Null);
-            assert_eq!(value["os_error"], serde_json::Value::Null);
-            assert_eq!(
-                [&value["phase"], &value["error_kind"]],
-                wire.map(|w| json!(w)).each_ref()
-            );
+            assert_eq!(value, json!({"error_kind": wire}));
         }
-    }
-
-    #[test]
-    fn nullable_diagnostic_details_are_emitted() {
-        let os_error = FetchOsError {
-            platform: "test".into(),
-            code: None,
-            kind: IoKind::Other,
-        };
-        assert_eq!(serde_json::to_value(os_error).unwrap()["code"], json!(null));
-        let connect = TimeoutAttribution::Connect { limit_ms: None };
-        assert_eq!(
-            serde_json::to_value(connect).unwrap(),
-            json!({"kind":"connect", "limit_ms":null})
-        );
     }
 
     #[test]

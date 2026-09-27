@@ -9,27 +9,34 @@ use futures_util::FutureExt;
 use libsql::{Builder, Connection, OpenFlags, Row, Value};
 
 use crate::{
-    named_enum::{NamedEnum, named_enum},
+    agent::{FailureKind, FaultKind},
+    named_enum::NamedEnum,
     session::{MessageSeq, RecordSeq, RequestSeq},
 };
 
+mod approval;
+mod contract;
 mod decode;
 mod diagnostic;
 mod encode;
+mod job;
+mod message;
 mod output;
+mod request;
 mod state;
 
 pub(super) use decode::{decode_records, u64_of};
 pub(super) use encode::Encoder;
-pub(super) use output::output_text;
-pub(crate) use output::{CaptureExtent, CaptureRow, Presentation};
-pub(crate) use state::InterruptedWork;
+pub(crate) use output::{CaptureExtent, CaptureRow, OutputSizes, Presentation};
 pub use state::SessionSummary;
-pub(super) use state::{interrupted_work, summary};
+pub(super) use state::summary;
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 14;
+pub(super) const USER_VERSION: i64 = 15;
 const SCHEMA: &str = include_str!("../schema.sql");
+const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bytes of write-ahead log kept after a checkpoint.
+const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
 /// Payload tables outside the append-only ledger: blob writes and output upserts.
 const MUTABLE_TABLES: [&str; 6] = [
     "blob",
@@ -48,6 +55,8 @@ pub enum DbError {
     Suspended,
     #[error("session database is not a supported skyhook session (version {0})")]
     Unsupported(i64),
+    #[error("session database dictionary {0} differs from this build's")]
+    Dictionary(&'static str),
     #[error("invalid session database row: {0}")]
     Corrupt(String),
     #[error("session record rejected: {0}")]
@@ -72,7 +81,7 @@ pub(super) fn rejected(message: impl Into<String>) -> DbError {
 }
 
 /// Bind a Rust value as an SQLite parameter. Unsigned values saturate at `i64::MAX`.
-pub(super) trait Sql {
+pub(crate) trait Sql {
     fn sql(self) -> Value;
 }
 
@@ -116,11 +125,29 @@ impl Sql for String {
     }
 }
 
-impl Sql for &String {
-    fn sql(self) -> Value {
-        Value::Text(self.clone())
-    }
+macro_rules! sql_text {
+    ($($type:ty),*) => {$(
+        impl Sql for &$type {
+            fn sql(self) -> Value {
+                self.as_str().sql()
+            }
+        }
+    )*};
 }
+sql_text!(
+    String,
+    crate::target::TargetRef,
+    crate::newtype::Prose,
+    crate::tool::policy::ModeName,
+    crate::tool::registry::JobName,
+    crate::tool::output::FieldPointer,
+    crate::provider::profile::ProviderName,
+    crate::provider::profile::ModelName,
+    crate::provider::protocol::WireModel,
+    crate::provider::protocol::ItemId,
+    crate::provider::protocol::BlockId,
+    crate::provider::protocol::Scope
+);
 
 impl Sql for &[u8] {
     fn sql(self) -> Value {
@@ -175,45 +202,6 @@ pub(super) fn optional_enum_column<T: NamedEnum>(row: &Row, index: i32) -> DbRes
         .transpose()
 }
 
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub(super) enum MessageRole {
-        User = "user",
-        Assistant = "assistant",
-        Tool = "tool",
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub(super) enum UserPartKind {
-        Text = "text",
-        Attachment = "attachment",
-        State = "state",
-        JobEvents = "job_events",
-        ParentInput = "parent_input",
-        Compaction = "compaction",
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub(super) enum JobEventKind {
-        Message = "message",
-        Job = "job",
-    }
-}
-
-named_enum! {
-    /// How a completed response ended; `cut` rows also name their `Truncation`.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub(super) enum ResponseOutcome {
-        Answer = "answer",
-        ToolUse = "tool_use",
-        Cut = "cut",
-    }
-}
-
 macro_rules! params {
     ($($value:expr),* $(,)?) => {
         vec![$($crate::session::db::Sql::sql($value)),*]
@@ -244,21 +232,24 @@ impl Db {
         };
         let database = ready(builder.build())?;
         let conn = database.connect()?;
-        conn.busy_timeout(std::time::Duration::from_secs(5))?;
+        conn.busy_timeout(BUSY_TIMEOUT)?;
         let db = Self {
             conn,
             _database: database,
         };
         match mode {
             OpenMode::Create | OpenMode::Memory => db.initialize()?,
-            OpenMode::Open | OpenMode::ReadOnly => db.check_version()?,
-        }
-        db.batch(match mode {
-            OpenMode::ReadOnly => "PRAGMA foreign_keys = ON; PRAGMA query_only = 1;",
-            _ => {
-                "PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; \
-                 PRAGMA journal_size_limit = 67108864; PRAGMA temp_store = MEMORY;"
+            OpenMode::Open | OpenMode::ReadOnly => {
+                db.check_version()?;
+                Dictionaries(&db, Seeding::Check).seed()?;
             }
+        }
+        db.batch(&match mode {
+            OpenMode::ReadOnly => "PRAGMA foreign_keys = ON; PRAGMA query_only = 1;".to_owned(),
+            _ => format!(
+                "PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; \
+                 PRAGMA journal_size_limit = {JOURNAL_SIZE_LIMIT}; PRAGMA temp_store = MEMORY;"
+            ),
         })?;
         Ok(db)
     }
@@ -268,6 +259,7 @@ impl Db {
         self.query_row("PRAGMA journal_mode = WAL", Vec::new(), |_| Ok(()))?;
         self.atomic(|| {
             self.batch(SCHEMA)?;
+            Dictionaries(self, Seeding::Fill).seed()?;
             let tables = self.query(
                 "SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name",
                 Vec::new(),
@@ -289,7 +281,175 @@ impl Db {
             ))
         })
     }
+}
 
+/// Whether [`Dictionaries::seed`] fills a new journal's dictionaries or checks that an
+/// opened one holds exactly the same rows, so that none decodes under another meaning.
+#[derive(Clone, Copy)]
+enum Seeding {
+    Fill,
+    Check,
+}
+
+struct Dictionaries<'a>(&'a Db, Seeding);
+
+impl Dictionaries<'_> {
+    /// Seed each dictionary with its enum's spellings and flags, and each subset
+    /// dictionary with the values its columns may take.
+    fn seed(&self) -> DbResult<()> {
+        use crate::{
+            agent::TodoStatus,
+            job::{CaptureKind, JobRole, JobState},
+            media::ImageFormat,
+            provider::{
+                profile::StateMode,
+                protocol::{Binding, HistoryLifetime, ItemKind, ReplayFormat},
+            },
+            session::{EntryKind as E, ModelPurpose, Truncation},
+            target::{SshAuth, TargetSource},
+            tool::{
+                diagnostic::{Effects, IoKind, Operation, PathRole},
+                policy::{ApprovalCoverage, Capability, ResourceKind},
+            },
+        };
+        self.names("capability", &Capability::ALL)?;
+        self.names("entry_kind", &E::ALL)?;
+        // The entry kinds each subset dictionary admits to the subtype table it narrows.
+        for (table, kinds) in [
+            ("text_entry_kind", &[E::TitleSet, E::Status][..]),
+            (
+                "targets_entry_kind",
+                &[E::SessionStarted, E::TargetsUpserted],
+            ),
+            ("mode_entry_kind", &[E::AgentStarted, E::ModeChanged]),
+            ("todos_entry_kind", &[E::TodosReplaced, E::Compaction]),
+            ("failure_entry_kind", &[E::AgentFailed, E::ModelFailed]),
+            (
+                "attempt_outcome_kind",
+                &[
+                    E::Compaction,
+                    E::ModelFailed,
+                    E::ModelAttemptInterrupted,
+                    E::ResponseCompleted,
+                ],
+            ),
+            (
+                "delivery_kind",
+                &[E::JobClaimed, E::JobInjected, E::JobMessageDelivered],
+            ),
+        ] {
+            self.names(table, kinds)?;
+        }
+        self.flagged(
+            "compaction_outcome_kind",
+            ["failed"],
+            &[E::CompactionSkipped, E::CompactionFailed],
+            |kind| [kind == E::CompactionFailed],
+        )?;
+        self.names("target_source", &TargetSource::ALL)?;
+        self.names("ssh_auth", &SshAuth::ALL)?;
+        self.names("state_mode", &StateMode::ALL)?;
+        self.names("model_purpose", &ModelPurpose::ALL)?;
+        self.names("message_role", &message::MessageRole::ALL)?;
+        self.names("image_format", &ImageFormat::ALL)?;
+        self.flagged(
+            "user_part_kind",
+            ["text"],
+            &message::UserPartKind::ALL,
+            |kind| [kind.text()],
+        )?;
+        self.names("job_event_kind", &message::JobEventKind::ALL)?;
+        self.names("item_kind", &ItemKind::ALL)?;
+        self.names("block_item_kind", &[ItemKind::Text, ItemKind::Reasoning])?;
+        self.names("replay_binding", &Binding::ALL)?;
+        self.names("replay_format", &ReplayFormat::ALL)?;
+        self.names("todo_status", &TodoStatus::ALL)?;
+        self.names("history_lifetime", &HistoryLifetime::ALL)?;
+        self.names("response_outcome", &request::ResponseOutcome::ALL)?;
+        self.names("cut_reason", &Truncation::ALL)?;
+        self.names("job_role", &JobRole::ALL)?;
+        self.names("capture_kind", &CaptureKind::ALL)?;
+        self.names("diagnostic_slot", &diagnostic::Slot::ALL)?;
+        self.names("diagnostic_operation", &Operation::ALL)?;
+        self.flagged(
+            "diagnostic_subject",
+            ["path", "text"],
+            &diagnostic::SubjectKind::ALL,
+            diagnostic::SubjectKind::stores,
+        )?;
+        self.names("diagnostic_site", &diagnostic::SiteKind::ALL)?;
+        self.names("diagnostic_effects", &Effects::ALL)?;
+        self.flagged(
+            "diagnostic_cause",
+            ["text", "job"],
+            &diagnostic::CauseKind::ALL,
+            diagnostic::CauseKind::stores,
+        )?;
+        self.names("diagnostic_io_kind", &IoKind::ALL)?;
+        self.names("diagnostic_path_role", &PathRole::ALL)?;
+        self.names("approval_coverage", &ApprovalCoverage::ALL)?;
+        self.flagged("resource_kind", ["target"], &ResourceKind::ALL, |kind| {
+            [approval::targeted(kind)]
+        })?;
+        self.flagged("job_state", ["terminal"], &JobState::ALL, |state| {
+            [state.is_terminal()]
+        })?;
+        self.flagged("failure_kind", ["detailed"], &FailureKind::ALL, |kind| {
+            [kind.detailed()]
+        })?;
+        self.names(
+            "provider_error_kind",
+            &crate::provider::ProviderErrorKind::ALL,
+        )?;
+        self.flagged("compaction_fault", ["detailed"], &FaultKind::ALL, |fault| {
+            [fault.detailed()]
+        })?;
+        self.names("checkpoint_error", &crate::session::CheckpointError::ALL)?;
+        Ok(())
+    }
+
+    fn names<T: NamedEnum>(&self, table: &'static str, values: &[T]) -> DbResult<()> {
+        self.flagged(table, [], values, |_| [])
+    }
+
+    /// `table` holds `values`, each with its `flags`, a column of `columns` each.
+    fn flagged<T: NamedEnum, const N: usize>(
+        &self,
+        table: &'static str,
+        columns: [&str; N],
+        values: &[T],
+        flags: impl Fn(T) -> [bool; N],
+    ) -> DbResult<()> {
+        let slots: String = (2..=N + 1).map(|slot| format!(", ?{slot}")).collect();
+        let columns: String = columns.map(|column| format!(", {column}")).concat();
+        let (columns, slots) = (format!("(name{columns})"), format!("(?1{slots})"));
+        let Self(db, seeding) = *self;
+        let sql = match seeding {
+            Seeding::Fill => format!("INSERT INTO {table} {columns} VALUES {slots}"),
+            Seeding::Check => format!("SELECT count(*) FROM {table} WHERE {columns} = {slots}"),
+        };
+        let count = |sql: &str, params| {
+            let count = db.query_row(sql, params, |row| Ok(row.get::<u64>(0)?))?;
+            DbResult::Ok(count.unwrap_or_default())
+        };
+        let mut held = 0;
+        for value in values {
+            let mut params = params![*value];
+            params.extend(flags(*value).map(Sql::sql));
+            held += match seeding {
+                Seeding::Fill => db.execute(&sql, params)?,
+                Seeding::Check => count(&sql, params)?,
+            };
+        }
+        let rows = count(&format!("SELECT count(*) FROM {table}"), Vec::new())?;
+        if held != values.len() as u64 || rows != held {
+            return Err(DbError::Dictionary(table));
+        }
+        Ok(())
+    }
+}
+
+impl Db {
     fn check_version(&self) -> DbResult<()> {
         let pragma = |name| {
             self.query_row(&format!("PRAGMA {name}"), Vec::new(), |row| {
@@ -398,11 +558,11 @@ mod tests {
     // encode -> decode round trips in encode.rs.
     use serde_json::json;
 
-    use super::{Db, Encoder, OpenMode, decode_records};
+    use super::{Db, DbError, Encoder, OpenMode, decode_records};
     use crate::{
         execution::ExecutionLocation,
         identity::{AgentId, EventId, JobId, SessionId},
-        job::{JobEnd, JobRole, JobState, JobTransition},
+        job::{JobEnd, JobRole, JobTransition},
         media::{AttachmentRef, BlobRef, ImageFormat, ImageRef},
         provider::protocol::{AssistantItem, ToolCall, ToolResult},
         session::{
@@ -623,95 +783,29 @@ mod tests {
         assert!(foreign_keys.is_empty());
     }
 
-    /// Every dictionary seeds exactly its enum's spellings.
     #[test]
-    fn dictionaries_list_every_enum_spelling() {
-        use crate::{
-            named_enum::NamedEnum,
-            provider::{
-                profile::StateMode,
-                protocol::{Binding, HistoryLifetime, ItemKind, ReplayFormat},
-            },
-            session::{EntryKind, ModelFailureKind, ModelPurpose, Truncation},
-            target::{SshAuth, TargetSource},
-            tool::{
-                diagnostic::{Effects, IoKind, Operation, PathRole},
-                policy::{ApprovalCoverage, Capability},
-            },
-        };
-        fn spellings<T: NamedEnum>() -> Vec<String> {
-            let mut names: Vec<_> = T::ALL.iter().map(|name| name.as_str().to_owned()).collect();
-            names.sort();
-            names
-        }
-        let fixture = Fixture::new();
-        for (table, expected) in [
-            ("capability", spellings::<Capability>()),
-            ("entry_kind", spellings::<EntryKind>()),
-            ("target_source", spellings::<TargetSource>()),
-            ("ssh_auth", spellings::<SshAuth>()),
-            ("state_mode", spellings::<StateMode>()),
-            ("model_purpose", spellings::<ModelPurpose>()),
-            ("message_role", spellings::<super::MessageRole>()),
-            ("image_format", spellings::<ImageFormat>()),
-            ("user_part_kind", spellings::<super::UserPartKind>()),
-            ("item_kind", spellings::<ItemKind>()),
-            ("replay_binding", spellings::<Binding>()),
-            ("replay_format", spellings::<ReplayFormat>()),
-            ("todo_status", spellings::<crate::agent::TodoStatus>()),
-            ("history_lifetime", spellings::<HistoryLifetime>()),
-            ("model_failure_kind", spellings::<ModelFailureKind>()),
-            ("response_outcome", spellings::<super::ResponseOutcome>()),
-            ("cut_reason", spellings::<Truncation>()),
-            ("job_role", spellings::<JobRole>()),
-            ("job_state", spellings::<JobState>()),
-            ("capture_kind", spellings::<crate::job::CaptureKind>()),
-            ("diagnostic_slot", spellings::<super::diagnostic::Slot>()),
-            ("diagnostic_operation", spellings::<Operation>()),
+    fn an_opened_journal_must_hold_this_builds_dictionaries() {
+        for (table, tamper) in [
             (
-                "diagnostic_subject",
-                spellings::<super::diagnostic::SubjectKind>(),
+                "todo_status",
+                "INSERT INTO todo_status (name) VALUES ('abandoned')",
             ),
             (
-                "diagnostic_site",
-                spellings::<super::diagnostic::SiteKind>(),
+                "job_state",
+                "DROP TRIGGER job_state_append_only_update; \
+                 UPDATE job_state SET terminal = 1 - terminal WHERE name = 'running'",
             ),
-            ("diagnostic_effects", spellings::<Effects>()),
-            (
-                "diagnostic_cause",
-                spellings::<super::diagnostic::CauseKind>(),
-            ),
-            ("diagnostic_io_kind", spellings::<IoKind>()),
-            ("diagnostic_path_role", spellings::<PathRole>()),
-            ("approval_coverage", spellings::<ApprovalCoverage>()),
-            (
-                "resource_kind",
-                spellings::<crate::tool::policy::ResourceKind>(),
-            ),
-            ("job_event_kind", spellings::<super::JobEventKind>()),
         ] {
-            let query = format!("SELECT name FROM {table} ORDER BY name");
-            let names = fixture
-                .db
-                .query(&query, Vec::new(), |row| Ok(row.get::<String>(0)?))
+            let root = tempfile::tempdir().unwrap();
+            let path = root.path().join("session.db");
+            Db::open(&path, OpenMode::Create)
+                .unwrap()
+                .batch(tamper)
                 .unwrap();
-            assert_eq!(names, expected, "{table}");
-        }
-        let terminal = fixture
-            .db
-            .query("SELECT name, terminal FROM job_state", Vec::new(), |row| {
-                Ok((row.get::<String>(0)?, row.get::<bool>(1)?))
-            })
-            .unwrap();
-        for state in JobState::ALL {
-            assert!(terminal.contains(&(state.as_str().to_owned(), state.is_terminal())));
-        }
-        // The two journaled subsets split the dictionary by its `terminal` column.
-        for transition in JobTransition::ALL {
-            assert!(terminal.contains(&(transition.as_str().to_owned(), false)));
-        }
-        for end in JobEnd::ALL {
-            assert!(terminal.contains(&(end.as_str().to_owned(), true)));
+            for mode in [OpenMode::Open, OpenMode::ReadOnly] {
+                let opened = Db::open(&path, mode);
+                assert!(matches!(opened, Err(DbError::Dictionary(name)) if name == table));
+            }
         }
     }
 
@@ -727,6 +821,25 @@ mod tests {
             assert!(fixture.db.execute(sql, Vec::new()).is_err(), "{sql}");
         }
         fixture.assert_round_trip();
+    }
+
+    /// A model failure is its attempt's outcome; an agent failure has none.
+    #[test]
+    fn only_agent_failures_stand_without_an_attempt_outcome() {
+        let mut fixture = Fixture::new();
+        fixture.start("/w");
+        for (seq, kind, accepted) in [
+            (100_i64, "agent_failed", true),
+            (101, "model_failed", false),
+        ] {
+            let entry = "INSERT INTO entry (seq, public_id, agent, created_millis, kind) \
+                         VALUES (?1, randomblob(16), (SELECT min(id) FROM agent), 0, ?2)";
+            fixture.db.execute(entry, params![seq, kind]).unwrap();
+            let failure = "INSERT INTO failure (entry, kind, failure, detailed) \
+                           VALUES (?1, ?2, 'empty', 0)";
+            let inserted = fixture.db.execute(failure, params![seq, kind]);
+            assert_eq!(inserted.is_ok(), accepted, "{kind}");
+        }
     }
 
     /// Only a run that restarts a finished job starts a new output generation; a

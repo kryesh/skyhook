@@ -5,23 +5,21 @@ mod config;
 mod process;
 
 pub(crate) use askpass::AskpassServer;
+pub use askpass::askpass_main;
 pub(crate) use authentication::WorkerAuthentication;
-pub(crate) use config::validate_option;
+pub(crate) use config::SshOption;
 pub(crate) use process::open;
 
-pub(crate) fn run_askpass_helper(
-    socket: &std::path::Path,
-    prompt: String,
-) -> Result<(), Box<dyn std::error::Error>> {
-    askpass::run_helper(socket, prompt)
-}
-
 use crate::remote::{
-    EmbeddedShimCatalog, RemoteError, SensitivePromptHandler,
+    artifact::EmbeddedShimCatalog,
     backend::{ConnectionFactory, ConnectionRequest, ProcessEnvironment, Transport},
+    error::RemoteError,
+    prompt::SensitivePromptHandler,
 };
 use futures_util::future::BoxFuture;
 use std::sync::Arc;
+
+const AUTH_SOCK: &str = "SSH_AUTH_SOCK";
 
 /// Session-owned OpenSSH implementation of the common transport factory.
 /// Authentication stays lazy and shared across every connection in the session.
@@ -44,7 +42,6 @@ impl Backend {
 impl ConnectionFactory for Backend {
     fn connect(&self, request: ConnectionRequest) -> BoxFuture<'_, Result<Transport, RemoteError>> {
         Box::pin(async move {
-            let destination = request.route.last().ok_or(RemoteError::EmptyRoute)?;
             // A remote origin's shim chooses agents for the SSH process it starts.
             let environment = if request.origin.is_some() {
                 ProcessEnvironment::new()
@@ -55,11 +52,11 @@ impl ConnectionFactory for Backend {
             };
             process::SshLauncher {
                 origin: request.origin,
-                route: request.route.clone(),
+                route: request.route,
                 environment,
                 prompts: self.prompts.clone(),
             }
-            .connect(destination, &request.workspace, &self.catalog)
+            .connect(&request.workspace, &self.catalog)
             .await
         })
     }

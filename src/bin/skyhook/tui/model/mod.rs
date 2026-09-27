@@ -12,13 +12,11 @@ mod retry;
 pub use super::format::{Clean, clean, footer, number, pretty};
 pub use cache::ContentCache;
 pub use entries::entries;
-pub use jobs::{state_name, target_suffix};
-pub use projection::{
-    AgentDisplayState, AgentInfo, JobInfo, Projection, WaitReason, agent_footer, agent_footer_stats,
-};
+pub use jobs::{state_glyph, state_name, state_role, target_suffix};
+pub use projection::{AgentDisplayState, AgentInfo, JobInfo, Projection, WaitReason};
 pub use requests::{RequestRow, RequestStatus};
 
-use super::tool_view::{Document, Run};
+use super::tool_view::{Document, Role, Run};
 use skyhook::identity::{AgentId, JobId};
 use skyhook::provider::protocol::BlockRef;
 use skyhook::session::{MessageSeq, RecordSeq, RequestSeq};
@@ -115,6 +113,18 @@ pub enum Disclosure {
     Open,
     Closed,
 }
+impl Disclosure {
+    fn new(open: bool) -> Self {
+        if open { Self::Open } else { Self::Closed }
+    }
+
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Open => "▾ ",
+            Self::Closed => "▸ ",
+        }
+    }
+}
 
 /// A generated heading above an entry's body. A disclosure makes the entry
 /// expandable and is drawn as its glyph; the spinner gutter is a render decision.
@@ -135,21 +145,13 @@ impl Title {
     pub fn disclosed(label: impl Into<Clean>, open: bool) -> Self {
         Self {
             label: label.into(),
-            disclosure: Some(if open {
-                Disclosure::Open
-            } else {
-                Disclosure::Closed
-            }),
+            disclosure: Some(Disclosure::new(open)),
         }
     }
 
     /// The heading line; `gutter` reserves the spinner's two cells before the label.
     pub fn line(&self, gutter: bool) -> String {
-        let glyph = match self.disclosure {
-            Some(Disclosure::Open) => "▾ ",
-            Some(Disclosure::Closed) => "▸ ",
-            None => "",
-        };
+        let glyph = self.disclosure.map_or("", Disclosure::glyph);
         let gutter = if gutter { "  " } else { "" };
         format!("{glyph}{gutter}{}", &*self.label)
     }
@@ -180,7 +182,10 @@ struct Card {
     plain: String,
 }
 impl Card {
-    fn new(header: Vec<Run>, body: Option<Document>) -> Self {
+    /// The header leads with the disclosure glyph of whether a body exists.
+    fn new(mut header: Vec<Run>, body: Option<Document>) -> Self {
+        let glyph = Disclosure::new(body.is_some()).glyph();
+        header.insert(0, Run::new(glyph, Role::Indicator));
         let mut plain = String::new();
         for run in &header {
             plain.push_str(run.text());
@@ -275,11 +280,7 @@ impl Entry {
         match &self.body {
             EntryBody::Text { title, .. } => title.as_ref()?.disclosure,
             EntryBody::Request { .. } => None,
-            EntryBody::Card(card) => Some(if card.body.is_some() {
-                Disclosure::Open
-            } else {
-                Disclosure::Closed
-            }),
+            EntryBody::Card(card) => Some(Disclosure::new(card.body.is_some())),
         }
     }
 
@@ -363,17 +364,27 @@ pub struct EntryView<'a> {
 mod tests {
     use super::super::tool_view::Run;
     use super::*;
-    use crate::tui::app::App;
+    use crate::tui::{
+        app::{
+            App, OutputStore,
+            tests::{model_context, requested},
+        },
+        tool_view::tests::view,
+    };
     use skyhook::agent::{ObservationSnapshot, ObservedEvent, RuntimeEvent};
     use skyhook::identity::SessionId;
     use skyhook::job::{JobRole, JobState};
     use skyhook::provider::protocol::{
-        AssistantItem, Binding, BlockId, BlockRef, ItemId, ItemKind, Provenance, Replay,
-        ReplayFormat, ResponseEvent, Scope, ToolCall, ToolResult,
+        AssistantItem, Binding, BlockRef, ItemKind, Provenance, Replay, ReplayFormat,
+        ResponseEvent, Scope, ToolCall, ToolResult,
     };
-    use skyhook::session::{
-        Message, MessageSeq, ModelPurpose, RecordSeq, RequestSeq, SessionEvent, UserPart,
-    };
+    use skyhook::session::{Message, MessageSeq, RecordSeq, RequestSeq, SessionEvent, UserPart};
+
+    /// Install a job view of `fields` as `job`'s output through the store's refresh path.
+    pub(super) fn loaded(outputs: &mut OutputStore, job: JobId, fields: serde_json::Value) {
+        let (attempt, _) = outputs.begin(job).unwrap();
+        outputs.complete(attempt, true, Ok(view(fields)));
+    }
 
     pub(super) fn header_text(runs: &[Run]) -> String {
         runs.iter().map(Run::text).collect()
@@ -461,10 +472,7 @@ mod tests {
                 ItemKind::Text
             };
             let event = ResponseEvent::Delta {
-                block: BlockRef {
-                    item: ItemId::try_from(item.to_owned()).unwrap(),
-                    block: BlockId::try_from(format!("{item}:0")).unwrap(),
-                },
+                block: BlockRef::single(item),
                 kind,
                 text: text.into(),
             };
@@ -482,9 +490,9 @@ mod tests {
 
         pub(super) async fn result_record(&mut self, agent: &AgentId, id: &str, error: bool) {
             let result = if error {
-                serde_json::json!({"error": "Permission was denied", "code": "permission_denied", "executed": false})
+                serde_json::json!({"state": "failed", "error": "Permission was denied"})
             } else {
-                serde_json::json!({"stdout": "  original\ttext\n"})
+                serde_json::json!({"state": "completed", "result": {"stdout": "  original\ttext\n"}})
             };
             let message = Message::Tool(vec![ToolResult {
                 call_id: id.into(),
@@ -510,34 +518,20 @@ mod tests {
                     let profile = skyhook::session::ProfileSnapshot {
                         name: "test/fixture".parse().unwrap(),
                         profile: skyhook::provider::profile::ModelProfile::new(
-                            "fixture-model",
+                            "fixture-model".parse().unwrap(),
                             None,
-                            128_000,
-                            100,
+                            128_000.try_into().unwrap(),
+                            100.try_into().unwrap(),
                             false,
                         ),
                     };
-                    let context = skyhook::session::ModelContext {
-                        purpose: ModelPurpose::Agent,
-                        profile,
-                        system: vec![],
-                        tools: vec![],
-                        response_schema: None,
-                    };
-                    self.record(agent, SessionEvent::ModelContext { context })
-                        .await
+                    self.record(agent, model_context(profile)).await
                 }
             };
             let text = "original request".into();
             let message = Message::User(vec![UserPart::Text { text }]);
-            let event = SessionEvent::ModelRequested {
-                context,
-                checkpoint: None,
-                history: vec![],
-                tail: vec![message],
-                history_lifetime: Default::default(),
-            };
-            let request = self.record(agent, event).await.request();
+            let request = self.record(agent, requested(context, vec![message]));
+            let request = request.await.request();
             let attempt = skyhook::session::AttemptRef {
                 request,
                 attempt: 1,
@@ -560,6 +554,32 @@ mod tests {
         }
     }
 
+    pub(super) fn created(id: u64, tool: &str, role: JobRole) -> SessionEvent {
+        SessionEvent::JobCreated {
+            job: JobId::new(id).unwrap(),
+            parent: None,
+            origin: None,
+            tool: tool.into(),
+            role,
+            name: None,
+            arguments: serde_json::json!({"command": ["true"]}),
+            output_schema: None,
+            accepts_input: role == JobRole::Agent,
+            background: false,
+            location: skyhook::execution::ExecutionLocation::root("/workspace".into()),
+        }
+    }
+
+    pub(super) fn finished(id: u64) -> SessionEvent {
+        SessionEvent::JobFinished {
+            job: JobId::new(id).unwrap(),
+            state: skyhook::job::JobEnd::Completed,
+            diagnostic: None,
+            output_diagnostic: None,
+            images: Vec::new(),
+        }
+    }
+
     pub(super) fn job_info(agent: &AgentId, id: u64, role: JobRole, state: JobState) -> JobInfo {
         JobInfo {
             id: JobId::new(id).unwrap(),
@@ -567,7 +587,6 @@ mod tests {
             name: None,
             tool: "exec".into(),
             role,
-            activity: projection::JobActivity::Work,
             args: serde_json::json!({"command":["echo"]}),
             parent: None,
             state,

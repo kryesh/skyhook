@@ -1,29 +1,29 @@
 //! Stateful lifecycle for a single Chat choice and stream.
 mod content;
 mod native;
-mod usage;
+mod reasoning;
+mod tools;
 
-use super::wire;
+use super::{NATIVE, ReasoningFormat, wire};
+use crate::media::BlobDigest;
 use crate::provider::{
     ProviderError,
     codec::{
-        common::Finish,
+        common::{Finish, Settle, Settlement, StopReason},
         usage::{Counters, InputAccounting},
     },
     http::{errors::ErrorSignals, transport::SseEvent},
-    protocol::{CutReason, ReplayFormat, ResponseEvent, Scope},
+    protocol::{Completion, ResponseEvent, Scope},
 };
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 
-#[derive(Clone)]
 enum Block {
     Text(String),
     Reasoning(String),
-    /// A native reasoning object retained whole for replay, with the text it
-    /// carries so far.
+    /// A native reasoning object retained whole for replay, its text field
+    /// holding the text so far.
     Native {
-        text: String,
         object: Map<String, Value>,
         shape: NativeShape,
     },
@@ -37,9 +37,12 @@ enum Block {
 /// How a native reasoning object is continued and bound.
 #[derive(Clone, Copy)]
 enum NativeShape {
-    /// A thinking block, open to further fragments until its signature (or
-    /// redacted data) completes it; bound by its own signature.
+    /// A thinking block, open to further fragments until its signature
+    /// completes it; bound by its own signature.
     Thinking { complete: bool, signed: bool },
+    /// Redacted thinking, whole on arrival and without readable text; bound
+    /// by its data.
+    Redacted { signed: bool },
     /// One detail of a sequence, continued by fragments at its index; the
     /// sequence is bound whole when any detail is signed.
     Detail {
@@ -49,13 +52,28 @@ enum NativeShape {
     },
 }
 
+impl NativeShape {
+    fn text_field(self) -> Option<&'static str> {
+        match self {
+            Self::Thinking { .. } => Some("thinking"),
+            Self::Redacted { .. } => None,
+            Self::Detail { kind, .. } => Some(kind.text_field()),
+        }
+    }
+
+    fn text(self, object: &Map<String, Value>) -> &str {
+        self.text_field()
+            .and_then(|field| object.get(field))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+    }
+}
+
 /// One choice, one stream. IDs identify logical blocks rather than wire indexes.
-#[derive(Clone)]
 pub(crate) struct Decoder {
     model: String,
     scope: Scope,
-    /// The native reasoning field the dialect replays, or text.
-    format: ReplayFormat,
+    format: ReasoningFormat,
     blocks: Vec<Block>,
     visible_id: Option<usize>,
     tool_ids: BTreeMap<u64, usize>,
@@ -63,180 +81,141 @@ pub(crate) struct Decoder {
     /// The server's response ID, from which missing call IDs are derived.
     response_id: Option<String>,
     /// Digest of the encoded request, distinguishing otherwise identical turns.
-    request_digest: String,
-    finish: Option<Finish>,
+    request: BlobDigest,
+    settlement: Settlement,
     usage: Counters,
     errors: ErrorSignals,
-    done: bool,
 }
 
 impl Decoder {
     pub(crate) fn new(
         model: String,
         scope: Scope,
-        format: ReplayFormat,
+        format: ReasoningFormat,
         errors: ErrorSignals,
+        request: BlobDigest,
     ) -> Self {
         Self {
             model,
             scope,
             format,
             errors,
+            request,
             blocks: Vec::new(),
             visible_id: None,
             tool_ids: BTreeMap::new(),
             last_tool: None,
             response_id: None,
-            request_digest: String::new(),
-            finish: None,
+            settlement: Settlement::Open,
             usage: Counters::new(InputAccounting::PromptTotal),
-            done: false,
         }
-    }
-
-    /// Bind the decoder to the request it decodes the response of.
-    pub(crate) fn for_request(mut self, body: &serde_json::Value) -> Self {
-        self.request_digest = crate::sha256_hex(body.to_string());
-        self
     }
 
     pub(crate) fn decode(&mut self, event: &SseEvent) -> Result<Vec<ResponseEvent>, ProviderError> {
-        if self.done {
+        if self.settlement == Settlement::Ended {
             return Ok(Vec::new());
         }
         let Some(wire::Chunk { id, choice, usage }) = native::decode(event, self.errors)? else {
-            if self.finish.is_none() {
-                // Without a finish reason, tool calls are not provably complete.
-                let finish = if self.tool_ids.is_empty() {
-                    Finish::Normal
-                } else {
-                    Finish::Cut(CutReason::Incomplete)
-                };
-                self.settle(finish)?;
-            }
-            return self.end().map(|end| vec![end]);
+            return self.close().map(|end| vec![end]);
         };
         if self.response_id.is_none() {
             self.response_id = id;
         }
         let mut events = Vec::new();
-        if let Some(mut choice) = choice {
-            let message = choice.message.take().or_else(|| {
-                choice.text.take().map(|text| wire::Delta {
-                    content: Some(text),
-                    ..Default::default()
-                })
-            });
-            if let Some(message) = message
-                && choice.delta.is_noop(self.format)
-            {
-                choice.delta = if self.blocks.is_empty() {
-                    message
-                } else {
-                    self.unstreamed(message)
-                };
-            }
-            if self.finish.is_some() {
-                // Generation has ended, but the stream may still carry metadata,
-                // usage, or repeated empty choice envelopes. Output after the
-                // end would be silently lost, so it remains an error.
-                if !choice.delta.is_noop(self.format) {
-                    return Err(ProviderError::protocol(
-                        "Chat output received after finish_reason",
-                    ));
-                }
+        if let Some(choice) = choice {
+            let delta = if choice.delta.is_noop(self.format) {
+                let message = choice.message.or_else(|| {
+                    choice.text.map(|text| wire::Delta {
+                        content: Some(text),
+                        ..Default::default()
+                    })
+                });
+                message
+                    .map(|message| {
+                        if self.blocks.is_empty() {
+                            message
+                        } else {
+                            self.unstreamed(message)
+                        }
+                    })
+                    .filter(|delta| !delta.is_noop(self.format))
             } else {
-                self.delta(&choice.delta, &mut events)?;
+                Some(choice.delta)
+            };
+            if let Some(delta) = delta {
+                // After the finish, metadata, usage and empty envelopes may still
+                // arrive, but output would be silently lost.
+                if self.settlement != Settlement::Open {
+                    return Err(NATIVE.error("output received after finish_reason"));
+                }
+                self.delta(&delta, &mut events);
             }
             if let Some(reason) = choice
                 .finish_reason
                 .as_deref()
                 .filter(|reason| !reason.is_empty())
             {
-                let finish = classify_finish(reason);
-                if self.finish.is_none() {
-                    self.settle(finish)?;
-                } else {
-                    self.revise(finish);
-                }
+                self.reason(Finish::of(StopReason::read(reason)))?;
             }
         }
-        if let Some(usage) = usage {
-            self.update_usage(usage, &mut events);
-        }
         // Keepalives do not complete a stream; EOF still requires a finish.
+        if let Some(usage) = usage {
+            events.push(ResponseEvent::Usage(self.usage.observe(usage)));
+        }
         Ok(events)
     }
 
-    /// Settle the finish. A normal finish must leave every tool call usable.
-    fn settle(&mut self, finish: Finish) -> Result<(), ProviderError> {
-        if finish == Finish::Normal {
-            self.items(false)?;
-        }
-        self.finish = Some(finish);
-        Ok(())
-    }
-
-    /// A later abnormal reason retracts tool calls; nothing revives them, and a
-    /// response without calls keeps its settled finish.
-    fn revise(&mut self, finish: Finish) {
-        if finish == Finish::Normal
-            || self.tool_ids.is_empty()
-            || !matches!(self.finish, Some(Finish::Normal))
-        {
-            return;
-        }
-        self.finish = Some(finish);
-    }
-
-    /// The authoritative response, once the finish has settled.
-    fn end(&mut self) -> Result<ResponseEvent, ProviderError> {
-        let finish = self
-            .finish
-            .expect("the response ends only after its finish settled");
-        let completion = finish.complete(self.items(finish != Finish::Normal)?)?;
-        self.done = true;
-        Ok(ResponseEvent::End(completion))
-    }
-
     pub(crate) fn finish(&mut self) -> Result<Vec<ResponseEvent>, ProviderError> {
-        if self.done {
-            return Ok(Vec::new());
-        }
-        if self.finish.is_none() {
-            return Err(ProviderError::protocol(
-                "Chat stream ended before finish_reason",
-            ));
-        }
-        self.end().map(|end| vec![end])
+        self.eof(|| NATIVE.error("stream ended before finish_reason"))
     }
 }
 
-fn classify_finish(reason: &str) -> Finish {
-    match reason.to_ascii_lowercase().as_str() {
-        "stop" | "eos" | "end_turn" | "stop_sequence" | "tool_calls" | "function_call"
-        | "tool_use" => Finish::Normal,
-        "length" | "max_tokens" | "max_output_tokens" | "model_length" => {
-            Finish::Cut(CutReason::MaxTokens)
+impl Settle for Decoder {
+    fn settlement(&mut self) -> &mut Settlement {
+        &mut self.settlement
+    }
+
+    fn has_tools(&self) -> bool {
+        !self.tool_ids.is_empty()
+    }
+
+    /// A normal finish must leave every tool call usable.
+    fn admit(&self, finish: Finish) -> Result<(), ProviderError> {
+        if finish == Finish::Normal {
+            for block in &self.blocks {
+                if let Block::Tool {
+                    name, arguments, ..
+                } = block
+                {
+                    tools::tool_arguments(name, arguments)?;
+                }
+            }
         }
-        "abort" | "aborted" | "cancelled" | "canceled" => Finish::Cut(CutReason::Aborted),
-        "content_filter" | "safety" | "refusal" => Finish::Cut(CutReason::Refusal),
-        _ => Finish::Cut(CutReason::Incomplete),
+        Ok(())
+    }
+
+    fn completion(&mut self, finish: Finish) -> Result<Completion, ProviderError> {
+        finish.complete(self.items(finish != Finish::Normal)?)
     }
 }
 
 #[cfg(test)]
 pub(super) mod tests {
     use super::*;
+    use crate::provider::ProviderErrorKind;
     use crate::provider::codec::common::tests::{Reduced, reduce, scope};
-    use crate::provider::protocol::{AssistantItem, Outcome, ToolCall, Usage};
+    use crate::provider::protocol::{AssistantItem, CutReason, Outcome, ToolCall, Usage};
     use serde_json::{Value, json};
 
-    pub(super) fn event(value: Value) -> SseEvent {
+    pub(super) fn raw(data: &str) -> SseEvent {
         SseEvent {
             event: None,
-            data: value.to_string(),
+            data: data.into(),
         }
+    }
+
+    pub(super) fn event(value: Value) -> SseEvent {
+        raw(&value.to_string())
     }
 
     pub(in crate::provider::codec::chat_completions) fn delta(value: Value) -> SseEvent {
@@ -248,28 +227,30 @@ pub(super) mod tests {
     }
 
     pub(super) fn decoder() -> Decoder {
-        decoder_for(ReplayFormat::ChatText)
+        decoder_for(ReasoningFormat::Text)
     }
 
-    pub(super) fn decoder_for(format: ReplayFormat) -> Decoder {
-        Decoder::new("test-model".into(), scope(), format, ErrorSignals::NONE)
+    pub(super) fn decoder_for(format: ReasoningFormat) -> Decoder {
+        let (model, request) = ("test-model".into(), BlobDigest::of(b""));
+        Decoder::new(model, scope(), format, ErrorSignals::NONE, request)
     }
 
     /// Everything a consumer sees of `frames`, including the EOF finish.
-    pub(in crate::provider::codec::chat_completions) fn reduced(frames: Vec<SseEvent>) -> Reduced {
-        let mut decoder = decoder();
+    pub(in crate::provider::codec::chat_completions) fn reduced_as(
+        format: ReasoningFormat,
+        frames: Vec<SseEvent>,
+    ) -> Reduced {
+        let mut decoder = decoder_for(format);
         let mut events = Vec::new();
-        for frame in frames {
-            events.extend(decoder.decode(&frame).unwrap());
+        for frame in &frames {
+            events.extend(decoder.decode(frame).unwrap());
         }
         events.extend(decoder.finish().unwrap());
         reduce(events)
     }
 
-    pub(in crate::provider::codec::chat_completions) fn decode(
-        frames: Vec<SseEvent>,
-    ) -> (Vec<AssistantItem>, Usage, Outcome) {
-        let reduced = reduced(frames);
+    pub(super) fn decode(frames: Vec<SseEvent>) -> (Vec<AssistantItem>, Usage, Outcome) {
+        let reduced = reduced_as(ReasoningFormat::Text, frames);
         let completion = &reduced.completion;
         (
             completion.items().to_vec(),
@@ -279,10 +260,7 @@ pub(super) mod tests {
     }
 
     pub(super) fn done() -> SseEvent {
-        SseEvent {
-            event: None,
-            data: "[DONE]".into(),
-        }
+        raw("[DONE]")
     }
 
     pub(super) fn phantom_usage_chunk() -> Value {
@@ -368,6 +346,18 @@ pub(super) mod tests {
         Content::Text(text.into())
     }
 
+    pub(super) fn tool_delta(calls: Value) -> SseEvent {
+        delta(json!({ "tool_calls": calls }))
+    }
+
+    pub(super) fn reasoning(text: &str) -> Content {
+        Content::Reasoning(text.into())
+    }
+
+    pub(super) fn tool(id: &str, name: &str, arguments: Value) -> Content {
+        Content::Tool(ToolCall::new(id, name, arguments).unwrap())
+    }
+
     #[test]
     fn post_finish_output_is_rejected() {
         let mut packets = Vec::new();
@@ -399,17 +389,17 @@ pub(super) mod tests {
             (
                 "thinking_blocks",
                 json!([{"type":"thinking","thinking":"","signature":"sig"}]),
-                ReplayFormat::ChatThinkingBlock,
+                ReasoningFormat::ThinkingBlocks,
             ),
             (
                 "reasoning_details",
                 json!([{"type":"reasoning.encrypted","data":"opaque"}]),
-                ReplayFormat::ChatReasoningDetail,
+                ReasoningFormat::Details,
             ),
         ] {
             let mut packet = phantom_usage_chunk();
             packet["choices"][0]["delta"][field] = value;
-            for (format, rejected) in [(ReplayFormat::ChatText, false), (native, true)] {
+            for (format, rejected) in [(ReasoningFormat::Text, false), (native, true)] {
                 let mut decoder = decoder_for(format);
                 decoder.decode(&delta(json!({"content":"answer"}))).unwrap();
                 decoder.decode(&end("stop")).unwrap();
@@ -495,7 +485,7 @@ pub(super) mod tests {
                 decoder.decode(&partial).unwrap();
                 let events = decoder.decode(&event(packet.clone())).unwrap();
                 assert!(!events.iter().any(ended), "{packet}");
-                assert!(decoder.clone().finish().is_err(), "{packet}");
+                assert!(decoder.finish().is_err(), "{packet}");
                 assert!(decoder.decode(&done()).unwrap().iter().any(ended));
                 // Packets after [DONE] are ignored.
                 assert!(decoder.decode(&event(packet.clone())).unwrap().is_empty());
@@ -630,6 +620,19 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn a_context_window_finish_is_the_context_window_error() {
+        let mut decoder = decoder();
+        decoder
+            .decode(&delta(json!({"content":"partial"})))
+            .unwrap();
+        decoder
+            .decode(&end("model_context_window_exceeded"))
+            .unwrap();
+        let error = decoder.finish().unwrap_err();
+        assert_eq!(error.kind(), ProviderErrorKind::ContextWindowExceeded);
+    }
+
+    #[test]
     fn a_later_abnormal_finish_retracts_tools() {
         let tool = || {
             delta(
@@ -638,8 +641,96 @@ pub(super) mod tests {
         };
         let (items, _, outcome) = decode(vec![tool(), end("stop"), end("length"), done()]);
         assert_eq!((outcome, items.len()), (MAX_TOKENS, 0));
+        // A late overflow retracts them without failing the response.
+        let late = end("model_context_window_exceeded");
+        let (items, _, outcome) = decode(vec![tool(), end("stop"), late, done()]);
+        let incomplete = Outcome::Cut(CutReason::Incomplete);
+        assert_eq!((outcome, items.len()), (incomplete, 0));
         // A later normal reason cannot revive discarded tools.
         let (items, _, outcome) = decode(vec![tool(), end("length"), end("stop"), done()]);
         assert_eq!((outcome, items.len()), (MAX_TOKENS, 0));
+    }
+
+    #[test]
+    fn late_cache_refinement_and_null_cache_details_preserve_totals() {
+        let packet = |details: Value, output| {
+            event(json!({"choices":[],"usage":{
+                "prompt_tokens":100,"completion_tokens":output,"prompt_tokens_details":details
+            }}))
+        };
+        let (_, usage, _) = decode(vec![
+            delta(json!({"content":"answer"})),
+            event(json!({"choices":[],"usage":{"prompt_tokens":100,"completion_tokens":1}})),
+            packet(json!({"cached_tokens":null}), 2),
+            packet(json!({"cached_tokens":80, "cache_write_tokens":5}), 3),
+            packet(Value::Null, 4),
+            packet(json!({"cached_tokens":null}), 5),
+            end("stop"),
+        ]);
+        let expected = Usage {
+            output_tokens: 5,
+            cache_write_input_tokens: 5,
+            ..USAGE
+        };
+        assert_eq!(usage, expected);
+    }
+
+    #[test]
+    fn loose_usage_is_merged_monotonically_at_every_stage() {
+        for usage in [
+            // Mismatched totals, string counters, and alternate key names.
+            json!({"prompt_tokens":100,"completion_tokens":10,"total_tokens":1}),
+            json!({"prompt_tokens":"100","completion_tokens":10.0}),
+            json!({"input_tokens":100,"output_tokens":10,"cache_read_input_tokens":80}),
+            // Regressions and missing or unusable counters keep the previous totals.
+            json!({"prompt_tokens":99,"completion_tokens":9,"prompt_tokens_details":{"cached_tokens":79}}),
+            json!({"prompt_tokens":100}),
+            json!({"completion_tokens":-1, "prompt_tokens":100}),
+            json!({"prompt_tokens":"garbage","completion_tokens":10}),
+        ] {
+            for stage in 0..3 {
+                let mut decoder = decoder();
+                let mut packet = phantom_usage_chunk();
+                packet["choices"] = json!([]);
+                decoder.decode(&event(packet.clone())).unwrap();
+                if stage > 0 {
+                    decoder.decode(&delta(json!({"content":"answer"}))).unwrap();
+                    decoder.decode(&end("length")).unwrap();
+                    packet["choices"] = json!([{"index":0,"delta":{}}]);
+                }
+                if stage == 2 {
+                    packet["choices"][0]["finish_reason"] = json!("length");
+                }
+                packet["usage"] = usage.clone();
+                decoder.decode(&event(packet)).unwrap();
+                assert_eq!(decoder.usage.usage(), USAGE, "stage {stage}: {usage}");
+            }
+        }
+        // Cached tokens never exceed the prompt.
+        let mut decoder = decoder();
+        let packet = json!({"usage":{"prompt_tokens":10,"completion_tokens":1,
+            "prompt_tokens_details":{"cached_tokens":50}}});
+        decoder.decode(&event(packet)).unwrap();
+        assert_eq!(decoder.usage.usage().cached_input_tokens, 10);
+        assert_eq!(decoder.usage.usage().input_tokens, 0);
+    }
+
+    #[test]
+    fn repeated_finish_can_refine_usage() {
+        let packet = |completion, cached: Value| {
+            event(json!({
+                "choices":[{"finish_reason":"length"}],
+                "usage":{"prompt_tokens":100,"completion_tokens":completion,
+                    "prompt_tokens_details":{"cached_tokens":cached}}
+            }))
+        };
+        let (_, usage, outcome) = decode(vec![
+            delta(json!({"content":"partial"})),
+            end("length"),
+            packet(9, Value::Null),
+            packet(10, json!(80)),
+            event(json!({"choices":[{"finish_reason":"length","delta":null}]})),
+        ]);
+        assert_eq!((outcome, usage), (MAX_TOKENS, USAGE));
     }
 }

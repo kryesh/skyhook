@@ -8,7 +8,13 @@ pub(crate) mod schema;
 mod wire;
 
 pub(crate) use decoder::Decoder;
-pub(crate) use dialect::{Cache, Dialect, EmptyContent, ReasoningReplay, SystemRole, UsageRequest};
+pub(crate) use dialect::{
+    Cache, Dialect, EmptyContent, ReasoningFormat, ReasoningReplay, SystemRole, UsageRequest,
+};
 pub use dialect::{DataCollection, ProviderPreferences, Routing};
 pub(crate) use encoder::{ASSISTANT_FIELDS, BODY_FIELDS, encode};
-pub(crate) use errors::read as read_error;
+pub(crate) use errors::Code;
+
+use crate::provider::codec::{CodecName, common::Native};
+
+const NATIVE: Native = Native(CodecName::ChatCompletions);

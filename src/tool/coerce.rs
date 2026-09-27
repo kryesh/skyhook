@@ -1,7 +1,10 @@
 //! Schema-guided repair of model tool arguments, such as `{"timeout": "30"}`
 //! for an integer. Only lossless conversions to a type the destination
 //! requires are tried, and a repair is kept only if the result validates.
-use crate::json_schema::{MAX_DEPTH, Node, Resolver, accepts, declared_types, value_type};
+use crate::{
+    json_schema::{MAX_DEPTH, Node, Resolver, accepts, declared_types, value_type},
+    tool::diagnostic::NoExternalArgumentSchemas,
+};
 use jsonschema::{JsonType, JsonTypeSet};
 use serde_json::{Map, Number, Value};
 
@@ -11,7 +14,7 @@ const MAX_EXACT_FLOAT_INTEGER: f64 = 9_007_199_254_740_992.0;
 /// Repair `arguments` in place when that makes them valid against `schema`.
 pub(crate) fn coerce_arguments(schema: &Value, arguments: &mut Value) {
     let Ok(validator) = jsonschema::options()
-        .with_retriever(NoExternalSchemas)
+        .with_retriever(NoExternalArgumentSchemas)
         .build(schema)
     else {
         return;
@@ -23,17 +26,6 @@ pub(crate) fn coerce_arguments(schema: &Value, arguments: &mut Value) {
     Walk::new(schema, integral_only).coerce_root(&mut repaired);
     if validator.is_valid(&repaired) {
         *arguments = repaired;
-    }
-}
-
-struct NoExternalSchemas;
-
-impl jsonschema::Retrieve for NoExternalSchemas {
-    fn retrieve(
-        &self,
-        _uri: &jsonschema::Uri<String>,
-    ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
-        Err("external schema references are not loaded".into())
     }
 }
 

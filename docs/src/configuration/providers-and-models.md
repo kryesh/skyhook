@@ -16,7 +16,7 @@ server follows:
 | Dialect | Codecs | Use for |
 | --- | --- | --- |
 | `compatible` | any | Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only `base_url`. A key is sent as each API specifies: a bearer token, or `x-api-key` on `messages`. |
-| `openai` | `chat_completions`, `responses` | `https://api.openai.com/v1`. Response schemas must fit OpenAI's strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: `reasoning_summary: false` for an unverified organisation (Responses only), `organization`, `project`. |
+| `openai` | `chat_completions`, `responses` | `https://api.openai.com/v1`. Response schemas must fit OpenAI's strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: `reasoning_summary: unsupported` (default `requested`) for an unverified organisation (Responses only), `organization`, `project`. |
 | `anthropic` | `messages` | `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`. |
 | `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login`. `base_url` defaults to `https://chatgpt.com/backend-api/codex` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. |
 | `openrouter` | any | `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: `routing` (Chat only: `order`, `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, `fallback_models`) and `cache_ttl: "5m"` or `"1h"`. A response schema always sets `require_parameters`. |
@@ -80,7 +80,8 @@ You can deliberately choose smaller budgets for cost, latency, or available memo
 it to the conversation.
 `persist` keeps each snapshot in the conversation. Use it for models that bind signed reasoning
 to the exact earlier conversation (such as Claude Fable 5.1), at the cost of keeping every snapshot in context until
-compaction. `none` sends no runtime state. See [runtime state](../reference/runtime-state.md)
+compaction. `none` sends no runtime state, except to a compaction summary, which needs the
+current todo list to reconcile it. See [runtime state](../reference/runtime-state.md)
 for what the model receives.
 
 The [complete example](overview.md#complete-example) uses published hosted-model limits:
@@ -184,6 +185,11 @@ Usage reported before interruption is retained; unreported provider usage remain
 Retries also cannot guarantee that tools hosted by the provider will not repeat side effects.
 
 ## Reasoning history and local-server compatibility
+
+On `chat_completions` and `responses`, a model's `reasoning` is an effort level: `none`, `minimal`,
+`low`, `medium`, `high`, `xhigh` or `max`. On `messages` it is a thinking mode (`off` or `adaptive`)
+or an effort level under adaptive thinking: `low`, `medium`, `high`, `xhigh` or `max`. A value the
+codec does not accept is refused when the configuration loads, with the accepted values listed.
 
 Responses and Codex automatically request reasoning summaries, even when no model `reasoning`
 effort is configured. Anthropic requests summarized thinking when `reasoning` enables thinking;

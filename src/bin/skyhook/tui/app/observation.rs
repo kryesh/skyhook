@@ -11,7 +11,7 @@ pub(super) struct ActiveObservation {
 /// Neither half can be installed separately by the event loop.
 pub struct PreparedObservation {
     pub(super) active: ActiveObservation,
-    pub(super) snapshot: ObservationSnapshot,
+    pub(super) snapshot: Box<ObservationSnapshot>,
 }
 impl PreparedObservation {
     pub async fn subscribe(session: SessionHandle) -> Self {
@@ -21,8 +21,11 @@ impl PreparedObservation {
                 session,
                 receiver: Some(observation.updates),
             },
-            snapshot: observation.snapshot,
+            snapshot: Box::new(observation.snapshot),
         }
+    }
+    pub fn session(&self) -> &SessionHandle {
+        &self.active.session
     }
 }
 
@@ -77,12 +80,8 @@ impl App {
         };
         let prepared = PreparedObservation::subscribe(observation.session.clone()).await;
         *observation = prepared.active;
-        self.snapshot = prepared.snapshot;
+        self.snapshot = *prepared.snapshot;
         self.reset_projection();
-    }
-
-    pub async fn session_ready(&mut self, session: SessionHandle) {
-        self.session_started(PreparedObservation::subscribe(session).await);
     }
 }
 
@@ -123,41 +122,21 @@ mod tests {
 
     #[tokio::test]
     async fn stopping_keeps_an_interrupted_reply_at_its_journal_position() {
-        use skyhook::provider::protocol::{BlockId, BlockRef, ItemId, ItemKind, ResponseEvent};
-        use skyhook::session::{AttemptRef, ModelContext, ModelPurpose, ProfileSnapshot};
+        use skyhook::provider::protocol::{BlockRef, ItemKind, ResponseEvent};
+        use skyhook::session::AttemptRef;
         let (_root, mut app) = fixture().await;
         let agent = app.selected.clone();
-        let profile = ProfileSnapshot {
-            name: app.launch.model.name(),
-            profile: app.launch.model.profile().clone(),
-        };
-        let context = ModelContext {
-            purpose: ModelPurpose::Agent,
-            profile,
-            system: Vec::new(),
-            tools: Vec::new(),
-            response_schema: None,
-        };
-        let context = journal(&mut app, SessionEvent::ModelContext { context }).await;
-        let requested = SessionEvent::ModelRequested {
-            context,
-            checkpoint: None,
-            history: Vec::new(),
-            tail: Vec::new(),
-            history_lifetime: Default::default(),
-        };
-        let request = journal(&mut app, requested).await.request();
+        let context = launch_context(&app);
+        let context = journal(&mut app, context).await;
+        let request = journal(&mut app, requested(context, Vec::new())).await;
+        let request = request.request();
         let attempt = AttemptRef {
             request,
             attempt: 1,
         };
         journal(&mut app, SessionEvent::ModelAttemptStarted(attempt)).await;
-        let block = BlockRef {
-            item: ItemId::try_from("text".to_owned()).unwrap(),
-            block: BlockId::try_from("text:0".to_owned()).unwrap(),
-        };
         let delta = ResponseEvent::Delta {
-            block,
+            block: BlockRef::single("text"),
             kind: ItemKind::Text,
             text: "cut short".into(),
         };
@@ -201,8 +180,7 @@ mod tests {
         assert!(matches!(closed, Err(broadcast::error::RecvError::Closed)));
         app.close_observation();
         assert_eq!(app.session_id(), Some(session.id()));
-        let idle = tokio::time::timeout(Duration::from_millis(1), app.recv_observation()).await;
-        assert!(idle.is_err());
+        assert!(futures_util::poll!(std::pin::pin!(app.recv_observation())).is_pending());
         session
             .record_status(root.clone(), "while closed".into())
             .await
@@ -213,8 +191,7 @@ mod tests {
             .record_status(root, "after subscription".into())
             .await
             .unwrap();
-        let event = tokio::time::timeout(Duration::from_secs(5), app.recv_observation()).await;
-        let event = event.unwrap().unwrap();
+        let event = crate::tests::bounded(app.recv_observation()).await.unwrap();
         assert!(matches!(&event.event, RuntimeEvent::Record(record)
             if matches!(&record.event, SessionEvent::Status { message } if message == "after subscription")));
         // Lag likewise replaces both the snapshot and the receiver.

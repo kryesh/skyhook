@@ -7,17 +7,19 @@ use std::{
 use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 use tokio::sync::Mutex;
 
+use super::{
+    artifact::EmbeddedShimCatalog,
+    backend::{ConnectionFactory, ConnectionRequest, ProcessEnvironment},
+    client::{PooledConnection, Session},
+    error::{ProtocolError, RemoteError},
+    prompt::SensitivePromptHandler,
+};
 use crate::{
     execution::ExecutionLocation,
     job::CancellationToken,
-    remote::{EmbeddedShimCatalog, ProtocolError, SensitivePromptHandler},
-    target::{ResolvedRoute, RouteIdentity, TargetName},
-    tool::{ToolContext, ToolOutput, authorization::AuthorizationCoordinator},
+    target::{ResolvedRoute, Route, RouteIdentity, TargetName},
+    tool::{ToolContext, ToolOutput},
 };
-
-pub(crate) use super::client::PooledConnection;
-pub(super) use super::client::Session;
-pub(crate) use super::error::RemoteError;
 
 #[derive(Clone)]
 pub(crate) struct RemoteManager {
@@ -25,12 +27,11 @@ pub(crate) struct RemoteManager {
 }
 
 struct RemoteInner {
-    factory: Arc<dyn super::backend::ConnectionFactory>,
+    factory: Arc<dyn ConnectionFactory>,
     shutdown: CancellationToken,
     tasks: tokio_util::task::TaskTracker,
     pool: Mutex<HashMap<ConnectionKey, Arc<PooledSlot>>>,
     prompts: Arc<dyn SensitivePromptHandler>,
-    authorization: AuthorizationCoordinator,
 }
 
 struct PooledSlot {
@@ -58,10 +59,7 @@ impl PreparedConnection {
         arguments: serde_json::Value,
         context: &ToolContext,
     ) -> Result<ToolOutput, RemoteError> {
-        let result = self
-            .connection
-            .execute(name, arguments, context, self.destination())
-            .await;
+        let result = self.connection.execute(name, arguments, context).await;
         self.release().await;
         result
     }
@@ -73,19 +71,9 @@ impl PreparedConnection {
         path: String,
         context: &ToolContext,
     ) -> Result<crate::tool::source::Source, RemoteError> {
-        let result = self
-            .connection
-            .read_source(tool, path, context, self.destination())
-            .await;
+        let result = self.connection.read_source(tool, path, context).await;
         self.release().await;
         result
-    }
-
-    fn destination(&self) -> ExecutionLocation {
-        ExecutionLocation::named(
-            self.key.route.destination().clone(),
-            self.key.workspace.clone(),
-        )
     }
 
     /// Worker I/O failures do not imply that the pooled transport failed.
@@ -100,7 +88,6 @@ impl RemoteManager {
     pub(crate) fn new(
         catalog: EmbeddedShimCatalog,
         prompts: Arc<dyn SensitivePromptHandler>,
-        authorization: AuthorizationCoordinator,
     ) -> Self {
         Self {
             inner: Arc::new(RemoteInner {
@@ -109,14 +96,11 @@ impl RemoteManager {
                 tasks: tokio_util::task::TaskTracker::new(),
                 pool: Mutex::new(HashMap::new()),
                 prompts,
-                authorization,
             }),
         }
     }
 
-    pub(crate) async fn environment(
-        &self,
-    ) -> Result<super::backend::ProcessEnvironment, RemoteError> {
+    pub(crate) async fn environment(&self) -> Result<ProcessEnvironment, RemoteError> {
         if self.inner.shutdown.is_cancelled() {
             return Err(RemoteError::Cancelled);
         }
@@ -136,10 +120,7 @@ impl RemoteManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn with_connection_factory(
-        mut self,
-        factory: Arc<dyn super::backend::ConnectionFactory>,
-    ) -> Self {
+    pub(crate) fn with_connection_factory(mut self, factory: Arc<dyn ConnectionFactory>) -> Self {
         Arc::get_mut(&mut self.inner)
             .expect("connection factories are installed before sharing a manager")
             .factory = factory;
@@ -172,9 +153,9 @@ impl RemoteManager {
                         tokio::select! { result = connect => result, () = manager.inner.shutdown.cancelled() => Err(RemoteError::Cancelled) }
                     });
                     let connection = async move {
-                        startup
-                            .await
-                            .map_err(|error| RemoteError::ConnectionTask(error.to_string()))?
+                        startup.await.map_err(|error| {
+                            RemoteError::task_failed("remote connection startup", error)
+                        })?
                     }
                     .boxed()
                     .shared();
@@ -238,30 +219,36 @@ impl RemoteManager {
         resolved_route: &ResolvedRoute,
         workspace: &Path,
     ) -> Result<Session, RemoteError> {
-        let target = &resolved_route.destination().name;
-        let route = resolved_route.definitions();
+        let Route { hops, destination } = resolved_route.route();
+        let location = ExecutionLocation::named(destination.name.clone(), workspace.to_owned());
         // The destination's origin starts this connection's SSH process on its shim;
         // the hops after it are native jumps of that process.
-        let (origin, hops) = match &resolved_route.destination().origin {
-            None => (None, route),
+        let (origin, hops) = match &destination.origin {
+            None => (None, hops.as_slice()),
             Some(origin) => {
-                let index = route.iter().position(|hop| &hop.name == origin).ok_or(
+                let index = hops.iter().position(|hop| &hop.name == origin).ok_or(
                     RemoteError::Protocol(ProtocolError::Violation("origin missing from route")),
                 )?;
-                let prefix = ResolvedRoute::from_definitions(route[..=index].to_vec())
-                    .expect("inclusive route prefix is nonempty");
+                let prefix = ResolvedRoute::new(Route {
+                    hops: hops[..index].to_vec(),
+                    destination: hops[index].clone(),
+                });
                 let cancellation = CancellationToken::new();
                 let prepared = self
-                    .connection(prefix, &route[index].workspace, &cancellation)
+                    .connection(prefix, &hops[index].workspace, &cancellation)
                     .await?;
-                (Some(prepared.connection), &route[index + 1..])
+                (Some(prepared.connection), &hops[index + 1..])
             }
+        };
+        let route = Route {
+            hops: hops.to_vec(),
+            destination: destination.clone(),
         };
         let mut transport = self
             .inner
             .factory
-            .connect(super::backend::ConnectionRequest {
-                route: hops.to_vec(),
+            .connect(ConnectionRequest {
+                route,
                 workspace: workspace.to_path_buf(),
                 origin: origin.clone(),
             })
@@ -272,8 +259,7 @@ impl RemoteManager {
         Ok(Arc::new(
             PooledConnection::from_transport(
                 transport,
-                target,
-                self.inner.authorization.clone(),
+                location,
                 self.inner.prompts.clone(),
                 &self.inner.tasks,
                 self.inner.shutdown.child_token(),
@@ -288,15 +274,13 @@ pub(crate) mod tests {
     use super::*;
     use crate::remote::{
         RejectSensitivePrompts,
-        backend::{ConnectionFactory, ConnectionRequest, Transport},
+        backend::Transport,
         client::test_transport,
         protocol::{Request, Response, read_frame, write_frame},
     };
-    use crate::{target::TargetDefinition, tool::policy::AllowAll};
+    use crate::{target::TargetDefinition, tests::bounded};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::sync::Semaphore;
-
-    const FIVE_SECONDS: std::time::Duration = std::time::Duration::from_secs(5);
 
     #[derive(Debug, PartialEq, Eq)]
     struct RecordedRequest {
@@ -335,7 +319,7 @@ pub(crate) mod tests {
                 self.origins.lock().unwrap().push(Arc::downgrade(origin));
             }
             self.requests.lock().unwrap().push(RecordedRequest {
-                target: request.route.last().unwrap().name.to_string(),
+                target: request.route.destination.name.to_string(),
                 route: request
                     .route
                     .iter()
@@ -357,14 +341,9 @@ pub(crate) mod tests {
         }
     }
 
-    fn allow_all() -> AuthorizationCoordinator {
-        AuthorizationCoordinator::new(Arc::new(AllowAll))
-    }
-
     fn manager(factory: Arc<dyn ConnectionFactory>) -> RemoteManager {
         let prompts = Arc::new(RejectSensitivePrompts);
-        RemoteManager::new(EmbeddedShimCatalog::default(), prompts, allow_all())
-            .with_connection_factory(factory)
+        RemoteManager::new(EmbeddedShimCatalog::default(), prompts).with_connection_factory(factory)
     }
 
     /// Counts transports it starts and holds each shim handshake until `ready` has a permit.
@@ -386,11 +365,7 @@ pub(crate) mod tests {
         }
 
         pub async fn wait_for_hello(&self) {
-            let permit = tokio::time::timeout(FIVE_SECONDS, self.hello.acquire()).await;
-            permit
-                .expect("common handshake did not start")
-                .unwrap()
-                .forget();
+            bounded(self.hello.acquire()).await.unwrap().forget();
         }
 
         /// (transports started, transport owners dropped)
@@ -427,8 +402,9 @@ pub(crate) mod tests {
         }
     }
 
-    fn route(definitions: Vec<TargetDefinition>) -> ResolvedRoute {
-        ResolvedRoute::from_definitions(definitions).expect("test route is nonempty")
+    fn route(mut hops: Vec<TargetDefinition>) -> ResolvedRoute {
+        let destination = hops.pop().unwrap();
+        ResolvedRoute::new(Route { hops, destination })
     }
 
     fn build_route() -> ResolvedRoute {
@@ -457,7 +433,7 @@ pub(crate) mod tests {
             }
         }
 
-        tokio::time::timeout(FIVE_SECONDS, async {
+        bounded(async {
             for successful in [true, false] {
                 let runtime = crate::tests::TestRuntime::new().await;
                 runtime
@@ -555,7 +531,7 @@ pub(crate) mod tests {
                     write_frame(
                         &mut shim,
                         &Response::Payload {
-                            request_id: RequestId::FIRST,
+                            request_id: RequestId::new(1),
                             event: PayloadEvent::Capture(event),
                         },
                     )
@@ -565,7 +541,7 @@ pub(crate) mod tests {
                 if successful {
                     write_result(
                         &mut shim,
-                        RequestId::new(2).unwrap(),
+                        RequestId::new(2),
                         Ok(crate::remote::protocol::RemoteToolOutput {
                             diagnostic: None,
                             value: serde_json::json!("second"),
@@ -577,9 +553,6 @@ pub(crate) mod tests {
                     .await;
                 }
                 drop(shim);
-                while !prepared.connection.is_failed().await {
-                    tokio::task::yield_now().await;
-                }
                 assert!(
                     dropped.await.is_err(),
                     "transport owner must stop before persistence drains"
@@ -621,8 +594,7 @@ pub(crate) mod tests {
                 );
             }
         })
-        .await
-        .unwrap();
+        .await;
     }
 
     #[tokio::test]
@@ -684,14 +656,8 @@ pub(crate) mod tests {
         tokio::pin!(second);
         assert!(futures_util::poll!(&mut second).is_pending());
         factory.ready.add_permits(1);
-        tokio::time::timeout(FIVE_SECONDS, joined)
-            .await
-            .expect("pending waiter did not finish the common handshake")
-            .unwrap();
-        let prepared = tokio::time::timeout(FIVE_SECONDS, second)
-            .await
-            .expect("surviving waiter did not finish the common handshake")
-            .unwrap();
+        bounded(joined).await.unwrap();
+        let prepared = bounded(second).await.unwrap();
         assert_eq!(factory.counts(), (1, 0));
         drop(prepared);
         manager.shutdown().await;
@@ -712,10 +678,7 @@ pub(crate) mod tests {
         assert_eq!(factory.counts(), (1, 0));
 
         manager.shutdown().await;
-        let (first, second) =
-            tokio::time::timeout(FIVE_SECONDS, async { tokio::join!(first, second) })
-                .await
-                .expect("shutdown did not cancel the common handshake");
+        let (first, second) = bounded(async { tokio::join!(first, second) }).await;
         assert!(matches!(first, Err(RemoteError::Cancelled)));
         assert!(matches!(second, Err(RemoteError::Cancelled)));
         assert_eq!(factory.counts(), (1, 1));

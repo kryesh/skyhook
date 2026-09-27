@@ -23,19 +23,8 @@ pub(crate) fn save_completed(
 ) -> Result<(), ToolError> {
     // An unreadable inventory leaves every receipt unbound (and so incomplete).
     let saved = Saved::load(output).ok();
-    let registered = saved
-        .as_ref()
-        .map(|saved| {
-            saved
-                .captures
-                .values()
-                .map(|capture| {
-                    let kind = capture.kind;
-                    (capture.pointer.clone(), (capture.id, kind))
-                })
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default();
+    let empty = BTreeMap::new();
+    let registered = saved.as_ref().map_or(&empty, |saved| &saved.captures);
     let fields = completed
         .iter()
         .map(CompletedCapture::field)
@@ -45,9 +34,10 @@ pub(crate) fn save_completed(
         .enumerate()
         .filter_map(|(index, capture)| {
             let field = capture.field();
-            let &(id, kind) = registered.get(field)?;
+            let registration = registered.get(field)?;
+            let id = registration.id;
             (capture.belongs_to(output.job, id)
-                && kind == capture.kind()
+                && registration.kind == capture.kind()
                 // Every receipt for a duplicate or overlapping field is unbound:
                 // neither can be referenced without shadowing the other.
                 && fields.iter().enumerate().all(|(other, candidate)| {
@@ -83,7 +73,7 @@ pub(crate) fn save_completed(
         output.db.resolve_capture_kind(id, kind).map_err(database)?;
     }
     let result = has_result.then(|| document["result"].take());
-    save_document(output, result, captures_complete, &references)
+    save_document(output, registered, result, captures_complete, &references)
 }
 
 /// Interpret one bound receipt against the terminal document. `Ok(None)` is a
@@ -106,7 +96,7 @@ fn admitted_value(
             // when the sender completed its bytes. Do not parse or replace it.
             (_, Some(Value::Null | Value::Bool(_) | Value::Number(_))) => return Ok(None),
             (CaptureKind::Text, _) | (CaptureKind::Unknown, Some(Value::String(_))) => {
-                validate_utf8(source()?, &mut [0; 64 * 1024])?;
+                validate_utf8(source()?, &mut [0; IO_BUFFER_BYTES])?;
                 (CaptureKind::Text, Value::String(String::new()))
             }
             (CaptureKind::Json, _)
@@ -194,10 +184,7 @@ fn install(document: &mut Value, field: &FieldPointer, value: Value) -> io::Resu
         *document = value;
         return Ok(());
     }
-    let keys = field.as_str()[1..]
-        .split('/')
-        .map(|key| key.replace("~1", "/").replace("~0", "~"))
-        .collect::<Vec<_>>();
+    let keys = field.segments().collect::<Vec<_>>();
     let (last, ancestors) = keys.split_last().expect("split yields a component");
     let mut probe = Some(&*document);
     for key in &keys {
@@ -503,22 +490,28 @@ mod tests {
         );
     }
 
-    /// A capture-backed field is presented as a page at most, so it is budgeted
-    /// as at most a page whatever its stored size.
+    /// Notification sizing budgets what automatic presentation emits, escapes
+    /// included: a truncatable capture as its retained prefix, others in full.
     #[tokio::test]
-    async fn presentation_size_budgets_a_large_capture_as_one_page() {
-        let (_root, _manager, output, _other) = outputs().await;
-        let capture = completed(
-            &output,
-            "/result/text",
-            CaptureKind::Text,
-            &vec![b's'; 6 * PAGE_BYTES],
-        );
-        save_completed(&output, Some(json!({})), true, vec![capture]).unwrap();
-        let estimate = presentation_size(&output);
-        assert!(
-            estimate <= 2 * PAGE_BYTES,
-            "capture-backed output estimated at {estimate} bytes"
-        );
+    async fn presentation_size_budgets_what_automatic_presentation_emits() {
+        let (_root, manager, agent) = runtime().await;
+        let text = "\u{1}".repeat(3 * CONTENT_BYTES);
+        let truncatable = json!({"properties":{"text":{"x-skyhook-truncatable":true}}});
+        for schema in [truncatable, Value::Bool(true)] {
+            let mut spec = JobSpec::test(agent.clone(), "sized");
+            spec.output_schema = Some(schema.clone());
+            let id = manager.test_running(spec).await.into_test_id();
+            manager.test_finish(id, json!({"text":text})).await;
+            let args = OutputArgs::new(id);
+            let view = (manager.inspect_output(args, Default::default(), &Default::default()))
+                .await
+                .unwrap();
+            let emitted = serde_json::to_vec(&view["result"]).unwrap().len();
+            let estimate = presentation_size(&manager.output(id), &schema);
+            assert!(
+                (emitted..emitted + 16).contains(&estimate),
+                "{estimate} bytes estimated for {emitted} emitted"
+            );
+        }
     }
 }

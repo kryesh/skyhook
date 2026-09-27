@@ -6,22 +6,24 @@ use schemars::JsonSchema;
 use serde::Serialize;
 use tokio::sync::Semaphore;
 
-use super::fetch::HttpRequestUrl;
+use super::validation::HttpRequestUrl;
 
 // Keep permits inside the blocking task: cancelling a caller must not let it
 // queue unlimited parsers while previously-started work is still running.
 static EXTRACTORS: Semaphore = Semaphore::const_new(2);
-const MAX_RAW_HTML_BYTES: usize = 10 * 1024 * 1024;
-const MAX_DECODED_HTML_BYTES: usize = 10 * 1024 * 1024;
-const MAX_HTML_ELEMENTS: usize = 50_000;
+pub(super) const MAX_RAW_HTML_BYTES: usize = 10 * 1024 * 1024;
+pub(super) const MAX_DECODED_HTML_BYTES: usize = 10 * 1024 * 1024;
+pub(super) const MAX_HTML_ELEMENTS: usize = 50_000;
 
+#[serde_with::skip_serializing_none]
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub(super) struct ExtractionMetadata {
-    pub engine: String,
     pub title: String,
+    #[schemars(with = "String")]
     pub byline: Option<String>,
-    pub excerpt: Option<String>,
+    #[schemars(with = "String")]
     pub site_name: Option<String>,
+    #[schemars(with = "String")]
     pub language: Option<String>,
 }
 
@@ -238,10 +240,8 @@ fn parse(input: ExtractableHtml) -> Result<ExtractedText, ExtractionFailure> {
     Ok(ExtractedText {
         text,
         metadata: ExtractionMetadata {
-            engine: "dom_smoothie".into(),
             title: article.title,
             byline: article.byline,
-            excerpt: article.excerpt,
             site_name: article.site_name,
             language: article.lang,
         },
@@ -373,25 +373,6 @@ mod tests {
         assert_eq!(extracted_content("  article  ").unwrap(), "article");
     }
 
-    #[test]
-    fn extraction_metadata_keeps_unknown_fields_as_null() {
-        let metadata = ExtractionMetadata {
-            engine: "dom_smoothie".into(),
-            title: String::new(),
-            byline: None,
-            excerpt: None,
-            site_name: None,
-            language: None,
-        };
-        assert_eq!(
-            serde_json::to_value(metadata).unwrap(),
-            serde_json::json!({
-                "engine":"dom_smoothie", "title":"", "byline":null,
-                "excerpt":null, "site_name":null, "language":null
-            })
-        );
-    }
-
     #[tokio::test]
     async fn extracts_readable_articles_tolerating_malformed_html_and_rejecting_oversized_dom() {
         let paragraph = "This is the important article body, with meaningful details about the topic. Readers should receive the actual article rather than navigation links, advertisements, styles, or executable code. ";
@@ -407,7 +388,6 @@ mod tests {
             assert!(!result.text.contains(absent));
         }
         assert_eq!(result.metadata.title, "A useful article");
-        assert_eq!(result.metadata.engine, "dom_smoothie");
         let malformed = format!(
             "<html><title>Broken</title><article><p>{}",
             "Readable content, even in an unclosed HTML article. ".repeat(30)

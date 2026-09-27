@@ -4,11 +4,12 @@
 //! which convention applies.
 
 use reqwest::header::{HeaderMap, HeaderValue};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::provider::{
     ProviderError,
+    ProviderErrorKind::InvalidRequest,
     http::{
         Headers,
         errors::{self, ErrorSignals},
@@ -16,6 +17,7 @@ use crate::provider::{
     },
     protocol::{ContextId, ModelRequest, ResponseEvent, Scope},
 };
+use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_valid_tool_name};
 
 pub mod chat_completions;
 pub(crate) mod common;
@@ -27,9 +29,10 @@ pub(crate) mod usage;
 
 pub use placement::{BodyPath, CacheKey, CacheTtl};
 pub(crate) use placement::{Identity, header, overlaps, path};
+pub use responses::ReasoningSummary;
 
 crate::named_enum::named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum CodecName {
         ChatCompletions = "chat_completions",
         Responses = "responses",
@@ -75,7 +78,7 @@ impl Encoded {
             CacheKey::Body(path) => path.set(root, Value::String(context.as_str().to_owned()))?,
             CacheKey::Header(name) => {
                 let value = HeaderValue::from_str(context.as_str())
-                    .map_err(|_| common::invalid("invalid context identity header"))?;
+                    .map_err(|_| InvalidRequest.error("invalid context identity header"))?;
                 headers.insert(name.clone(), value);
             }
         }
@@ -137,6 +140,14 @@ impl Codec {
         }
     }
 
+    pub(crate) fn effort_mut(&mut self) -> &mut Effort {
+        match self {
+            Self::ChatCompletions(dialect) => &mut dialect.effort,
+            Self::Responses(dialect) => &mut dialect.effort,
+            Self::Messages(dialect) => &mut dialect.effort,
+        }
+    }
+
     pub(crate) fn identity_mut(&mut self) -> &mut Identity {
         match self {
             Self::ChatCompletions(dialect) => &mut dialect.identity,
@@ -148,9 +159,9 @@ impl Codec {
     /// A rejected request's error, read with this family's vocabulary.
     pub(crate) fn error(&self, rejection: &Rejection, signals: ErrorSignals) -> ProviderError {
         let reading = match self {
-            Self::ChatCompletions(_) => chat_completions::read_error(&rejection.body),
-            Self::Responses(_) => responses::read_error(&rejection.body),
-            Self::Messages(_) => messages::read_error(&rejection.body),
+            Self::ChatCompletions(_) => openai::read::<chat_completions::Code>(&rejection.body),
+            Self::Responses(_) => openai::read::<responses::Code>(&rejection.body),
+            Self::Messages(_) => openai::read::<messages::Code>(&rejection.body),
         };
         errors::classify(
             Some(rejection.status),
@@ -161,21 +172,21 @@ impl Codec {
         )
     }
 
-    /// The decoder for a response to `body`, issuing replay under `scope` and
-    /// reading errors with the vendor's evidence.
+    /// The decoder for a response to the serialized `body`, issuing replay
+    /// under `scope` and reading errors with the vendor's evidence.
     pub(crate) fn decoder(
         &self,
         model: String,
         scope: Scope,
-        body: &Value,
+        body: &[u8],
         errors: ErrorSignals,
     ) -> Decoder {
         match self {
             Self::ChatCompletions(dialect) => {
                 let format = dialect.reasoning_replay.format();
-                Decoder::ChatCompletions(
-                    chat_completions::Decoder::new(model, scope, format, errors).for_request(body),
-                )
+                let request = crate::media::BlobDigest::of(body);
+                let decoder = chat_completions::Decoder::new(model, scope, format, errors, request);
+                Decoder::ChatCompletions(decoder)
             }
             Self::Responses(dialect) => {
                 Decoder::Responses(responses::Decoder::new(model, scope, dialect, errors))
@@ -239,44 +250,43 @@ impl Effort {
         effort: &str,
     ) -> Result<(), ProviderError> {
         if !self.levels.accepts(effort) {
-            return Err(common::invalid(format!(
-                "Unsupported reasoning effort: {effort}"
-            )));
+            return Err(InvalidRequest.error(format!("Unsupported reasoning effort: {effort}")));
         }
         self.path.set(root, Value::from(effort))
     }
 }
 
-/// Which tool names an endpoint accepts.
+const ANTHROPIC_MAX_TOOL_NAME_BYTES: usize = 128;
+
+/// Which tool names an endpoint accepts: any nonblank name, or a bounded
+/// run of ASCII letters, digits, underscores or hyphens.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolNames {
-    /// Any nonblank name.
     Any,
-    /// 1–64 ASCII letters, digits, underscores or hyphens.
     OpenAi,
-    /// 1–128 ASCII letters, digits, underscores or hyphens.
     Anthropic,
 }
 
 impl ToolNames {
-    pub(crate) fn accepts(self, name: &str) -> bool {
-        let limit = match self {
-            Self::Any => return !name.trim().is_empty(),
-            Self::OpenAi => 64,
-            Self::Anthropic => 128,
-        };
-        !name.is_empty()
-            && name.len() <= limit
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    fn limit(self) -> Option<usize> {
+        match self {
+            Self::Any => None,
+            Self::OpenAi => Some(MAX_TOOL_NAME_BYTES),
+            Self::Anthropic => Some(ANTHROPIC_MAX_TOOL_NAME_BYTES),
+        }
     }
 
-    pub(crate) fn rule(self) -> &'static str {
-        match self {
-            Self::Any => "a nonblank name",
-            Self::OpenAi => "1–64 ASCII letters, digits, underscores or hyphens",
-            Self::Anthropic => "1–128 ASCII letters, digits, underscores or hyphens",
+    pub(crate) fn accepts(self, name: &str) -> bool {
+        match self.limit() {
+            None => !name.trim().is_empty(),
+            Some(limit) => is_valid_tool_name(name, limit),
+        }
+    }
+
+    pub(crate) fn rule(self) -> String {
+        match self.limit() {
+            None => "a nonblank name".into(),
+            Some(limit) => format!("1–{limit} ASCII letters, digits, underscores or hyphens"),
         }
     }
 }
@@ -404,14 +414,12 @@ mod tests {
     }
 
     #[test]
-    fn tool_name_rules_and_effort_levels() {
+    fn tool_name_rules() {
         assert!(ToolNames::Any.accepts("vendor.tool/雪"));
         assert!(!ToolNames::Any.accepts(" "));
-        assert!(ToolNames::OpenAi.accepts(&"a".repeat(64)));
-        assert!(!ToolNames::OpenAi.accepts(&"a".repeat(65)));
-        assert!(ToolNames::Anthropic.accepts(&"a".repeat(128)));
+        assert!(ToolNames::OpenAi.accepts(&"a".repeat(MAX_TOOL_NAME_BYTES)));
+        assert!(!ToolNames::OpenAi.accepts(&"a".repeat(MAX_TOOL_NAME_BYTES + 1)));
+        assert!(ToolNames::Anthropic.accepts(&"a".repeat(ANTHROPIC_MAX_TOOL_NAME_BYTES)));
         assert!(!ToolNames::Anthropic.accepts("vendor.tool"));
-        assert!(OPENAI_EFFORT.accepts("xhigh"));
-        assert!(!OPENAI_EFFORT.accepts("adaptive"));
     }
 }

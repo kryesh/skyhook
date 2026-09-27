@@ -1,7 +1,6 @@
 //! Child-agent launch, tool dispatch, and model context selection.
 
 use super::*;
-use crate::tool::registry::JobName;
 
 // One owner binds the resolved provider context, admitted capabilities, loop
 // controls and initial journal publication to the same launch identity. There
@@ -10,109 +9,105 @@ struct PreparedAgentLaunch {
     runtime: Arc<SessionRuntime>,
     agent_loop: AgentLoop,
     sender: AgentSender,
-    todos: Option<Vec<TodoItem>>,
     available_depth: usize,
+    start: Start,
+}
+
+/// Whether a prepared agent is journaled as it starts, with its initial todos.
+enum Start {
+    New(Option<Vec<TodoItem>>),
     /// Journaled before: resume under that contract without starting it again.
-    resumed: bool,
-    /// The session's first agent, which commits the session start with it.
-    first: bool,
+    Resume(Resumed),
 }
 
 impl PreparedAgentLaunch {
     async fn prepare(
         runtime: Arc<SessionRuntime>,
+        id: AgentId,
+        owner_job: Option<JobId>,
         launch: AgentLaunch,
     ) -> Result<Self, HarnessError> {
-        let AgentLaunch {
-            id,
-            owner_job,
-            model,
-            todos,
-            mut available_depth,
-            mut location,
-            mode,
-            capabilities,
-        } = launch;
-        // An agent that started before resumes under its journaled contract. Live
-        // configuration may narrow its capabilities but never widen them.
-        let records = runtime.store.records().await;
-        let first = records.is_empty();
-        let recorded = recorded_contract(&records, &id, &runtime.capabilities);
-        drop(records);
-        let resumed = recorded.is_some();
         if id.depth() > runtime.harness.max_child_depth {
             return Err(HarnessError::ChildDepth);
         }
         let remaining_depth = runtime.harness.max_child_depth.saturating_sub(id.depth());
-        if let Some(recorded) = &recorded {
-            // A lowered live limit narrows a resumed agent rather than refusing it.
-            available_depth = recorded.available_depth.min(remaining_depth);
-            location.clone_from(&recorded.location);
-        }
-        let model = match (&recorded, model) {
-            (Some(recorded), _) => recorded.profile.name.clone(),
-            (None, Some(model)) => model,
-            (None, None) => return Err(HarnessError::NoRecordedModel(id)),
-        };
-        if available_depth > remaining_depth {
-            return Err(HarnessError::ChildDepth);
-        }
-        // A journaled contract is narrowed by the session, not by the launch's mode.
-        let mode = recorded
-            .as_ref()
-            .map_or(mode, |recorded| recorded.mode.clone());
-        let bound = if resumed {
-            &runtime.capabilities
-        } else {
-            &capabilities
-        };
-        let allowed = bound.for_agent(available_depth);
-        let capabilities = match &recorded {
-            Some(recorded) => recorded
-                .capabilities
-                .iter()
-                .filter(|capability| allowed.contains(*capability))
-                .collect(),
-            None => allowed,
-        };
-        // A journaled profile is applied as recorded; the live catalog supplies only
-        // the provider that serves it.
-        let (profile, system, tools) = match recorded {
-            Some(RecordedContract {
-                profile,
-                system: Some(system),
-                tools,
-                ..
-            }) => (profile, system, tools),
-            recorded => {
-                let profile = match recorded {
-                    Some(recorded) => recorded.profile,
-                    None => crate::session::ProfileSnapshot {
+        let (contract, meter, start, turn) = match launch {
+            AgentLaunch::New {
+                model,
+                todos,
+                available_depth,
+                location,
+                mode,
+                capabilities,
+            } => {
+                if available_depth > remaining_depth {
+                    return Err(HarnessError::ChildDepth);
+                }
+                let contract = RecordedContract {
+                    profile: crate::session::ProfileSnapshot {
                         profile: runtime.model_entry(&model)?.profile,
                         name: model,
                     },
+                    available_depth,
+                    mode,
+                    capabilities: capabilities.for_agent(available_depth),
+                    location,
+                    system: None,
+                    tools: None,
                 };
-                let system = runtime
+                let meter = super::compact::TokenMeter::default();
+                (contract, meter, Start::New(todos), TurnState::Idle)
+            }
+            AgentLaunch::Resume(resumed) => {
+                let (contract, meter) = (runtime.store)
+                    .visit_records_after(RecordSeq::default(), |records| {
+                        let meter = super::compact::TokenMeter::restore(records, &id);
+                        (runtime.resumed_contract(records, &id), meter)
+                    })
+                    .await;
+                let contract = contract.ok_or_else(|| HarnessError::NoRecordedModel(id.clone()))?;
+                let turn = match resumed {
+                    Resumed::Idle => TurnState::Idle,
+                    Resumed::Parked(_) => TurnState::Parked,
+                };
+                (contract, meter, Start::Resume(resumed), turn)
+            }
+        };
+        let RecordedContract {
+            profile,
+            available_depth,
+            mode,
+            capabilities,
+            location,
+            system,
+            tools,
+        } = contract;
+        // A journaled profile is applied as recorded; the live catalog supplies only
+        // the provider that serves it.
+        let system = match system {
+            Some(system) => system,
+            None => {
+                runtime
                     .system_prompt(
                         &id,
                         &location,
                         available_depth,
-                        mode.as_deref(),
+                        mode.as_ref(),
                         &capabilities,
                     )
-                    .await?;
-                (profile, system, None)
+                    .await?
             }
         };
-        let context = runtime
-            .open_agent_context(&id, profile, system, &capabilities, tools, true)
+        let mut context = runtime
+            .open_agent_context(&id, profile, system, &capabilities, tools)
             .await?;
+        context.meter = meter;
         let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
         let sender = AgentSender::new(tx);
         Ok(Self {
             runtime,
             agent_loop: AgentLoop {
-                control: AgentControl::new(),
+                control: AgentControl::new(turn),
                 id,
                 owner_job,
                 context,
@@ -121,10 +116,8 @@ impl PreparedAgentLaunch {
                 rx,
             },
             sender,
-            todos,
             available_depth,
-            resumed,
-            first,
+            start,
         })
     }
 
@@ -133,39 +126,40 @@ impl PreparedAgentLaunch {
             runtime,
             agent_loop,
             sender,
-            todos,
             available_depth,
-            resumed,
-            first,
+            start,
         } = self;
-        if !resumed {
-            let started = SessionEvent::AgentStarted {
-                owner_job: agent_loop.owner_job,
-                profile: Some(agent_loop.context.profile.clone()),
-                available_depth: u32::try_from(available_depth).unwrap_or(u32::MAX),
-                mode: (agent_loop.settings.mode.as_deref())
-                    .map(|mode| runtime.mode_selection(mode)),
-                capabilities: agent_loop.settings.capabilities.iter().collect(),
-                location: agent_loop.location.clone(),
-            };
-            // Every entry references an agent, so the session starts with its root.
-            let session = first.then(|| SessionEvent::SessionStarted {
-                targets: runtime.harness.target_definitions.clone(),
-                capabilities: runtime.capabilities.iter().collect(),
-            });
-            let events = session.into_iter().chain([started]);
-            let id = &agent_loop.id;
-            runtime
-                .store
-                .append_all(events.map(|event| (id.clone(), event)).collect())
-                .await?;
-        }
-        if let Some(job) = agent_loop.owner_job {
-            runtime
-                .jobs
-                .set_agent_location(job, agent_loop.location.clone())
-                .await?;
-        }
+        let activity = match &start {
+            Start::Resume(Resumed::Parked(failure)) => AgentActivity::Stopped(failure.clone()),
+            Start::New(_) | Start::Resume(Resumed::Idle) => AgentActivity::Idle,
+        };
+        let todos = match start {
+            Start::Resume(_) => None,
+            Start::New(todos) => {
+                let started = SessionEvent::AgentStarted {
+                    owner_job: agent_loop.owner_job,
+                    profile: Some(agent_loop.context.profile.clone()),
+                    available_depth: u32::try_from(available_depth).unwrap_or(u32::MAX),
+                    mode: (agent_loop.settings.mode.as_ref())
+                        .map(|mode| runtime.mode_selection(mode)),
+                    capabilities: agent_loop.settings.capabilities.iter().collect(),
+                    location: agent_loop.location.clone(),
+                };
+                // Every entry references an agent, so a new session starts with its
+                // root, the only agent that starts rather than resumes without an owner.
+                let id = &agent_loop.id;
+                let session = id.parent().is_none().then(|| SessionEvent::SessionStarted {
+                    targets: runtime.harness.target_definitions.clone(),
+                    capabilities: runtime.capabilities.iter().collect(),
+                });
+                let events = session.into_iter().chain([started]);
+                runtime
+                    .store
+                    .append_all(events.map(|event| (id.clone(), event)).collect())
+                    .await?;
+                todos
+            }
+        };
         runtime
             .todos
             .register(agent_loop.id.clone(), agent_loop.owner_job, todos)
@@ -189,7 +183,7 @@ impl PreparedAgentLaunch {
                 },
             );
         }
-        runtime.activity(&agent_loop.id, AgentActivity::Idle);
+        runtime.activity(&agent_loop.id, activity);
         tokio::spawn(async move { runtime.run_agent(agent_loop).await });
         Ok(sender)
     }
@@ -198,9 +192,11 @@ impl PreparedAgentLaunch {
 impl SessionRuntime {
     pub(super) async fn spawn_agent(
         self: &Arc<Self>,
+        id: AgentId,
+        owner_job: Option<JobId>,
         launch: AgentLaunch,
     ) -> Result<AgentSender, HarnessError> {
-        PreparedAgentLaunch::prepare(self.clone(), launch)
+        PreparedAgentLaunch::prepare(self.clone(), id, owner_job, launch)
             .await?
             .install()
             .await
@@ -240,13 +236,9 @@ impl SessionRuntime {
             Ok(created) => CreatedCall::Created {
                 executor,
                 call,
-                parent,
                 created: Box::new(created),
             },
-            Err(error) => {
-                let requested = JobName::requested(call.arguments());
-                CreatedCall::Settled(failed_result(&call, parent, &executor, error, requested))
-            }
+            Err(error) => CreatedCall::Settled(failed_result(&call, &executor, error)),
         }
     }
 }
@@ -256,7 +248,6 @@ pub(super) enum CreatedCall {
     Created {
         executor: ToolExecutor,
         call: ToolCall,
-        parent: Option<JobId>,
         created: Box<crate::tool::executor::CreatedInvocation>,
     },
     /// Settled without a job: planning failed or the tool is unavailable.
@@ -268,16 +259,14 @@ impl CreatedCall {
     /// the driver's Send proof from the nested supervised executor graph.
     pub(super) fn run(self) -> futures_util::future::BoxFuture<'static, ToolResult> {
         Box::pin(async move {
-            let (executor, call, parent, created) = match self {
+            let (executor, call, created) = match self {
                 Self::Settled(result) => return result,
                 Self::Created {
                     executor,
                     call,
-                    parent,
                     created,
-                } => (executor, call, parent, created),
+                } => (executor, call, created),
             };
-            let job_name = created.job_name().cloned();
             match executor.run(*created).await {
                 Ok(result) => ToolResult {
                     call_id: call.id().to_owned(),
@@ -286,25 +275,38 @@ impl CreatedCall {
                     images: result.output.images,
                     is_error: result.is_error,
                 },
-                Err(error) => failed_result(&call, parent, &executor, error, job_name),
+                Err(error) => failed_result(&call, &executor, error),
             }
         })
     }
 }
 
-/// `name` is the published job's name, or the requested one when no job was
-/// published.
 fn failed_result(
     call: &ToolCall,
-    parent: Option<JobId>,
     executor: &ToolExecutor,
-    error: crate::tool::executor::ExecutionError,
-    name: Option<JobName>,
+    error: crate::tool::ToolError,
 ) -> ToolResult {
-    let output = error.into_response(call.name(), parent, name, executor.diagnostic_viewer());
+    let viewer = executor.diagnostic_viewer();
+    let output = crate::tool::executor::failure_response(error, viewer);
+    failed_tool_result(call.id().to_owned(), call.name().to_owned(), output)
+}
+
+/// A call that never ran as a job: its failure view as the call's result.
+pub(super) fn unrun_tool_result(call_id: String, name: String, error: String) -> ToolResult {
+    let failure = crate::job::JobView::failure(error, None, false);
+    let output = crate::tool::ToolOutput::new(failure.into_value());
+    failed_tool_result(call_id, name, output)
+}
+
+/// A failed call's result, reported by no job.
+pub(super) fn failed_tool_result(
+    call_id: String,
+    name: String,
+    output: crate::tool::ToolOutput,
+) -> ToolResult {
     ToolResult {
-        call_id: call.id().to_owned(),
-        name: call.name().to_owned(),
+        call_id,
+        name,
         result: output.value,
         images: output.images,
         is_error: true,
@@ -324,9 +326,9 @@ impl SessionRuntime {
 
     /// The journal form of a mode about to be applied. The session keeps the
     /// definition of a mode's first use only.
-    pub(super) fn mode_selection(&self, name: &str) -> crate::session::ModeSelection {
+    pub(super) fn mode_selection(&self, name: &ModeName) -> crate::session::ModeSelection {
         crate::session::ModeSelection {
-            name: name.to_owned(),
+            name: name.clone(),
             definition: self.modes.get(name).cloned(),
         }
     }
@@ -336,7 +338,7 @@ impl SessionRuntime {
         agent: &AgentId,
         location: &crate::execution::ExecutionLocation,
         available_depth: usize,
-        mode: Option<&str>,
+        mode: Option<&ModeName>,
         capabilities: &CapabilitySet,
     ) -> Result<Vec<SystemSegment>, HarnessError> {
         let target = match &location.target {
@@ -349,7 +351,7 @@ impl SessionRuntime {
             location,
             target: target.as_ref(),
             available_depth,
-            mode: mode.and_then(|name| Some((name, self.modes.get(name)?))),
+            mode: mode.and_then(|name| Some((name.as_str(), self.modes.get(name)?))),
             capabilities,
         })];
         Ok(system)
@@ -366,7 +368,6 @@ impl SessionRuntime {
         system: Vec<SystemSegment>,
         capabilities: &CapabilitySet,
         pinned: Option<Vec<crate::provider::protocol::ToolDefinition>>,
-        restore_meter: bool,
     ) -> Result<AgentContext, HarnessError> {
         let provider = self.model_entry(&profile.name)?.provider;
         let live = self
@@ -400,14 +401,15 @@ impl SessionRuntime {
             max_output_tokens: Some(profile.profile.max_output),
             blobs: Default::default(),
         };
-        let mut context = AgentContext::open(
-            agent,
-            profile,
-            template.try_into()?,
-            provider.as_ref(),
-            &self.store.records().await,
-            restore_meter,
-        )?;
+        let template = template.try_into()?;
+        let provider = provider.open_context(crate::provider::protocol::ContextId::from(agent))?;
+        let open = |records: &[EventRecord]| {
+            AgentContext::open(agent, profile, template, provider, records)
+        };
+        let mut context = self
+            .store
+            .visit_records_after(RecordSeq::default(), open)
+            .await;
         context.unavailable_tools = Arc::new(unavailable);
         Ok(context)
     }
@@ -416,24 +418,12 @@ impl SessionRuntime {
 impl SessionRuntime {
     /// Give restored agent jobs a handler that resumes their child, starting it
     /// again under its journaled contract when its loop is gone.
-    pub(super) async fn install_retained_children(self: &Arc<Self>) {
-        let records = self.store.records().await;
+    pub(super) async fn install_retained_children(self: &Arc<Self>, records: &[EventRecord]) {
         for retained in self.jobs.retained_children().await {
-            let live = &self.capabilities;
-            let Some(mut owner) = recorded_contract(&records, &retained.owner, live) else {
+            // The owner holds what it would if it resumed itself.
+            let Some(owner) = self.resumed_contract(records, &retained.owner) else {
                 continue;
             };
-            // As when the owner itself resumes: its depth never exceeds the live limit.
-            let remaining = self
-                .harness
-                .max_child_depth
-                .saturating_sub(retained.owner.depth());
-            let allowed = live.for_agent(owner.available_depth.min(remaining));
-            owner.capabilities = owner
-                .capabilities
-                .iter()
-                .filter(|capability| allowed.contains(*capability))
-                .collect();
             let authorization = crate::tool::authorization::AuthorizationSubject {
                 agent: retained.owner,
                 job: retained.job,
@@ -451,33 +441,37 @@ impl SessionRuntime {
             let _ = self.jobs.set_resume_handler(retained.job, handler).await;
         }
     }
+
+    /// `agent`'s journaled contract under the live configuration, which may narrow
+    /// it but never widen it: a lowered depth limit narrows rather than refuses it.
+    fn resumed_contract(
+        &self,
+        records: &[EventRecord],
+        agent: &AgentId,
+    ) -> Option<RecordedContract> {
+        let mut contract = recorded_contract(records, agent)?;
+        let remaining = self.harness.max_child_depth.saturating_sub(agent.depth());
+        contract.available_depth = contract.available_depth.min(remaining);
+        let allowed = self.capabilities.for_agent(contract.available_depth);
+        contract.capabilities = &contract.capabilities & &allowed;
+        Some(contract)
+    }
 }
 
-/// The contract an agent was journaled under: its start, latest applied profile,
-/// and the prompt and tools of its latest agent model context.
+/// The contract an agent runs under. A journaled one is its start, latest applied
+/// profile, and the prompt and tools of its latest agent model context.
 struct RecordedContract {
     profile: crate::session::ProfileSnapshot,
     available_depth: usize,
-    mode: Option<String>,
-    /// The journaled set narrowed to the live configuration, never widened.
+    mode: Option<ModeName>,
     capabilities: CapabilitySet,
     location: crate::execution::ExecutionLocation,
     system: Option<Vec<SystemSegment>>,
     tools: Option<Vec<crate::provider::protocol::ToolDefinition>>,
 }
 
-fn recorded_contract(
-    records: &[EventRecord],
-    agent: &AgentId,
-    live: &CapabilitySet,
-) -> Option<RecordedContract> {
+fn recorded_contract(records: &[EventRecord], agent: &AgentId) -> Option<RecordedContract> {
     let mut contract: Option<RecordedContract> = None;
-    let narrowed = |capabilities: &[Capability]| {
-        let capabilities = capabilities.iter().copied();
-        capabilities
-            .filter(|capability| live.contains(*capability))
-            .collect()
-    };
     for record in records.iter().filter(|record| &record.agent == agent) {
         match &record.event {
             SessionEvent::AgentStarted {
@@ -492,7 +486,7 @@ fn recorded_contract(
                     profile: profile.clone(),
                     available_depth: *available_depth as usize,
                     mode: mode.as_ref().map(|mode| mode.name.clone()),
-                    capabilities: narrowed(capabilities),
+                    capabilities: capabilities.iter().copied().collect(),
                     location: location.clone(),
                     system: None,
                     tools: None,
@@ -506,7 +500,7 @@ fn recorded_contract(
             SessionEvent::ModeChanged { mode, capabilities } => {
                 if let Some(contract) = &mut contract {
                     contract.mode = Some(mode.name.clone());
-                    contract.capabilities = narrowed(capabilities);
+                    contract.capabilities = capabilities.iter().copied().collect();
                     // The mode's prompt and tools are pinned by its next model context.
                     (contract.system, contract.tools) = (None, None);
                 }
@@ -573,8 +567,10 @@ mod tests {
         results
     }
 
+    /// A call that fails before its job exists has no handle, and its metadata
+    /// would only repeat the call.
     #[tokio::test]
-    async fn preadmission_failure_history_keeps_requested_metadata() {
+    async fn preadmission_failure_history_is_a_failure_without_a_job() {
         let call = tool_call(0, "missing-call", "missing", json!({"name":"unadmitted"}));
         let (_root, requests, session) =
             scripted_session([response(vec![call]), answer("done")]).await;
@@ -582,14 +578,9 @@ mod tests {
         let requests = requests.lock().unwrap();
         let results = last_tool_results(&requests[1]);
         assert!(results[0].is_error);
-        let view = &results[0].result;
+        let view = results[0].result.as_object().unwrap();
         assert_eq!(view["state"], "failed");
-        assert_eq!(view["meta"]["tool"], "missing");
-        assert_eq!(view["meta"]["name"], "unadmitted");
-        assert_eq!(view.get("id"), Some(&serde_json::Value::Null));
-        assert_eq!(view["meta"].get("parent"), Some(&serde_json::Value::Null));
-        assert_eq!(view.get("result"), Some(&serde_json::Value::Null));
-        assert_eq!(view["has_result"], false);
+        assert_eq!(view.keys().collect::<Vec<_>>(), ["state", "error"]);
     }
 
     #[tokio::test]
@@ -704,11 +695,8 @@ mod tests {
                 let runtime = &session.runtime;
                 let todos = Some(vec![todo("seed", crate::agent::TodoStatus::Pending)]);
                 let id = runtime.next_child(&session.root).await;
-                let launch = AgentLaunch {
-                    todos,
-                    ..child_launch(&session, id, None)
-                };
-                let launch = PreparedAgentLaunch::prepare(runtime.clone(), launch)
+                let launch = child_launch(&session, todos);
+                let launch = PreparedAgentLaunch::prepare(runtime.clone(), id, None, launch)
                     .await
                     .unwrap();
                 let agent = launch.agent_loop.id.clone();
@@ -735,13 +723,68 @@ mod tests {
                 bounded(sender.closed()).await;
                 assert!(!runtime.agents.read().unwrap().contains_key(&agent));
                 let seeded = runtime.todos.inspect(&agent, None).await.unwrap();
-                assert!(seeded.items.is_empty());
+                assert!(seeded.is_empty());
                 // A failed append may leave a replayable prefix, never a live agent.
                 let visible = runtime.store.records().await;
                 let prefix = visible.iter().filter(|r| r.agent == agent).count();
                 assert_eq!(prefix, usize::from(seed_fault));
                 let _ = bounded(session.shutdown()).await;
             }
+        }
+    }
+
+    /// A resumed contract keeps the exact journaled set, never the defaults, and is
+    /// narrowed by the live ceiling and depth limit but never widened: a depth
+    /// reduced to zero drops only the ability to delegate.
+    #[tokio::test]
+    async fn resumed_contracts_narrow_exact_journaled_capabilities() {
+        use Capability::{Agents, Interactive, Mcp, Read};
+        let set = |capabilities: &[Capability]| -> CapabilitySet {
+            capabilities.iter().copied().collect()
+        };
+        let (all, defaults) = (set(&Capability::ALL), CapabilitySet::default());
+        let delegating = set(&[Read, Agents, Mcp, Interactive]);
+        let delegated = set(&[Read, Mcp, Interactive]);
+        let delegator = set(&[Read, Agents]);
+        // (journaled, journaled depth, live ceiling, live depth limit) -> contract
+        let cases = [
+            (set(&[]), 1, defaults.clone(), 2, set(&[]), 1),
+            (set(&[Read]), 1, all.clone(), 2, set(&[Read]), 1),
+            (defaults, 1, delegator.clone(), 2, delegator, 1),
+            (delegating.clone(), 1, all.clone(), 1, delegated, 0),
+            (delegating.clone(), 1, all, 3, delegating, 1),
+        ];
+        for (journaled, depth, ceiling, limit, capabilities, available_depth) in cases {
+            let root = tempfile::tempdir().unwrap();
+            let provider = scripted_provider(&Requests::default(), []);
+            let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
+                .capabilities(ceiling)
+                .max_child_depth(limit)
+                .build()
+                .await
+                .unwrap();
+            let session = ephemeral_session(&harness).await;
+            let runtime = &session.runtime;
+            let child = session.root.child(1);
+            let mut records = runtime.store.records().await;
+            records.retain(|record| matches!(record.event, SessionEvent::AgentStarted { .. }));
+            records[0].agent = child.clone();
+            let SessionEvent::AgentStarted {
+                available_depth: recorded_depth,
+                capabilities: recorded,
+                ..
+            } = &mut records[0].event
+            else {
+                unreachable!("retained above");
+            };
+            (*recorded_depth, *recorded) = (depth, journaled.iter().collect());
+            let contract = runtime.resumed_contract(&records, &child).unwrap();
+            assert_eq!(
+                (contract.capabilities, contract.available_depth),
+                (capabilities, available_depth),
+                "{journaled:?} at depth {depth} under {limit}"
+            );
+            shutdown_session(session).await;
         }
     }
 }

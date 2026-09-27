@@ -35,22 +35,26 @@ use crate::{
 
 pub(crate) mod output;
 pub use output::{
-    CaptureKind, FieldPointer, OutputArgs as JobOutputQuery, OutputSelection, PresentedOutput,
-    omit_null_fields,
+    CaptureDescriptor, CaptureKind, FieldPointer, OutputArgs as JobOutputQuery, OutputPreview,
+    OutputSelection, PresentedOutput, diagnostic_slot, omit_null_fields,
 };
 mod cancellation;
+pub(crate) use cancellation::CANCELLATION_GRACE;
 mod delivery;
+mod entry;
+mod error;
 mod input;
 mod lifecycle;
 mod messages;
 pub(super) mod views;
 
 pub(crate) use delivery::PendingDelivery;
+pub(crate) use entry::WaitFloor;
+use entry::{Answer, Finished, JobChange, JobEntry, JobStep, Phase, Rejected, RoleState};
+pub use error::{InputUnavailableReason, JobError};
 pub(crate) use progress::AgentProgress;
-pub use views::JobEnvelope;
-#[cfg(test)]
-pub(crate) use views::Presentation;
-pub(crate) use views::{JobMetadata, JobView, WaitCaller, presented_job_schema};
+pub(crate) use views::{JOB_VIEW_SCHEMAS, WaitCaller};
+pub use views::{JobEnvelope, JobView, Notice, Presentation};
 mod persistence;
 mod progress;
 mod supervisor;
@@ -74,17 +78,20 @@ fn current_pending_stamp() -> u64 {
 
 named_enum! {
     /// Semantic execution role, independent of extensible tool names.
-    #[derive(Clone, Copy, Debug, Default, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Default, JsonSchema, Serialize, PartialEq, Eq)]
     pub enum JobRole {
         #[default]
         Tool = "tool",
         Agent = "agent",
         Script = "script",
         Question = "question",
+        /// A `wait`: the agent pauses for events rather than doing work.
+        Wait = "wait",
     }
 }
 
-/// Automatic completion delivery may reference an already-visible child reply.
+/// How a model read presents a job: `Automatic` leaves out the metadata a
+/// successful foreground call does not need; `Full` always shows it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum OutputPresentation {
     Full,
@@ -92,7 +99,7 @@ pub(crate) enum OutputPresentation {
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, JsonSchema, Serialize, PartialEq, Eq)]
     pub enum JobState {
         Queued = "queued",
         #[schemars(skip)]
@@ -127,7 +134,7 @@ impl JobState {
 
 named_enum! {
     /// A live state a job is journaled entering; `Queued` is only ever created into.
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum JobTransition {
         AwaitingApproval = "awaiting_approval",
         Running = "running",
@@ -137,7 +144,7 @@ named_enum! {
 
 named_enum! {
     /// How a job's invocation ended.
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum JobEnd {
         Completed = "completed",
         Failed = "failed",
@@ -169,6 +176,8 @@ impl From<JobEnd> for JobState {
 
 pub(crate) enum JobOutcome {
     Completed(ToolOutput),
+    /// Completed by a tool whose native result type is unit.
+    NoResult,
     /// The cause decides whether the job failed, was cancelled, or was interrupted.
     Failed {
         diagnostic: PartialDiagnostic,
@@ -177,10 +186,21 @@ pub(crate) enum JobOutcome {
 }
 
 impl JobOutcome {
+    /// A unit tool's outcome: it has no result, even when cancelled or failed.
+    pub(crate) fn without_result(self) -> Self {
+        match self {
+            Self::Completed(_) | Self::NoResult => Self::NoResult,
+            Self::Failed { diagnostic, .. } => Self::Failed {
+                diagnostic,
+                output: None,
+            },
+        }
+    }
+
     fn end(&self) -> JobEnd {
         use crate::tool::diagnostic::Cause;
         match self {
-            Self::Completed(_) => JobEnd::Completed,
+            Self::Completed(_) | Self::NoResult => JobEnd::Completed,
             Self::Failed { diagnostic, .. } => match diagnostic.cause {
                 Cause::Cancelled => JobEnd::Cancelled,
                 Cause::Interrupted => JobEnd::Interrupted,
@@ -194,6 +214,12 @@ impl From<crate::tool::ToolError> for JobOutcome {
     fn from(error: crate::tool::ToolError) -> Self {
         let (diagnostic, output) = error.into_facts();
         Self::Failed { diagnostic, output }
+    }
+}
+
+impl From<Result<ToolOutput, crate::tool::ToolError>> for JobOutcome {
+    fn from(result: Result<ToolOutput, crate::tool::ToolError>) -> Self {
+        result.map_or_else(Into::into, Self::Completed)
     }
 }
 
@@ -224,395 +250,6 @@ pub(crate) type ResumeHandler = Arc<
         + Sync,
 >;
 
-/// Where a job is in its lifecycle. A waiting job holds the question it asked;
-/// a finished one holds its published outcome.
-enum Phase {
-    Queued,
-    AwaitingApproval,
-    Running,
-    WaitingInput(QuestionOutput),
-    Finished(Box<Finished>),
-}
-
-/// A published outcome. Saved results and captures stay in the database.
-#[derive(Clone)]
-struct Finished {
-    end: JobEnd,
-    images: Vec<ImageRef>,
-    diagnostic: Option<Diagnostic>,
-    output_diagnostic: Option<Diagnostic>,
-}
-
-/// A phase change: the journaled transitions, plus the question a live job asks.
-enum JobChange {
-    Advance(JobTransition),
-    Ask(QuestionOutput),
-    Finish(Box<Finished>),
-}
-
-/// The journaled shape of a change, checked before its event is appended.
-#[derive(Clone, Copy)]
-enum JobStep {
-    Advance(JobTransition),
-    Finish(JobEnd),
-}
-
-impl JobChange {
-    fn step(&self) -> JobStep {
-        match self {
-            Self::Advance(transition) => JobStep::Advance(*transition),
-            Self::Ask(_) => JobStep::Advance(JobTransition::WaitingInput),
-            Self::Finish(finished) => JobStep::Finish(finished.end),
-        }
-    }
-}
-
-/// A change the current phase does not admit.
-struct Rejected;
-
-/// What a role keeps beyond the shared lifecycle.
-enum RoleState {
-    Tool,
-    Question,
-    Agent(Child),
-    Script {
-        /// What a `wait` hosted by this script last reported, so it is not
-        /// told twice.
-        wait_floor: Option<WaitFloor>,
-    },
-}
-
-impl RoleState {
-    fn new(role: JobRole) -> Self {
-        match role {
-            JobRole::Tool => Self::Tool,
-            JobRole::Question => Self::Question,
-            JobRole::Agent => Self::Agent(Child::default()),
-            JobRole::Script => Self::Script { wait_floor: None },
-        }
-    }
-
-    fn role(&self) -> JobRole {
-        match self {
-            Self::Tool => JobRole::Tool,
-            Self::Question => JobRole::Question,
-            Self::Agent(_) => JobRole::Agent,
-            Self::Script { .. } => JobRole::Script,
-        }
-    }
-}
-
-/// The agent an agent job launched and the replies it has published.
-#[derive(Default)]
-struct Child {
-    /// Installed by the launch; a launch still in progress has none.
-    agent: Option<AgentId>,
-    /// Replies queued for delivery to the owner.
-    messages: Vec<AgentMessage>,
-    /// When the newest queued reply was published; replies are delivered
-    /// oldest first, so it stays queued while any older one does.
-    message_stamp: u64,
-    /// A terminal reply, queued only when its invocation resolves: the job's end
-    /// or `notify_owner` releases it, so the owner sees it with that resolution
-    /// rather than alone at an earlier request boundary.
-    withheld: Option<AgentMessage>,
-    /// Source sequence of the last visible reply.
-    last_message: Option<MessageSeq>,
-}
-
-impl Child {
-    /// Queue a reply for delivery to the owner.
-    fn queue(&mut self, message: AgentMessage) {
-        self.message_stamp = next_pending_stamp();
-        self.messages.push(message);
-    }
-
-    /// Queue the withheld reply, if any.
-    fn release(&mut self) {
-        if let Some(message) = self.withheld.take() {
-            self.queue(message);
-        }
-    }
-}
-
-/// The pending stamp and input revision a script's `wait` last reported.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct WaitFloor {
-    pub(crate) stamp: u64,
-    pub(crate) input: u64,
-}
-
-impl Rejected {
-    /// The change was checked before its append, so the phase moved underneath it.
-    fn journaled(self, id: JobId) -> JobError {
-        JobError::PhaseMoved(id)
-    }
-}
-
-struct JobEntry {
-    origin: Option<crate::session::ModelCallOrigin>,
-    output_schema: Option<Value>,
-    agent: AgentId,
-    parent: Option<JobId>,
-    tool: String,
-    role: RoleState,
-    name: Option<JobName>,
-    created_at_millis: i64,
-    phase: Phase,
-    accepts_input: bool,
-    resume: Option<ResumeHandler>,
-    input: mpsc::Sender<Value>,
-    cancellation: CancellationToken,
-    notify: Arc<Notify>,
-    operation: Arc<Mutex<()>>,
-    task_abort: Option<AbortHandle>,
-    cancellation_watchdog_started: bool,
-    delivery: DeliveryState,
-    /// When the current delivery last became pending.
-    delivery_stamp: u64,
-    /// A `wait` parked for agent events: not work other waits should defer to.
-    awaiting_events: bool,
-    background: bool,
-    location: ExecutionLocation,
-}
-
-impl JobEntry {
-    fn new(spec: JobSpec, created_at_millis: i64) -> (Self, mpsc::Receiver<Value>) {
-        let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
-        (
-            Self {
-                origin: spec.origin,
-                output_schema: spec.output_schema,
-                agent: spec.agent,
-                parent: spec.parent,
-                tool: spec.tool,
-                role: RoleState::new(spec.role),
-                name: spec.name,
-                created_at_millis,
-                phase: Phase::Queued,
-                accepts_input: spec.accepts_input,
-                resume: None,
-                input,
-                cancellation: CancellationToken::new(),
-                notify: Arc::new(Notify::new()),
-                operation: Arc::new(Mutex::new(())),
-                task_abort: None,
-                cancellation_watchdog_started: false,
-                delivery: DeliveryState::Pending,
-                awaiting_events: false,
-                delivery_stamp: next_pending_stamp(),
-                background: spec.background,
-                location: spec.location,
-            },
-            receiver,
-        )
-    }
-
-    fn role(&self) -> JobRole {
-        self.role.role()
-    }
-
-    /// The launched agent of an agent job.
-    fn child(&self) -> Option<&Child> {
-        match &self.role {
-            RoleState::Agent(child) => Some(child),
-            _ => None,
-        }
-    }
-
-    fn child_mut(&mut self) -> Option<&mut Child> {
-        match &mut self.role {
-            RoleState::Agent(child) => Some(child),
-            _ => None,
-        }
-    }
-
-    /// The journaled projection of the phase.
-    fn state(&self) -> JobState {
-        match &self.phase {
-            Phase::Queued => JobState::Queued,
-            Phase::AwaitingApproval => JobState::AwaitingApproval,
-            Phase::Running => JobState::Running,
-            Phase::WaitingInput(_) => JobState::WaitingInput,
-            Phase::Finished(finished) => finished.end.into(),
-        }
-    }
-
-    fn finished(&self) -> Option<&Finished> {
-        match &self.phase {
-            Phase::Finished(finished) => Some(finished.as_ref()),
-            _ => None,
-        }
-    }
-
-    fn end(&self) -> Option<JobEnd> {
-        self.finished().map(|finished| finished.end)
-    }
-
-    fn question(&self) -> Option<&QuestionOutput> {
-        match &self.phase {
-            Phase::WaitingInput(question) => Some(question),
-            _ => None,
-        }
-    }
-
-    /// Whether the phase admits `step`; `apply` changes nothing otherwise.
-    fn admits(&self, step: JobStep) -> bool {
-        use JobTransition::{AwaitingApproval, Running, WaitingInput};
-        match (&self.phase, step) {
-            (Phase::Queued, JobStep::Advance(AwaitingApproval))
-            | (Phase::AwaitingApproval, JobStep::Advance(Running))
-            | (Phase::Running | Phase::WaitingInput(_), JobStep::Advance(WaitingInput))
-            | (Phase::WaitingInput(_), JobStep::Advance(Running)) => true,
-            (Phase::Finished(_), JobStep::Advance(Running)) => self.resumable_end(),
-            // Cancelling an interruption ends its resumability; nothing else
-            // supersedes a published outcome.
-            (Phase::Finished(previous), JobStep::Finish(end)) => {
-                previous.end == JobEnd::Interrupted && end == JobEnd::Cancelled
-            }
-            (_, JobStep::Finish(_)) => true,
-            (_, JobStep::Advance(_)) => false,
-        }
-    }
-
-    /// Move to the next phase with every live effect the change implies.
-    fn apply(&mut self, change: JobChange) -> Result<(), Rejected> {
-        if !self.admits(change.step()) {
-            return Err(Rejected);
-        }
-        match change {
-            JobChange::Advance(JobTransition::AwaitingApproval) => {
-                self.phase = Phase::AwaitingApproval;
-            }
-            JobChange::Advance(JobTransition::Running) => {
-                match &self.phase {
-                    // A new invocation: the previous worker is gone and the new
-                    // outcome is a new delivery.
-                    Phase::Finished(previous) => {
-                        // An interrupted foreground invocation still has its original
-                        // waiter. Any other restart reports through delivery.
-                        if previous.end != JobEnd::Interrupted {
-                            self.background = true;
-                        }
-                        self.task_abort = None;
-                        self.pend_delivery();
-                    }
-                    Phase::WaitingInput(_) => self.pend_delivery(),
-                    Phase::Queued | Phase::AwaitingApproval | Phase::Running => {}
-                }
-                self.phase = Phase::Running;
-            }
-            JobChange::Advance(JobTransition::WaitingInput) => self.ask(QuestionOutput::default()),
-            JobChange::Ask(question) => self.ask(question),
-            JobChange::Finish(finished) => {
-                if finished.end == JobEnd::Cancelled {
-                    self.resume = None;
-                }
-                self.task_abort = None;
-                self.phase = Phase::Finished(finished);
-                // A new delivery even after an earlier question was acknowledged; it
-                // carries the reply the invocation withheld for it.
-                self.pend_delivery();
-                if let Some(child) = self.child_mut() {
-                    child.release();
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// A question is delivered like an outcome; its answer arrives as a wake.
-    fn ask(&mut self, question: QuestionOutput) {
-        self.phase = Phase::WaitingInput(question);
-        self.pend_delivery();
-        self.background = true;
-    }
-
-    fn waiting(&self) -> bool {
-        self.question().is_some()
-    }
-
-    /// Interrupted with a handler that can restart it.
-    fn suspended(&self) -> bool {
-        self.end() == Some(JobEnd::Interrupted) && self.resume.is_some()
-    }
-
-    /// Not finished, or finished but retained for resumption. `active_states`
-    /// deliberately differs: it presents a suspended job by its retained state.
-    fn live(&self) -> bool {
-        self.end().is_none() || self.suspended()
-    }
-
-    /// Ended, other than by a retained interruption.
-    fn settled(&self) -> bool {
-        self.end().is_some() && !self.suspended()
-    }
-
-    /// Still running, or interrupted: cancellation changes its outcome.
-    fn cancellable(&self) -> bool {
-        self.end().is_none_or(|end| end == JobEnd::Interrupted)
-    }
-
-    /// Finished in a way input can restart, given a handler.
-    fn resumable_end(&self) -> bool {
-        matches!(
-            self.end(),
-            Some(JobEnd::Completed | JobEnd::Failed | JobEnd::Interrupted)
-        )
-    }
-
-    fn pend_delivery(&mut self) {
-        self.delivery = DeliveryState::Pending;
-        self.delivery_stamp = next_pending_stamp();
-    }
-
-    fn deliverable(&self) -> bool {
-        // Keep parent waits pending across a retryable interruption. Snapshots
-        // still expose the interrupted state to the user.
-        !self.suspended() && (self.end().is_some() || self.waiting())
-    }
-
-    fn reserve_delivery(&mut self, delivery: DeliveryState) -> Option<AgentId> {
-        if !self.deliverable() || self.delivery != DeliveryState::Pending {
-            return None;
-        }
-        self.delivery = delivery;
-        Some(self.agent.clone())
-    }
-
-    fn metadata(&self, id: JobId) -> JobEnvelope {
-        let finished = self.finished();
-        let diagnostic = finished.and_then(|finished| finished.diagnostic.clone());
-        JobEnvelope {
-            id,
-            parent: self.parent,
-            tool: self.tool.clone(),
-            role: self.role(),
-            name: self.name.clone().map(String::from),
-            state: self.state(),
-            output: None,
-            question: None,
-            diagnostic,
-            output_diagnostic: finished.and_then(|finished| finished.output_diagnostic.clone()),
-            location: self.location.clone(),
-        }
-    }
-
-    fn envelope(&self, id: JobId) -> JobEnvelope {
-        JobEnvelope {
-            question: self.question().cloned(),
-            ..self.metadata(id)
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DeliveryState {
-    Pending,
-    Claimed,
-    Injected,
-}
-
 #[derive(Clone, Copy)]
 enum WaitMode {
     Foreground,
@@ -634,6 +271,26 @@ struct JobManagerInner {
     /// Per agent, fires when one of its jobs newly parks in a `wait`, releasing
     /// that agent's waits deferring to it.
     parked: std::sync::Mutex<HashMap<AgentId, Arc<Notify>>>,
+    /// Per parent job, its issued calls whose jobs are not published yet.
+    issuing: std::sync::Mutex<HashMap<JobId, usize>>,
+    issued: Notify,
+}
+
+/// A call from its issue until its job is published or refused.
+pub(crate) struct Issuing(JobManager, JobId);
+
+impl Drop for Issuing {
+    fn drop(&mut self) {
+        let inner = &self.0.inner;
+        let mut issuing = inner.issuing.lock().expect("issuing poisoned");
+        if let Some(count) = issuing.get_mut(&self.1) {
+            *count -= 1;
+            if *count == 0 {
+                issuing.remove(&self.1);
+            }
+        }
+        inner.issued.notify_waiters();
+    }
 }
 
 #[derive(Clone)]
@@ -646,7 +303,9 @@ pub struct JobManager {
 pub struct AgentMessage {
     pub id: JobId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub name: Option<String>,
+    pub name: Option<JobName>,
+    /// Delivery bookkeeping for the journal and the TUI; the model never sees it.
+    #[serde(skip)]
     pub message: MessageSeq,
     pub text: String,
 }
@@ -704,12 +363,35 @@ impl JobManager {
                 next_id: AtomicU64::new(next_id),
                 completions,
                 parked: std::sync::Mutex::default(),
+                issuing: std::sync::Mutex::default(),
+                issued: Notify::new(),
             }),
         }
     }
 
     pub async fn restore(store: SessionStore, records: &[EventRecord]) -> Result<Self, JobError> {
         persistence::restore(store, records).await
+    }
+
+    /// Count a call `parent` issued, synchronously, until its job is published.
+    pub(crate) fn issue(&self, parent: JobId) -> Issuing {
+        let mut issuing = self.inner.issuing.lock().expect("issuing poisoned");
+        *issuing.entry(parent).or_default() += 1;
+        Issuing(self.clone(), parent)
+    }
+
+    /// Wait until every call `parent` has issued so far has its job published.
+    pub(crate) async fn issued(&self, parent: JobId) {
+        loop {
+            let published = self.inner.issued.notified();
+            let pending = (self.inner.issuing.lock())
+                .expect("issuing poisoned")
+                .contains_key(&parent);
+            if !pending {
+                return;
+            }
+            published.await;
+        }
     }
 
     #[must_use]
@@ -721,77 +403,11 @@ impl JobManager {
     pub fn store(&self) -> &SessionStore {
         &self.inner.store
     }
-}
 
-/// Why a destination cannot accept input in its current lifecycle.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum InputUnavailableReason {
-    State(JobState),
-    CancellationRequested,
-    ResumeUnavailable,
-}
-
-impl std::fmt::Display for InputUnavailableReason {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::State(state) => write!(formatter, "job is {}", state.presented()),
-            Self::CancellationRequested => formatter.write_str("cancellation has been requested"),
-            Self::ResumeUnavailable => {
-                formatter.write_str("no retained resume handler is available")
-            }
-        }
+    /// Tell `agent` it has work from `job` to collect.
+    fn wake(&self, agent: AgentId, job: JobId) {
+        let _ = self.inner.completions.send(JobCompletion { agent, job });
     }
-}
-
-impl<O> From<JobError> for crate::tool::invocation::OperationError<O> {
-    fn from(error: JobError) -> Self {
-        match error {
-            JobError::Session(error) => error.into(),
-            JobError::InputClosed(_) => Self::input_closed(),
-            JobError::Output(error) => Self::from_facts(error.into_facts().0, None),
-            error => Self::failed(error),
-        }
-    }
-}
-
-#[derive(Debug, Error)]
-pub enum JobError {
-    #[error(transparent)]
-    Session(#[from] SessionError),
-    #[error("unknown job {0}")]
-    Unknown(JobId),
-    #[error("job {0} already has a terminal result")]
-    AlreadyTerminal(JobId),
-    #[error("job {0} is not terminal")]
-    NotTerminal(JobId),
-    #[error("job {job} input unavailable: {reason}")]
-    InputUnavailable {
-        job: JobId,
-        reason: InputUnavailableReason,
-    },
-    #[error("job {0} does not accept input")]
-    InputUnsupported(JobId),
-    #[error("job {0} input channel is closed")]
-    InputClosed(JobId),
-    #[error("job identifier space is exhausted")]
-    InvalidId,
-    /// The journaled change was admitted, but the live phase moved underneath it.
-    #[error("job {0} changed phase while its change was journaled")]
-    PhaseMoved(JobId),
-    #[error("journal entry {sequence} changes a job's phase illegally")]
-    IllegalTransition { sequence: u64 },
-    #[error("job {0} did not launch an agent")]
-    NoChild(JobId),
-    #[error("child agent does not belong to job {0}")]
-    ChildOwnerMismatch(JobId),
-    #[error("child message text does not match the committed assistant text")]
-    ChildTextMismatch,
-    /// The detached task publishing `owner` stopped before reporting.
-    #[error("{owner} owner lost: {reason}")]
-    OwnerLost { owner: &'static str, reason: String },
-    /// Saving or reading the job's output failed; the facts name the stage.
-    #[error(transparent)]
-    Output(Box<crate::tool::ToolError>),
 }
 
 #[cfg(test)]
@@ -824,35 +440,19 @@ mod tests {
     pub(super) fn job_view(job: JobId, state: JobState) -> crate::session::JobEvent {
         crate::session::JobEvent::Job(Box::new(JobView {
             id: Some(job),
-            state,
-            has_result: false,
-            result: Value::Null,
+            state: Some(state),
+            result: None,
             error: None,
             meta: None,
             presentation: None,
         }))
     }
 
-    /// Poll until a published job settles into a terminal state.
-    pub(super) async fn terminal(jobs: &JobManager, id: JobId) -> JobEnvelope {
-        tokio::time::timeout(Duration::from_secs(3), async {
-            loop {
-                match jobs.metadata(id).await {
-                    Ok(envelope) if envelope.state.is_terminal() => return envelope,
-                    Ok(_) | Err(JobError::Unknown(_)) => tokio::task::yield_now().await,
-                    Err(error) => panic!("unexpected job lookup failure: {error}"),
-                }
-            }
-        })
-        .await
-        .expect("creation owner must settle its published job")
-    }
-
     /// Every phase change `apply` admits or rejects, with the live effects a
     /// legal one carries.
     #[tokio::test]
     async fn apply_admits_only_lifecycle_order_and_cancels_interruptions() {
-        use JobChange::{Advance, Ask, Finish};
+        use JobChange::{Advance, Answer, Ask, Finish};
         use JobTransition::{AwaitingApproval, Running, WaitingInput};
         let finished = |end| {
             Box::new(Finished {
@@ -865,13 +465,18 @@ mod tests {
         let handler: ResumeHandler =
             Arc::new(|_, _| Box::pin(async { Ok(ToolOutput::new(Value::Null)) }));
         let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
-        let entry = || JobEntry::new(JobSpec::test(agent.clone(), "phase"), 0).0;
+        let spec = JobSpec {
+            role: JobRole::Agent,
+            ..JobSpec::test(agent.clone(), "phase")
+        };
+        let entry = || JobEntry::new(spec.clone(), 0).0;
         let at = |changes: &[JobChange]| {
             let mut entry = entry();
             for change in changes {
                 let change = match change {
                     Advance(transition) => Advance(*transition),
                     Ask(question) => Ask(question.clone()),
+                    Answer => Answer,
                     Finish(outcome) => Finish(outcome.clone()),
                 };
                 entry.apply(change).ok().expect("fixture prefix is legal");
@@ -945,6 +550,8 @@ mod tests {
                 Advance(Running),
                 Some(JobState::Running),
             ),
+            ("waiting answer", &waiting, Answer, Some(JobState::Running)),
+            ("running answer", &running, Answer, None),
             (
                 "waiting finish",
                 &waiting,
@@ -991,13 +598,13 @@ mod tests {
         ];
         for (case, prefix, change, expected) in cases {
             let mut entry = at(prefix);
-            entry.resume = Some(handler.clone());
+            entry.child_mut().unwrap().resume = Some(handler.clone());
             let before = entry.state();
             let applied = entry.apply(change);
             assert_eq!(applied.is_ok(), expected.is_some(), "{case}");
             assert_eq!(entry.state(), expected.unwrap_or(before), "{case}");
             assert_eq!(
-                entry.resume.is_none(),
+                entry.resume().is_none(),
                 expected == Some(JobState::Cancelled),
                 "{case}"
             );
@@ -1011,10 +618,10 @@ mod tests {
         ] {
             let mut entry = at(prefix);
             entry.background = false;
-            entry.delivery = DeliveryState::Claimed;
+            entry.acknowledge();
             entry.apply(change).ok().unwrap();
             assert_eq!(entry.background, background, "{case}");
-            assert_eq!(entry.delivery, DeliveryState::Pending, "{case}");
+            assert!(entry.unacknowledged(), "{case}");
         }
     }
 

@@ -10,9 +10,9 @@ use skyhook::{
     identity::SessionId,
     media::{Attachment, Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES, classify},
     provider::profile::ModelRef,
-    remote::EmbeddedShimCatalog,
+    remote::{ArtifactError, EmbeddedShimCatalog},
     session::{SessionError, SessionStore},
-    tool::policy::{AllowAll, Capability, CapabilitySet, Policy},
+    tool::policy::{AllowAll, Capability, CapabilitySet, ModeName, Policy},
 };
 use std::{
     path::{Path, PathBuf},
@@ -41,9 +41,10 @@ pub(crate) async fn read_attachment(workspace: &Path, path: &Path) -> Result<Att
             file: Some(path),
             image,
         }),
-        Classified::Text(content) if content.len() as u64 > MAX_TEXT_BYTES => {
-            Err("File is larger than 1 MiB; ask the agent to read it instead".into())
-        }
+        Classified::Text(content) if content.len() as u64 > MAX_TEXT_BYTES => Err(format!(
+            "File is larger than {} MiB; ask the agent to read it instead",
+            MAX_TEXT_BYTES >> 20
+        )),
         Classified::Text(content) => Ok(Attachment::Text {
             file: Some(path),
             content,
@@ -53,6 +54,17 @@ pub(crate) async fn read_attachment(workspace: &Path, path: &Path) -> Result<Att
             path.display()
         )),
     }
+}
+
+/// Why a submitted prompt or script failed.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum OperationError {
+    #[error(transparent)]
+    Harness(#[from] HarnessError),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error("{0}")]
+    Attachment(String),
 }
 
 /// Read the images named on the command line.
@@ -75,7 +87,7 @@ pub(crate) async fn read_images(
 /// A configured mode, or the exact capabilities of a batch job that named none.
 #[derive(Clone)]
 pub(crate) enum Permissions {
-    Mode(String),
+    Mode(ModeName),
     Exact(CapabilitySet),
 }
 
@@ -90,7 +102,7 @@ impl Permissions {
         Ok(match args {
             cli::PermissionArgs::Mode(Some(mode)) if resumed => Self::Mode(mode.clone()),
             cli::PermissionArgs::Mode(mode) => {
-                Self::Mode(config.select_mode(mode.as_deref())?.to_owned())
+                Self::Mode(config.select_mode(mode.as_ref())?.clone())
             }
             cli::PermissionArgs::Exact(capabilities) => {
                 Self::Exact(capabilities.iter().copied().collect())
@@ -102,6 +114,10 @@ impl Permissions {
 /// Why a session could not be created or resumed.
 #[derive(Debug, thiserror::Error)]
 pub enum LaunchError {
+    #[error("workspace: {0}")]
+    Workspace(#[source] std::io::Error),
+    #[error(transparent)]
+    Shims(#[from] ArtifactError),
     #[error(transparent)]
     Session(#[from] SessionError),
     #[error("Model {0} is missing. Restore it in the configuration before resuming.")]
@@ -120,7 +136,6 @@ pub struct Launch {
     pub sessions: PathBuf,
     pub(crate) catalog: EmbeddedShimCatalog,
     pub(crate) interaction: Option<Arc<UiInteraction>>,
-    pub(crate) approve_all: bool,
 }
 impl Launch {
     pub async fn create(&self, resume: Option<SessionId>) -> Result<SessionHandle, LaunchError> {
@@ -140,7 +155,7 @@ impl Launch {
         let builder = match &self.permissions {
             // A resumed session continues in its own mode, which may not be configured.
             Permissions::Mode(_) if resume.is_some() => builder,
-            Permissions::Mode(mode) => builder.mode(mode),
+            Permissions::Mode(mode) => builder.mode(mode.clone()),
             Permissions::Exact(_) => builder.modes(Default::default()),
         };
         let builder = builder
@@ -149,7 +164,8 @@ impl Launch {
             .session_root(self.sessions.clone())
             .shim_catalog(self.catalog.clone())
             .capabilities(capabilities.clone());
-        let policy: Arc<dyn Policy> = match (&self.interaction, self.approve_all) {
+        let policy: Arc<dyn Policy> = match (&self.interaction, model.config().config().approve_all)
+        {
             (_, true) => Arc::new(AllowAll),
             (None, false) => Arc::new(HostApprovalPolicy::Unattended),
             (Some(ui), false) => Arc::new(HostApprovalPolicy::Attended {
@@ -198,7 +214,7 @@ impl Launch {
 /// Resolve exactly the configuration shared by startup and inspection.
 pub async fn resolve_config(
     request: &ConfigRequest,
-) -> Result<skyhook::config::ResolvedConfig, Box<dyn std::error::Error>> {
+) -> Result<skyhook::config::ResolvedConfig, ConfigError> {
     // The core resolver owns ordering and workspace resolution, including its
     // diagnostics. Explicit files bypass workspace probing there entirely.
     let mut resolved = Config::resolve(&request.workspace, request.config.as_deref()).await?;
@@ -210,7 +226,7 @@ pub async fn resolve_config(
 pub async fn load_config(
     request: &ConfigRequest,
     display_diagnostics: bool,
-) -> Result<RuntimeConfig, Box<dyn std::error::Error>> {
+) -> Result<RuntimeConfig, ConfigError> {
     let resolved = resolve_config(request).await?;
     if display_diagnostics {
         for diagnostic in &resolved.report.diagnostics {
@@ -220,7 +236,7 @@ pub async fn load_config(
             );
         }
     }
-    Ok(resolved.config.into_runtime()?)
+    resolved.config.into_runtime()
 }
 
 /// Select the explicit model, remembered model, or configured default for both hosts.
@@ -243,19 +259,18 @@ impl Launch {
         model: ConfiguredModel,
         permissions: Permissions,
         interaction: Option<Arc<UiInteraction>>,
-    ) -> Result<Self, Box<dyn std::error::Error>> {
-        let request = &request.config;
-        let workspace = tokio::fs::canonicalize(&request.workspace).await?;
+    ) -> Result<Self, LaunchError> {
+        let workspace = tokio::fs::canonicalize(&request.config.workspace)
+            .await
+            .map_err(LaunchError::Workspace)?;
         // CLI history belongs only to the selected workspace, never to an
         // inherited/global session_root or an ancestor workspace's history.
         let sessions = skyhook::config::workspace_session_root(&workspace);
-        let approve_all = request.approve_all || model.config().config().approve_all;
         Ok(Self {
             model,
             permissions,
             workspace,
             sessions,
-            approve_all,
             catalog: super::embedded_shims::catalog()?,
             interaction,
         })
@@ -279,7 +294,7 @@ mod tests {
         let Invocation::Interactive(request, _) = cli::parse_from(args).unwrap() else {
             panic!("interactive request")
         };
-        let mode = Permissions::Mode(config.default_mode().to_owned());
+        let mode = Permissions::Mode(config.default_mode().clone());
         Launch::from_request(&request.execution, config.default_model(), mode, None)
             .await
             .unwrap()
@@ -291,7 +306,7 @@ mod tests {
         let mut config = original.config().clone();
         let models = &mut config.providers["test"].common.models;
         let mut second = models["test"].clone();
-        second.profile.model = "second-fixture".into();
+        second.profile.model = "second-fixture".parse().unwrap();
         models.insert("another".parse().unwrap(), second);
         let config = config.into_runtime().unwrap();
         let name = |name: &str| name.parse::<ModelRef>().unwrap();
@@ -324,11 +339,11 @@ mod tests {
         let mut reloaded = original.config().clone();
         reloaded.providers["test"].common.models["test"]
             .profile
-            .model = "reloaded-fixture".into();
+            .model = "reloaded-fixture".parse().unwrap();
         let reloaded = reloaded.into_runtime().unwrap();
         let rebound = select_model(&reloaded, None, Some(&old.name())).unwrap();
-        assert_eq!(old.profile().model, "fixture");
-        assert_eq!(rebound.profile().model, "reloaded-fixture");
+        assert_eq!(old.profile().model.as_str(), "fixture");
+        assert_eq!(rebound.profile().model.as_str(), "reloaded-fixture");
         assert!(!std::ptr::eq(
             old.config().config(),
             rebound.config().config()
@@ -437,24 +452,24 @@ mod tests {
         let mut config = history_config(None).config().clone();
         config.modes = Config::from_yaml("modes:\n  wide:\n    capabilities: [read, exec]\n  narrow:\n    capabilities: [read]\n  none:\n    capabilities: []").unwrap().modes;
         config.modes.shift_remove("general");
-        config.default_mode = "wide".into();
+        config.default_mode = "wide".parse().unwrap();
         let config = config.into_runtime().unwrap();
         let mut launch = launch(root.path(), &config).await;
-        assert!(matches!(&launch.permissions, Permissions::Mode(mode) if mode == "wide"));
+        assert!(matches!(&launch.permissions, Permissions::Mode(mode) if mode.as_str() == "wide"));
         let (interaction, _prompts) = UiInteraction::new();
         for (permissions, interactive, expected) in [
             // The terminal can switch modes, so its ceiling is their union.
             (
-                Permissions::Mode("none".into()),
+                Permissions::Mode("none".parse().unwrap()),
                 true,
                 &[Capability::Read, Capability::Exec, Capability::Interactive][..],
             ),
             (
-                Permissions::Mode("narrow".into()),
+                Permissions::Mode("narrow".parse().unwrap()),
                 false,
                 &[Capability::Read],
             ),
-            (Permissions::Mode("none".into()), false, &[]),
+            (Permissions::Mode("none".parse().unwrap()), false, &[]),
             (
                 Permissions::Exact(
                     [Capability::Targets, Capability::Interactive]
@@ -471,7 +486,7 @@ mod tests {
             assert!(ceiling.iter().eq(expected.iter().copied()), "{ceiling:?}");
         }
         // A resumed batch session may be in any mode; its journaled ceiling narrows this.
-        launch.permissions = Permissions::Mode("none".into());
+        launch.permissions = Permissions::Mode("none".parse().unwrap());
         let resumed = launch.ceiling(config.config(), true);
         assert!(resumed.iter().eq([Capability::Read, Capability::Exec]));
     }

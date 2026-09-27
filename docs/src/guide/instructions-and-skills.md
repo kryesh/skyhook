@@ -79,9 +79,9 @@ await tool.skill({ name: "release", path: "assets/logo.png" }); // Attached imag
 ```
 
 Results have a `kind` discriminator: `list`, `skill`, `directory`, `text`, `image`, or `binary`.
-Base skill results contain `name`, `description`, `location`, complete `content`, and an `assets`
-text tree that includes nested files but excludes the already-loaded root `SKILL.md`. Directory
-results use the same tree format, rooted at the selected path. Trees mark symlinks without
+Base skill results contain `location`, complete `content`, and, when the skill has other files, an
+`assets` text tree that includes nested files but excludes the already-loaded root `SKILL.md`.
+Directory results use the same tree format, rooted at the selected path. Trees mark symlinks without
 descending through them. Long trees and asset text are saved in full and can be paged using `jobs`.
 
 Text assets (including JSON, YAML, source code, and SVG) are returned unchanged, never executed.

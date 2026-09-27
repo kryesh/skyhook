@@ -2,68 +2,57 @@
 
 use super::*;
 
-use crate::tool::invocation::CANCELLATION_GRACE;
+/// How long a cancelled worker may take to stop before it is aborted.
+pub(crate) const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
 
 impl JobManager {
     /// Request cancellation of this job and its descendants. The returned
     /// metadata is a snapshot, not proof that cancellation has completed; a
     /// previously published terminal result is preserved.
     pub async fn cancel(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        let watchdogs = {
-            let mut jobs = self.inner.jobs.lock().await;
-            if !jobs.contains_key(&id) {
-                return Err(JobError::Unknown(id));
-            }
-            let mut descendants = std::collections::HashSet::from([id]);
-            loop {
-                let before = descendants.len();
-                for (child, entry) in jobs.iter() {
-                    if entry
-                        .parent
-                        .is_some_and(|parent| descendants.contains(&parent))
-                    {
-                        descendants.insert(*child);
-                    }
-                }
-                if descendants.len() == before {
-                    break;
-                }
-            }
-            let mut watchdogs = Vec::new();
-            for job in descendants {
-                let entry = jobs.get_mut(&job).expect("known descendant");
-                entry.cancellation.cancel();
-                if entry.cancellable() && !entry.cancellation_watchdog_started {
-                    entry.cancellation_watchdog_started = true;
-                    watchdogs.push(job);
-                }
-            }
-            watchdogs
-        };
-        for job in watchdogs {
-            let jobs = self.clone();
-            tokio::spawn(async move {
-                tokio::time::sleep(CANCELLATION_GRACE).await;
-                jobs.force_cancel(job).await;
-            });
+        let mut jobs = self.inner.jobs.lock().await;
+        if !jobs.contains_key(&id) {
+            return Err(JobError::Unknown(id));
         }
-        let jobs = self.inner.jobs.lock().await;
-        Ok(jobs.get(&id).ok_or(JobError::Unknown(id))?.metadata(id))
+        self.cancel_trees(&mut jobs, vec![id]);
+        Ok(jobs[&id].metadata(id))
+    }
+
+    /// Cancel `roots` and all their descendants, starting the forced-abort
+    /// watchdog of each whose outcome cancellation can still change.
+    fn cancel_trees(&self, jobs: &mut HashMap<JobId, JobEntry>, mut worklist: Vec<JobId>) {
+        let mut children = HashMap::<JobId, Vec<JobId>>::new();
+        for (&id, entry) in jobs.iter() {
+            if let Some(parent) = entry.parent {
+                children.entry(parent).or_default().push(id);
+            }
+        }
+        while let Some(job) = worklist.pop() {
+            worklist.extend(children.remove(&job).into_iter().flatten());
+            let Some(entry) = jobs.get_mut(&job) else {
+                continue;
+            };
+            entry.cancellation.cancel();
+            if entry.cancellable() && !entry.cancellation_watchdog_started {
+                entry.cancellation_watchdog_started = true;
+                let jobs = self.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(CANCELLATION_GRACE).await;
+                    jobs.force_cancel(job).await;
+                });
+            }
+        }
     }
 
     pub async fn cancel_all(&self, owner: &AgentId) -> usize {
-        let ids = self
-            .inner
-            .jobs
-            .lock()
-            .await
+        let mut jobs = self.inner.jobs.lock().await;
+        let ids = jobs
             .iter()
             .filter_map(|(id, entry)| (&entry.agent == owner && entry.cancellable()).then_some(*id))
             .collect::<Vec<_>>();
-        for id in &ids {
-            let _ = self.cancel(*id).await;
-        }
-        ids.len()
+        let count = ids.len();
+        self.cancel_trees(&mut jobs, ids);
+        count
     }
 
     /// Cancel every remaining job and await its persisted terminal outcome.
@@ -71,21 +60,19 @@ impl JobManager {
     /// the snapshot to include descendants created while cancellation propagates.
     pub(crate) async fn cancel_and_drain(&self) -> Result<(), JobError> {
         loop {
-            let ids = self
-                .inner
-                .jobs
-                .lock()
-                .await
-                .iter()
-                .filter_map(|(id, entry)| entry.cancellable().then_some(*id))
-                .collect::<Vec<_>>();
+            let ids = {
+                let mut jobs = self.inner.jobs.lock().await;
+                let ids = jobs
+                    .iter()
+                    .filter_map(|(id, entry)| entry.cancellable().then_some(*id))
+                    .collect::<Vec<_>>();
+                self.cancel_trees(&mut jobs, ids.clone());
+                ids
+            };
             if ids.is_empty() {
                 // Terminal publication may precede supervisor cleanup.
                 self.drain_supervisors().await;
                 return Ok(());
-            }
-            for id in &ids {
-                self.cancel(*id).await?;
             }
             for id in ids {
                 self.wait_inner(id, None, WaitMode::Terminal).await?;
@@ -107,22 +94,14 @@ impl JobManager {
         if let Some(task_abort) = task_abort {
             task_abort.abort();
         }
-        if let Err(error) = self.finish(id, ToolError::cancelled().into()).await
-            && !matches!(error, JobError::AlreadyTerminal(_))
-        {
-            self.fail_volatile(
-                id,
-                format!("job cancellation could not be persisted: {error}"),
-            )
-            .await;
-        }
+        self.settle(id, ToolError::cancelled().into()).await;
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tests::TestRuntime;
+    use crate::tests::{TestRuntime, bounded};
     use crate::tool::{
         ToolError, ToolOptions, ToolRegistryBuilder,
         policy::{AuthorizationRequest, Capability, Policy, PolicyFuture},
@@ -132,10 +111,12 @@ mod tests {
     #[derive(Deserialize, JsonSchema)]
     struct NoArgs {}
 
-    struct NeverAuthorize;
+    /// Reports each job it is asked about, and never decides.
+    struct NeverAuthorize(tokio::sync::mpsc::UnboundedSender<JobId>);
 
     impl Policy for NeverAuthorize {
-        fn authorize(&self, _request: AuthorizationRequest) -> PolicyFuture<'_> {
+        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+            self.0.send(request.job).unwrap();
             Box::pin(std::future::pending())
         }
     }
@@ -147,12 +128,8 @@ mod tests {
         }
     }
 
-    async fn cancelled_within(jobs: &JobManager, id: JobId, seconds: u64) -> JobState {
-        let wait = tokio::time::timeout(Duration::from_secs(seconds), jobs.wait(id, None, true));
-        wait.await
-            .expect("cancellation did not terminate the job")
-            .unwrap()
-            .state
+    async fn cancelled(jobs: &JobManager, id: JobId) -> JobState {
+        bounded(jobs.wait(id, None, true)).await.unwrap().state
     }
 
     #[tokio::test]
@@ -273,8 +250,7 @@ mod tests {
             jobs.snapshot(question.id()).await.unwrap().state,
             JobState::WaitingInput
         );
-        let drain = tokio::time::timeout(Duration::from_secs(5), jobs.cancel_and_drain());
-        drain.await.unwrap().unwrap();
+        bounded(jobs.cancel_and_drain()).await.unwrap();
         let records = jobs.store().records().await;
         for id in [parent.id(), question.id()] {
             assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Cancelled);
@@ -306,10 +282,7 @@ mod tests {
         assert!(grandchild.cancellation_token().is_cancelled());
         let late = jobs.test_lease(child(grandchild.id(), agent, "late")).await;
         assert!(late.cancellation_token().is_cancelled());
-        assert_eq!(
-            cancelled_within(&jobs, late.id(), 2).await,
-            JobState::Cancelled
-        );
+        assert_eq!(cancelled(&jobs, late.id()).await, JobState::Cancelled);
     }
 
     #[tokio::test]
@@ -320,16 +293,13 @@ mod tests {
         let observed = Arc::new(AtomicBool::new(false));
         let started = Arc::new(Notify::new());
         let mut builder = ToolRegistryBuilder::default();
-        let options = ToolOptions::new(vec![Capability::Exec]).background();
+        let options = || ToolOptions::new(vec![Capability::Exec]).background();
         builder
-            .register::<NoArgs, String, _, _>(
-                "stubborn",
-                "never completes",
-                options.clone(),
-                |_, _| std::future::pending::<Result<String, ToolError>>(),
-            )
+            .register::<NoArgs, String, _, _>("stubborn", "never completes", options(), |_, _| {
+                std::future::pending::<Result<String, ToolError>>()
+            })
             .unwrap()
-            .register::<NoArgs, String, _, _>("cooperative", "wait for cancellation", options, {
+            .register::<NoArgs, String, _, _>("cooperative", "wait for cancellation", options(), {
                 let (observed, started) = (observed.clone(), started.clone());
                 move |context, _input| {
                     let (observed, started) = (observed.clone(), started.clone());
@@ -350,31 +320,26 @@ mod tests {
             runtime.root.path().to_path_buf(),
         );
         // Uncooperative handlers are aborted after the cancellation grace.
-        let background = serde_json::json!({"bg": true});
+        let background = serde_json::json!({crate::tool::registry::BACKGROUND: true});
         let stubborn = executor
             .run_host(agent, "stubborn", background.clone())
             .await
             .unwrap();
         jobs.cancel(stubborn.job).await.unwrap();
-        assert_eq!(
-            cancelled_within(jobs, stubborn.job, 2).await,
-            JobState::Cancelled
-        );
+        assert_eq!(cancelled(jobs, stubborn.job).await, JobState::Cancelled);
         let cooperative = executor
             .run_host(agent, "cooperative", background)
             .await
             .unwrap();
         started.notified().await;
         jobs.cancel(cooperative.job).await.unwrap();
-        assert_eq!(
-            cancelled_within(jobs, cooperative.job, 1).await,
-            JobState::Cancelled
-        );
+        assert_eq!(cancelled(jobs, cooperative.job).await, JobState::Cancelled);
         assert!(observed.load(Ordering::Relaxed));
 
+        let (asked, mut asked_about) = tokio::sync::mpsc::unbounded_channel();
         let executor = crate::tool::executor::ToolExecutor::new(
             registry,
-            Arc::new(NeverAuthorize),
+            Arc::new(NeverAuthorize(asked)),
             jobs.clone(),
             runtime.root.path().to_path_buf(),
         );
@@ -386,26 +351,13 @@ mod tests {
                     .await
             }
         });
-        let awaiting = tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let listed = jobs.list(agent).await;
-                if let Some(job) = listed
-                    .iter()
-                    .find(|job| job.state == JobState::AwaitingApproval)
-                {
-                    break job.id;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
+        let awaiting = bounded(asked_about.recv()).await.unwrap();
+        assert_eq!(
+            jobs.snapshot(awaiting).await.unwrap().state,
+            JobState::AwaitingApproval
+        );
         jobs.cancel(awaiting).await.unwrap();
-        let result = tokio::time::timeout(Duration::from_secs(1), execution);
-        let result = result
-            .await
-            .expect("authorization did not observe cancellation")
-            .unwrap();
+        let result = bounded(execution).await.unwrap();
         assert_eq!(
             result.unwrap_err().diagnostic().cause,
             crate::tool::diagnostic::Cause::Cancelled,

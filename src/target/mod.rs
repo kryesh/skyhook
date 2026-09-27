@@ -12,20 +12,23 @@ use crate::newtype::string_newtype;
 
 pub use config::{SshAuth, SshOptions, TargetAuth, TargetConfig, TargetsConfig, Transport};
 pub use registry::{
-    TargetDefinition, TargetEdge, TargetError, TargetRecord, TargetRegistry, TargetSource,
+    TargetDefinition, TargetEdge, TargetError, TargetField, TargetRegistry, TargetSource,
 };
-pub(crate) use router::{ResolvedRoute, RouteIdentity, TargetRouter, select_location};
+pub(crate) use router::{ResolvedRoute, Route, RouteIdentity, TargetRouter, select_location};
+
+pub(crate) const MAX_TARGET_NAME_BYTES: usize = 128;
 
 string_newtype! {
-    /// The name of a configured or session-added target: 1 to 128 ASCII letters,
-    /// digits, underscores, hyphens, or periods, and never the reserved `root`.
+    /// The name of a configured or session-added target: 1 to
+    /// [`MAX_TARGET_NAME_BYTES`] ASCII letters, digits, underscores, hyphens, or
+    /// periods, and never the reserved `root`.
     #[derive(PartialOrd, Ord)]
     pub struct TargetName(TargetError) = |name| {
         if name == TargetRef::ROOT {
             return Err(TargetError::ReservedName);
         }
         let valid = !name.is_empty()
-            && name.len() <= 128
+            && name.len() <= MAX_TARGET_NAME_BYTES
             && name
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'));
@@ -39,12 +42,13 @@ string_newtype! {
 /// omitted target is the caller's own location; a named one resolves with the
 /// same rules as a tool's `target` argument. The `target` property is offered
 /// only with target selection, so schemas add it where that capability applies.
+#[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct TargetPath {
     /// File path.
     pub path: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     #[schemars(skip)]
     pub target: Option<TargetRef>,
 }
@@ -55,10 +59,16 @@ impl TargetPath {
 
     /// The `target` property schemas add where the caller can select targets.
     /// It names the host holding a path, which need not be where the operation
-    /// runs, so its wording differs from [`TargetRef::schema`].
-    pub(crate) fn target_schema() -> serde_json::Value {
+    /// runs, so its wording differs from [`TargetRef::schema`]. Arguments also
+    /// accept null for an omitted target; results omit it.
+    pub(crate) fn target_schema(contract: &schemars::generate::Contract) -> serde_json::Value {
+        let types = if contract.is_deserialize() {
+            serde_json::json!(["string", "null"])
+        } else {
+            serde_json::json!("string")
+        };
         serde_json::json!({
-            "type": ["string", "null"],
+            "type": types,
             "description": "Target holding the path; omitted means your own."
         })
     }
@@ -156,7 +166,12 @@ mod tests {
             "root".parse::<TargetName>(),
             Err(TargetError::ReservedName)
         ));
-        for invalid in ["", "has space", "ünïcode", &"x".repeat(129)] {
+        for invalid in [
+            "",
+            "has space",
+            "ünïcode",
+            &"x".repeat(MAX_TARGET_NAME_BYTES + 1),
+        ] {
             assert!(
                 matches!(
                     invalid.parse::<TargetName>(),

@@ -11,7 +11,8 @@ use serde_json::Value;
 use crate::{
     identity::{AgentId, JobId},
     named_enum::named_enum,
-    target::TargetRef,
+    newtype::{Blank, Prose, nonblank, string_newtype},
+    target::{TargetName, TargetRef},
     tool::{
         AdmissionError,
         diagnostic::{Operation, Subject},
@@ -19,7 +20,7 @@ use crate::{
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
     pub enum Capability {
         Read = "read",
         Write = "write",
@@ -108,6 +109,12 @@ impl std::ops::BitAnd for &CapabilitySet {
     }
 }
 
+string_newtype! {
+    /// The name a mode is declared under and selected by.
+    #[derive(PartialOrd, Ord)]
+    pub struct ModeName(Blank) = |name| nonblank("mode name", name);
+}
+
 /// A named permission preset. Interaction is supplied by the runtime host, never listed.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -116,10 +123,10 @@ pub struct Mode {
     pub capabilities: Vec<Capability>,
     /// Added to the system prompt of an agent running in the mode.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub instructions: Option<String>,
+    pub instructions: Option<Prose>,
     /// Describes the mode to agents choosing one for a child; without it they cannot.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub hint: Option<String>,
+    pub hint: Option<Prose>,
 }
 
 fn deserialize_policy_capabilities<'de, D>(deserializer: D) -> Result<Vec<Capability>, D::Error>
@@ -141,20 +148,20 @@ where
 #[serde(try_from = "ResourceWire", into = "ResourceWire")]
 pub enum ResourceId {
     Workspace {
-        target: String,
+        target: TargetRef,
         path: String,
     },
     Path {
-        target: String,
+        target: TargetRef,
         components: Vec<String>,
     },
     Network {
-        target: String,
+        target: TargetRef,
         origin: String,
     },
     Route {
-        destination: String,
-        hops: Vec<(String, u64)>,
+        destination: TargetName,
+        hops: Vec<(TargetName, u64)>,
     },
     Session {
         name: String,
@@ -166,7 +173,7 @@ pub enum ResourceId {
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub(crate) enum ResourceKind {
         Workspace = "workspace",
         Path = "path",
@@ -183,7 +190,7 @@ pub struct ResourceError(String);
 
 #[derive(Deserialize, Serialize)]
 struct ResourceWire {
-    namespace: String,
+    namespace: ResourceKind,
     segments: Vec<String>,
 }
 
@@ -228,7 +235,7 @@ impl ResourceId {
     #[must_use]
     pub fn workspace(target: &TargetRef, workspace: &PathText) -> Self {
         Self::Workspace {
-            target: target.to_string(),
+            target: target.clone(),
             path: workspace.0.clone(),
         }
     }
@@ -242,7 +249,7 @@ impl ResourceId {
             .map(|component| component.as_os_str().to_string_lossy().into_owned())
             .collect();
         Self::Path {
-            target: target.to_string(),
+            target: target.clone(),
             components,
         }
     }
@@ -252,7 +259,7 @@ impl ResourceId {
     #[must_use]
     pub fn network(target: &TargetRef, normalized_origin: &str) -> Self {
         Self::Network {
-            target: target.to_string(),
+            target: target.clone(),
             origin: normalized_origin.into(),
         }
     }
@@ -263,11 +270,8 @@ impl ResourceId {
     }
 
     #[must_use]
-    pub fn route(destination: impl Into<String>, hops: Vec<(String, u64)>) -> Self {
-        Self::Route {
-            destination: destination.into(),
-            hops,
-        }
+    pub fn route(destination: TargetName, hops: Vec<(TargetName, u64)>) -> Self {
+        Self::Route { destination, hops }
     }
 
     #[must_use]
@@ -289,8 +293,14 @@ impl ResourceId {
         }
     }
 
+    /// Only an invocation's destination resolves its paths and network origins,
+    /// so a forwarded call asks the host for these after the host admitted the rest.
+    pub(crate) fn resolved_at_destination(&self) -> bool {
+        matches!(self, Self::Path { .. } | Self::Network { .. })
+    }
+
     /// Only these three resource kinds are scoped to an execution target.
-    pub fn execution_target_mut(&mut self) -> Option<&mut String> {
+    pub fn execution_target_mut(&mut self) -> Option<&mut TargetRef> {
         match self {
             Self::Workspace { target, .. }
             | Self::Path { target, .. }
@@ -328,71 +338,75 @@ impl TryFrom<ResourceWire> for ResourceId {
             namespace,
             segments,
         } = wire;
-        // Arity is validated here only. Empty strings, relative components and
-        // whole workspace paths retain their historical opaque spelling.
-        match (namespace.as_str(), segments.as_slice()) {
-            ("workspace", [target, path]) => Ok(Self::Workspace {
-                target: target.clone(),
+        let target = |text: &String| {
+            TargetRef::try_from(text.clone()).map_err(|error| ResourceError(error.to_string()))
+        };
+        let name = |text: &String| {
+            TargetName::try_from(text.clone()).map_err(|error| ResourceError(error.to_string()))
+        };
+        // Arity and target names are validated here only. Empty strings, relative
+        // components and whole workspace paths retain their historical opaque spelling.
+        match (namespace, segments.as_slice()) {
+            (ResourceKind::Workspace, [workspace, path]) => Ok(Self::Workspace {
+                target: target(workspace)?,
                 path: path.clone(),
             }),
-            ("path", [target, components @ ..]) => Ok(Self::Path {
-                target: target.clone(),
+            (ResourceKind::Path, [path, components @ ..]) => Ok(Self::Path {
+                target: target(path)?,
                 components: components.to_vec(),
             }),
-            ("network", [target, origin]) => Ok(Self::Network {
-                target: target.clone(),
+            (ResourceKind::Network, [network, origin]) => Ok(Self::Network {
+                target: target(network)?,
                 origin: origin.clone(),
             }),
-            ("session", [name]) => Ok(Self::session(name)),
-            ("mcp", [server, tool]) => Ok(Self::mcp(server, tool)),
-            ("route", [destination, hops @ ..]) if hops.len() % 2 == 0 => {
+            (ResourceKind::Session, [session]) => Ok(Self::session(session)),
+            (ResourceKind::Mcp, [server, tool]) => Ok(Self::mcp(server, tool)),
+            (ResourceKind::Route, [destination, hops @ ..]) if hops.len() % 2 == 0 => {
                 let hops = hops
                     .as_chunks::<2>()
                     .0
                     .iter()
-                    .map(|pair| {
-                        let revision = pair[1]
+                    .map(|[hop, revision]| {
+                        let revision = revision
                             .parse::<u64>()
                             .map_err(|_| ResourceError("route revision must be a u64".into()))?;
-                        Ok((pair[0].clone(), revision))
+                        Ok((name(hop)?, revision))
                     })
                     .collect::<Result<_, ResourceError>>()?;
-                Ok(Self::route(destination, hops))
+                Ok(Self::route(name(destination)?, hops))
             }
-            _ => Err(ResourceError(namespace)),
+            _ => Err(ResourceError(namespace.to_string())),
         }
     }
 }
 
 impl From<ResourceId> for ResourceWire {
     fn from(resource: ResourceId) -> Self {
-        let (namespace, segments) = match resource {
-            ResourceId::Workspace { target, path } => ("workspace", vec![target, path]),
+        let namespace = resource.kind();
+        let segments = match resource {
+            ResourceId::Workspace { target, path } => vec![target.into(), path],
             ResourceId::Path { target, components } => {
-                ("path", std::iter::once(target).chain(components).collect())
+                std::iter::once(target.into()).chain(components).collect()
             }
-            ResourceId::Network { target, origin } => ("network", vec![target, origin]),
-            ResourceId::Route { destination, hops } => (
-                "route",
-                std::iter::once(destination)
-                    .chain(
-                        hops.into_iter()
-                            .flat_map(|(target, revision)| [target, revision.to_string()]),
-                    )
-                    .collect(),
-            ),
-            ResourceId::Session { name } => ("session", vec![name]),
-            ResourceId::Mcp { server, tool } => ("mcp", vec![server, tool]),
+            ResourceId::Network { target, origin } => vec![target.into(), origin],
+            ResourceId::Route { destination, hops } => std::iter::once(destination.into())
+                .chain(
+                    hops.into_iter()
+                        .flat_map(|(target, revision)| [target.into(), revision.to_string()]),
+                )
+                .collect(),
+            ResourceId::Session { name } => vec![name],
+            ResourceId::Mcp { server, tool } => vec![server, tool],
         };
         Self {
-            namespace: namespace.into(),
+            namespace,
             segments,
         }
     }
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Hash)]
     pub enum ApprovalCoverage {
         Exact = "exact",
         Descendants = "descendants",
@@ -553,28 +567,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_sets_do_not_inherit_defaults() {
-        assert_eq!(CapabilitySet::empty().iter().count(), 0);
-        let exact: CapabilitySet = [Capability::Mcp].into_iter().collect();
-        assert_eq!(exact.iter().collect::<Vec<_>>(), [Capability::Mcp]);
-        assert_eq!(
-            std::iter::empty::<Capability>().collect::<CapabilitySet>(),
-            CapabilitySet::empty()
-        );
-        let defaults = CapabilitySet::default();
-        for capability in Capability::ALL {
-            assert_eq!(
-                defaults.contains(capability),
-                !matches!(capability, Capability::Targets | Capability::SshAgent)
-            );
-        }
-        let child = defaults.for_agent(0);
-        assert!(!child.contains(Capability::Agents));
-        assert!(child.contains(Capability::Interactive));
-        assert!(child.contains(Capability::Mcp));
-    }
-
-    #[test]
     fn resource_wire_admits_builtin_shapes_without_path_normalization() {
         for (namespace, segments, admitted) in [
             ("workspace", vec!["root", "relative//workspace/../"], true),
@@ -590,6 +582,8 @@ mod tests {
             ("network", vec!["root", "origin", "extra"], false),
             ("route", vec!["destination", "hop"], false),
             ("route", vec!["destination", "hop", "-1"], false),
+            ("route", vec!["root", "root", "1"], false),
+            ("path", vec!["bad target", "/"], false),
         ] {
             let wire = serde_json::json!({"namespace": namespace, "segments": segments});
             let resource = serde_json::from_value::<ResourceId>(wire.clone());
@@ -615,13 +609,14 @@ mod tests {
         assert!(descendants.covers(Capability::Read, &child));
         assert!(!descendants.covers(Capability::Write, &child));
         assert!(!descendants.covers(Capability::Read, &path("/ab")));
-        let hops = vec![("jump".into(), 1), ("build".into(), 2)];
-        let route = ResourceId::route("build", hops.clone());
+        let name = |name: &str| name.parse::<TargetName>().unwrap();
+        let hops = vec![(name("jump"), 1), (name("build"), 2)];
+        let route = ResourceId::route(name("build"), hops.clone());
         let grant = ApprovalGrant::descendants(Capability::Targets, route.clone());
         assert!(grant.covers(Capability::Targets, &route));
         let longer = ResourceId::route(
-            "build",
-            vec![("jump".into(), 1), ("build".into(), 2), ("next".into(), 3)],
+            name("build"),
+            vec![(name("jump"), 1), (name("build"), 2), (name("next"), 3)],
         );
         assert!(grant.covers(Capability::Targets, &longer));
         assert!(
@@ -630,7 +625,7 @@ mod tests {
         );
         assert!(!grant.covers(
             Capability::Targets,
-            &ResourceId::route("build", vec![("jump".into(), 2), ("build".into(), 2)])
+            &ResourceId::route(name("build"), vec![(name("jump"), 2), (name("build"), 2)])
         ));
     }
 

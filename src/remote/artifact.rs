@@ -1,13 +1,13 @@
 //! Embedded remote shims, named `<os>-<protocol>-<arch>` such as `linux-ssh-x86_64`.
 use std::{borrow::Cow, fmt, sync::Arc};
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use thiserror::Error;
 
-use crate::named_enum::named_enum;
+use crate::{named_enum::named_enum, remote::error::DeploymentError};
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum Os {
         Linux = "linux",
     }
@@ -15,7 +15,7 @@ named_enum! {
 
 named_enum! {
     /// `uname -m` aliases parse to the canonical spelling.
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum Arch {
         X86_64 = "x86_64" | "amd64",
         Aarch64 = "aarch64" | "arm64",
@@ -23,7 +23,7 @@ named_enum! {
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum ShimProtocol {
         Ssh = "ssh",
     }
@@ -61,51 +61,82 @@ pub struct EmbeddedShim {
     pub bytes: Cow<'static, [u8]>,
 }
 
-#[derive(Clone, Debug, Default)]
+/// Reads a named shim's bytes. Debug builds read shims from disk, so the catalog
+/// only loads the one it deploys.
+pub type ShimLoader = fn(&str) -> Option<Cow<'static, [u8]>>;
+
+#[derive(Clone, Debug)]
+struct ShimEntry {
+    platform: Platform,
+    protocol: ShimProtocol,
+    name: Box<str>,
+}
+
+#[derive(Clone, Debug)]
 pub struct EmbeddedShimCatalog {
-    shims: Arc<[EmbeddedShim]>,
+    shims: Arc<[ShimEntry]>,
+    load: ShimLoader,
+}
+
+impl Default for EmbeddedShimCatalog {
+    fn default() -> Self {
+        Self {
+            shims: Arc::new([]),
+            load: |_| None,
+        }
+    }
 }
 
 impl EmbeddedShimCatalog {
-    /// Builds a catalog from `<os>-<protocol>-<arch>` artifact names and their bytes.
+    /// Builds a catalog from `<os>-<protocol>-<arch>` artifact names that `load` reads.
     /// Names with an extension, such as stray build outputs, are skipped.
-    pub fn from_embedded_assets<I, N>(assets: I) -> Result<Self, ArtifactError>
-    where
-        I: IntoIterator<Item = (N, Cow<'static, [u8]>)>,
-        N: AsRef<str>,
-    {
-        let shims = assets
+    pub fn from_embedded_assets<N: AsRef<str>>(
+        names: impl IntoIterator<Item = N>,
+        load: ShimLoader,
+    ) -> Result<Self, ArtifactError> {
+        let shims = names
             .into_iter()
-            .filter(|(name, _)| std::path::Path::new(name.as_ref()).extension().is_none())
-            .map(|(name, bytes)| {
+            .filter(|name| std::path::Path::new(name.as_ref()).extension().is_none())
+            .map(|name| {
                 let name = name.as_ref();
                 let invalid = || ArtifactError::InvalidName(name.to_owned());
                 let [os, protocol, arch] = name.split('-').collect::<Vec<_>>()[..] else {
                     return Err(invalid());
                 };
-                Ok(EmbeddedShim {
+                Ok(ShimEntry {
                     platform: Platform::parse(os, arch).ok_or_else(invalid)?,
                     protocol: protocol.parse().map_err(|_| invalid())?,
-                    bytes,
+                    name: name.into(),
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             shims: shims.into(),
+            load,
         })
     }
 
-    /// Reports whether this build supplied any remote artifacts.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.shims.is_empty()
-    }
-
-    #[must_use]
-    pub fn find(&self, protocol: ShimProtocol, platform: Platform) -> Option<&EmbeddedShim> {
-        self.shims
+    pub(crate) fn find(
+        &self,
+        protocol: ShimProtocol,
+        platform: Platform,
+    ) -> Result<EmbeddedShim, DeploymentError> {
+        if self.shims.is_empty() {
+            return Err(DeploymentError::NoShims);
+        }
+        let entry = self
+            .shims
             .iter()
             .find(|shim| shim.protocol == protocol && shim.platform == platform)
+            .ok_or(DeploymentError::NoShim { protocol, platform })?;
+        let bytes = (self.load)(&entry.name).ok_or_else(|| DeploymentError::Unreadable {
+            name: entry.name.clone(),
+        })?;
+        Ok(EmbeddedShim {
+            platform,
+            protocol,
+            bytes,
+        })
     }
 }
 
@@ -132,9 +163,7 @@ mod tests {
     use super::*;
 
     fn catalog(names: &[&str]) -> Result<EmbeddedShimCatalog, ArtifactError> {
-        EmbeddedShimCatalog::from_embedded_assets(
-            names.iter().map(|name| (*name, Cow::Borrowed(&b"abc"[..]))),
-        )
+        EmbeddedShimCatalog::from_embedded_assets(names, |_| Some(Cow::Borrowed(b"abc")))
     }
 
     #[test]
@@ -161,7 +190,27 @@ mod tests {
         assert!(Platform::parse("darwin", "x86_64").is_none());
         // An alias-named artifact serves the canonical platform.
         let aliased = catalog(&["linux-ssh-amd64"]).unwrap();
-        assert!(aliased.find(ShimProtocol::Ssh, platform).is_some());
+        assert!(aliased.find(ShimProtocol::Ssh, platform).is_ok());
+    }
+
+    #[test]
+    fn find_distinguishes_missing_from_unreadable_shims() {
+        let platform = Platform::parse("linux", "x86_64").unwrap();
+        let find = |catalog: EmbeddedShimCatalog| catalog.find(ShimProtocol::Ssh, platform);
+        assert!(matches!(
+            find(EmbeddedShimCatalog::default()),
+            Err(DeploymentError::NoShims)
+        ));
+        assert!(matches!(
+            find(catalog(&["linux-ssh-aarch64"]).unwrap()),
+            Err(DeploymentError::NoShim { .. })
+        ));
+        let unreadable =
+            EmbeddedShimCatalog::from_embedded_assets(["linux-ssh-x86_64"], |_| None).unwrap();
+        assert!(matches!(
+            find(unreadable),
+            Err(DeploymentError::Unreadable { name }) if &*name == "linux-ssh-x86_64"
+        ));
     }
 
     #[test]

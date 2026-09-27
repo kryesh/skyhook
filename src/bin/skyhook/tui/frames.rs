@@ -158,8 +158,7 @@ mod tests {
         writer.send().unwrap();
         assert!(writer.busy());
         for _ in 0..2 {
-            let written = tokio::time::timeout(Duration::from_secs(5), writer.written());
-            written.await.expect("written in time").unwrap();
+            crate::tests::bounded(writer.written()).await.unwrap();
         }
         assert!(!writer.busy());
         output.write_all(b" restore").unwrap();

@@ -1,5 +1,8 @@
-use crate::remote::{
-    PromptAnswer, SecretValue, SensitivePrompt, SensitivePromptHandler, SensitivePromptKind,
+use crate::{
+    remote::prompt::{
+        PromptAnswer, SecretValue, SensitivePrompt, SensitivePromptHandler, SensitivePromptKind,
+    },
+    target::{TargetName, TargetRef},
 };
 use serde::{Deserialize, Serialize};
 #[cfg(test)]
@@ -14,6 +17,34 @@ use tokio::{
     net::{UnixListener, UnixStream},
 };
 use zeroize::Zeroizing;
+
+/// The argument that makes a Skyhook binary run as OpenSSH's askpass helper.
+const FLAG: &str = "--askpass";
+/// Names the helper's server socket.
+const SOCKET: &str = "SKYHOOK_ASKPASS_SOCKET";
+/// The most either end reads of a request or an answer.
+const ASKPASS_MAX_BYTES: u64 = 64 * 1024;
+/// How often a pending prompt checks that the helper asking it still exists.
+const PEER_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Answer OpenSSH's prompt and exit, when OpenSSH started this process as its
+/// askpass helper; otherwise return. Every Skyhook binary calls this first.
+pub fn askpass_main() {
+    let mut arguments = std::env::args_os().skip(1);
+    if arguments.next().is_none_or(|flag| flag != FLAG) {
+        return;
+    }
+    let prompt = arguments.next().unwrap_or_default();
+    let result = match std::env::var_os(SOCKET) {
+        Some(socket) => run_helper(Path::new(&socket), prompt.to_string_lossy().into_owned()),
+        None => Err(format!("{SOCKET} is not set").into()),
+    };
+    if let Err(error) = result {
+        eprintln!("skyhook askpass: {error}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
+}
 
 pub(crate) struct AskpassServer {
     #[cfg(test)]
@@ -32,7 +63,11 @@ struct AskpassRequest {
 }
 
 impl AskpassServer {
-    pub fn start(handler: Arc<dyn SensitivePromptHandler>) -> Result<Self, std::io::Error> {
+    /// Serve prompts for SSH connecting to `target`, or for an agent's own prompts.
+    pub fn start(
+        handler: Arc<dyn SensitivePromptHandler>,
+        target: Option<TargetName>,
+    ) -> Result<Self, std::io::Error> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         // Randomness isolates servers even within one process; the PID is only descriptive.
         // Restrict access at creation, not just with a later chmod, even with umask 000.
@@ -50,12 +85,14 @@ impl AskpassServer {
                 super::config::wire_path(&executable)?.to_owned(),
             ),
             ("SSH_ASKPASS_REQUIRE".into(), "force".into()),
-            (
-                "SKYHOOK_ASKPASS_SOCKET".into(),
-                super::config::wire_path(&socket)?.to_owned(),
-            ),
+            (SOCKET.into(), super::config::wire_path(&socket)?.to_owned()),
             ("DISPLAY".into(), "skyhook".into()),
         ]);
+        // Name this process's image rather than its file: a rebuild or upgrade that
+        // replaces the binary mid-run would otherwise leave OpenSSH a missing helper.
+        #[cfg(target_os = "linux")]
+        let helper = std::path::PathBuf::from(format!("/proc/{}/exe", std::process::id()));
+        #[cfg(not(target_os = "linux"))]
         let helper = std::env::current_exe()?;
         let mut helper_file = std::fs::OpenOptions::new()
             .write(true)
@@ -64,7 +101,7 @@ impl AskpassServer {
             .open(&executable)?;
         helper_file.write_all(
             format!(
-                "#!/bin/sh\nexec {} --askpass \"$@\"\n",
+                "#!/bin/sh\nexec {} {FLAG} \"$@\"\n",
                 super::config::shell_quote(super::config::wire_path(&helper)?)
             )
             .as_bytes(),
@@ -79,8 +116,8 @@ impl AskpassServer {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
-                        let handler = handler.clone();
-                        tasks.spawn(async move { let _ = serve_one(stream, handler).await; });
+                        let (handler, target) = (handler.clone(), target.clone());
+                        tasks.spawn(async move { let _ = serve_one(stream, handler, target).await; });
                     }
                     _ = tasks.join_next(), if !tasks.is_empty() => {}
                 }
@@ -111,6 +148,7 @@ impl Drop for AskpassServer {
 async fn serve_one(
     mut stream: UnixStream,
     handler: Arc<dyn SensitivePromptHandler>,
+    target: Option<TargetName>,
 ) -> Result<(), std::io::Error> {
     // Authenticate before reading/parsing untrusted input or invoking the handler.
     let peer = stream.peer_cred()?;
@@ -119,7 +157,7 @@ async fn serve_one(
     let peer_pid = peer.pid();
     let mut bytes = Vec::new();
     (&mut stream)
-        .take(64 * 1024)
+        .take(ASKPASS_MAX_BYTES)
         .read_to_end(&mut bytes)
         .await?;
     let request: AskpassRequest = serde_json::from_slice(&bytes).map_err(std::io::Error::other)?;
@@ -136,11 +174,17 @@ async fn serve_one(
             {
                 return;
             }
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            tokio::time::sleep(PEER_POLL).await;
         }
     };
+    let prompt = SensitivePrompt {
+        kind,
+        message: request.prompt,
+        target,
+        origin: TargetRef::Root,
+    };
     let answer = tokio::select! {
-        result = handler.prompt(SensitivePrompt {kind, message:request.prompt}) => match result {
+        result = handler.prompt(prompt) => match result {
             // A confirmation is answered by choice and everything else with a
             // secret; a handler that mixes them never lets OpenSSH proceed.
             Ok(PromptAnswer::Secret(_)) if kind.is_confirmation() => PromptAnswer::Rejected,
@@ -180,16 +224,18 @@ fn classify(prompt: &str, hint: Option<&str>) -> SensitivePromptKind {
     }
 }
 
-pub fn run_helper(socket: &Path, prompt: String) -> Result<(), Box<dyn std::error::Error>> {
+fn run_helper(socket: &Path, prompt: String) -> Result<(), Box<dyn std::error::Error>> {
     let hint = std::env::var("SSH_ASKPASS_PROMPT").ok();
     let request = serde_json::to_vec(&AskpassRequest { prompt, hint })?;
     let mut stream = std::os::unix::net::UnixStream::connect(socket)?;
     stream.write_all(&request)?;
     stream.shutdown(std::net::Shutdown::Write)?;
     let mut response = Zeroizing::new(Vec::new());
-    stream.take(64 * 1024).read_to_end(&mut response)?;
+    stream.take(ASKPASS_MAX_BYTES).read_to_end(&mut response)?;
     let value = answer_value(serde_json::from_slice::<PromptAnswer>(&response)?)?;
-    std::io::stdout().write_all(value.expose().as_bytes())?;
+    let mut stdout = std::io::stdout();
+    stdout.write_all(value.expose().as_bytes())?;
+    stdout.flush()?;
     Ok(())
 }
 
@@ -218,10 +264,15 @@ mod tests {
     impl SensitivePromptHandler for FixedAnswer {
         fn prompt(&self, prompt: SensitivePrompt) -> crate::remote::SensitivePromptFuture {
             assert_eq!(prompt.kind, SensitivePromptKind::Password);
+            assert_eq!(prompt.target, Some("build".parse().unwrap()));
             self.calls.fetch_add(1, Ordering::SeqCst);
             let value = PromptAnswer::Secret(SecretValue::new(self.value.into()));
             Box::pin(async move { Ok(value) })
         }
+    }
+
+    fn start(handler: Arc<FixedAnswer>) -> AskpassServer {
+        AskpassServer::start(handler, Some("build".parse().unwrap())).unwrap()
     }
 
     fn fixed(value: &'static str) -> Arc<FixedAnswer> {
@@ -250,10 +301,7 @@ mod tests {
 
     async fn request_password(socket: &Path) -> SecretValue {
         let request = async { ask(UnixStream::connect(socket).await.unwrap()).await };
-        match tokio::time::timeout(std::time::Duration::from_secs(5), request)
-            .await
-            .expect("askpass request timed out")
-        {
+        match crate::tests::bounded(request).await {
             PromptAnswer::Secret(value) => value,
             answer => panic!("password request unexpectedly answered {answer:?}"),
         }
@@ -276,7 +324,7 @@ mod tests {
                     .arg(std::env::current_exe().unwrap())
                     .args(["--exact", &name, "--nocapture"])
                     .env(CHILD, "1")
-                    .env("SKYHOOK_ASKPASS_SOCKET", "/unused-inherited-askpass.sock")
+                    .env(SOCKET, "/unused-inherited-askpass.sock")
                     .output()
                     .unwrap();
                 let stdout = String::from_utf8_lossy(&output.stdout);
@@ -293,7 +341,7 @@ mod tests {
             .build()
             .unwrap();
         runtime.block_on(async {
-            let server = AskpassServer::start(fixed("private-answer")).unwrap();
+            let server = start(fixed("private-answer"));
             for (path, mode) in [
                 (server._directory.path(), 0o700),
                 (server.executable.as_path(), 0o700),
@@ -302,9 +350,9 @@ mod tests {
                 let actual = std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
                 assert_eq!(actual, mode, "incorrect permissions on {}", path.display());
             }
-            let socket = &server.environment()["SKYHOOK_ASKPASS_SOCKET"];
+            let socket = &server.environment()[SOCKET];
             assert_eq!(*socket, server.socket.to_string_lossy());
-            assert_ne!(*socket, std::env::var("SKYHOOK_ASKPASS_SOCKET").unwrap());
+            assert_ne!(*socket, std::env::var(SOCKET).unwrap());
             let answer = request_password(&server.socket).await;
             assert_eq!(answer.expose(), "private-answer");
         });
@@ -313,12 +361,12 @@ mod tests {
     #[tokio::test]
     async fn concurrent_servers_have_independent_handlers_and_cleanup() {
         let (first_handler, second_handler) = (fixed("first-answer"), fixed("second-answer"));
-        let first = AskpassServer::start(first_handler.clone()).unwrap();
-        let second = AskpassServer::start(second_handler.clone()).unwrap();
+        let first = start(first_handler.clone());
+        let second = start(second_handler.clone());
         assert_ne!(first._directory.path(), second._directory.path());
         assert_ne!(first.socket, second.socket);
         assert_ne!(first.executable, second.executable);
-        for key in ["SSH_ASKPASS", "SKYHOOK_ASKPASS_SOCKET"] {
+        for key in ["SSH_ASKPASS", SOCKET] {
             assert_ne!(first.environment()[key], second.environment()[key]);
         }
         let (first_answer, second_answer) = tokio::join!(
@@ -397,7 +445,7 @@ mod tests {
         }
         for prompt in ["Are you sure (yes/no)?", "Password:"] {
             let (client, server) = UnixStream::pair().unwrap();
-            let task = tokio::spawn(serve_one(server, Arc::new(Mismatched)));
+            let task = tokio::spawn(serve_one(server, Arc::new(Mismatched), None));
             assert!(matches!(
                 ask_for(client, prompt).await,
                 PromptAnswer::Rejected
@@ -410,7 +458,7 @@ mod tests {
     async fn rejected_prompts_are_distinct_from_empty_secrets() {
         let (client, server) = UnixStream::pair().unwrap();
         let rejecting = Arc::new(crate::remote::RejectSensitivePrompts);
-        let task = tokio::spawn(serve_one(server, rejecting));
+        let task = tokio::spawn(serve_one(server, rejecting, None));
         assert!(matches!(ask(client).await, PromptAnswer::Rejected));
         task.await.unwrap().unwrap();
         let empty = serde_json::from_str::<PromptAnswer>(r#"{"Secret":""}"#).unwrap();

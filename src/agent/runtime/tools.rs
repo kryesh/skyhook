@@ -10,17 +10,20 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{ModelEntry, Question, TodoItem, todo::TodoStore},
+    agent::{ModelEntry, Question, TodoItem},
     provider::profile::ModelRef,
     session::UserPart,
     tool::{
-        RegistryError, ToolError, ToolOptions, ToolRegistryBuilder,
+        AdmissionError, RegistryError, TARGET, ToolError, ToolOptions, ToolRegistryBuilder,
         diagnostic::{Effects, FailureSite, Operation, Subject},
-        policy::{Capability, CapabilitySet, Mode},
+        policy::{Capability, CapabilitySet, Mode, ModeName},
+        registry,
     },
 };
 
-use super::{AgentCommand, AgentLaunch, SessionRuntime, TurnFailure, queue::QueuedInput};
+use super::{
+    AgentCommand, AgentLaunch, Invocation, Resumed, SessionRuntime, TurnFailure, queue::QueuedInput,
+};
 
 /// Connect only root-eligible MCP servers; adapters enforce per-agent gates later.
 pub(super) async fn connect_mcp(
@@ -38,7 +41,7 @@ pub(super) async fn connect_mcp(
         )
         .await,
     );
-    let mut warnings = manager.warnings().to_vec();
+    let mut warnings = manager.warnings();
     warnings.extend(crate::mcp::adapter::register(
         builder,
         manager.clone(),
@@ -53,7 +56,7 @@ pub(super) struct AgentArgs {
     /// Task and context for the child.
     pub(super) prompt: String,
     /// Initial todo items, using the same format as todo.items.
-    pub(super) todos: Option<Vec<TodoItem>>,
+    pub(super) todos: Option<Vec<TodoItem<String>>>,
     /// Delegation depth available to the child; must be less than your available_depth.
     #[serde(default)]
     pub(super) depth: usize,
@@ -70,18 +73,11 @@ pub(super) struct AgentArgs {
     pub(super) workspace: Option<PathBuf>,
 }
 
-#[derive(Serialize, JsonSchema)]
-#[serde(untagged)]
-enum TodoOutput {
-    Updated { updated: bool },
-    Items { items: Vec<TodoItem> },
-}
-
 pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
     models: &indexmap::IndexMap<ModelRef, ModelEntry>,
-    modes: &indexmap::IndexMap<String, Mode>,
+    modes: &indexmap::IndexMap<ModeName, Mode>,
 ) -> Result<(), RegistryError> {
     register_wait(builder, runtime_slot.clone())?;
     register_ask(builder, runtime_slot.clone())?;
@@ -114,36 +110,62 @@ fn choice_input(summary: &str, choices: &[(&str, String)]) -> Option<Value> {
 #[serde(deny_unknown_fields)]
 struct TodoArgs {
     /// Replace your entire list. An empty array clears it. Cannot be combined with job.
-    items: Option<Vec<TodoItem>>,
+    items: Option<Vec<TodoItem<String>>>,
     /// Inspect a descendant's list using its agent job ID. Omit to read your own list.
     job: Option<crate::identity::JobId>,
+}
+
+enum TodoRequest {
+    Replace(Vec<TodoItem<String>>),
+    Inspect(Option<crate::identity::JobId>),
+}
+
+#[derive(Serialize, JsonSchema)]
+struct TodoList {
+    items: Vec<TodoItem>,
+}
+
+/// Admit todo items given as `argument`, rejecting blank text at its path.
+fn admit_todos(argument: &str, items: Vec<TodoItem<String>>) -> Result<Vec<TodoItem>, ToolError> {
+    let admit = |(index, TodoItem { text, status }): (usize, TodoItem<String>)| {
+        let path = [argument, &index.to_string(), "text"];
+        let text = text
+            .parse()
+            .map_err(|blank| invalid_argument(path, blank))?;
+        Ok(TodoItem { text, status })
+    };
+    items.into_iter().enumerate().map(admit).collect()
 }
 
 fn register_todo(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
 ) -> Result<(), RegistryError> {
-    builder.register::<TodoArgs, TodoOutput, _, _>(
+    builder.register_checked(
         "todo",
         "Read your list, replace it with items, or inspect a descendant by agent job ID. Only the owner can edit.",
-        ToolOptions::default(),
-        move |context, input| {
+        ToolOptions::default().result::<TodoList>(),
+        |TodoArgs { items, job }| match (items, job) {
+            (Some(_), Some(_)) => Err(AdmissionError::invalid_arguments("items and job cannot be combined")
+                .operation(Operation::Validate, Subject::argument(["job"])).effects(Effects::NotStarted)),
+            (Some(items), None) => Ok(TodoRequest::Replace(items)),
+            (None, job) => Ok(TodoRequest::Inspect(job)),
+        },
+        move |request| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
-            async move {
-                let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                if let Some(items) = input.items {
-                    if input.job.is_some() {
-                        return Err(invalid_argument("job", "items and job cannot be combined"));
-                    }
-                    TodoStore::validate(&items)?;
+            match request {
+                TodoRequest::Replace(items) => registry::AdmittedInvocation::unit(move |context| async move {
+                    let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                    let items = admit_todos("items", items)?;
                     runtime.todos.replace(context.agent(), items).await.map_err(|error| {
                         harness_error(error.into())
                             .operation(Operation::Save, Subject::Label(format!("todos for agent {}", context.agent()))).effects(Effects::Unknown)
-                    })?;
-                    Ok(TodoOutput::Updated { updated: true })
-                } else {
-                    Ok(TodoOutput::Items { items: runtime.todos.inspect(context.agent(), input.job).await?.items })
-                }
+                    })
+                }),
+                TodoRequest::Inspect(job) => registry::AdmittedInvocation::new(move |context| async move {
+                    let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                    registry::serialized(TodoList { items: runtime.todos.inspect(context.agent(), job).await? })
+                }),
             }
         },
     )?;
@@ -157,7 +179,7 @@ fn register_wait(
     builder.register::<super::wait::WaitArgs, super::wait::WaitOutput, _, _>(
         "wait",
         "Wait for any notification or input relevant to this agent. Optional timeout is a positive integer number of seconds; omitted/null waits indefinitely. Returns {reason: event|timeout}. Does not consume notifications or retrieve output; use jobs to inspect saved output. Cancellation interrupts the wait. A timeout ends this wait, not background work; wait again if still dependent on it.",
-        ToolOptions::default(),
+        ToolOptions::default().job_role(crate::job::JobRole::Wait),
         move |context, args| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
@@ -191,7 +213,7 @@ fn register_child_agent(
     builder: &mut ToolRegistryBuilder,
     runtime_slot: Arc<OnceLock<Weak<SessionRuntime>>>,
     models: &indexmap::IndexMap<ModelRef, ModelEntry>,
-    modes: &indexmap::IndexMap<String, Mode>,
+    modes: &indexmap::IndexMap<ModeName, Mode>,
 ) -> Result<(), RegistryError> {
     let hinted = |(name, entry): (&ModelRef, &ModelEntry)| {
         let hint = entry.profile.hint.as_ref()?;
@@ -200,12 +222,12 @@ fn register_child_agent(
     let models: Vec<_> = models.iter().filter_map(hinted).collect();
     let modes = modes.clone();
     builder.register::<AgentArgs, String, _, _>(
-        "agent",
-        "Start a child agent. Names are unique among your own installed children, including terminal children; other callers may reuse the same names. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Replies arrive as events. Sending input to a completed child resumes its retained history under the same job ID.",
+        crate::tool::builtins::names::AGENT,
+        "Start a child agent. Names are unique among your own installed children, including terminal children; other callers may reuse the same names. Send follow-ups or answers with tool.job(id).send({value: ...}). Questions pause the child; follow-ups arrive automatically at its next model-request boundary. Earlier replies arrive as events; the final reply is the job's result. Sending input to a completed child resumes its retained history under the same job ID.",
         ToolOptions::default().job_role(crate::job::JobRole::Agent)
             .named()
             .requires(Capability::Agents)
-            .conditional_input("target", Capability::Targets, crate::target::TargetRef::schema())
+            .conditional_input(TARGET, Capability::Targets, crate::target::TargetRef::schema())
             .computed_input("model", move |_| {
                 let choices: Vec<_> = models.iter().map(|(name, text)| (name.as_str(), text.clone())).collect();
                 choice_input("Model for the child; omitted inherits yours.", &choices)
@@ -216,53 +238,53 @@ fn register_child_agent(
                     .map(|(name, mode)| {
                         let granted: Vec<_> = mode.capabilities.iter().map(|capability| capability.as_str()).collect();
                         let granted = if granted.is_empty() { "none".to_owned() } else { granted.join(", ") };
-                        let hint = mode.hint.as_deref().unwrap_or_default();
+                        let hint = mode.hint.as_ref().map_or("", crate::Prose::as_str);
                         (name.as_str(), format!(" [{granted}]: {hint}"))
                     })
                     .collect();
                 choice_input("Mode limiting what the child can do; omitted inherits what you can.", &choices)
             })
             .background()
-            .input(),
+            .input()
+            .job_location(|input: &AgentArgs| crate::tool::JobLocation {
+                target: input.target.clone(),
+                workspace: input.workspace.clone(),
+            }),
         move |context, input| {
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
+                let todos = input.todos.map(|items| admit_todos("todos", items)).transpose()?;
                 // Only hinted models were offered; anything else is unknown to the caller.
                 let model = match input.model {
                     Some(name) => {
                         let hinted = |model: &ModelRef| runtime.harness.models.get(model).is_some_and(|entry| entry.profile.hint.is_some());
                         let model = name.parse::<ModelRef>().ok().filter(hinted);
-                        Some(model.ok_or_else(|| invalid_argument("model", format!("unknown model `{name}`")))?)
+                        Some(model.ok_or_else(|| invalid_argument(["model"], format!("unknown model `{name}`")))?)
                     }
                     None => None,
                 };
-                let capabilities = match &input.mode {
-                    None => context.capabilities().clone(),
+                let (mode, capabilities) = match &input.mode {
+                    None => (None, context.capabilities().clone()),
                     Some(name) => {
-                        let offered = |mode: &&Mode| offers_mode(mode, context.capabilities());
-                        if runtime.modes.get(name).filter(offered).is_none() {
-                            return Err(invalid_argument("mode", format!("unknown mode `{name}`")));
-                        }
+                        let offered = |(_, mode): &(&ModeName, &Mode)| offers_mode(mode, context.capabilities());
+                        let Some((name, mode)) = runtime.modes.get_key_value(name.as_str()).filter(offered) else {
+                            return Err(invalid_argument(["mode"], format!("unknown mode `{name}`")));
+                        };
                         // Interaction follows the caller, as the root's follows the host.
-                        let granted = runtime.mode_capabilities(name).map_err(|error| harness_error(error)
-                            .operation(Operation::Prepare, Subject::argument(["mode"])).effects(Effects::NotStarted))?;
-                        &granted & context.capabilities()
+                        (Some(name.clone()), &runtime.granted_by(mode) & context.capabilities())
                     }
                 };
                 let available_depth = runtime.available_depth(context.agent());
-                let todos = input.todos;
-                if let Some(items) = &todos {
-                    TodoStore::validate(items)?;
-                }
                 if input.depth >= available_depth {
-                    return Err(invalid_argument("depth", format!(
+                    return Err(invalid_argument(["depth"], format!(
                         "depth must be less than the caller's available depth of {available_depth}"
                     )));
                 }
+                let launched = runtime.jobs.metadata(context.job()).await.map_err(|error| harness_error(error.into())
+                    .operation(Operation::Inspect, Subject::Job(context.job())).effects(Effects::Unchanged))?;
                 // A reused name is a follow-up aimed at the wrong tool.
-                if let Some(name) = runtime.jobs.metadata(context.job()).await.map_err(|error| harness_error(error.into())
-                    .operation(Operation::Inspect, Subject::Job(context.job())).effects(Effects::Unchanged))?.name
+                if let Some(name) = launched.name
                     && let Some(id) = runtime.jobs.child_name_owner(context.agent(), &name, context.job()).await
                 {
                     return Err(ToolError::invalid_arguments(format!(
@@ -275,29 +297,12 @@ fn register_child_agent(
                         .get(context.agent()).map(|agent| agent.model.clone()))
                     .ok_or_else(|| ToolError::failed("parent agent is no longer running")
                         .operation(Operation::Lookup, Subject::Label(format!("parent agent {}", context.agent()))).effects(Effects::NotStarted))?;
-                let mut location = crate::target::select_location(
-                    context.caller_location(),
-                    &runtime.harness.workspace,
-                    input.target.as_ref(),
-                    context.capabilities(),
-                    Some(&runtime.router),
-                ).await.map_err(|error| error
-                    .operation(Operation::Lookup, Subject::argument(["target"])).effects(Effects::NotStarted))?
-                    .location;
-                if let Some(workspace) = input.workspace {
-                    if workspace.as_os_str().is_empty() {
-                        return Err(invalid_argument("workspace", "workspace cannot be empty"));
-                    }
-                    location.workspace = location.workspace.join(workspace);
-                }
-                let sender = runtime.spawn_agent(AgentLaunch {
-                    id: child.clone(),
-                    owner_job: Some(context.job()),
-                    model: Some(model),
+                let sender = runtime.spawn_agent(child.clone(), Some(context.job()), AgentLaunch::New {
+                    model,
                     todos,
                     available_depth: input.depth,
-                    location,
-                    mode: input.mode,
+                    location: launched.location,
+                    mode,
                     capabilities,
                 }).await.map_err(|error| harness_error(error)
                     .operation(Operation::Create, Subject::Label(format!("child agent {child}"))).effects(Effects::Unknown))?;
@@ -358,18 +363,11 @@ pub(super) fn child_resume_handler(
             let sender = match runtime.agent_sender(&child) {
                 Some(sender) => sender,
                 None => runtime
-                    .spawn_agent(AgentLaunch {
-                        id: child.clone(),
-                        owner_job: Some(authorization.job),
-                        // The journaled contract supplies the model, depth and location.
-                        model: None,
-                        todos: None,
-                        available_depth: 0,
-                        location: execution_location.clone(),
-                        mode: None,
-                        // The journaled contract narrows this.
-                        capabilities: runtime.capabilities.clone(),
-                    })
+                    .spawn_agent(
+                        child.clone(),
+                        Some(authorization.job),
+                        AgentLaunch::Resume(Resumed::Idle),
+                    )
                     .await
                     .map_err(|error| {
                         harness_error(error)
@@ -409,7 +407,7 @@ async fn send_child_input(
     let input = AgentCommand::Input {
         options: Default::default(),
         content,
-        done: Some(done),
+        done: Some(super::RequestCompletion::Child(done)),
     };
     let sent = sender.send(input).await;
     sent.map_err(|_| ToolError::failed("child agent stopped before accepting input"))?;
@@ -433,7 +431,7 @@ async fn run_child_request(
                 .effects(effects)
         }
     };
-    let completion_gate = runtime
+    let invocation = runtime
         .agents()
         .get(child)
         .ok_or_else(|| {
@@ -442,9 +440,9 @@ async fn run_child_request(
             ))
         })?
         .control
-        .completion_gate
+        .invocation
         .clone();
-    *completion_gate.lock().await = true;
+    *invocation.lock().await = Invocation::Open;
     let mut done_rx = send_child_input(sender, content)
         .await
         .map_err(failure(Operation::Send, Effects::NotStarted))?;
@@ -460,9 +458,9 @@ async fn run_child_request(
                 let inputs = context.drain_input_or_close().await;
                 if inputs.is_empty() { return Ok(text); }
                 // Owner input continues this invocation instead of finishing the job, so
-                // the answer above, published without a wake, needs its wake here.
+                // the answer above, held for its result, is released as a reply.
                 runtime.jobs.notify_owner(context.job()).await;
-                *completion_gate.lock().await = true;
+                *invocation.lock().await = Invocation::Open;
                 let content = inputs.iter().map(owner_input).collect();
                 done_rx = send_child_input(sender, content).await.map_err(|error| failure(Operation::Send, Effects::NotStarted)(error)
                     .with_result(crate::tool::ToolOutput::new(json!(text))))?;
@@ -479,12 +477,12 @@ async fn run_child_request(
                 if !runtime.questions.answer_child_question(context.job(), value.clone()).await
                     .map_err(|error| failure(Operation::Send, Effects::Unknown)(harness_error(error)))?
                 {
-                    let mut active = completion_gate.lock().await;
-                    if !*active {
+                    let mut active = invocation.lock().await;
+                    if *active == Invocation::Resolved {
                         // The child already resolved this invocation; owner input restarts
-                        // it, so an answer published without a wake needs its wake here.
+                        // it, so the held answer is released as a reply.
                         runtime.jobs.notify_owner(context.job()).await;
-                        *active = true;
+                        *active = Invocation::Open;
                         done_rx = send_child_input(sender, vec![owner_input(&value)]).await.map_err(failure(Operation::Send, Effects::NotStarted))?;
                         continue;
                     }
@@ -503,9 +501,12 @@ async fn run_child_request(
     }
 }
 
-fn invalid_argument(argument: &str, message: impl std::fmt::Display) -> ToolError {
+fn invalid_argument<S: AsRef<str>>(
+    path: impl IntoIterator<Item = S>,
+    message: impl std::fmt::Display,
+) -> ToolError {
     ToolError::invalid_arguments(message)
-        .operation(Operation::Validate, Subject::argument([argument]))
+        .operation(Operation::Validate, Subject::argument(path))
         .effects(Effects::NotStarted)
 }
 
@@ -527,7 +528,7 @@ pub(super) fn harness_error(error: crate::agent::HarnessError) -> ToolError {
         HarnessError::Io(error) => ToolError::io(error),
         HarnessError::Session(error) => error.into(),
         HarnessError::Job(error) => error.into(),
-        HarnessError::Execution(error) => error.into_tool_error(),
+        HarnessError::Execution(error) => error,
         error => ToolError::failed(error),
     }
 }
@@ -571,9 +572,7 @@ for line in sys.stdin:
             "transport":"stdio",
             "start_command":["python3", "-u", "-c", FIXTURE],
             "env":{"MCP_RUNTIME_MARKER":root.join("launched")},
-            "capabilities":capabilities,
-            "startup_timeout_secs":5,
-            "call_timeout_secs":5
+            "capabilities":capabilities
         }))
         .unwrap()
     }
@@ -583,8 +582,10 @@ for line in sys.stdin:
     }
 
     fn mcp_names(session: &SessionHandle) -> Vec<String> {
-        let tools = session.runtime.executor.registry().tools();
-        let names = tools.map(|tool| tool.name().to_owned());
+        let all = crate::tool::policy::Capability::ALL.into_iter().collect();
+        let tools = session.runtime.executor.registry();
+        let tools = tools.surface_for_agent(&all, &session.root).definitions();
+        let names = tools.into_iter().map(|tool| tool.name);
         names.filter(|name| name.starts_with("mcp_")).collect()
     }
 
@@ -633,7 +634,7 @@ for line in sys.stdin:
             let http = serde_json::from_value(json!({
                 "transport":"streamable_http",
                 "url":format!("http://{}/mcp", listener.local_addr().unwrap()),
-                "capabilities":required, "startup_timeout_secs":1
+                "capabilities":required
             }))
             .unwrap();
             let mcp = BTreeMap::from([
@@ -690,7 +691,12 @@ for line in sys.stdin:
         // Also test a discovered adapter with empty server requirements. Startup
         // omission alone would not catch a missing adapter-level global gate.
         let disabled = executor.with_capabilities(CapabilitySet::empty());
-        assert!(disabled.surface().get(&name).is_none());
+        assert!(
+            disabled
+                .surface_for_agent(&session.root)
+                .get(&name)
+                .is_none()
+        );
         let denied = json!({"text":"denied"});
         let direct = disabled.execute(session.root.clone(), &name, denied.clone(), None);
         assert!(direct.await.is_err());
@@ -703,7 +709,7 @@ for line in sys.stdin:
 
     /// An agent may name only hinted models, and hinted modes within what it holds
     /// itself; with none to name, the input is absent. A chosen mode is the child's.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn children_take_only_hinted_models_and_modes_their_parent_could_hold() {
         use crate::tool::policy::Mode;
         let root = tempfile::tempdir().unwrap();
@@ -728,8 +734,8 @@ for line in sys.stdin:
 
         let mode = |capabilities: &[Capability], hint: Option<&str>| Mode {
             capabilities: capabilities.to_vec(),
-            instructions: Some(format!("Holds {}.", capabilities.len())),
-            hint: hint.map(str::to_owned),
+            instructions: Some(format!("Holds {}.", capabilities.len()).parse().unwrap()),
+            hint: hint.map(|hint| hint.parse().unwrap()),
         };
         let (read, agents) = (Capability::Read, Capability::Agents);
         let modes = [
@@ -746,14 +752,18 @@ for line in sys.stdin:
             ("secret", mode(&[read], None)),
         ];
         let cheap = ModelProfile {
-            hint: Some("Cheap".into()),
-            ..ModelProfile::new("cheap", None, 128_000, 4096, false)
+            hint: Some("Cheap".parse().unwrap()),
+            ..crate::tests::profile("cheap", false)
         };
         let provider = scripted_provider(&requests, (0..3).map(|_| answer("done")));
         let harness = serving(root.path(), provider, [("cheap", cheap)])
             .session_root(root.path().join("hinted"))
             .max_child_depth(2)
-            .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).into())
+            .modes(
+                modes
+                    .map(|(name, mode)| (name.parse().unwrap(), mode))
+                    .into(),
+            )
             .build()
             .await
             .unwrap();
@@ -791,7 +801,7 @@ for line in sys.stdin:
             json!(["scout", "idle", null])
         );
         let child = requests.lock().unwrap()[1].clone();
-        assert_eq!(child.model, "cheap");
+        assert_eq!(child.model.as_str(), "cheap");
         assert!(
             child.system[0]
                 .text
@@ -801,7 +811,40 @@ for line in sys.stdin:
         let started = events!(&records, SessionEvent::AgentStarted { mode, capabilities, .. } => (mode.clone().map(|mode| mode.name), capabilities.clone()));
         // Interaction follows the parent; the mode grants the rest.
         let held = vec![read, agents, Capability::Interactive];
-        assert_eq!(started[1], (Some("scout".to_owned()), held));
+        assert_eq!(started[1], (Some(mode_name("scout")), held));
+        shutdown_session(session).await;
+    }
+
+    /// Replacing a list completes without a result, inspecting returns the
+    /// items, and blank text is rejected at its argument path.
+    #[tokio::test]
+    async fn todo_replace_has_no_result_and_inspect_returns_items() {
+        use crate::tool::diagnostic::{Cause, Subject};
+        let root = tempfile::tempdir().unwrap();
+        let harness = builder(root.path(), Requests::default())
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let executor = &session.runtime.executor;
+        let todo = |arguments| {
+            bounded(executor.execute_model(session.root.clone(), "todo", arguments, None))
+        };
+        let items = json!([{"text":"done","status":"completed"}]);
+        let replaced = todo(json!({"items":items})).await.unwrap();
+        assert_eq!(replaced.output.value, json!({}));
+        let inspected = todo(json!({})).await.unwrap();
+        assert_eq!(inspected.output.value["result"], json!({"items":items}));
+        let blank = json!([{"text":"done","status":"completed"}, {"text":" ","status":"pending"}]);
+        let error = executor.execute(session.root.clone(), "todo", json!({"items":blank}), None);
+        let error = bounded(error).await.unwrap_err();
+        let diagnostic = error.diagnostic();
+        assert_eq!(
+            diagnostic.context.subject,
+            Subject::argument(["items", "1", "text"])
+        );
+        let blank = Cause::InvalidArguments("text must not be blank".into());
+        assert_eq!(diagnostic.cause, blank);
         shutdown_session(session).await;
     }
 
@@ -852,7 +895,7 @@ for line in sys.stdin:
 
     /// A child in a mode is held to it: depth still withholds `agents`, a mode it could
     /// not hold is unknown to it, and a restart returns it to the mode as pinned.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_child_keeps_its_mode_through_depth_delegation_and_restart() {
         use crate::tool::policy::Mode;
         let root = tempfile::tempdir().unwrap();
@@ -860,8 +903,8 @@ for line in sys.stdin:
         let requests = Requests::default();
         let mode = |capabilities: &[Capability], instructions: &str| Mode {
             capabilities: capabilities.to_vec(),
-            instructions: Some(instructions.to_owned()),
-            hint: Some("Hinted".into()),
+            instructions: Some(instructions.parse().unwrap()),
+            hint: Some("Hinted".parse().unwrap()),
         };
         let (read, write, agents) = (Capability::Read, Capability::Write, Capability::Agents);
         let build = |scout: Mode, responses: Vec<Vec<ResponseEvent>>| {
@@ -872,7 +915,11 @@ for line in sys.stdin:
             ];
             test_builder(root.path(), &sessions, provider, false)
                 .max_child_depth(2)
-                .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).into())
+                .modes(
+                    modes
+                        .map(|(name, mode)| (name.parse().unwrap(), mode))
+                        .into(),
+                )
                 .build()
         };
         let scout = mode(&[read, agents], "Scout.");
@@ -892,7 +939,7 @@ for line in sys.stdin:
             "held"
         );
         let records = session.runtime.store.records().await;
-        let started = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), capabilities, .. } if mode.name == "scout" => capabilities.clone());
+        let started = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), capabilities, .. } if mode.name.as_str() == "scout" => capabilities.clone());
         let interactive = Capability::Interactive;
         assert_eq!(
             started,
@@ -951,7 +998,7 @@ for line in sys.stdin:
         let (_store, records) = crate::session::SessionStore::open(&sessions, id)
             .await
             .unwrap();
-        let pinned = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name == "scout" => mode.definition.clone());
+        let pinned = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name.as_str() == "scout" => mode.definition.clone());
         assert_eq!(pinned, [Some(scout), None]);
     }
 
@@ -964,7 +1011,7 @@ for line in sys.stdin:
         let mode = |capabilities: &[Capability]| Mode {
             capabilities: capabilities.to_vec(),
             instructions: None,
-            hint: Some("Hinted".into()),
+            hint: Some("Hinted".parse().unwrap()),
         };
         let modes = [
             ("work", mode(&[Capability::Read, Capability::Agents])),
@@ -973,7 +1020,11 @@ for line in sys.stdin:
         let provider = scripted_provider(&requests, (0..8).map(|_| answer("done")));
         let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
             .max_child_depth(1)
-            .modes(modes.map(|(name, mode)| (name.to_owned(), mode)).into())
+            .modes(
+                modes
+                    .map(|(name, mode)| (name.parse().unwrap(), mode))
+                    .into(),
+            )
             .build()
             .await
             .unwrap();
@@ -982,7 +1033,7 @@ for line in sys.stdin:
                       return (await Promise.all(all)).length;";
         assert_eq!(session.run_script(script).await.unwrap().value["value"], 8);
         let records = session.runtime.store.records().await;
-        let looks = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name == "look" => mode.definition.is_some());
+        let looks = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name.as_str() == "look" => mode.definition.is_some());
         assert_eq!(
             (looks.len(), looks.iter().filter(|pinned| **pinned).count()),
             (8, 1)
@@ -1059,7 +1110,7 @@ for line in sys.stdin:
         shutdown_session(session).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn root_interactive_gate_covers_dispatch_and_nested_scripts() {
         for enabled in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -1071,7 +1122,7 @@ for line in sys.stdin:
             }
             let questions = RecordingQuestions {
                 batches: batches.clone(),
-                answer: json!("host-answer"),
+                answer: "host-answer".into(),
                 ..Default::default()
             };
             let harness = builder(root.path(), requests.clone())
@@ -1136,5 +1187,27 @@ for line in sys.stdin:
             }
             shutdown_session(session).await;
         }
+    }
+
+    /// A background handle reports where the child runs, not where the tool does.
+    #[tokio::test]
+    async fn background_child_handle_reports_the_childs_workspace() {
+        let (_root, _requests, session) = scripted_session([answer("child done")]).await;
+        let workspace = session.runtime.harness.workspace.join("sub");
+        std::fs::create_dir(&workspace).unwrap();
+        let arguments = json!({"prompt":"work", "workspace":"sub", "bg":true});
+        let executor = &session.runtime.executor;
+        let launched = executor.execute(session.root.clone(), "agent", arguments, None);
+        let launched = launched.await.unwrap();
+        let handle = launched.output.value;
+        assert_eq!(
+            handle["meta"]["workspace"],
+            workspace.to_string_lossy().as_ref()
+        );
+        assert_eq!(
+            terminal(&session, launched.job).await.location.workspace,
+            workspace
+        );
+        shutdown_session(session).await;
     }
 }

@@ -3,28 +3,67 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
-use super::native::*;
-use crate::provider::{
-    ProviderError, ProviderErrorKind,
-    codec::{
-        common::{Finish, block_ref, delta, is_signed, item_id, position, replay, single_block},
-        usage::{Counters, InputAccounting, Observed},
-    },
-    http::{
-        errors::{self, ErrorSignals},
-        transport::SseEvent,
-    },
-    protocol::{
-        AssistantItem, Binding, CutReason, ItemKind, Replay, ReplayFormat, ResponseEvent, Scope,
-        ToolCall, Usage,
+use super::{
+    Code, NATIVE,
+    native::{BlockType, initial_input, tool_content},
+};
+use crate::{
+    named_enum::{NamedEnum, named_enum},
+    provider::{
+        ProviderError,
+        codec::{
+            common::{
+                Finish, Settle, Settlement, StopReason, delta, is_signed, position, replay, tagged,
+            },
+            openai,
+            usage::{Counters, InputAccounting, Observed, Spelling},
+        },
+        http::{
+            errors::{self, ErrorSignals},
+            transport::SseEvent,
+        },
+        protocol::{
+            AssistantItem, Binding, Completion, ItemKind, Replay, ReplayFormat, ResponseEvent,
+            Scope, ToolCall,
+        },
     },
 };
 
-// Native kind is decoded once at block admission. The opaque JSON remains
-// attached to its kind so signed reasoning is never regenerated; unsigned
-// thinking is rebuilt.
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    parsed enum Event {
+        MessageStart = "message_start",
+        BlockStart = "content_block_start",
+        BlockDelta = "content_block_delta",
+        BlockStop = "content_block_stop",
+        MessageDelta = "message_delta",
+        MessageStop = "message_stop",
+        Ping = "ping",
+        Error = "error",
+    }
+}
+
+named_enum! {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    parsed enum DeltaType {
+        Text = "text_delta",
+        Thinking = "thinking_delta",
+        Signature = "signature_delta",
+        InputJson = "input_json_delta",
+    }
+}
+
+const USAGE: Spelling = Spelling {
+    input: &["/input_tokens"],
+    cached: &["/cache_read_input_tokens"],
+    written: &["/cache_creation_input_tokens"],
+    output: &["/output_tokens"],
+};
+
+// Native kind is decoded once at block admission. Thinking keeps its opaque
+// JSON so signed reasoning is never regenerated; unsigned thinking is rebuilt.
 enum StreamingBlock {
-    Text(Value),
+    Text(String),
     Thinking(Value),
     RedactedThinking(Value),
     Tool {
@@ -75,19 +114,6 @@ fn thinking_replay(model: &str, scope: &Scope, native: &Value) -> Replay {
     )
 }
 
-/// Unknown reasons, including `pause_turn` (its calls are not final), end the turn
-/// without executing tools.
-fn classify_stop(reason: &str) -> Finish {
-    match reason.to_ascii_lowercase().as_str() {
-        "tool_use" | "end_turn" | "stop_sequence" => Finish::Normal,
-        "max_tokens" => Finish::Cut(CutReason::MaxTokens),
-        // An overflow fails the attempt: its output is discarded and the context compacted.
-        "model_context_window_exceeded" => Finish::Error(ProviderErrorKind::ContextWindowExceeded),
-        "refusal" => Finish::Cut(CutReason::Refusal),
-        _ => Finish::Cut(CutReason::Incomplete),
-    }
-}
-
 impl Block {
     fn is_tool(&self) -> bool {
         matches!(
@@ -99,71 +125,108 @@ impl Block {
     }
 }
 
-/// Read a string field that later deltas append to, defaulting it to empty.
-fn ensure_string(native: &mut Value, field: &str) -> String {
-    match native.get(field).and_then(Value::as_str) {
-        Some(text) => text.to_owned(),
-        None => {
-            native[field] = Value::String(String::new());
-            String::new()
-        }
+/// Append to a string field that the block's start ensured.
+fn append(native: &mut Value, field: &str, suffix: &str) {
+    if let Some(Value::String(text)) = native.get_mut(field) {
+        text.push_str(suffix);
     }
 }
 
 impl StreamingBlock {
-    fn start(mut native: Value, id: usize) -> Result<(Self, Vec<ResponseEvent>), ProviderError> {
-        let kind = native.get("type").and_then(Value::as_str).unwrap_or("");
-        let (block, kind, text) = match kind {
-            "text" => {
-                let text = ensure_string(&mut native, "text");
-                (Self::Text(native), ItemKind::Text, text)
+    fn start(
+        mut native: Value,
+        id: usize,
+        events: &mut Vec<ResponseEvent>,
+    ) -> Result<Self, ProviderError> {
+        let mut stream = |kind, text: &str| {
+            if !text.is_empty() {
+                events.push(delta(id, kind, text));
             }
-            "thinking" => {
-                let text = ensure_string(&mut native, "thinking");
-                ensure_string(&mut native, "signature");
-                (Self::Thinking(native), ItemKind::Reasoning, text)
+        };
+        let field = |native: &Value, name| {
+            native
+                .get(name)
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_owned()
+        };
+        Ok(match tagged(&native) {
+            Some(BlockType::Text) => {
+                let text = field(&native, "text");
+                stream(ItemKind::Text, &text);
+                Self::Text(text)
             }
-            "redacted_thinking"
-                if native
-                    .get("data")
-                    .and_then(Value::as_str)
-                    .is_some_and(|data| !data.is_empty()) =>
-            {
-                (
-                    Self::RedactedThinking(native),
-                    ItemKind::Reasoning,
-                    String::new(),
-                )
+            Some(BlockType::Thinking) => {
+                // Later deltas append to both fields.
+                for name in ["thinking", "signature"] {
+                    native[name] = Value::String(field(&native, name));
+                }
+                stream(ItemKind::Reasoning, &field(&native, "thinking"));
+                Self::Thinking(native)
             }
-            "tool_use" => {
-                if string(&native, "id")?.is_empty() || string(&native, "name")?.is_empty() {
-                    return Err(protocol("tool_use requires nonempty id and name"));
+            Some(BlockType::RedactedThinking) if !field(&native, "data").is_empty() => {
+                Self::RedactedThinking(native)
+            }
+            Some(BlockType::ToolUse) => {
+                if NATIVE.string(&native, "id")?.is_empty()
+                    || NATIVE.string(&native, "name")?.is_empty()
+                {
+                    return Err(NATIVE.error("tool_use requires nonempty id and name"));
                 }
                 initial_input(&native)?;
-                (
-                    Self::Tool {
-                        native,
-                        partial_json: None,
-                        unreadable: false,
-                    },
-                    ItemKind::ToolCall,
-                    String::new(),
-                )
+                Self::Tool {
+                    native,
+                    partial_json: None,
+                    unreadable: false,
+                }
             }
-            _ => return Ok((Self::Ignored, Vec::new())),
+            Some(BlockType::RedactedThinking) | None => Self::Ignored,
+        })
+    }
+
+    fn delta(
+        &mut self,
+        id: usize,
+        value: &Value,
+        events: &mut Vec<ResponseEvent>,
+    ) -> Result<(), ProviderError> {
+        let mut stream = |kind, text: &str| {
+            if !text.is_empty() {
+                events.push(delta(id, kind, text));
+            }
         };
-        let mut events = Vec::new();
-        if !text.is_empty() {
-            events.push(delta(block_ref(id), kind, text));
+        match (self, tagged(value)) {
+            (Self::Text(text), Some(DeltaType::Text)) => {
+                let fragment = NATIVE.string(value, "text")?;
+                text.push_str(fragment);
+                stream(ItemKind::Text, fragment);
+            }
+            (Self::Thinking(native), Some(DeltaType::Thinking)) => {
+                let fragment = NATIVE.string(value, "thinking")?;
+                append(native, "thinking", fragment);
+                stream(ItemKind::Reasoning, fragment);
+            }
+            (Self::Thinking(native), Some(DeltaType::Signature)) => {
+                append(native, "signature", NATIVE.string(value, "signature")?);
+            }
+            (Self::Tool { partial_json, .. }, Some(DeltaType::InputJson)) => {
+                let fragment = NATIVE.string(value, "partial_json")?;
+                partial_json
+                    .get_or_insert_with(String::new)
+                    .push_str(fragment);
+                stream(ItemKind::ToolCall, fragment);
+            }
+            (Self::Tool { unreadable, .. }, _) => *unreadable = true,
+            _ => {}
         }
-        Ok((block, events))
+        Ok(())
     }
 
     fn complete(&self, model: &str, scope: &Scope) -> Result<Block, ProviderError> {
         let content = match self {
-            Self::Text(native) => CompletedBlock::Text(string(native, "text")?.into()),
+            Self::Text(text) => CompletedBlock::Text(text.clone()),
             Self::Thinking(native) => CompletedBlock::Reasoning {
-                text: string(native, "thinking")?.into(),
+                text: NATIVE.string(native, "thinking")?.into(),
                 replay: thinking_replay(model, scope, native),
             },
             Self::RedactedThinking(native) => CompletedBlock::Reasoning {
@@ -178,9 +241,9 @@ impl StreamingBlock {
             Self::Tool {
                 unreadable: true, ..
             } => {
-                return Ok(Block::PendingToolError(protocol(
-                    "unsupported delta for tool input",
-                )));
+                return Ok(Block::PendingToolError(
+                    NATIVE.error("unsupported delta for tool input"),
+                ));
             }
             Self::Tool {
                 native,
@@ -202,9 +265,7 @@ pub(crate) struct Decoder {
     model: String,
     scope: Scope,
     started: bool,
-    message_delta: bool,
-    stopped: bool,
-    finish: Option<Finish>,
+    settlement: Settlement,
     blocks: BTreeMap<usize, Block>,
     usage: Counters,
     errors: ErrorSignals,
@@ -217,156 +278,130 @@ impl Decoder {
             scope,
             errors,
             started: false,
-            message_delta: false,
-            stopped: false,
-            finish: None,
+            settlement: Settlement::Open,
             blocks: BTreeMap::new(),
             usage: Counters::new(InputAccounting::FreshPrompt),
         }
     }
 
     pub(crate) fn decode(&mut self, event: &SseEvent) -> Result<Vec<ResponseEvent>, ProviderError> {
-        if self.stopped {
-            return Err(protocol("event after message_stop"));
+        if self.settlement == Settlement::Ended {
+            return Err(NATIVE.error("event after message_stop"));
         }
         let value: Value =
-            serde_json::from_str(&event.data).map_err(|_| protocol("invalid SSE JSON"))?;
+            serde_json::from_str(&event.data).map_err(|_| NATIVE.error("invalid SSE JSON"))?;
         // The payload type wins over a missing or mislabeled SSE event name.
-        let kind = value
+        let name = value
             .get("type")
             .and_then(Value::as_str)
             .or(event.event.as_deref())
-            .ok_or_else(|| protocol("missing event type"))?;
-        if kind == "error" {
-            let reading = super::read_error(&value);
-            return Err(errors::classify(None, &value, reading, self.errors, None));
-        }
-        if kind == "ping" {
-            return Ok(Vec::new());
+            .ok_or_else(|| NATIVE.error("missing event type"))?;
+        let kind = Event::parse(name);
+        if matches!(
+            kind,
+            Some(Event::BlockStart | Event::BlockDelta | Event::BlockStop)
+        ) && self.settlement != Settlement::Open
+        {
+            return Err(NATIVE.error("content event after terminal message_delta"));
         }
         let mut events = Vec::new();
-        if kind == "message_start" {
-            if self.started {
-                return Err(protocol("duplicate message_start"));
-            }
-            self.started = true;
-            let usage = value
-                .get("message")
-                .and_then(|message| message.get("usage"));
-            self.push_usage(usage, &mut events)?;
-            return Ok(events);
-        }
-        // A stream without message_start is still decoded.
-        self.started = true;
         match kind {
-            "content_block_start" => {
-                self.require_content_phase()?;
-                let id = index(&value)?;
+            Some(Event::Error) => {
+                let reading = openai::read::<Code>(&value);
+                return Err(errors::classify(None, &value, reading, self.errors, None));
+            }
+            Some(Event::MessageStart) => {
+                if self.started {
+                    return Err(NATIVE.error("duplicate message_start"));
+                }
+                self.push_usage(value.pointer("/message/usage"), &mut events);
+            }
+            Some(Event::BlockStart) => {
+                let id = NATIVE.index(&value, "index")?;
                 if self.blocks.contains_key(&id) {
-                    return Err(protocol(format!("duplicate content block index {id}")));
+                    return Err(NATIVE.error(format_args!("duplicate content block index {id}")));
                 }
                 let native = value
                     .get("content_block")
-                    .ok_or_else(|| protocol("missing content_block"))?
+                    .ok_or_else(|| NATIVE.error("missing content_block"))?
                     .clone();
-                let (block, started) = StreamingBlock::start(native, id)?;
+                let block = StreamingBlock::start(native, id, &mut events)?;
                 self.blocks.insert(id, Block::Streaming(block));
-                events.extend(started);
             }
-            "content_block_delta" => {
-                self.require_content_phase()?;
-                let id = index(&value)?;
-                let block = self
-                    .blocks
-                    .get_mut(&id)
-                    .and_then(|block| match block {
-                        Block::Streaming(block) => Some(block),
-                        _ => None,
-                    })
-                    .ok_or_else(|| protocol(format!("delta for unopened or ended block {id}")))?;
+            Some(Event::BlockDelta) => {
+                let id = NATIVE.index(&value, "index")?;
+                let Some(Block::Streaming(block)) = self.blocks.get_mut(&id) else {
+                    return Err(
+                        NATIVE.error(format_args!("delta for unopened or ended block {id}"))
+                    );
+                };
                 let value = value
                     .get("delta")
-                    .ok_or_else(|| protocol("missing content delta"))?;
-                let kind = value.get("type").and_then(Value::as_str).unwrap_or("");
-                match (block, kind) {
-                    (StreamingBlock::Text(native), "text_delta")
-                    | (StreamingBlock::Thinking(native), "thinking_delta") => {
-                        let field = kind.trim_end_matches("_delta");
-                        let text = string(value, field)?;
-                        append(native, field, text)?;
-                        let kind = if field == "text" {
-                            ItemKind::Text
-                        } else {
-                            ItemKind::Reasoning
-                        };
-                        if !text.is_empty() {
-                            events.push(delta(block_ref(id), kind, text));
-                        }
-                    }
-                    (StreamingBlock::Thinking(native), "signature_delta") => {
-                        append(native, "signature", string(value, "signature")?)?;
-                    }
-                    (StreamingBlock::Tool { partial_json, .. }, "input_json_delta") => {
-                        let fragment = string(value, "partial_json")?;
-                        partial_json
-                            .get_or_insert_with(String::new)
-                            .push_str(fragment);
-                        if !fragment.is_empty() {
-                            events.push(delta(block_ref(id), ItemKind::ToolCall, fragment));
-                        }
-                    }
-                    (StreamingBlock::Tool { unreadable, .. }, _) => *unreadable = true,
-                    _ => {}
-                }
+                    .ok_or_else(|| NATIVE.error("missing content delta"))?;
+                block.delta(id, value, &mut events)?;
             }
-            "content_block_stop" => {
-                self.require_content_phase()?;
-                let id = index(&value)?;
-                let block = self
-                    .blocks
-                    .get_mut(&id)
-                    .ok_or_else(|| protocol(format!("stop for unopened or ended block {id}")))?;
-                let Block::Streaming(streaming) = block else {
-                    return Err(protocol(format!("stop for unopened or ended block {id}")));
+            Some(Event::BlockStop) => {
+                let id = NATIVE.index(&value, "index")?;
+                let Some(Block::Streaming(streaming)) = self.blocks.get(&id) else {
+                    return Err(NATIVE.error(format_args!("stop for unopened or ended block {id}")));
                 };
-                *block = streaming.complete(&self.model, &self.scope)?;
+                let completed = streaming.complete(&self.model, &self.scope)?;
+                self.blocks.insert(id, completed);
             }
-            "message_delta" => {
-                let reason = value
-                    .get("delta")
-                    .and_then(|delta| delta.get("stop_reason"))
-                    .and_then(Value::as_str);
+            Some(Event::MessageDelta) => {
                 // A reasonless delta only carries usage.
-                if let Some(reason) = reason {
-                    if self.message_delta {
-                        self.revise(reason);
-                    } else {
-                        self.terminate(Some(reason))?;
-                    }
+                if let Some(reason) = value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                    self.reason(Finish::of(StopReason::read(reason)))?;
                 }
-                self.push_usage(value.get("usage"), &mut events)?;
+                self.push_usage(value.get("usage"), &mut events);
             }
-            "message_stop" => {
-                if !self.message_delta {
-                    self.terminate(None)?;
-                }
-                self.push_usage(value.get("usage"), &mut events)?;
-                events.push(self.end()?);
+            Some(Event::MessageStop) => {
+                self.push_usage(value.get("usage"), &mut events);
+                events.push(self.close()?);
             }
-            _ => {}
+            Some(Event::Ping) => return Ok(events),
+            None => {}
         }
+        // A stream without message_start is still decoded.
+        self.started = true;
         Ok(events)
     }
 
-    /// Settle the finish. Unknown or missing reasons cut tool calls; a normal finish
-    /// surfaces a tool input that never became a call.
-    fn terminate(&mut self, reason: Option<&str>) -> Result<(), ProviderError> {
-        self.require_all_blocks_ended()?;
-        let finish = match reason {
-            Some(reason) => classify_stop(reason),
-            None if self.blocks.values().any(Block::is_tool) => Finish::Cut(CutReason::Incomplete),
-            None => Finish::Normal,
-        };
+    /// Merge a usage report, if present, and report the new totals.
+    fn push_usage(&mut self, value: Option<&Value>, events: &mut Vec<ResponseEvent>) {
+        if let Some(observed) = value.and_then(|value| Observed::read(value, &USAGE)) {
+            events.push(ResponseEvent::Usage(self.usage.observe(observed)));
+        }
+    }
+
+    /// Some proxies close the stream after the terminal message_delta.
+    pub(crate) fn finish(&mut self) -> Result<Vec<ResponseEvent>, ProviderError> {
+        self.eof(|| NATIVE.error("unexpected EOF before message_stop"))
+    }
+}
+
+impl Settle for Decoder {
+    fn settlement(&mut self) -> &mut Settlement {
+        &mut self.settlement
+    }
+
+    fn has_tools(&self) -> bool {
+        self.blocks.values().any(Block::is_tool)
+    }
+
+    /// Every block must have ended; a normal finish surfaces a tool input that
+    /// never became a call.
+    fn admit(&self, finish: Finish) -> Result<(), ProviderError> {
+        if self
+            .blocks
+            .values()
+            .any(|block| matches!(block, Block::Streaming(_)))
+        {
+            return Err(NATIVE.error("message ended with open content blocks"));
+        }
+        if self.blocks.keys().copied().ne(0..self.blocks.len()) {
+            return Err(NATIVE.error("content block indices are not contiguous from zero"));
+        }
         if finish == Finish::Normal {
             for block in self.blocks.values() {
                 if let Block::PendingToolError(error) = block {
@@ -374,116 +409,34 @@ impl Decoder {
                 }
             }
         }
-        self.finish = Some(finish);
-        self.message_delta = true;
         Ok(())
     }
 
-    /// A later abnormal reason retracts tool calls; nothing revives them. Without
-    /// tool calls the model already finished, so the first reason stands.
-    fn revise(&mut self, reason: &str) {
-        if let (Some(Finish::Normal), cut @ Finish::Cut(_)) = (self.finish, classify_stop(reason))
-            && self.blocks.values().any(Block::is_tool)
-        {
-            self.finish = Some(cut);
-        }
-    }
-
-    /// The completion in native index order. Only reached once `terminate` settled
-    /// the finish; a cut leaves out every tool call, complete or not.
-    fn end(&mut self) -> Result<ResponseEvent, ProviderError> {
-        self.stopped = true;
-        let finish = self.finish.expect("settled by terminate");
+    /// The completion in native index order; a cut leaves out every tool call,
+    /// complete or not.
+    fn completion(&mut self, finish: Finish) -> Result<Completion, ProviderError> {
         let mut items = Vec::new();
         for (index, block) in std::mem::take(&mut self.blocks) {
-            let (id, position) = (item_id(index), position(index)?);
-            let item = match block {
-                Block::Completed(CompletedBlock::Text(text)) => AssistantItem::Text {
-                    id,
-                    position,
-                    blocks: single_block(index, text),
-                },
+            let (id, position) = (index.to_string(), position(index)?);
+            items.push(match block {
+                Block::Completed(CompletedBlock::Text(text)) => {
+                    AssistantItem::text(id, position, text)
+                }
                 Block::Completed(CompletedBlock::Reasoning { text, replay }) => {
-                    AssistantItem::Reasoning {
-                        id,
-                        position,
-                        blocks: single_block(index, text),
-                        replay: Some(replay),
-                    }
+                    AssistantItem::reasoning(id, position, text, Some(replay))
                 }
                 Block::Completed(CompletedBlock::Tool(call)) if finish == Finish::Normal => {
-                    AssistantItem::ToolCall { id, position, call }
+                    AssistantItem::tool_call(id, position, call)
                 }
-                // A pending tool error survives only into a cut: `terminate` raised it
-                // for a normal finish.
+                // Admission raised a pending tool error for a normal finish, and
+                // required every block ended.
                 Block::Completed(CompletedBlock::Tool(_))
                 | Block::PendingToolError(_)
-                | Block::Skipped => continue,
-                Block::Streaming(_) => {
-                    return Err(protocol("message ended with open content blocks"));
-                }
-            };
-            items.push(item);
+                | Block::Skipped
+                | Block::Streaming(_) => continue,
+            });
         }
-        Ok(ResponseEvent::End(finish.complete(items)?))
-    }
-
-    fn require_content_phase(&self) -> Result<(), ProviderError> {
-        if self.message_delta {
-            Err(protocol("content event after terminal message_delta"))
-        } else {
-            Ok(())
-        }
-    }
-
-    fn require_all_blocks_ended(&self) -> Result<(), ProviderError> {
-        if self
-            .blocks
-            .values()
-            .any(|block| matches!(block, Block::Streaming(_)))
-        {
-            return Err(protocol("message ended with open content blocks"));
-        }
-        if self.blocks.keys().copied().ne(0..self.blocks.len()) {
-            return Err(protocol(
-                "content block indices are not contiguous from zero",
-            ));
-        }
-        Ok(())
-    }
-
-    /// Merge a usage object, if present, and report the new totals.
-    fn push_usage(
-        &mut self,
-        value: Option<&Value>,
-        events: &mut Vec<ResponseEvent>,
-    ) -> Result<(), ProviderError> {
-        if let Some(value) = value.filter(|value| value.is_object()) {
-            let usage = self.update_usage(value)?;
-            events.push(ResponseEvent::Usage(usage));
-        }
-        Ok(())
-    }
-
-    fn update_usage(&mut self, value: &Value) -> Result<Usage, ProviderError> {
-        let observed = Observed {
-            input: counter(value, "input_tokens")?,
-            written: counter(value, "cache_creation_input_tokens")?,
-            cached: counter(value, "cache_read_input_tokens")?,
-            output: counter(value, "output_tokens")?,
-        };
-        Ok(self.usage.observe(observed))
-    }
-
-    pub(crate) fn finish(&mut self) -> Result<Vec<ResponseEvent>, ProviderError> {
-        if self.stopped {
-            return Ok(Vec::new());
-        }
-        // Some proxies close the stream after the terminal message_delta.
-        if self.message_delta {
-            return Ok(vec![self.end()?]);
-        }
-        Err(protocol("unexpected EOF before message_stop"))
+        finish.complete(items)
     }
 }
 
@@ -491,8 +444,9 @@ impl Decoder {
 mod tests {
     use super::super::{Dialect, encode};
     use super::*;
+    use crate::provider::ProviderErrorKind;
     use crate::provider::codec::common::tests::{Reduced, reduce, scope};
-    use crate::provider::protocol::{Completion, Message, ModelRequest, Outcome, ToolResult};
+    use crate::provider::protocol::{CutReason, Message, ModelRequest, Outcome, ToolResult, Usage};
     use serde_json::json;
 
     fn event(value: Value) -> SseEvent {
@@ -629,7 +583,7 @@ mod tests {
     #[test]
     fn signed_completion_keeps_opaque_native_fields_and_unsigned_thinking_replays_free() {
         let native = json!({"type":"thinking", "thinking":"reason", "signature":"signed", "x-vendor":{"nested":[1,null,"opaque"]}});
-        let (streaming, _) = StreamingBlock::start(native.clone(), 0).unwrap();
+        let streaming = StreamingBlock::start(native.clone(), 0, &mut Vec::new()).unwrap();
         let Block::Completed(CompletedBlock::Reasoning { text, replay }) =
             streaming.complete("vendor-model", &scope()).unwrap()
         else {
@@ -645,7 +599,7 @@ mod tests {
             json!({"type":"thinking", "thinking":"reason", "signature":""}),
             json!({"type":"thinking", "thinking":"reason"}),
         ] {
-            let (streaming, _) = StreamingBlock::start(unsigned, 0).unwrap();
+            let streaming = StreamingBlock::start(unsigned, 0, &mut Vec::new()).unwrap();
             let Block::Completed(CompletedBlock::Reasoning { text, replay }) =
                 streaming.complete("vendor-model", &scope()).unwrap()
             else {
@@ -696,7 +650,7 @@ mod tests {
         let tool =
             json!({"type":"tool_use", "id":"call_1", "name":"inspect", "input":{"path":"test"}});
         let events = decode(
-            &mut Decoder::new(request.model.clone(), scope(), ErrorSignals::NONE),
+            &mut Decoder::new(request.model.to_string(), scope(), ErrorSignals::NONE),
             vec![
                 start(),
                 block_start(
@@ -758,7 +712,7 @@ mod tests {
             encode(request, &Dialect::anthropic()).unwrap()["messages"][1]["content"].clone()
         };
         let mut foreign = original.clone();
-        foreign.model = "different-model".into();
+        foreign.model = "different-model".parse().unwrap();
         assert_eq!(assistant(&foreign), json!([tool]));
         assert_eq!(assistant(&original)[0], native);
     }
@@ -777,7 +731,7 @@ mod tests {
         assert_eq!(
             events,
             [crate::provider::codec::common::delta(
-                block_ref(1),
+                1,
                 ItemKind::ToolCall,
                 "{\"x\":1}"
             )]
@@ -856,26 +810,30 @@ mod tests {
 
     #[test]
     fn context_window_finish_is_the_context_window_error() {
-        // The condition fails the attempt; the streamed output is not kept as a cut.
-        let mut decoder = started();
-        decode(
-            &mut decoder,
-            vec![
-                block_start(0, json!({"type":"text","text":"partial"})),
-                stop(0),
-            ],
-        );
-        let result: Result<Vec<_>, _> = [
-            terminal("model_context_window_exceeded", 19),
-            message_stop(),
-        ]
-        .into_iter()
-        .map(|frame| decoder.decode(&event(frame)))
-        .collect();
-        assert_eq!(
-            result.unwrap_err().kind,
-            ProviderErrorKind::ContextWindowExceeded
-        );
+        // The condition fails the attempt; the streamed output is not kept as a
+        // cut, and a block the overflow left open does not hide it.
+        for frames in [vec![stop(0), stop(1)], vec![json_delta(1, "{")]] {
+            let mut decoder = started();
+            decode(
+                &mut decoder,
+                vec![
+                    block_start(0, json!({"type":"text","text":"partial"})),
+                    block_start(1, tool_use("call")),
+                ],
+            );
+            decode(&mut decoder, frames);
+            let result: Result<Vec<_>, _> = [
+                terminal("model_context_window_exceeded", 19),
+                message_stop(),
+            ]
+            .into_iter()
+            .map(|frame| decoder.decode(&event(frame)))
+            .collect();
+            assert_eq!(
+                result.unwrap_err().kind(),
+                ProviderErrorKind::ContextWindowExceeded
+            );
+        }
     }
 
     #[test]
@@ -899,6 +857,8 @@ mod tests {
         let mut absent = Decoder::new("model".into(), scope(), ErrorSignals::NONE);
         assert!(decode(&mut absent, vec![json!({"type":"ping"})]).is_empty());
         assert!(absent.finish().is_err());
+        let mut pinged = Decoder::new("model".into(), scope(), ErrorSignals::NONE);
+        decode(&mut pinged, vec![json!({"type":"ping"}), start()]);
         for frames in [
             vec![],
             vec![block_start(0, json!({"type":"text","text":"partial"}))],
@@ -964,10 +924,12 @@ mod tests {
                 json!({"type":"text", "text":"hi", "citations":[{"cited_text":"x"}]}),
             ),
             stop(1),
-            // Counters as strings; a smaller late value does not lower the total.
+            // Counters as strings; a smaller late value or an unusable one does
+            // not lower the total.
             json!({"type":"message_delta", "delta":{"stop_reason":"pause_for_vendor"},
                 "usage":{"output_tokens":"5", "input_tokens":"3"}}),
-            json!({"type":"message_delta", "delta":{}, "usage":{"output_tokens":4}}),
+            json!({"type":"message_delta", "delta":{},
+                "usage":{"output_tokens":4, "input_tokens":"garbage"}}),
             message_stop(),
         ];
         let reduced = reduced("model-a", frames);
@@ -1012,10 +974,19 @@ mod tests {
                 max_tokens,
                 true,
             ),
-            // A later abnormal reason retracts tools.
+            // A later cut retracts tools, and so does a later overflow, without
+            // failing the response.
             (
                 vec![terminal("tool_use", 3), terminal("max_tokens", 4)],
                 max_tokens,
+                true,
+            ),
+            (
+                vec![
+                    terminal("tool_use", 3),
+                    terminal("model_context_window_exceeded", 4),
+                ],
+                Some(Outcome::Cut(CutReason::Incomplete)),
                 true,
             ),
             (vec![terminal("tool_use", 2)], None, false),
@@ -1050,10 +1021,7 @@ mod tests {
                 "message":"Overloaded, retry with Bearer abc.def"}}),
             ))
             .unwrap_err();
-        assert_eq!(
-            error.kind,
-            ProviderErrorKind::Unavailable { retry_after: None }
-        );
+        assert_eq!(error.kind(), ProviderErrorKind::Unavailable);
         assert_eq!(
             error.message,
             "provider stream error [code=overloaded_error]: Overloaded, retry with Bearer abc.def"
@@ -1066,7 +1034,7 @@ mod tests {
                 "message":"prompt is too long: 213 tokens > 200 maximum"}}),
             ))
             .unwrap_err();
-        assert_eq!(error.kind, ProviderErrorKind::ContextWindowExceeded);
+        assert_eq!(error.kind(), ProviderErrorKind::ContextWindowExceeded);
     }
 
     #[test]

@@ -4,12 +4,12 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     ops::Range,
+    sync::Arc,
 };
 
-use super::editor::{EditOutcome, push_history};
+use super::editor::{EditOutcome, TextField, grapheme, push_history};
 use skyhook::media::Attachment;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
 use unicode_segmentation::UnicodeSegmentation;
 use zeroize::Zeroize;
 
@@ -19,7 +19,8 @@ pub use layout::ComposerLayout;
 
 const OBJECT: &str = "\u{fffc}";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Shared by undo snapshots, so it zeroizes when the last one drops.
+#[derive(Debug, PartialEq, Eq)]
 struct Paste {
     id: usize,
     content: String,
@@ -67,8 +68,8 @@ impl From<&str> for Submission {
 #[derive(Clone, Default)]
 struct Snapshot {
     text: String,
-    pastes: BTreeMap<usize, Paste>,
-    attachments: Vec<Attachment>,
+    pastes: BTreeMap<usize, Arc<Paste>>,
+    attachments: Vec<Arc<Attachment>>,
     cursor: usize,
     anchor: Option<usize>,
 }
@@ -83,13 +84,15 @@ pub struct Composer {
     text: String,
     cursor: usize,
     anchor: Option<usize>,
-    pastes: BTreeMap<usize, Paste>,
-    attachments: Vec<Attachment>,
+    pastes: BTreeMap<usize, Arc<Paste>>,
+    attachments: Vec<Arc<Attachment>>,
     next_id: usize,
     undo: VecDeque<Snapshot>,
     redo: VecDeque<Snapshot>,
     width: usize,
     preferred_column: Option<usize>,
+    /// Bumped by every edit, so a caller can tell whether the draft changed.
+    revision: u64,
     /// Last layout, keyed by a hash of everything it was built from.
     layout_cache: std::cell::RefCell<Option<(u64, std::sync::Arc<ComposerLayout>)>>,
 }
@@ -106,6 +109,7 @@ impl Default for Composer {
             redo: VecDeque::new(),
             width: 80,
             preferred_column: None,
+            revision: 0,
             layout_cache: Default::default(),
         }
     }
@@ -160,17 +164,6 @@ impl Token {
     }
 }
 impl Composer {
-    /// Raw document text; inline pastes occupy one object-replacement grapheme.
-    pub fn text(&self) -> &str {
-        &self.text
-    }
-    pub fn cursor(&self) -> usize {
-        self.cursor
-    }
-    pub fn anchor(&self) -> Option<usize> {
-        self.anchor
-    }
-
     /// Move to a source-byte offset, snapping inside graphemes/pastes to the start.
     #[cfg(test)]
     pub fn set_cursor(&mut self, cursor: usize) {
@@ -186,21 +179,24 @@ impl Composer {
     pub fn is_empty(&self) -> bool {
         self.text.is_empty() && self.attachments.is_empty()
     }
-    pub fn attachments(&self) -> &[Attachment] {
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+    pub fn attachments(&self) -> &[Arc<Attachment>] {
         &self.attachments
     }
     pub fn attach(&mut self, attachment: Attachment) -> EditOutcome {
         self.save();
-        self.attachments.push(attachment);
-        EditOutcome::CHANGED
+        self.attachments.push(Arc::new(attachment));
+        EditOutcome::Changed
     }
     pub fn remove_attachment(&mut self, index: usize) -> EditOutcome {
         if index >= self.attachments.len() {
-            return EditOutcome::default();
+            return EditOutcome::Ignored;
         }
         self.save();
         self.attachments.remove(index);
-        EditOutcome::CHANGED
+        EditOutcome::Changed
     }
     /// Delete a source range as one undoable edit.
     pub fn delete(&mut self, range: Range<usize>) {
@@ -229,7 +225,7 @@ impl Composer {
             .find(|(_, p)| p.id == id)
             .map(|(&offset, _)| offset)
         else {
-            return EditOutcome::default();
+            return EditOutcome::Ignored;
         };
         self.normalize();
         self.save();
@@ -242,7 +238,7 @@ impl Composer {
         };
         self.anchor = None;
         self.normalize();
-        EditOutcome::CHANGED
+        EditOutcome::Changed
     }
     pub fn set_width(&mut self, width: usize) {
         let width = width.max(1);
@@ -262,7 +258,7 @@ impl Composer {
         self.expand(0..self.text.len())
     }
     pub fn selected_text(&self) -> Option<String> {
-        self.selection_range()
+        self.selection()
             .filter(|r| !r.is_empty())
             .map(|range| self.expand(range))
     }
@@ -287,6 +283,7 @@ impl Composer {
         self.anchor = None;
         self.preferred_column = None;
         self.next_id = 1;
+        self.revision += 1;
         self.layout_cache.take();
     }
     /// Replace the whole document as plain text (history/menu recall).
@@ -314,23 +311,14 @@ impl Composer {
         self.cursor = snapshot.cursor;
         self.anchor = snapshot.anchor;
         self.preferred_column = None;
+        self.revision += 1;
     }
     fn save(&mut self) {
         let snapshot = self.snapshot();
         push_history(&mut self.undo, snapshot);
         self.redo.clear();
         self.preferred_column = None;
-    }
-    /// Undo (or redo) one edit, moving the current state onto the opposite stack.
-    fn step_history(&mut self, redo: bool) -> bool {
-        let Some(snapshot) = (if redo { &mut self.redo } else { &mut self.undo }).pop_back() else {
-            return false;
-        };
-        let current = self.snapshot();
-        push_history(if redo { &mut self.undo } else { &mut self.redo }, current);
-        let changed = self.text != snapshot.text || self.pastes != snapshot.pastes;
-        self.restore(snapshot);
-        changed
+        self.revision += 1;
     }
     fn tokens(&self) -> Vec<Token> {
         let mut tokens = Vec::new();
@@ -358,18 +346,11 @@ impl Composer {
         tokens
     }
     fn boundary(&self, offset: usize) -> usize {
-        Token::boundary(&self.tokens(), self.text.len(), offset)
+        self.unit(offset).start
     }
     fn normalize(&mut self) {
         self.cursor = self.boundary(self.cursor);
         self.anchor = self.anchor.map(|a| self.boundary(a));
-    }
-    pub fn selection_range(&self) -> Option<Range<usize>> {
-        self.anchor().map(|a| {
-            let a = self.boundary(a);
-            let c = self.boundary(self.cursor());
-            a.min(c)..a.max(c)
-        })
     }
     fn delete_range(&mut self, range: Range<usize>) {
         let removed = range.end - range.start;
@@ -391,7 +372,7 @@ impl Composer {
         self.cursor = range.start;
     }
     fn delete_selection(&mut self) -> bool {
-        let range = self.selection_range();
+        let range = self.selection();
         self.anchor = None;
         if let Some(range) = range.filter(|r| !r.is_empty()) {
             self.delete_range(range);
@@ -409,33 +390,9 @@ impl Composer {
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
-    pub fn insert(&mut self, text: &str) -> EditOutcome {
-        if text.is_empty() {
-            return EditOutcome::HANDLED;
-        }
-        self.normalize();
-        let text_changed = self.selection_range().is_none_or(|range| {
-            self.text[range.clone()] != *text || self.pastes.range(range).next().is_some()
-        });
-        if text_changed {
-            self.save();
-        }
-        self.delete_selection();
-        self.insert_raw(text);
-        // Inserting a combining mark can merge with its neighbor. Never leave
-        // the caret in the middle of the newly formed grapheme.
-        if let Some(token) = self
-            .tokens()
-            .iter()
-            .find(|t| t.source.start < self.cursor && self.cursor < t.source.end)
-        {
-            self.cursor = token.source.end;
-        }
-        EditOutcome::handled(text_changed)
-    }
     pub fn insert_paste(&mut self, content: String) -> EditOutcome {
         if content.is_empty() {
-            return EditOutcome::HANDLED;
+            return EditOutcome::Handled;
         }
         self.normalize();
         self.save();
@@ -445,8 +402,9 @@ impl Composer {
         let id = self.next_id;
         self.next_id += 1;
         let lines = content.lines().count().max(1);
-        self.pastes.insert(offset, Paste { id, content, lines });
-        EditOutcome::CHANGED
+        self.pastes
+            .insert(offset, Arc::new(Paste { id, content, lines }));
+        EditOutcome::Changed
     }
     /// Clear a local draft as one undoable edit (for Ctrl+C). Unlike sending or
     /// clearing sensitive data, this intentionally retains an undo snapshot.
@@ -470,168 +428,64 @@ impl Composer {
         let text = self.expanded_text();
         let attachments = std::mem::take(&mut self.attachments);
         self.clear_sensitive();
+        let attachments = attachments.into_iter().map(Arc::unwrap_or_clone).collect();
         Submission { text, attachments }
     }
     /// Replace the draft with a submission taken back for editing.
     pub fn set_submission(&mut self, submission: Submission) {
         self.set(submission.text);
-        self.attachments = submission.attachments;
+        self.attachments = submission.attachments.into_iter().map(Arc::new).collect();
     }
-    fn previous(&self) -> usize {
-        self.tokens()
-            .iter()
-            .rev()
-            .find(|t| t.source.start < self.cursor)
-            .map_or(0, |t| t.source.start)
+}
+
+impl TextField for Composer {
+    /// Raw document text; inline pastes occupy one object-replacement grapheme.
+    fn text(&self) -> &str {
+        &self.text
     }
-    fn next(&self) -> usize {
-        self.tokens()
-            .iter()
-            .find(|t| t.source.end > self.cursor)
-            .map_or(self.text.len(), |t| t.source.end)
+    fn cursor(&self) -> usize {
+        self.cursor
     }
-    fn word(&self, forward: bool) -> usize {
-        let tokens = self.tokens();
-        let mut end = self.cursor;
-        let mut seen_word = false;
-        let iter: Box<dyn Iterator<Item = &Token>> = if forward {
-            Box::new(tokens.iter().filter(|t| t.source.start >= self.cursor))
+    fn anchor(&self) -> Option<usize> {
+        self.anchor
+    }
+    /// A whole paste, or a grapheme of the text between pastes.
+    fn unit(&self, offset: usize) -> Range<usize> {
+        let before = self.pastes.range(..=offset).next_back();
+        let start = before.map_or(0, |(&paste, _)| paste + OBJECT.len());
+        if offset < start {
+            return start - OBJECT.len()..start;
+        }
+        let end = self.pastes.range(offset..).next();
+        let segment = &self.text[start..end.map_or(self.text.len(), |(&paste, _)| paste)];
+        let unit = grapheme(segment, offset - start);
+        start + unit.start..start + unit.end
+    }
+    fn is_object(&self, unit: &Range<usize>) -> bool {
+        self.pastes.contains_key(&unit.start)
+    }
+    fn vertical(&mut self, down: bool) -> usize {
+        let layout = self.layout(self.width);
+        let (row, column) = layout.cursor;
+        let column = *self.preferred_column.get_or_insert(column);
+        let target = if down {
+            (row + 1).min(layout.rows.len() - 1)
         } else {
-            Box::new(tokens.iter().rev().filter(|t| t.source.end <= self.cursor))
+            row.saturating_sub(1)
         };
-        for token in iter {
-            let edge = if forward {
-                token.source.end
-            } else {
-                token.source.start
-            };
-            if token.paste {
-                if !seen_word {
-                    end = edge;
-                }
-                break;
-            }
-            if seen_word && token.whitespace {
-                break;
-            }
-            seen_word |= !token.whitespace;
-            end = edge;
+        if target == row {
+            self.cursor
+        } else {
+            layout.closest(target, column)
         }
-        end
     }
-
-    pub fn handle(&mut self, key: KeyEvent) -> EditOutcome {
-        self.normalize();
-        let ctrl = key.modifiers.contains(M::CONTROL);
-        let alt = key.modifiers.contains(M::ALT);
-        let shift = key.modifiers.contains(M::SHIFT);
-        let start = self.text[..self.cursor].rfind('\n').map_or(0, |i| i + 1);
-        let end = self.boundary(
-            self.text[self.cursor..]
-                .find('\n')
-                .map_or(self.text.len(), |i| self.cursor + i),
-        );
-        let vertical = matches!(key.code, KeyCode::Up | KeyCode::Down);
-        let movement = match key.code {
-            KeyCode::Left => Some(if ctrl || alt {
-                self.word(false)
-            } else {
-                self.previous()
-            }),
-            KeyCode::Right => Some(if ctrl || alt {
-                self.word(true)
-            } else {
-                self.next()
-            }),
-            KeyCode::Home => Some(0),
-            KeyCode::End => Some(self.text.len()),
-            KeyCode::Char('a') if ctrl => Some(start),
-            KeyCode::Char('e') if ctrl => Some(end),
-            KeyCode::Char('b') if ctrl || alt => Some(if alt {
-                self.word(false)
-            } else {
-                self.previous()
-            }),
-            KeyCode::Char('f') if ctrl || alt => {
-                Some(if alt { self.word(true) } else { self.next() })
-            }
-            KeyCode::Up | KeyCode::Down => {
-                let layout = self.layout(self.width);
-                let (row, column) = layout.cursor;
-                let column = *self.preferred_column.get_or_insert(column);
-                let target = if key.code == KeyCode::Up {
-                    row.saturating_sub(1)
-                } else {
-                    (row + 1).min(layout.rows.len() - 1)
-                };
-                Some(if target == row {
-                    self.cursor
-                } else {
-                    layout.closest(target, column)
-                })
-            }
-            _ => None,
-        };
-        if let Some(cursor) = movement {
-            if shift {
-                self.anchor.get_or_insert(self.cursor);
-            } else {
-                self.anchor = None;
-            }
-            self.cursor = self.boundary(cursor);
-            if !vertical {
-                self.preferred_column = None;
-            }
-            return EditOutcome::HANDLED;
-        }
-        let text_changed = match key.code {
-            KeyCode::Char('-') if ctrl => self.step_history(false),
-            KeyCode::Char('.') if ctrl => self.step_history(true),
-            KeyCode::Backspace | KeyCode::Char('w') if key.code == KeyCode::Backspace || ctrl => {
-                let range = self
-                    .selection_range()
-                    .filter(|r| !r.is_empty())
-                    .unwrap_or_else(|| {
-                        let from = if ctrl || alt {
-                            self.word(false)
-                        } else {
-                            self.previous()
-                        };
-                        from..self.cursor
-                    });
-                self.erase(range)
-            }
-            KeyCode::Delete | KeyCode::Char('d') if key.code == KeyCode::Delete || ctrl || alt => {
-                let range = self
-                    .selection_range()
-                    .filter(|r| !r.is_empty())
-                    .unwrap_or_else(|| {
-                        let to = if ctrl || alt {
-                            self.word(true)
-                        } else {
-                            self.next()
-                        };
-                        self.cursor..to
-                    });
-                self.erase(range)
-            }
-            KeyCode::Char('u') if ctrl => self.erase(start..self.cursor),
-            KeyCode::Char('k') if ctrl => self.erase(
-                self.cursor..if self.cursor == end && end < self.text.len() {
-                    self.next()
-                } else {
-                    end
-                },
-            ),
-            KeyCode::Char(c) if !ctrl && !alt => return self.insert(&c.to_string()),
-            KeyCode::Enter if shift || alt => return self.insert("\n"),
-            _ => return EditOutcome::default(),
-        };
-        self.normalize();
-        EditOutcome::handled(text_changed)
+    fn forget_column(&mut self) {
+        self.preferred_column = None;
     }
-
-    /// Only actual deletions enter history or invalidate redo.
+    fn place(&mut self, cursor: usize, anchor: Option<usize>) {
+        self.cursor = self.boundary(cursor);
+        self.anchor = anchor;
+    }
     fn erase(&mut self, range: Range<usize>) -> bool {
         let changed = !range.is_empty();
         if changed {
@@ -639,6 +493,38 @@ impl Composer {
         }
         self.anchor = None;
         self.delete_range(range);
+        self.normalize();
+        changed
+    }
+    fn insert(&mut self, text: &str) -> EditOutcome {
+        if text.is_empty() {
+            return EditOutcome::Handled;
+        }
+        self.normalize();
+        let text_changed = self.selection().is_none_or(|range| {
+            self.text[range.clone()] != *text || self.pastes.range(range).next().is_some()
+        });
+        if text_changed {
+            self.save();
+        }
+        self.delete_selection();
+        self.insert_raw(text);
+        // Inserting a combining mark can merge with its neighbor. Never leave
+        // the caret in the middle of the newly formed grapheme.
+        let unit = self.unit(self.cursor);
+        if unit.start < self.cursor {
+            self.cursor = unit.end;
+        }
+        EditOutcome::handled(text_changed)
+    }
+    fn step_history(&mut self, redo: bool) -> bool {
+        let Some(snapshot) = (if redo { &mut self.redo } else { &mut self.undo }).pop_back() else {
+            return false;
+        };
+        let current = self.snapshot();
+        push_history(if redo { &mut self.undo } else { &mut self.redo }, current);
+        let changed = self.text != snapshot.text || self.pastes != snapshot.pastes;
+        self.restore(snapshot);
         changed
     }
 }
@@ -647,12 +533,16 @@ impl Composer {
 mod tests {
     use super::*;
     use crate::tui::editor::HISTORY_LIMIT;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
 
     fn key(editor: &mut Composer, code: KeyCode, modifiers: M) {
-        assert!(editor.handle(KeyEvent::new(code, modifiers)).handled);
+        assert_ne!(
+            editor.handle(KeyEvent::new(code, modifiers)),
+            EditOutcome::Ignored
+        );
     }
 
-    fn plain(text: &str) -> Composer {
+    pub(super) fn plain(text: &str) -> Composer {
         let mut editor = Composer::default();
         editor.set(text.to_owned());
         editor
@@ -680,6 +570,12 @@ mod tests {
             .flatten()
         {
             assert_eq!(Token::boundary(&tokens, len, position), position);
+        }
+        for token in &tokens {
+            let offsets = token.source.clone();
+            for offset in offsets.filter(|&offset| editor.text.is_char_boundary(offset)) {
+                assert_eq!(editor.unit(offset), token.source);
+            }
         }
         for (&offset, paste) in &editor.pastes {
             assert_eq!(&editor.text()[offset..offset + OBJECT.len()], OBJECT);
@@ -721,7 +617,7 @@ mod tests {
             [(2, "second"), (1, "first")]
         );
         assert_eq!(editor.paste(1), Some("first"));
-        assert!(editor.remove_paste(2).handled);
+        assert_eq!(editor.remove_paste(2), EditOutcome::Changed);
         assert_eq!(
             (editor.expanded_text().as_str(), editor.cursor),
             (" abcfirst", 1)
@@ -731,7 +627,7 @@ mod tests {
         assert_eq!(editor.paste(2), Some("second"));
         redo(&mut editor);
         assert_eq!(editor.expanded_text(), " abcfirst");
-        assert!(!editor.remove_paste(99).handled);
+        assert_eq!(editor.remove_paste(99), EditOutcome::Ignored);
     }
 
     #[test]
@@ -804,13 +700,16 @@ mod tests {
 
     #[test]
     fn unicode_graphemes_and_crlf_are_atomic_even_adjacent_to_pastes() {
-        let mut editor = plain("e\u{301}👩‍💻界");
+        let mut editor = plain("e\u{301}👩‍💻界\r\n");
+        assert_document_invariants(&editor);
+        key(&mut editor, KeyCode::Backspace, M::NONE);
         key(&mut editor, KeyCode::Backspace, M::NONE);
         assert_eq!(editor.text, "e\u{301}👩‍💻");
         key(&mut editor, KeyCode::Backspace, M::NONE);
         assert_eq!(editor.text, "e\u{301}");
         editor.insert_paste("paste".into());
         editor.insert("\u{301}");
+        assert_document_invariants(&editor);
         step(
             &mut editor,
             KeyCode::Left,
@@ -897,21 +796,21 @@ mod tests {
     fn outcomes_distinguish_noops_navigation_and_actual_rich_edits() {
         let mut editor = Composer::default();
         let outcome = editor.handle(KeyEvent::new(KeyCode::Esc, M::NONE));
-        assert!(!outcome.handled && !outcome.text_changed);
+        assert_eq!(outcome, EditOutcome::Ignored);
         let outcome = editor.handle(KeyEvent::new(KeyCode::Backspace, M::NONE));
-        assert!(outcome.handled && !outcome.text_changed);
-        assert!(!editor.insert("").text_changed);
-        assert!(editor.insert("same").text_changed);
+        assert_eq!(outcome, EditOutcome::Handled);
+        assert!(!editor.insert("").text_changed());
+        assert!(editor.insert("same").text_changed());
         editor.set_selection(Some(0), editor.text().len());
-        assert!(!editor.insert("same").text_changed);
-        assert!(!editor.set("same".into()).text_changed);
-        assert!(editor.insert_paste("paste".into()).text_changed);
+        assert!(!editor.insert("same").text_changed());
+        assert!(!editor.set("same".into()).text_changed());
+        assert!(editor.insert_paste("paste".into()).text_changed());
         editor.set_selection(Some(4), editor.text().len());
         // Identical raw object character, different rich document.
-        assert!(editor.insert(OBJECT).text_changed);
+        assert!(editor.insert(OBJECT).text_changed());
         assert!(!editor.has_pastes());
         let undo = KeyEvent::new(KeyCode::Char('-'), M::CONTROL);
-        assert!(editor.handle(undo).text_changed);
+        assert!(editor.handle(undo).text_changed());
         assert_eq!(editor.paste(1), Some("paste"));
         assert_document_invariants(&editor);
     }

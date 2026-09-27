@@ -1,4 +1,4 @@
-//! Validation and normalization of tool input and output schemas.
+//! Validation and normalization of tool names and their input and output schemas.
 
 use std::collections::BTreeSet;
 
@@ -6,68 +6,52 @@ use serde_json::{Map, Value};
 
 use crate::tool::policy::CapabilitySet;
 
-use super::{GeneratedToolDefinition, OutputSchema, RegistryError, ToolExecution, ToolSpec};
+use super::{RegistryError, envelope::BACKGROUND, options::ConditionalProperty};
 
-impl OutputSchema {
-    pub(super) fn generate(&self, capabilities: &CapabilitySet) -> Value {
-        match self {
-            Self::Static(schema) => schema.clone(),
-            Self::Generated(generate) => generate(capabilities),
+/// The longest tool name every provider accepts.
+pub(crate) const MAX_TOOL_NAME_BYTES: usize = 64;
+
+pub(crate) fn is_tool_name_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '_' | '-')
+}
+
+pub(crate) fn is_valid_tool_name(name: &str, max_bytes: usize) -> bool {
+    !name.is_empty() && name.len() <= max_bytes && name.chars().all(is_tool_name_char)
+}
+
+pub(super) fn validate_name(name: &str) -> Result<(), RegistryError> {
+    if is_valid_tool_name(name, MAX_TOOL_NAME_BYTES) {
+        Ok(())
+    } else {
+        Err(RegistryError::InvalidName(name.to_owned()))
+    }
+}
+
+pub(super) fn check_conditional(
+    schema: &Value,
+    properties: &[ConditionalProperty],
+    kind: &str,
+) -> Result<(), RegistryError> {
+    match (properties.iter())
+        .find(|(pointer, ..)| !schema.pointer(pointer).is_some_and(Value::is_object))
+    {
+        Some((pointer, ..)) => Err(RegistryError::Schema(format!(
+            "conditional {kind} location `{pointer}` is not an object schema"
+        ))),
+        None => Ok(()),
+    }
+}
+
+pub(super) fn add_conditional(
+    schema: &mut Value,
+    properties: &[ConditionalProperty],
+    capabilities: &CapabilitySet,
+) {
+    for (pointer, name, property) in properties {
+        if let Some(property) = property(capabilities) {
+            add_nested_schema_property(schema, pointer, name, property);
         }
     }
-}
-
-impl GeneratedToolDefinition {
-    pub(super) fn generate_scoped(
-        &self,
-        capabilities: &CapabilitySet,
-        execution: &ToolExecution,
-        child: bool,
-    ) -> Option<ToolSpec> {
-        self.required
-            .iter()
-            .chain(self.root_required.iter().filter(|_| !child))
-            .all(|capability| capabilities.contains(*capability))
-            .then(|| {
-                let mut input_schema = (self.input_schema)(capabilities);
-                if self.supports_background {
-                    add_background(&mut input_schema);
-                }
-                if !self.preserve_required {
-                    optional_defaults(&mut input_schema);
-                }
-                sanitize_schema_inner(&mut input_schema, self.preserve_schema_dialect);
-                // This schema describes the handler's stored native payload.
-                // Foreground/background presentation both wrap that payload in
-                // JobView elsewhere, so a background envelope alternative here
-                // would misdescribe the value persisted and later projected.
-                let result_schema = self.output_schema.as_ref().map(|schema| {
-                    let mut schema = schema.generate(capabilities);
-                    sanitize_schema(&mut schema);
-                    schema
-                });
-                let output_schema = result_schema.clone();
-                ToolSpec {
-                    supports_background: self.supports_background,
-                    job_role: execution.job_role,
-                    name: self.name.clone(),
-                    description: self.description.clone(),
-                    input_schema,
-                    result_schema,
-                    output_schema,
-                    exposure: self.exposure,
-                    script_binding: self.script_binding.clone(),
-                }
-            })
-    }
-}
-
-pub(super) fn ensure_no_target(schema: &Value) -> Result<(), RegistryError> {
-    validate_schema(schema)?;
-    if schema["properties"].get("target").is_some() {
-        return Err(RegistryError::ReservedTarget);
-    }
-    Ok(())
 }
 
 /// Put an object's tag properties (a `const` or single-value `enum`) before the
@@ -105,12 +89,7 @@ pub(super) fn add_schema_property(schema: &mut Value, name: &str, property: Valu
 
 /// Add a property to the object schema at a JSON pointer (`""` is the root).
 /// Registration guarantees the pointer names an object.
-pub(super) fn add_nested_schema_property(
-    schema: &mut Value,
-    pointer: &str,
-    name: &str,
-    property: Value,
-) {
+fn add_nested_schema_property(schema: &mut Value, pointer: &str, name: &str, property: Value) {
     let object = schema
         .pointer_mut(pointer)
         .expect("registered conditional inputs name schema objects");
@@ -118,19 +97,14 @@ pub(super) fn add_nested_schema_property(
 }
 
 pub(super) fn validate_schema(schema: &Value) -> Result<(), RegistryError> {
-    validate_object_schema(schema)?;
-    if schema["properties"].get("bg").is_some() {
-        return Err(RegistryError::ReservedBackground);
-    }
-    Ok(())
-}
-
-pub(super) fn validate_object_schema(schema: &Value) -> Result<(), RegistryError> {
     let object = schema
         .as_object()
         .ok_or_else(|| RegistryError::Schema("root must be an object".to_owned()))?;
     if object.get("type").and_then(Value::as_str) != Some("object") {
         return Err(RegistryError::Schema("root type must be object".to_owned()));
+    }
+    if schema["properties"].get(BACKGROUND).is_some() {
+        return Err(RegistryError::ReservedBackground);
     }
     Ok(())
 }
@@ -145,10 +119,10 @@ pub(super) fn validate_output_schema(schema: &Value) -> Result<(), RegistryError
     }
 }
 
-fn add_background(schema: &mut Value) {
+pub(super) fn add_background(schema: &mut Value) {
     add_schema_property(
         schema,
-        "bg",
+        BACKGROUND,
         serde_json::json!({
             "type": "boolean",
             "default": false,
@@ -207,7 +181,7 @@ fn for_each_subschema(schema: &mut Value, visit: &mut impl FnMut(&mut Value)) {
 }
 
 /// A documented default always permits omission from tool input.
-fn optional_defaults(schema: &mut Value) {
+pub(super) fn optional_defaults(schema: &mut Value) {
     for_each_subschema(schema, &mut |schema| {
         let Some(object) = schema.as_object_mut() else {
             return;
@@ -233,7 +207,7 @@ pub(super) fn sanitize_schema(value: &mut Value) {
 /// Strip annotations providers reject. `true` becomes `{}` because some
 /// provider-side converters (including llama.cpp) only accept the object form;
 /// `false` stays, since internal validation relies on closed-object flags.
-fn sanitize_schema_inner(value: &mut Value, preserve_dialect: bool) {
+pub(super) fn sanitize_schema_inner(value: &mut Value, preserve_dialect: bool) {
     for_each_subschema(value, &mut |schema| {
         if schema.as_bool() == Some(true) {
             *schema = Value::Object(Map::new());
@@ -250,7 +224,8 @@ fn sanitize_schema_inner(value: &mut Value, preserve_dialect: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{ToolOptions, ToolOutput, ToolRegistryBuilder};
+    use crate::tool::registry::AgentLevel;
+    use crate::tool::{ToolOptions, ToolOutput, ToolRegistryBuilder, ToolSpec};
     use serde_json::json;
 
     /// An internally tagged variant lists its tag last; a grammar built from that
@@ -382,12 +357,9 @@ mod tests {
                 Ok(ToolOutput::new(Value::Null))
             })
             .unwrap();
-        builder
-            .build()
-            .surface(&CapabilitySet::default())
-            .get("test")
+        let tool = builder.build().get("test").unwrap();
+        tool.spec(&CapabilitySet::default(), AgentLevel::Root)
             .unwrap()
-            .clone()
     }
 
     #[test]
@@ -398,8 +370,7 @@ mod tests {
                 .background()
                 .output_schema(Value::Bool(true)),
         );
-        assert_eq!(tool.result_schema, Some(json!({})));
-        assert_eq!(tool.output_schema, Some(json!({})));
+        assert_eq!(tool.result_schema.unwrap().schema(), &json!({}));
     }
 
     #[test]

@@ -3,8 +3,8 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 use futures_util::future::BoxFuture;
 
-use super::{RemoteError, client::Session};
-use crate::target::TargetDefinition;
+use super::{client::Session, error::RemoteError};
+use crate::target::Route;
 
 pub(crate) use super::transport::Transport;
 
@@ -14,7 +14,7 @@ pub(crate) type ProcessEnvironment = BTreeMap<String, String>;
 #[derive(Clone)]
 pub(crate) struct ConnectionRequest {
     /// Only the hops after `origin`; credentials belong to that origin, not `via`.
-    pub route: Vec<TargetDefinition>,
+    pub route: Route,
     pub workspace: PathBuf,
     pub origin: Option<Session>,
 }

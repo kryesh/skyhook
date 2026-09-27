@@ -12,14 +12,15 @@ use crate::tool::{
     AdmissionError, RegistryError, ToolError, ToolOptions, ToolOutput, ToolRegistryBuilder,
     diagnostic::{FailureSite, Operation, PartialContext, Subject, escape_controls},
     policy::{Capability, CapabilitySet},
+    registry::{Invocation, TARGET, serialized},
 };
 use crate::{
     fs::FileKind,
-    media::{Classified, ImageRef, MAX_IMAGE_BYTES, MAX_TEXT_BYTES},
+    media::{Classified, MAX_IMAGE_BYTES, MAX_TEXT_BYTES},
     session::SessionStore,
 };
 
-#[derive(Clone, Deserialize, JsonSchema)]
+#[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 struct SkillArgs {
     /// Skill to use; omit to list available skills.
@@ -60,6 +61,10 @@ impl TryFrom<SkillArgs> for SkillRequest {
 }
 
 const MAX_DESCRIPTION_CHARS: usize = 512;
+/// Where skills live, under the user's home and each workspace ancestor.
+const SKILLS_DIR: &str = ".agents/skills";
+/// A skill directory's instructions, with optional YAML frontmatter.
+const INSTRUCTIONS_FILE: &str = "SKILL.md";
 
 #[derive(Clone, Default)]
 pub struct HostSkills {
@@ -100,12 +105,7 @@ impl HostSkills {
         let mut ancestors = workspace.ancestors().collect::<Vec<_>>();
         ancestors.reverse();
         for ancestor in ancestors {
-            scan_root(
-                &ancestor.join(".agents/skills"),
-                &mut entries,
-                &mut warnings,
-            )
-            .await;
+            scan_root(&ancestor.join(SKILLS_DIR), &mut entries, &mut warnings).await;
         }
         Self {
             entries: Arc::new(entries),
@@ -178,7 +178,7 @@ impl HostSkills {
 fn user_skills_root() -> Option<PathBuf> {
     std::env::var_os("HOME")
         .filter(|home| !home.is_empty())
-        .map(|home| PathBuf::from(home).join(".agents/skills"))
+        .map(|home| PathBuf::from(home).join(SKILLS_DIR))
 }
 
 /// Discovery and describe report outside tool dispatch, which would otherwise bind the site.
@@ -257,7 +257,7 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
     let root = fs::canonicalize(path)
         .await
         .map_err(ToolError::annotated(at(Operation::Canonicalize, path)))?;
-    let instruction_path = path.join("SKILL.md");
+    let instruction_path = path.join(INSTRUCTIONS_FILE);
     let instruction_path =
         fs::canonicalize(&instruction_path)
             .await
@@ -266,8 +266,10 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
                 &instruction_path,
             )))?;
     if !instruction_path.starts_with(&root) {
-        return Err(ToolError::failed("SKILL.md escapes its skill directory")
-            .operation(Operation::Validate, Subject::path(&instruction_path)));
+        return Err(
+            ToolError::failed(format!("{INSTRUCTIONS_FILE} escapes its skill directory"))
+                .operation(Operation::Validate, Subject::path(&instruction_path)),
+        );
     }
     let bytes = crate::fs::read_regular(&instruction_path, MAX_TEXT_BYTES)
         .await
@@ -288,6 +290,12 @@ async fn load_skill(path: &Path) -> Result<SkillEntry, ToolError> {
     })
 }
 
+/// The frontmatter fields discovery reads; the rest is kept as metadata.
+#[derive(Deserialize)]
+struct Frontmatter {
+    description: Option<String>,
+}
+
 fn parse_instructions(instructions: &str) -> Result<(String, serde_json::Value), String> {
     use serde_json::Value;
 
@@ -303,20 +311,19 @@ fn parse_instructions(instructions: &str) -> Result<(String, serde_json::Value),
                     .map(|frontmatter| (frontmatter, ""))
             })
             .ok_or_else(|| "unterminated YAML frontmatter".to_owned())?;
-        metadata = crate::yaml::from_str(frontmatter)
-            .map_err(|error| format!("invalid YAML frontmatter: {error}"))?;
-        let description = match &metadata {
-            Value::Null => None,
-            Value::Object(fields) => fields.get("description"),
-            _ => return Err("invalid YAML frontmatter: expected a mapping".to_owned()),
-        };
-        let description = match description {
-            None | Some(Value::Null) => String::new(),
-            Some(Value::String(text)) => text.clone(),
-            Some(_) => {
-                return Err("invalid YAML frontmatter: description must be a string".to_owned());
-            }
-        };
+        let invalid = |error: &dyn std::fmt::Display| format!("invalid YAML frontmatter: {error}");
+        let value = crate::yaml::from_str(frontmatter).map_err(|error| invalid(&error))?;
+        // A derived struct would also accept a sequence positionally.
+        let fields = Option::<serde_json::Map<String, Value>>::deserialize(value)
+            .map_err(|error| invalid(&error))?;
+        let description = fields
+            .as_ref()
+            .map(Frontmatter::deserialize)
+            .transpose()
+            .map_err(|error| invalid(&error))?
+            .and_then(|frontmatter| frontmatter.description)
+            .unwrap_or_default();
+        metadata = fields.map_or(Value::Null, Value::Object);
         if !description.trim().is_empty() {
             return Ok((compact_description(description.trim()), metadata));
         }
@@ -345,40 +352,39 @@ pub(super) fn register(
     if skills.entries.is_empty() {
         return Ok(());
     }
-    builder.register_product::<SkillArgs, SkillOutput, _, _>(
+    builder.register_checked(
         "skill",
-        "List host-owned skills, or with `name` load complete skill instructions and discover assets. Select a relative path to list a directory (use `.` for the root), read text, attach a supported image, or inspect binary metadata.",
+        "List host-owned skills, or with `name` load complete skill instructions and discover assets. Select a relative path to list a directory (use `.` for the root), read text, attach a supported image, or inspect binary metadata; copy binary contents with write's source from the skill location.",
         ToolOptions::new(vec![Capability::Read])
-            .argument_validator(|args: &SkillArgs| SkillRequest::try_from(args.clone()).map(drop))
+            .result::<SkillOutput>()
             .conditional_output(
                 crate::target::TargetPath::SCHEMA,
-                "target",
+                TARGET,
                 Capability::Targets,
-                crate::target::TargetPath::target_schema(),
+                crate::target::TargetPath::target_schema(&schemars::generate::Contract::Serialize),
             ),
-        move |context, args| {
+        |args: SkillArgs| SkillRequest::try_from(args),
+        move |request| {
             let skills = skills.clone();
             let store = store.clone();
-            async move {
-                match SkillRequest::try_from(args)? {
-                    SkillRequest::List => skill_output(SkillOutput::List {
+            Invocation::new(move |context| async move {
+                match request {
+                    SkillRequest::List => serialized(SkillOutput::List {
                         skills: skills.summaries(),
                     }),
                     SkillRequest::Instructions { name } => {
                         let entry = skills.get(&name)?;
-                        skill_output(SkillOutput::Skill {
-                            name: entry.name.clone(),
-                            description: entry.description.clone(),
+                        serialized(SkillOutput::Skill {
                             location: location(&context, &entry.root),
                             content: entry.instructions.clone(),
-                            assets: asset_tree(&entry.root, true, None).await?,
+                            assets: nonempty(asset_tree(&entry.root, true, None).await?),
                         })
                     }
                     SkillRequest::Inspect { name, asset } => {
                         inspect_asset(skills.get(&name)?, asset, &store).await
                     }
                 }
-            }
+            })
         },
     )?;
     Ok(())
@@ -394,10 +400,8 @@ async fn inspect_asset(
         .await
         .map_err(ToolError::annotated(at(Operation::Inspect, &source)))?;
     if metadata.is_dir() {
-        return skill_output(SkillOutput::Directory {
-            name: entry.name.clone(),
-            path: asset,
-            assets: asset_tree(&source, false, None).await?,
+        return serialized(SkillOutput::Directory {
+            assets: nonempty(asset_tree(&source, false, None).await?),
         });
     }
     // Presentation reads only: larger assets are copied with write's source.
@@ -415,13 +419,11 @@ async fn inspect_asset(
     match crate::media::classify(bytes) {
         Classified::Image(image) => {
             let image = store
-            .store_image(Some(asset.clone()), &image)
+                .store_image(Some(asset.clone()), &image)
                 .await
                 .map_err(ToolError::annotated(at(Operation::StoreImage, &source)))?;
-            Ok(skill_output(SkillOutput::Image {
-                name: entry.name.clone(),
-                path: asset,
-                image: image.clone(),
+            Ok(serialized::<ToolOutput>(SkillOutput::Image {
+                image: super::ImageSummary::from(&image),
             })?
             .with_images(vec![image]))
         }
@@ -431,18 +433,11 @@ async fn inspect_asset(
             ))
             .operation(Operation::Read, Subject::path(&source)))
         }
-        Classified::Text(content) => skill_output(SkillOutput::Text {
-            name: entry.name.clone(),
-            path: asset,
+        Classified::Text(content) => serialized(SkillOutput::Text {
             bytes: content.len(),
             content,
         }),
-        Classified::Binary(bytes) => skill_output(SkillOutput::Binary {
-            name: entry.name.clone(),
-            path: asset,
-            bytes: bytes.len(),
-            note: "Binary contents are not inlined; copy the asset with write's source from the skill location.".to_owned(),
-        }),
+        Classified::Binary(bytes) => serialized(SkillOutput::Binary { bytes: bytes.len() }),
     }
 }
 
@@ -458,10 +453,6 @@ fn location(context: &crate::tool::ToolContext, root: &Path) -> Option<crate::ta
         path: root.to_string_lossy().into_owned(),
         target,
     })
-}
-
-fn skill_output(output: SkillOutput) -> Result<ToolOutput, ToolError> {
-    Ok(ToolOutput::new(serde_json::to_value(output)?))
 }
 
 // Render the complete tree; the output schema, not discovery, controls model-view
@@ -518,7 +509,7 @@ async fn asset_tree(
             .await
             .map_err(ToolError::annotated(at(Operation::ReadDirectory, &path)))?
         {
-            if is_root && exclude_instructions && child.file_name() == "SKILL.md" {
+            if is_root && exclude_instructions && child.file_name() == INSTRUCTIONS_FILE {
                 continue;
             }
             let kind = child
@@ -580,6 +571,7 @@ struct SkillSummary {
     description: String,
 }
 
+#[serde_with::skip_serializing_none]
 #[derive(Serialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum SkillOutput {
@@ -587,39 +579,32 @@ enum SkillOutput {
         skills: Vec<SkillSummary>,
     },
     Skill {
-        name: String,
-        description: String,
         /// The skill directory, for `read` and `write` sources.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[schemars(with = "crate::target::TargetPath")]
         location: Option<crate::target::TargetPath>,
         content: String,
-        #[schemars(extend("x-skyhook-truncatable" = true))]
-        assets: String,
+        #[schemars(with = "String", extend("x-skyhook-truncatable" = true))]
+        assets: Option<String>,
     },
     Directory {
-        name: String,
-        path: String,
-        #[schemars(extend("x-skyhook-truncatable" = true))]
-        assets: String,
+        #[schemars(with = "String", extend("x-skyhook-truncatable" = true))]
+        assets: Option<String>,
     },
     Image {
-        name: String,
-        path: String,
-        image: ImageRef,
+        image: super::ImageSummary,
     },
     Binary {
-        name: String,
-        path: String,
         bytes: usize,
-        note: String,
     },
     Text {
-        name: String,
-        path: String,
         #[schemars(extend("x-skyhook-truncatable" = true))]
         content: String,
         bytes: usize,
     },
+}
+
+fn nonempty(tree: String) -> Option<String> {
+    (!tree.is_empty()).then_some(tree)
 }
 
 #[cfg(test)]
@@ -678,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    fn frontmatter_retains_json_metadata_and_rejects_yaml_only_values() {
+    fn frontmatter_is_a_json_mapping_retained_as_metadata() {
         let (_, metadata) = parse_instructions(
             "---\ndescription: summary\nextra: [0x10, {two: null}]\nother: yes\n---\nBody",
         )
@@ -695,6 +680,7 @@ mod tests {
             "extra: {[a, b]: value}",
             "extra: {same: 1, same: 2}",
             "extra: {<<: {merged: value}}",
+            "- text",
         ] {
             let error = parse_instructions(&format!("---\n{yaml}\n---\nBody")).unwrap_err();
             assert!(error.starts_with("invalid YAML frontmatter:"), "{error}");
@@ -1024,8 +1010,8 @@ mod tests {
             .output
             .value;
         assert_eq!(
-            (&loaded["kind"], &loaded["path"], &loaded["content"]),
-            (&json!("text"), &json!(" asset "), &json!("spaced content"))
+            (&loaded["kind"], &loaded["content"]),
+            (&json!("text"), &json!("spaced content"))
         );
         // An asset too large to present points at the copy instead.
         let large = std::fs::File::create(nearest.join("large.bin")).unwrap();

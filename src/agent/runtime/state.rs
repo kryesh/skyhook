@@ -20,8 +20,7 @@ pub(super) async fn runtime_state_content(
     let items = todos
         .inspect(agent, None)
         .await
-        .expect("own todo list is always readable")
-        .items;
+        .expect("own todo list is always readable");
     runtime_state_with_todos(jobs, agent, capabilities, items, location).await
 }
 

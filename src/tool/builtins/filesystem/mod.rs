@@ -50,10 +50,7 @@ mod tests {
         let read = executor
             .run_host(agent, "read", json!({"path": root.join("outside.txt")}))
             .await;
-        assert_eq!(
-            read.unwrap().output.value["path"],
-            outside.to_string_lossy().as_ref()
-        );
+        assert_eq!(read.unwrap().output.value["content"], "outside");
         let permission = last_permission();
         assert_eq!(permission.capability, Capability::Read);
         assert_eq!(
@@ -78,7 +75,7 @@ mod tests {
             .run_host(agent, "read", json!({"path": "input.txt"}))
             .await
             .unwrap();
-        assert_eq!(read.output.value["path"], "input.txt");
+        assert_eq!(read.output.value["content"], "child");
         let expected = ResourceId::path(
             &crate::target::TargetRef::Root,
             &PathText::new(child_workspace.join("input.txt")).unwrap(),

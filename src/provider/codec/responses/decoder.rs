@@ -16,6 +16,8 @@ impl Decoder {
             model,
             scope,
             items: BTreeMap::new(),
+            ids: HashMap::new(),
+            wires: HashMap::new(),
             completed: false,
         }
     }
@@ -28,11 +30,11 @@ impl Decoder {
             return if self.completed {
                 Ok(vec![])
             } else {
-                Err(protocol("[DONE] before terminal response"))
+                Err(NATIVE.error("[DONE] before terminal response"))
             };
         }
         let value: Value =
-            serde_json::from_str(&event.data).map_err(|_| protocol("invalid SSE JSON"))?;
+            serde_json::from_str(&event.data).map_err(|_| NATIVE.error("invalid SSE JSON"))?;
         // Transport metadata the dialect names is not output; anything else unknown fails.
         if value
             .get("type")
@@ -46,14 +48,20 @@ impl Decoder {
             && name != "message"
             && Some(name.as_str()) != value.get("type").and_then(Value::as_str)
         {
-            return Err(protocol("SSE event name disagrees with payload type"));
+            return Err(NATIVE.error("SSE event name disagrees with payload type"));
         }
         self.feed(value)
     }
 
-    pub(super) fn start(&mut self, id: usize, item: NativeItem<'_>) -> Result<(), ProviderError> {
+    pub(super) fn start(
+        &mut self,
+        id: usize,
+        wire: Option<usize>,
+        item: NativeItem<'_>,
+    ) -> Result<(), ProviderError> {
         self.start_item(
             id,
+            wire,
             item.id,
             item.kind,
             (
@@ -66,24 +74,26 @@ impl Decoder {
     pub(super) fn start_item(
         &mut self,
         id: usize,
+        wire: Option<usize>,
         native_id: &str,
         item_kind: ItemKind,
         identity: (Option<&str>, Option<&str>),
     ) -> Result<(), ProviderError> {
         if self.items.contains_key(&id) {
-            return Err(protocol("duplicate output item index"));
+            return Err(NATIVE.error("duplicate output item index"));
         }
-        if self.items.values().any(|old| old.is(native_id)) {
-            return Err(protocol("duplicate output item ID"));
+        if self.ids.contains_key(native_id) {
+            return Err(NATIVE.error("duplicate output item ID"));
         }
-        let native_id =
-            ItemId::try_from(native_id.to_owned()).map_err(|_| protocol("empty output item ID"))?;
+        let native_id = ItemId::try_from(native_id.to_owned())
+            .map_err(|_| NATIVE.error("empty output item ID"))?;
+        self.ids.insert(native_id.as_str().into(), id);
+        self.wires.extend(wire.map(|wire| (wire, id)));
         self.items.insert(
             id,
             Item {
                 native_id,
-                aliases: BTreeSet::new(),
-                wire_index: Some(id),
+                wire_index: wire,
                 body: match item_kind {
                     ItemKind::Text => ItemBody::Text(TextState::default()),
                     ItemKind::Reasoning => ItemBody::Reasoning(ReasoningState::default()),
@@ -108,7 +118,7 @@ impl Decoder {
             ItemBody::Reasoning(state) => state.parts.entry(position).or_default(),
             ItemBody::Function(state) => {
                 if position != 0 {
-                    return Err(protocol("invalid function part index"));
+                    return Err(NATIVE.error("invalid function part index"));
                 }
                 state.part.get_or_insert_with(Part::default)
             }
@@ -124,7 +134,7 @@ impl Decoder {
         events: &mut Vec<ResponseEvent>,
     ) -> Result<(), ProviderError> {
         let Part::Streaming { text: streamed, .. } = self.part(id, position)? else {
-            return Err(protocol("delta after content part ended"));
+            return Err(NATIVE.error("delta after content part ended"));
         };
         streamed.push_str(text);
         let item = &self.items[&id];
@@ -145,7 +155,7 @@ impl Decoder {
         let part = self.part(id, position)?;
         if let Part::Completed(old) = part {
             if old != &content {
-                return Err(protocol("conflicting final content part"));
+                return Err(NATIVE.error("conflicting final content part"));
             }
             return Ok(());
         }
@@ -164,24 +174,24 @@ impl Decoder {
         let item = self
             .items
             .get(&id)
-            .ok_or_else(|| protocol("end of unstarted output item"))?;
-        if !item.is(header.id) || header.kind != item.kind() {
-            return Err(protocol("final output item identity changed"));
+            .ok_or_else(|| NATIVE.error("end of unstarted output item"))?;
+        if self.item_by_id(header.id) != Some(id) || header.kind != item.kind() {
+            return Err(NATIVE.error("final output item identity changed"));
         }
         match &item.body {
             ItemBody::Reasoning(_) => return self.end_reasoning(id, native),
             ItemBody::Function(_) => return self.end_function(id, native, terminal),
             ItemBody::Text(_) => {}
         }
-        let parts = header.final_parts()?;
+        let parts = final_parts(native, header.kind)?;
         if let Some(old) = item.snapshot() {
-            if final_parts(old)? != parts {
-                return Err(protocol("conflicting final output item"));
+            if final_parts(old, item.kind())? != parts {
+                return Err(NATIVE.error("conflicting final output item"));
             }
             return Ok(());
         }
         if item.parts().any(|(position, _)| *position >= parts.len()) {
-            return Err(protocol("final item omitted a streamed content part"));
+            return Err(NATIVE.error("final item omitted a streamed content part"));
         }
         for (position, content) in parts.into_iter().enumerate() {
             self.close_part(id, position, content)?;
@@ -207,7 +217,7 @@ impl Decoder {
             Err(error) => {
                 if !terminal && native::item_arguments(native).is_err() {
                     if state.snapshot().is_some() {
-                        return Err(protocol("duplicate final output item"));
+                        return Err(NATIVE.error("duplicate final output item"));
                     }
                     return self.mark_provisional(id, native);
                 }
@@ -222,7 +232,7 @@ impl Decoder {
                 let same =
                     old == &call || (omitted && old.id() == call.id() && old.name() == call.name());
                 if !same {
-                    return Err(protocol("conflicting final output item"));
+                    return Err(NATIVE.error("conflicting final output item"));
                 }
                 return Ok(());
             }
@@ -230,7 +240,7 @@ impl Decoder {
                 // Preserve the rejection of a malformed prior item.done even
                 // if a later normal terminal supplies a valid object.
                 native::function_call(old)?;
-                return Err(protocol("conflicting final output item"));
+                return Err(NATIVE.error("conflicting final output item"));
             }
             FunctionPhase::Streaming(_) => {}
         }
@@ -251,7 +261,7 @@ impl Decoder {
                     .and_then(FunctionState::snapshot)
                     .is_some_and(|other| other.get("call_id") == native.get("call_id"))
         }) {
-            return Err(protocol("duplicate function call ID"));
+            return Err(NATIVE.error("duplicate function call ID"));
         }
         let streaming = state.streaming()?;
         if streaming
@@ -263,7 +273,7 @@ impl Decoder {
                 .as_deref()
                 .is_some_and(|name| name != call.name())
         {
-            return Err(protocol("final function identity changed"));
+            return Err(NATIVE.error("final function identity changed"));
         }
         self.validate_arguments(id, call.arguments())?;
         self.close_part(id, 0, Content::ToolCall(call.clone()))?;
@@ -300,7 +310,7 @@ impl Decoder {
         match recovered {
             Some(object) if !object.is_empty() => {
                 ToolCall::new(call.id(), call.name(), Value::Object(object))
-                    .map_err(|error| protocol(error.to_string()))
+                    .map_err(|error| NATIVE.error(error.to_string()))
             }
             _ => Ok(call),
         }
@@ -318,7 +328,7 @@ impl Decoder {
                 FinalArguments::Incomplete(old) => &arguments(old)? == value,
             };
             if !matches {
-                return Err(protocol("conflicting final function arguments"));
+                return Err(NATIVE.error("conflicting final function arguments"));
             }
         }
         // Final arguments may repair unparseable deltas, but two complete,
@@ -328,14 +338,14 @@ impl Decoder {
             && !streamed.is_empty()
             && &streamed != value
         {
-            return Err(protocol("final function arguments disagree with deltas"));
+            return Err(NATIVE.error("final function arguments disagree with deltas"));
         }
         Ok(())
     }
 
     pub(crate) fn finish(&mut self) -> Result<Vec<ResponseEvent>, ProviderError> {
         if !self.completed {
-            return Err(protocol("stream ended before a terminal response"));
+            return Err(NATIVE.error("stream ended before a terminal response"));
         }
         Ok(vec![])
     }
@@ -367,12 +377,7 @@ mod tests {
 
     #[test]
     fn function_completion_replaces_partial_identity_with_validated_call() {
-        let mut decoder = Decoder::new(
-            "model".into(),
-            crate::provider::codec::common::tests::scope(),
-            &Dialect::stateless(),
-            ErrorSignals::NONE,
-        );
+        let mut decoder = decoder();
         decoder
             .feed(added(0, json!({"type":"function_call", "id":"f"})))
             .unwrap();
@@ -423,12 +428,7 @@ mod tests {
             ("max_output_tokens", CutReason::MaxTokens),
             ("content_filter", CutReason::Refusal),
         ] {
-            let mut decoder = Decoder::new(
-                "model".into(),
-                scope(),
-                &super::super::tests::streamed_only(),
-                ErrorSignals::NONE,
-            );
+            let mut decoder = decoder_for(TerminalOutput::StreamedOnly);
             let mut events = Vec::new();
             feed_into(
                 &mut decoder,
@@ -532,15 +532,9 @@ mod tests {
                 "context_length_exceeded",
                 ProviderErrorKind::ContextWindowExceeded,
             ),
-            (
-                "rate_limit_exceeded",
-                ProviderErrorKind::RateLimited { retry_after: None },
-            ),
+            ("rate_limit_exceeded", ProviderErrorKind::RateLimited),
             ("invalid_api_key", ProviderErrorKind::Authentication),
-            (
-                "server_error",
-                ProviderErrorKind::Unavailable { retry_after: None },
-            ),
+            ("server_error", ProviderErrorKind::Unavailable),
         ] {
             let details = json!({"code":code, "message":"details"});
             for event in [
@@ -549,7 +543,7 @@ mod tests {
             ] {
                 let error = decoder.feed(event).unwrap_err();
                 assert!(error.message.ends_with(": details"));
-                assert_eq!(error.kind, kind);
+                assert_eq!(error.kind(), kind);
             }
         }
         let terminal = sse(Some("response.completed"), completed(vec![]).to_string());

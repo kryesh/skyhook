@@ -80,7 +80,7 @@ impl McpImage {
     fn new(index: usize, image: &ImageRef) -> Self {
         Self {
             sha256: image.blob.sha256,
-            media_type: image.format.media_type(),
+            media_type: image.format.as_str(),
             name: format!("mcp-image-{index}.{}", image.format.extension()),
             bytes: image.blob.bytes,
         }

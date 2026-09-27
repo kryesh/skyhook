@@ -1,7 +1,6 @@
 use super::entries::{Dep, History, Inputs};
 use super::live::{live_tail_response, live_tail_responses, response_entries, working_entry};
-use super::requests::refresh_request_entry;
-use super::{Entry, EntryView, Projection, Tab};
+use super::{Entry, EntryKey, EntryView, Projection, Tab};
 use crate::tui::app::OutputStore;
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::{AgentId, JobId};
@@ -12,7 +11,7 @@ use std::collections::{HashMap, HashSet};
 /// History folds new records and rebuilds only the entries whose sources changed;
 /// the live tail and working indicator are rebuilt on each update. The caller
 /// bumps `revision` for presentation changes, which rebuild everything, as do a
-/// new agent, tab or detail setting.
+/// new agent, tab or detail setting; a toggled entry rebuilds only its source.
 ///
 /// Entries and all indices share one owner. Render/export borrow the entries;
 /// historical strings and documents are never cloned at the update boundary.
@@ -25,7 +24,7 @@ pub struct ContentCache {
     /// Requests whose responses form the live tail.
     live: Vec<RequestSeq>,
     dirty_responses: HashMap<AgentId, HashSet<RequestSeq>>,
-    invalid_jobs: HashSet<JobId>,
+    invalid: HashSet<Dep>,
 }
 
 impl ContentCache {
@@ -41,7 +40,12 @@ impl ContentCache {
 
     /// Refresh downloaded output for one tool without invalidating history.
     pub fn invalidate_job(&mut self, job: JobId) {
-        self.invalid_jobs.insert(job);
+        self.invalid.insert(Dep::Job(job));
+    }
+
+    /// Rebuild the entry after its expansion changed.
+    pub fn invalidate_entry(&mut self, key: EntryKey) {
+        self.invalid.insert(Dep::Entry(key));
     }
 
     pub fn entries(&self) -> &[Entry] {
@@ -103,7 +107,13 @@ impl ContentCache {
         let identity = (agent.clone(), tab, presentation.all_details, revision);
         let dirty_responses = self.dirty_responses.remove(agent).unwrap_or_default();
         changed.extend(dirty_responses.iter().copied().map(Dep::Request));
-        changed.extend(self.invalid_jobs.drain().map(Dep::Job));
+        changed.extend(self.invalid.drain());
+        if tab == Tab::Requests
+            && let Some(request) = snapshot.ledger.open(agent)
+        {
+            // Elapsed time changes without a new journal record.
+            changed.insert(Dep::Request(request));
+        }
         let inputs = Inputs {
             snapshot,
             projection,
@@ -122,23 +132,12 @@ impl ContentCache {
             let update = self.history.update(inputs, entries, changed);
             (tail, update.dirty, update.shifted)
         };
-        if tab == Tab::Requests {
-            // Elapsed time changes without a new journal record.
-            if let Some(request) = projection.ledger.open(agent)
-                && let Some(record) = projection.ledger.get(request)
-                && let Some(range) = self.history.record_entries(request.into())
-                && let Some(entry) = entries[range.clone()].first_mut()
-                && refresh_request_entry(entry, record)
-            {
-                dirty.push(range.start);
-            }
-        }
         if tab == Tab::Conversation {
             // Native events can replace equal-length text, reorder items, or end
             // blocks: the live suffix is rebuilt whole, never journal entries.
             let agent_name = projection.agent_name(agent);
             let requests: Vec<_> = if rebuild {
-                let responses = live_tail_responses(snapshot, projection, agent);
+                let responses = live_tail_responses(snapshot, agent);
                 responses.into_iter().map(|(request, _)| request).collect()
             } else {
                 let mut requests: Vec<_> =
@@ -149,14 +148,15 @@ impl ContentCache {
             };
             self.live.clear();
             for request in requests {
-                if let Some(response) = live_tail_response(snapshot, projection, agent, request) {
+                if let Some(response) = live_tail_response(snapshot, agent, request) {
                     self.live.push(request);
                     entries.extend(response_entries(request, response, view, agent_name));
                 }
             }
             // The working indicator is a synthetic tail, never part of history.
-            let running = entries.iter().any(|entry| entry.running);
-            entries.extend(working_entry(snapshot, projection, agent, running));
+            let live = &entries[self.history.len()..];
+            let running = self.history.running > 0 || live.iter().any(|entry| entry.running);
+            entries.extend(working_entry(snapshot, agent, running));
         }
         if rebuild {
             // Unchanged entries keep their layout. An insertion or removal shifts
@@ -182,11 +182,11 @@ fn changed_indices(old: &[Entry], new: &[Entry], offset: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::super::entries::entries as history_entries;
-    use super::super::tests::{Journal, job_info, replay, root, update};
+    use super::super::tests::{Journal, created, finished, loaded, replay, root, update};
     use super::super::{EntryKey, ResponseRef, Surface, Title, View};
     use super::*;
     use skyhook::agent::{AgentActivity, RuntimeEvent};
-    use skyhook::job::{JobRole, JobState};
+    use skyhook::job::JobRole;
     use skyhook::provider::protocol::{
         AssistantItem, BlockId, BlockRef, Completion, ItemId, ResponseEvent,
     };
@@ -265,21 +265,20 @@ mod tests {
             (&key, Surface::Tool, None)
         );
         assert_eq!(entry.text(), "▸ × exec · Failed");
+        // Expanding rebuilds only the toggled entry's source.
         view.set_expanded(key.clone(), true);
-        refresh(
+        cache.invalidate_entry(key.clone());
+        let dirty = refresh(
             &mut cache,
             (&journal.snapshot, &mut projection),
             show(&agent, &view, false),
             &outputs,
-            1,
+            0,
         );
+        assert_eq!(dirty, [0]);
         let text = cache.entries()[0].text();
         assert_eq!(cache.entries()[0].key(), &key);
-        for part in [
-            "Arguments",
-            "Output\n  Permission was denied",
-            "permission_denied",
-        ] {
+        for part in ["Arguments", "Output\n  Permission was denied"] {
             assert!(text.contains(part), "{text}");
         }
         assert_eq!(text.matches("Permission was denied").count(), 1);
@@ -289,15 +288,19 @@ mod tests {
         );
     }
 
-    #[test]
-    fn content_cache_refreshes_only_invalidated_tool_output() {
-        let agent = root(34);
-        let snapshot = ObservationSnapshot::default();
-        let mut projection = Projection::default();
+    #[tokio::test]
+    async fn content_cache_refreshes_only_invalidated_tool_output() {
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
         for id in 1..=2 {
-            let job = job_info(&agent, id, JobRole::Tool, JobState::Completed);
-            projection.jobs.insert(job.id, job);
+            journal
+                .record(&agent, created(id, "exec", JobRole::Tool))
+                .await;
+            journal.record(&agent, finished(id)).await;
         }
+        let snapshot = journal.snapshot;
+        let mut projection = Projection::default();
+        projection.rebuild(&snapshot);
         let view = View::default();
         let presentation = EntryView {
             tab: Tab::Jobs,
@@ -309,8 +312,8 @@ mod tests {
         assert_eq!(cache.entries().len(), 2);
         let unchanged = cache.entries()[1].clone();
         let job = JobId::new(1).unwrap();
-        let output = serde_json::json!({"stdout": "new output", "exit_code": 0});
-        outputs.insert_product(job, crate::tui::tool_view::OutputView::historical(output));
+        let output = serde_json::json!({"result": {"stdout": "new output"}});
+        loaded(&mut outputs, job, output);
         cache.invalidate_job(job);
         let state = (&snapshot, &mut projection);
         let dirty = refresh(&mut cache, state, presentation, &outputs, 0);
@@ -511,8 +514,10 @@ mod tests {
             let error = String::from("HTTP 503 [code=overloaded]");
             let failed = SessionEvent::ModelFailed {
                 attempt: skyhook::session::AttemptRef { request, attempt },
-                error: error.clone(),
-                kind: skyhook::session::ModelFailureKind::Error,
+                failure: skyhook::agent::Failure::Provider(
+                    error.clone(),
+                    skyhook::provider::ProviderErrorKind::Unavailable,
+                ),
             };
             assert_eq!(commit!(failed), [0]);
             assert_eq!(cache.entries().len(), 1);
@@ -553,8 +558,7 @@ mod tests {
                 request,
                 attempt: 3,
             },
-            error,
-            kind: skyhook::session::ModelFailureKind::Error,
+            failure: skyhook::agent::Failure::Other(error),
         };
         commit!(failed);
         assert_eq!(cache.entries().len(), 2);
@@ -578,9 +582,7 @@ mod tests {
     async fn incremental_history_matches_a_fresh_build_record_by_record() {
         use skyhook::job::{AgentMessage, JobEnd, JobTransition};
         use skyhook::provider::protocol::{ToolCall, ToolResult};
-        use skyhook::session::{
-            AttemptRef, CompletedOutcome, JobEvent, ModelCallOrigin, ModelFailureKind,
-        };
+        use skyhook::session::{AttemptRef, CompletedOutcome, JobEvent, ModelCallOrigin};
         let mut journal = Journal::new().await;
         let agent = journal.agent();
         let (view, outputs) = (View::default(), OutputStore::default());
@@ -623,8 +625,10 @@ mod tests {
         let error = "HTTP 503".into();
         let failure = SessionEvent::ModelFailed {
             attempt: attempt(1),
-            error,
-            kind: ModelFailureKind::Error,
+            failure: skyhook::agent::Failure::Provider(
+                error,
+                skyhook::provider::ProviderErrorKind::Unavailable,
+            ),
         };
         let failure = journal.record(&agent, failure).await;
         step(&journal, "failed", &[]);

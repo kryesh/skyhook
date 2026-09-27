@@ -30,9 +30,9 @@ pub(crate) struct ModelEntry {
 pub(crate) struct Catalog {
     pub(crate) models: indexmap::IndexMap<ModelRef, ModelEntry>,
     pub(crate) default_model: ModelRef,
-    pub(crate) modes: indexmap::IndexMap<String, Mode>,
+    pub(crate) modes: indexmap::IndexMap<ModeName, Mode>,
     /// The mode a new session starts in; none without modes.
-    pub(crate) mode: Option<String>,
+    pub(crate) mode: Option<ModeName>,
 }
 
 /// A catalog admitted with the configuration is proven; one assembled through
@@ -66,8 +66,8 @@ impl CatalogSource {
 struct Assembled {
     models: indexmap::IndexMap<ModelRef, ModelEntry>,
     default_model: Option<ModelRef>,
-    modes: indexmap::IndexMap<String, Mode>,
-    mode: Option<String>,
+    modes: indexmap::IndexMap<ModeName, Mode>,
+    mode: Option<ModeName>,
 }
 
 impl Assembled {
@@ -107,7 +107,7 @@ impl Assembled {
 
 /// A mode is a set: the journal pins it sorted and without repeats. Interaction
 /// follows the host, so a mode never lists it.
-fn normalize_modes(modes: &mut indexmap::IndexMap<String, Mode>) {
+fn normalize_modes(modes: &mut indexmap::IndexMap<ModeName, Mode>) {
     for mode in modes.values_mut() {
         (mode.capabilities).retain(|capability| *capability != Capability::Interactive);
         mode.capabilities.sort();
@@ -138,7 +138,7 @@ impl HarnessBuilder {
             extra_tools: ToolRegistry::default(),
             mcp: BTreeMap::new(),
             instructions: Vec::new(),
-            max_child_depth: 4,
+            max_child_depth: crate::config::DEFAULT_MAX_CHILD_DEPTH,
             capabilities: CapabilitySet::default(),
             targets: TargetsConfig::default(),
             shim_catalog: EmbeddedShimCatalog::default(),
@@ -232,7 +232,7 @@ impl HarnessBuilder {
     /// The modes the root agent can run in, and with a hint its descendants; each is
     /// limited by `capabilities`. With none, the root agent holds `capabilities` itself.
     #[must_use]
-    pub fn modes(self, mut modes: indexmap::IndexMap<String, Mode>) -> Self {
+    pub fn modes(self, mut modes: indexmap::IndexMap<ModeName, Mode>) -> Self {
         normalize_modes(&mut modes);
         self.assemble(|catalog| catalog.modes = modes)
     }
@@ -240,8 +240,8 @@ impl HarnessBuilder {
     /// The mode a new session starts in; by default the first. `build` rejects one
     /// the modes do not declare.
     #[must_use]
-    pub fn mode(self, mode: impl Into<String>) -> Self {
-        self.assemble(|catalog| catalog.mode = Some(mode.into()))
+    pub fn mode(self, mode: ModeName) -> Self {
+        self.assemble(|catalog| catalog.mode = Some(mode))
     }
 
     #[must_use]
@@ -485,21 +485,21 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let base = || test_builder(root.path(), &sessions, Arc::new(HangingProvider), false);
-        let profile = |context, output| ModelProfile::new("model", None, context, output, false);
-        let bad = |profile| {
-            base().provider(
-                "test".parse().unwrap(),
-                Arc::new(HangingProvider),
-                [("bad".parse().unwrap(), profile)],
-            )
-        };
+        let limit = crate::tests::limit(8);
+        let bad = base().provider(
+            "test".parse().unwrap(),
+            Arc::new(HangingProvider),
+            [(
+                "bad".parse().unwrap(),
+                ModelProfile::new("model".parse().unwrap(), None, limit, limit, false),
+            )],
+        );
         let cases = [
             (
                 "missing default",
                 base().default_model("test/absent".parse().unwrap()),
             ),
-            ("zero context", bad(profile(0, 1))),
-            ("output limit", bad(profile(8, 8))),
+            ("output limit", bad),
         ];
         for (case, builder) in cases {
             let (model, error) = match builder.build().await {
@@ -509,8 +509,7 @@ mod tests {
             };
             let expected = match case {
                 "missing default" => ("test/absent", None),
-                "zero context" => ("test/bad", Some(LimitsError::Context)),
-                _ => ("test/bad", Some(LimitsError::OutputExceedsContext)),
+                _ => ("test/bad", Some(LimitsError)),
             };
             assert_eq!((model.to_string().as_str(), error), expected, "{case}");
         }
@@ -527,32 +526,35 @@ mod tests {
             instructions: None,
             hint: None,
         };
+        let (look, work, missing) = (mode_name("look"), mode_name("work"), mode_name("missing"));
         let modes = || {
             [
-                ("look".to_owned(), mode(&[Capability::Read])),
-                (
-                    "work".to_owned(),
-                    mode(&[Capability::Read, Capability::Write]),
-                ),
+                (look.clone(), mode(&[Capability::Read])),
+                (work.clone(), mode(&[Capability::Read, Capability::Write])),
             ]
             .into()
         };
         let starting = |harness: Harness| harness.inner.mode.clone();
-        let built = base().mode("work").modes(modes()).build().await.unwrap();
-        assert_eq!(starting(built).as_deref(), Some("work"));
-        let built = base().modes(modes()).mode("work").build().await.unwrap();
-        assert_eq!(starting(built).as_deref(), Some("work"));
-        let built = base().modes(modes()).build().await.unwrap();
-        assert_eq!(starting(built).as_deref(), Some("look"));
         for builder in [
-            base().mode("missing").modes(modes()),
-            base().modes(modes()).mode("missing"),
+            base().mode(work.clone()).modes(modes()),
+            base().modes(modes()).mode(work.clone()),
+        ] {
+            assert_eq!(
+                starting(builder.build().await.unwrap()).as_ref(),
+                Some(&work)
+            );
+        }
+        let built = base().modes(modes()).build().await.unwrap();
+        assert_eq!(starting(built).as_ref(), Some(&look));
+        for builder in [
+            base().mode(missing.clone()).modes(modes()),
+            base().modes(modes()).mode(missing.clone()),
         ] {
             let error = builder.build().await.err().unwrap();
-            assert!(matches!(error, HarnessError::UnknownMode(mode) if mode == "missing"));
+            assert!(matches!(error, HarnessError::UnknownMode(mode) if mode == missing));
         }
         // Without modes the root holds the ceiling itself; a selection does not apply.
-        let built = base().mode("work").build().await.unwrap();
+        let built = base().mode(work).build().await.unwrap();
         assert!(starting(built).is_none());
     }
 
@@ -830,8 +832,7 @@ mod tests {
                 HostConfirmation,
                 AgentConfirmation,
             ] {
-                let message = "authentication requested".to_owned();
-                let prompt = SensitivePrompt { kind, message };
+                let prompt = SensitivePrompt::test(kind);
                 let result = harness.inner.sensitive_prompts.prompt(prompt).await;
                 match result {
                     Ok(_) => assert!(interactive),

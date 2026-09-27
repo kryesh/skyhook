@@ -8,28 +8,29 @@ as failures, with retained partial output marked incomplete.
 ## Tool result shapes
 
 See the [JavaScript JobView response contract](javascript.md#jobview-response-contract) for the
-seven-key envelope, metadata, presentation group, `has_result`, and `unwrap()` behavior. This page
+envelope, metadata, presentation group, and `unwrap()` behavior. This page
 focuses on saved output and the task-specific payloads below. A failed or pending view remains an
 ordinary response.
 
 Search and glob patterns filter eligible files without overriding hidden-file or ignore settings.
-Nulls in tool payloads and metadata are preserved; known empty/default output fields do not disappear.
-Process results always contain `exit_code: number|null`, `stdout: string`, `stderr: string`, and
-`timed_out: boolean`, including empty streams and a false timeout flag. Completed agent calls return
-their complete answer string without automatic truncation. Child questions return `{questions:[{id,prompt,options?}]}`.
+Nulls in tool payloads are preserved; fields a tool has no value for are absent.
+Process results contain `exit_code`, or `signal` when a signal killed the process, and the
+`stdout` and `stderr` streams that produced output; scripts read an absent stream as `""`.
+Completed agent calls return their complete answer string without automatic truncation. Child questions return `{questions:[{id,prompt,options?}]}`.
 
 Directory reads return grouped entries with file sizes, for example:
-`{kind:"directory",path:"src",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"],symlinks:[],other:[]}}`.
-Groups are `files`, `directories`, `symlinks`, and `other`, with sorted names; known empty groups
-remain present. `read({path:"src",details:true})` returns flat `{name,kind,bytes?}` entries; regular files include sizes in both forms.
+`{kind:"directory",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}`.
+Groups are `files`, `directories`, `symlinks`, and `other`, with sorted names; empty `symlinks` and
+`other` groups are absent, and scripts read them as `[]`.
+`read({path:"src",details:true})` returns flat `{name,kind,bytes?}` entries; regular files include sizes in both forms.
 Missing paths and operating-system access denials from `read` are successful tool results with
-`{kind:"error", path, error:{code:"not_found"|"permission_denied", message}}`, so workflows can inspect the
+`{kind:"error", error:{code:"not_found"|"permission_denied", message}}`, so workflows can inspect the
 error without catching an exception. Tool-policy permission denials remain tool errors.
 Search returns `{matches:{"src/main.rs":["12: matching text"]}}`, preserving source whitespace.
 `search({pattern:"...",details:true})` returns structured `{path,line,column,text}` matches instead.
 An empty search result has `matches: {}`. Grouped maps share a single preview budget.
-`targets({details:true})` returns full target metadata. Defaults and `target_add` retain their documented
-fields and populate known name/type/host/workspace/via/origin metadata; fields are null only when genuinely unavailable.
+`targets({details:true})` returns full target metadata; fields a target does not set are absent.
+`target_add` completes without a result.
 All defaulted input fields, including `details: false`, are optional in tool schemas.
 
 By default, hidden entries (including `.git`) and ignored files are excluded. `hidden: true`
@@ -77,15 +78,15 @@ is reached first. Strings count UTF-8 content bytes before JSON escaping; arrays
 count their saved JSON text and retain only complete items. Grouped maps share one budget across
 all groups. Shortened fields keep their original types.
 
-`presentation.truncated` contains `{field, total_lines, next_start, next_offset}` for each shortened
-field, reporting its total source lines and exact first unread position. `next_offset` is always
-numeric, including `0`. Finished jobs with incomplete captures include an `Output incomplete.`
-notice. These rules also apply after session resume and to completed remote jobs.
+`presentation.truncated` contains `{field, total_lines, next_start, next_offset?}` for each
+shortened field, reporting its total source lines and exact first unread position. `next_offset`
+is present only when the first unread position is inside a line. Finished jobs with incomplete
+captures include an `Output incomplete.` notice. These rules also apply after session resume and to completed remote jobs.
 
 ## Script result presentation
 
-The enclosing script's `.result` is `{value, console, failure}`; silent scripts retain
-`console: ""`. Ordinary tools have no console field. Existing JobViews such as
+The enclosing script's `.result` is `{value, console?, failure?}`; silent scripts have no
+`console`. Ordinary tools have no console field. Existing JobViews such as
 `tool.jobs({job})` reads are not wrapped again.
 
 Presentation never changes the full saved return value. Default script output retrieval returns
@@ -95,7 +96,7 @@ returning the same data explicitly produces both outputs.
 ## Paging and searching
 
 Explicit `jobs({job})` selections return a view whose `presentation.preview` defaults to
-100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is always returned in full.
+100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is never truncated.
 
 ```js
 // Read a selected part of a saved result.
@@ -121,21 +122,21 @@ starting line (default 0). `limit` is 1–1000 returned source lines (default 10
 match context. `context` is 0–20 surrounding lines (default 0); positive context requires `pattern`.
 Output inspection returns immediately; it does not wait for new output.
 
-Explicit read pages contain `field` and `lines`, plus `total_lines` (which is `null` when
-unavailable) and a next position. `next_start` is `null` when no continuation remains, while
-`next_offset` is always present and numeric, including `0`.
-`lines` is an array of strings, one per returned line (or fragment of an oversized line),
-without per-line objects or match flags. Empty fields have zero lines;
+Explicit read pages contain `lines`, plus `total_lines` (absent when unavailable) and a next
+position. `field` is omitted when it is the field the model asked for. `next_start` is absent when
+no continuation remains, and `next_offset` is present only when the next position is inside a
+line. `lines` has one entry per returned line (or fragment of an oversized line): a string for a
+plain read, and `{line, text}` with the one-based source line number for a search. Empty fields
+have zero lines;
 a final unterminated line counts, and a trailing newline does not add an empty line.
 Read pages and automatic string previews prefer whole lines; oversized lines are split at
 UTF-8 boundaries. The page byte budget may return fewer lines than `limit`: use the returned
 position instead of computing `start + limit`. Offsets beyond a line or inside a UTF-8
 character are rejected. A start past the available lines returns an empty page with the total.
 
-For closed fields, `next_start: null` means no selected content remains; `next_offset` remains
-numeric (usually `0`). For running fields, `total_lines` describes currently captured output and
+For closed fields, a missing `next_start` means no selected content remains. For running fields, `total_lines` describes currently captured output and
 the numeric next position can be retried after yielding with `wait`, even when no content is
-currently available. Unavailable output uses `total_lines: null`; known empty output retains zero.
+currently available. Unavailable output omits `total_lines`; known empty output retains zero.
 Repeat the field, regex, and context when continuing a search; overlapping
 match context is reconstructed from saved text. Live searches defer incomplete lines and context
 windows until more output arrives or capture closes. A wait timeout never stops the original job.
@@ -145,14 +146,14 @@ windows until more output arrives or capture closes. A wait timeout never stops 
 Reads are repeatable and survive session resume. Finished jobs with retained partial output have
 an `Output incomplete.` notice, including when viewing the final captured page.
 
-The view's `presentation.captures` lists available captures, even without a structured result:
+The view's `presentation.captures` lists the available captures its result does not already show
+in full, even without a structured result:
 
 ```json
-[{"field":"/result/console","kind":"text","complete":false,"output":null}]
+[{"field":"/result/console","complete":false}]
 ```
 
-`kind` is `text`, `json`, or `unknown`. `complete: false` means the capture is still live or
-incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
+`complete: false` means the capture is still live or incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
 Select a descriptor's `field` to page or search its retained bytes. Capture descriptors survive
 failures, cancellation, and session resume even when there is no structured result containing
 those fields. Empty or absent result fields are not fabricated to represent partial captures.

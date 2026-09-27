@@ -6,23 +6,20 @@ use tokio::sync::{Mutex, OwnedMutexGuard, oneshot};
 use crate::{
     execution::ExecutionLocation,
     job::CancellationToken,
-    remote::SensitivePromptHandler,
-    target::{TargetDefinition, TargetName},
+    remote::{
+        error::{ProtocolError, RemoteError},
+        flow::{self, Credits},
+        prompt::SensitivePromptHandler,
+        protocol::{
+            PromptId, Request, RequestId, Response, Sequence, read_frame, spawn_owned_write,
+            write_frame,
+        },
+        transport::{Transport, Writer},
+    },
     tool::{
         ToolContext, ToolOutput,
-        authorization::AuthorizationCoordinator,
         diagnostic::{Effects, FailureSite, Operation, PartialContext, Subject},
         source::Source,
-    },
-};
-
-use crate::remote::{
-    ProtocolError,
-    flow::{CHUNK_BYTES, Credits},
-    manager::RemoteError,
-    protocol::{
-        PromptId, RemoteToolResult, Request, RequestId, Response, read_frame, spawn_owned_write,
-        write_frame,
     },
 };
 
@@ -38,33 +35,25 @@ use streams::ClientStream;
 pub(crate) use tests::test_transport;
 
 pub(crate) struct PooledConnection {
-    writer: Arc<Mutex<RequestWriter>>,
+    writer: Arc<Mutex<Writer>>,
+    ids: Sequence<RequestId>,
     state: Arc<Mutex<ConnectionState>>,
     shutdown: CancellationToken,
 }
 
-struct RequestWriter {
-    input: crate::remote::transport::Writer,
-    next_request_id: Option<RequestId>,
-}
-
-#[cfg(test)]
-use crate::remote::protocol::{RemoteToolError, RemoteToolOutput};
-type PendingResult = Result<results::ReceivedResult, RemoteError>;
+type PendingResult = Result<results::Received, RemoteError>;
 
 struct PendingCall {
     sender: oneshot::Sender<PendingResult>,
     context: ToolContext,
-    // Host-owned tools retain their ownership context while invoking a remote worker.
-    destination: ExecutionLocation,
-    upload: Option<UploadCredits>,
+    /// Credits for the call's source upload, returned by the worker's `SourceAck`s.
+    upload: Option<OwnedCredits>,
 }
 
-/// Credits for a call's source upload, returned by the worker's `SourceAck`s.
-/// Dropping them with the call releases an upload waiting for credit.
-struct UploadCredits(Credits);
+/// Credits a sender waits for; dropping their owner releases the sender.
+struct OwnedCredits(Credits);
 
-impl Drop for UploadCredits {
+impl Drop for OwnedCredits {
     fn drop(&mut self) {
         self.0.close();
     }
@@ -77,6 +66,17 @@ struct ConnectionState {
     streams: HashMap<RequestId, ClientStream>,
 }
 
+impl ConnectionState {
+    /// Keep the first failure and end every relayed stream with it.
+    fn fail(&mut self, failure: RemoteError) -> RemoteError {
+        let failure = self.failure.get_or_insert(failure).clone();
+        for (_, stream) in self.streams.drain() {
+            let _ = stream.closed.send(Err(failure.clone()));
+        }
+        failure
+    }
+}
+
 impl PooledConnection {
     pub(in crate::remote) async fn is_failed(&self) -> bool {
         self.state.lock().await.failure.is_some()
@@ -87,13 +87,13 @@ impl PooledConnection {
         &self,
         register: impl FnOnce(RequestId, &mut ConnectionState) -> (Request, T),
     ) -> Result<(RequestId, T), RemoteError> {
-        let mut writer = self.writer.clone().lock_owned().await;
+        let writer = self.writer.clone().lock_owned().await;
         let mut state = self.state.lock().await;
         if let Some(failure) = &state.failure {
             // This attempt never registered, even if earlier calls may have executed.
             return Err(not_started(failure.clone()));
         }
-        let Some(request_id) = writer.next_request_id else {
+        let Some(request_id) = self.ids.next() else {
             drop(state);
             drop(writer);
             let failure = transport_error(
@@ -103,32 +103,21 @@ impl PooledConnection {
             fail_connection(&self.state, failure.clone()).await;
             return Err(not_started(failure));
         };
-        writer.next_request_id = request_id.next();
         let (request, result) = register(request_id, &mut state);
         drop(state);
-        self.write(writer, request).await?;
+        write_request(writer, &self.state, request).await?;
         Ok((request_id, result))
     }
 
-    /// Once registered, the frame is finished even if this await is dropped;
-    /// a failed write quarantines the connection.
-    async fn write(
-        &self,
-        writer: OwnedMutexGuard<RequestWriter>,
-        request: Request,
-    ) -> Result<(), RemoteError> {
-        write_request(writer, &self.state, request).await
-    }
-
+    /// Serve a shim's responses; the shim runs at `location`.
     pub(in crate::remote) async fn from_transport(
-        transport: crate::remote::transport::Transport,
-        target: &TargetName,
-        authorization: AuthorizationCoordinator,
+        transport: Transport,
+        location: ExecutionLocation,
         prompts: Arc<dyn SensitivePromptHandler>,
         tasks: &tokio_util::task::TaskTracker,
         shutdown: CancellationToken,
     ) -> Result<Self, RemoteError> {
-        let crate::remote::transport::Transport {
+        let Transport {
             mut input,
             mut output,
             owner,
@@ -150,20 +139,16 @@ impl PooledConnection {
             )));
         }
         let state = Arc::new(Mutex::new(ConnectionState::default()));
-        let writer = Arc::new(Mutex::new(RequestWriter {
-            input,
-            next_request_id: Some(RequestId::FIRST),
-        }));
+        let writer = Arc::new(Mutex::new(input));
         let reader_state = state.clone();
         let reader_writer = writer.clone();
-        let reader_target = target.clone();
         let reader_shutdown = shutdown.clone();
         tasks.spawn(async move {
             route_responses(
                 output,
                 &reader_state,
-                (&reader_writer, &authorization),
-                reader_target,
+                &reader_writer,
+                location,
                 prompts,
                 reader_shutdown,
                 owner,
@@ -172,34 +157,11 @@ impl PooledConnection {
         });
         Ok(PooledConnection {
             writer,
+            ids: Sequence::default(),
             state,
             shutdown,
         })
     }
-}
-
-async fn call_tool(
-    connection: &PooledConnection,
-    name: String,
-    arguments: serde_json::Value,
-    context: &ToolContext,
-    destination: ExecutionLocation,
-) -> Result<ToolOutput, RemoteError> {
-    let capabilities = context.capabilities().iter().collect();
-    let source = context.source().cloned();
-    let streams_source = source.is_some();
-    let request = move |request_id| Request::Tool {
-        request_id,
-        name,
-        arguments,
-        capabilities,
-        source: streams_source,
-    };
-    let received = call(connection, context, destination, request, source).await?;
-    if received.source.is_some() {
-        return Err(ProtocolError::Violation("source contents for a tool call").into());
-    }
-    Ok(received.output)
 }
 
 /// Submit one request, stream its source, and await its result, cancelling it
@@ -207,7 +169,6 @@ async fn call_tool(
 async fn call(
     connection: &PooledConnection,
     context: &ToolContext,
-    destination: ExecutionLocation,
     request: impl FnOnce(RequestId) -> Request + Send,
     source: Option<Source>,
 ) -> Result<results::Received, RemoteError> {
@@ -215,8 +176,10 @@ async fn call(
         return Err(RemoteError::Cancelled);
     }
     let credits = source.as_ref().map(|_| Credits::default());
-    let upload = credits.clone().map(UploadCredits);
-    let (request_id, receiver) = connection
+    let upload = credits.clone().map(OwnedCredits);
+    // Armed at registration: a call dropped while its request is still being
+    // written is released too.
+    let (request_id, (receiver, mut unfinished)) = connection
         .submit(move |request_id, state| {
             let (sender, receiver) = oneshot::channel();
             state.pending.insert(
@@ -224,26 +187,20 @@ async fn call(
                 PendingCall {
                     sender,
                     context: context.clone(),
-                    destination,
                     upload,
                 },
             );
-            (request(request_id), receiver)
+            let unfinished = CancelOnDrop::new(connection, request_id);
+            (request(request_id), (receiver, unfinished))
         })
         .await?;
-    let mut unfinished = CancelOnDrop::new(connection, request_id);
     if let Some((source, credits)) = source.zip(credits) {
-        let uploaded = tokio::select! {
+        // The worker holds the call until its source ends, so a failed upload
+        // relies on the guard to release it.
+        tokio::select! {
             result = send_source(connection, request_id, source, credits) => result,
             () = context.cancelled() => Err(RemoteError::Cancelled),
-        };
-        // The worker holds the call until its source ends; release it. The
-        // upload's own failure is the one to report.
-        if let Err(failure) = uploaded {
-            unfinished.defuse();
-            let _ = send_cancel(connection, request_id).await;
-            return Err(failure);
-        }
+        }?;
     }
     let received = async {
         receiver.await.map_err(|_| {
@@ -254,19 +211,13 @@ async fn call(
             .or(PartialContext::default().effects(Effects::MayHaveExecuted))
         })?
     };
-    tokio::pin!(received);
-    let result = tokio::select! {
-        result = &mut received => {
+    tokio::select! {
+        result = received => {
             unfinished.defuse();
-            result?
+            result
         }
-        () = context.cancelled() => {
-            unfinished.defuse();
-            send_cancel(connection, request_id).await?;
-            return Err(RemoteError::Cancelled);
-        }
-    };
-    result.0
+        () = context.cancelled() => Err(RemoteError::Cancelled),
+    }
 }
 
 /// Send a source's contents in credited chunks; the worker starts the call at
@@ -277,47 +228,26 @@ async fn send_source(
     source: Source,
     credits: Credits,
 ) -> Result<(), RemoteError> {
-    use tokio::io::AsyncReadExt as _;
-    let mut reader = tokio::fs::File::from_std(source.reader().map_err(host_source_error)?);
-    let mut buffer = vec![0; CHUNK_BYTES];
-    loop {
-        let read = reader.read(&mut buffer).await.map_err(host_source_error)?;
-        if read > 0 && credits.take().await.is_err() {
-            return Ok(());
-        }
-        let request = if read == 0 {
-            Request::SourceEnd { request_id }
-        } else {
-            Request::SourceData {
-                request_id,
-                data: buffer[..read].to_vec(),
-            }
+    let reader = tokio::fs::File::from_std(source.reader().map_err(host_source_error)?);
+    flow::pump(reader, Some(&credits), |data| async move {
+        let request = match data {
+            Some(data) => Request::SourceData { request_id, data },
+            None => Request::SourceEnd { request_id },
         };
         let writer = connection.writer.clone().lock_owned().await;
-        connection.write(writer, request).await?;
-        if read == 0 {
-            return Ok(());
-        }
-    }
+        write_request(writer, &connection.state, request).await
+    })
+    .await
+    // Send failures already carry their full context, so this only completes read failures.
+    .map_err(host_source_error)
 }
 
-fn host_source_error(error: std::io::Error) -> RemoteError {
-    RemoteError::from(error).or(PartialContext::new(
-        Operation::Read,
-        Subject::Label("source".into()),
+fn host_source_error(error: impl Into<RemoteError>) -> RemoteError {
+    error.into().or(
+        PartialContext::new(Operation::Read, Subject::Label("source".into()))
+            .at(FailureSite::Host)
+            .effects(Effects::NotStarted),
     )
-    .at(FailureSite::Host)
-    .effects(Effects::NotStarted))
-}
-
-async fn send_cancel(
-    connection: &PooledConnection,
-    request_id: RequestId,
-) -> Result<(), RemoteError> {
-    let writer = connection.writer.clone().lock_owned().await;
-    connection
-        .write(writer, Request::Cancel { request_id })
-        .await
 }
 
 fn not_started(error: RemoteError) -> RemoteError {
@@ -338,12 +268,13 @@ fn transport_error(error: impl Into<RemoteError>, operation: Operation) -> Remot
     )
 }
 
+/// Once registered, the frame is finished even if this await is dropped;
+/// a failed write quarantines the connection.
 async fn write_request(
-    writer: OwnedMutexGuard<RequestWriter>,
+    writer: OwnedMutexGuard<Writer>,
     state: &Mutex<ConnectionState>,
     request: Request,
 ) -> Result<(), RemoteError> {
-    let writer = OwnedMutexGuard::map(writer, |writer| &mut writer.input);
     if let Err(error) = spawn_owned_write(writer, request).await {
         let failure = transport_error(error, Operation::Send);
         fail_connection(state, failure.clone()).await;
@@ -352,10 +283,12 @@ async fn write_request(
     Ok(())
 }
 
-/// Cancels a submitted call that is dropped before its terminal result, so the
-/// worker always releases it (and any source upload it is holding).
+/// Cancels a submitted call that ends or is dropped before its terminal result,
+/// so the worker always releases it (and any source upload it is holding). The
+/// Cancel is written on its own task: a caller dropped while another frame holds
+/// the writer cannot lose it.
 struct CancelOnDrop {
-    writer: Arc<Mutex<RequestWriter>>,
+    writer: Arc<Mutex<Writer>>,
     state: Arc<Mutex<ConnectionState>>,
     request_id: Option<RequestId>,
 }
@@ -369,7 +302,7 @@ impl CancelOnDrop {
         }
     }
 
-    /// The call reached its terminal result or sent its own Cancel.
+    /// The call reached its terminal result.
     fn defuse(&mut self) {
         self.request_id = None;
     }
@@ -396,9 +329,7 @@ impl Drop for CancelOnDrop {
 async fn fail_connection(state: &Mutex<ConnectionState>, failure: RemoteError) {
     let (failure, pending) = {
         let mut state = state.lock().await;
-        let failure = state.failure.get_or_insert(failure).clone();
-        state.streams.clear();
-        (failure, std::mem::take(&mut state.pending))
+        (state.fail(failure), std::mem::take(&mut state.pending))
     };
     for pending in pending.into_values() {
         let _ = pending.sender.send(Err(failure
@@ -420,9 +351,22 @@ impl PooledConnection {
         name: String,
         arguments: serde_json::Value,
         context: &ToolContext,
-        destination: ExecutionLocation,
     ) -> Result<ToolOutput, RemoteError> {
-        call_tool(self, name, arguments, context, destination).await
+        let capabilities = context.capabilities().iter().collect();
+        let source = context.source().cloned();
+        let streams_source = source.is_some();
+        let request = move |request_id| Request::Tool {
+            request_id,
+            name,
+            arguments,
+            capabilities,
+            source: streams_source,
+        };
+        let received = call(self, context, request, source).await?;
+        if received.source.is_some() {
+            return Err(ProtocolError::Violation("source contents for a tool call").into());
+        }
+        Ok(received.output)
     }
 
     /// Read a source file on this connection's machine into a local spool.
@@ -431,7 +375,6 @@ impl PooledConnection {
         tool: String,
         path: String,
         context: &ToolContext,
-        destination: ExecutionLocation,
     ) -> Result<Source, RemoteError> {
         let capabilities = context.capabilities().iter().collect();
         let request = move |request_id| Request::ReadSource {
@@ -440,18 +383,10 @@ impl PooledConnection {
             path,
             capabilities,
         };
-        call(self, context, destination, request, None)
+        call(self, context, request, None)
             .await?
             .source
             .ok_or_else(|| ProtocolError::Violation("source read without contents").into())
-    }
-
-    pub(in crate::remote) async fn open_ssh(
-        self: Arc<Self>,
-        route: Vec<TargetDefinition>,
-        command: String,
-    ) -> Result<crate::remote::transport::Transport, RemoteError> {
-        self.open_stream(route, command).await
     }
 }
 
@@ -459,15 +394,18 @@ impl PooledConnection {
 pub(in crate::remote) mod tests {
     use super::*;
     use crate::job::CancellationToken;
+    use crate::remote::protocol::{ControlRequest, RemoteToolOutput, RemoteToolResult};
+    use crate::target::TargetDefinition;
+    use crate::tests::bounded;
     use crate::tool::{
-        authorization::AuthorizationError,
+        authorization::{AuthorizationArguments, AuthorizationCoordinator, AuthorizationError},
         policy::{AllowAll, Capability},
     };
 
     /// A live fake shim transport for manager/router tests, including the real handshake.
     pub(crate) fn test_transport(
         mut reply: Option<crate::tool::invocation::LocalError>,
-    ) -> crate::remote::transport::Transport {
+    ) -> Transport {
         struct FakeShim(tokio::task::JoinHandle<()>);
         impl Drop for FakeShim {
             fn drop(&mut self) {
@@ -497,29 +435,33 @@ pub(in crate::remote) mod tests {
             }
         }));
         let (output, input) = tokio::io::split(client);
-        crate::remote::transport::Transport {
+        Transport {
             input: Box::new(input),
             output: Box::new(output),
             owner: Box::new(owner),
         }
     }
 
-    pub(super) async fn test_connection() -> PooledConnection {
+    pub(super) fn sink() -> Arc<Mutex<Writer>> {
+        Arc::new(Mutex::new(Box::new(tokio::io::sink())))
+    }
+
+    pub(super) fn test_connection() -> PooledConnection {
         PooledConnection {
-            writer: Arc::new(Mutex::new(RequestWriter {
-                input: Box::new(tokio::io::sink()),
-                next_request_id: Some(RequestId::FIRST),
-            })),
+            writer: sink(),
+            ids: Sequence::default(),
             state: Arc::new(Mutex::new(ConnectionState::default())),
             shutdown: CancellationToken::new(),
         }
     }
 
     /// A test connection whose request writer is the returned in-memory peer.
-    async fn wired_connection(buffer: usize) -> (Arc<PooledConnection>, tokio::io::DuplexStream) {
-        let connection = test_connection().await;
+    pub(super) async fn wired_connection(
+        buffer: usize,
+    ) -> (Arc<PooledConnection>, tokio::io::DuplexStream) {
+        let connection = test_connection();
         let (input, peer) = tokio::io::duplex(buffer);
-        connection.writer.lock().await.input = Box::new(input);
+        *connection.writer.lock().await = Box::new(input);
         (Arc::new(connection), peer)
     }
 
@@ -532,17 +474,11 @@ pub(in crate::remote) mod tests {
         let runtime = crate::tests::TestRuntime::new().await;
         let context = fixture_context(&runtime);
         context.cancellation_token().cancel();
-        let connection = test_connection().await;
-        let result = connection.execute(
-            "read".into(),
-            serde_json::json!({}),
-            &context,
-            context.execution_location().clone(),
-        );
+        let connection = test_connection();
+        let result = connection.execute("read".into(), serde_json::json!({}), &context);
         assert!(matches!(result.await, Err(RemoteError::Cancelled)));
         assert!(connection.state.lock().await.pending.is_empty());
-        let next = connection.writer.lock().await.next_request_id;
-        assert_eq!(next, Some(RequestId::FIRST));
+        assert_eq!(connection.ids.next(), Some(RequestId::new(1)));
     }
 
     /// A call dropped before its terminal result, without cancelling its
@@ -555,9 +491,8 @@ pub(in crate::remote) mod tests {
         let call = {
             let (connection, context) = (connection.clone(), context.clone());
             tokio::spawn(async move {
-                let destination = context.execution_location().clone();
                 connection
-                    .execute("read".into(), serde_json::json!({}), &context, destination)
+                    .execute("read".into(), serde_json::json!({}), &context)
                     .await
             })
         };
@@ -569,34 +504,100 @@ pub(in crate::remote) mod tests {
         call.abort();
         assert!(call.await.unwrap_err().is_cancelled());
         assert!(!context.is_cancelled());
-        let cancel = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            read_frame::<_, Request>(&mut peer),
-        )
-        .await
-        .expect("dropped call sent no cancel")
-        .unwrap();
+        let cancel = bounded(read_frame::<_, Request>(&mut peer)).await.unwrap();
         assert!(matches!(cancel, Some(Request::Cancel { request_id: id }) if id == request_id));
+    }
+
+    /// A cancelled call dropped while another frame holds the writer still
+    /// sends its Cancel once the writer is free.
+    #[tokio::test]
+    async fn cancellation_waiting_for_the_writer_survives_the_call() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let context = fixture_context(&runtime);
+        let (connection, mut peer) = wired_connection(4096).await;
+        let request_id = {
+            let mut call =
+                std::pin::pin!(connection.execute("read".into(), serde_json::json!({}), &context));
+            assert!(futures_util::poll!(&mut call).is_pending());
+            let Some(Request::Tool { request_id, .. }) = read_frame(&mut peer).await.unwrap()
+            else {
+                panic!("expected the tool request");
+            };
+            let held = connection.writer.clone().lock_owned().await;
+            assert!(futures_util::poll!(&mut call).is_pending());
+            context.cancellation_token().cancel();
+            let _ = futures_util::poll!(&mut call);
+            drop(held);
+            request_id
+        };
+        drop(connection);
+        let cancel = bounded(read_frame::<_, Request>(&mut peer)).await.unwrap();
+        assert!(matches!(cancel, Some(Request::Cancel { request_id: id }) if id == request_id));
+    }
+
+    /// Drop `submission` once its frame has started on a one-byte pipe,
+    /// returning that frame and the next.
+    async fn drop_mid_write(
+        peer: tokio::io::DuplexStream,
+        submission: impl Future,
+    ) -> (Request, Request) {
+        let mut peer = tokio::io::BufReader::new(peer);
+        {
+            let mut submission = std::pin::pin!(submission);
+            assert!(futures_util::poll!(&mut submission).is_pending());
+            bounded(tokio::io::AsyncBufReadExt::fill_buf(&mut peer))
+                .await
+                .unwrap();
+        }
+        let mut next = async || {
+            let frame = bounded(read_frame::<_, Request>(&mut peer)).await;
+            frame.unwrap().unwrap()
+        };
+        (next().await, next().await)
+    }
+
+    #[tokio::test]
+    async fn submissions_dropped_mid_write_are_released() {
+        let runtime = crate::tests::TestRuntime::new().await;
+        let context = fixture_context(&runtime);
+        let (connection, peer) = wired_connection(1).await;
+        let call = connection.execute("read".into(), serde_json::json!({}), &context);
+        let (
+            Request::Tool { request_id, .. },
+            Request::Cancel {
+                request_id: cancelled,
+            },
+        ) = drop_mid_write(peer, call).await
+        else {
+            panic!("expected the tool request and its cancel");
+        };
+        assert_eq!(cancelled, request_id);
+
+        let (connection, peer) = wired_connection(1).await;
+        let open = connection.open_ssh(route(), "true".into());
+        let (
+            Request::Control(ControlRequest::OpenSsh { channel, .. }),
+            Request::Control(ControlRequest::StreamClose { channel: closed }),
+        ) = drop_mid_write(peer, open).await
+        else {
+            panic!("expected the stream's open and close");
+        };
+        assert_eq!(closed, channel);
+        assert!(connection.state.lock().await.streams.is_empty());
     }
 
     #[tokio::test]
     async fn channels_share_request_ids() {
         let (connection, mut peer) = wired_connection(4096).await;
-        let _stream = connection
-            .open_stream(Vec::new(), String::new())
-            .await
-            .unwrap();
+        let _stream = connection.open_ssh(route(), String::new()).await.unwrap();
         let (request_id, ()) = connection
             .submit(|request_id, _| (Request::Cancel { request_id }, ()))
             .await
             .unwrap();
-        assert_eq!(request_id.get(), 2);
+        assert_eq!(request_id, RequestId::new(2));
         assert!(matches!(
             read_frame::<_, Request>(&mut peer).await.unwrap(),
-            Some(Request::OpenSsh {
-                channel: RequestId::FIRST,
-                ..
-            })
+            Some(Request::Control(ControlRequest::OpenSsh { channel, .. })) if channel == RequestId::new(1)
         ));
         assert!(matches!(read_frame::<_, Request>(&mut peer).await.unwrap(),
             Some(Request::Cancel { request_id: id }) if id == request_id));
@@ -606,7 +607,7 @@ pub(in crate::remote) mod tests {
         fixture_context_with_capabilities(runtime, [Capability::Read].into_iter().collect())
     }
 
-    fn fixture_context_with_capabilities(
+    pub(in crate::remote) fn fixture_context_with_capabilities(
         runtime: &crate::tests::TestRuntime,
         capabilities: crate::tool::policy::CapabilitySet,
     ) -> ToolContext {
@@ -625,7 +626,11 @@ pub(in crate::remote) mod tests {
             tokio::sync::mpsc::channel(1).1,
             runtime.jobs.clone(),
         )
-        .with_invocation_authority(allow_all(), "read".into(), serde_json::json!({}))
+        .with_invocation_authority(
+            allow_all(),
+            "read".into(),
+            AuthorizationArguments::default(),
+        )
     }
 
     pub(super) fn output(value: &str) -> RemoteToolResult {
@@ -666,21 +671,27 @@ pub(in crate::remote) mod tests {
             .unwrap();
     }
 
+    pub(super) fn route() -> crate::target::Route {
+        crate::target::Route {
+            hops: Vec::new(),
+            destination: TargetDefinition::test("build", ".", None),
+        }
+    }
+
+    pub(super) fn build() -> ExecutionLocation {
+        ExecutionLocation::named("build".parse().unwrap(), "/build".into())
+    }
+
     pub(super) async fn route_fixture<R: tokio::io::AsyncRead + Unpin>(
         output: R,
         state: &Mutex<ConnectionState>,
-        target: &str,
     ) {
-        let writer = Arc::new(Mutex::new(RequestWriter {
-            input: Box::new(tokio::io::sink()),
-            next_request_id: Some(RequestId::FIRST),
-        }));
         let prompts = Arc::new(crate::remote::RejectSensitivePrompts);
         route_responses(
             output,
             state,
-            (&writer, &allow_all()),
-            target.parse().unwrap(),
+            &sink(),
+            build(),
             prompts,
             CancellationToken::new(),
             Box::new(()),
@@ -697,13 +708,7 @@ pub(in crate::remote) mod tests {
         let context = fixture_context_with_capabilities(&runtime, capabilities);
         let (connection, mut peer) = wired_connection(4096).await;
         let arguments = serde_json::json!({"command":["true"]});
-        let call = call_tool(
-            &connection,
-            "exec".into(),
-            arguments,
-            &context,
-            context.execution_location().clone(),
-        );
+        let call = connection.execute("exec".into(), arguments, &context);
         let inspect =
             async {
                 let Request::Tool {
@@ -739,7 +744,7 @@ pub(in crate::remote) mod tests {
     /// and stops once its call has ended, returning that call's result.
     #[tokio::test]
     async fn uploads_wait_for_credit_and_stop_with_their_call() {
-        use crate::remote::flow::WINDOW;
+        use crate::remote::flow::{CHUNK_BYTES, WINDOW};
         let runtime = crate::tests::TestRuntime::new().await;
         let context = fixture_context(&runtime);
         let file = tempfile::NamedTempFile::new().unwrap();
@@ -753,8 +758,7 @@ pub(in crate::remote) mod tests {
             capabilities: Vec::new(),
             source: true,
         };
-        let destination = context.execution_location().clone();
-        let upload = call(&connection, &context, destination, request, Some(source));
+        let upload = call(&connection, &context, request, Some(source));
         let worker = async {
             let Some(Request::Tool { request_id, .. }) = read_frame(&mut peer).await.unwrap()
             else {
@@ -785,15 +789,9 @@ pub(in crate::remote) mod tests {
                 output,
                 source: None,
             };
-            let _ = pending
-                .sender
-                .send(Ok(results::ReceivedResult(Ok(received))));
+            let _ = pending.sender.send(Ok(received));
         };
-        let (received, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            tokio::join!(upload, worker)
-        })
-        .await
-        .unwrap();
+        let (received, ()) = bounded(async { tokio::join!(upload, worker) }).await;
         assert_eq!(received.unwrap().output.value, "ended");
         // The upload sent nothing more, not even its end.
         drop(connection);
@@ -804,8 +802,7 @@ pub(in crate::remote) mod tests {
     async fn stream_submission_rejects_failed_connections_and_drains_on_write_failure() {
         let (connection, peer) = wired_connection(1).await;
         drop(peer);
-        let target = TargetDefinition::test("build", ".", None);
-        let stream = connection.open_stream(vec![target.clone()], "true".into());
+        let stream = connection.open_ssh(route(), "true".into());
         let error = stream.await.err().unwrap().into_tool_error().diagnostic();
         assert_eq!(error.context.operation, Operation::Send);
         assert_eq!(error.context.site, FailureSite::Host);
@@ -815,13 +812,26 @@ pub(in crate::remote) mod tests {
             crate::tool::diagnostic::Cause::Io { .. }
         ));
         // A writable pipe must not allow registration once the dispatcher has failed.
-        connection.writer.lock().await.input = Box::new(tokio::io::sink());
-        let retry = connection.open_stream(vec![target], "true".into());
-        let retry = tokio::time::timeout(std::time::Duration::from_secs(2), retry).await;
-        let retry = retry.unwrap().err().unwrap().into_tool_error().diagnostic();
+        *connection.writer.lock().await = Box::new(tokio::io::sink());
+        let retry = bounded(connection.open_ssh(route(), "true".into())).await;
+        let retry = retry.err().unwrap().into_tool_error().diagnostic();
         assert_eq!(retry.context.operation, Operation::Send);
         assert_eq!(retry.context.site, FailureSite::Host);
         assert_eq!(retry.context.effects, Effects::NotStarted);
         assert!(connection.state.lock().await.streams.is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_connections_end_relayed_streams_with_their_failure() {
+        use tokio::io::AsyncReadExt as _;
+        let (connection, _peer) = wired_connection(4096).await;
+        let mut stream = connection.open_ssh(route(), "true".into()).await.unwrap();
+        let failure = ProtocolError::Violation("connection failed").into();
+        fail_connection(&connection.state, failure).await;
+        let error = bounded(stream.output.read_to_end(&mut Vec::new())).await;
+        assert!(matches!(
+            RemoteError::from(error.unwrap_err()),
+            RemoteError::Protocol(ProtocolError::Violation("connection failed"))
+        ));
     }
 }

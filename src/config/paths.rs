@@ -4,15 +4,17 @@ use std::{
 };
 
 /// Skyhook's directory inside a workspace.
-const WORKSPACE_DIRECTORY: &str = ".skyhook";
+pub fn workspace_directory(workspace: &Path) -> PathBuf {
+    workspace.join(".skyhook")
+}
 
 /// A workspace's session history when no session root is configured.
 pub fn workspace_session_root(workspace: &Path) -> PathBuf {
-    workspace.join(WORKSPACE_DIRECTORY).join("sessions")
+    workspace_directory(workspace).join("sessions")
 }
 
 pub(super) fn workspace_config_path(workspace: &Path) -> PathBuf {
-    workspace.join(WORKSPACE_DIRECTORY).join("config.yaml")
+    workspace_directory(workspace).join("config.yaml")
 }
 
 /// Skyhook's user configuration directories, most preferred first:

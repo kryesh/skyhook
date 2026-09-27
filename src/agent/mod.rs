@@ -6,9 +6,11 @@ mod observation;
 mod runtime;
 mod todo;
 
-pub use error::{HarnessError, TurnFailure};
+pub use error::{CompactionError, CompactionFault, Failure, HarnessError, TurnFailure};
+pub(crate) use error::{FailureKind, FaultKind};
 pub use interaction::{
-    Question, QuestionError, QuestionFuture, QuestionHandler, QuestionOption, RuntimeEvent,
+    Question, QuestionAnswer, QuestionError, QuestionFuture, QuestionHandler, QuestionOption,
+    QuestionReply, RuntimeEvent,
 };
 pub use observation::{
     AgentActivity, ContextUsage, Observation, ObservationSnapshot, ObservedEvent, ObservedResponse,
@@ -18,7 +20,7 @@ pub use runtime::{
     ContinueOutcome, Harness, HarnessBuilder, QueuedPrompt, QueuedPromptCancellation,
     QueuedPromptReceipt, Selection, SessionHandle, SessionMode, SessionModel,
 };
-pub use todo::{TodoItem, TodoSnapshot, TodoStatus};
+pub use todo::{TodoItem, TodoStatus};
 
 pub(crate) use interaction::QuestionOutput;
 pub(crate) use runtime::{Catalog, ModelEntry};

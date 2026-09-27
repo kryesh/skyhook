@@ -14,12 +14,24 @@ pub use crate::tool::output::CaptureKind;
 
 /// Descriptors describe raw captures, not a replacement structured result. In
 /// particular, incomplete JSON is only safe to read through explicit byte paging.
+#[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
 pub struct CaptureDescriptor {
     pub(crate) field: FieldPointer,
-    pub(crate) kind: CaptureKind,
     pub(crate) complete: bool,
+    #[schemars(with = "crate::job::JobView")]
     pub(crate) output: Option<Box<crate::job::JobView>>,
+}
+
+impl CaptureDescriptor {
+    pub fn field(&self) -> &FieldPointer {
+        &self.field
+    }
+
+    /// The capture's page, when the host hydrated one.
+    pub fn output(&self) -> Option<&crate::job::JobView> {
+        self.output.as_deref()
+    }
 }
 
 pub(crate) fn available_captures(saved: &Saved, terminal: bool) -> Vec<CaptureDescriptor> {
@@ -37,7 +49,6 @@ pub(crate) fn available_captures(saved: &Saved, terminal: bool) -> Vec<CaptureDe
         .map(|capture| CaptureDescriptor {
             output: None,
             field: capture.pointer.clone(),
-            kind: capture.kind,
             complete: complete && capture.referenced,
         })
         .collect()

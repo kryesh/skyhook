@@ -8,10 +8,11 @@ use std::{path::PathBuf, sync::Arc};
 
 use indexmap::IndexMap;
 
-use super::{Config, ConfigError, providers::ProviderConfig};
+use super::{Config, ConfigError, ModeError, providers::ProviderConfig};
 use crate::{
     agent::{Catalog, HarnessBuilder},
     provider::profile::{ModelProfile, ModelRef, ProviderName},
+    tool::policy::ModeName,
 };
 
 /// An admitted, immutable configuration generation. Admission validates settings
@@ -61,8 +62,10 @@ impl Config {
             .position(|provider| !provider.models().is_empty())
             .ok_or(ConfigError::NoModels)?;
         if !self.modes.contains_key(&self.default_mode) {
-            let message = "default_mode is not a declared mode";
-            return Err(ConfigError::Mode(self.default_mode.clone(), message.into()));
+            return Err(ConfigError::Mode {
+                name: self.default_mode.clone(),
+                error: ModeError::Undeclared,
+            });
         }
         let default = match &self.default_model {
             Some(model) => {
@@ -133,19 +136,20 @@ impl RuntimeConfig {
     /// Admit an external mode name, or the configured default when none is given.
     /// Modes are looked up by name wherever they apply, so the admitted name is
     /// the selection.
-    pub fn select_mode(&self, name: Option<&str>) -> Result<&str, ConfigError> {
+    pub fn select_mode(&self, name: Option<&ModeName>) -> Result<&ModeName, ConfigError> {
         let Some(name) = name else {
             return Ok(self.default_mode());
         };
-        self.config()
-            .modes
-            .get_key_value(name)
-            .map(|(name, _)| name.as_str())
-            .ok_or_else(|| ConfigError::Mode(name.into(), "mode is not configured".into()))
+        let modes = &self.config().modes;
+        let known = modes.get_key_value(name).map(|(name, _)| name);
+        known.ok_or_else(|| ConfigError::Mode {
+            name: name.clone(),
+            error: ModeError::Unknown,
+        })
     }
 
     /// The mode a new session starts in; admission proved it declared.
-    pub fn default_mode(&self) -> &str {
+    pub fn default_mode(&self) -> &ModeName {
         &self.config().default_mode
     }
 
@@ -211,7 +215,7 @@ impl ConfiguredModel {
             models,
             default_model: self.name(),
             modes: config.modes.clone(),
-            mode: Some(self.config.default_mode().to_owned()),
+            mode: Some(self.config.default_mode().clone()),
         };
         let mut builder = HarnessBuilder::admitted(workspace, catalog)
             .max_child_depth(config.max_child_depth)
@@ -268,8 +272,8 @@ mod tests {
         let selected = runtime.default_model();
         assert_eq!(selected.name().to_string(), "vendor 任意/z first 任意");
         let profile = selected.profile();
-        assert_eq!(profile.model, "external:model/version");
-        assert_eq!(profile.max_context, 8192);
+        assert_eq!(profile.model.as_str(), "external:model/version");
+        assert_eq!(profile.max_context.get(), 8192);
         let second = runtime.select_model(&name("vendor 任意/a second")).unwrap();
         assert_eq!(second.name().to_string(), "vendor 任意/a second");
         for (unknown, reason) in [
@@ -285,16 +289,17 @@ mod tests {
         assert!(Arc::ptr_eq(&selected.config.0, &second.config.0));
 
         let mut reload = original;
-        models_mut(&mut reload)["z first 任意"].profile.model = "replacement-wire-model".into();
+        models_mut(&mut reload)["z first 任意"].profile.model =
+            "replacement-wire-model".parse().unwrap();
         models_mut(&mut reload).swap_remove("a second");
         let reloaded = reload.into_runtime().unwrap();
         let rebound = reloaded.select_model(&selected.name()).unwrap();
         assert!(!Arc::ptr_eq(&selected.config.0, &rebound.config.0));
-        assert_eq!(rebound.profile().model, "replacement-wire-model");
+        assert_eq!(rebound.profile().model.as_str(), "replacement-wire-model");
         assert!(reloaded.select_model(&second.name()).is_err());
         drop(runtime);
-        assert_eq!(selected.profile().model, "external:model/version");
-        assert_eq!(second.profile().model, "another-external-model");
+        assert_eq!(selected.profile().model.as_str(), "external:model/version");
+        assert_eq!(second.profile().model.as_str(), "another-external-model");
     }
 
     #[test]
@@ -348,7 +353,7 @@ mod tests {
             Err(ConfigError::Model { .. })
         ));
         let selected = runtime.default_model();
-        assert_eq!(selected.profile().model, "external:model/version");
+        assert_eq!(selected.profile().model.as_str(), "external:model/version");
         use crate::provider::dialect::{BuildError, ValueError, ValueField, ValueProblem};
         assert!(matches!(
             selected.harness_builder(root.path()),

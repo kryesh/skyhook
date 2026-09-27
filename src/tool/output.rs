@@ -16,7 +16,7 @@ use crate::{
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, schemars::JsonSchema, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, schemars::JsonSchema, PartialEq, Eq)]
     pub enum CaptureKind {
         Text = "text",
         Json = "json",
@@ -86,15 +86,18 @@ impl FieldPointer {
     }
     /// The pointer of object member `key` under this one.
     pub fn property(&self, key: &str) -> Self {
-        Self(format!(
-            "{}/{}",
-            self.0,
-            key.replace('~', "~0").replace('/', "~1")
-        ))
+        Self(format!("{}/{}", self.0, escape_pointer_segment(key)))
     }
     /// The pointer of array element `index` under this one.
     pub fn index(&self, index: usize) -> Self {
         Self(format!("{}/{index}", self.0))
+    }
+    /// The unescaped reference tokens, outermost first; none for the root.
+    pub fn segments(&self) -> impl Iterator<Item = String> + '_ {
+        self.0
+            .split('/')
+            .skip(1)
+            .map(|segment| segment.replace("~1", "/").replace("~0", "~"))
     }
     /// Whether `other` addresses a strict descendant of this pointer.
     pub fn contains(&self, other: &Self) -> bool {
@@ -103,6 +106,11 @@ impl FieldPointer {
             .strip_prefix(self.0.as_str())
             .is_some_and(|rest| rest.starts_with('/'))
     }
+}
+
+/// One JSON Pointer reference token, with `~` and `/` escaped.
+pub(crate) fn escape_pointer_segment(segment: &str) -> String {
+    segment.replace('~', "~0").replace('/', "~1")
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -162,6 +170,7 @@ pub(crate) enum CaptureEvent {
     },
     Write {
         id: CaptureId,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
     Truncate {
@@ -361,17 +370,30 @@ impl FinishedOutput {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-pub(crate) struct ProducedOutput {
-    pub(crate) value: Value,
-    pub(crate) images: Vec<ImageRef>,
-    pub(crate) captures: Vec<FinishedOutput>,
+/// A handler's value and the evidence its producer owns: the captures `C` its
+/// fields stream into, its images, whether its streams ran to their end, and a
+/// completed read error's facts.
+#[derive(Clone, Debug)]
+pub struct Output<C> {
+    pub value: Value,
+    pub images: Vec<ImageRef>,
+    pub(crate) captures: Vec<C>,
     pub(crate) streams: StreamEnd,
     pub(crate) diagnostic: Option<crate::tool::diagnostic::PartialDiagnostic>,
 }
 
-impl ProducedOutput {
-    pub(crate) const fn new(value: Value) -> Self {
+impl<C> Default for Output<C> {
+    fn default() -> Self {
+        Self::new(Value::Null)
+    }
+}
+
+/// Local production, before the session host imports its captures.
+pub(crate) type ProducedOutput = Output<FinishedOutput>;
+
+impl<C> Output<C> {
+    #[must_use]
+    pub const fn new(value: Value) -> Self {
         Self {
             value,
             images: Vec::new(),
@@ -382,6 +404,7 @@ impl ProducedOutput {
     }
 
     /// Register the builtin read result's error-message slot for presentation.
+    #[must_use]
     pub(crate) fn with_diagnostic(
         mut self,
         diagnostic: crate::tool::diagnostic::PartialDiagnostic,
@@ -390,14 +413,30 @@ impl ProducedOutput {
         self
     }
 
-    pub(crate) fn with_captures(mut self, captures: Vec<FinishedOutput>) -> Self {
+    #[must_use]
+    pub(crate) fn with_captures(mut self, captures: Vec<C>) -> Self {
         self.captures = captures;
         self
     }
 
-    pub(crate) fn with_images(mut self, images: Vec<ImageRef>) -> Self {
+    #[must_use]
+    pub fn with_images(mut self, images: Vec<ImageRef>) -> Self {
         self.images = images;
         self
+    }
+}
+
+/// Fill the facts a call's failure, or its completed read error, left unset.
+pub(crate) fn or_fallback<C>(
+    result: Result<Output<C>, crate::tool::invocation::OperationError<Output<C>>>,
+    fallback: crate::tool::diagnostic::PartialContext,
+) -> Result<Output<C>, crate::tool::invocation::OperationError<Output<C>>> {
+    match result {
+        Ok(mut output) => {
+            output.diagnostic = output.diagnostic.map(|diagnostic| diagnostic.or(fallback));
+            Ok(output)
+        }
+        Err(error) => Err(error.or(fallback)),
     }
 }
 
@@ -735,8 +774,9 @@ impl<T: CaptureTarget> AsyncProducer<T> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::tests::bounded;
     use std::{
-        future::{Future, poll_fn},
+        future::poll_fn,
         sync::atomic::{AtomicUsize, Ordering},
         task::Poll,
     };
@@ -810,12 +850,6 @@ pub(crate) mod tests {
         fn send(&self, event: OutputEvent) -> io::Result<()> {
             self.0.blocking_send(event).map_err(io::Error::other)
         }
-    }
-
-    async fn bounded<T>(future: impl Future<Output = T>) -> T {
-        tokio::time::timeout(std::time::Duration::from_secs(10), future)
-            .await
-            .expect("output operation timed out")
     }
 
     async fn poll_once(future: impl Future) {

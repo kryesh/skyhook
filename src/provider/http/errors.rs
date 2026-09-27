@@ -14,28 +14,7 @@ pub(crate) struct ErrorRule {
     /// only there.
     pub message: Option<&'static str>,
     pub retry_after: RetryAfter,
-    pub kind: RuleKind,
-}
-
-/// What a matching rule means.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum RuleKind {
-    Billing,
-    ContextWindowExceeded,
-    InvalidRequest,
-    /// Transient, with the response's retry hint when it gives one.
-    Unavailable,
-}
-
-impl RuleKind {
-    fn complete(self, retry_after: Option<Duration>) -> ProviderErrorKind {
-        match self {
-            Self::Billing => ProviderErrorKind::Billing,
-            Self::ContextWindowExceeded => ProviderErrorKind::ContextWindowExceeded,
-            Self::InvalidRequest => ProviderErrorKind::InvalidRequest,
-            Self::Unavailable => ProviderErrorKind::Unavailable { retry_after },
-        }
-    }
+    pub kind: ProviderErrorKind,
 }
 
 /// A condition on a dot path under `error`.
@@ -69,7 +48,7 @@ pub(crate) enum RetryAfter {
 
 impl ErrorRule {
     /// A rule with no conditions yet; presets add the ones that hold.
-    pub(crate) const fn kind(kind: RuleKind) -> Self {
+    pub(crate) const fn kind(kind: ProviderErrorKind) -> Self {
         Self {
             status: None,
             field: None,
@@ -117,7 +96,7 @@ impl ErrorSignals {
         self.rules
             .iter()
             .find(|rule| holds(rule))
-            .map(|rule| rule.kind.complete(retry_after))
+            .map(|rule| rule.kind)
             .or_else(|| (self.read)(native))
     }
 }
@@ -134,8 +113,7 @@ pub(crate) struct Reading {
 }
 
 impl Reading {
-    /// The vendor's evidence first, then what the body names, then the status. A
-    /// `Retry-After` hint rides on the kinds that carry one, whichever named it.
+    /// The vendor's evidence first, then what the body names, then the status.
     pub(crate) fn kind(
         &self,
         status: Option<u16>,
@@ -144,24 +122,18 @@ impl Reading {
         retry_after: Option<Duration>,
     ) -> ProviderErrorKind {
         let status = status.or(self.status);
-        let mut kind = signals
+        signals
             .classify(status, native, retry_after)
             .or(self.kind)
             .unwrap_or(match status {
                 Some(401 | 403) => ProviderErrorKind::Authentication,
                 Some(402) => ProviderErrorKind::Billing,
                 Some(408 | 504) => ProviderErrorKind::Timeout,
-                Some(429) => ProviderErrorKind::RateLimited { retry_after: None },
-                Some(409 | 425) => ProviderErrorKind::Unavailable { retry_after: None },
+                Some(429) => ProviderErrorKind::RateLimited,
+                Some(409 | 425) => ProviderErrorKind::Unavailable,
                 Some(300..=499) => ProviderErrorKind::InvalidRequest,
-                _ => ProviderErrorKind::Unavailable { retry_after: None },
-            });
-        if let ProviderErrorKind::RateLimited { retry_after: slot }
-        | ProviderErrorKind::Unavailable { retry_after: slot } = &mut kind
-        {
-            *slot = retry_after;
-        }
-        kind
+                _ => ProviderErrorKind::Unavailable,
+            })
     }
 
     /// `summary`, then the known code and an excerpt of the server's message.
@@ -200,10 +172,8 @@ pub(crate) fn classify(
         Some(status) => format!("provider HTTP {status} error"),
         None => "provider stream error".into(),
     };
-    ProviderError {
-        kind,
-        message: reading.describe(summary, native),
-    }
+    kind.error(reading.describe(summary, native))
+        .with_retry_after(retry_after)
 }
 
 /// The server's own explanation, from the common error envelope shapes:
@@ -248,30 +218,30 @@ mod tests {
                 ErrorRule {
                     status: Some(429),
                     field: Some(Field::Equals("detail.code", "cap")),
-                    ..ErrorRule::kind(RuleKind::Billing)
+                    ..ErrorRule::kind(ProviderErrorKind::Billing)
                 },
                 ErrorRule {
                     message: Some("Marker"),
-                    ..ErrorRule::kind(RuleKind::ContextWindowExceeded)
+                    ..ErrorRule::kind(ProviderErrorKind::ContextWindowExceeded)
                 },
                 ErrorRule {
                     field: Some(Field::Present("reasons")),
-                    ..ErrorRule::kind(RuleKind::InvalidRequest)
+                    ..ErrorRule::kind(ProviderErrorKind::InvalidRequest)
                 },
                 ErrorRule {
                     status: Some(402),
                     retry_after: RetryAfter::Required,
-                    ..ErrorRule::kind(RuleKind::Unavailable)
+                    ..ErrorRule::kind(ProviderErrorKind::Unavailable)
                 },
             ],
             ..ErrorSignals::NONE
         };
         let limited = Reading {
-            kind: Some(ProviderErrorKind::RateLimited { retry_after: None }),
+            kind: Some(ProviderErrorKind::RateLimited),
             ..Reading::default()
         };
         let kind = |status, native: serde_json::Value, reading: Reading, hint| {
-            classify(status, &native, reading, RULES, hint).kind
+            classify(status, &native, reading, RULES, hint).kind()
         };
         let capped = json!({"error":{"detail":{"code":"cap"}}});
         assert_eq!(
@@ -280,7 +250,7 @@ mod tests {
         );
         assert!(matches!(
             kind(Some(503), capped, limited, None),
-            ProviderErrorKind::RateLimited { .. }
+            ProviderErrorKind::RateLimited
         ));
         let none = Reading::default();
         assert_eq!(
@@ -289,7 +259,7 @@ mod tests {
         );
         assert!(matches!(
             kind(None, json!({"error":{"message":"No marker"}}), none, None),
-            ProviderErrorKind::Unavailable { .. }
+            ProviderErrorKind::Unavailable
         ));
         assert_eq!(
             kind(Some(401), json!({"error":{"reasons":["x"]}}), none, None),
@@ -300,18 +270,16 @@ mod tests {
             ProviderErrorKind::Authentication
         );
         let hint = Some(Duration::from_secs(3));
-        assert_eq!(
-            kind(Some(402), json!({}), none, hint),
-            ProviderErrorKind::Unavailable { retry_after: hint }
-        );
+        let hinted = |status| {
+            let error = classify(Some(status), &json!({}), none, RULES, hint);
+            (error.kind(), error.retry_after())
+        };
+        assert_eq!(hinted(402), (ProviderErrorKind::Unavailable, hint));
         assert_eq!(
             kind(Some(402), json!({}), none, None),
             ProviderErrorKind::Billing
         );
-        assert_eq!(
-            kind(Some(429), json!({}), none, hint),
-            ProviderErrorKind::RateLimited { retry_after: hint }
-        );
+        assert_eq!(hinted(429), (ProviderErrorKind::RateLimited, hint));
     }
 
     #[test]
@@ -332,7 +300,7 @@ mod tests {
             }
         }
         assert_eq!(
-            classify(Some(401), &json!({}), Reading::default()).kind,
+            classify(Some(401), &json!({}), Reading::default()).kind(),
             ProviderErrorKind::Authentication
         );
         // A status the body repeats stands in for a missing HTTP one.
@@ -346,7 +314,7 @@ mod tests {
             &json!({"error":{"message":"upstream\n\tbusy"}}),
             repeated,
         );
-        assert!(matches!(error.kind, ProviderErrorKind::RateLimited { .. }));
+        assert!(matches!(error.kind(), ProviderErrorKind::RateLimited));
         assert_eq!(
             error.message,
             "provider HTTP 429 error [code=server_error]: upstream busy"
@@ -372,41 +340,18 @@ mod tests {
                 json!({"error":"bad field"}),
                 "provider HTTP 400 error: bad field",
             ),
+            // A proxy nesting an upstream error keeps the upstream reason.
+            (
+                Some(400),
+                json!({"error":{"message":"proxy.BadRequestError: {\"message\":\"tools.0.strict: Extra inputs\"}\nFallbacks=None","type":null,"code":"400"}}),
+                "provider HTTP 400 error: proxy.BadRequestError: {\"message\":\"tools.0.strict: Extra inputs\"} Fallbacks=None",
+            ),
         ] {
             assert_eq!(
                 classify(status, &native, Reading::default()).message,
                 expected
             );
         }
-    }
-
-    /// A proxy rejection nesting an upstream error: the reason must survive.
-    #[test]
-    fn nested_proxy_rejection_is_diagnosable() {
-        let native = json!({"error":{"message":"proxy.BadRequestError: UpstreamException - {\"message\":\"The model returned the following errors: tools.0.custom.strict: Extra inputs are not permitted\"}. Received Model Group=vendor.model-family-5\nAvailable Model Group Fallbacks=None","type":null,"param":null,"code":"400"}});
-        let error = classify(
-            Some(400),
-            &native,
-            Reading::default(),
-            ErrorSignals::NONE,
-            None,
-        );
-        assert_eq!(error.kind, ProviderErrorKind::InvalidRequest);
-        assert!(
-            error
-                .message
-                .starts_with("provider HTTP 400 error: proxy.BadRequestError")
-        );
-        assert!(
-            error
-                .message
-                .contains("tools.0.custom.strict: Extra inputs are not permitted")
-        );
-        assert!(
-            error
-                .message
-                .contains("Model Group=vendor.model-family-5 Available")
-        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 //! Every open session: one `App` each, one of them on screen.
 use super::{
     Launch,
-    app::{App, HostRequest, PreparedObservation, Work},
+    app::{App, HostRequest, PreparedObservation, SlotKey, Work},
 };
 use crate::interaction::{Prompt, UiInteraction};
 use crate::launch::LaunchError;
@@ -15,8 +15,11 @@ use tokio::sync::{
     mpsc,
 };
 
+/// Observation events reduced together before one projection rebuild.
+const OBSERVATION_BURST: usize = 255;
+
 struct Slot {
-    key: u64,
+    key: SlotKey,
     app: App,
     work: mpsc::UnboundedReceiver<Work>,
     prompts: mpsc::UnboundedReceiver<Prompt>,
@@ -39,8 +42,8 @@ impl Slot {
 /// A saved session opened in the background, with the launch that owns its prompts.
 pub struct Opened {
     id: SessionId,
-    /// The slot that asked, and its composer text then: focus follows only an idle user.
-    from: (u64, String),
+    /// The slot that asked, and its composer revision then: focus follows only an idle user.
+    from: (SlotKey, u64),
     launch: Launch,
     prompts: mpsc::UnboundedReceiver<Prompt>,
     result: Result<SessionHandle, LaunchError>,
@@ -53,10 +56,12 @@ pub enum HostEvent {
 pub struct Host {
     slots: Vec<Slot>,
     active: usize,
-    next_key: u64,
+    next_key: SlotKey,
     /// Rotates the first slot polled, so a streaming session cannot starve the rest.
     turn: usize,
     quitting: bool,
+    /// Peers are summarized on each tick, or at once when the slots change.
+    peers_due: bool,
     opening: Vec<SessionId>,
     opened_tx: mpsc::UnboundedSender<Opened>,
     opened: mpsc::UnboundedReceiver<Opened>,
@@ -80,9 +85,10 @@ impl Host {
         let mut host = Self {
             slots: Vec::new(),
             active: 0,
-            next_key: 0,
+            next_key: SlotKey::default(),
             turn: 0,
             quitting: false,
+            peers_due: true,
             opening: Vec::new(),
             opened_tx,
             opened,
@@ -90,7 +96,7 @@ impl Host {
         host.push(app, work, prompts);
         host
     }
-    fn key(&self) -> u64 {
+    fn key(&self) -> SlotKey {
         self.slots[self.active].key
     }
     pub fn app(&mut self) -> &mut App {
@@ -98,6 +104,7 @@ impl Host {
     }
     pub fn tick(&mut self) {
         self.slots.iter_mut().for_each(|slot| slot.app.tick());
+        self.peers_due = true;
     }
     pub fn quit(&mut self) {
         self.quitting = true;
@@ -110,7 +117,8 @@ impl Host {
         work: mpsc::UnboundedReceiver<Work>,
         prompts: mpsc::UnboundedReceiver<Prompt>,
     ) -> usize {
-        self.next_key += 1;
+        self.next_key = self.next_key.next();
+        self.peers_due = true;
         self.slots.push(Slot {
             key: self.next_key,
             app,
@@ -130,6 +138,7 @@ impl Host {
     fn activate(&mut self, index: usize) {
         let previous = self.active;
         self.active = index;
+        self.peers_due = true;
         if previous != index && previous < self.slots.len() {
             self.slots[index].app.sidebar = self.slots[previous].app.sidebar;
             if self.slots[previous].app.untouched() {
@@ -169,8 +178,7 @@ impl Host {
                 match event {
                     SlotEvent::Observation(Ok(event)) => {
                         let mut records = app.observe(event);
-                        // Reduce a burst once instead of rebuilding the projection per token.
-                        for _ in 0..255 {
+                        for _ in 0..OBSERVATION_BURST {
                             match app.try_recv_observation() {
                                 Ok(event) => records |= app.observe(event),
                                 Err(TryRecvError::Lagged(_)) => {
@@ -181,15 +189,12 @@ impl Host {
                             }
                         }
                         if records {
-                            app.projection.rebuild(&app.snapshot);
+                            app.rebuild_projection();
                         }
                     }
                     SlotEvent::Observation(Err(RecvError::Lagged(_))) => app.resubscribe().await,
                     SlotEvent::Observation(Err(RecvError::Closed)) => app.close_observation(),
                     SlotEvent::Prompt(prompt) => app.prompt(prompt),
-                    SlotEvent::Work(Work::Started {
-                        result: Ok(session),
-                    }) => app.session_ready(session).await,
                     SlotEvent::Work(work) => app.work(work),
                 }
             }
@@ -199,7 +204,7 @@ impl Host {
     async fn opened(&mut self, opened: Opened) {
         let Opened {
             id,
-            from: (key, draft),
+            from: (key, revision),
             launch,
             prompts,
             result,
@@ -213,7 +218,7 @@ impl Host {
                 let observation = PreparedObservation::subscribe(session).await;
                 let (tx, work) = mpsc::unbounded_channel();
                 let app = self.app().sibling(Some(observation), launch, tx);
-                let idle = self.key() == key && self.app().editor.text() == draft;
+                let idle = self.key() == key && self.app().editor.revision() == revision;
                 let index = self.push(app, work, prompts);
                 if idle {
                     self.activate(index);
@@ -241,11 +246,12 @@ impl Host {
             // Closing the last session leaves a fresh draft, not an empty screen.
             self.draft();
         }
-        let (active, sidebar) = (self.key(), self.app().sidebar);
+        let (active, sidebar, open) = (self.key(), self.app().sidebar, self.slots.len());
         self.slots.retain(|slot| !slot.app.exit);
         if self.slots.is_empty() {
             return false;
         }
+        self.peers_due |= self.slots.len() != open;
         match self.slots.iter().position(|slot| slot.key == active) {
             Some(index) => self.active = index,
             None => {
@@ -254,15 +260,17 @@ impl Host {
                 self.app().dirty = true;
             }
         }
-        let current = self.key();
-        let peers = self.slots.iter();
-        let peers: Vec<_> = peers
-            .map(|slot| slot.app.peer(slot.key, slot.key == current))
-            .collect();
-        let app = self.app();
-        if app.peers != peers {
-            app.peers = peers;
-            app.dirty = true;
+        if std::mem::take(&mut self.peers_due) {
+            let current = self.key();
+            let peers = self.slots.iter();
+            let peers: Vec<_> = peers
+                .map(|slot| slot.app.peer(slot.key, slot.key == current))
+                .collect();
+            let app = self.app();
+            if app.peers != peers {
+                app.peers = peers;
+                app.dirty = true;
+            }
         }
         true
     }
@@ -276,7 +284,7 @@ impl Host {
             return;
         }
         self.opening.push(id);
-        let from = (self.key(), self.app().editor.text().to_owned());
+        let from = (self.key(), self.app().editor.revision());
         let (launch, prompts) = with_prompts(self.app().launch.clone());
         let opened = self.opened_tx.clone();
         tokio::spawn(async move {
@@ -312,10 +320,10 @@ impl Host {
             slot.work.close();
             while let Ok(work) = slot.work.try_recv() {
                 if let Work::Started {
-                    result: Ok(session),
+                    result: Ok(prepared),
                 } = work
                 {
-                    let _ = session.shutdown().await;
+                    let _ = prepared.session().shutdown().await;
                 }
             }
             slot.app.status.flush().await;
@@ -333,7 +341,6 @@ impl Host {
 mod tests {
     use super::*;
     use crate::tui::{app::tests::draft_fixture, keys::Command};
-    use std::time::Duration;
 
     async fn host() -> (tempfile::TempDir, Host) {
         let (root, draft) = draft_fixture().await;
@@ -347,9 +354,9 @@ mod tests {
         session.shutdown().await.unwrap();
         session.id()
     }
-    /// Pump events until `done`; false when the host closed or time ran out first.
-    async fn drive(host: &mut Host, wait: Duration, done: impl Fn(&Host) -> bool) -> bool {
-        tokio::time::timeout(wait, async {
+    /// Pump events until `done`; false when the host closed first.
+    async fn drive(host: &mut Host, done: impl Fn(&Host) -> bool) -> bool {
+        crate::tests::bounded(async {
             while host.settle() {
                 if done(host) {
                     return true;
@@ -360,9 +367,7 @@ mod tests {
             false
         })
         .await
-        .unwrap_or(false)
     }
-    const WAIT: Duration = Duration::from_secs(10);
     fn live(host: &Host, id: SessionId) -> bool {
         host.slots.iter().any(|s| s.app.session_id() == Some(id))
     }
@@ -371,7 +376,7 @@ mod tests {
         while !live(host, id) {
             host.app().host = Some(HostRequest::Open(id));
             let settled = |host: &Host| !host.opening.contains(&id);
-            assert!(drive(host, WAIT, settled).await);
+            assert!(drive(host, settled).await);
         }
     }
     fn sessions(host: &Host) -> Vec<Option<SessionId>> {
@@ -396,11 +401,7 @@ mod tests {
         assert_eq!(host.slots.len(), 2);
 
         host.app().command(Command::New);
-        assert!(
-            drive(&mut host, Duration::from_secs(5), |host| host.slots.len()
-                == 3)
-            .await
-        );
+        assert!(drive(&mut host, |host| host.slots.len() == 3).await);
         assert!(host.app().untouched());
         host.app().command(Command::New);
         host.settle();
@@ -412,12 +413,12 @@ mod tests {
         assert_eq!(sessions(&host), [Some(first), Some(second)]);
         host.app().command(Command::Close);
         let closed = |host: &Host| sessions(host) == [Some(first)];
-        assert!(drive(&mut host, WAIT, closed).await);
+        assert!(drive(&mut host, closed).await);
         // Closing released the session: it can be opened again.
         open(&mut host, second).await;
 
         host.app().command(Command::Exit);
-        assert!(!drive(&mut host, WAIT, |_| false).await);
+        assert!(!drive(&mut host, |_| false).await);
         assert!(host.slots.is_empty());
         host.close().await.unwrap();
     }
@@ -429,13 +430,13 @@ mod tests {
         open(&mut host, id).await;
         host.app().command(Command::Close);
         let drafted = |host: &Host| sessions(host) == [None];
-        assert!(drive(&mut host, WAIT, drafted).await);
+        assert!(drive(&mut host, drafted).await);
 
         // A session that cannot be opened is reported on screen and changes nothing.
         let missing = SessionId::from_bytes([9; 16]);
         host.app().host = Some(HostRequest::Open(missing));
         let settled = |host: &Host| !host.opening.contains(&missing);
-        assert!(drive(&mut host, WAIT, settled).await);
+        assert!(drive(&mut host, settled).await);
         assert_eq!(sessions(&host), [None]);
         assert!(crate::tui::app::tests::draw(host.app()).contains("Status ·"));
 
@@ -445,7 +446,7 @@ mod tests {
         host.settle();
         assert_eq!(host.opening, [id], "a repeated request opens nothing more");
         host.quit();
-        assert!(!drive(&mut host, WAIT, |_| false).await);
+        assert!(!drive(&mut host, |_| false).await);
         host.close().await.unwrap();
     }
 
@@ -461,7 +462,8 @@ mod tests {
             background.run_script(script).await
         });
         let asked = |host: &Host| !host.slots[0].app.prompts.is_empty();
-        assert!(drive(&mut host, WAIT, asked).await);
+        assert!(drive(&mut host, asked).await);
+        host.tick();
         host.settle();
         assert!(host.app().prompts.is_empty());
         let peers = &host.app().peers;
@@ -473,7 +475,7 @@ mod tests {
         assert!(screen.contains("1 other session(s) need attention"));
 
         host.quit();
-        assert!(!drive(&mut host, WAIT, |_| false).await);
+        assert!(!drive(&mut host, |_| false).await);
         let _ = script.await.unwrap();
         host.close().await.unwrap();
     }

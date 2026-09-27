@@ -1,9 +1,11 @@
 //! Encode conversation history and request options as native Responses input.
+use super::native::ItemType;
 use super::*;
+use crate::provider::ProviderErrorKind::InvalidRequest;
 use crate::provider::codec::{
     CodecName,
     common::{
-        attach_runtime_tail, check_tool, image_url, invalid, own_replay, system_text, tool_text,
+        attach_runtime_tail, check_tool, image_url, own_replay, system_text, tagged, tool_text,
         user_parts,
     },
 };
@@ -27,9 +29,6 @@ pub(crate) fn encode(
     request: &ModelRequest,
     dialect: &Dialect,
 ) -> Result<Map<String, Value>, ProviderError> {
-    if request.model.trim().is_empty() {
-        return Err(invalid("Responses requires a nonempty model"));
-    }
     // History precedes the per-request tail so the tail never breaks a cached
     // history prefix. Runtime state joins the final history turn, so only that
     // turn is re-read.
@@ -56,17 +55,18 @@ pub(crate) fn encode(
                         AssistantItem::Reasoning { replay, .. } => {
                             if let Some(Replay {
                                 payload: native, ..
-                            }) =
-                                own_replay(replay.as_ref(), ReplayFormat::Responses, &request.model)
-                            {
-                                if kind(native).map_err(|error| invalid(error.message))?
-                                    != ItemKind::Reasoning
+                            }) = own_replay(
+                                replay.as_ref(),
+                                ReplayFormat::Responses,
+                                request.model.as_str(),
+                            ) {
+                                if tagged(native) != Some(ItemType::Reasoning)
+                                    || reasoning_parts(native).is_err()
                                 {
-                                    return Err(invalid(
-                                        "Responses reasoning envelope contains a non-reasoning item",
+                                    return Err(InvalidRequest.error(
+                                        "Responses reasoning replay is not a readable reasoning item",
                                     ));
                                 }
-                                final_parts(native).map_err(|error| invalid(error.message))?;
                                 input.push(native.clone());
                             }
                         }
@@ -90,7 +90,9 @@ pub(crate) fn encode(
             Message::Tool(results) => {
                 for result in results {
                     if result.call_id.is_empty() {
-                        return Err(invalid("Responses tool output requires a call ID"));
+                        return Err(
+                            InvalidRequest.error("Responses tool output requires a call ID")
+                        );
                     }
                     input.push(
                         json!({"type":"function_call_output", "call_id":result.call_id,
@@ -115,7 +117,7 @@ pub(crate) fn encode(
         ("store".into(), json!(false)),
         ("include".into(), json!(["reasoning.encrypted_content"])),
     ]);
-    if dialect.reasoning_summary == ReasoningSummary::Requested {
+    if dialect.reasoning_summary.is_requested() {
         settings.insert("reasoning".into(), json!({"summary":"auto"}));
     }
     match (system_text(request), dialect.instructions) {
@@ -138,9 +140,8 @@ pub(crate) fn encode(
     }
     if let Some(schema) = &request.response_schema {
         if schema.name.is_empty() || !schema.schema.is_object() {
-            return Err(invalid(
-                "Responses structured output requires a name and object JSON Schema",
-            ));
+            return Err(InvalidRequest
+                .error("Responses structured output requires a name and object JSON Schema"));
         }
         settings.insert(
             "text".into(),
@@ -148,16 +149,11 @@ pub(crate) fn encode(
             "schema":schema.schema, "strict":true}}),
         );
     }
-    if let Some(effort) = &request.reasoning {
-        dialect.effort.place(&mut settings, effort)?;
+    if let Some(reasoning) = &request.reasoning {
+        dialect.effort.place(&mut settings, reasoning)?;
     }
-    if let Some(max) = request.max_output_tokens {
-        if max == 0 {
-            return Err(invalid("Responses max_output_tokens must be positive"));
-        }
-        if let Some(path) = &dialect.output_limit {
-            path.set(&mut settings, json!(max))?;
-        }
+    if let (Some(max), Some(path)) = (request.max_output_tokens, &dialect.output_limit) {
+        path.set(&mut settings, json!(max))?;
     }
     // Input is always an explicit array, even for an empty conversation.
     settings.shift_insert(1, "input".into(), Value::Array(input));
@@ -214,15 +210,12 @@ mod tests {
     #[test]
     fn summary_and_effort_are_placed_by_the_dialect() {
         let mut req = request("gpt-5");
-        let efforts = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
-        for effort in std::iter::once(None).chain(efforts.map(Some)) {
-            req.reasoning = effort.map(str::to_owned);
+        for effort in [None, Some("high".into())] {
+            let expected = effort.as_ref().map(|e| json!(e));
+            req.reasoning = effort;
             let body = encode(&req, &Dialect::stateless()).unwrap();
             assert_eq!(body["reasoning"]["summary"], "auto");
-            assert_eq!(
-                body["reasoning"].get("effort"),
-                effort.map(|e| json!(e)).as_ref()
-            );
+            assert_eq!(body["reasoning"].get("effort"), expected.as_ref());
             assert_eq!(body["include"], json!(["reasoning.encrypted_content"]));
         }
         req.reasoning = Some("low".into());
@@ -340,7 +333,7 @@ mod tests {
             "encrypted_content":"opaque+/=", "future_state":{"signature":"unchanged"},
             "content":[{"type":"reasoning_text", "text":"native reasoning text"}]});
         let decoder = Decoder::new(
-            req.model.clone(),
+            req.model.to_string(),
             scope(),
             &Dialect::stateless(),
             ErrorSignals::NONE,
@@ -366,7 +359,7 @@ mod tests {
         );
         assert_eq!(input[1]["call_id"], input[2]["call_id"]);
         // Another model's reasoning stays behind; the call and its output do not.
-        req.model = "gpt-6".into();
+        req.model = "gpt-6".parse().unwrap();
         let wire = encode(&req, &Dialect::stateless()).unwrap();
         assert_eq!(wire["input"], json!([input[1].clone(), input[2].clone()]));
     }

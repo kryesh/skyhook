@@ -1,6 +1,6 @@
 //! Shared execution-location identity.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,28 @@ pub struct ExecutionLocation {
     pub workspace: PathBuf,
 }
 
+/// A path's native bytes, for storage that is not text.
+#[cfg(unix)]
+pub(crate) fn path_bytes(path: &Path) -> Vec<u8> {
+    std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec()
+}
+
+#[cfg(not(unix))]
+pub(crate) fn path_bytes(path: &Path) -> Vec<u8> {
+    path.to_string_lossy().into_owned().into_bytes()
+}
+
+/// The path spelled by native `bytes`, the inverse of [`path_bytes`].
+#[cfg(unix)]
+pub(crate) fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(<std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(bytes))
+}
+
+#[cfg(not(unix))]
+pub(crate) fn path_from_bytes(bytes: Vec<u8>) -> PathBuf {
+    PathBuf::from(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 /// A Unicode workspace keeps its plain string spelling. A Unix workspace that is
 /// not Unicode is journaled as its native bytes instead of failing the record;
 /// text boundaries (permissions, remote frames) still reject such a path.
@@ -31,7 +53,10 @@ pub(crate) mod native_path {
     #[serde(untagged)]
     enum Spelling<'a> {
         Text(Cow<'a, str>),
-        Native { native_bytes: Vec<u8> },
+        Native {
+            #[serde(with = "serde_bytes")]
+            native_bytes: Vec<u8>,
+        },
     }
 
     pub(crate) fn serialize<S: Serializer>(path: &Path, serializer: S) -> Result<S::Ok, S::Error> {
@@ -39,7 +64,7 @@ pub(crate) mod native_path {
             Some(text) => Spelling::Text(Cow::Borrowed(text)),
             #[cfg(unix)]
             None => Spelling::Native {
-                native_bytes: std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).to_vec(),
+                native_bytes: super::path_bytes(path),
             },
             #[cfg(not(unix))]
             None => {
@@ -57,9 +82,7 @@ pub(crate) mod native_path {
         match Spelling::deserialize(deserializer)? {
             Spelling::Text(text) => Ok(PathBuf::from(text.into_owned())),
             #[cfg(unix)]
-            Spelling::Native { native_bytes } => Ok(PathBuf::from(
-                <std::ffi::OsString as std::os::unix::ffi::OsStringExt>::from_vec(native_bytes),
-            )),
+            Spelling::Native { native_bytes } => Ok(super::path_from_bytes(native_bytes)),
             #[cfg(not(unix))]
             Spelling::Native { .. } => Err(serde::de::Error::custom(
                 "native Unix path bytes are unsupported on this platform",

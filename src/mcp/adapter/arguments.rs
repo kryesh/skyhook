@@ -5,6 +5,7 @@ use crate::tool::{
         ArgumentPathSegment, Effects, NoExternalArgumentSchemas, Operation, Subject,
         safe_argument_path, safe_text, schema_argument_failure,
     },
+    registry::BACKGROUND,
 };
 use serde_json::{Map, Value, json};
 
@@ -44,7 +45,7 @@ impl Arguments {
         // unknown-property check only understands named properties.
         let wrapped = original["additionalProperties"] != false
             || original.get("$ref").is_some()
-            || original["properties"].get("bg").is_some()
+            || original["properties"].get(BACKGROUND).is_some()
             || original.get("patternProperties").is_some()
             // These root constraints may count, reject, or otherwise interpret
             // the synthetic bg property. Keep them inside the envelope too.
@@ -58,7 +59,7 @@ impl Arguments {
             .any(|keyword| original.get(*keyword).is_some())
             || original["required"]
                 .as_array()
-                .is_some_and(|required| required.iter().any(|name| name == "bg"));
+                .is_some_and(|required| required.iter().any(|name| name == BACKGROUND));
         let draft = jsonschema::Draft::default().detect(&original);
         let schema = if wrapped {
             let mut embedded = if original.get("$ref").is_some()

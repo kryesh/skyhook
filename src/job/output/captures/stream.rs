@@ -22,7 +22,7 @@ use crate::{
 /// Serialize implementation. Finalizing a writer is not publication: discovery
 /// reports completion only after the terminal document references this capture.
 #[derive(Clone, Debug)]
-pub(crate) struct CompletedCapture {
+pub struct CompletedCapture {
     job: JobId,
     capture: i64,
     field: FieldPointer,
@@ -154,23 +154,18 @@ impl CaptureTarget for StoredCapture {
 }
 
 impl JobManager {
+    /// Reserve a capture that is removed if abandoned before it finishes.
     pub(crate) async fn pending_capture(
         &self,
         job: JobId,
         field: FieldPointer,
         kind: CaptureKind,
-        remove_on_abandon: bool,
     ) -> Result<PendingCapture, ToolError> {
         let output = self.output(job);
         crate::job::output::blocking(move || {
-            let abandon = if remove_on_abandon {
-                Abandon::Discard
-            } else {
-                Abandon::Retain
-            };
             Ok(PendingCapture::new(
                 StoredCapture::reserve(&output, &field, kind, false)?,
-                abandon,
+                Abandon::Discard,
             ))
         })
         .await
@@ -194,6 +189,17 @@ enum CollectedCapture {
     Writing(StoredCapture),
     Finished(CompletedCapture),
     Closed,
+}
+
+/// The open capture `id` names.
+fn writing(
+    captures: &mut HashMap<CaptureId, CollectedCapture>,
+    id: CaptureId,
+) -> io::Result<&mut StoredCapture> {
+    match captures.get_mut(&id) {
+        Some(CollectedCapture::Writing(target)) => Ok(target),
+        _ => Err(io::Error::other("capture is not open")),
+    }
 }
 
 impl HostOutput {
@@ -286,30 +292,16 @@ impl OutputSink for CaptureCollector {
                     false,
                 )?));
             }
-            CaptureEvent::Write { id, data } => {
-                let Some(CollectedCapture::Writing(target)) = captures.get_mut(&id) else {
-                    return Err(io::Error::other("capture is not open"));
-                };
-                target.append(&data)?;
-            }
+            CaptureEvent::Write { id, data } => writing(&mut captures, id)?.append(&data)?,
             CaptureEvent::Truncate { id, length } => {
-                let Some(CollectedCapture::Writing(target)) = captures.get_mut(&id) else {
-                    return Err(io::Error::other("capture is not open"));
-                };
-                target.truncate(length)?;
+                writing(&mut captures, id)?.truncate(length)?
             }
             CaptureEvent::Discard { id } => {
-                let Some(CollectedCapture::Writing(target)) = captures.get_mut(&id) else {
-                    return Err(io::Error::other("capture is not open"));
-                };
-                target.discard()?;
+                writing(&mut captures, id)?.discard()?;
                 captures.insert(id, CollectedCapture::Closed);
             }
             CaptureEvent::Finish { id } => {
-                let Some(CollectedCapture::Writing(target)) = captures.get_mut(&id) else {
-                    return Err(io::Error::other("capture is not open"));
-                };
-                let completed = target.finish()?;
+                let completed = writing(&mut captures, id)?.finish()?;
                 captures.insert(id, CollectedCapture::Finished(completed));
             }
         }
@@ -457,8 +449,8 @@ mod tests {
         writer.seek(io::SeekFrom::Start(checkpoint)).unwrap();
         writer.write_all(b"]").unwrap();
         assert!(create(CaptureKind::Text).is_err());
-        let inventory = captures(&output, false);
-        assert!(matches!(inventory[0].kind, CaptureKind::Json));
+        let saved = Saved::load(&output).unwrap();
+        assert!(matches!(saved.captures[&matches].kind, CaptureKind::Json));
         let completed = writer.finish().unwrap();
         assert_eq!(output.test_bytes("/result/matches").unwrap(), b"[\"a\"]");
         let empty = text(&output, TextCaptureField::Console)
@@ -482,50 +474,53 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn writer_failures_and_interrupted_writes_preserve_capture_policy() {
-        let (_root, manager, job) = fixture(None).await;
-        let output = manager.output(job);
-        let console = TextCaptureField::Console.pointer();
-        let mut capture = text(&output, TextCaptureField::Console).open();
-        capture.write_text("before failure\n").unwrap();
-        let collision = PendingCapture::create(&output, &console, CaptureKind::Text);
-        assert!(collision.is_err());
-        assert_eq!(
-            output.test_bytes(console.as_str()).unwrap(),
-            b"before failure\n",
-            "collision must not truncate or delete a live writer"
-        );
-        drop(capture);
-        assert!(output.test_bytes(console.as_str()).is_none());
-
-        let mut capture = text(&output, TextCaptureField::Console).open();
-        // Deterministic storage fault: the capture row disappears under the writer.
-        let capture_id = Saved::load(&output).unwrap().captures[&console].id;
-        output.db.delete_capture(capture_id).unwrap();
-        assert!(capture.write_text("cannot write").is_err());
-        assert!(capture.finish().is_err(), "an IO error poisons completion");
-        assert!(output.test_bytes(console.as_str()).is_none());
-        let mut capture = text(&output, TextCaptureField::Stdout).open_async();
-        let payload = "é🦀".repeat(700_000);
-        poll_once(capture.write_text(&payload)).await;
-        assert!(capture.finish_nonempty().await.unwrap().is_some());
-        let stdout = output
-            .test_bytes(TextCaptureField::Stdout.pointer().as_str())
+    #[test]
+    fn writer_failures_and_interrupted_writes_preserve_capture_policy() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
             .unwrap();
-        assert_eq!(stdout, payload.as_bytes());
+        runtime.block_on(async {
+            let (_root, manager, job) = fixture(None).await;
+            let output = manager.output(job);
+            let console = TextCaptureField::Console.pointer();
+            let mut capture = text(&output, TextCaptureField::Console).open();
+            capture.write_text("before failure\n").unwrap();
+            let collision = PendingCapture::create(&output, &console, CaptureKind::Text);
+            assert!(collision.is_err());
+            assert_eq!(
+                output.test_bytes(console.as_str()).unwrap(),
+                b"before failure\n",
+                "collision must not truncate or delete a live writer"
+            );
+            drop(capture);
+            assert!(output.test_bytes(console.as_str()).is_none());
 
-        let mut capture = text(&output, TextCaptureField::Stderr).open_async();
-        poll_once(capture.write_text(&"x".repeat(4 * 1024 * 1024))).await;
-        drop(capture);
-        // The in-flight write finishes, then the abandoned capture is discarded.
-        let stderr = TextCaptureField::Stderr.pointer();
-        tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            while output.test_bytes(stderr.as_str()).is_some() {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("abandoned async writes are discarded");
+            let mut capture = text(&output, TextCaptureField::Console).open();
+            // Deterministic storage fault: the capture row disappears under the writer.
+            let capture_id = Saved::load(&output).unwrap().captures[&console].id;
+            output.db.delete_capture(capture_id).unwrap();
+            assert!(capture.write_text("cannot write").is_err());
+            assert!(capture.finish().is_err(), "an IO error poisons completion");
+            assert!(output.test_bytes(console.as_str()).is_none());
+            let mut capture = text(&output, TextCaptureField::Stdout).open_async();
+            let payload = "é🦀".repeat(700_000);
+            poll_once(capture.write_text(&payload)).await;
+            assert!(capture.finish_nonempty().await.unwrap().is_some());
+            let stdout = output
+                .test_bytes(TextCaptureField::Stdout.pointer().as_str())
+                .unwrap();
+            assert_eq!(stdout, payload.as_bytes());
+
+            let mut capture = text(&output, TextCaptureField::Stderr).open_async();
+            poll_once(capture.write_text(&"x".repeat(4 * 1024 * 1024))).await;
+            drop(capture);
+            // The in-flight write finishes, then the abandoned capture is discarded,
+            // both on the only blocking thread, before it runs anything else.
+            tokio::task::spawn_blocking(|| ()).await.unwrap();
+            let stderr = TextCaptureField::Stderr.pointer();
+            assert!(output.test_bytes(stderr.as_str()).is_none());
+        });
     }
 }

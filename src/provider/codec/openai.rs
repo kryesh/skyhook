@@ -1,6 +1,7 @@
 //! The error envelope OpenAI's APIs share with the servers that follow them:
-//! `{"error": {"code", "type", "message"}}`, or the object unwrapped. Chat and
-//! Responses each read it with their own code vocabulary.
+//! `{"error": {"code", "type", "message"}}`, or the object unwrapped. Messages
+//! fits it too, naming its codes only in `type`. Each codec reads it with its
+//! own code vocabulary.
 use serde::{Deserialize, de::DeserializeOwned};
 use serde_json::Value;
 
@@ -15,13 +16,13 @@ use crate::{
 
 /// A codec's error codes, each spelled once.
 pub(crate) trait ErrorCode: NamedEnum + DeserializeOwned {
+    /// How the API words an overflow without its code, as older OpenAI models
+    /// and the servers following them do.
+    const OVERFLOW_PREFIX: &'static str = "This model's maximum context length is";
+
     /// The kind the code names; `None` leaves the kind to the status.
     fn kind(self) -> Option<ProviderErrorKind>;
 }
-
-/// How the API words an overflow without its code, as older models and the
-/// servers following them do.
-const OVERFLOW_PREFIX: &str = "This model's maximum context length is";
 
 /// `code`: a known code, or the HTTP status some servers repeat there.
 #[derive(Deserialize)]
@@ -55,7 +56,7 @@ pub(crate) fn read<C: ErrorCode>(native: &Value) -> Reading {
     };
     let overflow = envelope
         .message
-        .is_some_and(|message| message.starts_with(OVERFLOW_PREFIX));
+        .is_some_and(|message| message.starts_with(C::OVERFLOW_PREFIX));
     Reading {
         kind: if overflow {
             Some(ProviderErrorKind::ContextWindowExceeded)

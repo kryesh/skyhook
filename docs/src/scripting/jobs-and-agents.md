@@ -3,8 +3,8 @@
 ## Delegation and child input
 
 Child agents retain their conversation for follow-up work. Send instructions with
-`tool.job(id).send({value: instructions})`; the returned JobView's payload includes
-`.result.accepted`. A running child receives the input at its next model-request boundary,
+`tool.job(id).send({value: instructions})`; the returned JobView completes, without a result,
+once the input is accepted. A running child receives the input at its next model-request boundary,
 without interrupting its current request or tools. Children do not need `receive()` for these
 updates.
 
@@ -19,19 +19,18 @@ selecting them individually. A child-only retry leaves a parent waiting on work 
 does not add a root model request. Retrying without an instruction continues the same history
 without adding a synthetic message.
 
-A background child's visible text replies, including progress and final replies, arrive as
-message events without waiting for the child job to finish. Events carry `kind: "message"`,
-the child job `id`, source `message` sequence, optional `name`, and `text`. They reach the
-parent at a model-request boundary, not by interrupting an in-flight request. Pending messages
-survive session restart. Reading a background job's output does not consume its message events.
+A child's final reply is its job's result. A background child's earlier visible text replies
+arrive as message events without waiting for the child job to finish. Events carry
+`kind: "message"`, the child job `id`, optional `name`, and `text`.
+They reach the parent at a model-request boundary, not by interrupting an in-flight request.
+Pending messages survive session restart. Reading a background job's output does not consume
+its message events.
 
 Message delivery does not mean the child has finished: completion also requires its owned work
-and queued inputs to be resolved. A completed background child's notification references its
-`meta.last_message` instead of repeating the reply already delivered. Explicit `jobs({job})`
-reads and script calls still expose the saved final result; progress text is not concatenated
-into it. A foreground child returns its final reply in the call's `.result`, with no progress
-or later message events. The parent cannot make another model request until its foreground
-calls return.
+and queued inputs to be resolved. A completed background child's notification carries the final
+reply in `.result`; earlier replies are not concatenated into it. A foreground child returns its
+final reply in the call's `.result`, with no progress or later message events. The parent cannot
+make another model request until its foreground calls return.
 
 Child names are scoped to their caller: `A` and `B` may each create a child named `worker`, but
 all scripts owned by `A` share `A`'s child-name scope. A child retains its name even after
@@ -74,8 +73,9 @@ may leave background services running after answering.
 ## Job lifecycle and cancellation
 
 Background-capable tools accept an optional `bg` argument. Calls use the [common JobView
-contract](../reference/javascript.md#jobview-response-contract); background launches have
-`result: null` and `has_result: false`, while loaded literal `null` results have `has_result: true`.
+contract](../reference/javascript.md#jobview-response-contract); a background launch reports
+the job as launched, `running` and without a `result`, even if it has already finished. A loaded
+literal `null` result is `result: null`.
 Cancellation returns target-job metadata in `.result`. A child
 question has `state: "waiting_input"`; `jobs({job})` returns its stable question IDs and text in
 `presentation.question`, regardless of its size.

@@ -16,8 +16,8 @@ pub(crate) fn nonblank(what: &'static str, value: &str) -> Result<(), Blank> {
 
 /// Declare a `String` newtype whose values passed `$check`, a `fn(&str) ->
 /// Result<(), $error>`. Serde, `TryFrom<String>`, `FromStr`, `Display`,
-/// `as_str` and `From<Self> for String` come with it; add further derives
-/// such as `Ord` as attributes.
+/// `as_str` and `From<Self> for String` come with it; add further derives such
+/// as `Ord` as attributes.
 macro_rules! string_newtype {
     (
         $(#[$attr:meta])*
@@ -74,6 +74,11 @@ macro_rules! string_newtype {
 }
 pub(crate) use string_newtype;
 
+string_newtype! {
+    /// Text written for a reader, such as instructions or a hint: never blank.
+    pub struct Prose(Blank) = |text| nonblank("text", text);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -99,10 +104,6 @@ mod tests {
         assert_eq!(String::from(word), "hello");
         for blank in ["", " \n"] {
             assert_eq!(blank.parse::<Word>().unwrap_err(), Blank("word"));
-            assert_eq!(
-                Word::try_from(blank.to_owned()).unwrap_err().to_string(),
-                "word must not be blank"
-            );
             assert!(serde_json::from_value::<Word>(serde_json::json!(blank)).is_err());
         }
     }

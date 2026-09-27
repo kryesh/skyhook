@@ -1,10 +1,23 @@
 use super::*;
 use crate::launch::LaunchError;
 
+/// What a new session is created for, and the model and mode it starts with.
 pub(super) enum PendingStart {
     Input(Box<QueuedInput>),
     QueuedInput(Box<QueuedInput>),
-    Script(PathBuf),
+    Script {
+        path: PathBuf,
+        model: ModelRef,
+        mode: ModeName,
+    },
+}
+impl PendingStart {
+    fn selection(&self) -> (&ModelRef, &ModeName) {
+        match self {
+            Self::Input(input) | Self::QueuedInput(input) => (&input.model, &input.mode),
+            Self::Script { model, mode, .. } => (model, mode),
+        }
+    }
 }
 
 /// Creation owns its pending action until the asynchronous task completes.
@@ -20,44 +33,48 @@ impl StartState {
     pub(super) fn is_creating(&self) -> bool {
         matches!(self, Self::Creating(_))
     }
-    /// Leaves the state `Idle`.
-    fn take_action(&mut self) -> Option<PendingStart> {
-        match std::mem::take(self) {
-            Self::Creating(action) => Some(action),
-            Self::RetryScript(path) => Some(PendingStart::Script(path)),
-            Self::Idle => None,
-        }
-    }
 }
 
 impl App {
     /// Invariant: at most one creation is in flight. Every caller is gated by
     /// `busy()`/`start.is_creating()`, so a `Started` completion is the current one.
     pub(super) fn begin_session(&mut self, action: PendingStart) {
-        if matches!(self.start, StartState::RetryScript(_)) {
-            self.notice("Cancelled the pending script in favor of the new action");
-        }
         if self.start.is_creating() {
             return;
         }
-        self.start = StartState::Creating(action);
-        let launch = self.launch.clone();
+        let (model, mode) = action.selection();
+        let Ok(model) = self.launch.model.config().select_model(model) else {
+            self.notice("The selected model is no longer configured; input retained");
+            self.paused = true;
+            return self.park_action(action);
+        };
+        let launch = Launch {
+            model,
+            permissions: crate::launch::Permissions::Mode(mode.clone()),
+            ..self.launch.clone()
+        };
+        self.replace_start(StartState::Creating(action));
         let tx = self.tx.clone();
         tokio::spawn(async move {
-            let result = launch.create(None).await;
+            let result = match launch.create(None).await {
+                Ok(session) => Ok(PreparedObservation::subscribe(session).await),
+                Err(error) => Err(error),
+            };
             if let Err(error) = tx.send(Work::Started { result })
                 && let Work::Started {
-                    result: Ok(session),
-                    ..
+                    result: Ok(prepared),
                 } = error.0
             {
-                let _ = session.shutdown().await;
+                let _ = prepared.session().shutdown().await;
             }
         });
         self.dirty = true;
     }
     pub(super) fn session_started(&mut self, prepared: PreparedObservation) {
-        let pending = self.start.take_action();
+        let pending = match std::mem::take(&mut self.start) {
+            StartState::Creating(action) => Some(action),
+            _ => None,
+        };
         let draft = self.root_agent().clone();
         let attached_draft = match &self.phase {
             Phase::Draft { root } => Some(root.clone()),
@@ -67,7 +84,7 @@ impl App {
             observation: prepared.active,
             attached_draft,
         };
-        self.snapshot = prepared.snapshot;
+        self.snapshot = *prepared.snapshot;
         self.selected = self.root_agent().clone();
         if let Some(view) = self.views.remove(&draft) {
             self.views.insert(self.selected.clone(), view);
@@ -85,34 +102,38 @@ impl App {
             self.finish_shutdown();
             return;
         }
-        if self.paused {
-            self.park_action(pending);
-            return;
-        }
         match pending {
+            Some(action) if self.paused => self.park_action(action),
             Some(PendingStart::Input(input)) => self.send_input(*input),
             Some(PendingStart::QueuedInput(input)) => {
                 self.queue.push_front(*input);
                 self.deliver_queue();
             }
-            Some(PendingStart::Script(path)) => self.start_script(path),
+            Some(PendingStart::Script { path, .. }) => self.start_script(path),
             None => {}
         }
     }
-    fn park_action(&mut self, pending: Option<PendingStart>) {
-        match pending {
-            Some(PendingStart::Input(input) | PendingStart::QueuedInput(input)) => {
+    /// Keep an action whose session was not created: input returns to the
+    /// head of the queue, and a script becomes an explicit retry.
+    fn park_action(&mut self, action: PendingStart) {
+        match action {
+            PendingStart::Input(input) | PendingStart::QueuedInput(input) => {
                 self.queue.push_front(*input);
-                self.refresh_queue_menu();
+                self.refresh_menu();
             }
-            Some(PendingStart::Script(path)) => self.start = StartState::RetryScript(path),
-            None => {}
+            PendingStart::Script { path, .. } => self.replace_start(StartState::RetryScript(path)),
+        }
+    }
+    /// A new action displaces a parked script only once it takes the start slot.
+    fn replace_start(&mut self, start: StartState) {
+        if let StartState::RetryScript(_) = std::mem::replace(&mut self.start, start) {
+            self.notice("Cancelled the pending script in favor of the new action");
         }
     }
     pub(super) fn start_failed(&mut self, error: LaunchError) {
-        // Keep an explicit script retry separate from composer input.
-        let pending = self.start.take_action();
-        self.park_action(pending);
+        if let StartState::Creating(action) = std::mem::take(&mut self.start) {
+            self.park_action(action);
+        }
         self.paused = true;
         self.notice(error.to_string());
         if self.stopping {
@@ -140,14 +161,8 @@ impl App {
             return;
         }
         let Some(session) = self.session().cloned() else {
-            let Ok(model) = self.launch.model.config().select_model(&self.model) else {
-                self.notice("The selected model is no longer configured");
-                return;
-            };
-            self.launch.model = model;
-            self.launch.permissions = crate::launch::Permissions::Mode(self.mode.clone());
-            self.begin_session(PendingStart::Script(path));
-            return;
+            let (model, mode) = (self.model.clone(), self.mode.clone());
+            return self.begin_session(PendingStart::Script { path, model, mode });
         };
         self.operation = true;
         self.set_title(&path.display().to_string());
@@ -156,13 +171,8 @@ impl App {
         tokio::spawn(async move {
             status.flush().await;
             let result = async {
-                let source = tokio::fs::read_to_string(path)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                session
-                    .run_script(source)
-                    .await
-                    .map_err(|e| e.to_string())?;
+                let source = tokio::fs::read_to_string(path).await?;
+                session.run_script(source).await?;
                 Ok(())
             }
             .await;
@@ -215,15 +225,14 @@ mod tests {
         assert!(!app.start.is_creating() && app.session().is_none());
     }
 
-    async fn started(rx: &mut mpsc::UnboundedReceiver<Work>) -> SessionHandle {
+    async fn started(rx: &mut mpsc::UnboundedReceiver<Work>) -> PreparedObservation {
         let Work::Started {
-            result: Ok(session),
-            ..
+            result: Ok(prepared),
         } = next_lifecycle(rx).await
         else {
             panic!("session creation should succeed");
         };
-        session
+        prepared
     }
 
     async fn fail_creation(app: &mut App, rx: &mut mpsc::UnboundedReceiver<Work>) {
@@ -271,12 +280,12 @@ mod tests {
         });
         app.editor.set("still composing".into());
         app.editor.insert_paste("unsent attachment".into());
-        let session = started(&mut rx).await;
+        let prepared = started(&mut rx).await;
         assert_eq!(std::fs::read_dir(&app.launch.sessions).unwrap().count(), 1);
-        app.session_started(PreparedObservation::subscribe(session).await);
+        app.session_started(prepared);
         assert!(!app.start.is_creating() && app.operation);
         assert_eq!(app.history, ["first input"]);
-        assert_eq!(app.model.to_string(), "test/second");
+        assert_eq!(app.model, "test/second".parse().unwrap());
         let image = [png_attachment("queued.png")];
         assert_eq!(
             queued(&app),
@@ -331,15 +340,38 @@ mod tests {
         assert!(app.start.is_creating());
         app.tick();
         assert_eq!(app.queue.len(), 1);
-        let session = started(&mut rx).await;
+        let prepared = started(&mut rx).await;
         app.shutdown();
-        app.session_started(PreparedObservation::subscribe(session).await);
+        app.session_started(prepared);
         app.work(next_lifecycle(&mut rx).await);
         assert!(app.exit);
         assert!(
             app.history.is_empty(),
             "shutdown must suppress the pending prompt"
         );
+    }
+
+    #[tokio::test]
+    async fn an_unstartable_input_leaves_the_pending_script_in_place() {
+        let (_root, mut app) = draft_fixture().await;
+        let mut rx = capture_work(&mut app);
+        app.status = crate::tui::status::StatusLog::new(app.tx.clone());
+        app.start = StartState::RetryScript("pending.js".into());
+        app.model = "test/removed".parse().unwrap();
+        app.submit("input".into());
+        app.status.flush().await;
+        let notices: Vec<_> = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|work| match work {
+                Work::LocalStatus { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            ["The selected model is no longer configured; input retained"]
+        );
+        assert!(matches!(app.start, StartState::RetryScript(_)));
+        assert_eq!(app.queue.len(), 1);
     }
 
     #[tokio::test]

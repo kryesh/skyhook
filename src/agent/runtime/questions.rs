@@ -2,19 +2,18 @@
 
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, hash_map::Entry},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex, PoisonError,
         atomic::{AtomicBool, Ordering},
     },
 };
 use tokio::sync::{Mutex, oneshot};
 
 use crate::{
-    agent::{HarnessError, Question, QuestionError, QuestionHandler},
+    agent::{HarnessError, Question, QuestionError, QuestionHandler, QuestionReply},
     identity::{AgentId, JobId},
     job::JobManager,
-    provider::protocol::ToolCall,
     tool::{
         ToolError, ToolOutput,
         diagnostic::{Effects, Operation, Subject},
@@ -25,7 +24,46 @@ pub(super) struct QuestionCoordinator {
     jobs: JobManager,
     handler: Option<Arc<dyn QuestionHandler>>,
     pending: Mutex<HashMap<JobId, PendingQuestion>>,
-    batches: Mutex<HashMap<AgentId, QuestionBatch>>,
+    batches: Mutex<HashMap<BatchKey, QuestionBatch>>,
+    joined: StdMutex<Joined>,
+}
+
+/// The asks one issuer made together: a model response's calls, or a script's.
+type BatchKey = (AgentId, Option<JobId>);
+
+/// Each issuer's newest ask to join a batch, and how many of its joined asks are
+/// still waiting. Job ids ascend, so no later batch waits for an ask at or below
+/// it; the entry goes once no joined ask waits.
+type Joined = HashMap<BatchKey, (JobId, usize)>;
+
+/// An ask's place in its issuer's `Joined` entry, released however the ask ends,
+/// cancellation included.
+struct JoinedAsk<'a> {
+    joined: &'a StdMutex<Joined>,
+    key: BatchKey,
+}
+
+impl<'a> JoinedAsk<'a> {
+    /// Join `job` to its issuer's entry; also returns the issuer's previous newest ask.
+    fn join(joined: &'a StdMutex<Joined>, key: BatchKey, job: JobId) -> (Self, Option<JobId>) {
+        let mut entries = joined.lock().unwrap_or_else(PoisonError::into_inner);
+        let newest = entries.get(&key).map(|(newest, _)| *newest);
+        let entry = entries.entry(key.clone()).or_insert((job, 0));
+        *entry = (entry.0.max(job), entry.1 + 1);
+        (Self { joined, key }, newest)
+    }
+}
+
+impl Drop for JoinedAsk<'_> {
+    fn drop(&mut self) {
+        let mut entries = self.joined.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Entry::Occupied(mut joined) = entries.entry(self.key.clone()) {
+            joined.get_mut().1 -= 1;
+            if joined.get().1 == 0 {
+                joined.remove();
+            }
+        }
+    }
 }
 
 // True while claimed, from claim until resolution, so duplicate answers cannot
@@ -90,15 +128,11 @@ struct PendingQuestion {
 }
 
 impl PendingQuestion {
+    /// `entries` is never empty: every batch holds the ask that opened it.
     fn new(entries: Vec<PendingQuestionEntry>) -> Result<Self, HarnessError> {
-        if entries.is_empty() {
-            return Err(HarnessError::Agent("question batch is empty".to_owned()));
-        }
         let ids = entries.iter().map(|entry| entry.question.id.as_str());
         if let Some(duplicate) = duplicate_question_id(ids) {
-            return Err(HarnessError::Agent(format!(
-                "duplicate question id `{duplicate}`"
-            )));
+            return Err(HarnessError::DuplicateQuestion(duplicate.to_owned()));
         }
         Ok(Self {
             merged: entries.len() > 1,
@@ -147,7 +181,9 @@ impl PendingAsk {
 
 #[derive(Default)]
 struct QuestionBatch {
-    expected: Option<usize>,
+    /// The issuer's other asks that have neither joined nor ended; the batch is
+    /// presented once none remain.
+    awaited: HashSet<JobId>,
     pending: Vec<PendingAsk>,
 }
 
@@ -157,7 +193,8 @@ impl QuestionCoordinator {
             jobs,
             handler,
             pending: Mutex::new(HashMap::new()),
-            batches: Mutex::new(HashMap::new()),
+            batches: Mutex::default(),
+            joined: StdMutex::default(),
         }
     }
 
@@ -167,9 +204,7 @@ impl QuestionCoordinator {
             if envelope.role == crate::job::JobRole::Agent {
                 return Ok(job);
             }
-            job = envelope.parent.ok_or_else(|| {
-                HarnessError::Agent("child question has no owning agent job".to_owned())
-            })?;
+            job = envelope.parent.ok_or(HarnessError::UnownedQuestion)?;
         }
     }
 
@@ -193,32 +228,51 @@ impl QuestionCoordinator {
             .effects(Effects::NotStarted));
         }
         let (result, received) = oneshot::channel();
-        let agent = context.agent().clone();
-        let launch = {
-            let mut batches = self.batches.lock().await;
-            let batch = batches.entry(agent.clone()).or_default();
-            let first = batch.pending.is_empty();
-            batch.pending.push(PendingAsk {
-                context,
-                question,
-                result,
-            });
-            batch
-                .expected
-                .map_or(first, |expected| batch.pending.len() >= expected)
+        let (agent, job) = (context.agent().clone(), context.job());
+        let key = (agent.clone(), context.job_subject().parent);
+        if let Some(parent) = key.1 {
+            self.jobs.issued(parent).await;
+        }
+        let mut open = self.batches.lock().await;
+        let (_joined, newest) = JoinedAsk::join(&self.joined, key.clone(), job);
+        let awaited: Vec<JobId> = if open.contains_key(&key) {
+            Vec::new()
+        } else {
+            // A response's calls are all created before any runs, and a script's
+            // issued calls are published above: a new batch waits for the issuer's
+            // other live asks.
+            let jobs = self.jobs.list(&agent).await.into_iter();
+            jobs.filter(|sibling| {
+                sibling.parent == key.1
+                    && sibling.role == crate::job::JobRole::Question
+                    && !sibling.state.is_terminal()
+                    && sibling.id != job
+                    && newest < Some(sibling.id)
+            })
+            .map(|sibling| sibling.id)
+            .collect()
         };
-        if launch {
-            let runtime = self.clone();
+        let batch = open.entry(key.clone()).or_default();
+        batch.awaited.extend(&awaited);
+        batch.awaited.remove(&job);
+        batch.pending.push(PendingAsk {
+            context,
+            question,
+            result,
+        });
+        self.present_ready(&mut open, &key);
+        drop(open);
+        for sibling in awaited {
+            let (runtime, key) = (self.clone(), key.clone());
             tokio::spawn(async move {
-                tokio::task::yield_now().await;
-                let batch = runtime
-                    .batches
-                    .lock()
-                    .await
-                    .remove(&agent)
-                    .unwrap_or_default()
-                    .pending;
-                runtime.present_question_batch(agent, batch).await;
+                let _ = runtime.jobs.wait_settled(sibling).await;
+                let mut open = runtime.batches.lock().await;
+                if open
+                    .get_mut(&key)
+                    .is_some_and(|batch| batch.awaited.remove(&sibling))
+                {
+                    runtime.present_ready(&mut open, &key);
+                }
             });
         }
         received.await.unwrap_or_else(|_| {
@@ -226,45 +280,25 @@ impl QuestionCoordinator {
         })
     }
 
-    pub(super) async fn prepare_question_batch(
-        &self,
-        agent: &AgentId,
-        calls: &[ToolCall],
-        executor: &crate::tool::executor::ToolExecutor,
+    /// Present the batch at `key` once no ask it waits for remains.
+    fn present_ready(
+        self: &Arc<Self>,
+        open: &mut HashMap<BatchKey, QuestionBatch>,
+        key: &BatchKey,
     ) {
-        let (registry, surface) = (executor.registry(), executor.surface_for_agent(agent));
-        let count = calls
-            .iter()
-            .filter(|call| {
-                let Some((tool, spec)) = registry.get(call.name()).zip(surface.get(call.name()))
-                else {
-                    return false;
-                };
-                tool.job_role() == crate::job::JobRole::Question
-                    && crate::tool::registry::split_envelope(
-                        spec,
-                        &tool,
-                        serde_json::Value::Object(call.arguments().clone()),
-                    )
-                    .is_ok_and(|(arguments, _)| {
-                        serde_json::from_value::<Question>(arguments).is_ok()
-                    })
-            })
-            .count();
-        if count > 0 {
-            self.batches
-                .lock()
-                .await
-                .entry(agent.clone())
-                .or_default()
-                .expected = Some(count);
+        if open.get(key).is_some_and(|batch| batch.awaited.is_empty()) {
+            let mut batch = open.remove(key).expect("checked above").pending;
+            // An ask dropped after joining has no one left to answer.
+            batch.retain(|ask| !ask.result.is_closed());
+            if batch.is_empty() {
+                return;
+            }
+            let (runtime, agent) = (self.clone(), key.0.clone());
+            tokio::spawn(async move { runtime.present_question_batch(agent, batch).await });
         }
     }
 
     async fn present_question_batch(&self, agent: AgentId, batch: Vec<PendingAsk>) {
-        if batch.is_empty() {
-            return;
-        }
         let entries = batch
             .iter()
             .map(|pending| {
@@ -480,7 +514,7 @@ impl QuestionCoordinator {
         let answers = if pending.entries.len() == 1 && !keyed {
             vec![(&pending.entries[0], value)]
         } else {
-            let values = keyed_answers(&value).map_err(HarnessError::Agent)?;
+            let values = value.as_object().ok_or(HarnessError::UnkeyedAnswers)?;
             let answers = pending
                 .entries
                 .iter()
@@ -492,9 +526,7 @@ impl QuestionCoordinator {
                 })
                 .collect::<Vec<_>>();
             if answers.is_empty() {
-                return Err(HarnessError::Agent(
-                    "answer contains no pending question ids".to_owned(),
-                ));
+                return Err(HarnessError::UnmatchedAnswers);
             }
             answers
         };
@@ -576,32 +608,17 @@ fn duplicate_question_id<'a>(mut ids: impl Iterator<Item = &'a str>) -> Option<&
     ids.find(|id| !seen.insert(*id))
 }
 
-/// Answers to several questions, keyed by question id.
-fn keyed_answers(
-    answer: &serde_json::Value,
-) -> Result<&serde_json::Map<String, serde_json::Value>, String> {
-    answer
-        .as_object()
-        .ok_or_else(|| "answers to multiple questions must be keyed by question id".to_owned())
-}
-
+/// Each question's answer from a host reply, as the value its ask returns.
 fn split_answers(
     ids: &[String],
-    answer: serde_json::Value,
+    mut reply: QuestionReply,
 ) -> Vec<Result<serde_json::Value, String>> {
-    if ids.len() == 1 {
-        return vec![Ok(answer)];
-    }
-    let answers = match keyed_answers(&answer) {
-        Ok(answers) => answers,
-        Err(error) => return ids.iter().map(|_| Err(error.clone())).collect(),
-    };
     ids.iter()
         .map(|id| {
-            answers
-                .get(id)
-                .cloned()
-                .ok_or_else(|| format!("answer is missing question id `{id}`"))
+            let answer = reply
+                .remove(id)
+                .ok_or_else(|| format!("answer is missing question id `{id}`"))?;
+            Ok(serde_json::to_value(answer).expect("answers serialize as JSON strings"))
         })
         .collect()
 }
@@ -620,37 +637,31 @@ mod tests {
     type Backgrounds = Arc<StdMutex<Vec<bool>>>;
 
     #[test]
-    fn split_answers_preserves_single_and_mixed_batch_answers() {
+    fn split_answers_keeps_each_answers_wire_shape_and_reports_missing_ids() {
+        use crate::agent::QuestionAnswer;
+        let commented = QuestionAnswer::Commented {
+            answer: "Use the default".into(),
+            comment: "  Keep the existing settings.\n".into(),
+        };
+        let reply = [
+            ("choice", QuestionAnswer::Text("Continue".into())),
+            ("commented", commented),
+        ];
+        let reply = reply.map(|(id, answer)| (id.to_owned(), answer)).into();
+        let ids = ["choice", "commented", "missing"].map(str::to_owned);
+        let found = split_answers(&ids, reply);
         let suggestion =
             json!({"answer": "Use the default", "comment": "  Keep the existing settings.\n"});
-        let single = split_answers(&["answer".to_owned()], suggestion.clone());
-        assert_eq!(single, vec![Ok(suggestion.clone())]);
-        let ids = ["choice", "commented_choice", "free_form"].map(str::to_owned);
-        let answers = json!({"free_form": "My own answer", "commented_choice": suggestion, "choice": "Continue"});
-        let (first, last) = (json!("Continue"), json!("My own answer"));
-        let found = split_answers(&ids, answers);
-        assert_eq!(found, vec![Ok(first), Ok(suggestion), Ok(last)]);
-        let partial = split_answers(&ids, json!({"choice":"Continue"}));
-        assert_eq!(partial[0], Ok(json!("Continue")));
-        assert!(
-            partial[1]
-                .as_ref()
-                .unwrap_err()
-                .contains("commented_choice")
-        );
-        assert!(partial[2].as_ref().unwrap_err().contains("free_form"));
+        assert_eq!(found[..2], [Ok(json!("Continue")), Ok(suggestion)]);
+        assert!(found[2].as_ref().unwrap_err().contains("missing"));
     }
 
     #[test]
     fn question_resolution_preserves_received_answers_and_control_failures() {
         use crate::tool::diagnostic::{Operation, Subject};
 
-        let question = Question {
-            id: "stable-id".into(),
-            prompt: "prompt".into(),
-            options: vec![],
-        };
-        let failure = || HarnessError::Agent("resolution unavailable".into());
+        let question = question("stable-id");
+        let failure = || HarnessError::AgentStopped;
         let answer = json!({"answer":"received"});
         let error =
             super::finish_child_answer(&question, Ok(answer.clone()), Err(failure())).unwrap_err();
@@ -671,12 +682,15 @@ mod tests {
         }
     }
 
-    fn pending_questions(entries: &[(&str, JobId)]) -> super::PendingQuestion {
-        let question = |id: &str| crate::agent::Question {
+    fn question(id: &str) -> Question {
+        Question {
             id: id.to_owned(),
             prompt: "Question?".to_owned(),
             options: Vec::new(),
-        };
+        }
+    }
+
+    fn pending_questions(entries: &[(&str, JobId)]) -> super::PendingQuestion {
         let entries = entries.iter();
         let entries = entries.map(|(id, job)| super::PendingQuestionEntry::new(question(id), *job));
         super::PendingQuestion::new(entries.collect()).unwrap()
@@ -684,6 +698,28 @@ mod tests {
 
     fn ask(id: &str, index: u32) -> AssistantItem {
         tool_call(index, id, "ask", json!({"id":id, "prompt":"Question?"}))
+    }
+
+    /// A running ask job of the root agent and the context its handler receives.
+    async fn ask_context(
+        session: &SessionHandle,
+        workspace: &Path,
+        spec: JobSpec,
+    ) -> (ToolContext, crate::job::JobWorker) {
+        let jobs = &session.runtime.jobs;
+        let parent = spec.parent;
+        let lease = jobs.test_running(spec).await;
+        let here = crate::execution::ExecutionLocation::root(workspace.to_owned());
+        let subject = crate::tool::authorization::AuthorizationSubject {
+            agent: session.root.clone(),
+            job: lease.id(),
+            parent,
+            capabilities: session.runtime.capabilities.clone(),
+            cancellation: lease.cancellation_token(),
+        };
+        let (input, worker) = lease.split();
+        let context = ToolContext::new(subject, here.clone(), here, input, jobs.clone());
+        (context, worker)
     }
 
     async fn hanging_session(root: &tempfile::TempDir) -> SessionHandle {
@@ -695,14 +731,14 @@ mod tests {
     async fn mode_session(
         root: &Path,
         provider: Arc<dyn Provider>,
-        answer: serde_json::Value,
+        answer: &str,
         cancel: bool,
     ) -> (SessionHandle, Batches, Backgrounds) {
         let (batches, backgrounds) = (Batches::default(), Backgrounds::default());
         let handler = RecordingQuestions {
             batches: batches.clone(),
             backgrounds: backgrounds.clone(),
-            answer,
+            answer: answer.into(),
             cancel,
         };
         let harness = test_builder(root, &root.join("sessions"), provider, false)
@@ -713,15 +749,14 @@ mod tests {
         (harness.new_session().await.unwrap(), batches, backgrounds)
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrent_root_questions_are_merged_and_answers_are_split() {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
         let asks = response(vec![ask("first", 0), ask("second", 1)]);
         let provider = scripted_provider(&requests, [asks, answer("done")]);
-        let answers = json!({"first":"yes", "second":{"value":2}, "extra":true});
         let (session, batches, backgrounds) =
-            mode_session(root.path(), provider, answers, false).await;
+            mode_session(root.path(), provider, "yes", false).await;
         assert_eq!(bounded(session.prompt("ask twice")).await.unwrap(), "done");
         {
             let batches = batches.lock().unwrap();
@@ -737,7 +772,7 @@ mod tests {
                 panic!("missing tool results")
             };
             assert_eq!(results[0].result["result"], "yes");
-            assert_eq!(results[1].result["result"], json!({"value":2}));
+            assert_eq!(results[1].result["result"], "yes");
         }
         assert_eq!(*backgrounds.lock().unwrap(), [false]);
         shutdown_session(session).await;
@@ -749,18 +784,10 @@ mod tests {
         {
             let root = tempfile::tempdir().unwrap();
             let background = script_background || ask_background;
-            let answers = json!({"first":"yes", "second":"yes"});
             let provider = Arc::new(HangingProvider);
             let (session, _, backgrounds) =
-                mode_session(root.path(), provider, answers, background).await;
-            let call = |id| ToolCall::new(id, "ask", json!({"id":id, "prompt":"Question?"}));
-            let calls = ["first", "second"].map(|id| call(id).unwrap());
+                mode_session(root.path(), provider, "yes", background).await;
             let (runtime, agent) = (&session.runtime, session.root.clone());
-            let prepared =
-                runtime
-                    .questions
-                    .prepare_question_batch(&agent, &calls, &runtime.executor);
-            prepared.await;
             let source = format!(
                 "async function ask(id, bg) {{ try {{ const answer = await tool.ask({{id,prompt:'Question?',bg}}); return bg ? {{job:answer.id}} : {{answer:answer.unwrap()}}; }} catch (error) {{ return {{error:String(error)}}; }} }} return await Promise.all([ask('first',false), ask('second',{ask_background})]);"
             );
@@ -793,11 +820,65 @@ mod tests {
         }
     }
 
+    /// A sibling ask holds its batch open until it joins or, like one rejected
+    /// before it runs, ends. A later ask from another issuer does not close it, and
+    /// one dropped after joining leaves neither its question nor its join behind.
+    #[tokio::test(start_paused = true)]
+    async fn sibling_asks_hold_the_batch_until_they_join_or_end() {
+        let root = tempfile::tempdir().unwrap();
+        let provider = Arc::new(HangingProvider);
+        let (session, batches, _) = mode_session(root.path(), provider, "yes", false).await;
+        let spec = || JobSpec {
+            accepts_input: true,
+            role: crate::job::JobRole::Question,
+            ..JobSpec::test(session.root.clone(), "ask")
+        };
+        let (context, _worker) = ask_context(&session, root.path(), spec()).await;
+        let sibling = session.runtime.jobs.test_running(spec()).await;
+        let questions = &session.runtime.questions;
+        let script = (session.runtime.jobs)
+            .test_running(JobSpec::test(session.root.clone(), "script"))
+            .await;
+        let scripted = JobSpec {
+            parent: Some(script.id()),
+            ..spec()
+        };
+        let (scripted, _scripted_worker) = ask_context(&session, root.path(), scripted).await;
+        let scripted = questions.coordinate_question(scripted, question("scripted"));
+        assert_eq!(bounded(scripted).await.unwrap(), json!("yes"));
+        let mut asked = Box::pin(questions.coordinate_question(context, question("first")));
+        let key = (session.root.clone(), None);
+        let opened = async || questions.batches.lock().await.contains_key(&key);
+        pending_until(&mut asked, opened).await;
+        let joined = || {
+            questions
+                .joined
+                .lock()
+                .unwrap()
+                .get(&key)
+                .map(|entry| entry.1)
+        };
+        let (dropped, _dropped_worker) = ask_context(&session, root.path(), spec()).await;
+        let mut dropped = Box::pin(questions.coordinate_question(dropped, question("dropped")));
+        pending_until(&mut dropped, async || joined() == Some(2)).await;
+        drop(dropped);
+        assert_eq!(joined(), Some(1));
+        session.runtime.jobs.cancel(sibling.id()).await.unwrap();
+        assert_eq!(bounded(asked).await.unwrap(), json!("yes"));
+        assert_eq!(joined(), None);
+        let presented = batches.lock().unwrap().clone();
+        let ids: Vec<Vec<&str>> = (presented.iter())
+            .map(|batch| batch.iter().map(|question| question.id.as_str()).collect())
+            .collect();
+        assert_eq!(ids, [["scripted"], ["first"]]);
+        shutdown_session(session).await;
+    }
+
     #[tokio::test]
     async fn background_child_asks_merge_across_turns_and_resolve_independently() {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
-        let owner = owner(&session).await;
+        let owner = owner(&session, false).await;
         start_child(&session, 1, Some(owner)).await;
         let (executor, jobs) = (&session.runtime.executor, &session.runtime.jobs);
         let waiting_with = |count: usize| {
@@ -839,11 +920,11 @@ mod tests {
         shutdown_session(session).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stable_agent_job_routes_answers_and_duplicate_bursts_do_not_block_cancellation() {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
-        let owner = owner(&session).await;
+        let owner = owner(&session, false).await;
         start_child(&session, 1, Some(owner)).await;
         let jobs = &session.runtime.jobs;
         let mut asks = Vec::new();
@@ -901,29 +982,11 @@ mod tests {
         shutdown_session(session).await;
     }
 
-    async fn park_answer(
-        answer: &mut std::pin::Pin<
-            Box<impl std::future::Future<Output = Result<bool, HarnessError>>>,
-        >,
-        route: &super::AnswerRoute,
-    ) {
-        bounded(async {
-            loop {
-                assert!(futures_util::poll!(answer.as_mut()).is_pending());
-                if route.0.load(Ordering::Acquire) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-    }
-
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn cancelled_answer_under_backpressure_releases_claim_without_cleanup_task() {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
-        let owner = owner(&session).await;
+        let owner = owner(&session, false).await;
         start_child(&session, 1, Some(owner)).await;
         let jobs = &session.runtime.jobs;
         // A live ask job with a full input mailbox and no retained-agent resume handler.
@@ -949,7 +1012,7 @@ mod tests {
         coordinator.open_child_questions(pending()).await.unwrap();
         let old_route = route().await;
         let mut abandoned = answer("abandoned");
-        park_answer(&mut abandoned, &old_route).await;
+        pending_until(&mut abandoned, async || old_route.0.load(Ordering::Acquire)).await;
         // Reused IDs test route generation: a stale claim must not release the new route.
         let job_list = [job];
         bounded(coordinator.resolve_child_question(owner, &job_list))
@@ -959,7 +1022,10 @@ mod tests {
         let new_route = route().await;
         assert!(!Arc::ptr_eq(&old_route.0, &new_route.0));
         let mut new_answer = answer("new");
-        park_answer(&mut new_answer, &new_route).await;
+        pending_until(&mut new_answer, async || {
+            new_route.0.load(Ordering::Acquire)
+        })
+        .await;
         drop(abandoned);
         assert!(!old_route.0.load(Ordering::Acquire));
         assert!(new_route.0.load(Ordering::Acquire));
@@ -984,7 +1050,7 @@ mod tests {
         shutdown_session(session).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn noninteractive_children_receive_parent_answers_directly_and_through_scripts() {
         for scripted in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -1002,7 +1068,7 @@ mod tests {
             let provider = scripted_provider(&requests, [response(vec![call]), answer("done")]);
             let handler = RecordingQuestions {
                 batches: batches.clone(),
-                answer: json!("host-answer"),
+                answer: "host-answer".into(),
                 ..Default::default()
             };
             let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
@@ -1064,24 +1130,9 @@ mod tests {
                     background,
                     ..JobSpec::test(session.root.clone(), "ask")
                 };
-                let lease = jobs.test_running(spec).await;
-                let job = lease.id();
-                let here = crate::execution::ExecutionLocation::root(root.path().to_owned());
-                let subject = crate::tool::authorization::AuthorizationSubject {
-                    agent: session.root.clone(),
-                    job,
-                    parent: None,
-                    capabilities: session.runtime.capabilities.clone(),
-                    cancellation: lease.cancellation_token(),
-                };
-                let (input, _worker) = lease.split();
-                let context = ToolContext::new(subject, here.clone(), here, input, jobs.clone());
-                let question = Question {
-                    id: "bypass".into(),
-                    prompt: "question".into(),
-                    options: vec![],
-                };
-                let asked = questions.coordinate_question(context, question);
+                let (context, _worker) = ask_context(&session, root.path(), spec).await;
+                let job = context.job();
+                let asked = questions.coordinate_question(context, question("bypass"));
                 let error = bounded(asked).await.unwrap_err();
                 assert!(matches!(
                     error.diagnostic().cause,

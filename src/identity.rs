@@ -213,17 +213,19 @@ pub enum IdentityError {
 mod tests {
     use super::*;
 
+    /// Session and event identifiers share one generator and one text form.
     #[test]
-    fn durable_event_ids_are_random_and_round_trip() {
+    fn random_ids_are_random_and_round_trip() {
         let event = EventId::generate().unwrap();
         assert_ne!(event, EventId::generate().unwrap());
+        let session = SessionId::from_bytes([0xab; 16]);
         assert_eq!(event.to_string().parse::<EventId>().unwrap(), event);
         assert_eq!(
-            serde_json::from_str::<EventId>(&serde_json::to_string(&event).unwrap()).unwrap(),
-            event
+            serde_json::from_str::<SessionId>(&serde_json::to_string(&session).unwrap()).unwrap(),
+            session
         );
         assert!("0".parse::<EventId>().is_err());
-        assert!("z".repeat(32).parse::<EventId>().is_err());
+        assert!("z".repeat(32).parse::<SessionId>().is_err());
     }
 
     #[test]
@@ -239,16 +241,6 @@ mod tests {
             !AgentId::root(SessionId::from_bytes([2; 16]))
                 .child(1)
                 .is_within(&root)
-        );
-    }
-
-    #[test]
-    fn session_id_round_trips() {
-        let id = SessionId::from_bytes([0xab; 16]);
-        assert_eq!(id.to_string().parse::<SessionId>().unwrap(), id);
-        assert_eq!(
-            serde_json::from_str::<SessionId>(&serde_json::to_string(&id).unwrap()).unwrap(),
-            id
         );
     }
 }

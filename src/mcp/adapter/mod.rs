@@ -59,28 +59,21 @@ pub fn register(
                 ""
             },
         );
-        if let Err(error) = builder.register_admission(
+        let schema = adapted.schema.clone();
+        if let Err(error) = builder.register_schema(
             name,
             description,
-            adapted.schema.clone(),
+            schema,
             options,
-            move |value| {
-                let arguments = adapted.admit(value)?;
-                let manager = manager.clone();
-                let store = store.clone();
-                let server = server.clone();
-                let upstream_name = upstream_name.clone();
-                Ok(Invocation::new(move |context: ToolContext| async move {
-                    let result = manager
-                        .call(
-                            &server,
-                            &upstream_name,
-                            arguments,
-                            context.cancellation_token(),
-                        )
-                        .await?;
-                    map_result(result, &store).await
-                }))
+            move |arguments| adapted.admit(Value::Object(arguments.clone())),
+            move |arguments| {
+                let (manager, store) = (manager.clone(), store.clone());
+                let (server, upstream_name) = (server.clone(), upstream_name.clone());
+                Invocation::new(move |context: ToolContext| async move {
+                    let cancellation = context.cancellation_token();
+                    let result = manager.call(&server, &upstream_name, arguments, cancellation);
+                    map_result(result.await?, &store).await
+                })
             },
         ) {
             let error = match error {
@@ -136,7 +129,7 @@ for line in sys.stdin:
         let runtime = TestRuntime::new().await;
         let config = serde_json::from_value(json!({
             "transport":"stdio", "start_command":["python3","-u","-c",FIXTURE],
-            "capabilities":["read","exec"], "startup_timeout_secs":5
+            "capabilities":["read","exec"]
         }))
         .unwrap();
         let mut configs = std::collections::BTreeMap::from([("fixture".to_owned(), config)]);
@@ -156,13 +149,15 @@ for line in sys.stdin:
         assert!(warnings[0].contains("invalid"));
         let registry = builder.build();
         let (native, open) = ("mcp_fixture_native", "mcp_fixture_open");
-        assert!(
-            registry
-                .tools()
-                .all(|tool| tool.placement() == ToolPlacement::Host)
-        );
+        for name in [native, open] {
+            assert_eq!(registry.get(name).unwrap().placement(), ToolPlacement::Host);
+        }
         for missing in [Capability::Exec, Capability::Mcp] {
-            assert!(registry.surface(&without(missing)).get(native).is_none());
+            let tool = registry.get(native).unwrap();
+            assert!(
+                tool.spec(&without(missing), crate::tool::registry::AgentLevel::Root)
+                    .is_none()
+            );
         }
         let policy = RecordingPolicy::allowing();
         let root = runtime.root.path().to_path_buf();
@@ -183,8 +178,8 @@ for line in sys.stdin:
                 .is_err()
         );
         assert!(policy.requests.lock().unwrap().is_empty());
-        // Upstream-schema rejection is an admission failure: like a typed tool,
-        // it fails its own approved job rather than being refused up front.
+        // Upstream-schema rejection is an admission failure: like a typed tool's,
+        // it is refused before a job or an approval exists.
         for invalid in [json!({"count":"bad"}), json!({})] {
             assert!(
                 executor
@@ -193,6 +188,8 @@ for line in sys.stdin:
                     .is_err()
             );
         }
+        assert!(policy.requests.lock().unwrap().is_empty());
+        assert!(runtime.jobs.list(&runtime.agent).await.is_empty());
         let arguments = |output: &Value| output["structuredContent"]["arguments"].clone();
         let native_input =
             json!({"count":2,"title":"user title","format":"user format","$schema":"user data"});

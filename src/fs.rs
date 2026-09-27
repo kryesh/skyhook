@@ -349,14 +349,8 @@ mod tests {
                 .unwrap();
             assert!(status.success());
             // Opening a FIFO without a writer would block without O_NONBLOCK.
-            let read = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                read_regular(&fifo, u64::MAX),
-            );
-            assert!(matches!(
-                read.await.unwrap(),
-                Err(RegularFileError::NotRegular)
-            ));
+            let read = crate::tests::bounded(read_regular(&fifo, u64::MAX));
+            assert!(matches!(read.await, Err(RegularFileError::NotRegular)));
         }
     }
 

@@ -1,14 +1,13 @@
 use std::sync::Arc;
 
-use crate::tool::invocation::AdmissionError;
+use crate::tool::{authorization::AuthorizationError, invocation::AdmissionError};
 use serde_json::Value;
 use tokio::sync::{Mutex, mpsc};
 
 use crate::{
     execution::ExecutionLocation,
     identity::{AgentId, JobId},
-    media::ImageRef,
-    tool::policy::{CapabilitySet, PermissionUse},
+    tool::policy::CapabilitySet,
 };
 
 #[derive(Clone)]
@@ -16,7 +15,7 @@ enum Authority {
     Invocation {
         coordinator: super::authorization::AuthorizationCoordinator,
         tool: String,
-        arguments: Value,
+        arguments: Arc<super::authorization::AuthorizationArguments>,
     },
     UnavailableForResume,
 }
@@ -75,12 +74,12 @@ impl ToolContext {
         mut self,
         coordinator: super::authorization::AuthorizationCoordinator,
         tool: String,
-        arguments: Value,
+        arguments: super::authorization::AuthorizationArguments,
     ) -> Self {
         self.authority = Authority::Invocation {
             coordinator,
             tool,
-            arguments,
+            arguments: Arc::new(arguments),
         };
         self
     }
@@ -126,43 +125,29 @@ impl ToolContext {
     pub(crate) fn invocation_subject(
         &self,
     ) -> Result<&super::authorization::AuthorizationSubject, ToolError> {
-        self.invocation().map(|_| &self.subject).map_err(Into::into)
-    }
-
-    /// The invocation authority's coordinator, tool name and admitted arguments.
-    fn invocation(
-        &self,
-    ) -> Result<
-        (
-            &super::authorization::AuthorizationCoordinator,
-            &str,
-            &Value,
-        ),
-        AdmissionError,
-    > {
-        match &self.authority {
-            Authority::Invocation {
-                coordinator,
-                tool,
-                arguments,
-            } => Ok((coordinator, tool, arguments)),
-            Authority::UnavailableForResume => Err(AdmissionError::denied(
-                "runtime authorization is unavailable",
-            )),
+        match self.authority {
+            Authority::Invocation { .. } => Ok(&self.subject),
+            Authority::UnavailableForResume => Err(AdmissionError::from(unavailable()).into()),
         }
     }
 
-    /// Authorize an additional operation under this invocation's capabilities.
+    /// Authorize further permissions under this invocation's capabilities and
+    /// authorization arguments, naming the origin a running request moved to.
     pub(crate) async fn authorize(
         &self,
-        permissions: Vec<PermissionUse>,
-        arguments: Value,
-    ) -> Result<(), AdmissionError> {
-        let (coordinator, tool, _) = self.invocation()?;
-        coordinator
-            .authorize(&self.subject, tool.to_owned(), permissions, arguments)
-            .await
-            .map_err(AdmissionError::from)
+        permissions: Vec<super::policy::PermissionUse>,
+        network_origin: Option<String>,
+    ) -> Result<(), AuthorizationError> {
+        let Authority::Invocation {
+            coordinator,
+            tool,
+            arguments,
+        } = &self.authority
+        else {
+            return Err(unavailable());
+        };
+        let arguments = arguments.document(network_origin.as_deref());
+        (coordinator.authorize(&self.subject, tool.clone(), permissions, arguments)).await
     }
 
     #[must_use]
@@ -216,10 +201,12 @@ impl ToolContext {
         field: crate::job::output::TextCaptureField,
     ) -> Result<crate::job::output::PendingCapture, ToolError> {
         let (field, kind) = (field.pointer(), crate::job::output::CaptureKind::Text);
-        self.jobs
-            .pending_capture(self.job(), field, kind, true)
-            .await
+        self.jobs.pending_capture(self.job(), field, kind).await
     }
+}
+
+fn unavailable() -> AuthorizationError {
+    AuthorizationError::Denied("runtime authorization is unavailable".to_owned())
 }
 
 /// Whether a producer's streams ran to their end; a timeout cuts them short.
@@ -231,63 +218,12 @@ pub(crate) enum StreamEnd {
     Cut,
 }
 
-#[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
-pub struct ToolOutput {
-    pub value: Value,
-    pub images: Vec<ImageRef>,
-    /// Producer-owned fields, consumed by the job finalizer. Wire/replay values
-    /// cannot deserialize completion evidence or substitute arbitrary files.
-    #[serde(skip)]
-    pub(crate) captures: Vec<crate::job::output::CompletedCapture>,
-    #[serde(skip)]
-    pub(crate) streams: StreamEnd,
-    #[serde(skip)]
-    pub(crate) diagnostic: Option<crate::tool::diagnostic::PartialDiagnostic>,
-}
-
-impl ToolOutput {
-    #[must_use]
-    pub const fn new(value: Value) -> Self {
-        Self {
-            value,
-            images: Vec::new(),
-            captures: Vec::new(),
-            streams: StreamEnd::Finished,
-            diagnostic: None,
-        }
-    }
-
-    /// Register the builtin read result's error-message slot for presentation.
-    pub(crate) fn with_diagnostic(
-        mut self,
-        diagnostic: crate::tool::diagnostic::PartialDiagnostic,
-    ) -> Self {
-        self.diagnostic = Some(diagnostic);
-        self
-    }
-
-    pub(crate) fn with_captures(
-        mut self,
-        captures: Vec<crate::job::output::CompletedCapture>,
-    ) -> Self {
-        self.captures = captures;
-        self
-    }
-
-    pub(crate) fn take_captures(&mut self) -> Vec<crate::job::output::CompletedCapture> {
-        std::mem::take(&mut self.captures)
-    }
-
-    #[must_use]
-    pub fn with_images(mut self, images: Vec<ImageRef>) -> Self {
-        self.images = images;
-        self
-    }
-}
+/// Output the session host holds, its captures imported into the job.
+pub type ToolOutput = crate::tool::output::Output<crate::job::output::CompletedCapture>;
 
 crate::named_enum::named_enum! {
     #[derive(
-        Clone, Copy, Debug, serde::Deserialize, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
+        Clone, Copy, Debug, serde::Serialize, schemars::JsonSchema, PartialEq, Eq,
     )]
     pub enum DenialCode {
         PermissionDenied = "permission_denied",

@@ -97,10 +97,15 @@ impl<O> OperationError<O> {
     pub fn denied(reason: impl Into<String>) -> Self {
         Self::cause(Cause::Denied(reason.into()))
     }
-    /// The tool needs a capability this context lacks: it is unavailable here,
-    /// which is not a policy denial.
     pub(crate) fn unavailable(tool: &str) -> Self {
-        Self::failed(format!("tool `{tool}` is unavailable in this context"))
+        Self::cause(Cause::Unavailable {
+            tool: tool.to_owned(),
+        })
+    }
+    pub(crate) fn unknown_tool(tool: &str) -> Self {
+        Self::cause(Cause::UnknownTool {
+            tool: tool.to_owned(),
+        })
     }
     pub fn invalid_arguments(message: impl std::fmt::Display) -> Self {
         Self::cause(Cause::InvalidArguments(safe_text(&message.to_string())))
@@ -243,37 +248,30 @@ pub(crate) type LocalError = OperationError<super::output::ProducedOutput>;
 
 use super::output::{
     CaptureKind, FieldPointer, OutputContext, PendingOutput, ProducedOutput, TextCaptureField,
+    or_fallback,
 };
 use crate::{
     execution::ExecutionLocation,
     tool::{
+        authorization::Reauthorization,
         policy::{Capability, CapabilitySet, PathText, PermissionUse, ResourceId},
-        registry::{Catalog, CatalogBuilder, CatalogEntry, OutputValue, PathArgument},
+        registry::{
+            AgentLevel, Catalog, CatalogBuilder, CatalogEntry, OutputValue, PathArgument, PathKind,
+            PathScope,
+        },
     },
 };
 use futures_util::future::BoxFuture;
 use serde_json::Value;
-use std::{path::Path, sync::Arc, time::Duration};
+use std::{path::Path, sync::Arc};
 
-pub(crate) const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
 pub(crate) type LocalCatalogBuilder = CatalogBuilder<LocalContext, ProducedOutput>;
 pub(crate) type LocalCatalog = Catalog<LocalContext, ProducedOutput>;
 
-impl OutputValue for ProducedOutput {
-    fn from_value(value: Value) -> Self {
-        Self::new(value)
-    }
-    fn with_diagnostic(self, diagnostic: PartialDiagnostic) -> Self {
-        self.with_diagnostic(diagnostic)
-    }
-}
-
 pub(crate) trait LocalAuthorizer: Send + Sync {
-    fn authorize(
-        &self,
-        permissions: Vec<PermissionUse>,
-        arguments: Value,
-    ) -> BoxFuture<'static, Result<(), AdmissionError>>;
+    /// Authorize under the invocation's own authorization arguments.
+    fn authorize(&self, request: Reauthorization)
+    -> BoxFuture<'static, Result<(), AdmissionError>>;
 }
 
 #[derive(Clone)]
@@ -284,7 +282,6 @@ pub(crate) struct LocalContext {
     cancellation: tokio_util::sync::CancellationToken,
     output: OutputContext,
     authorizer: Arc<dyn LocalAuthorizer>,
-    arguments: Arc<Value>,
     source: Option<crate::tool::source::Source>,
 }
 
@@ -296,7 +293,6 @@ impl LocalContext {
         cancellation: tokio_util::sync::CancellationToken,
         output: OutputContext,
         authorizer: Arc<dyn LocalAuthorizer>,
-        arguments: Value,
     ) -> Self {
         Self {
             location,
@@ -305,7 +301,6 @@ impl LocalContext {
             cancellation,
             output,
             authorizer,
-            arguments: Arc::new(arguments),
             source: None,
         }
     }
@@ -321,11 +316,6 @@ impl LocalContext {
         self.source
             .as_ref()
             .ok_or_else(|| LocalError::failed("source was not opened"))
-    }
-
-    pub(crate) fn with_arguments(mut self, arguments: Value) -> Self {
-        self.arguments = Arc::new(arguments);
-        self
     }
 
     pub(crate) fn capabilities(&self) -> &CapabilitySet {
@@ -369,33 +359,13 @@ impl LocalContext {
         &self,
         permissions: Vec<PermissionUse>,
     ) -> Result<(), LocalError> {
-        self.authorizer
-            .authorize(permissions, (*self.arguments).clone())
-            .await
-            .map_err(Into::into)
+        let request = Reauthorization::Permissions(permissions);
+        Ok(self.authorizer.authorize(request).await?)
     }
 
-    pub(crate) async fn authorize_network(
-        &self,
-        normalized_origin: &str,
-    ) -> Result<(), LocalError> {
-        let mut arguments = (*self.arguments).clone();
-        if let Some(object) = arguments.as_object_mut() {
-            object.insert(
-                "network_origin".to_owned(),
-                Value::String(normalized_origin.to_owned()),
-            );
-        }
-        self.authorizer
-            .authorize(
-                vec![PermissionUse::new(
-                    Capability::Network,
-                    ResourceId::network(&self.location.target, normalized_origin),
-                )],
-                arguments,
-            )
-            .await
-            .map_err(Into::into)
+    pub(crate) async fn authorize_network(&self, origin: &str) -> Result<(), LocalError> {
+        let request = Reauthorization::Network(origin.to_owned());
+        Ok(self.authorizer.authorize(request).await?)
     }
 }
 
@@ -416,51 +386,42 @@ impl LocalCatalog {
         authorization_root: &Path,
     ) -> Result<ProducedOutput, LocalError> {
         let fallback = PartialContext::new(Operation::Execute, Subject::Tool(name.to_owned()));
-        self.run_admitted(name, arguments, context, authorization_root)
-            .await
-            .map(|mut output| {
-                output.diagnostic = output.diagnostic.map(|d| d.or(fallback.clone()));
-                output
-            })
-            .map_err(|error| error.or(fallback))
+        let result = self.run_admitted(name, arguments, context, authorization_root);
+        or_fallback(result.await, fallback)
     }
 
     async fn run_admitted(
         &self,
         name: &str,
-        mut arguments: Value,
+        arguments: Value,
         context: LocalContext,
         authorization_root: &Path,
     ) -> Result<ProducedOutput, LocalError> {
         let tool = self
             .get(name)
-            .ok_or_else(|| LocalError::invalid_arguments(format!("unknown tool `{name}`")))?;
-        let surface = self.surface(context.capabilities());
-        let spec = surface
-            .get(name)
+            .ok_or_else(|| LocalError::unknown_tool(name))?;
+        let spec = (tool.spec(context.capabilities(), AgentLevel::Root))
             .ok_or_else(|| LocalError::unavailable(name))?;
-        spec.validate_arguments(&arguments)?;
-        let original_arguments = arguments.clone();
-        let checked = tool.check_arguments(&context.location, &arguments)?;
+        let arguments = spec.validate_arguments(arguments)?;
+        let mut admitted = tool.admit(&arguments)?;
+        let derived = admitted.permissions(&context.location)?;
         let path = preflight_path_arguments(
             &tool,
-            checked.paths,
+            admitted.paths(),
             &context.location,
             authorization_root,
-            &mut arguments,
         )
         .await?;
         let permissions = assemble_permissions(
             &tool,
             &context.location,
             &context.capabilities,
-            checked.permissions,
+            derived,
             &path,
             false,
         )?;
-        context
-            .authorizer
-            .authorize(permissions, original_arguments.clone())
+        (context.authorizer)
+            .authorize(Reauthorization::Permissions(permissions))
             .await?;
         if context.is_cancelled() {
             return Err(LocalError::cancelled());
@@ -468,14 +429,8 @@ impl LocalCatalog {
         match path.outcome {
             PathOutcome::Ready => {
                 let fallback = PartialContext::default().paths(path.paths);
-                tool.admit(arguments, &original_arguments)?
-                    .call(context.with_arguments(original_arguments))
-                    .await
-                    .map(|mut output| {
-                        output.diagnostic = output.diagnostic.map(|d| d.or(fallback.clone()));
-                        output
-                    })
-                    .map_err(|error| error.or(fallback))
+                let result = tool.invoke(admitted).call(context);
+                or_fallback(result.await, fallback)
             }
             PathOutcome::ReadError { value, diagnostic } => {
                 Ok(ProducedOutput::new(value).with_diagnostic(*diagnostic))
@@ -516,12 +471,7 @@ pub(crate) fn assemble_permissions<C: Send + 'static, O: OutputValue>(
         return Err(AdmissionError::unavailable(tool.name()));
     }
     if forwarded {
-        permissions.retain(|permission| {
-            !matches!(
-                permission.resource,
-                ResourceId::Path { .. } | ResourceId::Network { .. }
-            )
-        });
+        permissions.retain(|permission| !permission.resource.resolved_at_destination());
     }
     Ok(permissions)
 }
@@ -532,6 +482,17 @@ pub(crate) struct PathPreflight {
     pub(crate) paths: Vec<PathFact>,
 }
 
+impl PathPreflight {
+    /// Nothing resolved here: the call's paths are resolved where it runs.
+    pub(crate) const fn deferred() -> Self {
+        Self {
+            permissions: Vec::new(),
+            outcome: PathOutcome::Ready,
+            paths: Vec::new(),
+        }
+    }
+}
+
 pub(crate) enum PathOutcome {
     Ready,
     ReadError {
@@ -540,31 +501,22 @@ pub(crate) enum PathOutcome {
     },
 }
 
-use crate::tool::builtins::workspace::{lexical_path, resolve_for_authorization};
+use crate::tool::path::{lexical_path, resolve_for_authorization};
 
-/// Resolve each path argument where the invocation runs and rewrite it to its
-/// resolved spelling. A top-level path needs permission outside the
-/// authorization root; a nested one always does.
+/// Resolve each path argument where the invocation runs and replace it with its
+/// resolved spelling.
 pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
     tool: &CatalogEntry<C, O>,
-    specs: Vec<PathArgument>,
+    arguments: Vec<PathArgument<'_>>,
     location: &ExecutionLocation,
     authorization_root: &Path,
-    arguments: &mut Value,
 ) -> Result<PathPreflight, AdmissionError> {
-    if !arguments.is_object() {
-        return Err(AdmissionError::arguments_must_be_object());
-    }
     let ExecutionLocation { target, workspace } = location;
-    let mut permissions = Vec::new();
-    let mut paths = Vec::new();
-    let mut outcome = PathOutcome::Ready;
-    for spec in specs {
-        let Some(input) = spec.input(arguments)?.map(str::to_owned) else {
-            continue;
-        };
-        let capability = spec.access.capability();
-        let resolved = match resolve_for_authorization(workspace, &input, spec.kind).await {
+    let mut preflight = PathPreflight::deferred();
+    for argument in arguments {
+        let input = argument.path.clone();
+        let capability = argument.access.capability();
+        let resolved = match resolve_for_authorization(workspace, &input, argument.kind).await {
             Ok(resolved) => resolved,
             Err(error) => {
                 // Preflight adds what it knows to the resolver's facts; nothing is
@@ -575,14 +527,14 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
                     .clone()
                     .at(FailureSite::Execution(location.clone()))
                     .path(PathRole::Requested, &input);
-                if spec.name() == "cwd" {
+                if argument.kind == PathKind::WorkingDirectory {
                     facts = facts
                         .subject(Subject::working_directory(lexical_path(workspace, &input)?))
                         .effects(Effects::NotStarted);
                 }
                 let error = error.context(facts);
                 let diagnostic = error.diagnostic();
-                let Some(output) = tool.read_error_output(&input, &diagnostic) else {
+                let Some(output) = tool.read_error_output(&diagnostic) else {
                     return Err(error);
                 };
                 // Canonicalization failed, so this path is not proven to be within
@@ -590,40 +542,34 @@ pub(crate) async fn preflight_path_arguments<C: Send + 'static, O: OutputValue>(
                 // apparently local paths, then return the captured failure without
                 // retrying the handler (which could now access a changed target).
                 let path = PathText::new(lexical_path(workspace, &input)?)?;
-                permissions.push(PermissionUse::exact(
+                preflight.permissions.push(PermissionUse::exact(
                     capability,
                     ResourceId::path(target, &path),
                 ));
-                outcome = PathOutcome::ReadError {
+                preflight.outcome = PathOutcome::ReadError {
                     value: output,
                     diagnostic: Box::new(error.into_facts().0),
                 };
                 continue;
             }
         };
-        spec.rewrite(arguments, Value::String(resolved.path.as_str().to_owned()))?;
-        paths.push(PathFact {
+        resolved.path.as_str().clone_into(argument.path);
+        preflight.paths.push(PathFact {
             role: PathRole::Requested,
             path: input.into(),
         });
-        paths.push(PathFact {
+        preflight.paths.push(PathFact {
             role: PathRole::Resolved,
             path: resolved.path.as_path().to_owned(),
         });
-        permissions.extend(match spec.binding {
-            crate::tool::registry::PathBinding::Pointer(_) => {
-                Some(resolved.permission(capability, target))
-            }
-            crate::tool::registry::PathBinding::TopLevel { .. } => {
+        preflight.permissions.extend(match argument.scope {
+            PathScope::Exact => Some(resolved.permission(capability, target)),
+            PathScope::Workspace => {
                 resolved.permission_outside(authorization_root, capability, target)
             }
         });
     }
-    Ok(PathPreflight {
-        permissions,
-        outcome,
-        paths,
-    })
+    Ok(preflight)
 }
 
 /// Scope capabilities to `resource`, or else the workspace, which is spelled
@@ -687,16 +633,65 @@ pub(crate) mod tests {
     }
 
     #[derive(Default)]
-    pub(crate) struct Authorizations(Mutex<Vec<Vec<PermissionUse>>>);
+    pub(crate) struct Authorizations(Mutex<Vec<Reauthorization>>);
 
     impl LocalAuthorizer for Authorizations {
         fn authorize(
             &self,
-            permissions: Vec<PermissionUse>,
-            _: Value,
+            request: Reauthorization,
         ) -> BoxFuture<'static, Result<(), AdmissionError>> {
-            self.0.lock().unwrap().push(permissions);
+            self.0.lock().unwrap().push(request);
             Box::pin(async { Ok(()) })
+        }
+    }
+
+    /// Only a declared working directory fails as one; a path argument that is
+    /// merely named `cwd` keeps its resolver's facts.
+    #[tokio::test]
+    async fn only_a_declared_working_directory_fails_as_one() {
+        use crate::tool::{ToolOptions, policy::PathAccess};
+        let root = tempfile::tempdir().unwrap();
+        let mut builder = LocalCatalogBuilder::default();
+        crate::tool::builtins::register_local_tools(&mut builder).unwrap();
+        let options = ToolOptions::default().argument_paths(|arguments: &mut Value| {
+            let Some(Value::String(cwd)) = arguments.get_mut("cwd") else {
+                return Vec::new();
+            };
+            vec![PathArgument::new(cwd, PathAccess::Read, PathKind::Existing)]
+        });
+        builder
+            .register_dynamic(
+                "named_cwd",
+                "",
+                serde_json::json!({"type":"object"}),
+                options,
+                |_, _| async { Ok(ProducedOutput::new(Value::Null)) },
+            )
+            .unwrap();
+        let catalog = builder.build();
+        let context = LocalContext::new(
+            ExecutionLocation::root(root.path().to_owned()),
+            CapabilitySet::default(),
+            Default::default(),
+            tokio_util::sync::CancellationToken::new(),
+            OutputContext::new(Arc::new(CapturedOutput::default())),
+            Arc::new(Authorizations::default()),
+        );
+        let missing = root.path().join("missing");
+        for (tool, subject, effects) in [
+            (
+                "exec",
+                Subject::working_directory(&missing),
+                Effects::NotStarted,
+            ),
+            ("named_cwd", Subject::path(&missing), Effects::Unknown),
+        ] {
+            let arguments = serde_json::json!({"command":["true"], "cwd":"missing"});
+            let error = (catalog.run(tool, arguments, context.clone(), root.path()))
+                .await
+                .unwrap_err();
+            let facts = error.diagnostic().context;
+            assert_eq!((facts.subject, facts.effects), (subject, effects), "{tool}");
         }
     }
 
@@ -713,7 +708,6 @@ pub(crate) mod tests {
             tokio_util::sync::CancellationToken::new(),
             output.clone(),
             authorizations.clone(),
-            serde_json::json!({"path":"missing"}),
         );
         let missing = catalog
             .run(
@@ -739,10 +733,12 @@ pub(crate) mod tests {
             fact.role == PathRole::Requested && fact.path == std::path::Path::new("missing")
         }));
         {
-            let permissions = authorizations.0.lock().unwrap();
-            assert_eq!(permissions.len(), 1);
+            let requests = authorizations.0.lock().unwrap();
+            let [Reauthorization::Permissions(permissions)] = &requests[..] else {
+                panic!("one admission: {requests:?}");
+            };
             assert!(
-                permissions[0]
+                permissions
                     .iter()
                     .any(|permission| matches!(permission.resource, ResourceId::Path { .. }))
             );
@@ -759,7 +755,9 @@ pub(crate) mod tests {
             .unwrap_err();
         assert_eq!(
             unavailable.diagnostic().cause,
-            LocalError::unavailable("write").diagnostic().cause
+            Cause::Unavailable {
+                tool: "write".into()
+            }
         );
         assert!(!root.path().join("missing").exists());
         assert_eq!(authorizations.0.lock().unwrap().len(), 1);

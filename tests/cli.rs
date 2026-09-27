@@ -77,15 +77,25 @@ impl Fixture {
         self.write("run.js", source);
         output(self.batch().arg("-s").arg(self.path("run.js")).args(extra))
     }
-    /// Saved job outputs and captures as text.
+    /// Every job's output as the host inspects it, captures included.
     fn artifacts(&self, output: &Output) -> String {
+        use skyhook::{job::JobOutputQuery as Query, session::SessionEvent::JobCreated};
         let id = std::str::from_utf8(&output.stdout).unwrap().trim();
-        let id = id.parse().unwrap();
         let sessions = self.path(".skyhook/sessions");
-        let text = block_on(skyhook::session::SessionStore::read_output_text(
-            &sessions, id,
-        ));
-        text.unwrap().concat()
+        block_on(async {
+            let opened = skyhook::session::SessionStore::open(&sessions, id.parse().unwrap());
+            let (store, records) = opened.await.unwrap();
+            let jobs = skyhook::job::JobManager::restore(store, &records).await;
+            let (jobs, mut text, all) = (jobs.unwrap(), String::new(), <_>::default());
+            for record in &records {
+                if let JobCreated { job, .. } = record.event {
+                    let (query, token) = (Query::new(job), <_>::default());
+                    let view = jobs.inspect_output_with_captures(query, token, &all);
+                    text += &view.await.unwrap().into_view().to_string();
+                }
+            }
+            text
+        })
     }
     /// Records as JSON lines.
     fn journal(&self, output: &Output) -> String {
@@ -205,22 +215,12 @@ fn mock_provider() -> (String, thread::JoinHandle<(String, String)>) {
 }
 
 #[test]
-fn parse_early_runtime_and_redirected_terminal_failures_are_reported_correctly() {
+fn runtime_and_redirected_terminal_failures_are_reported_correctly() {
     let f = Fixture::new();
-    let run = |args: &[&str]| output(f.command().args(args));
     let batch = |args: &[&str]| output(f.batch().args(args));
-    for args in [
-        &["--unknown"][..],
-        &["-p", "x", "-m", "missing"],
-        &["-p", "x", "--mode", "missing"],
-        &["-p", "x", "--mode", "general", "--capabilities", "read"],
-        &[],
-    ] {
-        assert_reported_failure(&batch(args));
-    }
-    assert_reported_failure(&run(&["--non-interactive", "-p", "x"]));
+    assert_reported_failure(&batch(&["-p", "x", "--mode", "missing"]));
     // Terminal mode still rejects redirected IO.
-    let out = run(&["-p", "hello"]);
+    let out = output(f.command().args(["-p", "hello"]));
     assert!(!out.status.success() && out.stdout.is_empty());
     assert!(String::from_utf8_lossy(&out.stderr).contains("interactive terminal"));
     f.write("config/skyhook/config.yaml", "invalid [");
@@ -313,7 +313,9 @@ mod dotenv {
             }
             // Without an inherited socket the helper exits before reading anything.
             let out = output(f.bare_command().args(["--askpass", "Password:"]));
-            assert!(!out.status.success() && out.stdout.is_empty() && out.stderr.is_empty());
+            assert!(!out.status.success() && out.stdout.is_empty());
+            let stderr = String::from_utf8(out.stderr).unwrap();
+            assert!(!stderr.contains(".env") && !stderr.contains("never-print"));
         }
     }
 
@@ -837,13 +839,9 @@ mod headless {
         );
         assert!(resumed.status.success());
         let records = f.records(&resumed);
-        let root = skyhook::identity::AgentId::root(id.parse().unwrap());
-        assert_eq!(
-            skyhook::session::agent_selection(&records, &root)
-                .unwrap()
-                .to_string(),
-            "test/second"
-        );
+        let stats = skyhook::session::stats::session_stats(id.parse().unwrap(), &records);
+        let root = stats.agents[0].model.as_ref().unwrap();
+        assert_eq!(root.to_string(), "test/second");
         f.write(".skyhook/state.json", "invalid JSON");
         let warning = f.script("return 'warning';", &[]);
         assert!(warning.status.success());

@@ -29,8 +29,9 @@ pub(super) fn client(settings: &ClientSettings) -> Result<Client, FetchError> {
         .redirect(reqwest::redirect::Policy::none())
         .retry(reqwest::retry::never())
         .dns_resolver(std::sync::Arc::new(FetchResolver))
+        // The tool's outer deadline is the only total limit: an equal client
+        // timeout would race it and could report the timeout without its limit.
         .connect_timeout(settings.connect_timeout)
-        .timeout(settings.timeout)
         .danger_accept_invalid_certs(settings.insecure);
     // Proxy admission belongs here (before any send), preserving the existing
     // client-preparation diagnostic and permission-order contract. Proxy schemes
@@ -47,20 +48,20 @@ pub(super) fn client(settings: &ClientSettings) -> Result<Client, FetchError> {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Duration};
+    use std::sync::Arc;
 
-    use super::super::tests::{executor, fetch, read_request, response, server};
+    use super::super::tests::{executor, fetch, server};
+    use crate::provider::http::transport::tests::{read_request, reply};
     use rcgen::generate_simple_self_signed;
     use serde_json::json;
-    use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle, time::timeout};
+    use tokio::{io::AsyncWriteExt, net::TcpListener, task::JoinHandle};
     use tokio_rustls::{
         TlsAcceptor,
         rustls::{ServerConfig, crypto::ring, pki_types::PrivatePkcs8KeyDer},
     };
 
-    use crate::tests::TestRuntime;
+    use crate::tests::{TestRuntime, bounded};
 
-    const LIMIT: Duration = Duration::from_secs(15);
     const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: 6\r\nConnection: close\r\n\r\ntls-ok";
 
     /// Serves `connections` TLS accepts; returns (rejected handshakes, requests).
@@ -93,23 +94,19 @@ mod tests {
         let task = tokio::spawn(async move {
             let (mut rejected, mut requests) = (0, Vec::new());
             for _ in 0..connections {
-                let accepted = timeout(LIMIT, listener.accept()).await;
-                let (socket, _) = accepted
-                    .expect("fetch did not connect to the local TLS server")
-                    .unwrap();
-                let handshake = timeout(LIMIT, acceptor.accept(socket)).await;
-                let Ok(mut stream) = handshake.expect("TLS handshake did not finish") else {
+                let (socket, _) = bounded(listener.accept()).await.unwrap();
+                let Ok(mut stream) = bounded(acceptor.accept(socket)).await else {
                     rejected += 1;
                     continue;
                 };
-                let request = timeout(LIMIT, async {
+                let request = bounded(async {
                     let request = read_request(&mut stream).await;
                     stream.write_all(RESPONSE).await.unwrap();
                     stream.flush().await.unwrap();
                     let _ = stream.shutdown().await;
                     request
                 });
-                requests.push(request.await.expect("local HTTPS request did not finish"));
+                requests.push(request.await);
             }
             (rejected, requests)
         });
@@ -124,31 +121,23 @@ mod tests {
         // Reuse one executor and one HTTPS origin throughout. Both strict forms are
         // tested before AND after the opt-out, catching a shared permissive client.
         for insecure in [None, Some(false), Some(true), Some(false), None] {
-            let mut arguments = json!({"url":url, "timeout":5, "connect_timeout":5});
+            let mut arguments = json!({"url":url});
             if let Some(insecure) = insecure {
                 arguments["insecure"] = json!(insecure);
             }
-            let output = timeout(
-                LIMIT,
-                executor.run_model(&runtime.agent, "fetch", arguments),
-            );
-            let output = output
+            let output = bounded(executor.run_model(&runtime.agent, "fetch", arguments))
                 .await
-                .expect("registered fetch did not finish")
                 .unwrap()
                 .output
                 .value;
             if insecure == Some(true) {
-                assert_eq!(output["state"], "completed", "{output:#}");
+                assert_eq!(output.get("state"), None, "{output:#}");
                 assert_eq!(output["result"]["body"]["text"], "tls-ok", "{output:#}");
             } else {
                 assert_eq!(output["state"], "failed", "{output:#}");
             }
         }
-        let finished = timeout(LIMIT, &mut server.0)
-            .await
-            .expect("local TLS server did not finish");
-        let (rejected, requests) = finished.expect("local TLS server failed");
+        let (rejected, requests) = bounded(&mut server.0).await.unwrap();
         assert_eq!((rejected, requests.len()), (4, 1), "{requests:#?}");
         assert!(requests[0].starts_with("GET /tls HTTP/1.1\r\n"));
     }
@@ -157,7 +146,7 @@ mod tests {
     async fn default_user_agent_can_be_overridden() {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
-        let (url, task) = server(vec![response("200 OK", "", ""); 3]).await;
+        let (url, task) = server(vec![reply("200 OK", "", ""); 3]).await;
         let default = concat!("Skyhook/", env!("CARGO_PKG_VERSION"));
         let cases = [
             (json!({}), default),
@@ -169,7 +158,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        for (request, (_, expected)) in task.await.unwrap().iter().zip(cases) {
+        for (request, (_, expected)) in task.finish().await.iter().zip(cases) {
             let head = request.split("\r\n\r\n").next().unwrap();
             let values: Vec<_> = head
                 .lines()

@@ -1,6 +1,10 @@
 //! Syntax-only CLI admission. Paths and inputs remain unread until their host starts.
 use clap::{Parser, Subcommand, ValueEnum};
-use skyhook::{identity::SessionId, provider::profile::ModelRef, tool::policy::Capability};
+use skyhook::{
+    identity::SessionId,
+    provider::profile::ModelRef,
+    tool::policy::{Capability, ModeName},
+};
 use std::path::PathBuf;
 
 /// Session options belong to session execution only: a subcommand takes just its own.
@@ -19,7 +23,7 @@ struct Args {
     session: SessionArgs,
     /// Start the new session prompt in this mode instead of the default.
     #[arg(long, value_name = "NAME")]
-    mode: Option<String>,
+    mode: Option<ModeName>,
 }
 
 /// What a session runs with, in the terminal or as a batch job.
@@ -97,7 +101,7 @@ enum Command {
         session: SessionArgs,
         /// Run in this mode instead of the default.
         #[arg(long, value_name = "NAME", conflicts_with = "capabilities")]
-        mode: Option<String>,
+        mode: Option<ModeName>,
         /// Exact comma-separated policy capabilities, instead of a mode.
         #[arg(long, value_name = "LIST", value_parser = parse_capabilities)]
         capabilities: Option<Capabilities>,
@@ -175,16 +179,22 @@ pub(super) enum Inspection {
     Skills(PathBuf),
 }
 
+/// What `stats` reports on.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum StatsTarget {
+    /// The workspace's sessions with their totals.
+    List,
+    Session(SessionId, Option<StatsFormat>),
+}
+
 pub(super) struct StatsRequest {
-    /// None lists the workspace's sessions.
-    pub(super) session: Option<SessionId>,
+    pub(super) target: StatsTarget,
     pub(super) workspace: PathBuf,
-    pub(super) format: Option<StatsFormat>,
 }
 
 /// A configured mode (the default when unnamed), or a batch job's exact capabilities.
 pub(super) enum PermissionArgs {
-    Mode(Option<String>),
+    Mode(Option<ModeName>),
     Exact(Vec<Capability>),
 }
 
@@ -203,7 +213,7 @@ pub(super) struct BatchRequest {
 /// the resumed session still knows.
 pub(super) struct InteractiveRequest {
     pub(super) execution: ExecutionRequest,
-    pub(super) mode: Option<String>,
+    pub(super) mode: Option<ModeName>,
 }
 
 /// Only paths are admitted here: in particular headless input I/O must remain
@@ -237,8 +247,8 @@ impl TryFrom<Args> for Invocation {
     type Error = clap::Error;
 
     fn try_from(args: Args) -> Result<Self, Self::Error> {
-        // Clap enforces the external grammar; only the supplemental conflict
-        // that it cannot express is checked here.
+        // Clap enforces the external grammar; only the supplemental conflicts
+        // that it cannot express are checked here.
         match args.command {
             Some(Command::Auth { command }) => return Ok(Self::Auth(command)),
             Some(Command::Dump {
@@ -262,17 +272,22 @@ impl TryFrom<Args> for Invocation {
                 workspace,
                 format,
             }) => {
-                return Ok(Self::Stats(StatsRequest {
-                    session,
-                    workspace,
-                    format,
-                }));
+                let target = match session {
+                    Some(session) => StatsTarget::Session(session, format),
+                    None => StatsTarget::List,
+                };
+                return Ok(Self::Stats(StatsRequest { target, workspace }));
             }
             Some(Command::Batch {
                 session,
                 mode,
                 capabilities,
             }) => {
+                if session.resume.is_some() && mode.is_some() && session.script.is_some() {
+                    return Err(conflict(
+                        "--mode changes a resumed session with its next prompt; a script has none",
+                    ));
+                }
                 let permissions = match capabilities {
                     Some(Capabilities(capabilities)) => PermissionArgs::Exact(capabilities),
                     None => PermissionArgs::Mode(mode),
@@ -325,6 +340,8 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    const ID: &str = "00000000000000000000000000000001";
+
     fn parse(args: &[&str]) -> Option<Args> {
         Args::try_parse_from(std::iter::once(&"skyhook").chain(args)).ok()
     }
@@ -372,6 +389,8 @@ mod tests {
             (&["--capabilities", "read"], false),
             (&["--mode", "readonly", "-p", "hello"], true),
             (&["--mode", "readonly", "batch", "-p", "hello"], false),
+            (&["batch", "--resume", ID, "--mode", "m", "-s", "x"], false),
+            (&["batch", "--resume", ID, "--mode", "m", "-p", "x"], true),
         ] {
             let parsed = parse_from(std::iter::once(&"skyhook").chain(args));
             assert_eq!(parsed.is_ok(), valid, "{args:?}");
@@ -391,7 +410,7 @@ mod tests {
         ));
         assert!(matches!(
             permissions(&["batch", "-p", "x", "--mode", "m"]),
-            PermissionArgs::Mode(Some(mode)) if mode == "m"
+            PermissionArgs::Mode(Some(mode)) if mode.as_str() == "m"
         ));
         assert!(matches!(
             permissions(&["batch", "-s", "x"]),
@@ -399,7 +418,7 @@ mod tests {
         ));
         assert!(matches!(
             parse_from(["skyhook", "--mode", "m"]),
-            Ok(Invocation::Interactive(request, _)) if request.mode.as_deref() == Some("m")
+            Ok(Invocation::Interactive(request, _)) if request.mode.as_ref().is_some_and(|mode| mode.as_str() == "m")
         ));
         // A model is named where it is given: an unqualified name says how.
         assert!(matches!(
@@ -434,7 +453,7 @@ mod tests {
             &["--prompt", "hello"][..],
             &["--script", "run.js"],
             &["--model", "local/first"],
-            &["--resume", "00000000000000000000000000000001"],
+            &["--resume", ID],
             &["auth", "status"],
         ] {
             assert!(parse(&[&["dump", "config"], extra].concat()).is_none());
@@ -454,34 +473,33 @@ mod tests {
         );
         let skills = parse(&["dump", "skills", "--config", "other.yaml"]).unwrap();
         assert!(Invocation::try_from(skills).is_err());
-        let id = "00000000000000000000000000000001";
         let stats = |args: &[&str]| match parse_from([&["skyhook", "stats"], args].concat()) {
             Ok(Invocation::Stats(request)) => request,
             _ => panic!("stats invocation"),
         };
-        let request = stats(&[id]);
-        assert_eq!(request.session.unwrap().to_string(), id);
+        let session = |format| StatsTarget::Session(ID.parse().unwrap(), format);
+        let request = stats(&[ID]);
+        assert_eq!(request.target, session(None));
         assert_eq!(request.workspace, Path::new("."));
-        assert_eq!(request.format, None);
-        let request = stats(&[id, "-w", "w", "-f", "json"]);
+        let request = stats(&[ID, "-w", "w", "-f", "json"]);
         assert_eq!(request.workspace, Path::new("w"));
-        assert_eq!(request.format, Some(StatsFormat::Json));
+        assert_eq!(request.target, session(Some(StatsFormat::Json)));
         assert_eq!(
-            stats(&["--format", "tree", id]).format,
-            Some(StatsFormat::Tree)
+            stats(&["--format", "tree", ID]).target,
+            session(Some(StatsFormat::Tree))
         );
         assert_eq!(
-            stats(&[id, "--format", "markdown"]).format,
-            Some(StatsFormat::Markdown)
+            stats(&[ID, "--format", "markdown"]).target,
+            session(Some(StatsFormat::Markdown))
         );
-        assert_eq!(stats(&["-l"]).session, None);
+        assert_eq!(stats(&["-l"]).target, StatsTarget::List);
         for args in [
             &["stats"][..],
-            &["stats", id, "--list"],
+            &["stats", ID, "--list"],
             &["stats", "--list", "--format", "json"],
             &["stats", "not-an-id"],
-            &["stats", id, "--format", "csv"],
-            &["stats", id, "--config", "c.yaml"],
+            &["stats", ID, "--format", "csv"],
+            &["stats", ID, "--config", "c.yaml"],
         ] {
             assert!(parse(args).is_none(), "{args:?}");
         }

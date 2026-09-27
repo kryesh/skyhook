@@ -1,5 +1,6 @@
 //! Stable, bounded MCP registry names with catalog-wide collision avoidance.
 use super::super::manager::DiscoveredTool;
+use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_tool_name_char, is_valid_tool_name};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Prefer readable names. Allocate against the whole catalog before registration
@@ -13,12 +14,7 @@ pub(super) fn tool_names(
         .iter()
         .map(|item| format!("mcp_{}_{}", item.server, item.tool.name))
         .collect();
-    let safe = |name: &str| {
-        name.len() <= 64
-            && name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    };
+    let safe = |name: &str| is_valid_tool_name(name, MAX_TOOL_NAME_BYTES);
     let mut counts = BTreeMap::new();
     for name in &raw {
         *counts.entry(name.as_str()).or_insert(0_usize) += 1;
@@ -50,13 +46,7 @@ pub(super) fn tool_names(
         let hash = crate::sha256_hex(format!("{}:{server}{}:{tool}", server.len(), tool.len()));
         let readable: String = name
             .chars()
-            .map(|character| {
-                if character.is_ascii_alphanumeric() || matches!(character, '_' | '-') {
-                    character
-                } else {
-                    '_'
-                }
-            })
+            .map(|c| if is_tool_name_char(c) { c } else { '_' })
             .collect();
         for attempt in 0_usize.. {
             let suffix = if attempt == 0 {
@@ -64,7 +54,7 @@ pub(super) fn tool_names(
             } else {
                 format!("{}_{attempt}", &hash[..8])
             };
-            let prefix = &readable[..readable.len().min(64 - 1 - suffix.len())];
+            let prefix = &readable[..readable.len().min(MAX_TOOL_NAME_BYTES - 1 - suffix.len())];
             let candidate = format!("{prefix}_{suffix}");
             if !reserved.contains(candidate.as_str())
                 && !used.contains(&candidate)
@@ -103,7 +93,10 @@ mod tests {
             tool_name(&discovered("docs-v2", "Search")),
             "mcp_docs-v2_Search"
         );
-        assert_eq!(tool_name(&discovered("s", &"x".repeat(58))).len(), 64);
+        assert_eq!(
+            tool_name(&discovered("s", &"x".repeat(58))).len(),
+            MAX_TOOL_NAME_BYTES
+        );
         let long = "x".repeat(500);
         let identities = [
             ("a-b", "c"),
@@ -124,18 +117,14 @@ mod tests {
         assert_eq!(names.iter().collect::<BTreeSet<_>>().len(), names.len());
         for name in &names {
             assert!(name.starts_with("mcp_"));
-            assert!(name.len() <= 64);
-            assert!(
-                name.bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-            );
+            assert!(is_valid_tool_name(name, MAX_TOOL_NAME_BYTES));
         }
         // Both ambiguous identities receive suffixes, rather than first-one-wins.
         assert!(names[1].starts_with("mcp_a_b_c_"));
         assert!(names[2].starts_with("mcp_a_b_c_"));
         assert_ne!(names[1], names[2]);
-        assert_eq!(names[7].len(), 64);
-        assert_eq!(names[8].len(), 64);
+        assert_eq!(names[7].len(), MAX_TOOL_NAME_BYTES);
+        assert_eq!(names[8].len(), MAX_TOOL_NAME_BYTES);
         catalog.reverse();
         let mut reversed = tool_names(&catalog, |_| false);
         reversed.reverse();

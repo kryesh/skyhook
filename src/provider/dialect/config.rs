@@ -11,7 +11,7 @@ use crate::provider::{
     codec::{Codec, CodecName, EffortLevels},
     http::{
         Timeouts,
-        headers::{CommandValue, Role, Value},
+        headers::{CommandValue, Value, ValueField},
     },
     profile::{LimitsError, ModelName, ModelProfile},
 };
@@ -35,31 +35,6 @@ impl fmt::Debug for Sourced {
             Self::Literal(_) => f.write_str("Literal(..)"),
             Self::Env { env } => f.debug_struct("Env").field("name", env).finish(),
             Self::Command { .. } => f.write_str("Command(..)"),
-        }
-    }
-}
-
-/// The setting a configured value belongs to.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ValueField {
-    ApiKey,
-    Header(HeaderName),
-}
-
-impl fmt::Display for ValueField {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::ApiKey => f.write_str("api_key"),
-            Self::Header(name) => write!(f, "headers.{name}"),
-        }
-    }
-}
-
-impl ValueField {
-    fn role(&self) -> Role {
-        match self {
-            Self::ApiKey => Role::Credential,
-            Self::Header(_) => Role::Header,
         }
     }
 }
@@ -137,12 +112,11 @@ impl Source {
     /// values only when written literally in the file. Environment values are
     /// read once composition shows they are sent; commands stay lazy.
     pub(crate) fn header(&self, field: ValueField, prefix: Option<&'static str>) -> Pending {
-        let role = field.role();
         match self {
             Self::Literal(value) => Pending::Ready(Value::Fixed(prefixed(
                 prefix,
                 value,
-                role == Role::Credential,
+                field == ValueField::ApiKey,
             ))),
             Self::Env(name) => Pending::Env {
                 name: name.clone(),
@@ -152,7 +126,7 @@ impl Source {
             Self::Command(command) => Pending::Ready(Value::Command(CommandValue::new(
                 command.clone(),
                 prefix,
-                role,
+                field,
             ))),
         }
     }
@@ -243,8 +217,6 @@ impl<'de> Deserialize<'de> for ModelSpec {
 pub enum ModelError {
     #[error(transparent)]
     Limits(#[from] LimitsError),
-    #[error("hint must not be empty")]
-    EmptyHint,
     #[error("overrides: {0}")]
     Overrides(#[from] OverrideError),
     #[error(transparent)]
@@ -261,24 +233,14 @@ impl ModelSpec {
     /// must place every value apart and accept its reasoning level.
     pub(crate) fn admit(&self, conventions: &Codec) -> Result<Codec, ModelError> {
         self.profile.validate_limits()?;
-        if self
-            .profile
-            .hint
-            .as_deref()
-            .is_some_and(|hint| hint.trim().is_empty())
-        {
-            return Err(ModelError::EmptyHint);
-        }
         let codec = self.overrides.apply(conventions.clone())?;
         super::overrides::check(&codec)?;
         let levels = codec.effort().levels;
         if let Some(effort) = &self.profile.reasoning
             && !levels.accepts(effort)
         {
-            return Err(ModelError::Reasoning {
-                effort: effort.clone(),
-                levels,
-            });
+            let effort = effort.clone();
+            return Err(ModelError::Reasoning { effort, levels });
         }
         Ok(codec)
     }

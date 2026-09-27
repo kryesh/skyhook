@@ -10,13 +10,14 @@ use crate::{
     agent::ContextUsage,
     identity::AgentId,
     provider::{
-        Provider, ProviderContext,
+        ProviderContext,
         profile::StateMode,
-        protocol::{ContextId, HistoryLifetime, ModelRequest, Usage},
+        protocol::{ModelRequest, Usage},
     },
     session::{
-        EventRecord, Message, ModelRequestTemplate, ProfileSnapshot, Projection, RecordSeq,
-        SessionEvent, UserPart, project_history,
+        AttemptRef, EventRecord, Message, ModelPurpose, ModelRequestTemplate, ProfileSnapshot,
+        Projection, RecordSeq, RequestLedger, SessionEvent, UserPart, project_history,
+        render_history,
     },
 };
 
@@ -24,9 +25,13 @@ pub(super) struct AgentContext {
     /// The profile this context was opened for; a different selection reopens it.
     pub profile: ProfileSnapshot,
     pub template: ModelRequestTemplate,
+    /// The estimate of what `template` adds to every request.
+    pub template_tokens: u64,
     pub projected: Projection,
     pub meter: TokenMeter,
     pub provider: Box<dyn ProviderContext>,
+    /// The last request's blobs, which the next request reuses.
+    pub blobs: crate::media::LoadedBlobs,
     /// Pinned tools the live registry no longer provides as journaled.
     pub unavailable_tools: std::sync::Arc<std::collections::HashSet<String>>,
     /// The last journal sequence reflected in `projected`.
@@ -42,35 +47,29 @@ impl AgentContext {
         agent: &AgentId,
         profile: ProfileSnapshot,
         template: ModelRequestTemplate,
-        factory: &dyn Provider,
+        provider: Box<dyn ProviderContext>,
         records: &[EventRecord],
-        restore_meter: bool,
-    ) -> Result<Self, HarnessError> {
+    ) -> Self {
         let projected = project_history(records, agent);
-        let provider = factory.open_context(ContextId::from(agent))?;
-        let meter = if restore_meter {
-            TokenMeter::restore(records, agent)
-        } else {
-            TokenMeter::default()
-        };
-        Ok(Self {
+        Self {
             profile,
+            template_tokens: super::compaction::estimate_request(&template.to_request()),
             template,
             prefix: history_prefix(&projected.messages, records, agent),
             projected,
-            meter,
+            meter: TokenMeter::default(),
             provider,
+            blobs: Default::default(),
             unavailable_tools: Default::default(),
             through: records
                 .last()
                 .map_or(RecordSeq::default(), |record| record.sequence),
             skipped_at: None,
-        })
+        }
     }
 
-    /// The journal remains authoritative, including compactions committed externally.
-    /// Only records committed since the last refresh are visited, unless one of them
-    /// replaces this agent's history.
+    /// Project what the journal committed since the last refresh, from any producer.
+    /// A compaction among it replaces this agent's history, so all is re-projected.
     pub async fn refresh(
         &mut self,
         store: &crate::session::SessionStore,
@@ -92,26 +91,19 @@ impl AgentContext {
             })
             .await;
         if compacted {
-            let records = store.records().await;
-            self.projected = project_history(&records, agent);
-            self.prefix = history_prefix(&self.projected.messages, &records, agent);
+            let reproject = |records: &[EventRecord]| {
+                self.projected = project_history(records, agent);
+                self.prefix = history_prefix(&self.projected.messages, records, agent);
+                self.through = records.last().map_or(through, |record| record.sequence);
+            };
+            store
+                .visit_records_after(RecordSeq::default(), reproject)
+                .await;
             self.skipped_at = None;
-            self.through = records
-                .last()
-                .map_or(RecordSeq::default(), |record| record.sequence);
             return Ok(());
         }
-        // The turn pushes its own commits as it makes them; other producers'
-        // commits interleave, so later history is kept in journal order.
-        let suffix = &self.projected.messages[self.prefix..];
-        let known: std::collections::HashSet<_> =
-            suffix.iter().map(|(sequence, _)| *sequence).collect();
-        let unseen = committed
-            .into_iter()
-            .filter(|(sequence, _)| !known.contains(sequence));
-        self.projected.messages.extend(unseen);
-        self.projected.messages[self.prefix..].sort_by_key(|(sequence, _)| *sequence);
         self.through = through;
+        self.projected.messages.extend(committed);
         Ok(())
     }
 
@@ -127,7 +119,7 @@ impl AgentContext {
     /// The next request as the provider receives it: projected history, then the tail.
     pub fn request(&self, tail: Option<&Message>) -> ModelRequest {
         ModelRequest {
-            history: crate::session::render_history(self.projected.history()),
+            history: render_history(self.projected.history()),
             tail: tail.map(Message::render).into_iter().collect(),
             ..self.template.to_request()
         }
@@ -140,7 +132,8 @@ impl AgentContext {
         // A summary that could not shrink this context is not worth repeating until
         // there is another retained tail's worth of history to fold into it.
         let grown = self.skipped_at.is_none_or(|skipped| {
-            tokens >= skipped.saturating_add(retention_budget(self.profile.profile.max_context))
+            tokens
+                >= skipped.saturating_add(retention_budget(self.profile.profile.max_context.get()))
         });
         grown && self.reaches_compaction(tokens)
     }
@@ -160,16 +153,25 @@ impl AgentContext {
     }
 
     fn reaches_compaction(&self, tokens: u64) -> bool {
-        u128::from(tokens) * 5 >= u128::from(self.profile.profile.max_context) * 4
+        let (numerator, denominator) = COMPACTION_THRESHOLD;
+        u128::from(tokens) * denominator
+            >= u128::from(self.profile.profile.max_context.get()) * numerator
     }
 
     pub fn contains_images(&self) -> bool {
         self.projected
             .messages
             .iter()
-            .any(|(_, message)| super::contains_images(std::slice::from_ref(message)))
+            .any(|(_, message)| match message {
+                Message::User(content) => content.iter().any(UserPart::is_image),
+                Message::Tool(results) => results.iter().any(|result| !result.images.is_empty()),
+                Message::Assistant(_) => false,
+            })
     }
 }
+
+/// The share of the context window, as a fraction, whose reported use compacts it.
+const COMPACTION_THRESHOLD: (u128, u128) = (4, 5);
 
 fn occupancy(usage: Usage) -> u64 {
     let input = usage.input_tokens.saturating_add(usage.cached_input_tokens);
@@ -197,168 +199,91 @@ fn history_prefix(
     })
 }
 
-/// Reconstruct context occupancy for historical agents without consulting current config.
+/// Context occupancy for historical agents without consulting current config: each
+/// agent's last occupancy reported by an attempt that committed its response, or a
+/// later checkpoint's estimate, at the capacity of its latest request. Output of an
+/// attempt that committed nothing never joined the context. A zero report is a
+/// backend reporting nothing, as the meter treats it too.
 pub(in crate::agent) fn recorded_context(
     records: &[EventRecord],
+    ledger: &RequestLedger,
 ) -> HashMap<AgentId, ContextUsage> {
-    let mut contexts = HashMap::new();
-    let capacities: HashMap<_, _> = records
-        .iter()
-        .filter_map(|record| match &record.event {
-            SessionEvent::AgentStarted {
-                profile: Some(profile),
-                ..
-            }
-            | SessionEvent::ModelChanged { profile } => {
-                Some((&record.agent, profile.profile.max_context))
-            }
-            _ => None,
+    let committed = |attempt: AttemptRef| {
+        ledger.get(attempt.request).is_some_and(|request| {
+            request.purpose == ModelPurpose::Agent
+                && request.phase.committed_attempt() == Some(attempt.attempt)
         })
-        .collect();
-    for (agent, capacity) in capacities {
-        let Some(mut request) = records.iter().rev().find_map(|record| {
-            if &record.agent == agent
-                && crate::session::request_context(record, |sequence| {
-                    crate::session::record_at(records, sequence)
-                })
-                .is_some_and(|context| context.purpose == crate::session::ModelPurpose::Agent)
-            {
-                crate::session::reconstruct_model_request(records, record.sequence.request())
-                    .ok()
-                    .map(|(_, request)| request)
-            } else {
-                None
+    };
+    // Requests are sequential per agent, so a usage report belongs to the agent's
+    // latest started attempt.
+    let mut attempts = HashMap::new();
+    let mut tokens = HashMap::new();
+    for record in records {
+        let reported = match &record.event {
+            SessionEvent::ModelAttemptStarted(attempt) => {
+                attempts.insert(&record.agent, *attempt);
+                continue;
             }
-        }) else {
-            continue;
+            SessionEvent::Usage { request, usage }
+                if attempts
+                    .get(&record.agent)
+                    .is_some_and(|attempt| attempt.request == *request && committed(*attempt)) =>
+            {
+                match occupancy(*usage) {
+                    0 => continue,
+                    reported => reported,
+                }
+            }
+            SessionEvent::Compaction { checkpoint } => checkpoint.after_tokens,
+            _ => continue,
         };
-        // The recorded tail is that request's dynamic runtime state; history is re-projected.
-        let tail = std::mem::take(&mut request.tail);
-        request.history.clear();
-        request.history_lifetime = HistoryLifetime::default();
-        let meter = TokenMeter::restore(records, agent);
-        let current = ModelRequest {
-            history: crate::session::render_history(
-                crate::session::project_history(records, agent).history(),
-            ),
-            tail,
-            ..request
-        };
-        contexts.insert(
-            agent.clone(),
-            ContextUsage {
-                tokens: meter.estimate(&current),
-                capacity,
-            },
-        );
+        tokens.insert(&record.agent, reported);
     }
-    contexts
+    let latest = |agent| ledger.get(ledger.latest(agent)?);
+    tokens
+        .into_iter()
+        .filter_map(|(agent, tokens)| {
+            let capacity = latest(agent)?.profile.profile.max_context.get();
+            Some((agent.clone(), ContextUsage { tokens, capacity }))
+        })
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-    };
-    use std::time::Duration;
-
-    use tokio::sync::Notify;
-
     use super::super::*;
-    use crate::agent::runtime::tests::{model_ref, models, provider_name};
-    use crate::provider::{
-        ProviderContext, ProviderError, ResponseStream,
-        protocol::{AssistantItem, Completion, ContextId, ResponseEvent},
+    use crate::agent::runtime::tests::{
+        Requests, Script, Step, answer, child_launch, ephemeral_session, model_ref, recoverable,
+        scripted_session, shutdown_session, test_harness,
     };
-    use futures_util::TryStreamExt;
-
-    #[derive(Default)]
-    struct Tracking {
-        next: AtomicUsize,
-        opened: Mutex<Vec<(usize, ContextId)>>,
-        dropped: Mutex<Vec<usize>>,
-        fail_all_calls: AtomicBool,
-        entered: Notify,
-        released: Notify,
-    }
-
-    struct Factory(Arc<Tracking>);
-    struct Context {
-        tracking: Arc<Tracking>,
-        id: usize,
-    }
-
-    impl Provider for Factory {
-        fn open_context(
-            &self,
-            context: ContextId,
-        ) -> Result<Box<dyn ProviderContext>, ProviderError> {
-            let id = self.0.next.fetch_add(1, Ordering::SeqCst);
-            self.0.opened.lock().unwrap().push((id, context));
-            Ok(Box::new(Context {
-                tracking: self.0.clone(),
-                id,
-            }))
-        }
-    }
-
-    impl Drop for Context {
-        fn drop(&mut self) {
-            self.tracking.dropped.lock().unwrap().push(self.id);
-            self.tracking.released.notify_one();
-        }
-    }
-
-    impl ProviderContext for Context {
-        fn invoke(&mut self, request: ModelRequest) -> ResponseStream {
-            let blocks = request.messages().rev().flat_map(|message| match message {
-                crate::provider::protocol::Message::User(blocks) => blocks.as_slice(),
-                _ => &[],
-            });
-            let mut texts = blocks.filter_map(|block| match block {
-                crate::provider::protocol::UserContent::Text { text } => Some(text.as_str()),
-                _ => None,
-            });
-            let block = texts.next() == Some("block");
-            let tracking = self.tracking.clone();
-            let started = async move {
-                if tracking.fail_all_calls.load(Ordering::SeqCst) {
-                    return Err(ProviderError::protocol("retry this request"));
-                }
-                if block {
-                    // Blocked calls end only through interruption.
-                    tracking.entered.notify_one();
-                    std::future::pending::<()>().await;
-                }
-                let done = Completion::answer(vec![AssistantItem::text("text/0", 0, "done")]);
-                let events = vec![ResponseEvent::End(done.unwrap())];
-                let events = futures_util::stream::iter(events.into_iter().map(Ok));
-                Ok(Box::pin(events) as ResponseStream)
-            };
-            Box::pin(futures_util::stream::once(started).try_flatten())
-        }
-    }
+    use crate::provider::{
+        ProviderErrorKind,
+        protocol::{ContextId, ResponseEvent},
+    };
 
     fn test_context(capacity: u64, max_output: u64) -> super::AgentContext {
-        let profile = ModelProfile::new("test", None, capacity, max_output, false);
-        let request = ModelRequest {
-            max_output_tokens: Some(max_output),
-            ..ModelRequest::test(&profile.model)
+        let profile = ModelProfile {
+            max_context: crate::tests::limit(capacity),
+            max_output: crate::tests::limit(max_output),
+            ..crate::tests::profile("test", false)
         };
-        let provider = Box::new(Context {
-            tracking: Arc::new(Tracking::default()),
-            id: 0,
-        });
+        let request = ModelRequest {
+            max_output_tokens: Some(profile.max_output),
+            ..ModelRequest::test(profile.model.as_str())
+        };
+        let script = Script::new([], &Requests::default());
+        let provider = script.open_context("test".parse().unwrap()).unwrap();
         super::AgentContext {
             profile: crate::session::ProfileSnapshot {
                 name: model_ref("test"),
                 profile,
             },
+            template_tokens: crate::agent::runtime::compaction::estimate_request(&request),
             template: request.try_into().unwrap(),
             projected: crate::session::Projection::default(),
             meter: super::TokenMeter::default(),
             provider,
+            blobs: Default::default(),
             unavailable_tools: Default::default(),
             through: RecordSeq::default(),
             prefix: 0,
@@ -436,36 +361,77 @@ mod tests {
         }
     }
 
+    /// A backend that reports no usage leaves resumed occupancy unknown, not zero.
     #[tokio::test]
+    async fn resumed_context_skips_unreported_usage() {
+        let (_root, _, session) = scripted_session([answer("done")]).await;
+        session.prompt("work").await.unwrap();
+        let records = session.runtime.store.records().await;
+        let resumed = crate::agent::observation::RuntimeEvents::new(&records).observe();
+        assert!(!resumed.snapshot.context.contains_key(&session.root));
+        shutdown_session(session).await;
+    }
+
+    /// Only a committed response's report restores occupancy: output streamed by an
+    /// attempt that failed, was interrupted or was retried never joined the context.
+    #[tokio::test(start_paused = true)]
+    async fn resumed_context_counts_only_committed_attempts() {
+        let reported = |input, output| Ok(ResponseEvent::Usage(tests::usage(input, 0, output)));
+        let committed = |events: Vec<ResponseEvent>, input, output| {
+            let mut events: Vec<_> = events.into_iter().map(Ok).collect();
+            events.insert(events.len() - 1, reported(input, output));
+            Step::stream(events)
+        };
+        let failed = |error| Step::stream(vec![reported(2_000, 20_000), Err(error)]);
+        let steps = [
+            committed(answer("done"), 1_000, 10),
+            failed(ProviderErrorKind::Protocol.error("not retried")),
+            committed(answer("never released"), 3_000, 30_000).midstream(),
+            failed(recoverable()),
+            // The retry that commits reports nothing.
+            Step::new(answer("retried")),
+        ];
+        let script = Script::new(steps, &Requests::default());
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, script.clone()).await;
+        let session = ephemeral_session(&harness).await;
+        let resumed = async || {
+            let records = session.runtime.store.records().await;
+            let observation = crate::agent::observation::RuntimeEvents::new(&records).observe();
+            observation.snapshot.context[&session.root].tokens
+        };
+        session.prompt("committed").await.unwrap();
+        assert_eq!(resumed().await, 1_010);
+        session.prompt("failed").await.unwrap_err();
+        assert_eq!(resumed().await, 1_010);
+        let interrupted = session.prompt("interrupted");
+        let interrupt = async {
+            script.held(2).await;
+            session.interrupt().await;
+        };
+        let (result, ()) = tokio::join!(interrupted, interrupt);
+        result.unwrap_err();
+        assert_eq!(resumed().await, 1_010);
+        session.prompt("retried").await.unwrap();
+        assert_eq!(resumed().await, 1_010);
+        shutdown_session(session).await;
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn cancelled_children_release_but_failed_children_retain_their_context() {
         let root = tempfile::tempdir().unwrap();
-        let tracking = Arc::new(Tracking::default());
-        let profile = ModelProfile::new("first", None, 128_000, 16_384, false);
-        let harness = HarnessBuilder::new(root.path())
-            .session_root(root.path().join("sessions"))
-            .provider(
-                provider_name("test"),
-                Arc::new(Factory(tracking.clone())),
-                models([("first", profile)]),
-            )
-            .default_model(model_ref("first"))
-            .build()
-            .await
-            .unwrap();
-        let session = harness.new_session().await.unwrap();
-        let wait_dropped = async |id| {
-            tokio::time::timeout(Duration::from_secs(5), async {
-                loop {
-                    let notified = tracking.released.notified();
-                    if tracking.dropped.lock().unwrap().contains(&id) {
-                        break;
-                    }
-                    notified.await;
-                }
-            })
-            .await
-            .expect("context released")
-        };
+        let steps = [
+            Step::new(answer("done")).gated(),
+            Step::new(answer("done")),
+            Step::fail(ProviderErrorKind::Protocol.error("not retried")),
+            Step::new(answer("done")),
+        ];
+        let script = Script::new(steps, &Requests::default());
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, script.clone()).await;
+        let session = ephemeral_session(&harness).await;
+        let root_context = ContextId::from(&session.root);
         let jobs = &session.runtime.jobs;
         for (index, fail) in [(1, false), (2, true)] {
             let child = session.root.child(index);
@@ -474,38 +440,41 @@ mod tests {
                 ..crate::job::JobSpec::test(session.root.clone(), "agent")
             };
             let owner_job = jobs.create(spec).await.unwrap().into_test_id();
-            let launch = tests::child_launch(&session, child.clone(), Some(owner_job));
-            let sender = session.runtime.spawn_agent(launch).await.unwrap();
-            tracking.fail_all_calls.store(fail, Ordering::SeqCst);
+            let launch = child_launch(&session, None);
+            let spawned = session
+                .runtime
+                .spawn_agent(child.clone(), Some(owner_job), launch);
+            let sender = spawned.await.unwrap();
             let (done, received) = oneshot::channel();
-            let content = vec![UserPart::Text {
-                text: "block".into(),
-            }];
             let input = AgentCommand::Input {
                 options: Default::default(),
-                content,
-                done: Some(done),
+                content: vec![UserPart::Text {
+                    text: "work".into(),
+                }],
+                done: Some(RequestCompletion::Child(done)),
             };
             sender.send(input).await.unwrap();
             if !fail {
-                tracking.entered.notified().await;
+                script.request(0).await;
                 session.runtime.interrupt_tree(&child).await;
             }
             assert!(received.await.unwrap().is_err());
+            let context = ContextId::from(&child);
             if fail {
                 // Failed child turns are retained for retry with their provider
                 // session/history; explicit interruption still tears one down.
-                let dropped = tracking.dropped.lock().unwrap().contains(&(index as usize));
-                assert!(!dropped, "failed child context must remain live for retry");
+                assert!(
+                    !script.dropped(&context),
+                    "failed child context must remain live for retry"
+                );
             } else {
-                wait_dropped(index as usize).await;
+                script.released(&context).await;
             }
-            tracking.fail_all_calls.store(false, Ordering::SeqCst);
             session.prompt("root still usable").await.unwrap();
-            assert!(!tracking.dropped.lock().unwrap().contains(&0));
+            assert!(!script.dropped(&root_context));
         }
-        assert_eq!(tracking.opened.lock().unwrap().len(), 3);
+        assert_eq!(script.opened.load(Ordering::SeqCst), 3);
         session.shutdown().await.unwrap();
-        wait_dropped(0).await;
+        script.released(&root_context).await;
     }
 }

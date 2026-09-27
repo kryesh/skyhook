@@ -41,13 +41,13 @@ fn background_attention(app: &App) -> usize {
 
 /// The row above the tree and composer, most urgent first, and what clicking it
 /// opens; hints and toasts only inform.
-fn notice(app: &App, prompt_active: bool) -> Option<(String, Option<Hit>)> {
+fn notice(app: &App, prompt_shown: bool) -> Option<(String, Option<Hit>)> {
     let waiting = background_attention(app);
     if let Some(prefix) = app.leader {
         Some((app.keys.leader_hint(prefix, &leader_hints(app)), None))
     } else if let Some((message, _)) = &app.toast {
         Some((message.clone(), None))
-    } else if !app.prompts.is_empty() && !prompt_active {
+    } else if !app.prompts.is_empty() && !prompt_shown {
         let hint = match app.keys.binding(Command::Attention) {
             Some(binding) => format!("{binding} reopen"),
             None => "Reopen questions and permissions in the command palette".to_owned(),
@@ -91,7 +91,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         1
     };
-    let prompt_active = app.prompt_active && !app.prompts.is_empty();
+    let prompt_shown = app.prompt_shown();
+    let target = app.input_target();
     let editor_width = width.saturating_sub(4).max(1) as usize;
     app.editor.set_width(editor_width);
     let editor_layout = app.editor.layout(editor_width);
@@ -100,9 +101,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         (editor_layout.rows.len() as u16 + 2 + u16::from(!app.editor.attachments().is_empty()))
             .clamp(3, 7)
             .min(height.saturating_sub(footer_height + 3).max(3));
-    let notice = notice(app, prompt_active);
+    let notice = notice(app, prompt_shown);
     let notice_height = u16::from(notice.is_some());
-    let prompt_layout = prompt_active.then(|| PromptLayout::new(app, width));
+    let prompt_layout = prompt_shown.then(|| PromptLayout::new(app, width));
     let composer_height = if let Some(layout) = &prompt_layout {
         layout
             .height()
@@ -113,11 +114,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     } else {
         editor_height
     };
-    let tree_agents = app.projection.visible(&app.selected);
+    let tree_agents: Vec<_> = app.projection.visible(&app.selected).collect();
     let composer_y = height.saturating_sub(footer_height + composer_height);
     let tree_capacity = composer_y.saturating_sub(3 + notice_height).min(
         (height / 4).clamp(4, 10)
-            + if viewing_child && !prompt_active {
+            + if viewing_child && !prompt_shown {
                 editor_height
             } else {
                 0
@@ -138,7 +139,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             Focus::Composer
         };
     }
-    if viewing_child && !prompt_active && app.focus == Focus::Composer {
+    if matches!(target, InputTarget::None) && app.focus == Focus::Composer {
         app.focus = Focus::Content;
     }
     let tree_y = composer_y.saturating_sub(tree_height);
@@ -163,11 +164,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
     draw_header(frame, app, width);
     prepare_rows(app, content_width);
-    let navigation_active = app.menu.is_none() && app.search_editor.is_none() && !prompt_active;
+    let navigation_active = matches!(target, InputTarget::Composer | InputTarget::None);
     draw_content(frame, app, navigation_active);
     // The popup and any notice share the row above the tree and composer.
     let latest_width = draw_scrollbar(frame, app);
-    if let Some(search) = &app.search_editor {
+    if let Some(Overlay::Search(search)) = &app.overlay {
         text(
             frame,
             r(2, app.content_rect.y, content_width.saturating_sub(4), 1),
@@ -193,7 +194,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         }
         text(frame, rect, message, THEME.warning, THEME.base);
     }
-    draw_tree(frame, app, &tree_agents, tree_rows, navigation_active);
+    draw_tree(frame, app, &tree_agents, navigation_active);
     fill(frame, app.composer_rect, THEME.input);
     if let Some(layout) = &prompt_layout {
         draw_prompt(frame, app, layout);
@@ -434,7 +435,7 @@ fn draw_composer(frame: &mut Frame, app: &mut App, layout: &ComposerLayout) {
         let names = attachments.iter().map(|attachment| {
             match attachment.file().and_then(|file| file.file_name()) {
                 Some(name) => format!("[{}]", name.to_string_lossy()),
-                None => match attachment {
+                None => match &**attachment {
                     skyhook::media::Attachment::Text { .. } => "[text]".to_owned(),
                     skyhook::media::Attachment::Image { .. } => "[image]".to_owned(),
                 },
@@ -451,7 +452,7 @@ fn draw_composer(frame: &mut Frame, app: &mut App, layout: &ComposerLayout) {
         );
         app.hits.push((r(0, y, rect.width, 1), Hit::Attachments));
     }
-    if app.focus == Focus::Composer && app.menu.is_none() && app.search_editor.is_none() {
+    if app.focus == Focus::Composer && matches!(app.input_target(), InputTarget::Composer) {
         frame.set_cursor_position((
             2 + (cursor_column as u16).min(text_width),
             rect.y + 1 + (cursor_line - top) as u16,
@@ -517,7 +518,7 @@ fn footer_model(app: &App) -> String {
         |name| {
             config
                 .model(name)
-                .map_or_else(|| name.to_string(), |profile| profile.model.clone())
+                .map_or_else(|| name.to_string(), |profile| profile.model.to_string())
         },
     );
     if root {
@@ -551,8 +552,12 @@ mod tests {
     use crate::tui::{
         app::{
             Work,
-            tests::{fixture, push_record},
+            tests::{
+                fetch_output, fixture, job_named, launch_context, push_record, requested,
+                run_script,
+            },
         },
+        keys::Command,
         theme::THEME,
     };
     use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
@@ -582,7 +587,7 @@ mod tests {
             ),
         ];
         let items = items.map(|(text, status)| TodoItem {
-            text: text.into(),
+            text: text.parse().unwrap(),
             status,
         });
         push_record(
@@ -635,9 +640,9 @@ mod tests {
         assert!(!beside.contains("notice") && noticed.contains("· Use MCP tools"));
         app.toast = None;
         // A pending mode shows what the next message will be granted.
-        app.mode = "missing".into();
+        app.mode = "missing".parse().unwrap();
         assert!(!screen(&mut app, 120).contains("Capabilities"));
-        app.mode = "general".into();
+        app.mode = "general".parse().unwrap();
         assert_eq!(app.content_rect.width, 88);
         assert!(
             app.hits
@@ -652,43 +657,23 @@ mod tests {
         app.command(Command::Sidebar);
         assert!(!screen(&mut app, 120).contains("Todos"));
         assert_eq!(app.content_rect.width, 120);
-        let saved = || crate::tui::state::load(root.path()).0.sidebar;
-        tokio::time::timeout(Duration::from_secs(5), async {
+        let saved = || crate::state::load(root.path()).0.sidebar;
+        // The toggle is saved in the background, with nothing to await.
+        crate::tests::bounded(async {
             while saved() {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
-        .await
-        .expect("toggle is saved");
+        .await;
     }
 
     #[tokio::test]
     async fn request_headers_stay_outside_the_scrolling_rows() {
         let (_root, mut app) = fixture().await;
-        let profile = app.launch.model.profile().clone();
-        let context = skyhook::session::ModelContext {
-            purpose: skyhook::session::ModelPurpose::Agent,
-            profile: skyhook::session::ProfileSnapshot {
-                name: app.launch.model.name(),
-                profile,
-            },
-            system: Vec::new(),
-            tools: Vec::new(),
-            response_schema: None,
-        };
-        let context = push_record(&mut app, SessionEvent::ModelContext { context }).await;
+        let context = launch_context(&app);
+        let context = push_record(&mut app, context).await;
         for _ in 0..30 {
-            push_record(
-                &mut app,
-                SessionEvent::ModelRequested {
-                    context,
-                    checkpoint: None,
-                    history: Vec::new(),
-                    tail: Vec::new(),
-                    history_lifetime: Default::default(),
-                },
-            )
-            .await;
+            push_record(&mut app, requested(context, Vec::new())).await;
         }
         app.tab = Tab::Requests;
         app.refresh();
@@ -730,26 +715,27 @@ mod tests {
     #[tokio::test]
     async fn expanded_items_paint_solid_code_backgrounds_across_clipped_rows() {
         let (_root, mut app) = fixture().await;
-        app.content_dirty = false;
-        let entry = model::Entry::titled(
-            model::EntryKey::UnsavedStatus(1),
-            model::Title::disclosed("Expandable tool", true),
-            "body\n\n".repeat(20),
-            Surface::Tool,
-        );
-        app.install_entries(vec![entry]);
+        std::fs::write(app.launch.workspace.join("body.txt"), "body\n\n".repeat(20)).unwrap();
+        run_script(&mut app, "return await tool.read({path:'body.txt'});").await;
+        let job = job_named(&app, "read");
+        fetch_output(&mut app, job).await;
+        app.command(Command::Details);
         for width in [30, 60] {
             let mut terminal = Terminal::new(TestBackend::new(width, 18)).unwrap();
             terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-            let scroll = app.render.rows.len() - app.content_rect.height as usize;
+            // Halfway down the card, the viewport is clipped inside the body.
+            let scroll = (app.render.rows.len() - app.content_rect.height as usize) / 2;
             assert!(scroll > 0, "exercise a viewport clipped inside the body");
+            app.view().scroll = Some(scroll);
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
             let buffer = terminal.backend().buffer();
             let mut empty_body_rows = 0;
-            for (offset, row) in app.render.rows.iter().skip(scroll).enumerate() {
+            let rows = app.render.rows.iter().skip(scroll);
+            for (offset, row) in rows.take(app.content_rect.height.into()).enumerate() {
                 let y = app.content_rect.y + offset as u16;
                 let spacer = row.layout.is_spacer();
                 let expected = if spacer { THEME.base } else { THEME.code_bg };
-                empty_body_rows += usize::from(!spacer && row.text().is_empty());
+                empty_body_rows += usize::from(!spacer && row.text().trim().is_empty());
                 for x in row.x..row.x + row.width {
                     assert_eq!(
                         buffer[(x, y)].bg,
@@ -798,8 +784,7 @@ mod tests {
                 ));
                 assert!(!app.render.reset && app.render.dirty.is_empty());
                 assert!(!app.content_dirty);
-                let work = tokio::time::timeout(Duration::from_secs(5), ready.recv()).await;
-                let work = work.expect("highlight worker woke the UI").unwrap();
+                let work = crate::tests::bounded(ready.recv()).await.unwrap();
                 assert!(matches!(work, Work::HighlightsReady));
                 app.work(work);
                 terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -833,7 +818,7 @@ mod tests {
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         for (scroll, source) in [(None, "let last = 42;"), (Some(0), "let first = 42;")] {
             app.view().scroll = scroll;
-            tokio::time::timeout(Duration::from_secs(10), async {
+            crate::tests::bounded(async {
                 loop {
                     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
                     if number_is_painted(terminal.backend().buffer(), source, accent) {
@@ -842,8 +827,7 @@ mod tests {
                     app.work(ready.recv().await.expect("highlight worker is running"));
                 }
             })
-            .await
-            .unwrap_or_else(|_| panic!("{source} on screen was never highlighted"));
+            .await;
         }
     }
 

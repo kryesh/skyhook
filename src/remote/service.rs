@@ -3,18 +3,14 @@ use super::{
     PromptAnswer, SensitivePrompt, SensitivePromptError, SensitivePromptFuture,
     SensitivePromptHandler,
     backend::ProcessEnvironment,
-    flow::{CHUNK_BYTES, Credits, WINDOW},
-    protocol::{PromptId, Request, RequestId, Response, spawn_owned_write, write_frame},
-};
-use std::{
-    collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
+    flow::{self, CHUNK_BYTES, Credits, QUEUE},
+    protocol::{
+        ControlRequest, PromptId, RequestId, Response, Sequence, spawn_owned_write, write_frame,
     },
 };
+use std::{collections::HashMap, sync::Arc};
 use tokio::{
-    io::{AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _},
+    io::{AsyncWrite, AsyncWriteExt as _},
     sync::{Mutex, mpsc, oneshot},
 };
 
@@ -56,14 +52,15 @@ impl<W: AsyncWrite + Unpin + Send + 'static> Drop for PromptRegistration<W> {
 struct ForwardPrompts<W> {
     output: Arc<Mutex<W>>,
     answers: Answers,
-    next: AtomicU64,
+    ids: Sequence<PromptId>,
 }
 impl<W: AsyncWrite + Unpin + Send + 'static> SensitivePromptHandler for ForwardPrompts<W> {
     fn prompt(&self, prompt: SensitivePrompt) -> SensitivePromptFuture {
-        let prompt_id = PromptId(self.next.fetch_add(1, Ordering::Relaxed));
+        let prompt_id = self.ids.next();
         let output = self.output.clone();
         let answers = self.answers.clone();
         Box::pin(async move {
+            let prompt_id = prompt_id.ok_or(SensitivePromptError::Unavailable)?;
             let (sender, receiver) = oneshot::channel();
             answers
                 .lock()
@@ -116,7 +113,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
         let prompts: Arc<dyn SensitivePromptHandler> = Arc::new(ForwardPrompts {
             output: output.clone(),
             answers: answers.clone(),
-            next: AtomicU64::new(1),
+            ids: Sequence::default(),
         });
         let authentication = super::ssh::WorkerAuthentication::new(prompts.clone())?;
         let environment = authentication.environment().clone();
@@ -130,9 +127,9 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
             authentication,
         })
     }
-    pub async fn handle(&mut self, request: Request) -> Result<(), std::io::Error> {
+    pub async fn handle(&mut self, request: ControlRequest) -> Result<(), std::io::Error> {
         match request {
-            Request::SensitiveAnswer { prompt_id, answer } => {
+            ControlRequest::SensitiveAnswer { prompt_id, answer } => {
                 if let Some(sender) = self
                     .answers
                     .lock()
@@ -142,7 +139,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                     let _ = sender.send(answer);
                 }
             }
-            Request::OpenSsh {
+            ControlRequest::OpenSsh {
                 channel,
                 route,
                 command,
@@ -150,7 +147,7 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                 if self.streams.contains_key(&channel) {
                     return Err(std::io::Error::other("duplicate SSH stream"));
                 }
-                let (sender, mut input) = mpsc::channel(WINDOW + 1);
+                let (sender, input) = mpsc::channel(QUEUE);
                 let credit = Credits::default();
                 let cancellation = tokio_util::sync::CancellationToken::new();
                 self.streams.insert(
@@ -174,106 +171,102 @@ impl<W: AsyncWrite + Unpin + Send + 'static> WorkerServices<W> {
                             stream = open => stream?,
                             () = cancellation.cancelled() => return Ok(()),
                         };
-                        let super::transport::Transport {
-                            input: stdin,
-                            output: mut stdout,
-                            owner: _owner,
-                        } = stream;
-                        let output_writer = output.clone();
-                        let write = async move {
-                            let mut ended = false;
-                            let mut stdin = Some(stdin);
-                            while let Some(data) = input.recv().await {
-                                match data {
-                                    Some(data) if !ended => {
-                                        stdin
-                                            .as_mut()
-                                            .expect("open stream")
-                                            .write_all(&data)
-                                            .await?;
-                                        write_frame(
-                                            &mut *output_writer.lock().await,
-                                            &Response::StreamAck { channel },
-                                        )
-                                        .await?;
-                                    }
-                                    None if !ended => {
-                                        if let Some(mut stdin) = stdin.take() {
-                                            stdin.shutdown().await?;
-                                        }
-                                        ended = true;
-                                    }
-                                    _ => {
-                                        return Err(std::io::Error::other("data after stream EOF"));
-                                    }
-                                }
-                            }
-                            Ok::<(), std::io::Error>(())
-                        };
-                        let read = async {
-                            let mut bytes = vec![0; CHUNK_BYTES];
-                            loop {
-                                credit.take().await?;
-                                let count = stdout.read(&mut bytes).await?;
-                                if count == 0 {
-                                    credit.acknowledge()?;
-                                    break;
-                                }
-                                write_frame(
-                                    &mut *output.lock().await,
-                                    &Response::StreamData {
-                                        channel,
-                                        data: bytes[..count].to_vec(),
-                                    },
-                                )
-                                .await?;
-                            }
-                            Ok::<(), std::io::Error>(())
-                        };
-                        tokio::select! {
-                            result = write => { result?; }
-                            result = read => { result?; }
-                            () = cancellation.cancelled() => {}
-                        }
-                        Ok::<(), super::RemoteError>(())
+                        relay(stream, channel, input, &credit, &cancellation, &output)
+                            .await
+                            .map_err(super::error::RemoteError::from)
                     }
                     .await;
+                    let error = result
+                        .err()
+                        .map(|error| error.into_tool_error().diagnostic());
                     write_frame(
                         &mut *output.lock().await,
-                        &Response::StreamClosed {
-                            channel,
-                            error: result.err().map(|e| e.to_string()),
-                        },
+                        &Response::StreamClosed { channel, error },
                     )
                     .await
                 });
             }
-            Request::StreamData { channel, data } => {
+            ControlRequest::StreamData { channel, data } => {
                 if data.len() > CHUNK_BYTES {
                     return Err(std::io::Error::other("oversized stream chunk"));
                 }
-                if let Some(sender) = self.streams.get(&channel) {
-                    sender.input.try_send(Some(data)).map_err(|_| {
-                        std::io::Error::other("SSH stream input overflow or closed")
-                    })?;
+                // A closed input means the relay no longer takes input; it reports its end
+                // with `StreamClosed`.
+                if let Some(sender) = self.streams.get(&channel)
+                    && let Err(mpsc::error::TrySendError::Full(_)) =
+                        sender.input.try_send(Some(data))
+                {
+                    return Err(std::io::Error::other("SSH stream input overflow"));
                 }
             }
-            Request::StreamEnd { channel } => {
+            ControlRequest::StreamEnd { channel } => {
                 if let Some(sender) = self.streams.get(&channel) {
                     let _ = sender.input.try_send(None);
                 }
             }
-            Request::StreamAck { channel } => {
+            ControlRequest::StreamAck { channel } => {
                 if let Some(stream) = self.streams.get(&channel) {
                     stream.credit.acknowledge()?;
                 }
             }
-            Request::StreamClose { channel } => {
+            ControlRequest::StreamClose { channel } => {
                 self.streams.remove(&channel);
             }
-            _ => return Err(std::io::Error::other("unexpected control request")),
         }
         Ok(())
+    }
+}
+
+/// Relay an open SSH stream until its output ends or the host closes it.
+/// Each frame is written on its own task, so stopping the relay never leaves
+/// a partial frame on the wire.
+async fn relay<W: AsyncWrite + Unpin + Send + 'static>(
+    stream: super::transport::Transport,
+    channel: RequestId,
+    mut input: mpsc::Receiver<Option<Vec<u8>>>,
+    credit: &Credits,
+    cancellation: &tokio_util::sync::CancellationToken,
+    output: &Arc<Mutex<W>>,
+) -> std::io::Result<()> {
+    let super::transport::Transport {
+        input: stdin,
+        output: stdout,
+        owner: _owner,
+    } = stream;
+    let write = async move {
+        let mut stdin = Some(stdin);
+        while let Some(data) = input.recv().await {
+            match (data, &mut stdin) {
+                (Some(data), Some(open)) => {
+                    open.write_all(&data).await?;
+                    let frame = Response::StreamAck { channel };
+                    spawn_owned_write(output.clone().lock_owned().await, frame).await?;
+                }
+                (None, Some(open)) => {
+                    open.shutdown().await?;
+                    stdin = None;
+                }
+                (_, None) => return Err(std::io::Error::other("data after stream EOF")),
+            }
+        }
+        Ok(())
+    };
+    let read = flow::pump(stdout, Some(credit), |data| async move {
+        let Some(data) = data else { return Ok(()) };
+        let frame = Response::StreamData { channel, data };
+        spawn_owned_write(output.clone().lock_owned().await, frame).await
+    });
+    let mut read = std::pin::pin!(read);
+    let written = tokio::select! {
+        result = write => result,
+        result = &mut read => return result,
+        () = cancellation.cancelled() => return Ok(()),
+    };
+    // Input has stopped and later data for it is discarded, but the output still
+    // carries the command's remaining result and SSH's exit diagnostic.
+    tokio::select! {
+        result = read => result.and(written),
+        () = cancellation.cancelled() => Ok(()),
     }
 }
 
@@ -282,49 +275,161 @@ mod tests {
     use super::*;
     use crate::remote::protocol::read_frame;
 
-    fn prompts<W>(output: W, next: u64) -> ForwardPrompts<W> {
+    fn prompts<W>(output: W) -> ForwardPrompts<W> {
         ForwardPrompts {
             output: Arc::new(Mutex::new(output)),
             answers: Answers::default(),
-            next: AtomicU64::new(next),
+            ids: Sequence::default(),
         }
     }
 
     fn password() -> SensitivePrompt {
-        SensitivePrompt {
-            kind: crate::remote::SensitivePromptKind::Password,
-            message: "password".into(),
-        }
+        SensitivePrompt::test(crate::remote::SensitivePromptKind::Password)
     }
 
     #[tokio::test]
     async fn abandoned_partial_prompt_frame_is_finished_before_cancellation() {
-        let (client, mut peer) = tokio::io::duplex(1);
-        let prompts = prompts(client, 1);
+        let (client, peer) = tokio::io::duplex(1);
+        let mut peer = tokio::io::BufReader::new(peer);
+        let prompts = prompts(client);
         let mut future = prompts.prompt(password());
         assert!(futures_util::poll!(&mut future).is_pending());
-        tokio::task::yield_now().await;
+        // The frame's first byte arrives while the rest cannot fit the pipe.
+        crate::tests::bounded(tokio::io::AsyncBufReadExt::fill_buf(&mut peer))
+            .await
+            .unwrap();
         drop(future);
         assert!(prompts.answers.lock().unwrap().is_empty());
         assert!(matches!(
             read_frame::<_, Response>(&mut peer).await.unwrap(),
-            Some(Response::SensitivePrompt {
-                prompt_id: PromptId(1),
-                ..
-            })
+            Some(Response::SensitivePrompt { prompt_id, .. }) if prompt_id == PromptId::new(1)
         ));
         assert!(matches!(
             read_frame::<_, Response>(&mut peer).await.unwrap(),
-            Some(Response::SensitiveCancelled {
-                prompt_id: PromptId(1)
-            })
+            Some(Response::SensitiveCancelled { prompt_id }) if prompt_id == PromptId::new(1)
+        ));
+    }
+
+    #[tokio::test]
+    async fn closing_a_stream_mid_frame_finishes_the_frame_first() {
+        let (client, peer) = tokio::io::duplex(1);
+        let mut peer = tokio::io::BufReader::new(peer);
+        let output = Arc::new(Mutex::new(client));
+        let (_input, received) = mpsc::channel(QUEUE);
+        let stream = super::super::transport::Transport {
+            input: Box::new(tokio::io::sink()),
+            output: Box::new(&b"data"[..]),
+            owner: Box::new(()),
+        };
+        let channel = RequestId::new(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let credit = Credits::default();
+        {
+            let mut relay = std::pin::pin!(relay(
+                stream,
+                channel,
+                received,
+                &credit,
+                &cancellation,
+                &output
+            ));
+            assert!(futures_util::poll!(&mut relay).is_pending());
+            // The frame's first byte arrives while the rest cannot fit the pipe.
+            crate::tests::bounded(tokio::io::AsyncBufReadExt::fill_buf(&mut peer))
+                .await
+                .unwrap();
+            cancellation.cancel();
+            relay.await.unwrap();
+        }
+        let closing = async move {
+            let closed = Response::StreamClosed {
+                channel,
+                error: None,
+            };
+            write_frame(&mut *output.lock().await, &closed).await
+        };
+        let reading = async {
+            let mut frames = Vec::new();
+            while let Some(frame) = read_frame::<_, Response>(&mut peer).await.unwrap() {
+                frames.push(frame);
+            }
+            frames
+        };
+        let (closed, frames) =
+            crate::tests::bounded(async { tokio::join!(closing, reading) }).await;
+        closed.unwrap();
+        assert!(matches!(
+            frames.as_slice(),
+            [
+                Response::StreamData { data, .. },
+                Response::StreamClosed { error: None, .. },
+            ] if data == b"data"
+        ));
+    }
+
+    #[tokio::test]
+    async fn data_for_a_stream_that_stopped_taking_input_is_discarded() {
+        let mut services = WorkerServices::new(Arc::new(Mutex::new(tokio::io::sink()))).unwrap();
+        let channel = RequestId::new(1);
+        let (input, received) = mpsc::channel(1);
+        services.streams.insert(
+            channel,
+            WorkerStream {
+                input,
+                credit: Credits::default(),
+                cancellation: tokio_util::sync::CancellationToken::new(),
+            },
+        );
+        let data = || ControlRequest::StreamData {
+            channel,
+            data: b"data".to_vec(),
+        };
+        services.handle(data()).await.unwrap();
+        assert!(services.handle(data()).await.is_err());
+        drop(received);
+        services.handle(data()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn output_is_drained_after_input_fails() {
+        let (client, mut peer) = tokio::io::duplex(4096);
+        let output = Arc::new(Mutex::new(client));
+        let (stdin, _) = tokio::io::duplex(1);
+        let (stdout, mut remote) = tokio::io::duplex(64);
+        let (input, received) = mpsc::channel(QUEUE);
+        input.try_send(Some(b"input".to_vec())).unwrap();
+        let stream = super::super::transport::Transport {
+            input: Box::new(stdin),
+            output: Box::new(stdout),
+            owner: Box::new(()),
+        };
+        let channel = RequestId::new(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let credit = Credits::default();
+        let mut relay = std::pin::pin!(relay(
+            stream,
+            channel,
+            received,
+            &credit,
+            &cancellation,
+            &output
+        ));
+        assert!(futures_util::poll!(&mut relay).is_pending());
+        assert!(input.is_closed());
+        remote.write_all(b"tail").await.unwrap();
+        drop(remote);
+        let error = crate::tests::bounded(relay).await.unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert!(matches!(
+            read_frame::<_, Response>(&mut peer).await.unwrap(),
+            Some(Response::StreamData { data, .. }) if data == b"tail"
         ));
     }
 
     #[tokio::test]
     async fn successful_forwarded_answer_does_not_emit_late_cancellation() {
         let (client, mut peer) = tokio::io::duplex(4096);
-        let prompts = prompts(client, 1);
+        let prompts = prompts(client);
         let mut future = prompts.prompt(password());
         assert!(futures_util::poll!(&mut future).is_pending());
         let Some(Response::SensitivePrompt { prompt_id, .. }) =

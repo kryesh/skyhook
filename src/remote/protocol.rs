@@ -1,76 +1,86 @@
-use std::num::NonZeroU64;
+use std::{
+    marker::PhantomData,
+    num::NonZeroU64,
+    sync::{Mutex, PoisonError},
+};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
-use crate::tool::{
-    authorization::AuthorizationError,
-    output::{CaptureEvent, CaptureId, ProducedOutput},
-    policy::{Capability, PermissionUse},
+use crate::{
+    target::Route,
+    tool::{
+        authorization::AuthorizationError,
+        diagnostic::{Diagnostic, PartialDiagnostic},
+        output::{CaptureEvent, CaptureId, ProducedOutput},
+        policy::Capability,
+    },
 };
 use serde_json::Value;
 
-const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
+pub(super) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
-/// Request and SSH channel IDs share one connection-local allocator. Zero is invalid.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
-#[serde(transparent)]
-pub(crate) struct RequestId(NonZeroU64);
+macro_rules! wire_ids {
+    ($($(#[$attr:meta])* $name:ident),+ $(,)?) => {$(
+        $(#[$attr])*
+        #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
+        #[serde(transparent)]
+        pub(crate) struct $name(NonZeroU64);
 
-impl RequestId {
-    pub const FIRST: Self = Self(NonZeroU64::MIN);
-
-    pub const fn new(value: u64) -> Option<Self> {
-        match NonZeroU64::new(value) {
-            Some(value) => Some(Self(value)),
-            None => None,
+        impl From<NonZeroU64> for $name {
+            fn from(id: NonZeroU64) -> Self {
+                Self(id)
+            }
         }
-    }
 
-    pub fn get(self) -> u64 {
-        self.0.get()
-    }
+        impl std::fmt::Display for $name {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                self.0.fmt(f)
+            }
+        }
 
-    pub fn next(self) -> Option<Self> {
-        self.get().checked_add(1).and_then(Self::new)
+        #[cfg(test)]
+        impl $name {
+            pub(crate) const fn new(id: u64) -> Self {
+                Self(NonZeroU64::new(id).unwrap())
+            }
+        }
+    )+};
+}
+
+wire_ids! {
+    /// Requests and SSH channels share one connection's sequence.
+    RequestId,
+    /// Scoped to its request.
+    AuthorizationId,
+    PromptId,
+    /// Scoped to its request.
+    ImageId,
+}
+
+/// Allocates IDs of one kind in order from 1; once exhausted it yields none.
+pub(crate) struct Sequence<T>(Mutex<Option<NonZeroU64>>, PhantomData<fn() -> T>);
+
+impl<T> Default for Sequence<T> {
+    fn default() -> Self {
+        Self(Mutex::new(Some(NonZeroU64::MIN)), PhantomData)
     }
 }
 
-/// Authorization IDs are scoped to requests; zero is a valid wire value.
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
-#[serde(transparent)]
-pub(crate) struct AuthorizationId(pub u64);
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
-#[serde(transparent)]
-pub(crate) struct PromptId(pub u64);
+impl<T: From<NonZeroU64>> Sequence<T> {
+    pub(crate) fn next(&self) -> Option<T> {
+        let mut next = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let id = (*next)?;
+        *next = id.checked_add(1);
+        Some(T::from(id))
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Request {
-    OpenSsh {
-        channel: RequestId,
-        route: Vec<crate::target::TargetDefinition>,
-        command: String,
-    },
-    StreamData {
-        channel: RequestId,
-        data: Vec<u8>,
-    },
-    StreamEnd {
-        channel: RequestId,
-    },
-    StreamAck {
-        channel: RequestId,
-    },
-    StreamClose {
-        channel: RequestId,
-    },
+    Control(ControlRequest),
     PayloadAck,
-    SensitiveAnswer {
-        prompt_id: PromptId,
-        answer: super::prompt::PromptAnswer,
-    },
     Hello,
     Tool {
         request_id: RequestId,
@@ -84,6 +94,7 @@ pub(crate) enum Request {
     /// At most one flow-control window of chunks is unacknowledged by `SourceAck`.
     SourceData {
         request_id: RequestId,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
     SourceEnd {
@@ -107,6 +118,35 @@ pub(crate) enum Request {
         request_id: RequestId,
         authorization_id: AuthorizationId,
         decision: AuthorizationDecision,
+    },
+}
+
+/// Requests for the worker's private SSH and prompt services.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ControlRequest {
+    OpenSsh {
+        channel: RequestId,
+        route: Box<Route>,
+        command: String,
+    },
+    StreamData {
+        channel: RequestId,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    StreamEnd {
+        channel: RequestId,
+    },
+    StreamAck {
+        channel: RequestId,
+    },
+    StreamClose {
+        channel: RequestId,
+    },
+    SensitiveAnswer {
+        prompt_id: PromptId,
+        answer: super::prompt::PromptAnswer,
     },
 }
 
@@ -149,7 +189,7 @@ impl AuthorizationDecision {
 }
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(tag = "type", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Response {
     Payload {
         request_id: RequestId,
@@ -160,11 +200,12 @@ pub(crate) enum Response {
     },
     StreamData {
         channel: RequestId,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
     StreamClosed {
         channel: RequestId,
-        error: Option<String>,
+        error: Option<Diagnostic>,
     },
     StreamAck {
         channel: RequestId,
@@ -184,15 +225,9 @@ pub(crate) enum Response {
     Authorization {
         request_id: RequestId,
         authorization_id: AuthorizationId,
-        tool: String,
-        permissions: Vec<PermissionUse>,
-        arguments: Value,
+        request: crate::tool::authorization::Reauthorization,
     },
 }
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
-#[serde(transparent)]
-pub(crate) struct ImageId(pub NonZeroU64);
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
 pub(crate) enum PayloadId {
@@ -213,8 +248,14 @@ pub(crate) enum PayloadOpen {
 pub(crate) enum PayloadEvent {
     Capture(CaptureEvent),
     Open(PayloadOpen),
-    Data { id: PayloadId, data: Vec<u8> },
-    Finish { id: PayloadId },
+    Data {
+        id: PayloadId,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
+    Finish {
+        id: PayloadId,
+    },
 }
 
 pub(crate) type RemoteToolResult = Result<RemoteToolOutput, RemoteToolError>;
@@ -225,7 +266,7 @@ pub(crate) struct RemoteToolOutput {
     pub images: Vec<crate::media::ImageRef>,
     pub captures: Vec<CaptureId>,
     pub streams: crate::tool::StreamEnd,
-    pub diagnostic: Option<crate::tool::diagnostic::Diagnostic>,
+    pub diagnostic: Option<Diagnostic>,
 }
 
 impl From<ProducedOutput> for RemoteToolOutput {
@@ -239,16 +280,14 @@ impl From<ProducedOutput> for RemoteToolOutput {
                 .map(|capture| capture.id())
                 .collect(),
             streams: output.streams,
-            diagnostic: output
-                .diagnostic
-                .map(crate::tool::diagnostic::PartialDiagnostic::resolve),
+            diagnostic: output.diagnostic.map(PartialDiagnostic::resolve),
         }
     }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) struct RemoteToolError {
-    pub diagnostic: Box<crate::tool::diagnostic::Diagnostic>,
+    pub diagnostic: Box<Diagnostic>,
     pub output: Option<Box<RemoteToolOutput>>,
 }
 
@@ -257,8 +296,24 @@ where
     W: AsyncWrite + Unpin,
     T: Serialize,
 {
-    let bytes = zeroize::Zeroizing::new(serde_json::to_vec(value).map_err(std::io::Error::other)?);
-    if bytes.len() > MAX_FRAME_BYTES {
+    write_frame_within(writer, value, MAX_FRAME_BYTES).await
+}
+
+/// Write a frame of at most `limit` bytes.
+pub(super) async fn write_frame_within<W, T>(
+    writer: &mut W,
+    value: &T,
+    limit: usize,
+) -> Result<(), std::io::Error>
+where
+    W: AsyncWrite + Unpin,
+    T: Serialize,
+{
+    let bytes = zeroize::Zeroizing::new(
+        rmp_serde::to_vec_named(value)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?,
+    );
+    if bytes.len() > limit {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             "RPC frame is too large",
@@ -308,9 +363,9 @@ where
     }
     let mut bytes = zeroize::Zeroizing::new(vec![0; length]);
     reader.read_exact(&mut bytes).await?;
-    serde_json::from_slice(&bytes)
+    rmp_serde::from_slice(&bytes)
         .map(Some)
-        .map_err(std::io::Error::other)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))
 }
 
 #[cfg(test)]
@@ -335,7 +390,9 @@ mod tests {
             ),
             (
                 AuthorizationError::Unavailable("tool".into()),
-                Cause::Message("tool `tool` is unavailable in this context".into()),
+                Cause::Unavailable {
+                    tool: "tool".into(),
+                },
             ),
             (
                 AuthorizationError::PolicyFailed,

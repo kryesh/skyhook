@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::{
+    agent::{CompactionFault, Failure},
     execution::ExecutionLocation,
     identity::{AgentId, EventId, JobId},
     job::{JobEnd, JobRole, JobTransition},
@@ -25,7 +26,7 @@ use crate::{
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum ModelPurpose {
         Agent = "agent",
         Compaction = "compaction",
@@ -35,7 +36,7 @@ named_enum! {
 named_enum! {
     /// Why a completed response ended early. Refusals and aborts fail the turn
     /// instead, so they are never journaled as a completed response.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum Truncation {
         MaxTokens = "max_tokens",
         Incomplete = "incomplete",
@@ -277,7 +278,7 @@ impl ModelContext {
 /// and keeps it whatever the configuration later says.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ModeSelection {
-    pub name: String,
+    pub name: crate::tool::policy::ModeName,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<crate::tool::policy::Mode>,
 }
@@ -335,9 +336,9 @@ pub enum SessionEvent {
         context: RecordSeq,
         /// The compaction whose message opens the history, when the agent has one.
         checkpoint: Option<RecordSeq>,
-        /// Committed messages sent after the checkpoint: its retained messages, then
-        /// every later committed message up to the last one named.
-        history: Vec<MessageSeq>,
+        /// History after the checkpoint is its retained messages, then the agent's
+        /// later commits up to `through`.
+        through: Option<MessageSeq>,
         /// Request-specific messages sent after history.
         tail: Vec<Message>,
         history_lifetime: HistoryLifetime,
@@ -348,10 +349,11 @@ pub enum SessionEvent {
     /// A new attempt starts for an existing frozen logical request. This resets
     /// its live output in host projections without changing model history.
     ModelAttemptStarted(AttemptRef),
+    /// A refusal is never retried automatically: it is deterministic for a given
+    /// request, so only a parent agent or a human may retry it.
     ModelFailed {
         attempt: AttemptRef,
-        error: String,
-        kind: ModelFailureKind,
+        failure: Failure,
     },
     /// An attempt ended without an outcome: cancelled, or open when the session stopped.
     ModelAttemptInterrupted(AttemptRef),
@@ -370,13 +372,14 @@ pub enum SessionEvent {
         /// Backoff scheduled before the next invocation.
         delay_millis: u64,
     },
+    /// The summary at `attempt` would not have shrunk the context, so the original
+    /// history stays.
     CompactionSkipped {
         attempt: AttemptRef,
-        reason: String,
     },
     CompactionFailed {
         failure: CompactionFailure,
-        error: String,
+        error: CompactionFault,
     },
     Usage {
         request: RequestSeq,
@@ -436,26 +439,13 @@ pub enum SessionEvent {
     /// retry. Journaled so a resumed session re-arms its retry affordance instead
     /// of appearing idle; the agent itself never retries on this signal.
     AgentFailed {
-        error: String,
+        failure: Failure,
     },
 }
 
 named_enum! {
-    /// Classification of a failed model request.
-    #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq, Deserialize)]
-    pub enum ModelFailureKind {
-        /// Transport, protocol, or validation failure.
-        #[default]
-        Error = "error",
-        /// The model declined to answer. Deterministic for a given request, so it is
-        /// never retried automatically; only a parent agent or a human may retry it.
-        Refusal = "refusal",
-    }
-}
-
-named_enum! {
     /// The journal's name for each event, also the entry's subtype table selector.
-    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq, Deserialize)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub(crate) enum EntryKind {
         SessionStarted = "session_started",
         TitleSet = "title_set",

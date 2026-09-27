@@ -1,24 +1,23 @@
 //! Relational encoding of terminal and output-persistence diagnostics.
 
-use std::collections::HashMap;
+use std::{collections::HashMap, path::PathBuf};
 
 use libsql::Row;
 
 use super::{
-    Db, DbResult, Encoder,
-    decode::{path, u64_of},
-    encode::path_bytes,
-    enum_column, params,
+    Db, DbResult, Encoder, corrupt, decode::u64_of, enum_column, optional_enum_column, params,
 };
 use crate::{
-    execution::ExecutionLocation,
+    execution::{ExecutionLocation, path_bytes, path_from_bytes},
     identity::JobId,
     named_enum::named_enum,
-    tool::diagnostic::{Cause, Diagnostic, DiagnosticContext, FailureSite, PathFact, Subject},
+    tool::diagnostic::{
+        Cause, Diagnostic, DiagnosticContext, FailureSite, IoKind, PathFact, Subject,
+    },
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize)]
     pub(super) enum Slot {
         Diagnostic = "diagnostic",
         OutputDiagnostic = "output_diagnostic",
@@ -26,24 +25,7 @@ named_enum! {
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub(super) enum SubjectKind {
-        None = "none",
-        Path = "path",
-        WorkingDirectory = "working_directory",
-        StagingFile = "staging_file",
-        ParentDirectory = "parent_directory",
-        DirectoryEntry = "directory_entry",
-        Argument = "argument",
-        Tool = "tool",
-        Job = "job",
-        Process = "process",
-        Label = "label",
-    }
-}
-
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
     pub(super) enum SiteKind {
         Invocation = "invocation",
         Host = "host",
@@ -51,108 +33,155 @@ named_enum! {
     }
 }
 
-named_enum! {
-    #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub(super) enum CauseKind {
-        Io = "io",
-        InvalidArguments = "invalid_arguments",
-        Denied = "denied",
+/// The columns a [`Subject`] or [`Cause`] stores its fields in.
+#[derive(Default)]
+struct Columns {
+    path: Option<PathBuf>,
+    text: Option<String>,
+    job: Option<JobId>,
+    io_kind: Option<IoKind>,
+    io_code: Option<Option<i32>>,
+    io_detail: Option<Option<String>>,
+}
+
+/// Declare `$kind`, the journal's name for each `$enum` variant, beside the
+/// [`Columns`] each variant's fields fill: `split` and `join` convert between
+/// them, and `stores` flags which of `$flag` a kind fills, for its dictionary.
+macro_rules! stored_enum {
+    (
+        $enum:ident / $kind:ident [$($flag:ident),+] {
+            $(
+                $variant:ident $(($tuple:ident))? $({ $($field:ident: $column:ident),+ })?
+                    = $text:literal
+            ),+ $(,)?
+        }
+    ) => {
+        named_enum! {
+            #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+            pub(super) enum $kind { $($variant = $text),+ }
+        }
+
+        impl $kind {
+            pub(super) fn stores(self) -> [bool; crate::named_enum::count!($($flag)+)] {
+                let columns: &[&str] = match self {
+                    $(
+                        Self::$variant => {
+                            &[$(stringify!($tuple))? $($(stringify!($column)),+)?]
+                        }
+                    ),+
+                };
+                [$(columns.contains(&stringify!($flag))),+]
+            }
+        }
+
+        impl $enum {
+            fn split(&self) -> ($kind, Columns) {
+                match self {
+                    $(
+                        Self::$variant $(($tuple))? $({ $($field: $column),+ })? => (
+                            $kind::$variant,
+                            Columns {
+                                $($tuple: Some($tuple.to_owned()),)?
+                                $($($column: Some($column.to_owned()),)+)?
+                                ..Columns::default()
+                            },
+                        )
+                    ),+
+                }
+            }
+
+            fn join(kind: $kind, columns: Columns) -> Option<Self> {
+                Some(match kind {
+                    $(
+                        $kind::$variant => Self::$variant
+                            $((columns.$tuple?))?
+                            $({ $($field: columns.$column?),+ })?
+                    ),+
+                })
+            }
+        }
+    };
+}
+
+stored_enum! {
+    Subject / SubjectKind [path, text] {
+        None = "none",
+        Path(path) = "path",
+        WorkingDirectory(path) = "working_directory",
+        StagingFile(path) = "staging_file",
+        ParentDirectory(path) = "parent_directory",
+        DirectoryEntry(path) = "directory_entry",
+        Argument(text) = "argument",
+        Tool(text) = "tool",
+        Job(job) = "job",
+        Process = "process",
+        Label(text) = "label",
+    }
+}
+
+stored_enum! {
+    Cause / CauseKind [text, job] {
+        Io { kind: io_kind, code: io_code, detail: io_detail } = "io",
+        InvalidArguments(text) = "invalid_arguments",
+        Denied(text) = "denied",
         Cancelled = "cancelled",
         Interrupted = "interrupted",
         InputClosed = "input_closed",
-        Message = "message",
+        Message(text) = "message",
         Json = "json",
+        Unavailable { tool: text } = "unavailable",
+        UnknownTool { tool: text } = "unknown_tool",
+        ModelHidden { tool: text } = "model_hidden",
+        ScriptUnavailable { tool: text } = "script_unavailable",
+        UnknownJob { job: job } = "unknown_job",
+        JobNotTerminal { job: job } = "job_not_terminal",
+        JobAlreadyTerminal { job: job } = "job_already_terminal",
     }
 }
 
 impl Encoder {
     pub(super) fn diagnostic(
-        &self,
+        &mut self,
         db: &Db,
         finish: u64,
         slot: Slot,
         diagnostic: &Diagnostic,
     ) -> DbResult<()> {
         let context = &diagnostic.context;
-        let (subject, subject_path, subject_text, subject_job) = match &context.subject {
-            Subject::None => (SubjectKind::None, None, None, None),
-            Subject::Path(path) => (SubjectKind::Path, Some(path_bytes(path)), None, None),
-            Subject::WorkingDirectory(path) => (
-                SubjectKind::WorkingDirectory,
-                Some(path_bytes(path)),
-                None,
-                None,
-            ),
-            Subject::StagingFile(path) => {
-                (SubjectKind::StagingFile, Some(path_bytes(path)), None, None)
-            }
-            Subject::ParentDirectory(path) => (
-                SubjectKind::ParentDirectory,
-                Some(path_bytes(path)),
-                None,
-                None,
-            ),
-            Subject::DirectoryEntry(path) => (
-                SubjectKind::DirectoryEntry,
-                Some(path_bytes(path)),
-                None,
-                None,
-            ),
-            Subject::Argument(text) => (SubjectKind::Argument, None, Some(text), None),
-            Subject::Tool(text) => (SubjectKind::Tool, None, Some(text), None),
-            Subject::Job(job) => (SubjectKind::Job, None, None, Some(job.get())),
-            Subject::Process => (SubjectKind::Process, None, None, None),
-            Subject::Label(text) => (SubjectKind::Label, None, Some(text), None),
-        };
+        let (subject, subject_columns) = context.subject.split();
         let (site, target, workspace) = match &context.site {
             FailureSite::Invocation => (SiteKind::Invocation, None, None),
             FailureSite::Host => (SiteKind::Host, None, None),
             FailureSite::Execution(location) => (
                 SiteKind::Execution,
-                Some(self.target(db, location.target.as_str())?),
+                Some(self.target(db, &location.target)?),
                 Some(path_bytes(&location.workspace)),
             ),
         };
-        let (cause, io_kind, io_code, cause_text, io_detail) = match &diagnostic.cause {
-            Cause::Io { kind, code, detail } => (
-                CauseKind::Io,
-                Some(*kind),
-                code.map(i64::from),
-                None,
-                detail.as_ref(),
-            ),
-            Cause::InvalidArguments(text) => {
-                (CauseKind::InvalidArguments, None, None, Some(text), None)
-            }
-            Cause::Denied(text) => (CauseKind::Denied, None, None, Some(text), None),
-            Cause::Cancelled => (CauseKind::Cancelled, None, None, None, None),
-            Cause::Interrupted => (CauseKind::Interrupted, None, None, None, None),
-            Cause::InputClosed => (CauseKind::InputClosed, None, None, None, None),
-            Cause::Message(text) => (CauseKind::Message, None, None, Some(text), None),
-            Cause::Json => (CauseKind::Json, None, None, None, None),
-        };
+        let (cause, cause_columns) = diagnostic.cause.split();
         db.execute(
             "INSERT INTO job_finish_diagnostic (finish, slot, operation, subject, subject_path, \
              subject_text, subject_job, site, location_target, location_workspace, effects, \
-             cause, io_kind, io_code, cause_text, io_detail) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+             cause, io_kind, io_code, cause_text, io_detail, cause_job) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 finish,
                 slot,
                 context.operation,
                 subject,
-                subject_path,
-                subject_text,
-                subject_job,
+                subject_columns.path.as_deref().map(path_bytes),
+                subject_columns.text,
+                subject_columns.job.map(JobId::get),
                 site,
                 target,
                 workspace,
                 context.effects,
                 cause,
-                io_kind,
-                io_code,
-                cause_text,
-                io_detail,
+                cause_columns.io_kind,
+                cause_columns.io_code.flatten().map(i64::from),
+                cause_columns.text,
+                cause_columns.io_detail.flatten(),
+                cause_columns.job.map(JobId::get),
             ],
         )?;
         for (position, fact) in context.paths.iter().enumerate() {
@@ -166,44 +195,43 @@ impl Encoder {
     }
 }
 
+fn job(row: &Row, index: i32) -> DbResult<Option<JobId>> {
+    row.get::<Option<i64>>(index)?
+        .map(|job| JobId::new(u64_of(job)).map_err(|error| corrupt(error.to_string())))
+        .transpose()
+}
+
 fn decode(row: &Row, paths: Vec<PathFact>) -> DbResult<Diagnostic> {
-    let subject = match enum_column(row, 3)? {
-        SubjectKind::None => Subject::None,
-        SubjectKind::Path => Subject::Path(path(row.get(4)?)),
-        SubjectKind::WorkingDirectory => Subject::WorkingDirectory(path(row.get(4)?)),
-        SubjectKind::StagingFile => Subject::StagingFile(path(row.get(4)?)),
-        SubjectKind::ParentDirectory => Subject::ParentDirectory(path(row.get(4)?)),
-        SubjectKind::DirectoryEntry => Subject::DirectoryEntry(path(row.get(4)?)),
-        SubjectKind::Argument => Subject::Argument(row.get(5)?),
-        SubjectKind::Tool => Subject::Tool(row.get(5)?),
-        SubjectKind::Job => Subject::Job(
-            JobId::new(u64_of(row.get(6)?)).map_err(|error| super::corrupt(error.to_string()))?,
-        ),
-        SubjectKind::Process => Subject::Process,
-        SubjectKind::Label => Subject::Label(row.get(5)?),
-    };
+    let subject = Subject::join(
+        enum_column(row, 3)?,
+        Columns {
+            path: row.get::<Option<Vec<u8>>>(4)?.map(path_from_bytes),
+            text: row.get(5)?,
+            job: job(row, 6)?,
+            ..Columns::default()
+        },
+    )
+    .ok_or_else(|| corrupt("diagnostic subject does not match its columns"))?;
     let site = match enum_column(row, 7)? {
         SiteKind::Invocation => FailureSite::Invocation,
         SiteKind::Host => FailureSite::Host,
         SiteKind::Execution => FailureSite::Execution(ExecutionLocation {
-            target: super::decode::target_ref(row.get(8)?)?,
-            workspace: path(row.get(9)?),
+            target: super::decode::parsed(row.get(8)?)?,
+            workspace: path_from_bytes(row.get(9)?),
         }),
     };
-    let cause = match enum_column(row, 11)? {
-        CauseKind::Io => Cause::Io {
-            kind: enum_column(row, 12)?,
-            code: row.get(13)?,
-            detail: row.get(15)?,
+    let cause = Cause::join(
+        enum_column(row, 11)?,
+        Columns {
+            io_kind: optional_enum_column(row, 12)?,
+            io_code: Some(row.get(13)?),
+            text: row.get(14)?,
+            io_detail: Some(row.get(15)?),
+            job: job(row, 16)?,
+            ..Columns::default()
         },
-        CauseKind::InvalidArguments => Cause::InvalidArguments(row.get(14)?),
-        CauseKind::Denied => Cause::Denied(row.get(14)?),
-        CauseKind::Cancelled => Cause::Cancelled,
-        CauseKind::Interrupted => Cause::Interrupted,
-        CauseKind::InputClosed => Cause::InputClosed,
-        CauseKind::Message => Cause::Message(row.get(14)?),
-        CauseKind::Json => Cause::Json,
-    };
+    )
+    .ok_or_else(|| corrupt("diagnostic cause does not match its columns"))?;
     Ok(Diagnostic {
         context: DiagnosticContext {
             operation: enum_column(row, 2)?,
@@ -226,7 +254,7 @@ pub(super) fn load(db: &Db) -> DbResult<HashMap<(i64, Slot), Diagnostic>> {
                 (row.get(0)?, enum_column(row, 1)?),
                 PathFact {
                     role: enum_column(row, 2)?,
-                    path: path(row.get(3)?),
+                    path: path_from_bytes(row.get(3)?),
                 },
             ))
         },
@@ -237,7 +265,8 @@ pub(super) fn load(db: &Db) -> DbResult<HashMap<(i64, Slot), Diagnostic>> {
         .query(
             "SELECT d.finish, d.slot, d.operation, d.subject, d.subject_path, d.subject_text, \
              d.subject_job, d.site, t.name, d.location_workspace, d.effects, d.cause, \
-             d.io_kind, d.io_code, d.cause_text, d.io_detail FROM job_finish_diagnostic d \
+             d.io_kind, d.io_code, d.cause_text, d.io_detail, d.cause_job \
+             FROM job_finish_diagnostic d \
              LEFT JOIN target t ON t.id = d.location_target",
             Vec::new(),
             |row| {
@@ -298,9 +327,9 @@ mod tests {
         let mut fixture = Fixture::new();
         fixture.start("/workspace");
         #[cfg(unix)]
-        let native = path(b"/remote-\xfe".to_vec());
+        let native = path_from_bytes(b"/remote-\xfe".to_vec());
         #[cfg(not(unix))]
-        let native = path(b"/remote".to_vec());
+        let native = path_from_bytes(b"/remote".to_vec());
         let subjects = [
             Subject::None,
             Subject::Path(native.clone()),
@@ -341,6 +370,9 @@ mod tests {
             Cause::InputClosed,
             Cause::Message("capture failed".into()),
             Cause::Json,
+            Cause::UnknownJob {
+                job: JobId::new(999_998).unwrap(),
+            },
         ];
         for (index, operation) in Operation::ALL.iter().enumerate() {
             let diagnostic = Diagnostic {

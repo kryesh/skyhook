@@ -11,12 +11,21 @@ pub(crate) enum Instructions {
     RequiredEvenWhenEmpty,
 }
 
-/// Whether reasoning summaries are requested.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ReasoningSummary {
-    Requested,
-    /// The service rejects `reasoning.summary`.
-    Unsupported,
+crate::named_enum::named_enum! {
+    /// Whether reasoning summaries are requested.
+    #[derive(Clone, Copy, Debug, Default, serde::Serialize, PartialEq, Eq)]
+    pub enum ReasoningSummary {
+        #[default]
+        Requested = "requested",
+        /// The service rejects `reasoning.summary`.
+        Unsupported = "unsupported",
+    }
+}
+
+impl ReasoningSummary {
+    pub(crate) fn is_requested(&self) -> bool {
+        *self == Self::Requested
+    }
 }
 
 /// What the terminal event says about streamed output items.

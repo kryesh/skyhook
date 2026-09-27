@@ -11,8 +11,8 @@ use tokio::io::AsyncWriteExt as _;
 
 use crate::tool::{
     PathKind,
-    builtins::workspace::{resolve_for_authorization, source_file},
     invocation::{AdmissionError, LocalContext, LocalError},
+    path::{resolve_for_authorization, source_file},
     policy::Capability,
 };
 

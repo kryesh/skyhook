@@ -41,6 +41,8 @@ pub(crate) type Client = RunningService<RoleClient, ()>;
 // Bound raw stdio frames before rmcp's default (unbounded) read_until buffer.
 // Keep the counter in the reader so cancelled receive futures cannot reset it.
 pub(crate) const MAX_MESSAGE_BYTES: usize = 8 * 1024 * 1024;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const READINESS_POLL: Duration = Duration::from_millis(100);
 struct BoundedLines<R> {
     inner: R,
     length: usize,
@@ -245,18 +247,11 @@ fn http_config(
     transport.retry_config = Arc::new(NeverRetry::default());
     transport.max_sse_event_size = MAX_MESSAGE_BYTES;
     for (header, variable) in headers {
-        let name = HeaderName::from_bytes(header.as_bytes())
-            .map_err(|_| McpError::Configuration("invalid MCP header name".into()))?;
-        let value = std::env::var(variable).map_err(|_| {
-            McpError::Configuration(format!(
-                "MCP header environment variable {variable:?} is missing or not Unicode"
-            ))
-        })?;
-        let mut value = HeaderValue::from_str(&value).map_err(|_| {
-            McpError::Configuration(format!(
-                "invalid value in MCP header environment variable {variable:?}"
-            ))
-        })?;
+        let name = HeaderName::from_bytes(header.as_bytes()).map_err(|_| McpError::HeaderName)?;
+        let value =
+            std::env::var(variable).map_err(|_| McpError::HeaderVariable(variable.clone()))?;
+        let mut value =
+            HeaderValue::from_str(&value).map_err(|_| McpError::HeaderValue(variable.clone()))?;
         value.set_sensitive(true);
         transport.custom_headers.insert(name, value);
     }
@@ -582,7 +577,7 @@ pub(crate) async fn connect(
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
                 .retry(reqwest::retry::never())
-                .connect_timeout(Duration::from_secs(3))
+                .connect_timeout(CONNECT_TIMEOUT)
                 .build()
                 .map_err(|error| http_error(&error))?;
             let client = BoundedHttpClient {
@@ -603,7 +598,7 @@ pub(crate) async fn connect(
             // Retry only establishment, before any tool has been advertised or
             // invoked. Authentication/protocol failures stop readiness immediately.
             loop {
-                tokio::time::sleep(Duration::from_millis(100)).await;
+                tokio::time::sleep(READINESS_POLL).await;
                 match http_connect(client.clone(), transport.clone()).await {
                     Ok(service) => return Ok(service),
                     Err(error) if unreachable(&error) => {}
@@ -617,15 +612,14 @@ pub(crate) async fn connect(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tests::bounded;
     use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn http_transport_errors_strip_url_secrets_before_sdk_logging() {
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        drop(listener);
+        let port = crate::tests::RefusedPort::new();
         let client = reqwest::Client::builder().no_proxy().build().unwrap();
-        let url = format!("http://{address}/mcp?token=private-secret");
+        let url = format!("http://{}/mcp?token=private-secret", port.address());
         let error = client.get(url).send().await.unwrap_err();
         let was_connect_error = error.is_connect();
         let error = redact_http_error(StreamableHttpError::Client(error));
@@ -688,7 +682,8 @@ mod tests {
                 .retry(reqwest::retry::never())
                 .build()
                 .unwrap(),
-            timeout: Duration::from_secs(5),
+            // Never fires on its own; a test expires it or `bounded` guards the call.
+            timeout: Duration::from_secs(3600),
         }
     }
 
@@ -761,10 +756,7 @@ mod tests {
         let mut config = StreamableHttpClientTransportConfig::with_uri(uri);
         config.reinit_on_expired_session = false;
         config.retry_config = Arc::new(NeverRetry::default());
-        let connect = http_connect(test_http_client(), config);
-        let result = tokio::time::timeout(Duration::from_secs(2), connect)
-            .await
-            .unwrap();
+        let result = bounded(http_connect(test_http_client(), config)).await;
         let Err(error) = result else {
             panic!("plaintext endpoint unexpectedly negotiated TLS")
         };
@@ -776,16 +768,15 @@ mod tests {
     async fn http_post_has_a_transport_deadline() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let uri: Arc<str> = format!("http://{}/mcp", listener.local_addr().unwrap()).into();
+        let (accepted, connected) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
             let (_socket, _) = listener.accept().await.unwrap();
+            accepted.send(()).unwrap();
             std::future::pending::<()>().await;
         });
-        let mut client = test_http_client();
-        client.timeout = Duration::from_millis(25);
+        let client = test_http_client();
         let post = client.post_message(uri, ping_message(), None, None, HashMap::new());
-        let result = tokio::time::timeout(Duration::from_secs(2), post)
-            .await
-            .unwrap();
+        let (result, _) = crate::tests::expire(post, connected, client.timeout).await;
         assert!(
             matches!(result, Err(StreamableHttpError::Client(ref error)) if error.is_timeout())
         );
@@ -819,8 +810,8 @@ mod tests {
         output.write_all(b"x").await.unwrap();
         let mut byte = [0; 1];
         reader.read_exact(&mut byte).await.unwrap();
-        let pending = tokio::time::timeout(Duration::from_millis(10), reader.read_exact(&mut byte));
-        assert!(pending.await.is_err());
+        let pending = std::pin::pin!(reader.read_exact(&mut byte));
+        assert!(futures_util::poll!(pending).is_pending());
         output.write_all(b"x").await.unwrap();
         assert!(reader.read_exact(&mut byte).await.is_err());
     }

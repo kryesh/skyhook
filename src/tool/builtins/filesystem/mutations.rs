@@ -1,127 +1,67 @@
 //! Atomic writes, exact replacements, and removals.
 use crate::tool::ToolOptions;
-use crate::tool::diagnostic::{Effects, Operation, PartialContext, Subject};
-use crate::tool::invocation::{AdmissionError, LocalCatalogBuilder, LocalError};
+use crate::tool::diagnostic::{Cause, Effects, IoKind, Operation, PartialContext, Subject};
+use crate::tool::invocation::{AdmissionError, LocalCatalogBuilder, LocalContext, LocalError};
+use crate::tool::registry::{Invocation, SOURCE_ARGUMENT, serialized};
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tokio::fs;
 
-use super::super::workspace::{atomic_write, relative_path};
+use super::super::workspace::atomic_write;
 use crate::fs::{Contents, FileKind};
 use crate::tool::{
-    PathKind, RegistryError,
+    PathArgument, PathKind, RegistryError,
     policy::{Capability, PathAccess},
 };
 
 const MAX_WRITE_BYTES: usize = 4 * 1024 * 1024;
 
 pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), RegistryError> {
-    builder.register::<WriteArgs, WriteOutput, _, _>(
-        "write",
+    builder.register_checked(
+        crate::tool::builtins::names::WRITE,
         "Atomically create or replace a workspace file with UTF-8 `content`, or copy the bytes of a `source` file. Set create_parents to create missing parent directories recursively.",
         ToolOptions::new(vec![Capability::Write])
+            .result::<WriteOutput>()
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
-            .source_argument("source")
-            .argument_validator(|args: &WriteArgs| args.data().map(drop))
-            .argument_paths(|args| {
-                Ok(vec![crate::tool::PathArgument::top_level(
-                    "path", None, PathAccess::Write,
-                    if args.create_parents { PathKind::WritableWithParents } else { PathKind::Writable },
-                )])
+            .reads_source()
+            .argument_paths(|write: &mut Write| {
+                let kind = if write.create_parents {
+                    PathKind::WritableWithParents
+                } else {
+                    PathKind::Writable
+                };
+                vec![PathArgument::new(&mut write.path, PathAccess::Write, kind)]
             }),
-        |context, args| async move {
-            let path = std::path::PathBuf::from(&args.path);
-            let contents = match args.data()? {
-                WriteData::Content(content) => Contents::Bytes(content.as_bytes().to_vec()),
-                WriteData::Source => Contents::File(context.source()?.reader().map_err(|error| {
-                    LocalError::io(error).operation(Operation::Read, Subject::argument(["source"]))
-                })?),
-            };
-            if args.create_parents {
-                let parent = path
-                    .parent()
-                    .ok_or_else(|| AdmissionError::failed("path has no parent").context(unchanged(Operation::CreateDirectories, &path)))?;
-                fs::create_dir_all(parent).await.map_err(LocalError::annotated(
-                    PartialContext::new(Operation::CreateDirectories, Subject::ParentDirectory(parent.to_owned()))
-                        .effects(Effects::PartialChange),
-                ))?;
-            }
-            let bytes = atomic_write(&path, contents).await.map_err(|error| {
-                if args.create_parents && error.diagnostic().context.effects != Effects::DestinationReplaced {
-                    error.effects(Effects::PartialChange)
-                } else { error }
-            })?;
-            Ok(WriteOutput {
-                path: relative_path(&context.execution_location().workspace, &path),
-                bytes,
-            })
-        },
+        WriteArgs::admit,
+        |write| Invocation::new(|context| async move { serialized(write.run(context).await?) }),
     )?;
-    builder.register::<ReplaceArgs, EditOutput, _, _>(
-        "replace",
+    builder.register_checked(
+        crate::tool::builtins::names::REPLACE,
         "Replace exact text in a UTF-8 workspace file with an expected match count.",
         ToolOptions::new(vec![Capability::Write])
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
-            .path_argument("path", PathAccess::Write, PathKind::Existing)
-            .argument_validator(|args: &ReplaceArgs| {
-                // Reject invalid input before authorization, source reads, or allocation.
-                let input = args.old.len().saturating_add(args.new.len());
-                let invalid = if input > MAX_WRITE_BYTES {
-                    format!(
-                        "replace input is {input} bytes, exceeding the {MAX_WRITE_BYTES}-byte limit"
-                    )
-                } else if args.old.is_empty() {
-                    "old cannot be empty".to_owned()
-                } else {
-                    return Ok(());
-                };
-                Err(AdmissionError::invalid_arguments(invalid)
-                    .context(unchanged(Operation::Validate, &args.path)))
+            .argument_paths(|args: &mut ReplaceArgs| {
+                vec![PathArgument::new(
+                    &mut args.path,
+                    PathAccess::Write,
+                    PathKind::Existing,
+                )]
             }),
-        |context, args| async move {
-            let path = std::path::PathBuf::from(&args.path);
-            let bytes = crate::fs::read_regular(&path, MAX_WRITE_BYTES as u64)
-                .await
-                .map_err(AdmissionError::annotated(unchanged(Operation::Read, &path)))?;
-            let text = String::from_utf8(bytes).map_err(|error| {
-                AdmissionError::failed(error.utf8_error())
-                    .context(unchanged(Operation::Deserialize, &path))
-            })?;
-            let replacements = text.matches(&args.old).count();
-            if replacements != args.count {
-                return Err(LocalError::failed(format!(
-                    "expected {} matches, found {replacements}{}",
-                    args.count,
-                    match_lines(&text, &args.old)
-                ))
-                .context(unchanged(Operation::Validate, &path)));
-            }
-            // Bound the result before allocating it: a short search string and
-            // a large replacement can otherwise expand a small input enormously.
-            check_write_size(
-                replacement_size(text.len(), args.old.len(), args.new.len(), replacements),
-                &path,
-            )?;
-            let output = text.replace(&args.old, &args.new);
-            let bytes = output.len();
-            atomic_write(&path, Contents::Bytes(output.into_bytes())).await?;
-            Ok(EditOutput {
-                path: relative_path(&context.execution_location().workspace, &path),
-                replacements,
-                bytes,
-            })
-        },
+        ReplaceArgs::admit,
+        |args| Invocation::unit(|_| args.run()),
     )?;
     builder.register::<RemoveArgs, RemoveOutput, _, _>(
         "remove",
         "Remove a workspace file, symlink, or directory.",
         ToolOptions::new(vec![Capability::Write])
             .placement(crate::tool::ToolPlacement::InheritWorkspace)
-            .path_argument("path", PathAccess::Write, PathKind::Removable),
-        |context, args| async move {
-            let path = std::path::PathBuf::from(&args.path);
+            .argument_paths(|args: &mut RemoveArgs| {
+                vec![PathArgument::new(&mut args.path, PathAccess::Write, PathKind::Removable)]
+            }),
+        |_, args| async move {
+            let path = PathBuf::from(&args.path);
             let metadata = fs::symlink_metadata(&path)
                 .await
                 .map_err(AdmissionError::annotated(unchanged(
@@ -143,15 +83,25 @@ pub(super) fn register(builder: &mut LocalCatalogBuilder) -> Result<(), Registry
                 RemoveKind::Directory if args.recursive => fs::remove_dir_all(&path)
                     .await
                     .map_err(|error| failed(error).effects(Effects::PartialChange))?,
-                RemoveKind::Directory => fs::remove_dir(&path).await.map_err(failed)?,
+                RemoveKind::Directory => fs::remove_dir(&path).await.map_err(|error| {
+                    match error.kind() {
+                        std::io::ErrorKind::DirectoryNotEmpty => LocalError::cause(Cause::Io {
+                            kind: IoKind::DirectoryNotEmpty,
+                            code: error.raw_os_error(),
+                            detail: Some(
+                                "use recursive removal only if all directory contents should be deleted"
+                                    .to_owned(),
+                            ),
+                        })
+                        .operation(Operation::Remove, Subject::path(&path)),
+                        _ => failed(error),
+                    }
+                })?,
                 RemoveKind::Symlink | RemoveKind::File => {
                     fs::remove_file(&path).await.map_err(failed)?
                 }
             }
-            Ok(RemoveOutput {
-                path: relative_path(&context.execution_location().workspace, &path),
-                kind,
-            })
+            Ok(RemoveOutput { kind })
         },
     )?;
     Ok(())
@@ -209,31 +159,82 @@ struct WriteArgs {
     create_parents: bool,
 }
 
-enum WriteData<'a> {
-    Content(&'a str),
+/// A write admitted with exactly one of content or a source.
+struct Write {
+    path: String,
+    data: WriteData,
+    create_parents: bool,
+}
+
+enum WriteData {
+    Content(String),
     /// The executor loads the source's bytes into the call's context.
     Source,
 }
 
 impl WriteArgs {
-    fn data(&self) -> Result<WriteData<'_>, AdmissionError> {
-        match (&self.content, &self.source) {
+    fn admit(self) -> Result<Write, AdmissionError> {
+        let data = match (self.content, self.source) {
             (Some(content), None) => {
                 check_write_size(content.len(), &self.path)?;
-                Ok(WriteData::Content(content))
+                WriteData::Content(content)
             }
-            (None, Some(_)) => Ok(WriteData::Source),
-            _ => Err(
-                AdmissionError::invalid_arguments("supply exactly one of content or source")
-                    .context(unchanged(Operation::Validate, &self.path)),
-            ),
+            (None, Some(_)) => WriteData::Source,
+            _ => {
+                return Err(AdmissionError::invalid_arguments(
+                    "supply exactly one of content or source",
+                )
+                .context(unchanged(Operation::Validate, &self.path)));
+            }
+        };
+        Ok(Write {
+            path: self.path,
+            data,
+            create_parents: self.create_parents,
+        })
+    }
+}
+
+impl Write {
+    async fn run(self, context: LocalContext) -> Result<WriteOutput, LocalError> {
+        let path = PathBuf::from(&self.path);
+        let contents = match self.data {
+            WriteData::Content(content) => Contents::Bytes(content.into_bytes()),
+            WriteData::Source => Contents::File(context.source()?.reader().map_err(|error| {
+                LocalError::io(error)
+                    .operation(Operation::Read, Subject::argument([SOURCE_ARGUMENT]))
+            })?),
+        };
+        if self.create_parents {
+            let parent = path.parent().ok_or_else(|| {
+                AdmissionError::failed("path has no parent")
+                    .context(unchanged(Operation::CreateDirectories, &path))
+            })?;
+            fs::create_dir_all(parent)
+                .await
+                .map_err(LocalError::annotated(
+                    PartialContext::new(
+                        Operation::CreateDirectories,
+                        Subject::ParentDirectory(parent.to_owned()),
+                    )
+                    .effects(Effects::PartialChange),
+                ))?;
         }
+        let bytes = atomic_write(&path, contents).await.map_err(|error| {
+            if self.create_parents
+                && error.diagnostic().context.effects != Effects::DestinationReplaced
+            {
+                error.effects(Effects::PartialChange)
+            } else {
+                error
+            }
+        })?;
+        Ok(WriteOutput { bytes })
     }
 }
 
 #[derive(Serialize, JsonSchema)]
 struct WriteOutput {
-    path: String,
     bytes: u64,
 }
 
@@ -251,11 +252,49 @@ struct ReplaceArgs {
     count: usize,
 }
 
-#[derive(Serialize, JsonSchema)]
-struct EditOutput {
-    path: String,
-    replacements: usize,
-    bytes: usize,
+impl ReplaceArgs {
+    /// Reject invalid input before authorization, source reads, or allocation.
+    fn admit(self) -> Result<Self, AdmissionError> {
+        let input = self.old.len().saturating_add(self.new.len());
+        let invalid = if input > MAX_WRITE_BYTES {
+            format!("replace input is {input} bytes, exceeding the {MAX_WRITE_BYTES}-byte limit")
+        } else if self.old.is_empty() {
+            "old cannot be empty".to_owned()
+        } else {
+            return Ok(self);
+        };
+        Err(AdmissionError::invalid_arguments(invalid)
+            .context(unchanged(Operation::Validate, &self.path)))
+    }
+
+    async fn run(self) -> Result<(), LocalError> {
+        let path = PathBuf::from(&self.path);
+        let bytes = crate::fs::read_regular(&path, MAX_WRITE_BYTES as u64)
+            .await
+            .map_err(AdmissionError::annotated(unchanged(Operation::Read, &path)))?;
+        let text = String::from_utf8(bytes).map_err(|error| {
+            AdmissionError::failed(error.utf8_error())
+                .context(unchanged(Operation::Deserialize, &path))
+        })?;
+        let found = text.matches(&self.old).count();
+        if found != self.count {
+            return Err(LocalError::failed(format!(
+                "expected {} matches, found {found}{}",
+                self.count,
+                match_lines(&text, &self.old)
+            ))
+            .context(unchanged(Operation::Validate, &path)));
+        }
+        // Bound the result before allocating it: a short search string and
+        // a large replacement can otherwise expand a small input enormously.
+        check_write_size(
+            replacement_size(text.len(), self.old.len(), self.new.len(), found),
+            &path,
+        )?;
+        let output = text.replace(&self.old, &self.new);
+        atomic_write(&path, Contents::Bytes(output.into_bytes())).await?;
+        Ok(())
+    }
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -270,7 +309,6 @@ struct RemoveArgs {
 
 #[derive(Serialize, JsonSchema)]
 struct RemoveOutput {
-    path: String,
     kind: RemoveKind,
 }
 
@@ -296,8 +334,9 @@ mod tests {
     use crate::{
         tests::{RecordingPolicy, TestRuntime},
         tool::{
+            ToolError,
             diagnostic::{Cause, IoKind},
-            executor::{ExecutionError, ExecutionResult, ToolExecutor},
+            executor::{ExecutionResult, ToolExecutor},
             policy::{PolicyDecision, ResourceId},
         },
     };
@@ -314,7 +353,7 @@ mod tests {
         path: impl serde::Serialize,
         content: &str,
         create_parents: bool,
-    ) -> Result<ExecutionResult, ExecutionError> {
+    ) -> Result<ExecutionResult, ToolError> {
         let arguments = json!({"path": path, "content": content, "create_parents": create_parents});
         executor.run_host(&runtime.agent, "write", arguments).await
     }
@@ -457,7 +496,6 @@ mod tests {
             let result = write(&executor, &runtime, &input, "hello", true)
                 .await
                 .unwrap();
-            assert_eq!(result.output.value["path"], relative);
             assert_eq!(result.output.value["bytes"], 5);
             assert_eq!(fs::read_to_string(&path).await.unwrap(), "hello");
             // Both modes keep working with existing parents and replace files.
@@ -491,10 +529,9 @@ mod tests {
             ("missing/../file.txt", "file.txt"),
             ("missing/../new/nested/file.txt", "new/nested/file.txt"),
         ] {
-            let result = write(&executor, &runtime, input, "text", true)
+            write(&executor, &runtime, input, "text", true)
                 .await
                 .unwrap();
-            assert_eq!(result.output.value["path"], expected);
             assert_eq!(
                 fs::read_to_string(root.join(expected)).await.unwrap(),
                 "text"
@@ -648,9 +685,15 @@ mod tests {
             .await
             .unwrap();
         let error = remove(json!({"path":"directory"})).await.unwrap_err();
-        let message = error.to_string();
-        assert!(message.contains("not empty"), "{message}");
-        assert!(message.contains("recursive"), "{message}");
+        let Cause::Io {
+            kind: IoKind::DirectoryNotEmpty,
+            detail: Some(detail),
+            ..
+        } = error.diagnostic().cause
+        else {
+            panic!("{error:?}")
+        };
+        assert!(detail.contains("recursive"), "{detail}");
         remove(json!({"path":"directory", "recursive":true}))
             .await
             .unwrap();

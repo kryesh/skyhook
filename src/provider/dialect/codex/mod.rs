@@ -10,16 +10,17 @@ use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
 use super::{
-    BaseUrl, BuildError, Common, Connection, Dialect, DialectConfig, DialectError, Pending,
-    Profile, UnsupportedCodec,
+    BaseUrl, BuildError, Common, Connection, Dialect, DialectConfig, DialectError, DialectSettings,
+    Pending, Profile, UnsupportedCodec,
 };
 use crate::provider::{
-    ProviderError, ProviderErrorKind,
+    ProviderError,
     codec::{
         Codec, CodecName, Identity, header,
         responses::{self, Instructions, TerminalOutput},
     },
     http::{Headers, Session, Transport, auth::Authenticator, headers::Value},
+    profile::ProviderName,
 };
 
 const ACCOUNT_HEADER: HeaderName = HeaderName::from_static("chatgpt-account-id");
@@ -80,6 +81,40 @@ impl Config {
     }
 }
 
+/// Codex entries naming different issuers, where one credential store serves one.
+#[derive(Debug, thiserror::Error)]
+#[error(
+    "codex providers `{first}` and `{second}` name different auth_url issuers, but Skyhook \
+     keeps one Codex login; give them the same auth_url"
+)]
+pub struct IssuerConflict {
+    pub first: ProviderName,
+    pub second: ProviderName,
+}
+
+/// The issuer every codex entry names, since one credential store serves one;
+/// OpenAI's when no entry names one.
+pub(crate) fn shared_issuer<'a>(
+    entries: impl IntoIterator<Item = (&'a ProviderName, &'a DialectSettings)>,
+) -> Result<auth::Issuer, IssuerConflict> {
+    let mut issuers = entries
+        .into_iter()
+        .filter_map(|(name, settings)| match settings {
+            DialectSettings::Codex(codex) => Some((name, codex.issuer())),
+            _ => None,
+        });
+    let Some((first, issuer)) = issuers.next() else {
+        return Ok(auth::Issuer::default());
+    };
+    match issuers.find(|(_, other)| *other != issuer) {
+        Some((second, _)) => Err(IssuerConflict {
+            first: first.clone(),
+            second: second.clone(),
+        }),
+        None => Ok(issuer),
+    }
+}
+
 impl DialectConfig for Config {
     fn admit(&self, common: &Common, codec: CodecName) -> Result<Profile, DialectError> {
         if codec != CodecName::Responses {
@@ -96,10 +131,7 @@ impl DialectConfig for Config {
             base_url: BaseUrl::Default(DEFAULT_BASE_URL),
             ..Profile::new(Codec::Responses(responses()), transport(), Dialect::Codex)
         };
-        profile.headers.insert(
-            HeaderName::from_static("originator"),
-            Value::Fixed(HeaderValue::from_static("skyhook")),
-        );
+        profile.fixed("originator", HeaderValue::from_static("skyhook"));
         Ok(profile)
     }
 
@@ -125,22 +157,16 @@ impl Authenticator for Subscription {
     fn headers(&self) -> BoxFuture<'_, Result<HeaderMap, ProviderError>> {
         Box::pin(async move {
             let credentials = self.0.credentials().await?;
-            let sensitive = |value: &str, message| {
-                let mut value = HeaderValue::from_str(value).map_err(|_| ProviderError {
-                    kind: ProviderErrorKind::Authentication,
-                    message: String::from(message),
-                })?;
+            let sensitive = |text: &str| {
+                let mut value = HeaderValue::from_str(text)
+                    .expect("tokens and account IDs hold no control characters");
                 value.set_sensitive(true);
-                Ok::<_, ProviderError>(value)
+                value
             };
-            let token = sensitive(
-                &format!("Bearer {}", credentials.access_token),
-                "invalid Codex access token",
-            )?;
-            let account = sensitive(&credentials.account_id, "invalid Codex account identifier")?;
+            let token = format!("Bearer {}", credentials.access_token.as_str());
             Ok(HeaderMap::from_iter([
-                (AUTHORIZATION, token),
-                (ACCOUNT_HEADER, account),
+                (AUTHORIZATION, sensitive(&token)),
+                (ACCOUNT_HEADER, sensitive(credentials.account_id.as_str())),
             ]))
         })
     }
@@ -151,8 +177,11 @@ mod tests {
     use super::*;
     use crate::provider::{
         Provider,
-        codec::common::tests::{reasoning_tool_request, reduce},
-        http::transport::tests::{Plan, Server, header_values, reply},
+        codec::common::tests::reduce,
+        http::{
+            tests::reasoning_tool_request,
+            transport::tests::{Plan, Server, header_values, reply},
+        },
         protocol::Outcome,
     };
     use futures_util::StreamExt;
@@ -224,17 +253,8 @@ mod tests {
     }
 
     #[test]
-    fn speaks_responses_without_a_key_at_the_service_or_a_mirror() {
+    fn takes_no_key_at_the_service_or_a_mirror() {
         let config = Config::default();
-        let chat = CodecName::ChatCompletions;
-        assert_eq!(
-            config.admit(&Common::default(), chat).unwrap_err(),
-            UnsupportedCodec {
-                dialect: Dialect::Codex,
-                codec: chat
-            }
-            .into()
-        );
         let keyed = Common {
             api_key: Some(crate::provider::dialect::Sourced::Literal("k".into())),
             ..Common::default()
@@ -277,8 +297,11 @@ mod tests {
             "https://auth.example/?secret",
             "https://auth.example/#secret",
         ] {
-            let error = mirror(invalid).unwrap_err().to_string();
-            assert!(error.contains(&auth::InvalidIssuer.to_string()), "{error}");
+            assert_eq!(
+                auth::Issuer::parse(invalid),
+                Err(auth::InvalidIssuer),
+                "{invalid}"
+            );
         }
     }
 }

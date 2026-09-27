@@ -11,12 +11,20 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    execution::ExecutionLocation, identity::JobId, named_enum::named_enum, target::TargetRef,
-    tool::policy::CapabilitySet,
+    execution::ExecutionLocation,
+    identity::JobId,
+    job::JobError,
+    named_enum::named_enum,
+    target::TargetRef,
+    tool::{
+        ToolPlacement,
+        output::{FieldPointer, escape_pointer_segment},
+        policy::CapabilitySet,
+    },
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
     pub enum Operation {
         Execute = "execute",
         Validate = "validate",
@@ -56,7 +64,7 @@ named_enum! {
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
     pub enum Effects {
         Unknown = "unknown",
         NotStarted = "not_started",
@@ -117,14 +125,10 @@ impl Subject {
         Self::Argument(
             segments
                 .into_iter()
-                .map(|segment| format!("/{}", pointer_segment(segment.as_ref())))
+                .map(|segment| format!("/{}", escape_pointer_segment(segment.as_ref())))
                 .collect(),
         )
     }
-}
-
-fn pointer_segment(segment: &str) -> String {
-    segment.replace('~', "~0").replace('/', "~1")
 }
 
 /// Invocation is resolved by the executor, not by the tool or renderer.
@@ -136,11 +140,13 @@ pub enum FailureSite {
 }
 
 impl FailureSite {
-    pub fn bound(location: &ExecutionLocation, host: bool) -> Self {
-        if host {
-            Self::Host
-        } else {
-            Self::Execution(location.clone())
+    /// Where a tool so placed fails: the host, or where it runs.
+    pub fn bound(location: &ExecutionLocation, placement: ToolPlacement) -> Self {
+        match placement {
+            ToolPlacement::Host => Self::Host,
+            ToolPlacement::InheritWorkspace | ToolPlacement::TargetedWorkspace => {
+                Self::Execution(location.clone())
+            }
         }
     }
 }
@@ -149,15 +155,20 @@ impl FailureSite {
 #[derive(Clone, Copy)]
 pub(crate) struct DiagnosticViewer<'a> {
     pub capabilities: &'a CapabilitySet,
-    target: &'a TargetRef,
+    /// The viewing agent's location; a host viewer has none and sees every detail.
+    location: Option<&'a ExecutionLocation>,
 }
 
 impl<'a> DiagnosticViewer<'a> {
     pub(crate) fn new(capabilities: &'a CapabilitySet, location: &'a ExecutionLocation) -> Self {
         Self {
             capabilities,
-            target: &location.target,
+            location: Some(location),
         }
+    }
+
+    pub(crate) fn location(&self) -> Option<&'a ExecutionLocation> {
+        self.location
     }
 }
 
@@ -166,13 +177,13 @@ impl<'a> From<&'a CapabilitySet> for DiagnosticViewer<'a> {
     fn from(capabilities: &'a CapabilitySet) -> Self {
         Self {
             capabilities,
-            target: &TargetRef::Root,
+            location: None,
         }
     }
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
     pub enum PathRole {
         Requested = "requested",
         Resolved = "resolved",
@@ -290,7 +301,7 @@ impl From<DiagnosticContext> for PartialContext {
 }
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, JsonSchema, PartialEq, Eq)]
     pub enum IoKind {
         NotFound = "not_found",
         PermissionDenied = "permission_denied",
@@ -372,6 +383,30 @@ pub enum Cause {
     InputClosed,
     Message(String),
     Json,
+    /// The tool needs a capability this context lacks: it is unavailable here,
+    /// which is not a policy denial.
+    Unavailable {
+        tool: String,
+    },
+    UnknownTool {
+        tool: String,
+    },
+    /// A script-only tool called directly by the model.
+    ModelHidden {
+        tool: String,
+    },
+    ScriptUnavailable {
+        tool: String,
+    },
+    UnknownJob {
+        job: JobId,
+    },
+    JobNotTerminal {
+        job: JobId,
+    },
+    JobAlreadyTerminal {
+        job: JobId,
+    },
 }
 
 impl Cause {
@@ -429,7 +464,7 @@ impl PartialDiagnostic {
                 cause.redact_io_detail();
                 cause
             }
-            AppendIndeterminate(_) => {
+            AppendIndeterminate { .. } => {
                 Message("session append completion is unknown; recovery is required".into())
             }
             AppendUnavailable(_) => {
@@ -443,14 +478,19 @@ impl PartialDiagnostic {
             ModelRequestReplay { sequence, reason } => Message(format!(
                 "cannot reconstruct model request at sequence {sequence}: {reason}"
             )),
+            InvalidCompaction { sequence, reason } => Message(format!(
+                "invalid compaction at sequence {sequence}: {reason}"
+            )),
+            WriterLost => Message("session writer was lost".into()),
+            Task(_) => Message("session task failed".into()),
+            NotFound(session) => Message(format!("session {session} was not found")),
             Random(_) => Message("session identifier generation failed".into()),
-            IdCollisions => Message("could not allocate a unique session identifier".into()),
             AlreadyOpen(session) => Message(format!("session {session} is already open")),
             UnsupportedVersion(version) => {
                 Message(format!("unsupported session version {version}"))
             }
             WrongSession => Message("event belongs to another session".into()),
-            BlobHashMismatch(_) => Message("stored blob failed its content hash check".into()),
+            Blob { reason, .. } => Message(format!("stored blob {reason}")),
         };
         Self::new(PartialContext::default().at(FailureSite::Host), cause)
     }
@@ -506,7 +546,10 @@ impl Diagnostic {
         match &self.context.site {
             FailureSite::Invocation => {}
             FailureSite::Host => {
-                if *viewer.target != TargetRef::Root {
+                if viewer
+                    .location
+                    .is_some_and(|location| location.target != TargetRef::Root)
+                {
                     text.push_str(" on session host");
                 }
             }
@@ -549,19 +592,25 @@ impl Diagnostic {
             Cause::Interrupted => text.push_str("operation interrupted; completion is unknown"),
             Cause::InputClosed => text.push_str("tool input channel is closed"),
             Cause::Json => text.push_str("invalid JSON data"),
-        }
-        if self.context.operation == Operation::Remove
-            && matches!(
-                self.cause,
-                Cause::Io {
-                    kind: IoKind::DirectoryNotEmpty,
-                    ..
-                }
-            )
-        {
-            text.push_str(
-                "; use recursive removal only if all directory contents should be deleted",
-            );
+            Cause::Unavailable { tool } => text.push_str(&safe_text(&format!(
+                "tool `{tool}` is unavailable in this context"
+            ))),
+            Cause::UnknownTool { tool } => {
+                text.push_str(&safe_text(&format!("unknown tool `{tool}`")))
+            }
+            Cause::ModelHidden { tool } => text.push_str(&safe_text(&format!(
+                "tool `{tool}` is not exposed for direct model calls"
+            ))),
+            Cause::ScriptUnavailable { tool } => text.push_str(&safe_text(&format!(
+                "tool `{tool}` is not available in scripts"
+            ))),
+            Cause::UnknownJob { job } => text.push_str(&JobError::Unknown(*job).to_string()),
+            Cause::JobNotTerminal { job } => {
+                text.push_str(&JobError::NotTerminal(*job).to_string())
+            }
+            Cause::JobAlreadyTerminal { job } => {
+                text.push_str(&JobError::AlreadyTerminal(*job).to_string())
+            }
         }
         text.push_str(match self.context.effects {
             Effects::Unknown => "",
@@ -669,24 +718,24 @@ fn quoted(value: &str) -> String {
 /// Deserialize once at the argument boundary. Only rejected inputs need schema
 /// diagnostics; serde's errors may echo credentials or user-provided content.
 pub(crate) fn deserialize_arguments<T: serde::de::DeserializeOwned + JsonSchema>(
-    value: &serde_json::Value,
+    arguments: &crate::tool::registry::Arguments,
 ) -> Result<T, super::AdmissionError> {
-    serde_path_to_error::deserialize(value).map_err(|error| {
-        let schema =
-            serde_json::to_value(schemars::schema_for!(T)).expect("generated schema serializes");
+    serde_path_to_error::deserialize(arguments).map_err(|error| {
+        let schema = schemars::schema_for!(T).to_value();
+        let value = serde_json::Value::Object(arguments.clone());
         let (path, expectation) = jsonschema::options()
             .with_retriever(NoExternalArgumentSchemas)
             .build(&schema)
             .ok()
             .and_then(|validator| {
                 validator
-                    .validate(value)
+                    .validate(&value)
                     .err()
-                    .map(|error| schema_argument_failure(&schema, value, &error))
+                    .map(|error| schema_argument_failure(&schema, &value, &error))
             })
             .unwrap_or_else(|| {
-                // Custom deserializers may reject values the schema accepts.
-                // Retain the declared expectation without reading serde's Display.
+                // Custom deserializers may reject values the schema accepts. Report
+                // the declared expectation, never serde's Display.
                 let (path, node) = argument_location(
                     &schema,
                     error.path().iter().map(|segment| match segment {
@@ -731,13 +780,8 @@ pub(crate) fn schema_argument_failure(
 ) -> (String, String) {
     // JSON pointers cannot distinguish numeric map keys from array indices.
     // Decode against the instance, preserving empty property names too.
-    let components: Vec<_> = error
-        .instance_path()
-        .as_str()
-        .split('/')
-        .skip(1)
-        .map(|component| component.replace("~1", "/").replace("~0", "~"))
-        .collect();
+    let pointer: FieldPointer = error.instance_path().as_str().parse().unwrap_or_default();
+    let components: Vec<_> = pointer.segments().collect();
     let mut node = input;
     let segments = components.iter().map(|component| {
         let segment = match node {
@@ -900,7 +944,7 @@ fn argument_location<'schema, 'path>(
             ArgumentPathSegment::Property(key) => {
                 let property = node.and_then(|node| node.schema.get("properties")?.get(key));
                 if property.is_some() {
-                    rendered.push_str(&pointer_segment(key));
+                    rendered.push_str(&escape_pointer_segment(key));
                 } else {
                     rendered.push('*');
                 }
@@ -1034,7 +1078,7 @@ mod tests {
                 vec!["expected one of", "fast", "safe"],
             ),
         ] {
-            let error = deserialize_arguments::<Input>(&value).unwrap_err();
+            let error = deserialize_arguments::<Input>(value.as_object().unwrap()).unwrap_err();
             let diagnostic = error.diagnostic();
             assert_eq!(diagnostic.context.subject, Subject::Argument(path.into()));
             let text = diagnostic.render(&CapabilitySet::default());
@@ -1156,8 +1200,8 @@ mod tests {
         use crate::{
             identity::{EventId, SessionId},
             job::JobError,
-            session::{AppendIdentity, AppendRecovery, DbError, SessionError},
-            tool::{ToolError, ToolOutput, executor::ExecutionError},
+            session::{AppendIdentity, AppendRecovery, DbError, RecoveryReason, SessionError},
+            tool::{ToolError, ToolOutput},
         };
         use std::sync::Arc;
 
@@ -1169,7 +1213,7 @@ mod tests {
                     session: SessionId::from_bytes([2; 16]),
                     sequence: 3.into(),
                 },
-                reason: SECRET.into(),
+                reason: RecoveryReason::Unpublished,
             }
         }
         for (error, message) in [
@@ -1179,11 +1223,10 @@ mod tests {
             ),
             (SessionError::Closed, "writer is closed"),
             (
-                SessionError::BlobHashMismatch(SECRET.into()),
-                "content hash check",
-            ),
-            (
-                SessionError::AppendIndeterminate(recovery()),
+                SessionError::AppendIndeterminate {
+                    recovery: recovery(),
+                    source: None,
+                },
                 "completion is unknown",
             ),
             (
@@ -1217,7 +1260,7 @@ mod tests {
             for error in [
                 ToolError::from(SessionError::Io(make())),
                 ToolError::from(Arc::new(SessionError::Io(make()))),
-                ExecutionError::from(JobError::from(SessionError::Io(make()))).into_tool_error(),
+                ToolError::from(JobError::from(SessionError::Io(make()))),
             ] {
                 let (diagnostic, output) = error
                     .with_result(ToolOutput::new(json!({"partial": true})))

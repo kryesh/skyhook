@@ -57,6 +57,69 @@ pub(crate) struct AuthorizationSubject {
     pub cancellation: CancellationToken,
 }
 
+/// What a policy sees of one invocation, for its admission and every later
+/// request. The tool's own arguments keep their namespace.
+#[derive(Debug, Default, serde::Serialize)]
+pub(crate) struct AuthorizationArguments {
+    pub(crate) tool: super::registry::Arguments,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) route: Option<serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) source: Option<SourceArguments>,
+}
+
+#[derive(Clone, Debug, serde::Serialize)]
+pub(crate) struct SourceArguments {
+    pub(crate) path: String,
+    pub(crate) target: crate::target::TargetRef,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) route: Option<serde_json::Value>,
+}
+
+impl AuthorizationArguments {
+    /// The document a request shows, naming the origin a running request moved to.
+    pub(crate) fn document(&self, network_origin: Option<&str>) -> serde_json::Value {
+        #[derive(serde::Serialize)]
+        struct Document<'a> {
+            #[serde(flatten)]
+            arguments: &'a AuthorizationArguments,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            network_origin: Option<&'a str>,
+        }
+        let document = Document {
+            arguments: self,
+            network_origin,
+        };
+        serde_json::to_value(document).expect("JSON values and strings serialize")
+    }
+}
+
+/// What a running invocation asks its host to authorize.
+#[derive(Debug, serde::Deserialize, serde::Serialize)]
+pub(crate) enum Reauthorization {
+    /// Permissions derived where the invocation runs.
+    Permissions(Vec<PermissionUse>),
+    /// The origin a running request moved to, which the policy is also shown.
+    Network(String),
+}
+
+impl Reauthorization {
+    /// The permissions asked for on `target`, and the origin a request moved to.
+    pub(crate) fn into_parts(
+        self,
+        target: &crate::target::TargetRef,
+    ) -> (Vec<PermissionUse>, Option<String>) {
+        match self {
+            Self::Permissions(permissions) => (permissions, None),
+            Self::Network(origin) => {
+                let resource = super::policy::ResourceId::network(target, &origin);
+                let permission = PermissionUse::new(super::policy::Capability::Network, resource);
+                (vec![permission], Some(origin))
+            }
+        }
+    }
+}
+
 type ApprovalFuture = Shared<BoxFuture<'static, Result<Vec<ApprovalGrant>, AuthorizationError>>>;
 
 #[derive(Clone)]
@@ -90,16 +153,20 @@ impl AuthorizationCoordinator {
         }
     }
 
-    /// Journal grants to `store`, starting from those it already holds.
-    pub async fn journaled(mut self, store: crate::session::SessionStore) -> Self {
+    /// Journal grants to `store`, starting from those its `records` hold.
+    pub async fn journaled(
+        mut self,
+        store: crate::session::SessionStore,
+        records: &[crate::session::EventRecord],
+    ) -> Self {
         let mut grants = Vec::new();
-        for record in store.records().await {
-            match record.event {
+        for record in records {
+            match &record.event {
                 crate::session::SessionEvent::ApprovalGranted { grant, .. } => {
-                    grants.push((Some(record.sequence), grant));
+                    grants.push((Some(record.sequence), grant.clone()));
                 }
                 crate::session::SessionEvent::ApprovalRevoked { grant } => {
-                    grants.retain(|(sequence, _)| *sequence != Some(grant));
+                    grants.retain(|(sequence, _)| *sequence != Some(*grant));
                 }
                 _ => {}
             }
@@ -385,8 +452,9 @@ mod tests {
         let resource = ResourceId::mcp("server", "operation");
         let policy = Arc::new(CountingPolicy::default());
         let journaled = async || {
+            let records = session.store.records().await;
             AuthorizationCoordinator::new(policy.clone())
-                .journaled(session.store.clone())
+                .journaled(session.store.clone(), &records)
                 .await
         };
         authorize(&journaled().await, &subject, &resource)
@@ -433,15 +501,16 @@ mod tests {
         while policy.calls.load(Ordering::SeqCst) == 0 {
             policy.started.notified().await;
         }
-        let second = spawn(subject(CancellationToken::new()));
-        tokio::task::yield_now().await;
+        let second_subject = subject(CancellationToken::new());
+        let mut second = Box::pin(authorize(&coordinator, &second_subject, &resource));
+        assert!(futures_util::poll!(&mut second).is_pending());
         first_cancellation.cancel();
         assert!(matches!(
             first.await.unwrap(),
             Err(AuthorizationError::Cancelled)
         ));
         release.add_permits(1);
-        second.await.unwrap().unwrap();
+        crate::tests::bounded(second).await.unwrap();
         assert_eq!(policy.calls.load(Ordering::SeqCst), 1);
     }
 

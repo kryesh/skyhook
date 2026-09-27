@@ -2,27 +2,23 @@
 
 use super::*;
 
-type Completion = RequestCompletion;
-
 // This is only the retained command loop's state. Shared job liveness, pending
 // deliveries and owner forwarding remain authoritative in their own managers.
 enum DriverPhase {
-    // The root has no waiter to settle, only whether its last turn ended in error.
-    Root { parked: bool },
+    // The root has no waiter to settle; whether it is parked is its published turn.
+    Root,
     Child(ChildPhase),
 }
 
 enum ChildPhase {
     Idle,
     Running {
-        completion: Option<Completion>,
+        completion: Option<ChildCompletion>,
     },
     Answered {
         answer: String,
-        completion: Option<Completion>,
+        completion: Option<ChildCompletion>,
     },
-    // Failed or interrupted turns retain context, but notifications cannot resume them.
-    Parked,
 }
 
 /// Who took a child's answer when its invocation completed.
@@ -35,10 +31,10 @@ enum Handoff {
 }
 
 /// Replace a child's phase, yielding the waiter the old phase held.
-fn take_completion(phase: &mut ChildPhase, next: ChildPhase) -> Option<Completion> {
+fn take_completion(phase: &mut ChildPhase, next: ChildPhase) -> Option<ChildCompletion> {
     match std::mem::replace(phase, next) {
         ChildPhase::Running { completion } | ChildPhase::Answered { completion, .. } => completion,
-        ChildPhase::Idle | ChildPhase::Parked => None,
+        ChildPhase::Idle => None,
     }
 }
 
@@ -47,23 +43,19 @@ impl DriverPhase {
         matches!(self, Self::Child(_))
     }
 
-    fn parked(&self) -> bool {
-        matches!(
-            self,
-            Self::Root { parked: true } | Self::Child(ChildPhase::Parked)
-        )
-    }
-
-    fn begin(&mut self, completion: Option<Completion>) -> Option<Completion> {
+    /// The waiter the turn's caller settles: the root's, never a child's own.
+    fn begin(&mut self, completion: Option<RequestCompletion>) -> Option<RequestCompletion> {
         let phase = match self {
-            Self::Root { parked } => {
-                *parked = false;
-                return completion;
-            }
+            Self::Root => return completion,
             Self::Child(phase) => phase,
         };
         // A new explicit waiter supersedes the old one; callback-free queued
         // input and descendant turns keep the current invocation's waiter.
+        let completion = match completion {
+            Some(RequestCompletion::Child(completion)) => Some(completion),
+            None => None,
+            root => return root,
+        };
         let previous = take_completion(phase, ChildPhase::Idle);
         *phase = ChildPhase::Running {
             completion: completion.or(previous),
@@ -78,17 +70,14 @@ impl DriverPhase {
         }
     }
 
-    // Parking is unconditional; the returned flag is only whether the failure
-    // reached this invocation's waiter, which is what finishes the owning job.
+    // Whether the failure reached this invocation's waiter, which is what
+    // finishes the owning job. Parking is the published turn's, not the phase's.
     fn fail(&mut self, error: TurnFailure) -> bool {
         let phase = match self {
-            Self::Root { parked } => {
-                *parked = true;
-                return false;
-            }
+            Self::Root => return false,
             Self::Child(phase) => phase,
         };
-        let Some(completion) = take_completion(phase, ChildPhase::Parked) else {
+        let Some(completion) = take_completion(phase, ChildPhase::Idle) else {
             return false;
         };
         completion.send(Err(error)).is_ok()
@@ -117,9 +106,8 @@ impl DriverPhase {
 }
 
 impl SessionRuntime {
-    /// Wake a child's owner for a reply published without a wake. Only for paths
-    /// that do not finish the owning job: a finishing job's own completion presents
-    /// reply and completion in one delivery batch, which an earlier wake would split.
+    /// Release a child's held answer to its owner as a reply. Only for paths that
+    /// do not finish the owning job: a completing job's answer is its result.
     async fn wake_owner(&self, owner_job: Option<JobId>) {
         if let Some(job) = owner_job {
             self.jobs.notify_owner(job).await;
@@ -142,14 +130,36 @@ impl SessionRuntime {
             || self.jobs.has_pending(id).await
     }
 
-    /// Resolve an answered invocation once. Without a waiter nothing finishes the
-    /// owning job, so the owner is woken here instead.
-    async fn complete_invocation(
+    /// Complete an answered child's invocation once nothing keeps it open: work
+    /// that kept it open may have been rejected, withdrawn or consumed elsewhere
+    /// without running a turn. Without a waiter nothing finishes the owning job,
+    /// so the owner is woken here instead. One that stays open waits idle for that
+    /// work, and its reply must not wait for the work to reach the owner.
+    async fn settle_answered(
         &self,
         id: &AgentId,
         owner_job: Option<JobId>,
         phase: &mut DriverPhase,
+        control: &AgentControl,
+        rx: &mut mpsc::Receiver<AgentCommand>,
+        deferred: &mut VecDeque<AgentCommand>,
     ) {
+        if !matches!(phase, DriverPhase::Child(ChildPhase::Answered { .. })) {
+            return;
+        }
+        if self.jobs.has_running(id).await {
+            self.wake_owner(owner_job).await;
+            return;
+        }
+        // A descendant may have published a reply and then finished meanwhile, so
+        // pending work is checked after observing no live jobs, and under the
+        // invocation lock that serializes it with owner forwarding.
+        let mut invocation = control.invocation.lock().await;
+        if self.invocation_continues(id, rx, deferred).await {
+            self.wake_owner(owner_job).await;
+            return;
+        }
+        *invocation = Invocation::Resolved;
         if let Some(handoff) = phase.complete() {
             let _ = self
                 .store
@@ -163,11 +173,7 @@ impl SessionRuntime {
 
     pub(super) async fn run_agent(self: Arc<Self>, agent_loop: AgentLoop) {
         let AgentLoop {
-            control:
-                AgentControl {
-                    completion_gate,
-                    retryable_interrupt,
-                },
+            control,
             id,
             owner_job,
             mut context,
@@ -175,11 +181,13 @@ impl SessionRuntime {
             mut settings,
             mut rx,
         } = agent_loop;
-        let mut phase = if owner_job.is_some() {
-            DriverPhase::Child(ChildPhase::Idle)
-        } else {
-            DriverPhase::Root { parked: false }
-        };
+        let AgentControl {
+            invocation,
+            retryable_interrupt,
+            ..
+        } = control.clone();
+        let mut phase =
+            owner_job.map_or(DriverPhase::Root, |_| DriverPhase::Child(ChildPhase::Idle));
         let child = phase.is_child();
         let owner_cancellation = match owner_job {
             Some(job) => match self.jobs.cancellation_token(job).await {
@@ -202,8 +210,7 @@ impl SessionRuntime {
                         // The cancelled owning job finishes and wakes the owner for
                         // whatever is still pending; with no waiter nothing finishes
                         // it, so a retained reply needs the explicit wake.
-                        let failure = TurnFailure::Other("child agent cancelled".to_owned());
-                        if !phase.fail(failure) {
+                        if !phase.fail(TurnFailure::Cancelled) {
                             self.wake_owner(owner_job).await;
                         }
                         let _ = self.store.append(id.clone(), SessionEvent::AgentInterrupted).await;
@@ -214,7 +221,7 @@ impl SessionRuntime {
                     command = rx.recv() => match command { Some(command) => command, None => break },
                 }
             };
-            if phase.parked() && matches!(command, AgentCommand::JobsReady) {
+            if control.turn() == TurnState::Parked && matches!(command, AgentCommand::JobsReady) {
                 // Leave durable notifications pending without rearming a failed
                 // turn or clearing its interruption marker before explicit resume;
                 // the next input's request carries them.
@@ -253,6 +260,15 @@ impl SessionRuntime {
                         queue::reject_pending(&mut rx, &mut deferred);
                     }
                     if !batch.consumed {
+                        self.settle_answered(
+                            &id,
+                            owner_job,
+                            &mut phase,
+                            &control,
+                            &mut rx,
+                            &mut deferred,
+                        )
+                        .await;
                         continue;
                     }
                     (Vec::new(), None, Selection::default())
@@ -276,67 +292,60 @@ impl SessionRuntime {
                     {
                         Ok(Some((content, pending))) => {
                             pending_events = Some(pending);
-                            content
+                            vec![content]
                         }
-                        Ok(None)
-                            if matches!(phase, DriverPhase::Child(ChildPhase::Answered { .. }))
-                                && !self.jobs.has_running(&id).await =>
-                        {
-                            let mut completing = completion_gate.lock().await;
-                            if self.invocation_continues(&id, &mut rx, &mut deferred).await {
-                                self.wake_owner(owner_job).await;
-                                continue;
-                            }
-                            *completing = false;
-                            self.complete_invocation(&id, owner_job, &mut phase).await;
+                        Ok(None) => {
+                            self.settle_answered(
+                                &id,
+                                owner_job,
+                                &mut phase,
+                                &control,
+                                &mut rx,
+                                &mut deferred,
+                            )
+                            .await;
                             continue;
                         }
-                        _ => continue,
+                        Err(_) => continue,
                     };
                     (content, None, Selection::default())
                 }
             };
-            let selected = self.select(&mut turn, &mut context, &mut settings, options, false);
+            let images = content.iter().any(UserPart::is_image);
+            let selected = self.select(&mut turn, &mut context, &mut settings, options, images);
             if let Err(error) = selected.await {
                 if let Some(done) = done {
-                    let _ = done.send(Err((&error).into()));
+                    done.settle(Err(error));
                 }
                 // The phase is untouched: a parked child stays parked until an
                 // input with an admissible selection resumes its retained task.
                 continue;
             }
             let done = phase.begin(done);
+            control.set_turn(TurnState::Busy);
             self.activity(&id, AgentActivity::Working);
             if !content.is_empty() {
                 let message = Message::User(content);
                 let committed = match pending_events {
-                    Some(pending) => pending
-                        .commit(message.clone())
-                        .await
-                        .map_err(HarnessError::from),
-                    None => self
-                        .commit(&id, message.clone())
-                        .await
-                        .map_err(HarnessError::from),
+                    Some(pending) => pending.commit(message).await.map_err(HarnessError::from),
+                    None => self.commit(&id, message).await.map_err(HarnessError::from),
                 };
-                if let Err(error) = &committed {
+                if let Err(error) = committed {
+                    let failure = TurnFailure::from(&error);
                     if let Some(done) = done {
-                        let _ = done.send(Err(error.into()));
+                        done.settle(Err(error));
                     }
                     // No reply was published in this iteration and every earlier
-                    // resolution already finished the job or woke the owner, so the
-                    // parked/failed handoff needs no wake of its own.
-                    phase.fail(error.into());
+                    // resolution already finished the job or woke the owner, so
+                    // the parked/failed handoff needs no wake of its own.
+                    phase.fail(failure);
+                    control.set_turn(TurnState::Parked);
                     if child {
                         self.interrupt_tree(&id).await;
                         break;
                     }
                     continue;
                 }
-                context
-                    .projected
-                    .messages
-                    .push((committed.expect("commit succeeded").into(), message));
             }
             let result = tokio::select! {
                 biased;
@@ -351,59 +360,47 @@ impl SessionRuntime {
             };
             // Serialize the final mailbox check with owner forwarding. An accepted
             // update either joins this request cycle or starts a new retained turn.
-            let mut completing = completion_gate.lock().await;
+            let mut completing = invocation.lock().await;
             if result.is_err() {
                 // Reject under the forwarding gate too: a late queued update must
                 // not start an orphan turn after a retained child has failed.
                 queue::reject_pending(&mut rx, &mut deferred);
             }
             if let Ok(answer) = &result {
-                // Preserve the latest successful turn BEFORE any pending-work
-                // gate can continue the loop (including rejected queued input).
                 phase.answered(answer.clone());
             }
-            if child
-                && result.is_ok()
-                && self.invocation_continues(&id, &mut rx, &mut deferred).await
-            {
-                // No job completion will carry the reply published during the turn.
-                self.wake_owner(owner_job).await;
-                continue;
-            }
+            let failure = result.as_ref().err().map(TurnFailure::from);
             // A terminal turn failure is journaled, not only broadcast: the retry
             // affordance is gated on agent activity, which is otherwise lost when
             // the session is reopened.
-            if let Err(error) = &result
-                && !matches!(error, HarnessError::Interrupted)
-            {
-                let _ = self
-                    .store
-                    .append(
-                        id.clone(),
-                        SessionEvent::AgentFailed {
-                            error: error.to_string(),
-                        },
-                    )
-                    .await;
+            if let Some(TurnFailure::Failed(failure)) = &failure {
+                let failure = failure.clone();
+                let failed = SessionEvent::AgentFailed { failure };
+                let _ = self.store.append(id.clone(), failed).await;
             }
+            // An answered child is idle even while work keeps its invocation open:
+            // no turn runs until that work arrives, so an interrupt has nothing to stop.
+            control.set_turn(match &failure {
+                Some(_) => TurnState::Parked,
+                None => TurnState::Idle,
+            });
             self.activity(
                 &id,
-                match &result {
-                    Err(error) => AgentActivity::Stopped(error.into()),
-                    Ok(_) if child && self.jobs.has_running(&id).await => {
+                match &failure {
+                    Some(failure) => AgentActivity::Stopped(failure.clone()),
+                    None if child && self.jobs.has_running(&id).await => {
                         AgentActivity::WaitingChildren
                     }
-                    Ok(_) => AgentActivity::Idle,
+                    None => AgentActivity::Idle,
                 },
             );
+            // Only the root holds its own waiter; a child's lives in its phase.
             if let Some(done) = done {
-                let _ = done.send(result.as_ref().map(Clone::clone).map_err(TurnFailure::from));
+                done.settle(result);
+                continue;
             }
-            if !child && let Err(error) = &result {
-                phase.fail(error.into());
-            }
-            if child && result.is_err() {
-                if matches!(&result, Err(HarnessError::Interrupted))
+            if child && let Some(failure) = failure {
+                if failure == TurnFailure::Interrupted
                     && (owner_cancellation.is_cancelled()
                         || !retryable_interrupt.load(Ordering::Acquire))
                 {
@@ -425,39 +422,20 @@ impl SessionRuntime {
                 // A provider/turn failure is terminal for this invocation, not for
                 // the retained child. Keep its command loop, provider session, and
                 // projected history alive so the owning job can restart it.
-                *completing = false;
-                if let Err(error) = &result {
-                    // An aborted response commits its partial visible text before
-                    // failing the turn; the failing job wakes the owner for it, and
-                    // a parked child without a waiter needs the explicit wake.
-                    if !phase.fail(error.into()) {
-                        self.wake_owner(owner_job).await;
-                    }
-                }
-                continue;
-            }
-            if matches!(phase, DriverPhase::Child(ChildPhase::Answered { .. }))
-                && !self.jobs.has_running(&id).await
-            {
-                // A descendant may have published a reply and then finished
-                // during the awaits above. Check after observing no live jobs.
-                if self.jobs.has_pending(&id).await {
-                    // The loop continues instead of completing, so the terminal reply
-                    // published during this turn needs its wake here.
+                *completing = Invocation::Resolved;
+                // An aborted response commits its partial visible text before
+                // failing the turn; the failing job wakes the owner for it, and a
+                // parked child without a waiter needs the explicit wake.
+                if !phase.fail(failure) {
                     self.wake_owner(owner_job).await;
-                    continue;
                 }
-                *completing = false;
-                self.complete_invocation(&id, owner_job, &mut phase).await;
-                // Retain the provider session and full projected history while idle.
-                // A fresh owner request resumes this same child, never a new agent.
                 continue;
             }
-            // Loop tail: a child that answered while holding live jobs of its own.
-            // The invocation stays open across another mailbox wait, so its terminal
-            // reply must not wait for that work to reach the owner. The root has no
-            // owner job and never wakes anyone here.
-            self.wake_owner(owner_job).await;
+            drop(completing);
+            // Retain the provider session and full projected history while idle. A
+            // fresh owner request resumes this same child, never a new agent.
+            self.settle_answered(&id, owner_job, &mut phase, &control, &mut rx, &mut deferred)
+                .await;
         }
         if let Some(job) = owner_job {
             self.jobs.clear_resume_handler(job).await;
@@ -493,7 +471,7 @@ mod tests {
             loop {
                 tokio::select! {
                     result = &mut prompt => panic!("parent returned before child work completed: {result:?}"),
-                    event = events.recv() => if matches!(event.unwrap().event, RuntimeEvent::TurnCompleted { text, .. } if text == "premature child answer") { break; },
+                    event = events.recv() => if matches!(event.unwrap().event, RuntimeEvent::TurnCompleted { agent } if agent == session.root.child(1)) { break; },
                 }
             }
         }).await;
@@ -529,10 +507,9 @@ mod tests {
             _ => &[],
         });
         let result = results.find(|result| result.name == "agent").unwrap();
-        assert_eq!(result.result["state"], "completed");
+        assert!(!result.is_error);
         // A foreground call returns its answer in the result and nothing else is
         // delivered: no progress replies, and the answer only once.
-        assert!(result.result["meta"]["last_message"].is_null());
         let serialized = rendered(last);
         assert_eq!(serialized.matches("premature child answer").count(), 0);
         let in_result = serde_json::to_string(&result.result).unwrap();
@@ -573,19 +550,7 @@ mod tests {
         let parent_session = session.clone();
         let parent = tokio::spawn(async move { parent_session.prompt("delegate").await });
         provider.request(2).await;
-        // Observed activity trails the journal; interrupt once the parent is seen waiting.
-        bounded(async {
-            while !matches!(
-                session.observe().await.snapshot.activity.get(&session.root),
-                Some(
-                    crate::agent::AgentActivity::Tools
-                        | crate::agent::AgentActivity::WaitingChildren
-                )
-            ) {
-                poll().await;
-            }
-        })
-        .await;
+        root_waiting(&session).await;
         let original_jobs = session.runtime.jobs.list(&session.root).await;
         assert_eq!(original_jobs.len(), 2);
         // The children are interrupted; the parent holding them shows interrupted
@@ -594,13 +559,13 @@ mod tests {
         assert!(!parent.is_finished());
         assert!(!provider.requested_from(3));
         // Resume immediately, even before the child worker journals Interrupted.
-        assert!(session.runtime.events.retryable(&session.root));
+        assert_eq!(turn(&session, &session.root), TurnState::Held);
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
         provider.request(4).await;
         // Resume must leave the original parent wait pending, and shows it waiting
         // again rather than interrupted.
         assert!(!parent.is_finished());
-        assert!(!session.runtime.events.retryable(&session.root));
+        assert_eq!(turn(&session, &session.root), TurnState::Busy);
         assert_eq!(
             session.observe().await.snapshot.activity.get(&session.root),
             Some(&crate::agent::AgentActivity::WaitingChildren)
@@ -608,9 +573,12 @@ mod tests {
         let records = session.runtime.store.records().await;
         let interrupted = count!(&records, SessionEvent::JobFinished { state, .. } if *state == JobEnd::Interrupted);
         assert_eq!(interrupted, 2);
-        // Only an interrupted stream, never an interrupted startup, journals usage.
+        // Only an interrupted stream, never an interrupted startup, closes an attempt.
         let children = records.iter().filter(|record| record.agent != session.root);
-        assert_eq!(count!(children, SessionEvent::Usage { .. }), 2);
+        assert_eq!(
+            count!(children, SessionEvent::ModelAttemptInterrupted(_)),
+            2
+        );
         let root_records = records.iter().filter(|record| record.agent == session.root);
         assert_eq!(count!(root_records, SessionEvent::ModelRequested { .. }), 1);
         // Continuation must not create replacement agents.
@@ -658,18 +626,7 @@ mod tests {
         let parent_session = session.clone();
         let parent = tokio::spawn(async move { parent_session.prompt("delegate").await });
         provider.request(1).await;
-        bounded(async {
-            while !matches!(
-                session.observe().await.snapshot.activity.get(&session.root),
-                Some(
-                    crate::agent::AgentActivity::Tools
-                        | crate::agent::AgentActivity::WaitingChildren
-                )
-            ) {
-                poll().await;
-            }
-        })
-        .await;
+        root_waiting(&session).await;
         assert_eq!(session.interrupt().await, 2);
         assert!(!parent.is_finished());
         assert_eq!(
@@ -722,18 +679,7 @@ mod tests {
         let parent_session = session.clone();
         let parent = tokio::spawn(async move { parent_session.prompt("delegate").await });
         provider.request(1).await;
-        bounded(async {
-            while !matches!(
-                session.observe().await.snapshot.activity.get(&session.root),
-                Some(
-                    crate::agent::AgentActivity::Tools
-                        | crate::agent::AgentActivity::WaitingChildren
-                )
-            ) {
-                poll().await;
-            }
-        })
-        .await;
+        root_waiting(&session).await;
         assert_eq!(session.interrupt().await, 2);
         let prompt = QueuedPrompt {
             text: "use the right user".into(),
@@ -780,10 +726,8 @@ mod tests {
                 let partial = AssistantItem::text("answer", 0, "partial child answer");
                 Step::new(cut(vec![partial], CutReason::Aborted))
             } else {
-                Step::fail(ProviderError {
-                    kind: crate::provider::ProviderErrorKind::Authentication,
-                    message: "fixture permanent failure".into(),
-                })
+                let kind = crate::provider::ProviderErrorKind::Authentication;
+                Step::fail(kind.error("fixture permanent failure"))
             };
             let answers = ["child recovered", "parent done", "parent done"];
             let answers = answers.map(|text| Step::new(answer(text)));
@@ -818,11 +762,7 @@ mod tests {
                 .await
                 .unwrap()
                 .job;
-            let wait = async || {
-                jobs.wait(job, Some(Duration::from_secs(5)), true)
-                    .await
-                    .unwrap()
-            };
+            let wait = async || bounded(jobs.wait(job, None, true)).await.unwrap();
             let failed = wait().await;
             assert_eq!(failed.state, JobState::Failed);
             let child = session.root.child(1);
@@ -839,7 +779,7 @@ mod tests {
             }
             let retry = format!("return tool.job({job}).send({{value:'try again'}});");
             let resumed = session.run_script(retry).await.unwrap();
-            assert_eq!(resumed.value["value"]["result"]["accepted"], true);
+            assert_eq!(resumed.value["value"], json!({}));
             let recovered = wait().await;
             assert_eq!(recovered.state, JobState::Completed);
             assert_eq!(recovered.output, Some(json!("child recovered")));
@@ -926,36 +866,70 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
+    /// A background child's answer, released early while it still held work, is
+    /// its result once: completion withdraws the undelivered reply, as replay does.
     #[tokio::test(start_paused = true)]
     async fn child_finishes_when_another_waiter_claims_its_last_background_result() {
-        let (_root, _requests, session) = scripted_session([answer("initial")]).await;
-        let (child, sender, job) = retained_child(&session).await;
-        let (done, received) = oneshot::channel();
-        let mut events = session.runtime.events.observe().updates;
-        child_input(&sender, Some(done)).await;
-        wait_for_child_answer(&mut events, &child).await;
-        claim_completed(&session, job).await;
-        assert_eq!(bounded(received).await.unwrap().unwrap(), "initial");
-        session.shutdown().await.unwrap();
+        for background in [false, true] {
+            let (_root, _requests, session) = scripted_session([answer("initial")]).await;
+            let root_inbox = quiet_root(&session);
+            let (owner, child, sender, job) = retained_child(&session, background).await;
+            let (done, received) = oneshot::channel();
+            let mut events = session.runtime.events.observe().updates;
+            child_input(&sender, Some(done)).await;
+            wait_for_child_answer(&mut events, &child).await;
+            let jobs = &session.runtime.jobs;
+            if background {
+                // The loop tail releases the answer: the child still holds work.
+                bounded(async {
+                    while !jobs.has_pending(&session.root).await {
+                        poll().await;
+                    }
+                })
+                .await;
+            }
+            claim_completed(&session, job).await;
+            let answer = bounded(received).await.unwrap().unwrap();
+            assert_eq!(answer, "initial");
+            let result = JobOutcome::Completed(ToolOutput::new(answer.into()));
+            jobs.finish(owner, result).await.unwrap();
+            let delivery = jobs.pending_delivery(&session.root).await.unwrap();
+            assert!(delivery.messages().is_empty());
+            drop((delivery, root_inbox));
+            session.shutdown().await.unwrap();
+        }
+    }
+
+    /// A retained child with an owner job.
+    async fn spawned_child(
+        session: &SessionHandle,
+        background: bool,
+    ) -> (JobId, AgentId, AgentSender) {
+        let child = session.root.child(1);
+        let owner = owner(session, background).await;
+        let launch = child_launch(session, None);
+        let spawned = session
+            .runtime
+            .spawn_agent(child.clone(), Some(owner), launch);
+        let sender = spawned.await.unwrap();
+        let jobs = &session.runtime.jobs;
+        jobs.set_child_agent(owner, child.clone()).await.unwrap();
+        (owner, child, sender)
     }
 
     /// A retained child with an owner job, plus one background job it owns.
-    async fn retained_child(session: &SessionHandle) -> (AgentId, AgentSender, JobId) {
-        let child = session.root.child(1);
-        let launch = child_launch(session, child.clone(), Some(owner(session).await));
-        let sender = session.runtime.spawn_agent(launch).await.unwrap();
+    async fn retained_child(
+        session: &SessionHandle,
+        background: bool,
+    ) -> (JobId, AgentId, AgentSender, JobId) {
+        let (owner, child, sender) = spawned_child(session, background).await;
+        let jobs = &session.runtime.jobs;
         let spec = JobSpec {
             background: true,
             ..JobSpec::test(child.clone(), "manual")
         };
-        let job = session
-            .runtime
-            .jobs
-            .create(spec)
-            .await
-            .unwrap()
-            .into_test_id();
-        (child, sender, job)
+        let job = jobs.create(spec).await.unwrap().into_test_id();
+        (owner, child, sender, job)
     }
 
     async fn claim_completed(session: &SessionHandle, job: JobId) {
@@ -964,16 +938,16 @@ mod tests {
         session.runtime.jobs.claim(job).await.unwrap();
     }
 
-    fn input(text: &str, options: Selection, done: Option<Completion>) -> AgentCommand {
+    fn input(text: &str, options: Selection, done: Option<ChildCompletion>) -> AgentCommand {
         let content = vec![UserPart::Text { text: text.into() }];
         AgentCommand::Input {
             options,
             content,
-            done,
+            done: done.map(RequestCompletion::Child),
         }
     }
 
-    async fn child_input(sender: &AgentSender, done: Option<Completion>) {
+    async fn child_input(sender: &AgentSender, done: Option<ChildCompletion>) {
         let input = input("task", Selection::default(), done);
         sender.send(input).await.unwrap();
     }
@@ -985,7 +959,7 @@ mod tests {
         let (done, received) = oneshot::channel();
         let mode = SessionMode {
             runtime: session.runtime.instance,
-            name: "driver-test-mode".into(),
+            name: "driver-test-mode".parse().unwrap(),
         };
         let selection = Selection {
             mode: Some(mode),
@@ -1014,29 +988,13 @@ mod tests {
         count!(child_records, SessionEvent::AgentCompleted)
     }
 
-    fn completion_gate(session: &SessionHandle, child: &AgentId) -> Arc<Mutex<bool>> {
+    fn invocation(session: &SessionHandle, child: &AgentId) -> Arc<Mutex<Invocation>> {
         let agents = session.runtime.agents.read().unwrap();
-        agents[child].control.completion_gate.clone()
+        agents[child].control.invocation.clone()
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn pending_rejected_input_preserves_latest_child_answer() {
-        let (_root, requests, session) =
-            scripted_session([answer("old answer"), answer("latest answer")]).await;
-        let root_inbox = quiet_root(&session);
-        let (child, sender, background) = retained_child(&session).await;
-        let (done, received) = oneshot::channel();
-        let mut events = session.runtime.events.observe().updates;
-        child_input(&sender, Some(done)).await;
-        wait_for_child_answer(&mut events, &child).await;
-        mailbox_barrier(&session, &sender).await;
-        assert_eq!(completion_count(&session, &child).await, 0);
-
-        let gate = completion_gate(&session, &child);
-        let completing = gate.lock().await;
-        child_input(&sender, None).await;
-        wait_for_child_answer(&mut events, &child).await;
-        // The newer answer's final mailbox check waits for this forwarding window.
+    /// Queue input its sender already withdrew; the receiver reports its rejection.
+    async fn withdrawn_input(sender: &AgentSender) -> oneshot::Receiver<Result<(), HarnessError>> {
         let cancellation = QueuedPromptCancellation::default();
         assert!(cancellation.cancel());
         let (committed, rejected) = oneshot::channel();
@@ -1049,6 +1007,31 @@ mod tests {
         };
         let queued = AgentCommand::QueuedInputs(vec![queued]);
         sender.send(queued).await.unwrap();
+        rejected
+    }
+
+    /// Rejected input that kept an answered invocation open completes it with the
+    /// latest answer on a later empty wakeup. The completed child is idle, so a
+    /// later interrupt leaves it alone.
+    #[tokio::test(start_paused = true)]
+    async fn pending_rejected_input_preserves_latest_child_answer() {
+        let (_root, requests, session) =
+            scripted_session([answer("old answer"), answer("latest answer")]).await;
+        let root_inbox = quiet_root(&session);
+        let (_, child, sender, background) = retained_child(&session, false).await;
+        let (done, received) = oneshot::channel();
+        let mut events = session.runtime.events.observe().updates;
+        child_input(&sender, Some(done)).await;
+        wait_for_child_answer(&mut events, &child).await;
+        mailbox_barrier(&session, &sender).await;
+        assert_eq!(completion_count(&session, &child).await, 0);
+
+        let gate = invocation(&session, &child);
+        let completing = gate.lock().await;
+        child_input(&sender, None).await;
+        wait_for_child_answer(&mut events, &child).await;
+        // The newer answer's final mailbox check waits for this forwarding window.
+        let rejected = withdrawn_input(&sender).await;
         claim_completed(&session, background).await;
         sender.send(AgentCommand::JobsReady).await.unwrap();
         drop(completing);
@@ -1056,10 +1039,88 @@ mod tests {
         assert_eq!(bounded(received).await.unwrap().unwrap(), "latest answer");
         mailbox_barrier(&session, &sender).await;
         assert_eq!(completion_count(&session, &child).await, 1);
+        assert_eq!(turn(&session, &child), TurnState::Idle);
+        assert_eq!(session.interrupt().await, 0);
+        assert_eq!(turn(&session, &child), TurnState::Idle);
         // Rejected input must not run another model turn.
         assert_eq!(requests.lock().unwrap().len(), 2);
         drop(root_inbox);
         session.shutdown().await.unwrap();
+    }
+
+    /// With nothing else to wake the child, the rejection itself completes the
+    /// invocation its input kept open.
+    #[tokio::test(start_paused = true)]
+    async fn rejected_input_alone_completes_answered_invocation() {
+        let (_root, _, session) = scripted_session([answer("answer")]).await;
+        let root_inbox = quiet_root(&session);
+        let (_, child, sender) = spawned_child(&session, false).await;
+        let mut events = session.runtime.events.observe().updates;
+        let gate = invocation(&session, &child);
+        let completing = gate.lock().await;
+        let (done, received) = oneshot::channel();
+        child_input(&sender, Some(done)).await;
+        wait_for_child_answer(&mut events, &child).await;
+        let rejected = withdrawn_input(&sender).await;
+        drop(completing);
+        assert!(bounded(rejected).await.unwrap().is_err());
+        assert_eq!(bounded(received).await.unwrap().unwrap(), "answer");
+        mailbox_barrier(&session, &sender).await;
+        assert_eq!(completion_count(&session, &child).await, 1);
+        assert_eq!(turn(&session, &child), TurnState::Idle);
+        drop(root_inbox);
+        session.shutdown().await.unwrap();
+    }
+
+    /// An answered child kept open only by a result whose wake has not arrived yet
+    /// is between turns: an interrupt passes it by, so neither Continue nor a new
+    /// prompt waits on it, and the late wake or a rejected input still completes it.
+    #[tokio::test(start_paused = true)]
+    async fn interrupt_passes_by_an_answered_child_awaiting_its_wake() {
+        for rejected in [false, true] {
+            let steps = [answer("initial"), answer("root answer"), answer("resumed")];
+            let (_root, _, session) = scripted_session(steps).await;
+            let root_inbox = quiet_root(&session);
+            let (_, child, sender, background) = retained_child(&session, false).await;
+            let mut events = session.runtime.events.observe().updates;
+            let gate = invocation(&session, &child);
+            let completing = gate.lock().await;
+            let (done, received) = oneshot::channel();
+            child_input(&sender, Some(done)).await;
+            wait_for_child_answer(&mut events, &child).await;
+            let forwarding = session.runtime.forwarding_gate.lock().await;
+            let jobs = &session.runtime.jobs;
+            let outcome = JobOutcome::Completed(ToolOutput::default());
+            jobs.finish(background, outcome).await.unwrap();
+            bounded(async {
+                while !jobs.has_pending(&child).await {
+                    poll().await;
+                }
+            })
+            .await;
+            drop(completing);
+            mailbox_barrier(&session, &sender).await;
+            assert_eq!(session.interrupt().await, 0);
+            assert_eq!(turn(&session, &child), TurnState::Idle);
+            let expected = if rejected {
+                jobs.claim(background).await.unwrap();
+                let rejection = withdrawn_input(&sender).await;
+                assert!(bounded(rejection).await.unwrap().is_err());
+                "initial"
+            } else {
+                assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
+                let prompt = bounded(session.prompt("direct")).await;
+                assert_eq!(prompt.unwrap(), "root answer");
+                drop(forwarding);
+                "resumed"
+            };
+            assert_eq!(bounded(received).await.unwrap().unwrap(), expected);
+            mailbox_barrier(&session, &sender).await;
+            assert_eq!(completion_count(&session, &child).await, 1);
+            assert_eq!(turn(&session, &child), TurnState::Idle);
+            drop(root_inbox);
+            session.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -1067,12 +1128,12 @@ mod tests {
         let (_root, requests, session) =
             scripted_session([answer("first"), answer("resumed")]).await;
         let root_inbox = quiet_root(&session);
-        let (child, sender, background) = retained_child(&session).await;
+        let (_, child, sender, background) = retained_child(&session, false).await;
         let mut events = session.runtime.events.observe().updates;
         child_input(&sender, None).await;
         wait_for_child_answer(&mut events, &child).await;
         mailbox_barrier(&session, &sender).await;
-        let gate = completion_gate(&session, &child);
+        let gate = invocation(&session, &child);
         let completing = gate.lock().await;
         claim_completed(&session, background).await;
         for _ in 0..3 {

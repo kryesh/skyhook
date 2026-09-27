@@ -37,7 +37,9 @@ impl SessionRuntime {
             return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
         }
         let mode = match mode {
-            Some(name) if agent.depth() != 0 => return Err(HarnessError::UnknownMode(name)),
+            Some(name) if agent.depth() != 0 => {
+                return Err(HarnessError::ModeChangeUnsupported(name));
+            }
             Some(name) => {
                 let depth = self.available_depth(agent);
                 let capabilities = self.granted_by(&self.modes[&name]).for_agent(depth);
@@ -50,7 +52,7 @@ impl SessionRuntime {
                 .system_prompt(agent, turn.location, *depth, Some(name), capabilities)
                 .await?;
             let opening =
-                self.open_agent_context(agent, snapshot.clone(), system, capabilities, None, false);
+                self.open_agent_context(agent, snapshot.clone(), system, capabilities, None);
             // Projected before its `ModeChanged` is journaled, which later projections see.
             let mut replacement = opening.await?;
             replacement.strip_bound_reasoning();
@@ -60,14 +62,8 @@ impl SessionRuntime {
             // The tools stay pinned across a model change.
             let tools = Some(context.template.to_request().tools);
             let capabilities = &settings.capabilities;
-            let opening = self.open_agent_context(
-                agent,
-                snapshot.clone(),
-                system,
-                capabilities,
-                tools,
-                false,
-            );
+            let opening =
+                self.open_agent_context(agent, snapshot.clone(), system, capabilities, tools);
             Some(opening.await?)
         } else {
             None
@@ -137,12 +133,7 @@ impl SessionRuntime {
         let result = async {
             self.select(turn, context, settings, options, images)
                 .await?;
-            let message = Message::User(content);
-            let event = SessionEvent::MessageCommitted {
-                message: message.clone(),
-            };
-            let record = self.store.append(agent.clone(), event).await?;
-            context.projected.messages.push((record.sequence, message));
+            self.commit(agent, Message::User(content)).await?;
             Ok(())
         }
         .await;
@@ -150,6 +141,9 @@ impl SessionRuntime {
         if consumed {
             // Receipt readers must already observe a busy agent when this input
             // starts a fresh turn; publishing afterward races the UI's idle check.
+            if let Some(live) = self.agents().get(agent) {
+                live.control.set_turn(TurnState::Busy);
+            }
             self.activity(agent, AgentActivity::Working);
         }
         let _ = committed.send(result);
@@ -163,7 +157,7 @@ mod tests {
     use super::*;
     use crate::agent::runtime::tests::{answer, model_ref, scripted_provider};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn running_child_parent_inputs_are_fifo_once_after_tool_or_final_responses() {
         for first_calls_tool in [true, false] {
             running_child_receives_parent_inputs(first_calls_tool).await;
@@ -206,7 +200,7 @@ mod tests {
         let second = json!("test:parent-two");
         let send = format!("return await tool.job({job}).send({{value:{first}}});");
         let accepted = bounded(session.run_script(send)).await.unwrap();
-        assert_eq!(accepted.value["value"]["result"], json!({"accepted": true}));
+        assert_eq!(accepted.value["value"], json!({}));
         forwarded(1).await;
         let send = runtime.jobs.send(job, second.clone());
         bounded(send).await.unwrap();
@@ -243,7 +237,7 @@ mod tests {
         assert_eq!(count(&tracking), 2);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn child_names_are_owner_scoped_and_survive_completion_but_not_failed_launches() {
         let (_root, tracking, session) = start(false).await;
         let runtime = &session.runtime;
@@ -357,7 +351,7 @@ mod tests {
         };
         let turn = prompt(&session, "test:initial");
         let in_flight = tracking.request(0).await;
-        assert_eq!(in_flight.model, "first-model");
+        assert_eq!(in_flight.model.as_str(), "first-model");
 
         let first_image = vec![image("first.png", &first_png)];
         let (first, first_cancel) = enqueue(
@@ -389,7 +383,7 @@ mod tests {
         assert!(first_cancel.is_claimed() && second_cancel.is_claimed());
         // A committed submission cannot be recalled.
         assert!(!first_cancel.cancel() && !second_cancel.cancel());
-        assert_eq!(next.model, "third-model");
+        assert_eq!(next.model.as_str(), "third-model");
         let expected = ["test:initial", "test:queued-one", "test:queued-two"];
         assert_eq!(texts(next.messages()), expected);
         let blocks = next.messages().flat_map(|message| match message {
@@ -427,7 +421,7 @@ mod tests {
             scripted_provider(&requests, [answer("from a")]),
             scripted_provider(&requests, [answer("from b")]),
         );
-        let profile = ModelProfile::new("same", None, 128_000, 4096, false);
+        let profile = crate::tests::profile("same", false);
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
             .provider(
@@ -486,7 +480,7 @@ mod tests {
         let next = tracking.request(1).await;
         assert!(bounded(receipt).await.unwrap().is_err());
         assert!(!token_cancel.is_claimed());
-        assert_eq!(next.model, "first-model");
+        assert_eq!(next.model.as_str(), "first-model");
         assert_eq!(texts(next.messages()), ["test:initial"]);
         assert!(model_changes(&session).await.is_empty());
         tracking.release(1);

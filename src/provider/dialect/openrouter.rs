@@ -4,30 +4,22 @@
 //! models; Responses stateless with the same affinity header. Bearer keys on
 //! every codec; attribution headers name Skyhook.
 
-use reqwest::header::{HeaderName, HeaderValue};
+use reqwest::header::HeaderValue;
 use serde::{Deserialize, Serialize};
 
 use super::{Common, Dialect, DialectConfig, DialectError, Profile};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheTtl, Codec, CodecName, Effort, Identity, OPENAI_EFFORT, SchemaConstraint, ToolNames,
+        CacheTtl, Codec, CodecName, Effort, OPENAI_EFFORT, SchemaConstraint, ToolNames,
         chat_completions::{self, Cache, EmptyContent, ReasoningReplay, Routing, UsageRequest},
-        header, messages, path, responses,
+        header, messages, path,
     },
     http::{
         Transport,
-        errors::{ErrorRule, ErrorSignals, Field, Reader, RetryAfter, RuleKind, error_object},
-        headers::Value,
+        errors::{ErrorRule, ErrorSignals, Field, Reader, RetryAfter, error_object},
     },
 };
-
-const fn session() -> Identity {
-    Identity {
-        cache_key: header("x-session-id"),
-        user_id: None,
-    }
-}
 
 fn chat(ttl: Option<CacheTtl>, routing: Option<Routing>) -> chat_completions::Dialect {
     chat_completions::Dialect {
@@ -40,25 +32,9 @@ fn chat(ttl: Option<CacheTtl>, routing: Option<Routing>) -> chat_completions::Di
         usage_request: UsageRequest::Implicit,
         tool_names: ToolNames::OpenAi,
         schema: SchemaConstraint::OpenAiStrict,
-        identity: session(),
         cache: Cache::ContentPartBreakpoints { ttl },
         routing,
         ..chat_completions::Dialect::compatible()
-    }
-}
-
-fn responses() -> responses::Dialect {
-    responses::Dialect {
-        identity: session(),
-        ..super::openai::responses()
-    }
-}
-
-fn messages(ttl: Option<CacheTtl>) -> messages::Dialect {
-    messages::Dialect {
-        identity: session(),
-        cache_ttl: ttl,
-        ..messages::Dialect::anthropic()
     }
 }
 
@@ -69,12 +45,12 @@ const RULES: &[ErrorRule] = &[
     ErrorRule {
         status: Some(403),
         field: Some(Field::Present("metadata.reasons")),
-        ..ErrorRule::kind(RuleKind::InvalidRequest)
+        ..ErrorRule::kind(ProviderErrorKind::InvalidRequest)
     },
     ErrorRule {
         status: Some(402),
         retry_after: RetryAfter::Required,
-        ..ErrorRule::kind(RuleKind::Unavailable)
+        ..ErrorRule::kind(ProviderErrorKind::Unavailable)
     },
 ];
 
@@ -134,10 +110,8 @@ impl ErrorType {
             Self::ContextLengthExceeded => ContextWindowExceeded,
             Self::Authentication | Self::PermissionDenied => Authentication,
             Self::PaymentRequired => Billing,
-            Self::RateLimitExceeded => RateLimited { retry_after: None },
-            Self::ProviderOverloaded | Self::ProviderUnavailable => {
-                Unavailable { retry_after: None }
-            }
+            Self::RateLimitExceeded => RateLimited,
+            Self::ProviderOverloaded | Self::ProviderUnavailable => Unavailable,
             Self::Timeout => Timeout,
             Self::MaxTokensExceeded
             | Self::TokenLimitExceeded
@@ -212,22 +186,23 @@ impl DialectConfig for Config {
             return Err(Error::RoutingNeedsChat.into());
         }
         let transport = transport(codec);
-        let codec = match codec {
+        let mut codec = match codec {
             CodecName::ChatCompletions => {
                 Codec::ChatCompletions(chat(self.cache_ttl, self.routing.clone()))
             }
-            CodecName::Responses => Codec::Responses(responses()),
-            CodecName::Messages => Codec::Messages(messages(self.cache_ttl)),
+            CodecName::Responses => Codec::Responses(super::openai::responses()),
+            CodecName::Messages => Codec::Messages(messages::Dialect {
+                cache_ttl: self.cache_ttl,
+                ..messages::Dialect::anthropic()
+            }),
         };
+        codec.identity_mut().cache_key = header("x-session-id");
         let mut profile = Profile::new(codec, transport, Dialect::Openrouter);
         for (name, value) in [
             ("http-referer", "https://github.com/kryesh/skyhook"),
             ("x-openrouter-title", "Skyhook"),
         ] {
-            profile.headers.insert(
-                HeaderName::from_static(name),
-                Value::Fixed(HeaderValue::from_static(value)),
-            );
+            profile.fixed(name, HeaderValue::from_static(value));
         }
         Ok(profile)
     }
@@ -274,7 +249,7 @@ mod tests {
             for (name, kind) in [
                 ("authentication", Authentication),
                 ("context_length_exceeded", ContextWindowExceeded),
-                ("rate_limit_exceeded", RateLimited { retry_after: None }),
+                ("rate_limit_exceeded", RateLimited),
             ] {
                 assert_eq!(rejected(&settings, codec, 400, http(name), None), kind);
                 assert_eq!(streamed(&settings, codec, stream(name)), kind, "{name}");
@@ -285,12 +260,12 @@ mod tests {
             json!({"type":"error","error":{"type":"rate_limit_error","error_type":"new"}});
         assert_eq!(
             streamed(&settings, CodecName::Messages, unknown),
-            RateLimited { retry_after: None }
+            RateLimited
         );
     }
 
     /// Moderation is named by its reasons; a 402 is transient only with a
-    /// retry hint, which rides the kind.
+    /// retry hint.
     #[test]
     fn moderation_and_retry_hints_name_the_condition() {
         use crate::provider::{ProviderErrorKind, dialect::tests::rejected};
@@ -307,10 +282,7 @@ mod tests {
             ProviderErrorKind::InvalidRequest
         );
         let hint = Some(Duration::from_secs(3));
-        assert_eq!(
-            kind(402, json!({}), hint),
-            ProviderErrorKind::Unavailable { retry_after: hint }
-        );
+        assert_eq!(kind(402, json!({}), hint), ProviderErrorKind::Unavailable);
         assert_eq!(kind(402, json!({}), None), ProviderErrorKind::Billing);
     }
 

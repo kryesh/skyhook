@@ -104,7 +104,8 @@ commands.
 
 Passwords, key passphrases, keyboard-interactive challenges, host confirmations, and agent
 confirmations appear in Skyhook's interface, including prompts from SSH started on a remote
-origin. Target configuration cannot enable prompts in a noninteractive session.
+origin; each names the target being connected to and, when it is remote, that origin.
+Target configuration cannot enable prompts in a noninteractive session.
 `skyhook batch` has no authentication prompts; invocations without an interactive terminal
 must use it and fail operations that require input; `--approve-all` does not approve
 authentication prompts. Secrets are never included in tool results or session logs.

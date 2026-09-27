@@ -6,15 +6,12 @@ use skyhook::job::JobState;
 fn agent_status_color(state: model::AgentDisplayState) -> Color {
     use model::AgentDisplayState as State;
     match state {
-        State::Job(JobState::Failed) => THEME.error,
-        State::Waiting(_) | State::Job(JobState::AwaitingApproval | JobState::WaitingInput) => {
-            THEME.warning
-        }
+        State::Job(state) => model::state_role(state).color(),
+        State::Waiting(_) => THEME.warning,
         State::Working | State::Reconnecting { .. } | State::Compacting | State::RunningTools => {
             THEME.primary
         }
-        State::Job(JobState::Completed) => THEME.success,
-        State::Ready | State::Job(_) => THEME.muted,
+        State::Ready => THEME.muted,
     }
 }
 
@@ -45,8 +42,8 @@ pub(super) fn draw_agent_row(
     } = row;
     fill(frame, rect, bg);
     let color = agent_status_color(state);
-    let symbol = agent_symbol(state, agent.terminal(), tick);
-    let indent = (agent.id.depth() as u16 * 4).min(rect.width / 3);
+    let symbol = agent_symbol(state, tick);
+    let indent = agent_indent(agent, rect.width);
     let name_width = columns.identity_width.saturating_sub(indent);
     let available = name_width.saturating_sub((marker.width() + symbol.width() + 1) as u16);
     let target = model::clean(&model::target_suffix(&agent.target));
@@ -98,19 +95,18 @@ pub(super) fn draw_agent_row(
     x
 }
 
-fn agent_symbol(state: model::AgentDisplayState, terminal: bool, tick: usize) -> &'static str {
+fn agent_symbol(state: model::AgentDisplayState, tick: usize) -> &'static str {
     use model::{AgentDisplayState as State, WaitReason};
     if state.running() {
         return spinner(tick);
     }
     match state {
-        State::Job(JobState::Failed) => "✗",
-        State::Job(JobState::Cancelled | JobState::Interrupted) => "■",
-        State::Waiting(WaitReason::Permission) | State::Job(JobState::AwaitingApproval) => "◇",
-        State::Waiting(WaitReason::Input | WaitReason::ParentInput)
-        | State::Job(JobState::WaitingInput) => "?",
+        State::Job(state) => model::state_glyph(state),
+        State::Waiting(WaitReason::Permission) => model::state_glyph(JobState::AwaitingApproval),
+        State::Waiting(WaitReason::Input | WaitReason::ParentInput) => {
+            model::state_glyph(JobState::WaitingInput)
+        }
         State::Waiting(WaitReason::Child | WaitReason::Event) => "◷",
-        _ if terminal => "✓",
         _ => "·",
     }
 }
@@ -168,8 +164,9 @@ pub(super) fn draw_menu_item(
 }
 
 pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
-    app.refresh_agent_menu();
-    let Some(menu) = &app.menu else { return };
+    let Some(Overlay::Menu(menu)) = &app.overlay else {
+        return;
+    };
     let area = app.content_rect;
     // Avoid spending scarce identity space on margins in narrow palettes.
     let minimum_width = if matches!(menu.kind, MenuKind::Agents(_)) {
@@ -201,10 +198,10 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
     let agent_menu = matches!(menu.kind, MenuKind::Agents(_));
     let agents = &app.projection.agents;
     let agent_stats: Vec<_> = if agent_menu {
-        let stats = agents.iter();
-        stats
-            .map(|agent| model::agent_footer_stats(&app.snapshot, &app.projection, &agent.id))
-            .collect()
+        let stats = agents
+            .iter()
+            .map(|agent| app.projection.agent_stats(&app.snapshot, &agent.id));
+        stats.collect()
     } else {
         Vec::new()
     };
@@ -245,11 +242,11 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
         let row = r(rect.x + 1, y, width.saturating_sub(2), 1);
         if let MenuKind::Agents(choices) = &menu.kind {
             let id = &choices[item.index].value;
-            if let Some((index, agent)) = agents.iter().enumerate().find(|(_, a)| &a.id == id) {
+            if let Some(agent) = agents.get(item.index).filter(|a| &a.id == id) {
                 let agent_row = AgentRow {
                     agent,
                     state: app.agent_status(agent),
-                    stats: &agent_stats[index],
+                    stats: &agent_stats[item.index],
                     marker: "",
                 };
                 app.animating |= agent_row.state.running();
@@ -264,7 +261,7 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
             };
             if let Some(peer) = peer {
                 app.animating |= peer.state.running();
-                let symbol = agent_symbol(peer.state, false, app.tick_count);
+                let symbol = agent_symbol(peer.state, app.tick_count);
                 let color = agent_status_color(peer.state);
                 text(frame, r(row.x, y, 1, 1), symbol, color, bg);
             }
@@ -325,27 +322,30 @@ mod tests {
             let cells = &terminal.backend().buffer().content;
             let found = cells.iter().any(|cell| cell.bg == THEME.selected);
             assert_eq!(found, highlighted, "{command}");
-            app.menu = None;
+            app.overlay = None;
         }
     }
 
     #[tokio::test]
     async fn agents_palette_hides_columns_without_stacking_rows() {
-        let (_root, mut app) = crate::tui::app::tests::fixture().await;
-        let root = app.projection.agents[0].clone();
-        let agents: Vec<_> = (0..2)
-            .map(|index| {
-                let mut agent = root.clone();
-                agent.id = root.id.child(index);
-                agent.name = format!("agent-{index}");
-                agent
-            })
-            .collect();
-        app.projection.agents = agents.clone();
-        for agent in agents {
-            app.projection.complete_agent(&agent.id);
-        }
+        use crate::tui::app::tests::{fixture, push_child};
+        let (_root, mut app) = fixture().await;
+        let session = app.session().unwrap().clone();
         app.command(crate::tui::keys::Command::Agents);
+        let mut children = Vec::new();
+        for index in 0..2 {
+            let child = push_child(&mut app, index).await;
+            let event = skyhook::session::SessionEvent::AgentCompleted;
+            let record = session.store().append(child.clone(), event).await;
+            let record = record.unwrap();
+            app.snapshot.records.insert(record.sequence, record);
+            children.push(format!("agent {}", crate::tui::format::agent_label(&child)));
+        }
+        app.refresh();
+        // An open palette's rows follow agents and their live status, which is searchable.
+        app.menu_mut().unwrap().input.set("completed".into());
+        assert_eq!(app.menu().unwrap().filtered().len(), 2);
+        app.menu_mut().unwrap().input.set(String::new());
         for (width, stats, status) in [
             (40, false, false),
             (65, false, false),
@@ -370,14 +370,16 @@ mod tests {
             let rows: Vec<_> = hits
                 .filter_map(|(rect, hit)| matches!(hit, Hit::Menu(_)).then_some(*rect))
                 .collect();
-            assert_eq!(rows.len(), 2);
+            assert_eq!(rows.len(), 3);
             for (index, row) in rows.iter().enumerate() {
                 assert_eq!(
                     (row.height, row.y),
                     (1, 3 + u16::from(stats) + index as u16)
                 );
+            }
+            for (row, child) in rows[1..].iter().zip(&children) {
                 let text = line(row.y);
-                assert!(text.contains(&format!("agent-{index}")));
+                assert!(text.contains(child.as_str()), "{text}");
                 assert_eq!(text.contains("Completed"), status);
             }
         }
@@ -395,6 +397,7 @@ mod tests {
                 index: 0,
                 label,
                 detail: hint,
+                search: "",
             };
             for width in [0, 2, 8, 12, 21, 80] {
                 for selected in [false, true] {

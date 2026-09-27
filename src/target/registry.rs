@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
     sync::Arc,
@@ -9,9 +10,12 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::RwLock;
 
-use super::{SshAuth, SshOptions, TargetConfig, TargetName, TargetRef, Transport};
+use super::{
+    MAX_TARGET_NAME_BYTES, Route, SshOptions, TargetConfig, TargetName, TargetRef, Transport,
+};
 use crate::{
     named_enum::named_enum,
+    remote::SshOption,
     tool::{
         AdmissionError,
         diagnostic::{Operation, Subject},
@@ -20,7 +24,7 @@ use crate::{
 };
 
 named_enum! {
-    #[derive(Clone, Copy, Debug, Deserialize, JsonSchema, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, JsonSchema, Serialize, PartialEq, Eq)]
     pub enum TargetSource {
         Builtin = "builtin",
         Config = "config",
@@ -78,10 +82,6 @@ impl TargetDefinition {
     }
 
     /// The previous target in this target's route: its jump, otherwise its origin.
-    pub fn parent(&self) -> Option<&TargetName> {
-        self.parent_edge().map(|(_, name)| name)
-    }
-
     pub(crate) fn parent_edge(&self) -> Option<(TargetEdge, &TargetName)> {
         self.via
             .as_ref()
@@ -92,15 +92,26 @@ impl TargetDefinition {
     pub(crate) fn validate(&self) -> Result<(), TargetError> {
         validate_endpoint(&self.host, self.ssh.user.as_deref())?;
         if self.via.is_some() && self.via == self.origin {
-            return Err(TargetError::ViaIsOrigin(self.name.to_string()));
+            return Err(TargetError::ViaIsOrigin(self.name.clone()));
         }
+        // Option values are never retained in errors: they may be sensitive.
         for (key, value) in &self.ssh.options {
-            crate::remote::ssh::validate_option(key, value)?;
-        }
-        let proxy_command =
-            (self.ssh.options.keys()).any(|key| key.eq_ignore_ascii_case("proxycommand"));
-        if proxy_command && self.via.is_some() {
-            return Err(TargetError::ProxyCommandWithVia(self.name.to_string()));
+            match SshOption::parse(key)? {
+                SshOption::Dedicated(field) => {
+                    return Err(TargetError::DedicatedSshOption(key.clone(), field));
+                }
+                SshOption::Reserved => return Err(TargetError::ReservedSshOption(key.clone())),
+                SshOption::ProxyCommand if self.via.is_some() => {
+                    return Err(TargetError::ProxyCommandWithVia(self.name.clone()));
+                }
+                SshOption::ProxyCommand | SshOption::Free => {}
+            }
+            if value.is_empty() {
+                return Err(TargetError::EmptySshOptionValue(key.clone()));
+            }
+            if value.chars().any(char::is_control) {
+                return Err(TargetError::InvalidSshOptionValue(key.clone()));
+            }
         }
         Ok(())
     }
@@ -119,41 +130,6 @@ impl TargetDefinition {
             },
         )
         .unwrap()
-    }
-}
-
-/// A listed target without its key path: the session host, or an SSH target.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum TargetRecord {
-    Root,
-    Ssh {
-        name: TargetName,
-        source: TargetSource,
-        host: String,
-        user: Option<String>,
-        port: Option<u16>,
-        workspace: PathBuf,
-        via: Option<TargetName>,
-        origin: Option<TargetName>,
-        auth: SshAuth,
-        external_agent: bool,
-    },
-}
-
-impl From<&TargetDefinition> for TargetRecord {
-    fn from(value: &TargetDefinition) -> Self {
-        Self::Ssh {
-            name: value.name.clone(),
-            source: value.source,
-            host: value.host.clone(),
-            user: value.ssh.user.clone(),
-            port: value.ssh.port.map(std::num::NonZeroU16::get),
-            workspace: value.workspace.clone(),
-            via: value.via.clone(),
-            origin: value.origin.clone(),
-            auth: value.ssh.auth.kind(),
-            external_agent: value.ssh.external_agent,
-        }
     }
 }
 
@@ -180,15 +156,13 @@ impl TargetRegistry {
         })
     }
 
-    /// Targets visible with `capabilities`, starting with root.
-    pub async fn list(&self, capabilities: &CapabilitySet) -> Vec<TargetRecord> {
+    /// Named targets visible with `capabilities`.
+    pub async fn list(&self, capabilities: &CapabilitySet) -> Vec<TargetDefinition> {
         let entries = self.entries.read().await;
         let visible = |target: &&TargetDefinition| {
             capabilities.contains(Capability::SshAgent) || !needs_ssh_agent(&entries, &target.name)
         };
-        std::iter::once(TargetRecord::Root)
-            .chain(entries.values().filter(visible).map(TargetRecord::from))
-            .collect()
+        entries.values().filter(visible).cloned().collect()
     }
 
     /// Whether reaching `name` forwards an agent Skyhook does not own. Such targets
@@ -203,17 +177,19 @@ impl TargetRegistry {
             .await
             .get(name)
             .cloned()
-            .ok_or_else(|| TargetError::Unknown(name.to_string()))
+            .ok_or_else(|| TargetError::Unknown(name.clone()))
     }
 
-    pub async fn route(&self, name: &TargetName) -> Result<Vec<TargetDefinition>, TargetError> {
+    pub(crate) async fn route(&self, name: &TargetName) -> Result<Route, TargetError> {
         let entries = self.entries.read().await;
-        let mut route = walk_route(&entries, name)?
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        route.reverse();
-        Ok(route)
+        let walked = walk_route(&entries, name)?;
+        let Some((destination, hops)) = walked.split_first() else {
+            return Err(TargetError::Unknown(name.clone()));
+        };
+        Ok(Route {
+            hops: hops.iter().rev().map(|&hop| hop.clone()).collect(),
+            destination: (*destination).clone(),
+        })
     }
 
     pub async fn definitions(&self) -> Vec<TargetDefinition> {
@@ -317,10 +293,10 @@ fn validate_graph(entries: &BTreeMap<TargetName, TargetDefinition>) -> Result<()
         for jump in (route.iter().skip(1)).take_while(|hop| Some(&hop.name) != origin) {
             if jump.origin != target.origin {
                 return Err(TargetError::OriginMismatch {
-                    target: name.to_string(),
-                    jump: jump.name.to_string(),
-                    origin: origin_of(target).to_string(),
-                    jump_origin: origin_of(jump).to_string(),
+                    target: name.clone(),
+                    jump: jump.name.clone(),
+                    origin: origin_of(target),
+                    jump_origin: origin_of(jump),
                 });
             }
         }
@@ -360,11 +336,11 @@ fn walk_partial_route<'a>(
     let mut visited = BTreeSet::new();
     loop {
         if !visited.insert(current) {
-            return Err(TargetError::Cycle(current.to_string()));
+            return Err(TargetError::Cycle(current.clone()));
         }
         let Some(target) = entries.get(current) else {
             return match missing {
-                MissingReference::Reject => Err(TargetError::Unknown(current.to_string())),
+                MissingReference::Reject => Err(TargetError::Unknown(current.clone())),
                 MissingReference::Allow => Ok(route),
             };
         };
@@ -375,9 +351,9 @@ fn walk_partial_route<'a>(
         if !entries.contains_key(parent) {
             return match missing {
                 MissingReference::Reject => Err(TargetError::UnknownReference {
-                    target: target.name.to_string(),
+                    target: target.name.clone(),
                     edge,
-                    reference: parent.to_string(),
+                    reference: parent.clone(),
                 }),
                 MissingReference::Allow => Ok(route),
             };
@@ -400,6 +376,18 @@ fn validate_endpoint(host: &str, user: Option<&str>) -> Result<(), TargetError> 
         return Err(TargetError::InvalidUser);
     }
     Ok(())
+}
+
+named_enum! {
+    /// A target field that an `ssh.options` key would duplicate.
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+    pub enum TargetField {
+        Host = "host",
+        SshUser = "ssh.user",
+        SshPort = "ssh.port",
+        SshAuth = "ssh.auth",
+        Via = "via",
+    }
 }
 
 /// The field that introduces a target reference, retained when resolution fails.
@@ -435,36 +423,36 @@ pub enum TargetError {
     #[error("SSH option `{0}` cannot contain control characters")]
     InvalidSshOptionValue(String),
     #[error("SSH option `{0}` is set through the `{1}` field, not ssh.options")]
-    DedicatedSshOption(String, &'static str),
+    DedicatedSshOption(String, TargetField),
     #[error("target `{0}` sets ProxyCommand, which cannot be combined with via")]
-    ProxyCommandWithVia(String),
+    ProxyCommandWithVia(TargetName),
     #[error("target `{0}` sets via to its origin; omit via to connect directly from the origin")]
-    ViaIsOrigin(String),
+    ViaIsOrigin(TargetName),
     #[error("target name `{0}` is unavailable")]
-    NameUnavailable(String),
+    NameUnavailable(TargetName),
     #[error(
         "target `{target}` starts SSH from `{origin}`, but its jump `{jump}` starts from `{jump_origin}`; give them the same origin"
     )]
     OriginMismatch {
-        target: String,
-        jump: String,
-        origin: String,
-        jump_origin: String,
+        target: TargetName,
+        jump: TargetName,
+        origin: TargetRef,
+        jump_origin: TargetRef,
     },
     #[error("invalid SSH username")]
     InvalidUser,
     #[error("unknown target `{0}`")]
-    Unknown(String),
+    Unknown(TargetName),
     #[error("invalid {edge} target name")]
     InvalidReference { edge: TargetEdge },
     #[error("target `{target}` references unknown {edge} target `{reference}`")]
     UnknownReference {
-        target: String,
+        target: TargetName,
         edge: TargetEdge,
-        reference: String,
+        reference: TargetName,
     },
     #[error("target route contains a cycle at `{0}`")]
-    Cycle(String),
+    Cycle(TargetName),
     #[error("`root` cannot be used as a jump target")]
     RootCannotBeJump,
 }
@@ -474,67 +462,66 @@ impl TargetError {
     /// diagnostic can later be read with fewer capabilities than its first reader.
     pub(crate) fn into_admission_error(self) -> AdmissionError {
         let argument = |name: &str| Subject::argument(name.split('.'));
+        let fixed = |reason: &'static str| Some(Cow::Borrowed(reason));
         let (subject, reason) = match &self {
             Self::ReservedName => (argument("name"), None),
             Self::InvalidName(_) => (
                 argument("name"),
-                Some(
-                    "target name must contain 1 to 128 ASCII letters, digits, underscores, hyphens, or periods",
-                ),
+                Some(format!(
+                    "target name must contain 1 to {MAX_TARGET_NAME_BYTES} ASCII letters, digits, underscores, hyphens, or periods"
+                ).into()),
             ),
             Self::InvalidHost(_) => (
                 argument("host"),
-                Some("hostname must be nonempty and contain no whitespace or control characters"),
+                fixed("hostname must be nonempty and contain no whitespace or control characters"),
             ),
             Self::InvalidSshOptionName => (argument("ssh.options"), None),
             Self::ReservedSshOption(_) => (
                 argument("ssh.options"),
-                Some("SSH option is reserved by Skyhook"),
+                fixed("SSH option is reserved by Skyhook"),
             ),
             Self::EmptySshOptionValue(_) => (
                 argument("ssh.options"),
-                Some("SSH option requires a nonempty value"),
+                fixed("SSH option requires a nonempty value"),
             ),
             Self::InvalidSshOptionValue(_) => (
                 argument("ssh.options"),
-                Some("SSH option value cannot contain control characters"),
+                fixed("SSH option value cannot contain control characters"),
             ),
-            Self::DedicatedSshOption(_, field) => {
-                return AdmissionError::invalid_arguments(format!(
-                    "SSH option must be set through the {field} field, not ssh.options"
-                ))
-                .operation(Operation::Validate, argument("ssh.options"));
-            }
+            Self::DedicatedSshOption(_, field) => (
+                argument("ssh.options"),
+                Some(format!("SSH option must be set through the {field} field, not ssh.options").into()),
+            ),
             Self::ProxyCommandWithVia(_) => (
                 argument("ssh.options"),
-                Some("ProxyCommand cannot be combined with via"),
+                fixed("ProxyCommand cannot be combined with via"),
             ),
             Self::ViaIsOrigin(_) => (
                 argument("via"),
-                Some(
+                fixed(
                     "via cannot be the connection origin; omit via to connect directly from the origin",
                 ),
             ),
-            Self::NameUnavailable(_) => (argument("name"), Some("target name is unavailable")),
+            Self::NameUnavailable(_) => (argument("name"), fixed("target name is unavailable")),
             Self::OriginMismatch { .. } => (
                 argument("origin"),
-                Some("target and its jump must start SSH from the same origin"),
+                fixed("target and its jump must start SSH from the same origin"),
             ),
             Self::InvalidUser => (argument("ssh.user"), None),
-            Self::Unknown(_) => (argument("target"), Some("unknown target")),
+            Self::Unknown(_) => (argument("target"), fixed("unknown target")),
             Self::InvalidReference { edge } => (argument(&edge.to_string()), None),
             Self::UnknownReference { edge, .. } => match edge {
-                TargetEdge::Origin => (argument("origin"), Some("unknown origin target")),
-                TargetEdge::Via => (argument("via"), Some("unknown jump target")),
+                TargetEdge::Origin => (argument("origin"), fixed("unknown origin target")),
+                TargetEdge::Via => (argument("via"), fixed("unknown jump target")),
             },
             Self::Cycle(_) => (
                 Subject::Label("target route".into()),
-                Some("target route contains a cycle"),
+                fixed("target route contains a cycle"),
             ),
             Self::RootCannotBeJump => (argument("via"), None),
         };
         // Variants without a payload render nothing private.
-        AdmissionError::invalid_arguments(reason.map_or_else(|| self.to_string(), str::to_owned))
+        AdmissionError::invalid_arguments(reason.unwrap_or_else(|| self.to_string().into()))
             .operation(Operation::Validate, subject)
     }
 }
@@ -581,29 +568,30 @@ mod tests {
     #[test]
     fn admission_errors_never_carry_submitted_values_or_aliases() {
         let private = || "private-submitted-target".to_owned();
+        let named = || name(&private());
         for error in [
             TargetError::InvalidName(private()),
             TargetError::InvalidHost(private()),
             TargetError::ReservedSshOption(private()),
             TargetError::EmptySshOptionValue(private()),
             TargetError::InvalidSshOptionValue(private()),
-            TargetError::DedicatedSshOption(private(), "ssh.auth"),
-            TargetError::ProxyCommandWithVia(private()),
-            TargetError::ViaIsOrigin(private()),
-            TargetError::NameUnavailable(private()),
+            TargetError::DedicatedSshOption(private(), TargetField::SshAuth),
+            TargetError::ProxyCommandWithVia(named()),
+            TargetError::ViaIsOrigin(named()),
+            TargetError::NameUnavailable(named()),
             TargetError::OriginMismatch {
-                target: private(),
-                jump: private(),
-                origin: private(),
-                jump_origin: private(),
+                target: named(),
+                jump: named(),
+                origin: named().into(),
+                jump_origin: named().into(),
             },
-            TargetError::Unknown(private()),
+            TargetError::Unknown(named()),
             TargetError::UnknownReference {
-                target: private(),
+                target: named(),
                 edge: TargetEdge::Via,
-                reference: private(),
+                reference: named(),
             },
-            TargetError::Cycle(private()),
+            TargetError::Cycle(named()),
         ] {
             let diagnostic = error.into_admission_error().diagnostic();
             let saved = serde_json::to_string(&diagnostic).unwrap();
@@ -628,11 +616,11 @@ mod tests {
                 target,
                 edge: actual,
                 reference,
-            }) if target == "invalid" && actual == edge && reference == "missing"));
+            }) if target == name("invalid") && actual == edge && reference == name("missing")));
             assert_eq!(registry.definitions().await, before);
         }
         assert!(
-            matches!(registry.route(&name("absent")).await, Err(TargetError::Unknown(unknown)) if unknown == "absent")
+            matches!(registry.route(&name("absent")).await, Err(TargetError::Unknown(unknown)) if unknown == name("absent"))
         );
     }
 
@@ -645,7 +633,7 @@ mod tests {
         let mismatched = [shim.clone(), jump.clone(), destination.clone()];
         assert!(matches!(
             TargetRegistry::from_definitions(mismatched),
-            Err(TargetError::OriginMismatch { jump_origin, .. }) if jump_origin == "shim"
+            Err(TargetError::OriginMismatch { jump_origin, .. }) if jump_origin == name("shim").into()
         ));
         // A jump reached from root cannot continue a connection started on shim.
         let mut remote = target("remote", Some("root-jump"));
@@ -653,7 +641,10 @@ mod tests {
         let mismatched = [shim.clone(), target("root-jump", None), remote];
         assert!(matches!(
             TargetRegistry::from_definitions(mismatched),
-            Err(TargetError::OriginMismatch { jump_origin, .. }) if jump_origin == "root"
+            Err(TargetError::OriginMismatch {
+                jump_origin: TargetRef::Root,
+                ..
+            })
         ));
         destination.origin = Some(name("shim"));
         // Origins nest: deep's connection starts on destination, itself reached from shim.

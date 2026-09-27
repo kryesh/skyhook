@@ -91,7 +91,7 @@ pub enum TargetAuth {
 
 named_enum! {
     /// The authentication method of a `TargetAuth`, without its key path.
-    #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum SshAuth {
         Default = "default",
         Agent = "agent",
@@ -112,4 +112,42 @@ impl TargetAuth {
 
 fn default_workspace() -> PathBuf {
     PathBuf::from(".")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::target::{TargetEdge, TargetRegistry};
+
+    #[test]
+    fn root_is_implicit_and_local_named_targets_remain_invalid() {
+        let valid = |text: &str| {
+            crate::yaml::parse::<TargetsConfig>(text)
+                .is_ok_and(|config| config.validate_structure().is_ok())
+        };
+        for text in [
+            "root:\n  type: ssh\n  host: root",
+            "a:\n  type: ssh\n  host: a\n  via: root",
+            "a:\n  type: local\n  host: localhost",
+        ] {
+            assert!(!valid(text), "{text}");
+        }
+        assert!(valid("a:\n  type: ssh\n  host: a"));
+    }
+
+    /// A later layer or the runtime may supply a missing name.
+    #[test]
+    fn unresolved_references_are_valid_until_a_registry_needs_them() {
+        let text = "a:\n  type: ssh\n  host: a\n  via: b";
+        let config = crate::yaml::parse::<TargetsConfig>(text).unwrap();
+        config.validate_structure().unwrap();
+        assert!(matches!(
+            TargetRegistry::from_definitions(config.definitions().unwrap()),
+            Err(TargetError::UnknownReference {
+                edge: TargetEdge::Via,
+                reference,
+                ..
+            }) if reference.as_str() == "b"
+        ));
+    }
 }

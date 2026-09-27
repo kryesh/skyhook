@@ -15,7 +15,7 @@ use super::diagnostics::{
 };
 use super::progress::FetchProgress;
 use super::validation::{HttpRequestUrl, InlineMode, OutputPlan};
-use super::{LocalContext, LocalError, ResponseBody, fetch_text};
+use super::{LocalContext, LocalError, ResponseBody, text};
 
 enum BodySink {
     Memory {
@@ -115,7 +115,7 @@ impl BodySink {
             OutputPlan::Download {
                 destination,
                 overwrite,
-            } => PendingDownload::new(destination, overwrite, progress).map(Self::Download),
+            } => PendingDownload::new(destination.into(), overwrite, progress).map(Self::Download),
         }
     }
 
@@ -285,7 +285,7 @@ async fn response_body(
     url: &HttpRequestUrl,
     mode: InlineMode,
 ) -> Result<ResponseBody, FetchError> {
-    use fetch_text::{ContentClass, ExtractableHtml, ResponseEntity};
+    use text::{ContentClass, ExtractableHtml, ResponseEntity};
 
     if bytes.is_empty() {
         return Ok(ResponseBody::Empty);
@@ -303,7 +303,7 @@ async fn response_body(
                 let extraction_error =
                     |reason| extraction_failure(DiagnosticMessage::Extraction(reason));
                 let input = ExtractableHtml::admit(entity, url).map_err(extraction_error)?;
-                let extracted = fetch_text::extract(input).await.map_err(extraction_error)?;
+                let extracted = text::extract(input).await.map_err(extraction_error)?;
                 return Ok(ResponseBody::Text {
                     text: extracted.text,
                     metadata: Some(extracted.metadata),
@@ -331,12 +331,10 @@ async fn response_body(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{
-        executor, fetch, progress_for, read_request, response, server, stalled_server,
-    };
+    use super::super::tests::{executor, fetch, progress_for, server};
     use super::*;
+    use crate::provider::http::transport::tests::{Plan, Server, read_request, reply};
     use serde_json::json;
-    use std::time::Duration;
 
     fn accounting_fixture(limit: u64) -> (FetchProgress, u64) {
         let (plan, progress) = progress_for(json!({"url":"http://example.org","max_bytes":limit}));
@@ -376,7 +374,7 @@ mod tests {
         let runtime = crate::tests::TestRuntime::new().await;
         let executor = executor(&runtime);
         let html = "<html><body></body></html>";
-        let (url, task) = server(vec![response(
+        let (url, task) = server(vec![reply(
             "201 Created",
             "Content-Type: text/html\r\n",
             html,
@@ -385,13 +383,24 @@ mod tests {
         let error = fetch(&runtime, &executor, json!({"url":url, "text":true}))
             .await
             .unwrap_err();
-        task.await.unwrap();
-        let output = error.into_tool_error().into_parts().1.unwrap().value;
+        task.finish().await;
+        let rendered = error
+            .diagnostic()
+            .render(&crate::tool::policy::CapabilitySet::default());
+        let output = error.into_parts().1.unwrap().value;
         assert_eq!(output["status"], 201);
-        assert_eq!(output["received_bytes"], html.len());
-        assert_eq!(output["diagnostic"]["phase"], "extraction");
-        let message = output["diagnostic"]["message"].as_str().unwrap();
-        assert!(message.contains("parser could not extract"), "{message}");
+        assert_eq!(output["size"], html.len());
+        let expected = FetchDiagnostic::classified(
+            FetchPhase::Extraction,
+            FetchErrorKind::ExtractionFailure,
+            DiagnosticMessage::Extraction(text::ExtractionFailure::Parser),
+        );
+        // The reason is in the rendered error; the serialized diagnostic omits it.
+        assert!(rendered.contains(expected.message()), "{rendered}");
+        assert_eq!(
+            output["diagnostic"],
+            serde_json::to_value(expected).unwrap()
+        );
     }
 
     #[test]
@@ -410,7 +419,7 @@ mod tests {
         let (_, Some(output)) = error.into_parts() else {
             panic!("structured staging failure")
         };
-        assert_eq!(output.value["diagnostic"]["phase"], "local_io");
+        assert_eq!(output.value["diagnostic"]["error_kind"], "local_io");
         assert_eq!(output.value["diagnostic"]["os_error"]["kind"], "not_found");
         assert!(!destination.exists());
     }
@@ -429,26 +438,19 @@ mod tests {
             // publication must still reject a newly created destination.
             tokio::fs::write(raced, b"keep original").await.unwrap();
             socket
-                .write_all(response("200 OK", "", "replacement").as_bytes())
+                .write_all(reply("200 OK", "", "replacement").as_bytes())
                 .await
                 .unwrap();
         });
         let executor = executor(&runtime);
-        let error = tokio::time::timeout(
-            Duration::from_secs(10),
-            fetch(
-                &runtime,
-                &executor,
-                json!({"url":url,"save_to":"raced-download"}),
-            ),
-        )
+        let error = crate::tests::bounded(fetch(
+            &runtime,
+            &executor,
+            json!({"url":url,"save_to":"raced-download"}),
+        ))
         .await
-        .unwrap()
         .unwrap_err();
-        tokio::time::timeout(Duration::from_secs(10), task)
-            .await
-            .unwrap()
-            .unwrap();
+        crate::tests::bounded(task).await.unwrap();
         let context = error.diagnostic().context;
         assert_eq!(context.operation, Operation::Rename);
         assert_eq!(context.subject, Subject::path(&destination));
@@ -458,10 +460,10 @@ mod tests {
                 .to_string()
                 .contains("server-side effects are unknown")
         );
-        let output = error.into_tool_error().into_parts().1.unwrap().value;
+        let output = error.into_parts().1.unwrap().value;
         assert_eq!(output["status"], 200);
-        assert_eq!(output["received_bytes"], 11);
-        assert_eq!(output["diagnostic"]["phase"], "local_io");
+        assert_eq!(output["size"], 11);
+        assert_eq!(output["diagnostic"]["error_kind"], "local_io");
         assert_eq!(
             tokio::fs::read(destination).await.unwrap(),
             b"keep original"
@@ -489,13 +491,13 @@ mod tests {
             let mut arguments = arguments;
             arguments["url"] = json!(url);
             assert!(fetch(&runtime, &executor, arguments).await.is_err());
-            assert_eq!(task.await.unwrap().len(), 1);
+            assert_eq!(task.finish().await.len(), 1);
             assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"original");
         }
-        let (url, task) = server(vec![response("200 OK", "", "replacement")]).await;
+        let (url, task) = server(vec![reply("200 OK", "", "replacement")]).await;
         let arguments = json!({"url":url,"save_to":"out","overwrite":true});
         let result = fetch(&runtime, &executor, arguments).await.unwrap();
-        task.await.unwrap();
+        task.finish().await;
         assert_eq!(
             (&result["body"]["kind"], &result["body"]["bytes"]),
             (&json!("file"), &json!(11))
@@ -507,10 +509,10 @@ mod tests {
         let (url, task) = server(vec![head.to_owned()]).await;
         let arguments = json!({"url":url,"method":"HEAD","max_bytes":1});
         assert_eq!(
-            fetch(&runtime, &executor, arguments).await.unwrap()["received_bytes"],
+            fetch(&runtime, &executor, arguments).await.unwrap()["size"],
             0
         );
-        task.await.unwrap();
+        task.finish().await;
     }
 
     #[tokio::test]
@@ -550,11 +552,11 @@ mod tests {
             InlineMode::ExtractText,
         )
         .await;
-        let diagnostic =
-            serde_json::to_value(error.unwrap_err().into_diagnostic().unwrap()).unwrap();
+        let diagnostic = error.unwrap_err().into_diagnostic().unwrap();
+        assert_eq!(diagnostic.phase(), FetchPhase::Extraction);
         assert_eq!(
-            (&diagnostic["phase"], &diagnostic["error_kind"]),
-            (&json!("extraction"), &json!("extraction_failure"))
+            serde_json::to_value(diagnostic).unwrap()["error_kind"],
+            "extraction_failure"
         );
     }
 
@@ -578,12 +580,12 @@ mod tests {
             .await;
             if max_bytes == 4096 {
                 let output = result.unwrap();
-                assert_eq!(output["received_bytes"], 4096);
+                assert_eq!(output["size"], 4096);
                 assert_eq!(output["body"]["text"], "A".repeat(4096));
             } else {
                 assert!(result.is_err());
             }
-            task.await.unwrap();
+            task.finish().await;
         }
     }
 
@@ -592,24 +594,19 @@ mod tests {
         let runtime = crate::tests::TestRuntime::new().await;
         let destination = runtime.root.path().join("saved.txt");
         tokio::fs::write(&destination, b"original").await.unwrap();
-        let (url, ready_rx, server_task) =
-            stalled_server(b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\npartial").await;
+        let head = b"HTTP/1.1 200 OK\r\nContent-Length: 10000\r\n\r\npartial";
+        let mut server = Server::start(vec![Plan::stalled(head)]).await;
+        let url = server.root();
         let executor = executor(&runtime);
         let agent = runtime.agent.clone();
         let arguments = json!({"url":url,"save_to":"saved.txt","overwrite":true});
         let pending =
             tokio::spawn(async move { executor.run_host(&agent, "fetch", arguments).await });
-        tokio::time::timeout(Duration::from_secs(10), ready_rx)
-            .await
-            .unwrap()
-            .unwrap();
+        server.request().await;
         assert_eq!(runtime.jobs.cancel_all(&runtime.agent).await, 1);
-        let result = tokio::time::timeout(Duration::from_secs(10), pending)
-            .await
-            .unwrap();
+        let result = crate::tests::bounded(pending).await;
         assert!(result.unwrap().is_err());
-        server_task.abort();
-        let _ = server_task.await;
+        drop(server);
         assert_eq!(tokio::fs::read(&destination).await.unwrap(), b"original");
         let entries: Vec<_> = std::fs::read_dir(runtime.root.path())
             .unwrap()

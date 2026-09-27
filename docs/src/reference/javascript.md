@@ -44,31 +44,34 @@ search selections omit image attachments; whole-output reads can attach saved im
 
 ## JobView response contract
 
-Direct model calls and JavaScript tool calls return the same seven-key `JobView` envelope. Its
-required keys and types are:
+Direct model calls and JavaScript tool calls return the same `JobView` envelope:
 
 ```text
-id: number|null
-state: string
-has_result: boolean
-result: JSON
-error: string|null
-meta: null|JobMetadata
-presentation: null|Presentation
+id?: number
+state?: string
+result?: JSON
+error?: string
+meta?: JobMetadata
+presentation?: Presentation
 ```
 
-`result` is the native tool payload (and may be a loaded literal `null`); `has_result` tells
-whether that payload is available. `meta` is `null` on an ordinary successful foreground call
-when no full metadata is needed. Background, status, inspection, and failure responses carry
-`meta` when available. It has nullable `parent`, `tool`, `name`, `target`, `workspace`,
-`last_message`, `code`, and `executed` fields. `target` is `null` when target capabilities are
-unavailable. A pre-admission failure can have `id: null`, as can a call the runtime could not
-make at all: a tool that is no longer available, or a call interrupted while the session was not
+Tool results omit absent fields and empty lists at every level. JavaScript receives the same
+JSON, so an absent field is `undefined`, as `x?: T` means in TypeScript.
+
+A completed call with nothing more to read or resume (no truncation, page, capture, question,
+notice, or retained child that input resumes) omits `id` and `state`. `result` is the native tool payload. It is present exactly when the job
+has a result, and a loaded literal `null` result stays `result: null`. A tool with nothing to
+return, such as `tool.job(id).send`, completes without a result. `meta` is absent on an ordinary
+successful foreground call. Background handles, listings, inspections, and failures carry `meta`
+with what the caller does not already know: `tool` and `name` except in the response to the
+caller's own foreground call, `parent`, `target`, and `workspace` only when they differ from the
+calling agent's own, and `code` for a denial. A pre-admission failure lacks `id`, as does a call the runtime could not make
+at all: a tool that is no longer available, or a call interrupted while the session was not
 running, is answered with this same failure shape.
 
-`presentation` is `null` when a successful foreground response has no truncation, page, capture,
+`presentation` is absent when a successful foreground response has no truncation, page, capture,
 question, or notice. When present, it groups `preview`, `truncated`, `captures`, `question`, and
-`notice`; empty or absent members use their nullable/empty defaults. Read a page as
+`notice`, each present only when it has content. Read a page as
 `r.presentation.preview.lines` and a question as `r.presentation.question`.
 Truncation entries keep their source paths rooted at `/result/...`.
 
@@ -86,10 +89,9 @@ Use `response.unwrap()` synchronously when a completed native payload is needed:
 const data = (await tool.read({path: "README.md"})).unwrap();
 ```
 
-It returns `response.result` only when `state: "completed"` and `has_result: true`, including a
-completed literal `null`. It throws for failed, pending, or result-unavailable responses; the
-thrown error has `error.response` containing the envelope and `error.output` equal to its
-`.result`. The method is non-enumerable and runtime-only: `Object.keys`, JSON serialization,
+It returns `response.result` when the response is completed (an absent `state` means completed),
+or `null` when the job has no result, and throws for failed or pending responses; the thrown error has `error.response` containing the envelope and `error.output` equal to its
+`.result`, plus `error.job` and `error.code` when the response has an `id` or denial `code`. The method is non-enumerable and runtime-only: `Object.keys`, JSON serialization,
 logging, returning, and saving the envelope retain plain JSON. Nested payloads, JSON copies, and
 `receive()` values are not decorated, and there is no built-in `tool.unwrap` helper.
 
@@ -104,9 +106,9 @@ Node.js APIs, `fetch`, `URL`, `TextEncoder`/`TextDecoder`, or `setTimeout`/`setI
 
 ## Script results and failures
 
-Every script result payload is always `{value: <JavaScript return>, console: <captured text>, failure: null|JSON}`,
-including silent scripts (`console: ""`) and scripts without a return (`value: null`). `failure`
-is `null` on success. In a script JobView, the payload is at `/result` and its return is at
+Every script result payload is `{value: <JavaScript return>, console?: <captured text>, failure?: <details>}`.
+Scripts without a return have `value: null`, silent scripts have no `console`, and `failure` is
+absent on success. In a script JobView, the payload is at `/result` and its return is at
 `/result/value`; logs are at `/result/console`.
 
 `console.log(...values)` captures space-separated text, formatting objects as JSON. A running
@@ -119,14 +121,15 @@ Automatic previews can truncate displayed text without discarding captured outpu
 [paging or search](job-output.md) to inspect more. The **16 MiB limit applies to JavaScript
 source**, not console capture.
 
-On a script execution failure, the saved script payload is `{value: null, console: <captured text>, failure: <details>}`;
-the enclosing JobView is `failed` and also carries its `error`. Console text belongs to the script
-result, not job metadata.
+On a script execution failure, the saved script payload is `{value: null, console?: <captured text>, failure?: <details>}`;
+the enclosing JobView is `failed` and carries its `error`: the thrown error's message and stack,
+or the JSON of any other thrown value. Console text belongs to the script result, not job
+metadata.
 
-Failure details do not have a fixed `{message, stack}` shape. Error objects retain available
-`message`, `stack`, and `cause` fields, together with enumerable properties; other thrown values
-can produce primitive or array details. `failure` can also be `null` on a failed job, so use the
-enclosing JobView's `state` and `error` to determine whether execution failed.
+`failure` holds a thrown error's other properties: its `cause` and enumerable properties, such as
+the `job` and `code` of an unwrapped failed response, whose full view `tool.jobs({job})` reads.
+It is absent when there are none, so use the enclosing JobView's `state` and `error` to determine
+whether execution failed. Automatic previews can shorten it.
 
 A top-level `undefined` becomes JSON `null`; nested `undefined` is not coerced or removed and
 causes serialization failure.

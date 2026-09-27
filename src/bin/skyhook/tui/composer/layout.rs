@@ -55,7 +55,7 @@ impl ComposerLayout {
             .next_back()
             .map_or((0, 0), |(_, pos)| *pos)
     }
-    pub(super) fn closest(&self, row: usize, column: usize) -> usize {
+    pub(in crate::tui) fn closest(&self, row: usize, column: usize) -> usize {
         self.positions
             .iter()
             .filter(|(_, (r, _))| *r == row)
@@ -230,7 +230,9 @@ fn clip(text: &str, width: usize) -> (String, usize) {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::plain;
     use super::*;
+    use crate::tui::editor::{EditOutcome, TextField};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers as M};
     use ratatui::style::Color;
 
@@ -239,12 +241,6 @@ mod tests {
         let rows = layout.rows.iter();
         rows.map(|r| r.spans.iter().map(|s| s.text.as_str()).collect())
             .collect()
-    }
-
-    fn plain(text: &str) -> Composer {
-        let mut editor = Composer::default();
-        editor.set(text.to_owned());
-        editor
     }
 
     #[test]
@@ -367,7 +363,10 @@ mod tests {
             assert_eq!(rows(&editor, 4), [text.split('\n').next().unwrap(), "x"]);
             editor.set_width(4);
             for code in [KeyCode::Down, KeyCode::Up] {
-                assert!(editor.handle(KeyEvent::new(code, M::NONE)).handled);
+                assert_ne!(
+                    editor.handle(KeyEvent::new(code, M::NONE)),
+                    EditOutcome::Ignored
+                );
             }
             assert_eq!(
                 editor.cursor, newline,

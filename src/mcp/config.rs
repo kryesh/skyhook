@@ -69,35 +69,48 @@ const fn default_call_timeout_secs() -> u64 {
     120
 }
 
+#[derive(Debug, PartialEq, Eq, thiserror::Error)]
+pub enum McpConfigError {
+    #[error("startup_timeout_secs must be positive and fit a timer deadline")]
+    StartupTimeout,
+    #[error("call_timeout_secs must be positive and fit a timer deadline")]
+    CallTimeout,
+    #[error("start_command must contain a nonempty executable")]
+    EmptyCommand,
+    #[error("stdio transport requires start_command")]
+    MissingCommand,
+    #[error("stdio transport does not accept url or headers_env")]
+    StdioEndpoint,
+    #[error("streamable_http transport requires url")]
+    MissingUrl,
+    #[error("MCP HTTP url must be an absolute http or https URL")]
+    Url,
+    #[error("cwd and env require start_command")]
+    LaunchWithoutCommand,
+}
+
 impl TryFrom<RawMcpServerConfig> for McpServerConfig {
-    type Error = String;
+    type Error = McpConfigError;
     fn try_from(raw: RawMcpServerConfig) -> Result<Self, Self::Error> {
-        for (name, seconds) in [
-            ("startup_timeout_secs", raw.startup_timeout_secs),
-            ("call_timeout_secs", raw.call_timeout_secs),
-        ] {
-            if seconds == 0
-                || std::time::Instant::now()
-                    .checked_add(Duration::from_secs(seconds))
-                    .is_none()
-            {
-                return Err(format!("{name} must be positive and fit a timer deadline"));
-            }
-        }
+        let timeout = |seconds, error| {
+            let timeout = Duration::from_secs(seconds);
+            let fits = std::time::Instant::now().checked_add(timeout).is_some();
+            (seconds > 0 && fits).then_some(timeout).ok_or(error)
+        };
+        let startup_timeout = timeout(raw.startup_timeout_secs, McpConfigError::StartupTimeout)?;
+        let call_timeout = timeout(raw.call_timeout_secs, McpConfigError::CallTimeout)?;
         if let Some(command) = &raw.start_command
             && command
                 .first()
                 .is_none_or(|program| program.trim().is_empty())
         {
-            return Err("start_command must contain a nonempty executable".to_owned());
+            return Err(McpConfigError::EmptyCommand);
         }
         let connection = match raw.transport {
             McpTransport::Stdio => {
-                let argv = raw
-                    .start_command
-                    .ok_or("stdio transport requires start_command")?;
+                let argv = raw.start_command.ok_or(McpConfigError::MissingCommand)?;
                 if raw.url.is_some() || !raw.headers_env.is_empty() {
-                    return Err("stdio transport does not accept url or headers_env".to_owned());
+                    return Err(McpConfigError::StdioEndpoint);
                 }
                 McpConnection::Stdio(CommandSpec {
                     argv,
@@ -106,14 +119,15 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
                 })
             }
             McpTransport::StreamableHttp => {
-                let original = raw.url.ok_or("streamable_http transport requires url")?;
-                let parsed = reqwest::Url::parse(&original)
-                    .map_err(|error| format!("invalid MCP HTTP url: {error}"))?;
-                if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
-                    return Err("MCP HTTP url must be an absolute http or https URL".to_owned());
+                let original = raw.url.ok_or(McpConfigError::MissingUrl)?;
+                let absolute = reqwest::Url::parse(&original).is_ok_and(|url| {
+                    matches!(url.scheme(), "http" | "https") && url.host_str().is_some()
+                });
+                if !absolute {
+                    return Err(McpConfigError::Url);
                 }
                 if raw.start_command.is_none() && (raw.cwd.is_some() || !raw.env.is_empty()) {
-                    return Err("cwd and env require start_command".to_owned());
+                    return Err(McpConfigError::LaunchWithoutCommand);
                 }
                 McpConnection::Http {
                     endpoint: original,
@@ -129,8 +143,8 @@ impl TryFrom<RawMcpServerConfig> for McpServerConfig {
         Ok(Self {
             connection,
             capabilities: raw.capabilities,
-            startup_timeout: Duration::from_secs(raw.startup_timeout_secs),
-            call_timeout: Duration::from_secs(raw.call_timeout_secs),
+            startup_timeout,
+            call_timeout,
         })
     }
 }
@@ -147,11 +161,6 @@ impl McpServerConfig {
     }
     pub fn call_timeout(&self) -> Duration {
         self.call_timeout
-    }
-    #[cfg(test)]
-    pub(crate) fn with_call_timeout(mut self, timeout: Duration) -> Self {
-        self.call_timeout = timeout;
-        self
     }
     pub fn transport(&self) -> McpTransport {
         match self.connection {
@@ -214,10 +223,6 @@ mod tests {
             assert_eq!(serde_json::to_value(decoded).unwrap(), expected);
             assert_eq!(config.transport(), raw.transport);
         }
-        let config: McpServerConfig = crate::yaml::parse(STDIO).unwrap();
-        assert_eq!(config.startup_timeout(), Duration::from_secs(30));
-        assert_eq!(config.call_timeout(), Duration::from_secs(120));
-        assert!(config.capabilities().is_empty());
     }
 
     #[test]
@@ -232,63 +237,77 @@ mod tests {
         let cwd = Some(Path::new("/nonexistent/mcp-directory"));
         assert_eq!(raw.cwd.as_deref(), cwd);
         raw.start_command = None;
-        assert!(McpServerConfig::try_from(raw).is_err());
+        let error = McpServerConfig::try_from(raw).unwrap_err();
+        assert_eq!(error, McpConfigError::LaunchWithoutCommand);
     }
 
     #[test]
-    fn programmatic_timeouts_and_commands_must_pass_the_same_admission() {
-        let raw: RawMcpServerConfig = crate::yaml::parse(STDIO).unwrap();
-        for seconds in [0, u64::MAX] {
-            let mut startup = raw.clone();
-            startup.startup_timeout_secs = seconds;
-            assert!(McpServerConfig::try_from(startup).is_err());
-            let mut call = raw.clone();
-            call.call_timeout_secs = seconds;
-            assert!(McpServerConfig::try_from(call).is_err());
+    fn admission_rejects_invalid_connections_commands_and_timeouts() {
+        use McpConfigError::*;
+        let http = "transport: 'streamable_http'\nurl: 'https://example.com/mcp'";
+        let cases = [
+            ("transport: 'stdio'".into(), MissingCommand),
+            ("transport: 'stdio'\nstart_command: []".into(), EmptyCommand),
+            (
+                "transport: 'stdio'\nstart_command: ['']".into(),
+                EmptyCommand,
+            ),
+            (
+                "transport: 'stdio'\nstart_command: ['   ']".into(),
+                EmptyCommand,
+            ),
+            (
+                format!("{STDIO}\nurl: 'https://example.com/mcp'"),
+                StdioEndpoint,
+            ),
+            (
+                format!("{STDIO}\nheaders_env: {{ Authorization: 'TOKEN' }}"),
+                StdioEndpoint,
+            ),
+            ("transport: 'streamable_http'".into(), MissingUrl),
+            ("transport: 'streamable_http'\nurl: ''".into(), Url),
+            ("transport: 'streamable_http'\nurl: '/mcp'".into(), Url),
+            (
+                "transport: 'streamable_http'\nurl: 'ftp://example.com/mcp'".into(),
+                Url,
+            ),
+            (format!("{http}\nstart_command: []"), EmptyCommand),
+            (format!("{http}\ncwd: 'work'"), LaunchWithoutCommand),
+            (
+                format!("{http}\nenv: {{ MODE: 'test' }}"),
+                LaunchWithoutCommand,
+            ),
+            (format!("{STDIO}\nstartup_timeout_secs: 0"), StartupTimeout),
+            (format!("{STDIO}\ncall_timeout_secs: 0"), CallTimeout),
+            (
+                format!("{STDIO}\nstartup_timeout_secs: {}", u64::MAX),
+                StartupTimeout,
+            ),
+            (
+                format!("{STDIO}\ncall_timeout_secs: {}", u64::MAX),
+                CallTimeout,
+            ),
+        ];
+        for (text, expected) in cases {
+            let raw: RawMcpServerConfig = crate::yaml::parse(&text).unwrap();
+            let error = McpServerConfig::try_from(raw).unwrap_err();
+            assert_eq!(error, expected, "{text}");
         }
-        for command in [None, Some(vec![]), Some(vec![" ".into()])] {
-            let mut invalid = raw.clone();
-            invalid.start_command = command;
-            assert!(McpServerConfig::try_from(invalid).is_err());
-        }
-    }
-
-    #[test]
-    fn invalid_connections_unknown_fields_capabilities_and_timeouts_are_rejected() {
-        let mut texts: Vec<String> = [
-            "transport: 'stdio'",
-            "transport: 'stdio'\nstart_command: []",
-            "transport: 'stdio'\nstart_command: ['']",
-            "transport: 'stdio'\nstart_command: ['   ']",
-            "transport: 'stdio'\nstart_command: ['server']\nurl: 'https://example.com/mcp'",
-            "transport: 'stdio'\nstart_command: ['server']\nheaders_env: { Authorization: 'TOKEN' }",
-            "transport: 'streamable_http'",
-            "transport: 'streamable_http'\nurl: ''",
-            "transport: 'streamable_http'\nurl: '/mcp'",
-            "transport: 'streamable_http'\nurl: 'ftp://example.com/mcp'",
-            "transport: 'streamable_http'\nurl: 'https://example.com/mcp'\nstart_command: []",
-            "transport: 'streamable_http'\nurl: 'https://example.com/mcp'\ncwd: 'work'",
-            "transport: 'streamable_http'\nurl: 'https://example.com/mcp'\nenv: { MODE: 'test' }",
-            "transport: 'sse'\nurl: 'https://example.com/mcp'",
-        ]
-        .map(String::from)
-        .into();
-        for extra in [
+        let extras = [
             "capabilities: ['unknown_capability']",
             "capabilities: ['Read']",
             "command: ['other']",
-            "startup_timeout_secs: 0",
-            "call_timeout_secs: 0",
             "startup_timeout_secs: -1",
             "call_timeout_secs: -1",
             "startup_timeout_secs: 1.5",
             "call_timeout_secs: '120'",
-        ] {
-            texts.push(format!("{STDIO}\n{extra}"));
-        }
-        for text in texts {
+        ]
+        .map(|extra| format!("{STDIO}\n{extra}"));
+        let sse = "transport: 'sse'\nstart_command: ['server']";
+        for text in extras.iter().map(String::as_str).chain([sse]) {
+            let parsed = crate::yaml::parse::<RawMcpServerConfig>(text);
             assert!(
-                crate::yaml::parse::<McpServerConfig>(&text).is_err(),
+                matches!(parsed, Err(crate::yaml::YamlError::Value(_))),
                 "{text}"
             );
         }

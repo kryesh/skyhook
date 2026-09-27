@@ -14,17 +14,17 @@ impl SessionRuntime {
         &self,
         agent: &crate::identity::AgentId,
         viewer: impl Into<DiagnosticViewer<'a>>,
-    ) -> Result<Option<(Vec<UserPart>, PendingDelivery)>, crate::agent::runtime::HarnessError> {
+    ) -> Result<Option<(UserPart, PendingDelivery)>, crate::agent::runtime::HarnessError> {
         let pending = self.jobs.pending_delivery(agent).await?;
         let content = self.job_event_content(&pending, viewer.into()).await;
-        Ok((!content.is_empty()).then_some((content, pending)))
+        Ok(content.map(|content| (content, pending)))
     }
 
     async fn job_event_content(
         &self,
         pending: &crate::job::PendingDelivery,
         viewer: DiagnosticViewer<'_>,
-    ) -> Vec<UserPart> {
+    ) -> Option<UserPart> {
         let mut events: Vec<_> = pending
             .messages()
             .iter()
@@ -38,28 +38,22 @@ impl SessionRuntime {
                     crate::job::output::OutputArgs::new(job.id),
                     crate::job::CancellationToken::new(),
                     viewer,
-                    crate::job::output::OutputOptions::Host {
-                        presentation: crate::job::OutputPresentation::Automatic,
-                    },
+                    crate::job::output::OutputOptions::Host,
                 )
                 .await
                 .map(crate::job::PresentedOutput::into_job_view);
             events.push(JobEvent::Job(Box::new(view.unwrap_or_else(|error| {
                 JobView {
                     id: Some(job.id),
-                    state: job.state.presented(),
-                    has_result: false,
-                    result: serde_json::Value::Null,
+                    state: Some(job.state.presented()),
+                    result: None,
                     error: Some(error.diagnostic().render_for(viewer)),
                     meta: None,
                     presentation: None,
                 }
             }))));
         }
-        if events.is_empty() {
-            return Vec::new();
-        }
-        vec![UserPart::JobEvents { events }]
+        (!events.is_empty()).then_some(UserPart::JobEvents { events })
     }
 }
 
@@ -266,10 +260,10 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    /// A completing child's answer and its completion envelope are one wake: the
-    /// answer is published without a wake and the job completion carries both.
+    /// A background child's final answer is its job's result: the completion is the
+    /// only wake and the answer is not delivered as a separate reply.
     #[tokio::test(start_paused = true)]
-    async fn terminal_child_reply_and_completion_reach_the_owner_in_one_batch() {
+    async fn background_child_answer_arrives_as_its_completion_result() {
         const FINAL: &str = "merged-child-final-answer";
         let launch =
             json!({"prompt":"report", "model":"wait-test/child", "name":"merged", "bg":true});
@@ -294,20 +288,12 @@ mod tests {
         let woken = tracking.request(3).await;
         assert_reason(&woken, "waiting", "event");
         // Exactly one wake, independent of any coalescing window: the answer is
-        // published silently and the job completion is the wake that carries it.
+        // held and the job completion is the wake that carries it.
         assert_eq!(drain_wakes(&mut wakes, job), 1);
-        // One envelope, holding the answer and the completion that references it.
         let envelopes = envelopes(&woken);
-        assert_eq!(
-            envelopes.len(),
-            1,
-            "answer and completion must share one batch"
-        );
-        let batch = &envelopes[0];
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0]["kind"], "message");
-        assert_eq!(batch[0]["text"], FINAL);
-        assert_child_completion(&batch[1], &batch[0]);
+        assert_eq!(envelopes.len(), 1);
+        assert_eq!(envelopes[0].len(), 1, "no separate reply");
+        assert_child_completion(&envelopes[0][0], job, FINAL);
         // The wake came from the completion, so the owner never ran on the answer
         // alone: three requests total, and the answer is not copied anywhere else.
         assert_eq!(tracking.requests.lock().unwrap().len(), 4);
@@ -363,7 +349,7 @@ mod tests {
         assert_eq!(jobs.snapshot(job).await.unwrap().state, JobState::Running);
 
         // Releasing its work lets the child answer again and complete; that answer
-        // and the completion then arrive together, as in the merged case above.
+        // is the completion's result.
         tracking.release(4);
         running_job(&session, &session.root, "wait").await;
         jobs.send(work, json!("released")).await.unwrap();
@@ -372,12 +358,11 @@ mod tests {
         let completed = tracking.request(6).await;
         assert_reason(&completed, "again", "event");
         // The second answer completes the invocation, so its completion is again the
-        // only wake and presents both entries in one batch.
+        // only wake.
         assert_eq!(drain_wakes(&mut wakes, job), 1);
         let batch = envelopes(&completed).pop().unwrap();
-        assert_eq!(batch.len(), 2);
-        assert_eq!(batch[0]["text"], FINAL);
-        assert_child_completion(&batch[1], &batch[0]);
+        assert_eq!(batch.len(), 1);
+        assert_child_completion(&batch[0], job, FINAL);
         tracking.release(6);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
@@ -420,7 +405,7 @@ mod tests {
             let send =
                 format!("return await tool.job({job}).send({{value:'please add an addendum'}});");
             let sent = bounded(session.run_script(send)).await.unwrap();
-            assert_eq!(sent.value["value"]["result"], json!({"accepted":true}));
+            assert_eq!(sent.value["value"], json!({}));
             // Occupancy proves forwarding to the child's queue while A's invoke is gated.
             bounded(async {
                 while sender.capacity() != AGENT_CHANNEL_CAPACITY - 1 {
@@ -466,17 +451,14 @@ mod tests {
         tracking.release(5);
         let completed = tracking.pass(6).await;
         assert_reason(&completed, "last-report", "event");
-        let delivered = agent_messages(&completed);
-        assert_eq!(delivered.len(), 2);
-        assert_eq!(delivered[0], messages[0]);
-        assert_eq!(delivered[1]["text"], B);
+        assert_eq!(agent_messages(&completed), messages);
         let lifecycle = events(&completed);
         assert_eq!(lifecycle.len(), 1);
-        assert_child_completion(&lifecycle[0], &delivered[1]);
+        assert_child_completion(&lifecycle[0], job, B);
         let history = rendered(&completed);
         // A must not be overwritten or repeated
         assert_eq!(history.matches(A).count(), 1);
-        // completion must not repeat B
+        // B is the result alone
         assert_eq!(history.matches(B).count(), 1);
         let output = runtime.jobs.snapshot(job).await.unwrap().output;
         assert_eq!(output, Some(json!(B)));
@@ -554,18 +536,17 @@ mod tests {
         };
         assert_eq!(delivered(&records), 0, "a blank turn was delivered");
 
-        // Only the real answer reaches the owner, once, with its completion.
+        // Only the real answer reaches the owner, once, as its completion's result.
         tracking.release(3);
         child_completed(&session, job).await;
         let woken = tracking.request(4).await;
         assert_reason(&woken, "waiting", "event");
         assert_eq!(drain_wakes(&mut wakes, job), 1);
-        let replies = agent_messages(&woken);
-        assert_eq!(replies.len(), 1);
-        assert_eq!(replies[0]["text"], FINAL);
+        assert!(agent_messages(&woken).is_empty());
+        assert_child_completion(&events(&woken)[0], job, FINAL);
         tracking.release(4);
         bounded(turn).await.unwrap().unwrap();
-        assert_eq!(delivered(&runtime.store.records().await), 1);
+        assert_eq!(delivered(&runtime.store.records().await), 0);
         session.shutdown().await.unwrap();
     }
 
@@ -620,7 +601,7 @@ mod tests {
         let value = "parent-reply-request-marker";
         let send = format!("return await tool.job({child_job}).send({{value:{value:?}}});");
         let sent = bounded(session.run_script(send)).await.unwrap();
-        assert_eq!(sent.value["value"]["result"], json!({"accepted":true}));
+        assert_eq!(sent.value["value"], json!({}));
         let child_request = tracking.pass(3).await;
         assert_reason(&child_request, "child-wait", "event");
         let messages = rendered(&child_request);
@@ -653,7 +634,6 @@ mod tests {
             "kind":"message",
             "id":child_job.get(),
             "name":"child-replier",
-            "message":committed[0].sequence,
             "text":REPLY,
         });
         assert_eq!(replies, vec![expected]);
@@ -673,16 +653,13 @@ mod tests {
         tracking.release(6);
         let completed = tracking.pass(7).await;
         assert_reason(&completed, "finish-wait", "event");
-        let all_replies = agent_messages(&completed);
-        assert_eq!(&all_replies[..replies.len()], replies.as_slice());
-        assert_eq!(all_replies.len(), 2);
-        assert_eq!(all_replies[1]["text"], FINAL);
+        assert_eq!(agent_messages(&completed), replies);
         let notifications = events(&completed);
         assert_eq!(notifications.len(), 1);
-        assert_child_completion(&notifications[0], &all_replies[1]);
+        assert_child_completion(&notifications[0], child_job, FINAL);
         let last = tracking.pass(8).await;
         assert_reason(&last, "after-final", "timeout");
-        assert_eq!(agent_messages(&last), all_replies);
+        assert_eq!(agent_messages(&last), replies);
         assert_eq!(events(&last), notifications);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
@@ -754,14 +731,11 @@ mod tests {
         tracking.release(parent_reply);
         let completed = tracking.pass(parent_completed).await;
         assert_reason(&completed, "finish-wait", "event");
-        let all_replies = agent_messages(&completed);
         // retained replies are exactly once
-        assert_eq!(&all_replies[..reply_count], replies.as_slice());
-        assert_eq!(all_replies.len(), reply_count + 1);
-        assert_eq!(all_replies[reply_count]["text"], "mailbox-child-final");
+        assert_eq!(agent_messages(&completed), replies);
         let notifications = events(&completed);
         assert_eq!(notifications.len(), 1);
-        assert_child_completion(&notifications[0], &all_replies[reply_count]);
+        assert_child_completion(&notifications[0], child_job, "mailbox-child-final");
         bounded(turn).await.unwrap().unwrap();
         bounded(session.shutdown()).await.unwrap();
         bounded(session.root_tx.closed()).await;
@@ -810,6 +784,8 @@ mod tests {
             crate::execution::ExecutionLocation::root(root.to_path_buf()),
         );
         runtime.store.append(child.clone(), started).await.unwrap();
+        let jobs = &runtime.jobs;
+        jobs.set_child_agent(id, child.clone()).await.unwrap();
         (id, child)
     }
 
@@ -819,18 +795,19 @@ mod tests {
         child: &AgentId,
         text: &str,
     ) -> MessageSeq {
-        let message = Message::Assistant(vec![AssistantItem::text("fixture-reply", 0, text)]);
+        // A turn with a call is progress, which wakes the owner.
+        let message = Message::Assistant(vec![
+            AssistantItem::text("fixture-reply", 0, text),
+            call_at(1, "fixture-call", "todo", json!({"items":[]})),
+        ]);
         let jobs = &session.runtime.jobs;
-        // Fixture progress stands in for a non-terminal child reply: it wakes the owner.
         let committed =
-            jobs.commit_child_message(child, job, message, text.to_owned(), true, |_| Vec::new());
+            jobs.commit_child_message(child, job, message, text.to_owned(), |_| Vec::new());
         committed.await.unwrap()
     }
 
     /// The owner's pending events and the receipt that delivers them.
-    async fn pending_content(
-        session: &SessionHandle,
-    ) -> (Vec<UserPart>, crate::job::PendingDelivery) {
+    async fn pending_content(session: &SessionHandle) -> (UserPart, crate::job::PendingDelivery) {
         let runtime = &session.runtime;
         let capabilities = &runtime.capabilities;
         let pending = runtime.pending_event_content(session.root_agent(), capabilities);
@@ -848,14 +825,13 @@ mod tests {
         let (job, child) = fixture_child(&session, root.path()).await;
         let first = fixture_message(&session, job, &child, "retained-progress").await;
         let (content, batch) = pending_content(&session).await;
-        assert_eq!(content.len(), 1);
         drop(batch);
         assert!(runtime.jobs.has_pending(session.root_agent()).await);
 
         let (retry, batch) = pending_content(&session).await;
         // abandoning a receipt must retain its source message
         assert_eq!(retry, content);
-        let sequence = batch.commit(Message::User(retry)).await.unwrap();
+        let sequence = batch.commit(Message::User(vec![retry])).await.unwrap();
         let records = runtime.store.records().await;
         let committed = records
             .iter()
@@ -863,7 +839,7 @@ mod tests {
         let committed = committed.unwrap();
         assert_eq!(&committed.agent, session.root_agent());
         assert!(matches!(&committed.event,
-            SessionEvent::MessageCommitted { message: Message::User(saved) } if saved == &content));
+            SessionEvent::MessageCommitted { message: Message::User(saved) } if saved.as_slice() == std::slice::from_ref(&content)));
         assert!(!runtime.jobs.has_pending(session.root_agent()).await);
         // Equal text is a new independent event when its source sequence differs.
         let second = fixture_message(&session, job, &child, "retained-progress").await;
@@ -876,8 +852,7 @@ mod tests {
         let next = tracking.pass(1).await;
         let delivered = agent_messages(&next);
         assert_eq!(delivered.len(), 2);
-        let found = (&delivered[0]["message"], &delivered[1]["message"]);
-        assert_eq!(found, (&json!(first), &json!(second)));
+        assert_eq!(delivered[0], delivered[1]);
         assert!(!runtime.jobs.has_pending(session.root_agent()).await);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
@@ -905,12 +880,10 @@ mod tests {
         let (job, child) = fixture_child(&session, root.path()).await;
         fixture_message(&session, job, &child, "committed-progress").await;
         let (content, batch) = pending_content(&session).await;
-        // progress and completion share the same envelope
-        assert_eq!(content.len(), 1);
         assert!(runtime.jobs.has_pending(session.root_agent()).await);
         let mut records = runtime.store.subscribe();
         {
-            let commit = batch.commit(Message::User(content));
+            let commit = batch.commit(Message::User(vec![content]));
             tokio::pin!(commit);
             // Unpolled since scheduling: dropping the caller models an interrupt just
             // after this transaction's ownership boundary.

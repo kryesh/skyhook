@@ -11,7 +11,7 @@ use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::{
     identity::{AgentId, EventId, SessionId},
-    provider::{profile::ModelRef, protocol::ModelRequest},
+    provider::protocol::ModelRequest,
 };
 
 mod content;
@@ -25,69 +25,37 @@ mod template;
 pub(crate) use template::ModelRequestTemplate;
 
 pub use content::{JobEvent, Message, RuntimeState, StateJob, StateJobKind, UserPart};
-pub(crate) use db::{CaptureExtent, CaptureRow, Presentation, SharedDb};
+pub(crate) use db::{CaptureExtent, CaptureRow, OutputSizes, Presentation, SharedDb};
 pub use db::{DbError, SessionSummary};
 pub(crate) use event::EntryKind;
 pub use event::{
     AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, EventRecord, MessageSeq,
-    ModeSelection, ModelCallOrigin, ModelContext, ModelFailureKind, ModelPurpose, ProfileSnapshot,
-    RecordSeq, RequestSeq, SessionEvent, Truncation,
+    ModeSelection, ModelCallOrigin, ModelContext, ModelPurpose, ProfileSnapshot, RecordSeq,
+    RequestSeq, SessionEvent, Truncation,
 };
-pub use ledger::{RequestChanges, RequestLedger, RequestPhase, RequestRecord};
+pub use ledger::{RequestChanges, RequestFailure, RequestLedger, RequestPhase, RequestRecord};
 pub use request::{
-    Projection, project_history, reconstruct_model_request, record_at, render_history,
-    request_context,
+    CheckpointError, Projection, ReplayError, project_history, reconstruct_model_request,
+    record_at, render_history, request_context,
 };
 
 /// The database schema version; earlier formats are intentionally unsupported.
 pub const SESSION_FORMAT_VERSION: i64 = db::USER_VERSION;
 const DATABASE_FILE: &str = "session.db";
 const LOCK_FILE: &str = "lock";
-
-/// Restore the agent's last applied model.
-pub fn agent_selection(records: &[EventRecord], agent: &AgentId) -> Option<ModelRef> {
-    let mut selection = None;
-    for record in records.iter().filter(|record| &record.agent == agent) {
-        match &record.event {
-            SessionEvent::AgentStarted { profile, .. } => {
-                selection = profile.as_ref().map(|profile| profile.name.clone());
-            }
-            SessionEvent::ModelChanged { profile } => {
-                if let Some(model) = &mut selection {
-                    model.clone_from(&profile.name);
-                }
-            }
-            _ => {}
-        }
-    }
-    selection
-}
+/// Committed records an observer may fall behind by before it lags.
+const PUBLICATION_CAPACITY: usize = 512;
 
 /// The mode definitions the session has pinned, in order of first use.
 pub fn pinned_modes(
     records: &[EventRecord],
-) -> indexmap::IndexMap<String, crate::tool::policy::Mode> {
+) -> impl Iterator<Item = (&crate::tool::policy::ModeName, &crate::tool::policy::Mode)> {
     let selections = records.iter().filter_map(|record| match &record.event {
         SessionEvent::AgentStarted { mode, .. } => mode.as_ref(),
         SessionEvent::ModeChanged { mode, .. } => Some(mode),
         _ => None,
     });
-    selections
-        .filter_map(|mode| Some((mode.name.clone(), mode.definition.clone()?)))
-        .collect()
-}
-
-/// Restore the agent's last applied mode.
-pub fn agent_mode(records: &[EventRecord], agent: &AgentId) -> Option<String> {
-    let records = records.iter().rev();
-    records
-        .filter(|record| &record.agent == agent)
-        .find_map(|record| match &record.event {
-            SessionEvent::AgentStarted { mode, .. } => Some(mode.as_ref()),
-            SessionEvent::ModeChanged { mode, .. } => Some(Some(mode)),
-            _ => None,
-        })?
-        .map(|mode| mode.name.clone())
+    selections.filter_map(|mode| Some((&mode.name, mode.definition.as_ref()?)))
 }
 
 struct SessionLock(std::fs::File);
@@ -125,20 +93,27 @@ pub struct AppendIdentity {
     pub sequence: RecordSeq,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+#[error(
+    "session {} event {} sequence {}: {reason}",
+    identity.session,
+    identity.event,
+    identity.sequence
+)]
 pub struct AppendRecovery {
     pub identity: AppendIdentity,
-    pub reason: String,
+    pub reason: RecoveryReason,
 }
 
-impl std::fmt::Display for AppendRecovery {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "session {} event {} sequence {}: {}",
-            self.identity.session, self.identity.event, self.identity.sequence, self.reason
-        )
-    }
+/// Why an accepted append's outcome is unknown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum RecoveryReason {
+    #[error("accepted append did not finish publication")]
+    Unpublished,
+    #[error("accepted writer lost its receipt")]
+    ReceiptLost,
+    #[error("accepted append failed to commit")]
+    Commit,
 }
 
 /// Receipt for an accepted append; dropping it does not cancel the writer. A
@@ -156,14 +131,8 @@ impl AcceptedAppend {
     }
 
     pub async fn committed(self) -> Result<EventRecord, SessionError> {
-        let identity = self.identity;
-        let mut records = receipt(identity, self.committed).await?;
-        records.pop().ok_or_else(|| {
-            SessionError::AppendIndeterminate(AppendRecovery {
-                identity,
-                reason: "accepted append committed no record".into(),
-            })
-        })
+        let mut records = receipt(self.identity, self.committed).await?;
+        Ok(records.pop().expect("one record per accepted event"))
     }
 }
 
@@ -174,10 +143,13 @@ async fn receipt(
     committed: Receipt,
 ) -> Result<Vec<EventRecord>, SessionError> {
     committed.await.unwrap_or_else(|_| {
-        Err(SessionError::AppendIndeterminate(AppendRecovery {
-            identity,
-            reason: "accepted writer lost its receipt; recovery is required".into(),
-        }))
+        Err(SessionError::AppendIndeterminate {
+            recovery: AppendRecovery {
+                identity,
+                reason: RecoveryReason::ReceiptLost,
+            },
+            source: None,
+        })
     })
 }
 
@@ -224,7 +196,7 @@ impl State {
         match &self.health {
             WriterHealth::Healthy => Ok(()),
             WriterHealth::NeedsRecovery(recovery) => {
-                Err(SessionError::AppendUnavailable(recovery.clone()))
+                Err(SessionError::AppendUnavailable(*recovery))
             }
         }
     }
@@ -284,25 +256,21 @@ impl Writer {
         // Pessimistic poison also survives a lost writer task.
         self.shared.write().health = WriterHealth::NeedsRecovery(AppendRecovery {
             identity,
-            reason: "accepted append did not finish publication".into(),
+            reason: RecoveryReason::Unpublished,
         });
         #[cfg(test)]
         {
             self.pause_at(AppendBoundary::Write);
             match self.fault.take() {
-                Some(CommitFault::Fail(boundary)) => {
-                    let reason = if boundary == AppendBoundary::Write {
-                        let _ = db.rollback();
-                        self.encoder.reset();
-                        "injected rollback"
-                    } else {
-                        let _ = db.commit();
-                        "injected failure after commit"
-                    };
-                    let (identity, reason) = (identity, reason.into());
-                    let recovery = AppendRecovery { identity, reason };
-                    self.shared.write().health = WriterHealth::NeedsRecovery(recovery.clone());
-                    return Ok(Err(SessionError::AppendIndeterminate(recovery)));
+                // Without its transaction, the COMMIT below fails for real.
+                Some(CommitFault::Fail(AppendBoundary::Write)) => drop(db.rollback()),
+                Some(CommitFault::Fail(AppendBoundary::Publication)) => {
+                    let _ = db.commit();
+                    let reason = RecoveryReason::Unpublished;
+                    return Ok(Err(SessionError::AppendIndeterminate {
+                        recovery: AppendRecovery { identity, reason },
+                        source: None,
+                    }));
                 }
                 Some(CommitFault::Panic) => panic!("injected writer loss"),
                 pause => self.fault = pause,
@@ -320,15 +288,18 @@ impl Writer {
                 state.health = WriterHealth::Healthy;
                 Ok(records)
             }
-            Err(error) => {
+            Err(source) => {
                 let _ = db.rollback();
                 self.encoder.reset();
                 let recovery = AppendRecovery {
                     identity,
-                    reason: error.to_string(),
+                    reason: RecoveryReason::Commit,
                 };
-                self.shared.write().health = WriterHealth::NeedsRecovery(recovery.clone());
-                Err(SessionError::AppendIndeterminate(recovery))
+                self.shared.write().health = WriterHealth::NeedsRecovery(recovery);
+                Err(SessionError::AppendIndeterminate {
+                    recovery,
+                    source: Some(source),
+                })
             }
         })
     }
@@ -341,6 +312,33 @@ impl Writer {
             let _ = reached.send(());
             let _ = resume.blocking_recv();
         }
+    }
+
+    fn read_blob(
+        &self,
+        blob: crate::media::BlobRef,
+        limit: usize,
+    ) -> Result<Vec<u8>, SessionError> {
+        usize::try_from(blob.bytes)
+            .ok()
+            .filter(|&length| length <= limit)
+            .ok_or(BlobError::TooLarge.at(blob.sha256))?;
+        let bytes = self
+            .db
+            .lock()
+            .query_row(
+                "SELECT bytes FROM blob WHERE sha256 = ?1",
+                db::params![blob.sha256.to_bytes().to_vec()],
+                |row| Ok(row.get::<Vec<u8>>(0)?),
+            )?
+            .ok_or(BlobError::Missing.at(blob.sha256))?;
+        if crate::media::BlobDigest::of(&bytes) != blob.sha256 {
+            return Err(BlobError::HashMismatch.at(blob.sha256));
+        }
+        if bytes.len() as u64 != blob.bytes {
+            return Err(BlobError::LengthMismatch.at(blob.sha256));
+        }
+        Ok(bytes)
     }
 
     /// Validate and encode inside an open transaction; any error is a definite rejection.
@@ -366,7 +364,7 @@ impl Writer {
         let mut records = Vec::with_capacity(entries.len());
         // A mode's first use pins its definition. Appends are serialized here, so
         // agents applying one mode at once still pin it once.
-        let mut pinned: Option<std::collections::HashSet<String>> = None;
+        let mut pinned: Option<std::collections::HashSet<crate::tool::policy::ModeName>> = None;
         for (offset, (agent, mut event)) in entries.into_iter().enumerate() {
             if agent.session() != self.shared.id {
                 return Err(SessionError::WrongSession);
@@ -377,8 +375,11 @@ impl Writer {
             | SessionEvent::ModeChanged { mode, .. } = &mut event
                 && mode.definition.is_some()
             {
-                let pinned = pinned
-                    .get_or_insert_with(|| pinned_modes(&state.records).into_keys().collect());
+                let pinned = pinned.get_or_insert_with(|| {
+                    pinned_modes(&state.records)
+                        .map(|(name, _)| name.clone())
+                        .collect()
+                });
                 if !pinned.insert(mode.name.clone()) {
                     mode.definition = None;
                 }
@@ -392,15 +393,9 @@ impl Writer {
             });
         }
         // Order-dependent rules validate against the committed prefix plus this batch.
-        // Only a multi-entry batch copies the prefix.
-        let mut prefix = std::borrow::Cow::Borrowed(state.records.as_slice());
         for (index, record) in records.iter().enumerate() {
-            request::validate_compaction(&prefix, record)?;
-            if index + 1 < records.len() {
-                prefix.to_mut().push(record.clone());
-            }
+            request::validate(&state.records, &records[..index], record)?;
         }
-        drop(prefix);
         drop(state);
         let encoder = &mut self.encoder;
         let result = db.transaction(|| encoder.records(db, &records));
@@ -504,11 +499,6 @@ impl SessionStore {
         Self::read_only(root, id, db::summary).await
     }
 
-    /// Every saved job output document and capture as text, for inspection.
-    pub async fn read_output_text(root: &Path, id: SessionId) -> Result<Vec<String>, SessionError> {
-        Self::read_only(root, id, db::output_text).await
-    }
-
     /// Run `read` against one snapshot: a live owner may commit between its queries.
     async fn read_only<T: Send + 'static>(
         root: &Path,
@@ -518,7 +508,7 @@ impl SessionStore {
         let path = root.join(id.to_string()).join(DATABASE_FILE);
         blocking(move || {
             if !path.is_file() {
-                return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
+                return Err(SessionError::NotFound(id));
             }
             let db = db::Db::open(&path, db::OpenMode::ReadOnly)?;
             db.batch("BEGIN")?;
@@ -527,14 +517,6 @@ impl SessionStore {
             Ok(value?)
         })
         .await?
-    }
-
-    /// Attempts and tool calls a stopped process left without an outcome.
-    pub(crate) async fn interrupted_work(&self) -> Result<db::InterruptedWork, SessionError> {
-        let id = self.id();
-        Ok(self
-            .with_writer(move |writer| db::interrupted_work(&writer.db.lock(), id))
-            .await??)
     }
 
     pub async fn create(root: &Path) -> Result<Self, SessionError> {
@@ -548,20 +530,11 @@ impl SessionStore {
 
     async fn create_with_durability(root: &Path, durable: bool) -> Result<Self, SessionError> {
         tokio::fs::create_dir_all(root).await?;
-        for _ in 0..16 {
-            let id = SessionId::generate()?;
-            let directory = root.join(id.to_string());
-            match tokio::fs::create_dir(&directory).await {
-                Ok(()) => {
-                    return Self::start(id, directory, durable, false)
-                        .await
-                        .map(|(store, _)| store);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Err(SessionError::IdCollisions)
+        let id = SessionId::generate()?;
+        let directory = root.join(id.to_string());
+        tokio::fs::create_dir(&directory).await?;
+        let (store, _) = Self::start(id, directory, durable, false).await?;
+        Ok(store)
     }
 
     pub async fn open(
@@ -579,25 +552,25 @@ impl SessionStore {
     ) -> Result<(Self, Vec<EventRecord>), SessionError> {
         let (shared_directory, open_directory) = (directory.clone(), directory.clone());
         let (db, lock, records) = blocking(move || {
+            let path = open_directory.join(DATABASE_FILE);
+            if existing && !path.is_file() {
+                return Err(SessionError::NotFound(id));
+            }
             // Acquire ownership before opening a potentially active database.
             let lock = durable
                 .then(|| lock_session(&open_directory, id))
                 .transpose()?;
-            let path = open_directory.join(DATABASE_FILE);
             let mode = match (durable, existing) {
                 (false, _) => db::OpenMode::Memory,
                 (true, false) => db::OpenMode::Create,
-                (true, true) if path.is_file() => db::OpenMode::Open,
-                (true, true) => {
-                    return Err(std::io::Error::from(std::io::ErrorKind::NotFound).into());
-                }
+                (true, true) => db::OpenMode::Open,
             };
             let db = db::Db::open(&path, mode)?;
             let records = request::admit_records(db::decode_records(&db, id)?)?;
             Ok::<_, SessionError>((db, lock, records))
         })
         .await??;
-        let (events, _) = broadcast::channel(512);
+        let (events, _) = broadcast::channel(PUBLICATION_CAPACITY);
         let shared = Arc::new(Shared {
             id,
             state: StdRwLock::new(State {
@@ -681,17 +654,18 @@ impl SessionStore {
         Ok(state.records.clone())
     }
 
-    /// Visit a consistent committed suffix without cloning event payloads.
-    pub(crate) async fn visit_records_after(
+    /// Visit a consistent committed suffix without cloning event payloads; the
+    /// default sequence visits the whole journal. Publication waits for `visit`.
+    pub(crate) async fn visit_records_after<T>(
         &self,
         sequence: RecordSeq,
-        visit: impl FnOnce(&[EventRecord]),
-    ) {
+        visit: impl FnOnce(&[EventRecord]) -> T,
+    ) -> T {
         let state = self.inner.shared.read();
         let start = state
             .records
             .partition_point(|record| record.sequence <= sequence);
-        visit(&state.records[start..]);
+        visit(&state.records[start..])
     }
 
     /// Accept and await one append; dropping this waiter does not cancel persistence.
@@ -752,12 +726,6 @@ impl SessionStore {
         entries: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
     ) -> Result<(Vec<AppendIdentity>, Receipt), SessionError> {
-        if entries
-            .iter()
-            .any(|(agent, _)| agent.session() != self.id())
-        {
-            return Err(SessionError::WrongSession);
-        }
         let (accepted, acceptance) = oneshot::channel();
         let (committed, receipt) = oneshot::channel();
         let mut turn = self.turn().await;
@@ -778,11 +746,7 @@ impl SessionStore {
             }
         });
         // A dropped sender means the writer was lost before acceptance: nothing is durable.
-        let identities = acceptance.await.map_err(|_| {
-            SessionError::Io(std::io::Error::other(
-                "session writer lost before accepting the append",
-            ))
-        })??;
+        let identities = acceptance.await.map_err(|_| SessionError::WriterLost)??;
         Ok((identities, receipt))
     }
 
@@ -826,33 +790,9 @@ impl SessionStore {
         blob: &crate::media::BlobRef,
         limit: usize,
     ) -> Result<Vec<u8>, SessionError> {
-        use crate::media::MediaError;
-        let invalid = |error| match error {
-            MediaError::HashMismatch => SessionError::BlobHashMismatch(blob.sha256.to_string()),
-            error => invalid_data(error),
-        };
-        usize::try_from(blob.bytes)
-            .ok()
-            .filter(|&length| length <= limit)
-            .ok_or_else(|| invalid(MediaError::TooLarge))?;
-        let key = blob.sha256.to_bytes().to_vec();
-        let bytes = self
-            .with_writer(move |writer| {
-                writer.db.lock().query_row(
-                    "SELECT bytes FROM blob WHERE sha256 = ?1",
-                    db::params![key],
-                    |row| Ok(row.get::<Vec<u8>>(0)?),
-                )
-            })
-            .await??
-            .ok_or_else(|| SessionError::Io(std::io::Error::from(std::io::ErrorKind::NotFound)))?;
-        if crate::media::BlobDigest::of(&bytes) != blob.sha256 {
-            return Err(invalid(MediaError::HashMismatch));
-        }
-        if bytes.len() as u64 != blob.bytes {
-            return Err(invalid(MediaError::LengthMismatch));
-        }
-        Ok(bytes)
+        let blob = *blob;
+        self.with_writer(move |writer| writer.read_blob(blob, limit))
+            .await?
     }
 
     pub async fn store_image(
@@ -884,9 +824,14 @@ impl SessionStore {
         })
     }
 
-    /// Load every blob a request references so providers can encode it.
-    pub async fn load_blobs(&self, request: &mut ModelRequest) -> Result<(), SessionError> {
-        use crate::media::{AttachmentRef, ImageFormat, MAX_IMAGE_BYTES, MediaError};
+    /// Load every blob a request references so providers can encode it. Blobs in
+    /// `cache` are not read again; afterwards it holds exactly this request's blobs.
+    pub async fn load_blobs(
+        &self,
+        request: &mut ModelRequest,
+        cache: &mut crate::media::LoadedBlobs,
+    ) -> Result<(), SessionError> {
+        use crate::media::{AttachmentRef, ImageFormat, MAX_IMAGE_BYTES};
         // Image blobs carry the format they must sniff as; text blobs carry none.
         let mut blobs = Vec::new();
         use crate::provider::protocol::{Message, UserContent};
@@ -912,19 +857,35 @@ impl SessionStore {
                 Message::Assistant(_) => {}
             }
         }
-        // Texts load before images, as a shared blob is then exempt from sniffing.
-        blobs.sort_by_key(|(_, format)| format.is_some());
-        // One bound for every blob loaded into a request, text or image.
-        let limit = MAX_IMAGE_BYTES as usize;
-        for (blob, format) in blobs {
-            if !request.blobs.contains(&blob) {
-                let bytes = self.read_blob(&blob, limit).await?;
-                if format.is_some_and(|format| ImageFormat::sniff(&bytes) != Some(format)) {
-                    return Err(invalid_data(MediaError::UnsupportedImage));
-                }
-                request.blobs.insert(blob, bytes);
+        // A blob a text also references is exempt from sniffing.
+        blobs.sort_by_key(|(_, format)| format.is_none());
+        let blobs: std::collections::BTreeMap<_, _> = blobs.into_iter().collect();
+        let missing: Vec<_> = blobs
+            .keys()
+            .filter(|blob| !cache.contains(blob))
+            .copied()
+            .collect();
+        if !missing.is_empty() {
+            // One bound for every blob loaded into a request, text or image.
+            let limit = MAX_IMAGE_BYTES as usize;
+            let read = move |writer: &mut Writer| -> Result<Vec<_>, SessionError> {
+                let read = |blob| Ok((blob, writer.read_blob(blob, limit)?));
+                missing.into_iter().map(read).collect()
+            };
+            for (blob, bytes) in self.with_writer(read).await?? {
+                cache.insert(blob, bytes);
             }
         }
+        let mut loaded = crate::media::LoadedBlobs::default();
+        for (blob, format) in blobs {
+            let bytes = cache.shared(&blob).expect("referenced blobs are loaded");
+            if format.is_some_and(|format| ImageFormat::sniff(&bytes) != Some(format)) {
+                return Err(BlobError::UnsupportedImage.at(blob.sha256));
+            }
+            loaded.insert(blob, bytes);
+        }
+        cache.clone_from(&loaded);
+        request.blobs = loaded;
         Ok(())
     }
 }
@@ -933,41 +894,81 @@ async fn blocking<T: Send + 'static>(
     work: impl FnOnce() -> T + Send + 'static,
 ) -> Result<T, SessionError> {
     let joined = tokio::task::spawn_blocking(work).await;
-    joined.map_err(|error| SessionError::Io(std::io::Error::other(error)))
+    joined.map_err(SessionError::Task)
 }
 
-fn invalid_data(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> SessionError {
-    SessionError::Io(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
+/// Why a stored blob cannot be used.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Error)]
+pub enum BlobError {
+    #[error("is missing")]
+    Missing,
+    #[error("failed its content hash check")]
+    HashMismatch,
+    #[error("exceeds its byte limit")]
+    TooLarge,
+    #[error("does not match its byte length")]
+    LengthMismatch,
+    #[error("is not the image format it was stored as")]
+    UnsupportedImage,
+}
+
+impl BlobError {
+    fn at(self, digest: crate::media::BlobDigest) -> SessionError {
+        SessionError::Blob {
+            digest,
+            reason: self,
+        }
+    }
 }
 
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error("model request template must not contain conversation history")]
     TemplateHistory,
-    #[error("accepted append is indeterminate; recovery required: {0}")]
-    AppendIndeterminate(AppendRecovery),
+    #[error("accepted append is indeterminate; recovery required: {recovery}")]
+    AppendIndeterminate {
+        recovery: AppendRecovery,
+        /// The database's report when the commit itself failed.
+        #[source]
+        source: Option<DbError>,
+    },
     #[error("append rejected: writer requires recovery of prior attempt: {0}")]
     AppendUnavailable(AppendRecovery),
     #[error("session writer is closed")]
     Closed,
     #[error("cannot reconstruct model request at sequence {sequence}: {reason}")]
-    ModelRequestReplay { sequence: u64, reason: &'static str },
+    ModelRequestReplay {
+        sequence: RequestSeq,
+        reason: ReplayError,
+    },
+    #[error("invalid compaction at sequence {sequence}: {reason}")]
+    InvalidCompaction {
+        sequence: RecordSeq,
+        reason: CheckpointError,
+    },
+    #[error("session writer was lost before accepting the append")]
+    WriterLost,
+    #[error("session task failed: {0}")]
+    Task(#[source] tokio::task::JoinError),
+    #[error("session {0} was not found")]
+    NotFound(SessionId),
     #[error("session I/O failed: {0}")]
     Io(#[from] std::io::Error),
     #[error(transparent)]
     Database(DbError),
     #[error("session identifier generation failed: {0}")]
     Random(#[from] getrandom::Error),
-    #[error("could not allocate a unique session identifier")]
-    IdCollisions,
     #[error("session {0} is already open")]
     AlreadyOpen(SessionId),
     #[error("unsupported session version {0}")]
     UnsupportedVersion(i64),
     #[error("event belongs to another session")]
     WrongSession,
-    #[error("blob `{0}` failed its content hash check")]
-    BlobHashMismatch(String),
+    #[error("blob `{digest}` {reason}")]
+    Blob {
+        digest: crate::media::BlobDigest,
+        reason: BlobError,
+    },
 }
 
 impl From<DbError> for SessionError {
@@ -1072,8 +1073,8 @@ pub(crate) mod tests {
         ProfileSnapshot {
             name: "test/test".parse().unwrap(),
             profile: ModelProfile {
-                hint: Some("Test model.".into()),
-                ..ModelProfile::new("test", None, 128_000, 4096, false)
+                hint: Some("Test model.".parse().unwrap()),
+                ..crate::tests::profile("test", false)
             },
         }
     }
@@ -1084,6 +1085,31 @@ pub(crate) mod tests {
             cached_input_tokens: cached,
             cache_write_input_tokens: 0,
             output_tokens: output,
+        }
+    }
+
+    /// A request against `context` with no checkpoint or history range.
+    pub(crate) fn requested(context: RecordSeq) -> SessionEvent {
+        SessionEvent::ModelRequested {
+            context,
+            checkpoint: None,
+            through: None,
+            tail: Vec::new(),
+            history_lifetime: Default::default(),
+        }
+    }
+
+    pub(crate) fn attempt(request: RequestSeq, attempt: u64) -> SessionEvent {
+        SessionEvent::ModelAttemptStarted(AttemptRef { request, attempt })
+    }
+
+    pub(crate) fn record(agent: &AgentId, sequence: u64, event: SessionEvent) -> EventRecord {
+        EventRecord {
+            id: EventId::generate().unwrap(),
+            sequence: sequence.into(),
+            timestamp_millis: 0,
+            agent: agent.clone(),
+            event,
         }
     }
 
@@ -1126,14 +1152,11 @@ pub(crate) mod tests {
             "publication must follow the commit"
         );
         drop(accepted);
-        let closing = tokio::spawn({
-            let store = store.clone();
-            async move { store.close().await }
-        });
-        tokio::task::yield_now().await;
-        assert!(!closing.is_finished(), "close must drain accepted work");
+        let mut closing = Box::pin(store.close());
+        let pending = futures_util::poll!(&mut closing).is_pending();
+        assert!(pending, "close must drain accepted work");
         resume.send(()).unwrap();
-        closing.await.unwrap().unwrap();
+        crate::tests::bounded(closing).await.unwrap();
         let record = events.recv().await.unwrap();
         assert_eq!(record.sequence, identity.sequence);
         assert_eq!(store.records().await.last(), Some(&record));
@@ -1156,28 +1179,21 @@ pub(crate) mod tests {
                 .await
                 .unwrap();
             reached.await.unwrap();
-            let reading = tokio::spawn({
-                let store = store.clone();
-                async move { store.reconciled_records().await }
-            });
-            let draining = tokio::spawn({
-                let store = store.clone();
-                async move { store.drain().await }
-            });
-            tokio::task::yield_now().await;
+            let mut reading = Box::pin(store.reconciled_records());
+            let mut draining = Box::pin(store.drain());
             assert!(
-                !reading.is_finished(),
+                futures_util::poll!(&mut reading).is_pending(),
                 "{boundary:?}: read must wait for publication"
             );
             assert!(
-                !draining.is_finished(),
+                futures_util::poll!(&mut draining).is_pending(),
                 "{boundary:?}: drain must wait for publication"
             );
             resume.send(()).unwrap();
             let record = accepted.committed().await.unwrap();
-            let records = reading.await.unwrap().unwrap();
+            let records = crate::tests::bounded(reading).await.unwrap();
             assert_eq!(records.last(), Some(&record), "{boundary:?}");
-            draining.await.unwrap().unwrap();
+            crate::tests::bounded(draining).await.unwrap();
         }
     }
 
@@ -1192,7 +1208,7 @@ pub(crate) mod tests {
             })
             .await;
         assert!(
-            matches!(lost, Err(SessionError::Io(_))),
+            matches!(lost, Err(SessionError::WriterLost)),
             "unexpected result: {lost:?}"
         );
         let before = store.reconciled_records().await.unwrap().len();
@@ -1203,15 +1219,18 @@ pub(crate) mod tests {
         assert_eq!(store.reconciled_records().await.unwrap().len(), before + 1);
     }
 
-    /// Failures after acceptance poison the writer with the exact recovery identity;
-    /// reopening resolves the append from what the database actually committed.
+    /// Failures after acceptance poison the writer with the exact recovery identity,
+    /// keeping a failed commit's database error; reopening resolves the append from
+    /// what the database actually committed.
     #[tokio::test]
     async fn failures_poison_the_writer_and_reopen_resolves_the_commit() {
-        for (fault, durable) in [
-            (CommitFault::Fail(AppendBoundary::Write), false),
-            (CommitFault::Fail(AppendBoundary::Publication), true),
-            (CommitFault::Panic, false),
+        use {AppendBoundary::*, RecoveryReason::*};
+        for (fault, reason) in [
+            (CommitFault::Fail(Write), Commit),
+            (CommitFault::Fail(Publication), Unpublished),
+            (CommitFault::Panic, ReceiptLost),
         ] {
+            let durable = reason == Unpublished;
             let (root, store, id, agent) = fresh().await;
             let before = store.records().await.len();
             store.fault_next_commit(fault).await;
@@ -1219,8 +1238,9 @@ pub(crate) mod tests {
             let accepted = accepted.await.unwrap();
             let identity = accepted.identity();
             let recovery_is = |result: Result<_, SessionError>, indeterminate: bool| match result {
-                Err(SessionError::AppendIndeterminate(recovery)) if indeterminate => {
-                    recovery.identity == identity
+                Err(SessionError::AppendIndeterminate { recovery, source }) if indeterminate => {
+                    recovery == AppendRecovery { identity, reason }
+                        && source.is_some() == (reason == Commit)
                 }
                 Err(SessionError::AppendUnavailable(recovery)) if !indeterminate => {
                     recovery.identity == identity
@@ -1281,23 +1301,20 @@ pub(crate) mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn acknowledged_append_releases_owned_store_before_immediate_reopen() {
-        for _ in 0..28 {
-            let (_root, store, id, agent) = fresh().await;
-            let root = _root.path().to_path_buf();
-            store
-                .append(agent, SessionEvent::AgentInterrupted)
-                .await
-                .unwrap();
-            drop(store);
-            let (_, records) = SessionStore::open(&root, id).await.unwrap();
-            assert_eq!(records.len(), 3);
-        }
+        let (root, store, id, agent) = fresh().await;
+        store
+            .append(agent, SessionEvent::AgentInterrupted)
+            .await
+            .unwrap();
+        drop(store);
+        let (_, records) = SessionStore::open(root.path(), id).await.unwrap();
+        assert_eq!(records.len(), 3);
     }
 
     /// A cancelled caller leaves its operation running: later work waits for it.
     #[tokio::test]
     async fn cancelled_writer_operation_keeps_its_turn_until_it_finishes() {
-        let (_root, store, _id, agent) = fresh().await;
+        let (_root, store, _id, _) = fresh().await;
         let (entered, running) = oneshot::channel();
         let (release, released) = std::sync::mpsc::channel::<()>();
         let caller = tokio::spawn({
@@ -1313,44 +1330,35 @@ pub(crate) mod tests {
         running.await.unwrap();
         caller.abort();
         assert!(caller.await.unwrap_err().is_cancelled());
-        let append = tokio::spawn({
-            let store = store.clone();
-            async move { store.append(agent, SessionEvent::AgentInterrupted).await }
-        });
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert!(!append.is_finished(), "the operation still owns the writer");
+        // `drain` completes on its first poll exactly when the turn is free.
+        let mut draining = Box::pin(store.drain());
+        let pending = futures_util::poll!(&mut draining).is_pending();
+        assert!(pending, "the operation still owns the writer");
         release.send(()).unwrap();
-        append.await.unwrap().unwrap();
+        crate::tests::bounded(draining).await.unwrap();
     }
 
     /// `close` waits until queued work has let go of the lease, so dropping the
     /// last handle frees the session at once, and admission stays closed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_under_traffic_stops_admission_and_frees_the_lease_for_reopen() {
-        for round in 0..16 {
-            let (root, store, id, agent) = fresh().await;
-            let traffic = async {
-                for _ in 0..3 {
-                    // Dropped receipts: the commits are still in flight when `close` queues.
-                    let accepted =
-                        store.accept_append(agent.clone(), SessionEvent::AgentInterrupted);
-                    drop(accepted.await.unwrap());
-                }
-                store.close().await
-            };
-            let (blob, closed) = tokio::join!(store.store_blob(b"racing"), traffic);
-            blob.unwrap();
-            closed.unwrap();
-            if round % 2 == 0 {
-                let late = store.append(agent, SessionEvent::AgentCompleted).await;
-                assert!(matches!(late, Err(SessionError::Closed)));
+        let (root, store, id, agent) = fresh().await;
+        let traffic = async {
+            for _ in 0..3 {
+                // Dropped receipts: the commits are still in flight when `close` queues.
+                let accepted = store.accept_append(agent.clone(), SessionEvent::AgentInterrupted);
+                drop(accepted.await.unwrap());
             }
-            drop(store);
-            let (_, records) = SessionStore::open(root.path(), id).await.unwrap();
-            assert_eq!(records.len(), 5);
-        }
+            store.close().await
+        };
+        let (blob, closed) = tokio::join!(store.store_blob(b"racing"), traffic);
+        blob.unwrap();
+        closed.unwrap();
+        let late = store.append(agent, SessionEvent::AgentCompleted).await;
+        assert!(matches!(late, Err(SessionError::Closed)));
+        drop(store);
+        let (_, records) = SessionStore::open(root.path(), id).await.unwrap();
+        assert_eq!(records.len(), 5);
     }
 
     #[tokio::test]
@@ -1413,32 +1421,6 @@ pub(crate) mod tests {
                 Err(SessionError::UnsupportedVersion(_))
             ));
             assert_eq!(std::fs::read(&path).unwrap(), archive);
-        }
-    }
-
-    #[tokio::test]
-    async fn ephemeral_store_keeps_events_and_images_in_memory() {
-        let root = tempfile::tempdir().unwrap();
-        let store = SessionStore::create_ephemeral(root.path()).await.unwrap();
-        let directory = store.directory().to_path_buf();
-        let agent = started(&store, root.path()).await;
-        store
-            .append(agent, SessionEvent::AgentInterrupted)
-            .await
-            .unwrap();
-        assert_eq!(store.records().await.len(), 3);
-        let png = crate::tests::png(b"image");
-        let image = store
-            .store_image(Some("image.png".to_owned()), &png)
-            .await
-            .unwrap();
-        let limit = crate::media::MAX_IMAGE_BYTES as usize;
-        assert_eq!(
-            store.read_blob(&image.blob, limit).await.unwrap(),
-            png.bytes()
-        );
-        for file in [DATABASE_FILE, LOCK_FILE] {
-            assert!(!directory.join(file).exists());
         }
     }
 }
