@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-a66e78fb.js";
+            window.path_to_searchindex_js = "searchindex-0b462d45.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -1990,9 +1990,10 @@ return results;
 <h2 id="saved-output-and-serialization"><a class="header" href="#saved-output-and-serialization">Saved output and serialization</a></h2>
 <p>Read or search saved command output with <code>tool.jobs({job: commandJobId, field: "/result/stdout"})</code>.
 A <code>jobs</code> read returns the existing JobView for that job; it does not add another wrapper.
-Field-selected output is a job view, not a raw string: available text is in
-<code>presentation.preview.lines</code>, with pagination metadata alongside it. Field, pagination, and
-search selections omit image attachments; whole-output reads can attach saved images.</p>
+Field-selected output is a job view, not a raw string: the page is in <code>presentation.preview</code>,
+as <code>lines</code> of text, <code>elements</code> or <code>members</code> of JSON, or query <code>matches</code>, with pagination metadata
+alongside it. Field, pagination, search, and query selections omit image attachments; whole-output
+reads can attach saved images.</p>
 <h2 id="jobview-response-contract"><a class="header" href="#jobview-response-contract">JobView response contract</a></h2>
 <p>Direct model calls and JavaScript tool calls return the same <code>JobView</code> envelope:</p>
 <pre><code class="language-text">id?: number
@@ -2015,12 +2016,14 @@ calling agent’s own, and <code>code</code> for a denial. A pre-admission failu
 at all: a tool that is no longer available, or a call interrupted while the session was not
 running, is answered with this same failure shape.</p>
 <p><code>presentation</code> is absent when a successful foreground response has no truncation, page, capture,
-question, or notice. When present, it groups <code>preview</code>, <code>truncated</code>, <code>captures</code>, <code>question</code>, and
-<code>notice</code>, each present only when it has content. Read a page as
-<code>r.presentation.preview.lines</code> and a question as <code>r.presentation.question</code>.
+question, or notice. When present, it groups <code>preview</code>, <code>shape</code>, <code>truncated</code>, <code>captures</code>,
+<code>question</code>, and <code>notice</code>, each present only when it has content, and precedes <code>result</code>. Read a
+text page as <code>r.presentation.preview.lines</code> and a question as <code>r.presentation.question</code>.
 Truncation entries keep their source paths rooted at <code>/result/...</code>.</p>
 <p>JavaScript receives complete data; model views may shorten fields as described in
-<a href="#automatic-previews">saved job output</a>.
+<a href="#automatic-previews">saved job output</a>. A returned tool response keeps its complete
+fields whole in the script’s own preview; a value taken out of it, such as <code>response.result</code>, is
+shortened like any other returned value.
 Tool descriptions’ <code>Result</code> refers to the envelope’s <code>.result</code>, not a separate wrapper. A successful
 <code>jobs({job})</code> read of a failed target is still a successful tool invocation returning that failed
 <code>JobView</code>; <code>response.unwrap()</code> checks the observed job state and can therefore throw for that view.</p>
@@ -2050,8 +2053,8 @@ script’s captured text can be inspected with
 <code>tool.jobs({job: scriptJobId, field: "/result/console"})</code>. These inspections read the currently
 available output; they do not subscribe to future writes or wait for script completion.</p>
 <p>There is no fixed console-capture size cap. Disk capacity and I/O failures still apply.
-Automatic previews can truncate displayed text without discarding captured output; use
-<a href="#saved-job-output">paging or search</a> to inspect more. The <strong>16 MiB limit applies to JavaScript
+Automatic previews can shorten displayed output without discarding captured output; use
+<a href="#paging-searching-and-querying">paging, search, or queries</a> to inspect more. The <strong>16 MiB limit applies to JavaScript
 source</strong>, not console capture.</p>
 <p>On a script execution failure, the saved script payload is <code>{value: null, console?: &lt;captured text&gt;, failure?: &lt;details&gt;}</code>;
 the enclosing JobView is <code>failed</code> and carries its <code>error</code>: the thrown error’s message and stack,
@@ -2089,7 +2092,8 @@ shell parsing: <code>exec({command: "cargo test 2&gt;&amp;1 | tail"})</code> or 
 <code>jobs({all:true})</code> includes completed history, and the listing payload is in the envelope’s <code>.result</code>.
 <code>jobs({job})</code> reads that job’s saved output and status immediately; it never waits for new output or
 completion. It returns the existing queried view, not another wrapper, and accepts the
-<a href="#saved-job-output">output selections</a> <code>field</code>, <code>start</code>, <code>limit</code>, <code>pattern</code>, <code>context</code>, and <code>offset</code>.
+<a href="#paging-searching-and-querying">output selections</a> <code>field</code> and <code>limit</code>, with
+<code>start</code>, <code>offset</code>, <code>pattern</code>, and <code>context</code> for text, or <code>index</code> and <code>query</code> for JSON.
 <code>all</code> cannot be combined with <code>job</code>, and selections require <code>job</code>. Scripts also control jobs with
 <code>tool.job(id).send({value})</code> and <code>.cancel()</code>.</p>
 <p>Use <code>wait({timeout?: seconds})</code> (or <code>await tool.wait(...)</code> in scripts) to yield until an agent
@@ -2198,19 +2202,22 @@ Do not combine <code>auth</code> with an <code>Authorization</code> header or em
 <code>Content-Type</code> request header; they are not interchangeable with multipart uploads.</p>
 <h2 id="responses-and-extraction"><a class="header" href="#responses-and-extraction">Responses and extraction</a></h2>
 <p>Responses include the status, the received byte count (<code>size</code>), the elapsed milliseconds
-(<code>duration</code>), and a tagged <code>body</code>: <code>text</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Followed redirects add
+(<code>duration</code>), and a tagged <code>body</code>: <code>text</code>, <code>json</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Followed redirects add
 their history (<code>redirects</code>), whose last <code>location</code> is the final URL. Response <code>headers</code> is absent
 by default; set <code>include_headers: true</code> to return a map of repeated header values.
 This option does not affect the <code>headers</code> request-header map.
-JSON responses remain decoded text; scripts can use <code>JSON.parse(response.body.text)</code>.
+A textual body that is JSON is read as that value, following the
+<a href="#json-output">JSON output</a> rules: the body is then <code>{kind: "json", value}</code>. Other
+bodies, and any body fetched with <code>response_format: "text"</code> or <code>text: true</code>, remain decoded text in
+<code>body.text</code>.
 <code>response_format</code> defaults to <code>auto</code> (text for textual content, base64 otherwise); <code>text</code> forces
 character decoding and <code>base64</code> preserves response entity bytes. HTTP decompression is automatic;
 these are not raw wire bytes. <code>save_to</code> saves the response to a file on success instead of
 embedding the payload. Errors or cancellation do not replace an existing destination.
-Automatic job presentation may shorten <code>body.text</code> and <code>body.data</code>, with continuation markers;
-retrieve the complete saved payload using <code>jobs({job})</code> fields <code>/result/body/text</code> or
-<code>/result/body/data</code>. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
-calls still receive the complete payload for processing.</p>
+Automatic job presentation may shorten a result over its preview budget: the body, and also long
+header values and redirect lists, recording what it cut; retrieve the complete saved payload
+using <code>jobs({job})</code> fields such as <code>/result/body/text</code>, <code>/result/body/value</code>, <code>/result/body/data</code>
+or <code>/result/headers</code>. JavaScript calls still receive the complete payload for processing.</p>
 <p><code>text:true</code> is separate from <code>response_format:"text"</code>: it extracts readable article content from
 HTML, returning plain text and metadata with the title, plus byline, site name, and language when
 available.
@@ -2300,6 +2307,7 @@ ordinary response.</p>
 Nulls in tool payloads are preserved; fields a tool has no value for are absent.
 Process results contain <code>exit_code</code>, or <code>signal</code> when a signal killed the process, and the
 <code>stdout</code> and <code>stderr</code> streams that produced output; scripts read an absent stream as <code>""</code>.
+A <code>stdout</code> holding JSON is read as that JSON; see <a href="#json-output">JSON output</a>.
 Completed agent calls return their complete answer string without automatic truncation. Child questions return <code>{questions:[{id,prompt,options?}]}</code>.</p>
 <p>Directory reads return grouped entries with file sizes, for example:
 <code>{kind:"directory",entries:{files:[{name:"main.rs",bytes:4096}],directories:["lib"]}}</code>.
@@ -2311,7 +2319,7 @@ Missing paths and operating-system access denials from <code>read</code> are suc
 error without catching an exception. Tool-policy permission denials remain tool errors.
 Search returns <code>{matches:{"src/main.rs":["12: matching text"]}}</code>, preserving source whitespace.
 <code>search({pattern:"...",details:true})</code> returns structured <code>{path,line,column,text}</code> matches instead.
-An empty search result has <code>matches: {}</code>. Grouped maps share a single preview budget.
+An empty search result has <code>matches: {}</code>.
 <code>targets({details:true})</code> returns full target metadata; fields a target does not set are absent.
 <code>target_add</code> completes without a result.
 All defaulted input fields, including <code>details: false</code>, are optional in tool schemas.</p>
@@ -2341,20 +2349,59 @@ mutation merely because its result is a failed job.</p>
 HTTP error status is a normal HTTP result, and a <code>wait</code> timeout ends only that wait. Expected
 missing/unreadable-file results from <code>read</code> remain completed diagnostic payloads. Policy denials,
 operating-system access failures, cancellation, and interrupted execution remain distinct.</p>
+<h2 id="json-output"><a class="header" href="#json-output">JSON output</a></h2>
+<p>Process <code>stdout</code> and MCP <code>text</code> content blocks are checked once when the job finishes, and a
+textual HTTP body when it arrives. When the whole text is one JSON object or array, or two or more
+objects or arrays in a row (JSON Lines, or concatenated output such as <code>jq</code> prints by default),
+the value replaces the text; a sequence becomes an array. <code>stdout</code> and MCP <code>text</code> then hold the
+value, and <code>stdout</code>’s result type reads <code>string | object | JSON[]</code>; an HTTP body becomes
+<code>{kind: "json", value}</code> (<code>response_format: "text"</code> keeps it as text). Scripts and the model both
+receive the value, and page or query it as JSON.</p>
+<p>The text stays text when it is anything else (a lone number or string, or JSON with other text
+around it), is unfinished (cut off or cancelled output), nests deeper than 64 levels, repeats an
+object key, or holds a number that double-precision floating point cannot represent as written.
+A number qualifies when the shortest decimal that reads back as its nearest double has the same
+value as written: <code>0.1</code>, <code>1.0</code> and <code>1e30</code> do; integers above 2^53 such as <code>9007199254740993</code>,
+over-precise decimals, and out-of-range numbers such as <code>1e400</code> do not.</p>
 <h2 id="automatic-previews"><a class="header" href="#automatic-previews">Automatic previews</a></h2>
-<p>JavaScript receives complete result data. Model-facing previews may shorten designated output
-fields: file <code>content</code>, directory <code>entries</code>, process <code>stdout</code> and <code>stderr</code>, search <code>matches</code>, glob
-<code>paths</code>, skill asset <code>content</code> and <code>assets</code> trees, HTTP <code>body.text</code> and <code>body.data</code>, and script
-<code>console</code> text. Skill instructions, errors, questions, and other fields remain complete; there
-is no aggregate response-size limit or whole-result fallback.</p>
-<p>Each shortened field independently retains at most 100 lines or 32 KiB (32768 bytes), whichever
-is reached first. Strings count UTF-8 content bytes before JSON escaping; arrays and grouped maps
-count their saved JSON text and retain only complete items. Grouped maps share one budget across
-all groups. Shortened fields keep their original types.</p>
-<p><code>presentation.truncated</code> contains <code>{field, total_lines, next_start, next_offset?}</code> for each
-shortened field, reporting its total source lines and exact first unread position. <code>next_offset</code>
-is present only when the first unread position is inside a line. Finished jobs with incomplete
-captures include an <code>Output incomplete.</code> notice. These rules also apply after session resume and to completed remote jobs.</p>
+<p>JavaScript receives complete result data. The model’s automatic view of a finished result is a
+preview:</p>
+<ul>
+<li><strong>Text fields</strong>, strings reached only through objects of at most 100 members, such as <code>stdout</code>,
+file <code>content</code>, or <code>body.text</code>, each keep at most 100 lines or 8 KiB (8192 bytes), whichever
+comes first, counting UTF-8 content bytes before JSON escaping. Together they keep at most
+32 KiB; later strings are shortened like everything else.</li>
+<li><strong>Everything else</strong> shares one 8 KiB preview budget, which also counts the shape and truncation
+records below. When it is exceeded, strings keep their first 256 bytes; if every element then
+fits, all are kept. Otherwise arrays keep their first elements, with one count shared by every
+array at any depth: the largest that fits, and at most 10. Objects with more than 100 members
+keep their first members in source order the same way; smaller objects keep all of theirs, or
+when that does not fit, none. When even a single sample does not fit, strings get shorter, then
+deeper levels are left empty. Values holding complete fields keep the path to them.</li>
+</ul>
+<p>Fields a tool declares complete are never shortened and are not counted: skill instructions,
+child agent answers, and the job views <code>jobs</code> reads return. Errors and child questions sit
+outside <code>result</code> and are also complete, including those of tool responses a script returns. A
+response can therefore exceed the budget; it does not limit response size.</p>
+<p><code>presentation</code> precedes <code>result</code>. When arrays or objects were cut, <code>presentation.shape</code> describes
+the whole result: objects list each member’s shape under its own name, and a member only some
+objects have includes <code>absent</code>, as in <code>"boolean|absent"</code>; arrays are <code>[count, element]</code>, with <code>"min..max"</code> when lengths vary and <code>[0]</code> when always empty;
+types that vary are joined as <code>"string|null"</code>, or <code>{"|": [...]}</code> when one is a container; objects
+with more than 100 members read <code>{"*": value, "#": count}</code>. A shape over half the budget collapses
+its deepest levels to <code>"{…}"</code> and <code>[count, "…"]</code>.</p>
+<p><code>presentation.truncated</code> lists each cut in its own unit:</p>
+<ul>
+<li><code>{field, total_lines, next_start, next_offset?}</code> for a string, with the exact position to
+continue from; <code>next_offset</code> is present only when that position is inside a line.</li>
+<li><code>{field, shown, total_elements, kept?}</code> for an array.</li>
+<li><code>{field, shown, total_members, kept?}</code> for an object.</li>
+<li><code>{field, cuts}</code> for further cuts within <code>field</code>, beyond the first 32 listed.</li>
+</ul>
+<p><code>kept</code> lists the index ranges shown, as <code>[[first, last], ...]</code>, when a complete field inside an
+array or object keeps an element beyond the leading ones; such records are always listed. Reading
+a cut array or object continues at its first value not shown. Finished jobs with incomplete captures
+include an <code>Output incomplete.</code> notice. These rules also apply after session resume and to
+completed remote jobs.</p>
 <h2 id="script-result-presentation"><a class="header" href="#script-result-presentation">Script result presentation</a></h2>
 <p>The enclosing script’s <code>.result</code> is <code>{value, console?, failure?}</code>; silent scripts have no
 <code>console</code>. Ordinary tools have no console field. Existing JobViews such as
@@ -2362,55 +2409,89 @@ captures include an <code>Output incomplete.</code> notice. These rules also app
 <p>Presentation never changes the full saved return value. Default script output retrieval returns
 the composed script payload; explicit field selections read saved script data. Logging and
 returning the same data explicitly produces both outputs.</p>
-<h2 id="paging-and-searching"><a class="header" href="#paging-and-searching">Paging and searching</a></h2>
-<p>Explicit <code>jobs({job})</code> selections return a view whose <code>presentation.preview</code> defaults to
-100 lines with up to 32 KiB of JSON-encoded line content. Job metadata is never truncated.</p>
-<pre><code class="language-js">// Read a selected part of a saved result.
+<h2 id="paging-searching-and-querying"><a class="header" href="#paging-searching-and-querying">Paging, searching, and querying</a></h2>
+<p>Explicit <code>jobs({job})</code> selections return a view whose <code>presentation.preview</code> is one page of the
+selected field, in that field’s own unit:</p>
+<div class="table-wrapper">
+<table>
+<thead>
+<tr><th>Field</th><th>Selectors</th><th>Page</th></tr>
+</thead>
+<tbody>
+<tr><td>Text: a string, a number, boolean or null, or a capture that is live or unfinished</td><td><code>start</code>, <code>offset</code>, <code>limit</code>, <code>pattern</code>, <code>context</code></td><td><code>lines</code>, <code>total_lines</code>, <code>next_start</code>, <code>next_offset</code></td></tr>
+<tr><td>A JSON object or array</td><td><code>index</code>, <code>limit</code></td><td><code>elements</code> or <code>members</code>, <code>total_elements</code> or <code>total_members</code>, <code>next_index</code></td></tr>
+<tr><td>A JSON object or array, queried</td><td><code>query</code>, <code>index</code>, <code>limit</code></td><td><code>matches</code>, <code>total_matches</code>, <code>next_index</code></td></tr>
+</tbody>
+</table>
+</div>
+<p>Using another unit’s selectors is rejected with an error naming the field’s kind; selectors that
+only restate their defaults (<code>start: 1</code>, <code>offset: 0</code>, <code>context: 0</code>, and <code>index: 0</code> without
+<code>query</code>) select nothing, so they are accepted with either kind of field. Job metadata is never truncated.</p>
+<pre><code class="language-js">// Read part of a text field, search it, and continue a long line.
 jobs({job:42, field:"/result/stdout", start:300, limit:80})
-// Search stored text, with surrounding context.
 jobs({job:42, field:"/result/stderr", pattern:"(?i)error|warning", context:2})
-// Continue at the returned source line and UTF-8 byte offset.
 jobs({job:42, field:"/result/stdout", start:22, offset:54, limit:100})
+// Page a JSON array, then continue at the returned position.
+jobs({job:42, field:"/result/stdout/items", index:200, limit:50})
+// Select within JSON.
+jobs({job:42, field:"/result/stdout", query:"$.items[?@.status.phase == 'Failed'].metadata.name"})
 </code></pre>
 <p><code>field</code> is a JSON Pointer: <code>/result/content</code> selects a file snapshot, <code>/result/stdout</code> and
 <code>/result/stderr</code> select process streams. For scripts, <code>/result/console</code> selects captured console
-text and <code>/result/value</code> selects the JavaScript return (append pointer segments for nested data,
-for example <code>/result/value/items</code>). The empty pointer <code>""</code> selects the whole saved output, a
-page of <code>{"result": ...}</code>. Objects and
-arrays have deterministic JSON text views. Long lines are split into UTF-8-safe fragments;
-the next position identifies where to continue. Regex matching is case-sensitive unless inline
-flags override it. Matching supports lines up to 4 MiB and reports an explicit resource error
-for larger lines; ordinary paging can still read those lines.</p>
-<p><code>start</code> is one-based (default 1); <code>offset</code> is a zero-based UTF-8 byte offset within that
-starting line (default 0). <code>limit</code> is 1–1000 returned source lines (default 100), including
-match context. <code>context</code> is 0–20 surrounding lines (default 0); positive context requires <code>pattern</code>.
-Output inspection returns immediately; it does not wait for new output.</p>
-<p>Explicit read pages contain <code>lines</code>, plus <code>total_lines</code> (absent when unavailable) and a next
-position. <code>field</code> is omitted when it is the field the model asked for. <code>next_start</code> is absent when
-no continuation remains, and <code>next_offset</code> is present only when the next position is inside a
-line. <code>lines</code> has one entry per returned line (or fragment of an oversized line): a string for a
-plain read, and <code>{line, text}</code> with the one-based source line number for a search. Empty fields
-have zero lines;
-a final unterminated line counts, and a trailing newline does not add an empty line.
-Read pages and automatic string previews prefer whole lines; oversized lines are split at
-UTF-8 boundaries. The page byte budget may return fewer lines than <code>limit</code>: use the returned
-position instead of computing <code>start + limit</code>. Offsets beyond a line or inside a UTF-8
-character are rejected. A start past the available lines returns an empty page with the total.</p>
-<p>For closed fields, a missing <code>next_start</code> means no selected content remains. For running fields, <code>total_lines</code> describes currently captured output and
-the numeric next position can be retried after yielding with <code>wait</code>, even when no content is
-currently available. Unavailable output omits <code>total_lines</code>; known empty output retains zero.
-Repeat the field, regex, and context when continuing a search; overlapping
-match context is reconstructed from saved text. Live searches defer incomplete lines and context
-windows until more output arrives or capture closes. A wait timeout never stops the original job.</p>
+text and <code>/result/value</code> selects the JavaScript return; append pointer segments for nested data,
+for example <code>/result/value/items</code>. The empty pointer <code>""</code> selects the whole saved output, the
+members of <code>{"result": ...}</code>. <code>limit</code> is 1–1000 lines, values, or matches (default 100). Output
+inspection returns immediately; it does not wait for new output.</p>
+<h3 id="text-pages"><a class="header" href="#text-pages">Text pages</a></h3>
+<p><code>start</code> is one-based (default 1); <code>offset</code> is a zero-based UTF-8 byte offset within that starting
+line (default 0). <code>context</code> is 0–20 surrounding lines (default 0), and positive context requires
+<code>pattern</code>. Pages hold up to 32 KiB of JSON-encoded line content; <code>field</code> is omitted when it is the
+field the model asked for. <code>next_start</code> is absent when no continuation remains, and <code>next_offset</code> is
+present only when the next position is inside a line. <code>lines</code> has one entry per returned line (or
+fragment of an oversized line): a string for a plain read, and <code>{line, text}</code> with the one-based
+source line number for a search. Empty fields have zero lines; a final unterminated line counts,
+and a trailing newline does not add an empty line.</p>
+<p>Pages prefer whole lines; oversized lines are split at UTF-8 boundaries. The page budget may return
+fewer lines than <code>limit</code>: use the returned position rather than computing <code>start + limit</code>. Offsets
+beyond a line or inside a UTF-8 character are rejected. A start past the available lines returns an
+empty page with the total. Regex matching is case-sensitive unless inline flags override it.
+Matching supports lines up to 4 MiB and reports an explicit resource error for larger lines; ordinary
+paging can still read those lines.</p>
+<p>For closed fields, a missing <code>next_start</code> means no selected content remains. For running fields,
+<code>total_lines</code> describes currently captured output, and the numeric next position can be retried
+after yielding with <code>wait</code>, even when no content is currently available. Unavailable output omits
+<code>total_lines</code>; known empty output retains zero. Repeat the field, regex, and context when continuing
+a search; overlapping match context is reconstructed from saved text. Live searches defer incomplete
+lines and context windows until more output arrives or capture closes. A wait timeout never stops
+the original job.</p>
+<h3 id="json-pages"><a class="header" href="#json-pages">JSON pages</a></h3>
+<p><code>index</code> is the zero-based first element or member (default 0). A page holds whole consecutive
+values in source order within 32 KiB, member names and text included, so it may return fewer than
+<code>limit</code>: continue at <code>next_index</code>, which is absent at the end. A first value that is not whole
+within the page is sampled as a preview is, within the page budget, with the page’s <code>shape</code> and
+<code>truncated</code> records at that value’s own pointers, for scripts and the model alike; select those
+pointers to read further into it. A member name longer than the page budget is still shown whole.</p>
+<h3 id="queries"><a class="header" href="#queries">Queries</a></h3>
+<p><code>query</code> is a JSONPath (RFC 9535) query over the selected JSON field: <code>$</code> is that field. Filters can
+use <code>length()</code>, <code>count()</code>, <code>value()</code>, and regular expressions with <code>match()</code> (the whole string) and
+<code>search()</code> (any part). Matches are <code>{at, value}</code> in document order, duplicates included, where <code>at</code>
+is the match’s pointer in the saved output, ready to use as <code>field</code>. They page by <code>index</code> like
+elements, with <code>total_matches</code> counting all of them. Numeric comparisons use double precision.
+When nothing matches, the page carries the queried field’s <code>shape</code>, which shows the member names
+a query can use.</p>
+<p>A query reads the selected field’s JSON into memory, up to 64 MiB of JSON text; a larger field is
+rejected, so query a field within it. This limits a query’s input, not its evaluation: once it
+starts, a query runs to completion, and queries that repeat selectors can produce many duplicate
+matches.</p>
 <h2 id="persistence-and-live-output"><a class="header" href="#persistence-and-live-output">Persistence and live output</a></h2>
 <p>Reads are repeatable and survive session resume. Finished jobs with retained partial output have
 an <code>Output incomplete.</code> notice, including when viewing the final captured page.</p>
-<p>The view’s <code>presentation.captures</code> lists the available captures its result does not already show
-in full, even without a structured result:</p>
+<p>The view’s <code>presentation.captures</code> lists captures that are not a finished part of the result: live,
+unfinished, or abandoned output, even without a structured result:</p>
 <pre><code class="language-json">[{"field":"/result/console","complete":false}]
 </code></pre>
 <p><code>complete: false</code> means the capture is still live or incomplete; in particular, a partial JSON capture must not be treated as a valid JSON value.
-Select a descriptor’s <code>field</code> to page or search its retained bytes. Capture descriptors survive
+Select a descriptor’s <code>field</code> to page or search its retained bytes as text. Capture descriptors survive
 failures, cancellation, and session resume even when there is no structured result containing
 those fields. Empty or absent result fields are not fabricated to represent partial captures.</p>
 <p>Local captures, including script console output, can be read while running. Remote captures
@@ -2419,8 +2500,10 @@ reconnecting to the remote machine.</p>
 <p>The TUI’s automatic output view shows the structured result and previews any available captures
 not represented there. This exposes both process streams while live and preserves stderr and exit
 status on completion. Explicit field, page, and search selections remain selected; choose
-<strong>automatic output</strong> in the Saved output menu to return to automatic viewing. The menu includes
-both result fields and available captures.</p>
+<strong>automatic output</strong> in the Saved output menu to return to automatic viewing. The menu lists up to
+100 fields one level below the one shown, from the page of it shown, starting with the result’s
+fields and captures, and the field above it; <strong>more fields</strong> shows the field from where the
+list stops, so the menu lists the rest.</p>
 <p>Recorded model requests keep the previews, pages, and notifications the model actually saw;
 they are not regenerated from saved output.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -2790,19 +2873,33 @@ destination of the connection it arrived on.</p>
 diagnostics and result slots registered by their producer, such as an expected <code>read</code> failure, are
 rendered only when the viewer’s capabilities permit exposing them. Host-site wording is relative
 to the viewer’s target: “on session host” is omitted for host-local viewers and retained for remote
-viewers. Capability-sensitive enclosing output pages use private file-backed renderings rather
-than shared render caches, keeping captured output out of memory without reusing privileged
-renderings for those diagnostic slots.</p>
+viewers. Pages of a value enclosing a diagnostic slot stream from the viewer’s own rendering of
+the saved document; nothing capability-sensitive is cached.</p>
 <p>This rendering boundary does not guarantee that target aliases never appear in a restricted view.
 A privileged <code>jobs</code> output read saves its rendered view as an ordinary JSON snapshot. Later
 restricted views of that saved result, or script results that copy it, retain the earlier rendered
 JSON unchanged. Already-committed model messages are not rewritten. Arbitrary returned JSON is not
 inspected for diagnostics or target aliases, and copied data does not acquire diagnostic provenance.</p>
-<p>Saved output and model-visible presentation are separate. Automatic previews shorten only fields
-marked <code>x-skyhook-truncatable</code> in the output schema; storing a field separately does not make it
-truncatable. Jobs persist their output schemas so resumed and remote results use the same rules.
-JavaScript receives complete results, while the journal retains the exact previews delivered to
-the model. See <a href="#saved-job-output">saved job output</a> for the user-facing limits.</p>
+<p>Saved output and model-visible presentation are separate. A finished result is saved as a compact
+document whose large parts live in captures: referenced streams, strings over 4 KiB, and the
+outermost larger containers, unless they enclose a capture, JSON-declared text, a complete field,
+a long string reached through object members alone, or the diagnostic slot. Text a schema
+declares as <code>contentMediaType: application/json</code> is classified once at finalization, unless its
+output was cut off, and when it is JSON is read as that value from its original bytes.
+Finalization also records the fields presentation never shortens, those marked
+<code>x-skyhook-complete</code> in the output schema joining those a script’s returned tool results carry,
+and then the size of the result’s automatic presentation, which notification batching budgets
+without previewing it again. Jobs persist their output schemas so resumed and remote results use
+the same rules.</p>
+<p>All saved JSON is read through streaming readers built in <code>job::output::json</code>. Previews, pages,
+and navigation into stored containers hold a bounded pool of what they may show rather than the
+value, and sampled readings take stored text only up to its prefix, with its extent from storage.
+Memory still grows with the largest single key or number, which the reader buffers whole; with the
+keys of each open object while detection tracks duplicates by hash; with fields marked complete,
+which are read whole; and with a JSONPath query’s selected field, which is loaded within a cap
+metered on the bytes it reads. JavaScript receives complete results, while the journal retains the
+exact previews delivered to the model. See <a href="#saved-job-output">saved job output</a> for the
+user-facing limits.</p>
 <p>Child messages and job notifications use a prepared delivery receipt: snapshot pending events,
 then commit them to the parent’s history together with their acknowledgment. Abandoned preparation leaves the
 events pending; cancellation cannot split an accepted commit from its acknowledgment. Replay

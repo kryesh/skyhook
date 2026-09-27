@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
+            window.path_to_searchindex_js = "../searchindex-0b462d45.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -214,9 +214,10 @@ return results;
 <h2 id="saved-output-and-serialization"><a class="header" href="#saved-output-and-serialization">Saved output and serialization</a></h2>
 <p>Read or search saved command output with <code>tool.jobs({job: commandJobId, field: "/result/stdout"})</code>.
 A <code>jobs</code> read returns the existing JobView for that job; it does not add another wrapper.
-Field-selected output is a job view, not a raw string: available text is in
-<code>presentation.preview.lines</code>, with pagination metadata alongside it. Field, pagination, and
-search selections omit image attachments; whole-output reads can attach saved images.</p>
+Field-selected output is a job view, not a raw string: the page is in <code>presentation.preview</code>,
+as <code>lines</code> of text, <code>elements</code> or <code>members</code> of JSON, or query <code>matches</code>, with pagination metadata
+alongside it. Field, pagination, search, and query selections omit image attachments; whole-output
+reads can attach saved images.</p>
 <h2 id="jobview-response-contract"><a class="header" href="#jobview-response-contract">JobView response contract</a></h2>
 <p>Direct model calls and JavaScript tool calls return the same <code>JobView</code> envelope:</p>
 <pre><code class="language-text">id?: number
@@ -239,12 +240,14 @@ calling agent’s own, and <code>code</code> for a denial. A pre-admission failu
 at all: a tool that is no longer available, or a call interrupted while the session was not
 running, is answered with this same failure shape.</p>
 <p><code>presentation</code> is absent when a successful foreground response has no truncation, page, capture,
-question, or notice. When present, it groups <code>preview</code>, <code>truncated</code>, <code>captures</code>, <code>question</code>, and
-<code>notice</code>, each present only when it has content. Read a page as
-<code>r.presentation.preview.lines</code> and a question as <code>r.presentation.question</code>.
+question, or notice. When present, it groups <code>preview</code>, <code>shape</code>, <code>truncated</code>, <code>captures</code>,
+<code>question</code>, and <code>notice</code>, each present only when it has content, and precedes <code>result</code>. Read a
+text page as <code>r.presentation.preview.lines</code> and a question as <code>r.presentation.question</code>.
 Truncation entries keep their source paths rooted at <code>/result/...</code>.</p>
 <p>JavaScript receives complete data; model views may shorten fields as described in
-<a href="job-output.html#automatic-previews">saved job output</a>.
+<a href="job-output.html#automatic-previews">saved job output</a>. A returned tool response keeps its complete
+fields whole in the script’s own preview; a value taken out of it, such as <code>response.result</code>, is
+shortened like any other returned value.
 Tool descriptions’ <code>Result</code> refers to the envelope’s <code>.result</code>, not a separate wrapper. A successful
 <code>jobs({job})</code> read of a failed target is still a successful tool invocation returning that failed
 <code>JobView</code>; <code>response.unwrap()</code> checks the observed job state and can therefore throw for that view.</p>
@@ -274,8 +277,8 @@ script’s captured text can be inspected with
 <code>tool.jobs({job: scriptJobId, field: "/result/console"})</code>. These inspections read the currently
 available output; they do not subscribe to future writes or wait for script completion.</p>
 <p>There is no fixed console-capture size cap. Disk capacity and I/O failures still apply.
-Automatic previews can truncate displayed text without discarding captured output; use
-<a href="job-output.html">paging or search</a> to inspect more. The <strong>16 MiB limit applies to JavaScript
+Automatic previews can shorten displayed output without discarding captured output; use
+<a href="job-output.html#paging-searching-and-querying">paging, search, or queries</a> to inspect more. The <strong>16 MiB limit applies to JavaScript
 source</strong>, not console capture.</p>
 <p>On a script execution failure, the saved script payload is <code>{value: null, console?: &lt;captured text&gt;, failure?: &lt;details&gt;}</code>;
 the enclosing JobView is <code>failed</code> and carries its <code>error</code>: the thrown error’s message and stack,

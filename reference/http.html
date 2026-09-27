@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-a66e78fb.js";
+            window.path_to_searchindex_js = "../searchindex-0b462d45.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -241,19 +241,22 @@ Do not combine <code>auth</code> with an <code>Authorization</code> header or em
 <code>Content-Type</code> request header; they are not interchangeable with multipart uploads.</p>
 <h2 id="responses-and-extraction"><a class="header" href="#responses-and-extraction">Responses and extraction</a></h2>
 <p>Responses include the status, the received byte count (<code>size</code>), the elapsed milliseconds
-(<code>duration</code>), and a tagged <code>body</code>: <code>text</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Followed redirects add
+(<code>duration</code>), and a tagged <code>body</code>: <code>text</code>, <code>json</code>, <code>base64</code>, <code>file</code>, or <code>empty</code>. Followed redirects add
 their history (<code>redirects</code>), whose last <code>location</code> is the final URL. Response <code>headers</code> is absent
 by default; set <code>include_headers: true</code> to return a map of repeated header values.
 This option does not affect the <code>headers</code> request-header map.
-JSON responses remain decoded text; scripts can use <code>JSON.parse(response.body.text)</code>.
+A textual body that is JSON is read as that value, following the
+<a href="job-output.html#json-output">JSON output</a> rules: the body is then <code>{kind: "json", value}</code>. Other
+bodies, and any body fetched with <code>response_format: "text"</code> or <code>text: true</code>, remain decoded text in
+<code>body.text</code>.
 <code>response_format</code> defaults to <code>auto</code> (text for textual content, base64 otherwise); <code>text</code> forces
 character decoding and <code>base64</code> preserves response entity bytes. HTTP decompression is automatic;
 these are not raw wire bytes. <code>save_to</code> saves the response to a file on success instead of
 embedding the payload. Errors or cancellation do not replace an existing destination.
-Automatic job presentation may shorten <code>body.text</code> and <code>body.data</code>, with continuation markers;
-retrieve the complete saved payload using <code>jobs({job})</code> fields <code>/result/body/text</code> or
-<code>/result/body/data</code>. Status, opted-in headers, body kind, and other metadata remain intact. JavaScript
-calls still receive the complete payload for processing.</p>
+Automatic job presentation may shorten a result over its preview budget: the body, and also long
+header values and redirect lists, recording what it cut; retrieve the complete saved payload
+using <code>jobs({job})</code> fields such as <code>/result/body/text</code>, <code>/result/body/value</code>, <code>/result/body/data</code>
+or <code>/result/headers</code>. JavaScript calls still receive the complete payload for processing.</p>
 <p><code>text:true</code> is separate from <code>response_format:"text"</code>: it extracts readable article content from
 HTML, returning plain text and metadata with the title, plus byline, site name, and language when
 available.
