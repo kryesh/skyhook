@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b462d45.js";
+            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -207,14 +207,18 @@ entry of the same name, without inheriting omitted fields. For example, <code>ta
 replaces that target’s SSH, authentication, workspace, and routing settings; <code>modes.general</code>
 replaces that mode’s capabilities, instructions, and hint. Other named entries remain available.
 A provider entry that changes <code>dialect</code> likewise replaces the earlier provider’s settings, which
-belong to the other dialect, while the models declared under it still merge by name. Within a
+belong to the other dialect, while the models declared under it still merge by name, keeping their
+profile, <code>codec</code>, and placements but not the earlier dialect’s fields. Within a
 provider, a later layer replaces <code>api_key</code> and each <code>headers</code> value whole, and likewise each
 convention choice (<code>cache_key</code>, <code>output_limit</code>, <code>reasoning_effort</code>, <code>reasoning_replay</code>,
-<code>tool_stream</code>, <code>user_id</code>) at entry level or under a model’s <code>overrides</code>: a workspace
+<code>tool_stream</code>, <code>user_id</code>) directly on the provider or model: a workspace
 <code>api_key: {command: ...}</code> or <code>cache_key: {body: ...}</code> takes the place of a user <code>{env: ...}</code> or
 <code>{header: ...}</code> rather than combining with it. An explicit <code>null</code> replaces the earlier value: it
-clears an optional field, but is not a deletion operator for map entries. Required fields and named
+clears a nullable field, but is not a deletion operator for map entries. Required fields and named
 entries must still have valid values.</p>
+<p>Layers merge first; only then does each model inherit the request settings it omits from its
+provider (see <a href="providers-and-models.html#provider-defaults-and-model-settings">provider defaults and model settings</a>).
+An explicit <code>null</code>, <code>false</code>, or <code>[]</code> stays explicit through layering.</p>
 <h3 id="example-user-models-workspace-targets"><a class="header" href="#example-user-models-workspace-targets">Example: user models, workspace targets</a></h3>
 <p>Keep providers, with their models, in the selected user <code>config.yaml</code>:</p>
 <pre><code class="language-yaml">providers:
@@ -360,8 +364,10 @@ approve_all: false
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.
 # Host environment and .env values are not forwarded to remote targets.
-# Each entry names a dialect (the vendor's conventions) and a codec (the API family).
+# Each provider names a dialect (the vendor's conventions) and each model a codec (the API family).
 # A model is selected as provider/model, e.g. openai/openai.
+# Request settings (codec, placements, dialect fields such as tags) written beside `models`
+# are defaults; written beside `model`, they replace the default for that model.
 providers:
   openai:
     codec: "responses"
@@ -447,8 +453,8 @@ providers:
   #       max_output: 64000
   #       supports_images: true
 
-  # A LiteLLM proxy speaks every codec; the upstream family behind an alias is
-  # hidden from clients, so the entry names it.
+  # A LiteLLM virtual key is a bearer token for every codec, including messages.
+  # upstream asserts the family behind an alias; configure actual routing in LiteLLM.
   # proxy:
   #   codec: "chat_completions"
   #   dialect: "litellm"
@@ -463,6 +469,13 @@ providers:
   #       reasoning: "high"
   #       max_context: 200000
   #       max_output: 64000
+  #     gpt:
+  #       model: "gpt-alias"
+  #       codec: "responses"      # Different API and upstream, same connection/key.
+  #       upstream: "openai"
+  #       tags: []                # Replace the provider's tags, rather than inherit.
+  #       max_context: 1050000
+  #       max_output: 128000
 
   # Keyless local llama.cpp endpoint; the model alias matches --alias below.
   # Example text-only server (requires enough memory for the configured context):

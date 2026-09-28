@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b462d45.js";
+            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -317,9 +317,12 @@ agents and inspector tabs. Click the conversation, or pick an agent with <code>C
 Menus use arrows, mouse hover, the mouse wheel, or <code>Ctrl+P/N</code>; Enter or Tab activates
 the selected item. The Agents
 palette labels its Output, Input (uncached), and Context statistics. The composer
-wraps at word boundaries and supports word movement, selection, <code>Ctrl+A/E</code>, <code>Ctrl+W</code>,
-<code>Ctrl+U/K</code>, and undo/redo with <code>Ctrl+-</code> / <code>Ctrl+.</code>. Up/Down moves through displayed input
-rows, reaching prompt history only from the first/last row.
+wraps at word boundaries and grows with its draft up to half the space between the top and
+bottom bars, then scrolls to follow the cursor. It supports word movement, selection, <code>Ctrl+A/E</code>,
+<code>Ctrl+W</code>, <code>Ctrl+U/K</code>, undo with <code>Ctrl+Z</code> or <code>Ctrl+-</code>, and redo with <code>Ctrl+Y</code>, <code>Ctrl+Shift+Z</code> or
+<code>Ctrl+.</code>. <code>Home</code>/<code>End</code> move to the start/end of the line, and <code>Ctrl+Home</code>/<code>Ctrl+End</code> to the
+start/end of the draft. Up/Down move through displayed input rows; in an empty composer they
+recall earlier prompts, and keep stepping through them until the recalled prompt is edited.
 Click agent and tool rows, scroll the relevant panel, or drag across text in user/agent messages
 and tool output, then copy the selected characters with <code>Ctrl+X Y</code> (or <code>y</code> while content is focused).
 Selection supports parts of a line and multiple lines; copying preserves Unicode and code indentation
@@ -334,7 +337,8 @@ repository or not), <code>.ignore</code> files, and Git’s global and repositor
 <code>target</code> and <code>node_modules</code> directories, and does not follow symbolic links.
 Attachments are listed below the composer, and attached text is sent after the message. Pastes longer than 12 lines appear as inline items at the cursor. Type
 before, between, or after multiple paste items; move across, select, delete, and undo them as
-single editing units. Sending or copying expands their original contents in place. Shorter pastes
+single editing units; pasting the same text again right after its item expands it into editable
+text. Sending or copying expands their original contents in place. Shorter pastes
 remain ordinary editable text. Use <code>/attachments</code> to inspect or remove pasted items and attachments.
 Questions and permissions open even while inspecting the agent tree or
 conversation; open menus and search keep input focus until closed. <code>Esc</code> dismisses foreground

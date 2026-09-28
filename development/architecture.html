@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-0b462d45.js";
+            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -206,6 +206,14 @@ local or remote execution meet at shared runtime boundaries.</p>
 </div>
 <p>A session’s isolated runtime state does not imply filesystem isolation. Execution locations
 select machines and workspaces; tools still operate on those machines’ files.</p>
+<h2 id="configuration-and-provider-entries"><a class="header" href="#configuration-and-provider-entries">Configuration and provider entries</a></h2>
+<p><code>config</code> loads and layers configuration, admits it, resolves model selections, and builds the
+model catalog; it does not interpret provider entries. <code>provider::dialect</code> owns them
+(<code>RawProviderConfig</code>, <code>ProviderSettings</code>, <code>ProviderModels</code>): each dialect module declares its
+provider-only <code>Options</code> (connection rules, authentication, cross-entry constraints) and its
+inheritable request settings. Request defaults and model settings are typed partial declarations
+(<code>provider::settings</code>) that keep inheritance intent until admission resolves each model into a
+complete, independently validated codec and transport profile.</p>
 <h2 id="provider-boundary-and-lifetime"><a class="header" href="#provider-boundary-and-lifetime">Provider boundary and lifetime</a></h2>
 <p><code>provider::Provider</code> is a shared factory. <code>open_context(id)</code> creates an independently owned
 <code>ProviderContext</code> for one conversation without making a model request; <code>invoke(&amp;mut self, request)</code> returns an owned asynchronous response stream that does not borrow the context. A
@@ -215,11 +223,14 @@ families live under <code>provider::codec</code>: each codec encodes requests an
 under a typed dialect that names the conventions varying between servers of that family (field
 placements, tool-name rules, schema constraint, replay spelling, terminal-event shape), while the
 codec keeps the correctness rules and reads error bodies with its API’s own codes. Vendor modules
-under <code>provider::dialect</code> own an entry’s configuration, the codecs they speak and the dialect
+under <code>provider::dialect</code> own provider-only settings, the codecs they speak and the dialect
 presets for each, credentials, and the transport conventions (fixed headers, per-turn session
 headers, and rules and typed readers that map their servers’ own error codes and wording onto
-error kinds); every configured provider runs as the one <code>provider::http::HttpProvider</code>. Shared
-request, message, and response types live under <code>provider::protocol</code>.</p>
+error kinds); configured models run through <code>provider::http::HttpProvider</code>. Shared request,
+message, and response types live under <code>provider::protocol</code>.</p>
+<p>Each model runs as its own <code>HttpProvider</code> at its codec’s endpoint under the shared API root; the
+models of one provider build share its HTTP client, credential sources, command generations, and
+OAuth state.</p>
 <p>The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context
 for later input; resources are released when that loop exits. A model change prepares
@@ -307,15 +318,31 @@ Empty text is never committed, even beside a tool call.</p>
 <h2 id="compaction-and-context-accounting"><a class="header" href="#compaction-and-context-accounting">Compaction and context accounting</a></h2>
 <p>The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a successful response’s reported occupancy (uncached input,
-cached input, and output), not from a display estimate or output-token limit.</p>
+cached input, and output), at 90% of <code>max_context - max_output</code>, not from a display estimate.
+It runs after committing that response and before creating or executing its tool calls.</p>
 <p>Summarization is a separate recorded request with a structured response schema and no callable
-tools. The runtime retains whole exchanges rather than orphaning tool results, and removes reasoning
-bound to the replaced context from the retained projection.</p>
+tools. Native history ends before any trailing unanswered tool-call message, keeping the summary
+request valid for providers that require paired calls and results. The latest response is instead
+supplied in a temporary, journaled tail block: visible text and reasoning plus every pending call’s
+ID, name, and arguments, marked as unexecuted. Opaque reasoning replay payloads are omitted.
+The checkpoint retains the entire available exchange, and every call runs afterward. The
+summarizer’s reconciled list is authoritative: the todo store records each checkpoint’s frontier
+and refuses, as superseded, a replacement called directly by a response at or before it.
+Replacements made by that response’s scripts run normally.
+All results join the retained calls in the first normal post-compaction request. Completed
+exchanges cannot be partially retained. The retained projection removes reasoning bound to the
+replaced context.
+Compaction reserves the greater of reported occupancy and calibrated summary-input size,
+including the temporary response block, directive, and schema. Its output limit is the smaller
+of the configured limit and the remaining context space; no available output space fails before
+invoking the provider. Normal request settings are unchanged, and the summary’s effective limit
+is journaled for exact reconstruction.</p>
 <p>History replacement and todo reconciliation become active only after checkpoint persistence.
-Validation prevents a stale summary from overwriting newer todo state. A continuation that does
-not shrink the context is skipped; replay uses the stored continuation rather than rerunning the
-summary or today’s renderer. See <a href="embedding.html#reconstructing-model-calls">model-call reconstruction</a>
-for the durable reference contract.</p>
+Validation prevents a stale summary from overwriting newer todo state. Every valid, successfully
+persisted continuation replaces the context and reconciles todos, regardless of estimated size
+reduction. Replay uses the stored continuation rather than rerunning the summary or today’s
+renderer. See <a href="embedding.html#reconstructing-model-calls">model-call reconstruction</a> for the
+durable reference contract.</p>
 <h2 id="tools-jobs-and-execution"><a class="header" href="#tools-jobs-and-execution">Tools, jobs, and execution</a></h2>
 <p><code>ToolRegistryBuilder</code> supports typed and JSON-based registrations. Typed registrations generate
 input and output schemas, and a unit registration completes its job without a result;
