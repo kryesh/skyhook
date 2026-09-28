@@ -8,6 +8,10 @@ use std::{
 use tokio::fs;
 
 use super::{Config, ConfigError};
+use crate::provider::{
+    dialect::Dialect,
+    settings::{FieldKind, find_field},
+};
 
 #[derive(Debug, thiserror::Error)]
 enum LayerError {
@@ -164,7 +168,7 @@ async fn resolve_paths(
     let workspace_path = super::paths::workspace_config_path(&workspace);
     match read_layer(&workspace_path).await {
         Ok(value) => {
-            merge(&mut merged, value, &mut Vec::new());
+            merge(&mut merged, value, &mut Vec::new(), None);
             report.sources.push(workspace_path.clone());
         }
         Err(LayerError::Missing) => {}
@@ -280,32 +284,54 @@ enum Merge {
     /// Header names ignore case: a later layer's header replaces an earlier
     /// one's however either spells it.
     Headers,
-    /// A provider entry of another dialect keeps none of the earlier
-    /// settings, which belong to that dialect, but its models still merge.
+    /// A dialect change replaces provider settings, preserving only model
+    /// profiles and common request settings before merging the new models.
     Provider,
 }
 
-fn merge_rule(path: &[String]) -> Merge {
-    let placement = |key: &str| key.parse::<crate::provider::dialect::OverrideKey>().is_ok();
+fn merge_rule(path: &[String], dialect: Option<Dialect>) -> Merge {
     let path: Vec<&str> = path.iter().map(String::as_str).collect();
-    match path[..] {
-        ["targets" | "modes", _] => Merge::Whole,
-        ["providers", _] => Merge::Provider,
-        ["providers", _, "headers"] => Merge::Headers,
-        ["providers", _, "api_key"] => Merge::Whole,
-        ["providers", _, key] | ["providers", _, "models", _, "overrides", key]
-            if placement(key) =>
-        {
-            Merge::Whole
-        }
+    let request = match path.as_slice() {
+        ["targets" | "modes", _] => return Merge::Whole,
+        ["providers", _] => return Merge::Provider,
+        ["providers", _, "headers"] => return Merge::Headers,
+        ["providers", _, "api_key"] => return Merge::Whole,
+        ["providers", _, "models", _, request @ ..] => request,
+        ["providers", _, request @ ..] => request,
+        _ => return Merge::Deep,
+    };
+    let Some(dialect) = dialect else {
+        return Merge::Deep;
+    };
+    let Some((name, nested)) = request.split_first() else {
+        return Merge::Deep;
+    };
+    let mut field = if matches!(path.as_slice(), ["providers", _, "models", _, ..]) {
+        dialect.request_field(name)
+    } else {
+        dialect.provider_field(name)
+    };
+    for name in nested {
+        field = field.and_then(|field| match field.kind {
+            FieldKind::Object(fields) => find_field(fields, name),
+            FieldKind::Atomic => None,
+        });
+    }
+    match field.map(|field| field.kind) {
+        Some(FieldKind::Atomic) => Merge::Whole,
         _ => Merge::Deep,
     }
 }
 
-fn merge(base: &mut serde_json::Value, overlay: serde_json::Value, path: &mut Vec<String>) {
+fn merge(
+    base: &mut serde_json::Value,
+    overlay: serde_json::Value,
+    path: &mut Vec<String>,
+    dialect: Option<Dialect>,
+) {
     match (base, overlay) {
         (serde_json::Value::Object(base), serde_json::Value::Object(overlay)) => {
-            if merge_rule(path) == Merge::Headers {
+            if merge_rule(path, dialect) == Merge::Headers {
                 base.retain(|name, _| !overlay.keys().any(|key| key.eq_ignore_ascii_case(name)));
             }
             for (key, value) in overlay {
@@ -314,18 +340,28 @@ fn merge(base: &mut serde_json::Value, overlay: serde_json::Value, path: &mut Ve
                     continue;
                 };
                 path.push(key);
-                match merge_rule(path) {
+                match merge_rule(path, dialect) {
                     Merge::Whole => *previous = value,
-                    Merge::Provider if changes_kind(previous, &value) => {
-                        replace_provider(previous, value, path);
+                    Merge::Provider => {
+                        let dialect =
+                            provider_dialect(&value).or_else(|| provider_dialect(previous));
+                        if changes_kind(previous, &value) {
+                            replace_provider(previous, value, path, dialect);
+                        } else {
+                            merge(previous, value, path, dialect);
+                        }
                     }
-                    _ => merge(previous, value, path),
+                    _ => merge(previous, value, path, dialect),
                 }
                 path.pop();
             }
         }
         (base, overlay) => *base = overlay,
     }
+}
+
+fn provider_dialect(value: &serde_json::Value) -> Option<Dialect> {
+    value.get("dialect")?.as_str()?.parse().ok()
 }
 
 /// Whether an overlay names a dialect other than the base entry's.
@@ -335,18 +371,32 @@ fn changes_kind(base: &serde_json::Value, overlay: &serde_json::Value) -> bool {
         .is_some_and(|dialect| base.get("dialect") != Some(dialect))
 }
 
-/// Replace a provider entry by one of another dialect, merging their models.
+/// Only profiles and common request choices survive a dialect transition.
+/// Remove old dialect-owned model fields before merging the new layer, so its
+/// explicitly supplied fields are still validated against the new dialect.
 fn replace_provider(
     base: &mut serde_json::Value,
     overlay: serde_json::Value,
     path: &mut Vec<String>,
+    dialect: Option<Dialect>,
 ) {
+    let previous_dialect = provider_dialect(base);
     let models = base.get_mut("models").map(std::mem::take);
     *base = overlay;
     if let (Some(mut models), Some(base)) = (models, base.as_object_mut()) {
+        if let Some(previous_dialect) = previous_dialect
+            && let Some(models) = models.as_object_mut()
+        {
+            for model in models
+                .values_mut()
+                .filter_map(serde_json::Value::as_object_mut)
+            {
+                model.retain(|name, _| !previous_dialect.owns_request_field(name));
+            }
+        }
         if let Some(overlay) = base.remove("models") {
             path.push("models".into());
-            merge(&mut models, overlay, path);
+            merge(&mut models, overlay, path, dialect);
             path.pop();
         }
         base.insert("models".into(), models);
@@ -359,9 +409,30 @@ mod tests {
 
     use super::*;
     use crate::target::TargetAuth;
+    use serde_json::{Value, json};
 
     const PROVIDER: &str = "providers:\n  local:\n    dialect: compatible\n    base_url: https://example.com/v1\n    codec: chat_completions\n";
     const CONFIG: &str = "providers:\n  local:\n    dialect: compatible\n    base_url: https://example.com/v1\n    codec: chat_completions\n    models:\n      main:\n        model: test\n        max_context: 4096\n        max_output: 512\n";
+
+    const ROUTED: &str = r#"providers:
+  local:
+    dialect: openrouter
+    codec: chat_completions
+    base_url: https://example.com/v1
+    routing:
+      order: [provider]
+      allow_fallbacks: true
+      quantizations: [fp16]
+    models:
+      main:
+        model: test
+        max_context: 4096
+        max_output: 512
+        routing:
+          order: [old, removed]
+          zdr: true
+          data_collection: deny
+"#;
 
     struct Fixture {
         _root: tempfile::TempDir,
@@ -404,6 +475,10 @@ mod tests {
         std::fs::write(path, contents).unwrap();
     }
 
+    fn normalized(config: &Config) -> Value {
+        crate::yaml::from_str(&config.to_yaml().unwrap()).unwrap()
+    }
+
     #[tokio::test]
     async fn xdg_wins_without_even_reading_home_and_workspace_merges() {
         let f = Fixture::new();
@@ -417,11 +492,10 @@ mod tests {
         assert_eq!(resolved.report.sources, [f.xdg.clone(), f.local.clone()]);
         assert!(resolved.report.diagnostics.is_empty());
         assert!(resolved.config.approve_all);
-        let main = &resolved.config.providers["local"].common.models["main"];
-        assert_eq!(
-            (main.profile.model.as_str(), main.profile.max_output.get()),
-            ("workspace-model", 512)
-        );
+        let value = normalized(&resolved.config);
+        let main = &value["providers"]["local"]["models"]["main"];
+        assert_eq!(main["model"], "workspace-model");
+        assert_eq!(main["max_output"], 512);
     }
 
     #[tokio::test]
@@ -443,7 +517,7 @@ mod tests {
         Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: relative"),
         Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: messages\n    base_url: https://example.com\n    api_key: {command: '  '}"),
         Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: openai\n    codec: responses\n    base_url: https://example.com\n    reasoning_summary: maybe"),
-        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: responses\n    base_url: https://example.com"),
+        Some(b"approve_all: true\nproviders:\n  bad:\n    dialect: anthropic\n    codec: responses\n    base_url: https://example.com\n    models:\n      bad:\n        model: bad\n        max_context: 4096\n        max_output: 512"),
         Some(b"approve_all: true\ntargets:\n  a:\n    type: ssh\n    host: a\n    via: b\n  b:\n    type: ssh\n    host: b\n    via: a"), // route cycle
         Some(b""),
     ];
@@ -506,7 +580,13 @@ mod tests {
             let resolved = f.resolve().await.unwrap();
             assert_eq!(resolved.report.sources, std::slice::from_ref(&f.local));
             assert_eq!(resolved.report.diagnostics.len(), 2);
-            assert_eq!(resolved.config.providers["local"].common.models.len(), 1);
+            assert_eq!(
+                normalized(&resolved.config)["providers"]["local"]["models"]
+                    .as_object()
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
     }
 
@@ -544,7 +624,13 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.report.sources, std::slice::from_ref(&f.home));
         assert!(resolved.report.diagnostics.is_empty());
-        assert_eq!(resolved.config.providers["local"].common.models.len(), 1);
+        assert_eq!(
+            normalized(&resolved.config)["providers"]["local"]["models"]
+                .as_object()
+                .unwrap()
+                .len(),
+            1
+        );
         write(&f.home, "[broken");
         let error = f.resolve().await.unwrap_err();
         assert!(error.to_string().contains(f.local.to_str().unwrap()));
@@ -728,10 +814,11 @@ mod tests {
         );
         let resolved = f.resolve().await.unwrap();
         let config = Config::from_yaml(&resolved.normalized_yaml).unwrap();
-        let models = &config.providers["local"].common.models;
-        assert_eq!(models["true"].profile.max_output.get(), 256);
-        assert_eq!(models["true"].profile.model.as_str(), "42");
-        assert_eq!(models["null"].profile.model.as_str(), "true");
+        let value = normalized(&config);
+        let models = &value["providers"]["local"]["models"];
+        assert_eq!(models["true"]["max_output"], 256);
+        assert_eq!(models["true"]["model"], "42");
+        assert_eq!(models["null"]["model"], "true");
         let runtime = config.into_runtime().unwrap();
         assert_eq!(
             runtime
@@ -754,26 +841,115 @@ mod tests {
         );
         let config = f.resolve().await.unwrap().config;
         assert!(config.to_yaml().unwrap().contains("USER_KEY"));
-        assert_eq!(config.providers["local"].common.models.len(), 2);
+        assert_eq!(
+            normalized(&config)["providers"]["local"]["models"]
+                .as_object()
+                .unwrap()
+                .len(),
+            2
+        );
         // Another dialect: the earlier settings belong to it, so only models carry over.
         write(
             &f.local,
             "providers:\n  local:\n    dialect: codex\n    codec: responses\n    models:\n      extra:\n        model: extra\n        max_context: 4096\n        max_output: 512\n      main:\n        max_output: 256\n",
         );
         let config = f.resolve().await.unwrap().config;
-        let models = &config.providers["local"].common.models;
+        let value = normalized(&config);
+        let models = value["providers"]["local"]["models"].as_object().unwrap();
         assert!(!config.to_yaml().unwrap().contains("USER_KEY"));
         assert_eq!(
-            models.keys().map(ToString::to_string).collect::<Vec<_>>(),
+            models.keys().map(String::as_str).collect::<Vec<_>>(),
             ["main", "extra"]
         );
-        assert_eq!(
-            (
-                models["main"].profile.model.as_str(),
-                models["main"].profile.max_output.get()
+        assert_eq!(models["main"]["model"], "test");
+        assert_eq!(models["main"]["max_output"], 256);
+    }
+
+    #[tokio::test]
+    async fn dialect_changes_drop_inherited_request_flags_before_overlaying_models() {
+        let f = Fixture::new();
+        write(
+            &f.xdg,
+            format!(
+                "{ROUTED}        codec: chat_completions\n        cache_key: {{header: x-model}}\n        cache_ttl: 1h\n      untouched:\n        model: untouched\n        max_context: 4096\n        max_output: 512\n        cache_key: null\n        routing: {{order: [old]}}\n"
             ),
-            ("test", 256)
         );
+        let overlay = "providers:\n  local:\n    dialect: openai\n    codec: responses\n    base_url: https://other.example/v1\n    models:\n      main:\n        max_output: 256\n        organization: workspace\n";
+        write(&f.local, overlay);
+        let value = normalized(&f.resolve().await.unwrap().config);
+        let entry = &value["providers"]["local"];
+        assert!(entry.get("routing").is_none());
+        assert_eq!(entry["codec"], "responses");
+        let models = entry["models"].as_object().unwrap();
+        for model in models.values() {
+            assert!(model.get("routing").is_none());
+            assert!(model.get("cache_ttl").is_none());
+        }
+        let main = &models["main"];
+        assert_eq!(main["model"], "test");
+        assert_eq!(main["max_context"], 4096);
+        assert_eq!(main["max_output"], 256);
+        assert_eq!(main["codec"], "chat_completions");
+        assert_eq!(main["cache_key"], json!({"header": "x-model"}));
+        assert_eq!(main["organization"], "workspace");
+        assert_eq!(models["untouched"]["model"], "untouched");
+        assert_eq!(models["untouched"].get("cache_key"), Some(&Value::Null));
+
+        // Filtering inherited flags must not hide an invalid flag in the new layer.
+        write(
+            &f.local,
+            format!("{overlay}        routing: {{order: [new]}}\n"),
+        );
+        assert!(f.resolve().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn structured_request_settings_merge_fields_and_replace_lists_at_both_levels() {
+        let f = Fixture::new();
+        write(&f.xdg, ROUTED);
+        write(
+            &f.local,
+            "providers:\n  local:\n    routing: {order: [new-provider], allow_fallbacks: false}\n    models:\n      main:\n        routing: {order: [], data_collection: null}\n",
+        );
+        let resolved = f.resolve().await.unwrap();
+        let value = normalized(&resolved.config);
+        let entry = &value["providers"]["local"];
+        assert_eq!(
+            entry["routing"],
+            json!({"order": ["new-provider"], "allow_fallbacks": false, "quantizations": ["fp16"]})
+        );
+        assert_eq!(
+            entry["models"]["main"]["routing"],
+            json!({"order": [], "zdr": true, "data_collection": null})
+        );
+        let round_trip = Config::from_yaml(&resolved.normalized_yaml).unwrap();
+        assert_eq!(normalized(&round_trip), value);
+    }
+
+    #[tokio::test]
+    async fn request_null_clears_survive_layering_and_normalized_yaml_round_trips() {
+        let f = Fixture::new();
+        write(
+            &f.xdg,
+            format!("{ROUTED}        cache_key: {{header: x-model}}\n"),
+        );
+        write(
+            &f.local,
+            "providers:\n  local:\n    routing: null\n    models:\n      main:\n        routing: null\n        cache_key: null\n",
+        );
+        let resolved = f.resolve().await.unwrap();
+        let value = normalized(&resolved.config);
+        let entry = &value["providers"]["local"];
+        assert_eq!(entry.get("routing"), Some(&Value::Null));
+        let model = &entry["models"]["main"];
+        assert_eq!(model.get("routing"), Some(&Value::Null));
+        assert_eq!(model.get("cache_key"), Some(&Value::Null));
+        assert!(
+            model.get("user_id").is_none(),
+            "undeclared settings still inherit"
+        );
+        let round_trip = Config::from_yaml(&resolved.normalized_yaml).unwrap();
+        assert_eq!(normalized(&round_trip), value);
     }
 
     #[tokio::test]
@@ -812,12 +988,8 @@ mod tests {
 
     #[tokio::test]
     async fn choices_are_replaced_whole_only_where_a_choice_is_accepted() {
-        use crate::provider::{
-            codec::{CacheKey, path},
-            dialect::{DialectSettings, Sourced},
-        };
         let f = Fixture::new();
-        let env = "      env:\n        model: env-model\n        max_context: 4096\n        max_output: 512\n        overrides:\n          cache_key: {header: x-model}\n";
+        let env = "      env:\n        model: env-model\n        max_context: 4096\n        max_output: 512\n        cache_key: {header: x-model}\n";
         write(
             &f.xdg,
             format!(
@@ -827,55 +999,30 @@ mod tests {
         // A model named `env` is a model, not a source.
         write(
             &f.local,
-            "providers:\n  local:\n    api_key: {command: workspace}\n    headers: {x-token: {env: WORKSPACE}}\n    cache_key: {body: entry_key}\n    models:\n      env:\n        max_output: 256\n        overrides:\n          cache_key: {body: model_key}\n",
+            "providers:\n  local:\n    api_key: {command: workspace}\n    headers: {x-token: {env: WORKSPACE}}\n    cache_key: {body: entry_key}\n    models:\n      env:\n        max_output: 256\n        cache_key: {body: model_key}\n",
         );
-        let config = f.resolve().await.unwrap().config;
-        let entry = &config.providers["local"];
-        let local = &entry.common;
-        assert_eq!(
-            local.api_key,
-            Some(Sourced::Command {
-                command: "workspace".into()
-            })
-        );
+        let value = normalized(&f.resolve().await.unwrap().config);
+        let entry = &value["providers"]["local"];
+        assert_eq!(entry["api_key"], json!({"command": "workspace"}));
         // Header names ignore case across layers too.
-        assert_eq!(
-            local.headers.iter().collect::<Vec<_>>(),
-            [(
-                &"x-token".to_owned(),
-                &Sourced::Env {
-                    env: "WORKSPACE".into()
-                }
-            )]
-        );
-        let DialectSettings::Compatible(settings) = &entry.settings else {
-            panic!("{:?}", entry.settings)
-        };
-        assert_eq!(
-            settings.0.cache_key,
-            Some(CacheKey::Body(path("entry_key")))
-        );
-        let env = &local.models["env"];
-        assert_eq!(local.models.len(), 2);
-        assert_eq!(
-            (env.profile.model.as_str(), env.profile.max_output.get()),
-            ("env-model", 256)
-        );
-        assert_eq!(
-            env.overrides.cache_key,
-            Some(CacheKey::Body(path("model_key")))
-        );
+        assert_eq!(entry["headers"], json!({"x-token": {"env": "WORKSPACE"}}));
+        assert_eq!(entry["cache_key"], json!({"body": "entry_key"}));
+        let models = &entry["models"];
+        assert_eq!(models.as_object().unwrap().len(), 2);
+        let env = &models["env"];
+        assert_eq!(env["model"], "env-model");
+        assert_eq!(env["max_output"], 256);
+        assert_eq!(env["cache_key"], json!({"body": "model_key"}));
+
         // A layer that changes the dialect still replaces its models' choices whole.
         write(
             &f.local,
-            "providers:\n  local:\n    dialect: openai\n    codec: responses\n    base_url: https://example.com/v1\n    models:\n      env:\n        overrides:\n          cache_key: {body: model_key}\n",
+            "providers:\n  local:\n    dialect: openai\n    codec: responses\n    base_url: https://example.com/v1\n    models:\n      env:\n        cache_key: {body: model_key}\n",
         );
-        let config = f.resolve().await.unwrap().config;
+        let value = normalized(&f.resolve().await.unwrap().config);
         assert_eq!(
-            config.providers["local"].common.models["env"]
-                .overrides
-                .cache_key,
-            Some(CacheKey::Body(path("model_key")))
+            value["providers"]["local"]["models"]["env"]["cache_key"],
+            json!({"body": "model_key"})
         );
     }
 

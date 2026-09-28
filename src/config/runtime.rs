@@ -8,10 +8,13 @@ use std::{path::PathBuf, sync::Arc};
 
 use indexmap::IndexMap;
 
-use super::{Config, ConfigError, ModeError, providers::ProviderConfig};
+use super::{Config, ConfigError, ModeError};
 use crate::{
-    agent::{Catalog, HarnessBuilder},
-    provider::profile::{ModelProfile, ModelRef, ProviderName},
+    agent::{Catalog, HarnessBuilder, ModelEntry},
+    provider::{
+        dialect::AdmittedProvider,
+        profile::{ModelProfile, ModelRef, ProviderName},
+    },
     tool::policy::ModeName,
 };
 
@@ -23,7 +26,7 @@ pub struct RuntimeConfig(Arc<Admitted>);
 
 struct Admitted {
     config: Config,
-    providers: IndexMap<ProviderName, ProviderConfig>,
+    providers: IndexMap<ProviderName, AdmittedProvider>,
     /// Where the model a new session starts with sits in `providers`.
     default: (usize, usize),
 }
@@ -85,7 +88,7 @@ impl Config {
 }
 
 fn locate(
-    providers: &IndexMap<ProviderName, ProviderConfig>,
+    providers: &IndexMap<ProviderName, AdmittedProvider>,
     model: &ModelRef,
 ) -> Result<(usize, usize), SelectionError> {
     let (provider, _, config) = providers
@@ -189,7 +192,7 @@ impl ConfiguredModel {
         &self.config
     }
 
-    fn provider(&self) -> (&ProviderName, &ProviderConfig) {
+    fn provider(&self) -> (&ProviderName, &AdmittedProvider) {
         self.config
             .0
             .providers
@@ -207,8 +210,21 @@ impl ConfiguredModel {
         let config = self.config.config();
         let mut models = IndexMap::new();
         for (name, settings) in &self.config.0.providers {
-            for (model, entry) in settings.build(name)? {
-                models.insert(ModelRef::new(name.clone(), model), entry);
+            let built = settings
+                .build(name)
+                .map_err(|error| ConfigError::Provider {
+                    provider: name.clone(),
+                    error,
+                })?;
+            for model in built {
+                let reference = ModelRef::new(name.clone(), model.name);
+                models.insert(
+                    reference,
+                    ModelEntry {
+                        profile: model.profile,
+                        provider: model.provider,
+                    },
+                );
             }
         }
         let catalog = Catalog {
@@ -232,6 +248,10 @@ impl ConfiguredModel {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::{
+        dialect::{ModelSpec, ProviderSettings, compatible},
+        profile::ModelName,
+    };
 
     const VENDOR: &str = "vendor 任意";
 
@@ -256,13 +276,13 @@ mod tests {
         Config::from_yaml(&text("http://127.0.0.1:1/v1", "", MODELS)).unwrap()
     }
 
-    fn models_mut(
-        config: &mut Config,
-    ) -> &mut indexmap::IndexMap<
-        crate::provider::profile::ModelName,
-        crate::provider::dialect::ModelSpec,
-    > {
-        &mut config.providers.get_index_mut(0).unwrap().1.common.models
+    fn models_mut(config: &mut Config) -> &mut IndexMap<ModelName, ModelSpec<compatible::Patch>> {
+        let ProviderSettings::Compatible(provider) =
+            &mut config.providers.get_index_mut(0).unwrap().1.settings
+        else {
+            panic!("compatible fixture");
+        };
+        &mut provider.models
     }
 
     #[test]

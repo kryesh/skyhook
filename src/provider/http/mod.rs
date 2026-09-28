@@ -73,8 +73,10 @@ impl Timeouts {
     }
 }
 
-/// What a dialect module assembles for one provider entry.
+/// What a dialect module assembles for one complete model profile.
 pub(crate) struct Build<'a> {
+    /// The client shared by every profile under the configured provider.
+    pub client: reqwest::Client,
     /// The configured provider name; with the endpoint, codec and dialect it
     /// scopes private reasoning replay.
     pub name: &'a str,
@@ -100,30 +102,22 @@ pub(crate) struct HttpProvider {
 }
 
 impl HttpProvider {
-    /// Admission validated the timeouts; only the HTTP client can fail here.
-    pub(crate) fn new(build: Build<'_>) -> Result<Self, ProviderError> {
+    /// Admission validated the timeouts and the shared client is already built.
+    pub(crate) fn new(build: Build<'_>) -> Self {
         let scope = reasoning_scope(
             build.name,
             build.endpoint.as_str(),
             build.codec.name(),
             build.scope_tag,
         );
-        Ok(Self {
-            client: transport::client()?,
+        Self {
+            client: build.client,
             endpoint: build.endpoint,
             codec: build.codec,
             transport: build.transport,
             headers: build.headers,
             scope,
             timeouts: build.timeouts,
-        })
-    }
-
-    /// The same provider serving a model with its own conventions.
-    pub(crate) fn with_codec(&self, codec: Codec) -> Self {
-        Self {
-            codec,
-            ..self.clone()
         }
     }
 
@@ -444,7 +438,7 @@ pub(crate) mod tests {
     async fn chat_round_trip_persists_history_and_scopes_replay_by_provider_name() {
         use crate::provider::{
             Provider,
-            dialect::{self, Overrides, Placement, Sourced, compatible},
+            dialect::{self, Placement, Placements, Sourced, compatible},
             protocol::{Message, Outcome, ToolResult, UserContent},
         };
         crate::tests::bounded(async {
@@ -469,14 +463,15 @@ pub(crate) mod tests {
                     json!({"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":"stop"}]}),
                 ];
                 let (url, server) = serve(vec![first, answer.clone(), answer]).await;
-                let overrides = Overrides {
+                let placements = Placements {
                     reasoning_replay: replay,
-                    ..Overrides::default()
+                    ..Placements::default()
                 };
                 let common = dialect::tests::common(&url, Some(Sourced::Literal("k".into())));
-                let settings = compatible::Config(overrides.clone());
+                let settings = compatible::Config::default();
                 let chat = codec::CodecName::ChatCompletions;
-                let configured = |name| dialect::tests::provider(name, &settings, chat, &common);
+                let configured =
+                    |name| dialect::tests::placed(name, &settings, &placements, chat, &common);
                 let provider: Arc<dyn Provider> = Arc::new(configured("local"));
                 let mut context = provider.open_context("initial".parse().unwrap()).unwrap();
                 let user = Message::User(vec![UserContent::Text {
@@ -594,10 +589,11 @@ pub(crate) mod tests {
     /// A Responses provider at `server` whose bearer key a command produces.
     fn keyed_by_command(server: &Server, session: Session, command: String) -> HttpProvider {
         use headers::{CommandValue, ValueField};
-        let key = CommandValue::new(command, Some("Bearer "), ValueField::ApiKey);
+        let key = CommandValue::new(command, ValueField::ApiKey).with_prefix(Some("Bearer "));
         let mut composed = Headers::default();
         composed.insert(reqwest::header::AUTHORIZATION, headers::Value::Command(key));
         HttpProvider::new(Build {
+            client: transport::client().unwrap(),
             name: "test",
             scope_tag: "compatible",
             endpoint: Url::parse(&server.url).unwrap(),
@@ -609,7 +605,6 @@ pub(crate) mod tests {
             headers: composed,
             timeouts: Timeouts::default(),
         })
-        .unwrap()
     }
 
     /// A 401 on a command key's first use is a plain authentication failure,

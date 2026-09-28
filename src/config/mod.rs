@@ -7,7 +7,10 @@ use std::{
 
 use crate::{
     mcp::config::McpServerConfig,
-    provider::profile::{ModelRef, ProviderName},
+    provider::{
+        dialect::{self, AdmissionError, AdmittedProvider, RawProviderConfig},
+        profile::{ModelRef, ProviderName},
+    },
     target::TargetsConfig,
     tool::policy::{Capability, CapabilitySet, Mode, ModeName},
 };
@@ -16,10 +19,8 @@ use thiserror::Error;
 
 mod loader;
 mod paths;
-mod providers;
 mod runtime;
 
-pub use providers::{EntryError, RawProviderConfig};
 pub use runtime::{ConfiguredModel, RuntimeConfig, SelectionError};
 
 pub use loader::{ConfigDiagnostic, ConfigReport, ResolutionStage, ResolvedConfig};
@@ -33,6 +34,7 @@ pub struct Config {
     /// relative to the process working directory, not the config or target directory.
     /// When absent, the harness uses `<resolved workspace>/.skyhook/sessions`.
     /// The CLI always uses that workspace-local directory, ignoring this override.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub session_root: Option<PathBuf>,
     /// Approve all tool calls without consulting an interactive policy.
     #[serde(default)]
@@ -51,13 +53,35 @@ pub struct Config {
     /// model of the first provider.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_model: Option<ModelRef>,
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_connection_options")]
     pub targets: TargetsConfig,
     /// Named, trusted MCP server connections. Empty by default.
-    #[serde(default)]
+    #[serde(default, serialize_with = "serialize_connection_options")]
     pub mcp: BTreeMap<String, McpServerConfig>,
     #[serde(default = "default_child_depth")]
     pub max_child_depth: usize,
+}
+
+// Target and MCP protocol serializers retain their own public shapes. In these
+// config-only branches, null means an absent ordinary option, never a request
+// patch clear; omit it here rather than changing those serializers or YAML values.
+fn serialize_connection_options<T: Serialize, S: serde::Serializer>(
+    value: &T,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    fn omit_absent(value: &mut serde_json::Value) {
+        match value {
+            serde_json::Value::Object(fields) => {
+                fields.retain(|_, value| !value.is_null());
+                fields.values_mut().for_each(omit_absent);
+            }
+            serde_json::Value::Array(items) => items.iter_mut().for_each(omit_absent),
+            _ => {}
+        }
+    }
+    let mut value = serde_json::to_value(value).map_err(serde::ser::Error::custom)?;
+    omit_absent(&mut value);
+    value.serialize(serializer)
 }
 
 pub(crate) const DEFAULT_MAX_CHILD_DEPTH: usize = 4;
@@ -150,22 +174,30 @@ impl Config {
     /// Admit targets and every provider entry, without model selection or
     /// external resources. Loading checks each layer and the merged result
     /// with this; sealing keeps the admitted entries.
-    fn admit(
-        &self,
-    ) -> Result<indexmap::IndexMap<ProviderName, providers::ProviderConfig>, ConfigError> {
+    fn admit(&self) -> Result<indexmap::IndexMap<ProviderName, AdmittedProvider>, ConfigError> {
         self.targets.validate_structure()?;
-        providers::admit(&self.providers)
+        let providers = self
+            .providers
+            .iter()
+            .map(|(name, entry)| {
+                let provider = entry.admit().map_err(|error| EntryError {
+                    provider: name.clone(),
+                    error,
+                })?;
+                Ok((name.clone(), provider))
+            })
+            .collect::<Result<_, EntryError>>()?;
+        dialect::validate_entries(&self.providers)?;
+        Ok(providers)
     }
+}
 
-    /// The OAuth issuer every codex entry shares; OpenAI's when no entry
-    /// names one.
-    pub fn codex_issuer(
-        &self,
-    ) -> Result<crate::provider::dialect::codex::auth::Issuer, ConfigError> {
-        let entries = self.providers.iter();
-        let settings = entries.map(|(name, entry)| (name, &entry.settings));
-        Ok(crate::provider::dialect::codex::shared_issuer(settings)?)
-    }
+/// A provider admission failure located in the configuration document.
+#[derive(Debug, Error)]
+#[error("`providers.{provider}`: {error}")]
+pub struct EntryError {
+    pub provider: ProviderName,
+    pub error: AdmissionError,
 }
 
 #[derive(Debug, Error)]
@@ -190,7 +222,7 @@ pub enum ConfigError {
     #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.yaml{0}")]
     Missing(ConfigReport),
     #[error("invalid configuration: {0}")]
-    CodexIssuers(#[from] crate::provider::dialect::codex::IssuerConflict),
+    Dialect(#[from] dialect::DialectError),
     #[error("provider `{provider}` could not be initialized: {error}")]
     Provider {
         provider: ProviderName,
@@ -275,10 +307,9 @@ providers:
         tokio::fs::write(&path, text).await.unwrap();
         let config = Config::load(Some(&path)).await.unwrap();
         assert!(
-            config.providers["local"]
-                .common
-                .models
-                .contains_key("local")
+            serde_json::to_value(&config.providers["local"]).unwrap()["models"]
+                .get("local")
+                .is_some()
         );
         assert!(!config.approve_all);
         assert_eq!(config.modes, default_modes());
@@ -306,6 +337,32 @@ providers:
         assert_eq!(cwd("relative"), Some(work));
         assert_eq!(cwd("absolute"), Some(absolute));
         assert_eq!(cwd("default"), None);
+    }
+
+    #[test]
+    fn config_omits_absent_connection_options_without_changing_shared_serializers() {
+        let config = parse(
+            "targets:\n  remote:\n    type: ssh\n    host: host\nmcp:\n  local:\n    transport: stdio\n    start_command: [server]\n",
+        )
+        .unwrap();
+        let value = crate::yaml::from_str(&config.to_yaml().unwrap()).unwrap();
+        assert!(value.get("session_root").is_none());
+        let target = &value["targets"]["remote"];
+        assert!(target.get("via").is_none());
+        assert!(target["ssh"].get("user").is_none());
+        assert!(target["ssh"].get("port").is_none());
+        let server = &value["mcp"]["local"];
+        assert!(server.get("url").is_none());
+        assert!(server.get("cwd").is_none());
+        assert_eq!(server["start_command"], serde_json::json!(["server"]));
+
+        let target = serde_json::to_value(&config.targets.entries["remote"]).unwrap();
+        assert_eq!(target.get("via"), Some(&serde_json::Value::Null));
+        assert_eq!(target["ssh"].get("user"), Some(&serde_json::Value::Null));
+        let server = serde_json::to_value(&config.mcp["local"]).unwrap();
+        assert_eq!(server.get("url"), Some(&serde_json::Value::Null));
+        assert_eq!(server.get("cwd"), Some(&serde_json::Value::Null));
+        Config::from_yaml(&config.to_yaml().unwrap()).unwrap();
     }
 
     #[test]

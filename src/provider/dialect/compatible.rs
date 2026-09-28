@@ -1,23 +1,39 @@
 //! Standards-following servers, which need only an endpoint. Each placement
 //! dimension may still be selected in the entry, and any codec is admitted.
 
-use serde::{Deserialize, Serialize};
+use super::{Dialect, DialectConfig, DialectError, Profile, Scheme};
+use crate::provider::{
+    codec::{Codec, CodecName, chat_completions, messages, responses},
+    http::Transport,
+};
 
-use super::{Common, Dialect, DialectConfig, DialectError, Overrides, Profile, Scheme};
-use crate::provider::{codec::CodecName, http::Transport};
+/// Provider-only options; request settings are declared separately.
+pub type Options = crate::provider::settings::Empty;
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(transparent)]
-pub struct Config(pub Overrides);
+crate::provider::settings::settings! {
+    #[derive(Default)]
+    pub struct Config => Patch {}
+}
 
 impl DialectConfig for Config {
     /// A key travels as the codec's own.
-    fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
-        let conventions = self.0.apply(super::base(codec))?;
+    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
+        let conventions = base(codec);
         Ok(Profile {
             key: Scheme::standard(codec),
             ..Profile::new(conventions, Transport::plain(), Dialect::Compatible)
         })
+    }
+}
+
+/// The base conventions of a family, which `compatible` serves as they are.
+pub(crate) fn base(codec: CodecName) -> Codec {
+    match codec {
+        CodecName::ChatCompletions => {
+            Codec::ChatCompletions(chat_completions::Dialect::compatible())
+        }
+        CodecName::Responses => Codec::Responses(responses::Dialect::stateless()),
+        CodecName::Messages => Codec::Messages(messages::Dialect::anthropic()),
     }
 }
 

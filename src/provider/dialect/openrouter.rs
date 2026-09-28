@@ -5,9 +5,9 @@
 //! every codec; attribution headers name Skyhook.
 
 use reqwest::header::HeaderValue;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
-use super::{Common, Dialect, DialectConfig, DialectError, Profile};
+use super::{Dialect, DialectConfig, DialectError, Profile};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
@@ -163,15 +163,19 @@ fn transport(codec: CodecName) -> Transport {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    /// Chat only: provider routing preferences and fallback models.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub routing: Option<Routing>,
-    /// Cache breakpoint lifetime for models that take one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_ttl: Option<CacheTtl>,
+/// Provider-only options; request settings are declared separately.
+pub type Options = crate::provider::settings::Empty;
+
+crate::provider::settings::settings! {
+    #[derive(Default)]
+    pub struct Config => Patch {
+        /// Chat only: provider routing preferences and fallback models.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub routing: Option<Routing> => object(Routing),
+        /// Cache breakpoint lifetime for models that take one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cache_ttl: Option<CacheTtl> => default,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -181,7 +185,7 @@ pub enum Error {
 }
 
 impl DialectConfig for Config {
-    fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if self.routing.is_some() && codec != CodecName::ChatCompletions {
             return Err(Error::RoutingNeedsChat.into());
         }
@@ -198,6 +202,9 @@ impl DialectConfig for Config {
         };
         codec.identity_mut().cache_key = header("x-session-id");
         let mut profile = Profile::new(codec, transport, Dialect::Openrouter);
+        if let Some(routing) = &self.routing {
+            profile.discriminate(routing);
+        }
         for (name, value) in [
             ("http-referer", "https://github.com/kryesh/skyhook"),
             ("x-openrouter-title", "Skyhook"),
@@ -212,6 +219,68 @@ impl DialectConfig for Config {
 mod tests {
     use super::*;
     use crate::provider::{dialect::tests::head, http::transport::tests::header_values};
+
+    #[test]
+    fn replay_identity_tracks_routing_not_cache_lifetime() {
+        let scope = |yaml| {
+            crate::yaml::parse::<Config>(yaml)
+                .unwrap()
+                .admit(CodecName::ChatCompletions)
+                .unwrap()
+                .scope
+        };
+        assert_eq!(scope("{}"), scope("cache_ttl: 1h"));
+        let routed = scope("routing: {order: [first], fallback_models: [backup]}");
+        for other in [
+            "{}",
+            "routing: {order: [second], fallback_models: [backup]}",
+            "routing: {order: [first], fallback_models: [other]}",
+        ] {
+            assert_ne!(routed, scope(other));
+        }
+    }
+
+    #[test]
+    fn routing_overlay_is_fieldwise_and_null_resets_the_whole_object() {
+        use crate::provider::settings::{FieldKind, Patch as _, Settings, find_field};
+        use serde_json::json;
+
+        let lower: Patch = serde_json::from_value(json!({"routing": {
+            "order": ["first"], "allow_fallbacks": true,
+            "require_parameters": true, "fallback_models": ["fallback"]
+        }}))
+        .unwrap();
+        let higher_json = json!({"routing": {
+            "order": [], "allow_fallbacks": false, "require_parameters": null
+        }});
+        let higher: Patch = serde_json::from_value(higher_json.clone()).unwrap();
+        assert_eq!(serde_json::to_value(&higher).unwrap(), higher_json);
+        let merged = lower.overlay(&higher);
+        let config = Config::resolve(&merged).unwrap();
+        let routing = config.routing.unwrap();
+        assert!(routing.provider.order.is_empty());
+        assert_eq!(routing.provider.allow_fallbacks, Some(false));
+        assert_eq!(routing.provider.require_parameters, None);
+        assert_eq!(routing.fallback_models, ["fallback"]);
+
+        let clear: Patch = serde_json::from_value(json!({"routing": null})).unwrap();
+        let cleared = merged.overlay(&clear);
+        assert_eq!(Config::resolve(&cleared).unwrap().routing, None);
+        let empty: Patch = serde_json::from_value(json!({"routing": {}})).unwrap();
+        assert_eq!(
+            Config::resolve(&cleared.overlay(&empty)).unwrap().routing,
+            Some(Routing::default())
+        );
+        assert_eq!(lower.overlay(&empty), lower);
+        assert!(serde_json::from_value::<Patch>(json!({"routing": {"unknown": 1}})).is_err());
+
+        let FieldKind::Object(fields) = find_field(Patch::FIELDS, "routing").unwrap().kind else {
+            panic!("routing must expose its nested fields");
+        };
+        assert!(find_field(fields, "allow_fallbacks").is_some());
+        assert!(find_field(fields, "fallback_models").is_some());
+        assert!(find_field(fields, "provider").is_none());
+    }
 
     #[tokio::test]
     async fn key_session_and_attribution_ride_every_request() {
@@ -292,15 +361,9 @@ mod tests {
         let routed =
             parse("routing: {order: [anthropic], zdr: true, fallback_models: [x/y]}").unwrap();
         assert!(parse("routing: {sort: price}").is_err());
-        assert!(
-            routed
-                .admit(&Common::default(), CodecName::ChatCompletions)
-                .is_ok()
-        );
+        assert!(routed.admit(CodecName::ChatCompletions).is_ok());
         assert_eq!(
-            routed
-                .admit(&Common::default(), CodecName::Messages)
-                .unwrap_err(),
+            routed.admit(CodecName::Messages).unwrap_err(),
             Error::RoutingNeedsChat.into()
         );
     }

@@ -373,6 +373,7 @@ mod tests {
     use crate::tui::app::{Hit, SlotKey, Work};
     use crossterm::event::MouseEventKind;
     use ratatui::layout::Rect;
+    use skyhook::provider::dialect::ProviderSettings;
     use tokio::sync::mpsc;
 
     fn menu_completion(menu: &Menu, error: Option<&str>) -> Work {
@@ -456,7 +457,10 @@ mod tests {
         let (_root, mut app) = fixture().await;
         // The palette's selected value must belong to the admitted catalog.
         let mut config = app.launch.model.config().config().clone();
-        let models = &mut config.providers["test"].common.models;
+        let ProviderSettings::Compatible(provider) = &mut config.providers["test"].settings else {
+            panic!("compatible fixture");
+        };
+        let models = &mut provider.models;
         for name in ["second", "third"] {
             let first = models["first"].clone();
             models.insert(name.parse().unwrap(), first);

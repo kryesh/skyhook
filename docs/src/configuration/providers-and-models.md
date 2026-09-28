@@ -8,10 +8,11 @@ free-form. `default_model` selects the model a new session starts with when neit
 the model last submitted in the workspace chooses one; without it, the first model of the first
 provider is used.
 
-Every entry names a **dialect** and a **codec**. The codec is the API family the endpoint speaks:
-`chat_completions`, `responses`, or `messages`; `base_url` names the API root and Skyhook appends
-`/chat/completions`, `/responses`, or `/messages`. The dialect is the set of wire conventions the
-server follows:
+Every provider names a **dialect**, the server's wire conventions. Each model selects a **codec**,
+either directly or from its provider's defaults: `chat_completions`, `responses`, or `messages`.
+The codec is the API family; `base_url` names the shared API root and Skyhook appends
+`/chat/completions`, `/responses`, or `/messages` for the selected model.
+Different models on one provider may use different supported codecs:
 
 | Dialect | Codecs | Use for |
 | --- | --- | --- |
@@ -20,19 +21,75 @@ server follows:
 | `anthropic` | `messages` | `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`. |
 | `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login`. `base_url` defaults to `https://chatgpt.com/backend-api/codex` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. |
 | `openrouter` | any | `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: `routing` (Chat only: `order`, `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, `fallback_models`) and `cache_ttl: "5m"` or `"1h"`. A response schema always sets `require_parameters`. |
-| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key. Required `upstream: "openai"`, `"anthropic"` or `"bedrock"` names the family behind the alias, which the proxy hides: Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; `messages` behind an OpenAI upstream goes through the proxy's translation, which drops reasoning. Optional `tags` select LiteLLM's tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session. |
+| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; `messages` behind an OpenAI upstream goes through the proxy's translation, which drops reasoning. Optional `tags` select LiteLLM's tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session. |
 
 Every dialect but `codex` accepts `api_key` (see [authentication](authentication.md)); every
 dialect accepts fixed request `headers` for proxies or attribution, the
 [connection timeouts](#connection-timeouts), and `models`. On `messages`, a configured
 `anthropic-beta` adds to the betas Skyhook announces rather than replacing them. The credential
-header and header placements (`cache_key: {header: …}`, or a dialect's own) in turn replace an
-entry header of the same name, whose command then never runs; so does `Accept`, which is always
-`text/event-stream`. Unknown fields, and a codec the dialect does not speak, are rejected. There
-are no model aliases or automatic vendor detection: `model` is the identifier sent on the wire.
+header and header placements (`cache_key: {header: …}`, or a dialect's own) replace an entry
+header of the same name; so does `Accept`, which is always `text/event-stream`. A shadowed
+header's command does not run for that request. There are no model aliases or automatic vendor
+detection: `model` is the identifier sent on the wire.
 
-A `compatible` entry may place each convention itself when a server deviates, and any model may
-carry the same selections under `overrides` to differ from its provider:
+## Provider defaults and model settings
+
+Request settings are flat: put shared defaults beside `models`, and model-specific values
+directly beside `model`. To migrate an older configuration, move each member of a model's
+`overrides` mapping directly under that model; the old wrapper is rejected.
+
+| Where | Fields |
+| --- | --- |
+| Provider only | `dialect`, `base_url`, `api_key`, `headers`, `startup_timeout_secs`, `read_idle_timeout_secs`; Codex's `auth_url`. |
+| Provider defaults or direct model settings | `codec`; all placement selections listed below; the dialect's request fields: OpenAI's `reasoning_summary`, `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`; OpenRouter's `routing`, `cache_ttl`; LiteLLM's `upstream`, `tags`. |
+| Model only | `model`, `reasoning`, `max_context`, `max_output`, `supports_images`, `state_mode`, `hint`. |
+
+Missing model settings inherit from the provider. Explicit values win even when they are `false`,
+`[]`, or a setting's usual default. Lists replace inherited lists rather than append. Under
+OpenRouter's `routing`, only declared members change: a model's `order` replaces the inherited
+order while an undeclared `allow_fallbacks` still inherits. For nullable settings, `null` clears
+an inherited value; for example, `organization: null` removes the organization header and
+`routing: null` removes routing preferences.
+
+Every model must have `codec`, and LiteLLM models must also have `upstream`, **after inheritance**.
+A provider may omit either if every model supplies it. Defaults and compatibility checks apply to
+each effective model, not to the provider defaults in isolation. Unknown fields, provider-only
+fields under a model, fields for another dialect, and unsupported codec/setting combinations are
+rejected. API keys, credential-command caches, and connection resources remain shared by all
+models in one provider instance, regardless of their request settings.
+
+For example, one proxy can serve different families and APIs without duplicating credentials:
+
+```yaml
+providers:
+  proxy:
+    dialect: "litellm"
+    base_url: "https://litellm.example.com/v1"
+    api_key:
+      env: "LITELLM_API_KEY"
+    tags: ["skyhook"]
+    models:
+      claude:
+        model: "claude-alias"
+        codec: "messages"
+        upstream: "anthropic"
+        max_context: 200000
+        max_output: 64000
+      gpt:
+        model: "gpt-alias"
+        codec: "responses"
+        upstream: "openai"
+        tags: []                  # Do not inherit the provider's tags.
+        max_context: 1050000
+        max_output: 128000
+```
+
+Configure the aliases and routing in LiteLLM itself; `upstream` tells Skyhook which request and
+reasoning conventions to use for each alias.
+
+### Placement selections
+
+A server that deviates from its dialect's presets can select placements at either level:
 
 ```yaml
 providers:
@@ -51,13 +108,19 @@ providers:
         model: "served-name"
         max_context: 131072
         max_output: 32768
-        overrides:
-          reasoning_effort: "reasoning_effort"
+        reasoning_effort: "reasoning_effort"
+        output_limit: null                      # Restore the preset: max_completion_tokens.
 ```
 
 The selectable dimensions are `output_limit`, `reasoning_effort` (a field path), `reasoning_replay`
-and `tool_stream` (Chat Completions only), `cache_key`, and `user_id`. A field path is
-dot-separated (`metadata.user_id`); `cache_key` and `user_id` carry the conversation identity.
+and `tool_stream` (Chat Completions only), `cache_key`, and `user_id`. An absent model selection
+inherits. A `null` selection clears the inherited explicit placement and restores the preset for
+the model's effective codec and dialect settings; it does not disable the convention. Use
+`omitted` to disable a placement that allows it. Changing `codec` does not discard inherited
+selections; clear or replace any that are not valid for the new codec.
+
+A field path is dot-separated (`metadata.user_id`); `cache_key` and `user_id` carry the
+conversation identity.
 Paths must not name a field the codec writes itself (such as `model` or `messages`), and no two may
 overlap, including one inside another (`reasoning` and `reasoning.effort`). A `cache_key` header
 must not be `accept`, `content-type`, or a header the codec sends itself (such as
@@ -198,8 +261,9 @@ Skyhook displays only the reasoning text or summaries the service returns, not o
 reasoning. Support varies by provider, model, and compatible server.
 
 Skyhook saves returned reasoning and automatically reuses it when compatible with the selected
-provider, endpoint, API, and model. Switching to an incompatible model omits that reasoning from
-requests without deleting the saved history. Signed thinking cannot be reused across compaction
+provider, endpoint, API, model, and configured routing or tenant identity. Switching to an
+incompatible configuration omits private reasoning from requests without deleting the saved history.
+A proxy changing the upstream behind an unchanged alias cannot be detected automatically. Signed thinking cannot be reused across compaction
 or mode switches. Visible summaries cannot replace private reasoning state the service requires.
 Messages servers that do not sign thinking still get it replayed, until a signed block appears in
 the context; from then on only signed blocks are sent.

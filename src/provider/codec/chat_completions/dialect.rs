@@ -111,34 +111,35 @@ pub(crate) enum UsageRequest {
     Implicit,
 }
 
-/// OpenRouter's routing: the `provider` preferences object and the `models`
-/// fallback list.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Routing {
-    #[serde(flatten)]
-    pub provider: ProviderPreferences,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub fallback_models: Vec<String>,
+crate::provider::settings::settings! {
+    /// OpenRouter's routing: the `provider` preferences object and the `models`
+    /// fallback list.
+    #[derive(Default)]
+    pub struct Routing => RoutingPatch {
+        @flatten { pub provider: ProviderPreferences }
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub fallback_models: Vec<String> => default,
+    }
 }
 
-/// The `provider` object. `require_parameters` is forced on whenever a response
-/// schema is sent, so no endpoint that ignores it is routed to.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct ProviderPreferences {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub order: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub allow_fallbacks: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub require_parameters: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub data_collection: Option<DataCollection>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub quantizations: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub zdr: Option<bool>,
+crate::provider::settings::settings! {
+    /// The `provider` object. `require_parameters` is forced on whenever a response
+    /// schema is sent, so no endpoint that ignores it is routed to.
+    #[derive(Default)]
+    pub struct ProviderPreferences => ProviderPreferencesPatch {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub order: Vec<String> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub allow_fallbacks: Option<bool> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub require_parameters: Option<bool> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub data_collection: Option<DataCollection> => default,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub quantizations: Vec<String> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub zdr: Option<bool> => default,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]

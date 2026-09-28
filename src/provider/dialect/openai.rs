@@ -1,9 +1,7 @@
 //! api.openai.com: the `developer` role, `prompt_cache_key` on Chat as well,
 //! no reasoning replay on Chat, strict schemas, and organisation headers.
 
-use serde::{Deserialize, Serialize};
-
-use super::{Common, Dialect, DialectConfig, DialectError, Profile, UnsupportedCodec};
+use super::{Dialect, DialectConfig, DialectError, Profile, UnsupportedCodec};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
@@ -62,19 +60,23 @@ const ERRORS: ErrorSignals = ErrorSignals {
     ..ErrorSignals::NONE
 };
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    /// Responses only. Reasoning summaries need a verified organisation; an
-    /// unverified one is refused with HTTP 400, so it opts out here.
-    #[serde(default, skip_serializing_if = "ReasoningSummary::is_requested")]
-    pub reasoning_summary: ReasoningSummary,
-    /// Sent as `OpenAI-Organization`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub organization: Option<HeaderText>,
-    /// Sent as `OpenAI-Project`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project: Option<HeaderText>,
+/// Provider-only options; request settings are declared separately.
+pub type Options = crate::provider::settings::Empty;
+
+crate::provider::settings::settings! {
+    #[derive(Default)]
+    pub struct Config => Patch {
+        /// Responses only. Reasoning summaries need a verified organisation; an
+        /// unverified one is refused with HTTP 400, so it opts out here.
+        #[serde(default, skip_serializing_if = "ReasoningSummary::is_requested")]
+        pub reasoning_summary: ReasoningSummary => default,
+        /// Sent as `OpenAI-Organization`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub organization: Option<HeaderText> => default,
+        /// Sent as `OpenAI-Project`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub project: Option<HeaderText> => default,
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -84,7 +86,7 @@ pub enum Error {
 }
 
 impl DialectConfig for Config {
-    fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if !self.reasoning_summary.is_requested() && codec != CodecName::Responses {
             return Err(Error::SummaryNeedsResponses.into());
         }
@@ -107,6 +109,9 @@ impl DialectConfig for Config {
             ..Transport::plain()
         };
         let mut profile = Profile::new(codec, transport, Dialect::Openai);
+        if self.organization.is_some() || self.project.is_some() {
+            profile.discriminate(&(&self.organization, &self.project));
+        }
         // Identity headers tied to the key.
         for (header, value) in [
             ("openai-organization", &self.organization),
@@ -139,15 +144,48 @@ mod tests {
     }
 
     #[test]
+    fn replay_identity_tracks_tenant_headers_not_summary_preferences() {
+        let scope = |yaml| {
+            crate::yaml::parse::<Config>(yaml)
+                .unwrap()
+                .admit(CodecName::Responses)
+                .unwrap()
+                .scope
+        };
+        assert_eq!(scope("{}"), scope("reasoning_summary: unsupported"));
+        let tenant = scope("organization: org_1\nproject: project_1");
+        for other in [
+            "{}",
+            "organization: org_2\nproject: project_1",
+            "organization: org_1\nproject: project_2",
+        ] {
+            assert_ne!(tenant, scope(other));
+        }
+    }
+
+    #[test]
+    fn an_explicit_preset_default_overrides_an_inherited_opt_out() {
+        use crate::provider::settings::{Patch as _, Settings};
+
+        let lower: Patch = crate::yaml::parse("reasoning_summary: unsupported").unwrap();
+        let higher: Patch = crate::yaml::parse("reasoning_summary: requested").unwrap();
+        assert_eq!(
+            crate::yaml::to_string(&higher).unwrap(),
+            "reasoning_summary: requested\n"
+        );
+        let config = Config::resolve(&lower.overlay(&higher)).unwrap();
+        assert_eq!(config.reasoning_summary, ReasoningSummary::Requested);
+        assert!(config.admit(CodecName::ChatCompletions).is_ok());
+    }
+
+    #[test]
     fn summaries_opt_out_on_responses_only() {
         let quiet = Config {
             reasoning_summary: ReasoningSummary::Unsupported,
             ..Config::default()
         };
         assert_eq!(
-            quiet
-                .admit(&Common::default(), CodecName::ChatCompletions)
-                .err(),
+            quiet.admit(CodecName::ChatCompletions).err(),
             Some(Error::SummaryNeedsResponses.into())
         );
     }

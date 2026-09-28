@@ -6,12 +6,13 @@ pub mod auth;
 use std::sync::Arc;
 
 use futures_util::future::BoxFuture;
+use indexmap::IndexMap;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
-use serde::{Deserialize, Serialize};
 
 use super::{
-    BaseUrl, BuildError, Common, Connection, Dialect, DialectConfig, DialectError, DialectSettings,
+    AdmissionError, BaseUrl, BuildError, Common, Connection, Dialect, DialectConfig, DialectError,
     Pending, Profile, UnsupportedCodec,
+    entry::{ProviderOptions, ProviderSettings, RawProviderConfig},
 };
 use crate::provider::{
     ProviderError,
@@ -58,23 +59,55 @@ fn transport() -> Transport {
     }
 }
 
-/// Codex takes no key: `skyhook auth login` stores its credentials. `base_url`
-/// and `auth_url` default to OpenAI's service and are named only for a mirror.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    /// The OAuth issuer `skyhook auth login` and token refresh talk to.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub auth_url: Option<auth::Issuer>,
+crate::provider::settings::settings! {
+    /// Codex takes no key: `skyhook auth login` stores its credentials. `base_url`
+    /// and `auth_url` default to OpenAI's service and are named only for a mirror.
+    #[derive(Default)]
+    pub struct Options => OptionsPatch {
+        /// The OAuth issuer `skyhook auth login` and token refresh talk to.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub auth_url: Option<auth::Issuer> => default,
+    }
+}
+
+crate::provider::settings::settings! {
+    #[derive(Default)]
+    pub struct Config => Patch {}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
     #[error("api_key does not apply to codex; run `skyhook auth login`")]
     ApiKey,
+    #[error(transparent)]
+    Issuers(#[from] IssuerConflict),
 }
 
-impl Config {
+impl ProviderOptions for Options {
+    fn admit(&self, common: &Common) -> Result<Connection, AdmissionError> {
+        let connection = common.admit(BaseUrl::Default(DEFAULT_BASE_URL))?;
+        if common.api_key.is_some() {
+            return Err(DialectError::Codex(Error::ApiKey).into());
+        }
+        Ok(connection)
+    }
+
+    fn authentication(&self) -> Result<Option<Headers<Pending>>, BuildError> {
+        Ok(Some(subscription(auth::AuthManager::new(self.issuer())?)))
+    }
+
+    fn validate<'a>(
+        entries: impl Iterator<Item = (&'a ProviderName, &'a Self)>,
+    ) -> Result<(), DialectError>
+    where
+        Self: 'a,
+    {
+        shared_issuer(entries).map_err(Error::from)?;
+        Ok(())
+    }
+}
+
+impl Options {
     /// The issuer the entry names, or OpenAI's.
     pub fn issuer(&self) -> auth::Issuer {
         self.auth_url.clone().unwrap_or_default()
@@ -82,7 +115,7 @@ impl Config {
 }
 
 /// Codex entries naming different issuers, where one credential store serves one.
-#[derive(Debug, thiserror::Error)]
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error(
     "codex providers `{first}` and `{second}` name different auth_url issuers, but Skyhook \
      keeps one Codex login; give them the same auth_url"
@@ -92,17 +125,27 @@ pub struct IssuerConflict {
     pub second: ProviderName,
 }
 
-/// The issuer every codex entry names, since one credential store serves one;
+/// The issuer every Codex entry names, since one credential store serves one;
 /// OpenAI's when no entry names one.
-pub(crate) fn shared_issuer<'a>(
-    entries: impl IntoIterator<Item = (&'a ProviderName, &'a DialectSettings)>,
+pub fn issuer(
+    providers: &IndexMap<ProviderName, RawProviderConfig>,
+) -> Result<auth::Issuer, IssuerConflict> {
+    shared_issuer(
+        providers
+            .iter()
+            .filter_map(|(name, entry)| match &entry.settings {
+                ProviderSettings::Codex(entry) => Some((name, &entry.options)),
+                _ => None,
+            }),
+    )
+}
+
+fn shared_issuer<'a>(
+    entries: impl IntoIterator<Item = (&'a ProviderName, &'a Options)>,
 ) -> Result<auth::Issuer, IssuerConflict> {
     let mut issuers = entries
         .into_iter()
-        .filter_map(|(name, settings)| match settings {
-            DialectSettings::Codex(codex) => Some((name, codex.issuer())),
-            _ => None,
-        });
+        .map(|(name, options)| (name, options.issuer()));
     let Some((first, issuer)) = issuers.next() else {
         return Ok(auth::Issuer::default());
     };
@@ -116,7 +159,7 @@ pub(crate) fn shared_issuer<'a>(
 }
 
 impl DialectConfig for Config {
-    fn admit(&self, common: &Common, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if codec != CodecName::Responses {
             return Err(UnsupportedCodec {
                 dialect: Dialect::Codex,
@@ -124,20 +167,9 @@ impl DialectConfig for Config {
             }
             .into());
         }
-        if common.api_key.is_some() {
-            return Err(Error::ApiKey.into());
-        }
-        let mut profile = Profile {
-            base_url: BaseUrl::Default(DEFAULT_BASE_URL),
-            ..Profile::new(Codec::Responses(responses()), transport(), Dialect::Codex)
-        };
+        let mut profile = Profile::new(Codec::Responses(responses()), transport(), Dialect::Codex);
         profile.fixed("originator", HeaderValue::from_static("skyhook"));
         Ok(profile)
-    }
-
-    /// No credentials are read and no login is required until invocation.
-    fn credentials(&self, _: &Profile, _: &Connection) -> Result<Headers<Pending>, BuildError> {
-        Ok(subscription(auth::AuthManager::new(self.issuer())?))
     }
 }
 
@@ -178,6 +210,7 @@ mod tests {
     use crate::provider::{
         Provider,
         codec::common::tests::reduce,
+        dialect::Sourced,
         http::{
             tests::reasoning_tool_request,
             transport::tests::{Plan, Server, header_values, reply},
@@ -197,14 +230,17 @@ mod tests {
             base_url: Some(server.url.trim_end_matches("/responses").to_owned()),
             ..Common::default()
         };
-        let profile = Config::default()
-            .admit(&common, CodecName::Responses)
-            .unwrap();
-        let connection = common
-            .admit(profile.base_url, CodecName::Responses)
-            .unwrap();
+        let profile = Config::default().admit(CodecName::Responses).unwrap();
+        let connection = common.admit(BaseUrl::Required).unwrap();
         let credentials = subscription(auth::test_manager(directory));
-        super::super::build(name, profile, &connection, credentials).unwrap()
+        super::super::build(
+            name,
+            profile,
+            &connection,
+            credentials,
+            &mut super::super::Resources::new().unwrap(),
+        )
+        .unwrap()
     }
 
     #[tokio::test]
@@ -252,30 +288,35 @@ mod tests {
         assert_eq!(body["instructions"], "");
     }
 
+    /// One credential store serves one issuer, so every codex entry names the
+    /// same one; the default counts as OpenAI's.
     #[test]
     fn takes_no_key_at_the_service_or_a_mirror() {
-        let config = Config::default();
-        let keyed = Common {
-            api_key: Some(crate::provider::dialect::Sourced::Literal("k".into())),
-            ..Common::default()
-        };
+        // Refused whether or not the entry has models yet.
+        let keyed = "providers:\n  codex:\n    dialect: codex\n    api_key: k\n";
+        let refused = crate::config::Config::from_yaml(keyed)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(&Error::ApiKey.to_string()), "{refused}");
+        let options = Options::default();
+        assert_eq!(options.issuer().as_str(), "https://auth.openai.com/");
+        Config::default().admit(CodecName::Responses).unwrap();
         assert_eq!(
-            config.admit(&keyed, CodecName::Responses).unwrap_err(),
-            Error::ApiKey.into()
+            options.admit(&Common::default()).unwrap().root.as_str(),
+            "https://chatgpt.com/backend-api/codex"
         );
-        assert_eq!(config.issuer().as_str(), "https://auth.openai.com/");
-        let profile = config
-            .admit(&Common::default(), CodecName::Responses)
-            .unwrap();
-        assert_eq!(
-            Common::default()
-                .admit(profile.base_url, CodecName::Responses)
-                .unwrap()
-                .endpoint
-                .as_str(),
-            "https://chatgpt.com/backend-api/codex/responses"
-        );
-        let mirror = |url: &str| crate::yaml::parse::<Config>(&format!("auth_url: '{url}'"));
+        for base_url in [None, Some("https://api.example/codex".to_owned())] {
+            let common = Common {
+                base_url,
+                api_key: Some(Sourced::Literal("k".to_owned())),
+                ..Common::default()
+            };
+            assert!(matches!(
+                options.admit(&common),
+                Err(AdmissionError::Dialect(DialectError::Codex(Error::ApiKey)))
+            ));
+        }
+        let mirror = |url: &str| crate::yaml::parse::<Options>(&format!("auth_url: '{url}'"));
         // OAuth paths join beneath a mirror's path prefix.
         let tenant = mirror("https://auth.example/tenant").unwrap().issuer();
         assert_eq!(

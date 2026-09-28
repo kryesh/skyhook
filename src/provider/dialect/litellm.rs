@@ -7,9 +7,9 @@
 //! `x-litellm-session-id`; deployment tags ride `x-litellm-tags`.
 
 use reqwest::header::HeaderValue;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 
-use super::{Common, Dialect, DialectConfig, DialectError, Profile};
+use super::{Dialect, DialectConfig, DialectError, Profile};
 use crate::{
     named_enum::named_enum,
     newtype::string_newtype,
@@ -106,19 +106,22 @@ string_newtype! {
     };
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    pub upstream: Upstream,
-    /// Sent as `x-litellm-tags`, for tag-based routing and spend logs.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub tags: Vec<Tag>,
+/// Provider-only options; request settings are declared separately.
+pub type Options = crate::provider::settings::Empty;
+
+crate::provider::settings::settings! {
+    pub struct Config => Patch {
+        pub upstream: Upstream => required,
+        /// Sent as `x-litellm-tags`, for tag-based routing and spend logs.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pub tags: Vec<Tag> => default,
+    }
 }
 
 impl DialectConfig for Config {
     /// The bridge to Claude may drop `prompt_cache_key`, so affinity travels as
     /// a header whatever the upstream and codec.
-    fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         let claude = self.upstream.is_claude();
         let mut conventions = match codec {
             CodecName::ChatCompletions => {
@@ -133,6 +136,7 @@ impl DialectConfig for Config {
             ..Profile::new(conventions, transport(), Dialect::Litellm)
         };
         if !self.tags.is_empty() {
+            profile.discriminate(&self.tags);
             let tags: Vec<_> = self.tags.iter().map(Tag::as_str).collect();
             let value = HeaderValue::from_str(&tags.join(",")).expect("tags join into header text");
             profile.fixed("x-litellm-tags", value);
@@ -145,6 +149,25 @@ impl DialectConfig for Config {
 mod tests {
     use super::*;
     use crate::provider::{dialect::tests::head, http::transport::tests::header_values};
+
+    #[test]
+    fn replay_identity_tracks_upstream_and_routing_tags() {
+        let scope = |yaml| {
+            crate::yaml::parse::<Config>(yaml)
+                .unwrap()
+                .admit(CodecName::ChatCompletions)
+                .unwrap()
+                .scope
+        };
+        let tagged = scope("upstream: anthropic\ntags: [deployment-a]");
+        for other in [
+            "upstream: anthropic",
+            "upstream: anthropic\ntags: [deployment-b]",
+            "upstream: bedrock\ntags: [deployment-a]",
+        ] {
+            assert_ne!(tagged, scope(other));
+        }
+    }
 
     #[tokio::test]
     async fn virtual_key_session_and_tags_ride_every_request() {

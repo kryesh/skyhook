@@ -23,6 +23,16 @@ See [embedding](embedding.md) for host API and replay contracts,
 A session's isolated runtime state does not imply filesystem isolation. Execution locations
 select machines and workspaces; tools still operate on those machines' files.
 
+## Configuration and provider entries
+
+`config` loads and layers configuration, admits it, resolves model selections, and builds the
+model catalog; it does not interpret provider entries. `provider::dialect` owns them
+(`RawProviderConfig`, `ProviderSettings`, `ProviderModels`): each dialect module declares its
+provider-only `Options` (connection rules, authentication, cross-entry constraints) and its
+inheritable request settings. Request defaults and model settings are typed partial declarations
+(`provider::settings`) that keep inheritance intent until admission resolves each model into a
+complete, independently validated codec and transport profile.
+
 ## Provider boundary and lifetime
 
 `provider::Provider` is a shared factory. `open_context(id)` creates an independently owned
@@ -34,11 +44,15 @@ families live under `provider::codec`: each codec encodes requests and decodes n
 under a typed dialect that names the conventions varying between servers of that family (field
 placements, tool-name rules, schema constraint, replay spelling, terminal-event shape), while the
 codec keeps the correctness rules and reads error bodies with its API's own codes. Vendor modules
-under `provider::dialect` own an entry's configuration, the codecs they speak and the dialect
+under `provider::dialect` own provider-only settings, the codecs they speak and the dialect
 presets for each, credentials, and the transport conventions (fixed headers, per-turn session
 headers, and rules and typed readers that map their servers' own error codes and wording onto
-error kinds); every configured provider runs as the one `provider::http::HttpProvider`. Shared
-request, message, and response types live under `provider::protocol`.
+error kinds); configured models run through `provider::http::HttpProvider`. Shared request,
+message, and response types live under `provider::protocol`.
+
+Each model runs as its own `HttpProvider` at its codec's endpoint under the shared API root; the
+models of one provider build share its HTTP client, credential sources, command generations, and
+OAuth state.
 
 The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context

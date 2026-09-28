@@ -1,9 +1,7 @@
 //! api.anthropic.com: the Messages API with its version header, `x-api-key`,
 //! prefix-bound thinking, cache breakpoint lifetimes, and workspace-scoped keys.
 
-use serde::{Deserialize, Serialize};
-
-use super::{Common, Dialect, DialectConfig, DialectError, Profile, Scheme, UnsupportedCodec};
+use super::{Dialect, DialectConfig, DialectError, Profile, Scheme, UnsupportedCodec};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
@@ -47,19 +45,23 @@ fn transport() -> Transport {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Config {
-    /// Sent as `anthropic-workspace-id`; required by keys that span workspaces.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workspace_id: Option<HeaderText>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_ttl: Option<CacheTtl>,
+/// Provider-only options; request settings are declared separately.
+pub type Options = crate::provider::settings::Empty;
+
+crate::provider::settings::settings! {
+    #[derive(Default)]
+    pub struct Config => Patch {
+        /// Sent as `anthropic-workspace-id`; required by keys that span workspaces.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub workspace_id: Option<HeaderText> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cache_ttl: Option<CacheTtl> => default,
+    }
 }
 
 impl DialectConfig for Config {
     /// The key travels as the codec's own, `x-api-key`.
-    fn admit(&self, _: &Common, codec: CodecName) -> Result<Profile, DialectError> {
+    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if codec != CodecName::Messages {
             return Err(UnsupportedCodec {
                 dialect: Dialect::Anthropic,
@@ -76,6 +78,7 @@ impl DialectConfig for Config {
             ..Profile::new(codec, transport(), Dialect::Anthropic)
         };
         if let Some(workspace) = &self.workspace_id {
+            profile.discriminate(workspace);
             profile.fixed("anthropic-workspace-id", workspace.value());
         }
         Ok(profile)
@@ -95,6 +98,23 @@ mod tests {
     };
     use futures_util::StreamExt;
 
+    #[test]
+    fn replay_identity_tracks_workspace_not_cache_lifetime() {
+        let scope = |yaml| {
+            crate::yaml::parse::<Config>(yaml)
+                .unwrap()
+                .admit(CodecName::Messages)
+                .unwrap()
+                .scope
+        };
+        assert_eq!(scope("{}"), scope("cache_ttl: 1h"));
+        assert_ne!(scope("{}"), scope("workspace_id: workspace_1"));
+        assert_ne!(
+            scope("workspace_id: workspace_1"),
+            scope("workspace_id: workspace_2")
+        );
+    }
+
     #[tokio::test]
     async fn key_and_workspace_ride_the_version_header() {
         let keyed = head(&Config::default(), CodecName::Messages, "k").await;
@@ -107,10 +127,7 @@ mod tests {
             cache_ttl: Some(CacheTtl::OneHour),
         };
         assert_eq!(
-            configured
-                .admit(&Common::default(), CodecName::Messages)
-                .unwrap()
-                .codec,
+            configured.admit(CodecName::Messages).unwrap().codec,
             Codec::Messages(messages::Dialect {
                 cache_ttl: Some(CacheTtl::OneHour),
                 ..messages()

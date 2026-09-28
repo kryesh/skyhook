@@ -30,7 +30,7 @@ impl Placement {
 named_enum! {
     /// A placement dimension, as configuration spells it.
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
-    pub enum OverrideKey {
+    pub enum PlacementKey {
         OutputLimit = "output_limit",
         ReasoningEffort = "reasoning_effort",
         ReasoningReplay = "reasoning_replay",
@@ -40,20 +40,23 @@ named_enum! {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum OverrideError {
-    #[error("{key} is not a {family} setting")]
-    Foreign { key: OverrideKey, family: CodecName },
-    #[error("{family} requires a field for {key}")]
-    RequiresField { key: OverrideKey, family: CodecName },
-}
-
-/// A placement that would write where something else already does.
+/// A selection the codec has no dimension for, or one that would write where
+/// something else already does.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum PlacementError {
+    #[error("{key} is not a {family} setting")]
+    Foreign {
+        key: PlacementKey,
+        family: CodecName,
+    },
+    #[error("{family} requires a field for {key}")]
+    RequiresField {
+        key: PlacementKey,
+        family: CodecName,
+    },
     #[error("{key} `{path}` is a field the {family} codec writes")]
     Reserved {
-        key: OverrideKey,
+        key: PlacementKey,
         path: BodyPath,
         family: CodecName,
     },
@@ -61,59 +64,56 @@ pub enum PlacementError {
         "{key} header `{name}` is reserved: `accept`, `content-type`, or one the {family} codec sends"
     )]
     ReservedHeader {
-        key: OverrideKey,
+        key: PlacementKey,
         name: reqwest::header::HeaderName,
         family: CodecName,
     },
     #[error("{key} `{path}` overlaps {other} `{other_path}`")]
     Overlap {
-        key: OverrideKey,
+        key: PlacementKey,
         path: BodyPath,
-        other: OverrideKey,
+        other: PlacementKey,
         other_path: BodyPath,
     },
 }
 
-/// The placement dimensions an entry or a model may select. Each is optional;
-/// absent keeps the dialect's value.
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(deny_unknown_fields)]
-pub struct Overrides {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub output_limit: Option<Placement>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_effort: Option<BodyPath>,
-    /// Chat Completions only. A field keeps the dialect's replay shape.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub reasoning_replay: Option<Placement>,
-    /// Chat Completions only.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_stream: Option<Placement>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub cache_key: Option<CacheKey>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub user_id: Option<Placement>,
+crate::provider::settings::settings! {
+    /// Resolved placement selections. None keeps the dialect preset; a patch
+    /// can explicitly reset an inherited selection to None.
+    #[derive(Default)]
+    pub struct Placements => PlacementsPatch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub output_limit: Option<Placement> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reasoning_effort: Option<BodyPath> => default,
+        /// Chat Completions only. A field keeps the dialect's replay shape.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub reasoning_replay: Option<Placement> => default,
+        /// Chat Completions only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub tool_stream: Option<Placement> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cache_key: Option<CacheKey> => default,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub user_id: Option<Placement> => default,
+    }
 }
 
-impl Overrides {
-    pub fn is_empty(&self) -> bool {
-        *self == Self::default()
-    }
-
+impl Placements {
     /// The codec with these selections applied, or the first selection the
     /// codec has no dimension for.
-    pub(crate) fn apply(&self, mut codec: Codec) -> Result<Codec, OverrideError> {
+    pub(crate) fn apply(&self, mut codec: Codec) -> Result<Codec, PlacementError> {
         let family = codec.name();
         if family != CodecName::ChatCompletions {
             for (key, selected) in [
                 (
-                    OverrideKey::ReasoningReplay,
+                    PlacementKey::ReasoningReplay,
                     self.reasoning_replay.is_some(),
                 ),
-                (OverrideKey::ToolStream, self.tool_stream.is_some()),
+                (PlacementKey::ToolStream, self.tool_stream.is_some()),
             ] {
                 if selected {
-                    return Err(OverrideError::Foreign { key, family });
+                    return Err(PlacementError::Foreign { key, family });
                 }
             }
         }
@@ -142,8 +142,8 @@ impl Overrides {
             }
             Codec::Messages(dialect) => {
                 if let Some(limit) = &self.output_limit {
-                    dialect.output_limit = limit.path().ok_or(OverrideError::RequiresField {
-                        key: OverrideKey::OutputLimit,
+                    dialect.output_limit = limit.path().ok_or(PlacementError::RequiresField {
+                        key: PlacementKey::OutputLimit,
                         family,
                     })?;
                 }
@@ -163,7 +163,7 @@ impl Overrides {
 /// Every placement the conventions select stays clear of the fields the codec
 /// writes and of every other placement in the object they share.
 pub(crate) fn check(codec: &Codec) -> Result<(), PlacementError> {
-    use OverrideKey as Key;
+    use PlacementKey as Key;
     let family = codec.name();
     let mut body: Vec<(Key, &BodyPath)> = Vec::new();
     let mut message: Vec<(Key, &BodyPath)> = Vec::new();
@@ -253,17 +253,45 @@ mod tests {
     use super::*;
     use crate::provider::{
         codec::{header, path},
-        dialect::base,
+        dialect::compatible::base,
     };
 
     #[test]
-    fn overrides_select_placements_per_family_and_reject_foreign_ones() {
-        let overrides: Overrides = crate::yaml::parse(
+    fn null_resets_an_inherited_selection_but_omitted_is_a_value() {
+        use crate::provider::settings::{Patch as _, Settings};
+
+        let lower: PlacementsPatch =
+            crate::yaml::parse("output_limit: {field: max_tokens}").unwrap();
+        let omitted: PlacementsPatch = crate::yaml::parse("output_limit: omitted").unwrap();
+        assert_eq!(
+            Placements::resolve(&lower.overlay(&omitted))
+                .unwrap()
+                .output_limit,
+            Some(Placement::Omitted)
+        );
+        let reset: PlacementsPatch = crate::yaml::parse("output_limit: null").unwrap();
+        assert_eq!(
+            crate::yaml::to_string(&reset).unwrap(),
+            "output_limit: null\n"
+        );
+        let resolved = Placements::resolve(&lower.overlay(&reset)).unwrap();
+        assert_eq!(resolved.output_limit, None);
+        assert_eq!(
+            Placements::resolve(&lower.overlay(&PlacementsPatch::default()))
+                .unwrap()
+                .output_limit,
+            Some(Placement::Field(path("max_tokens")))
+        );
+    }
+
+    #[test]
+    fn selections_apply_per_family_and_reject_foreign_ones() {
+        let placements: Placements = crate::yaml::parse(
             "output_limit: {field: max_tokens}\nreasoning_replay: omitted\ncache_key: {header: x-session-id}\nuser_id: {field: metadata.user}\n",
         )
         .unwrap();
         let Codec::ChatCompletions(chat) =
-            overrides.apply(base(CodecName::ChatCompletions)).unwrap()
+            placements.apply(base(CodecName::ChatCompletions)).unwrap()
         else {
             panic!()
         };
@@ -276,20 +304,20 @@ mod tests {
         assert_eq!(chat.identity.user_id, Some(path("metadata.user")));
         assert_eq!(chat.effort.path, path("reasoning_effort"));
         assert_eq!(
-            overrides.apply(base(CodecName::Responses)).unwrap_err(),
-            OverrideError::Foreign {
-                key: OverrideKey::ReasoningReplay,
+            placements.apply(base(CodecName::Responses)).unwrap_err(),
+            PlacementError::Foreign {
+                key: PlacementKey::ReasoningReplay,
                 family: CodecName::Responses
             }
         );
-        let omitted = Overrides {
+        let omitted = Placements {
             output_limit: Some(Placement::Omitted),
             ..Default::default()
         };
         assert_eq!(
             omitted.apply(base(CodecName::Messages)).unwrap_err(),
-            OverrideError::RequiresField {
-                key: OverrideKey::OutputLimit,
+            PlacementError::RequiresField {
+                key: PlacementKey::OutputLimit,
                 family: CodecName::Messages
             }
         );
@@ -297,11 +325,11 @@ mod tests {
             panic!()
         };
         assert_eq!(responses.output_limit, None);
-        assert!(crate::yaml::parse::<Overrides>("cache_key: {header: 'bad header'}").is_err());
-        assert!(crate::yaml::parse::<Overrides>("unknown: 1").is_err());
+        assert!(crate::yaml::parse::<Placements>("cache_key: {header: 'bad header'}").is_err());
+        assert!(crate::yaml::parse::<Placements>("unknown: 1").is_err());
         // `dump config` writes the tagged spelling back.
         assert_eq!(
-            crate::yaml::to_string(&overrides).unwrap().trim(),
+            crate::yaml::to_string(&placements).unwrap().trim(),
             "output_limit:\n  field: max_tokens\nreasoning_replay: omitted\ncache_key:\n  header: x-session-id\nuser_id:\n  field: metadata.user"
         );
     }
@@ -309,7 +337,7 @@ mod tests {
     #[test]
     fn a_replay_field_keeps_the_dialect_shape() {
         use chat_completions::ReasoningReplay;
-        let field: Overrides = crate::yaml::parse("reasoning_replay: {field: kept}").unwrap();
+        let field: Placements = crate::yaml::parse("reasoning_replay: {field: kept}").unwrap();
         for (preset, expected) in [
             (
                 ReasoningReplay::ThinkingBlocks(path("thinking_blocks")),
@@ -338,42 +366,39 @@ mod tests {
     #[test]
     fn placements_stay_clear_of_codec_fields_and_one_another() {
         use crate::provider::dialect::{
-            DialectSettings, anthropic, codex, compatible, litellm, openai, openrouter,
+            DialectConfig, anthropic, codex, compatible, litellm, openai, openrouter,
         };
-        let presets = [
-            DialectSettings::Compatible(compatible::Config::default()),
-            DialectSettings::Openai(openai::Config::default()),
-            DialectSettings::Anthropic(anthropic::Config::default()),
-            DialectSettings::Codex(codex::Config::default()),
-            DialectSettings::Openrouter(openrouter::Config::default()),
-        ]
-        .into_iter()
-        .chain(
-            [litellm::Upstream::Openai, litellm::Upstream::Anthropic].map(|upstream| {
-                DialectSettings::Litellm(litellm::Config {
-                    upstream,
-                    tags: Vec::new(),
-                })
-            }),
-        );
-        for settings in presets {
+        let litellm = |upstream| litellm::Config {
+            upstream,
+            tags: Vec::new(),
+        };
+        let presets: [&dyn DialectConfig; 7] = [
+            &compatible::Config::default(),
+            &openai::Config::default(),
+            &anthropic::Config::default(),
+            &codex::Config::default(),
+            &openrouter::Config::default(),
+            &litellm(litellm::Upstream::Openai),
+            &litellm(litellm::Upstream::Anthropic),
+        ];
+        for (index, settings) in presets.into_iter().enumerate() {
             for family in [
                 CodecName::ChatCompletions,
                 CodecName::Responses,
                 CodecName::Messages,
             ] {
-                if let Ok(profile) = settings.admit(&Default::default(), family) {
-                    assert_eq!(check(&profile.codec), Ok(()), "{settings:?} {family}");
+                if let Ok(profile) = settings.admit(family) {
+                    assert_eq!(check(&profile.codec), Ok(()), "preset {index} {family}");
                 }
             }
         }
         let checked = |family, text: &str| {
-            let overrides: Overrides = crate::yaml::parse(text).unwrap();
-            check(&overrides.apply(base(family)).unwrap())
+            let placements: Placements = crate::yaml::parse(text).unwrap();
+            check(&placements.apply(base(family)).unwrap())
         };
         let chat = CodecName::ChatCompletions;
         let header = |name: &'static str, family| PlacementError::ReservedHeader {
-            key: OverrideKey::CacheKey,
+            key: PlacementKey::CacheKey,
             name: reqwest::header::HeaderName::from_static(name),
             family,
         };
@@ -402,18 +427,22 @@ mod tests {
         };
         assert_eq!(
             checked(chat, "reasoning_effort: model"),
-            Err(reserved(OverrideKey::ReasoningEffort, "model", chat))
+            Err(reserved(PlacementKey::ReasoningEffort, "model", chat))
         );
         assert_eq!(
             checked(chat, "reasoning_replay: {field: tool_calls.0}"),
-            Err(reserved(OverrideKey::ReasoningReplay, "tool_calls.0", chat))
+            Err(reserved(
+                PlacementKey::ReasoningReplay,
+                "tool_calls.0",
+                chat
+            ))
         );
         // The codec writes `reasoning.summary`, so `reasoning` is taken.
         let responses = CodecName::Responses;
         assert_eq!(
             checked(responses, "reasoning_effort: reasoning"),
             Err(reserved(
-                OverrideKey::ReasoningEffort,
+                PlacementKey::ReasoningEffort,
                 "reasoning",
                 responses
             ))
@@ -427,9 +456,9 @@ mod tests {
         assert_eq!(
             checked(chat, "output_limit: {field: reasoning_effort}"),
             Err(overlap(
-                OverrideKey::OutputLimit,
+                PlacementKey::OutputLimit,
                 "reasoning_effort",
-                OverrideKey::ReasoningEffort,
+                PlacementKey::ReasoningEffort,
                 "reasoning_effort"
             ))
         );
@@ -439,9 +468,9 @@ mod tests {
                 "user_id: {field: metadata}\ncache_key: {body: metadata.session}"
             ),
             Err(overlap(
-                OverrideKey::CacheKey,
+                PlacementKey::CacheKey,
                 "metadata.session",
-                OverrideKey::UserId,
+                PlacementKey::UserId,
                 "metadata"
             ))
         );

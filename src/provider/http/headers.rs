@@ -340,10 +340,24 @@ impl fmt::Display for ValueField {
     }
 }
 
-/// A header value produced by `/bin/sh -c command` on first use; the trimmed
-/// stdout, behind `prefix`, is cached only when the command succeeds. Each run
-/// starts a generation; a 401 discards the generation its request carried
-/// unless a newer one replaced it.
+/// `value` behind `prefix`, as `Bearer ` precedes a bearer token, and as
+/// sensitive as `value`. Header values are checked byte by byte, so a valid
+/// value behind a valid prefix stays valid.
+pub(crate) fn prefixed(prefix: Option<&str>, value: &HeaderValue) -> HeaderValue {
+    let Some(prefix) = prefix else {
+        return value.clone();
+    };
+    let bytes = zeroize::Zeroizing::new([prefix.as_bytes(), value.as_bytes()].concat());
+    let mut prefixed =
+        HeaderValue::from_bytes(&bytes).expect("a valid value behind a valid prefix");
+    prefixed.set_sensitive(value.is_sensitive());
+    prefixed
+}
+
+/// A header value produced by `/bin/sh -c command` on first use. Successful,
+/// validated stdout is cached without its presentation prefix, so different
+/// credential schemes share one generation. A 401 discards the generation its
+/// request carried unless a newer one replaced it.
 #[derive(Clone)]
 pub(crate) struct CommandValue {
     command: String,
@@ -357,7 +371,7 @@ type Current = Arc<Mutex<Arc<Generation>>>;
 /// One run's value, shared by every request sent with it.
 #[derive(Default)]
 struct Generation {
-    value: OnceCell<HeaderValue>,
+    raw: OnceCell<HeaderValue>,
     /// A response has accepted a request carrying this value.
     served: AtomicBool,
 }
@@ -370,23 +384,31 @@ impl fmt::Debug for CommandValue {
 }
 
 impl CommandValue {
-    pub(crate) fn new(command: String, prefix: Option<&'static str>, field: ValueField) -> Self {
+    pub(crate) fn new(command: String, field: ValueField) -> Self {
         Self {
             command,
-            prefix,
+            prefix: None,
             field,
             current: Current::default(),
+        }
+    }
+
+    /// Present the same command generation under another credential scheme.
+    pub(crate) fn with_prefix(&self, prefix: Option<&'static str>) -> Self {
+        Self {
+            prefix,
+            ..self.clone()
         }
     }
 
     /// The current generation's value, running the command once per generation.
     async fn lease(&self) -> Result<(HeaderValue, Lease), ProviderError> {
         let generation = Arc::clone(&self.current.lock().unwrap_or_else(PoisonError::into_inner));
-        let value = generation
-            .value
-            .get_or_try_init(|| execute(&self.command, self.prefix, &self.field))
-            .await?
-            .clone();
+        let raw = generation
+            .raw
+            .get_or_try_init(|| execute(&self.command, &self.field))
+            .await?;
+        let value = prefixed(self.prefix, raw);
         let lease = Lease {
             current: Arc::clone(&self.current),
             generation,
@@ -401,11 +423,7 @@ struct Lease {
     generation: Arc<Generation>,
 }
 
-async fn execute(
-    command: &str,
-    prefix: Option<&'static str>,
-    field: &ValueField,
-) -> Result<HeaderValue, ProviderError> {
+async fn execute(command: &str, field: &ValueField) -> Result<HeaderValue, ProviderError> {
     // Never retain the command, output, exit status, or underlying OS error.
     let failure = |what| ProviderErrorKind::Authentication.error(format!("{field} command {what}"));
     let mut child = Command::new("/bin/sh")
@@ -443,9 +461,8 @@ async fn execute(
     if key.is_empty() {
         return Err(failure("output was empty"));
     }
-    let value = zeroize::Zeroizing::new(format!("{}{key}", prefix.unwrap_or("")));
-    let mut header = HeaderValue::from_str(&value)
-        .map_err(|_| failure("output was not a valid header value"))?;
+    let mut header =
+        HeaderValue::from_str(key).map_err(|_| failure("output was not a valid header value"))?;
     header.set_sensitive(true);
     Ok(header)
 }
@@ -479,7 +496,7 @@ mod tests {
     fn counting(count: &Path) -> CommandValue {
         let count = quote(count);
         let text = format!("printf x >> {count}; printf key-%s \"$(wc -c < {count})\"");
-        CommandValue::new(text, None, ValueField::ApiKey)
+        CommandValue::new(text, ValueField::ApiKey)
     }
 
     fn runs(count: &Path) -> usize {
@@ -515,7 +532,7 @@ mod tests {
         let empty = dir.path().join("empty");
         let blank = |count: &Path| {
             let text = format!("printf x >> {}; printf ' , '", quote(count));
-            Value::Command(CommandValue::new(text, None, header()))
+            Value::Command(CommandValue::new(text, header()))
         };
         let issuer = Arc::new(Counted::default());
         let issued = || Value::Issued(Arc::clone(&issuer) as Arc<dyn Authenticator>);
@@ -550,21 +567,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn command_values_are_lazy_run_once_and_shared_by_clones() {
+    async fn command_values_are_lazy_run_once_and_shared_across_prefixes() {
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
         let text = format!(
             "printf x >> {}; printf ' \\t  resolved-key  \\r\\n '",
             quote(&count)
         );
-        let value = CommandValue::new(text, Some("Bearer "), ValueField::ApiKey);
+        let value = CommandValue::new(text, ValueField::ApiKey).with_prefix(Some("Bearer "));
         assert!(!count.exists(), "nothing runs before the first use");
-        let shared: Vec<_> = (0..8).map(|_| value.clone()).collect();
-        let resolved = futures_util::future::join_all(shared.iter().map(CommandValue::value)).await;
-        for header in resolved {
+        let shared: Vec<_> = (0..8)
+            .map(|index| match index % 2 {
+                0 => (value.clone(), "Bearer resolved-key"),
+                _ => (value.with_prefix(None), "resolved-key"),
+            })
+            .collect();
+        let resolved = crate::tests::bounded(futures_util::future::join_all(
+            shared.iter().map(|(value, _)| value.value()),
+        ))
+        .await;
+        for (header, (_, expected)) in resolved.into_iter().zip(shared) {
             let header = header.unwrap();
-            assert_eq!(header.to_str().unwrap(), "Bearer resolved-key");
+            assert_eq!(header, expected);
             assert!(header.is_sensitive());
+            assert!(!format!("{header:?}").contains("resolved-key"));
         }
         assert_eq!(std::fs::read(&count).unwrap(), b"x");
     }
@@ -609,7 +635,7 @@ mod tests {
             let text = format!(
                 "# private-command-text\nif test -e {marker}; then printf retry-key; else touch {marker}; {bad}; fi"
             );
-            let value = CommandValue::new(text, None, field);
+            let value = CommandValue::new(text, field);
             let error = value.value().await.unwrap_err();
             assert_eq!(error.kind(), ProviderErrorKind::Authentication);
             assert_eq!(error.message, expected);
@@ -622,15 +648,15 @@ mod tests {
         }
     }
 
-    /// Concurrent 401s from one accepted generation discard it once and fetch
-    /// its successor once; a late 401 from the old generation keeps the successor.
+    /// Concurrent 401s across credential schemes discard their shared accepted
+    /// generation once; a late 401 from either scheme keeps the successor.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn unauthorized_discards_only_the_generation_it_carried_and_refetches_once() {
-        async fn send(value: CommandValue) -> (HeaderValue, Resolved) {
+    async fn unauthorized_across_schemes_discards_only_its_generation_and_refetches_once() {
+        async fn send(name: &HeaderName, value: &CommandValue) -> (HeaderValue, Resolved) {
             let mut headers = Headers::default();
-            headers.insert(AUTHORIZATION, Value::Command(value));
+            headers.insert(name.clone(), Value::Command(value.clone()));
             let resolved = headers.resolve().await.unwrap();
-            (resolved.map()[AUTHORIZATION].clone(), resolved)
+            (resolved.map()[name].clone(), resolved)
         }
         // A proxy's rate-limit hint on a 401 does not outlive the reclassification.
         fn refused() -> ProviderError {
@@ -640,29 +666,36 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
         let value = counting(&count);
+        let schemes = [
+            (AUTHORIZATION, value.with_prefix(Some("Bearer ")), "Bearer "),
+            (HeaderName::from_static("x-api-key"), value, ""),
+        ];
         let run = async {
-            let sent = futures_util::future::join_all((0..8).map(|_| send(value.clone()))).await;
-            assert!(sent.iter().all(|(header, _)| header == "key-1"));
-            sent[0].1.served();
-            let renewals = sent.into_iter().map(|(_, leases)| {
-                let value = value.clone();
+            let sent = futures_util::future::join_all(schemes.iter().cycle().take(8).map(
+                |(name, value, prefix)| async move {
+                    let (header, leases) = send(name, value).await;
+                    assert_eq!(header, format!("{prefix}key-1"));
+                    (leases, name.clone(), value.clone(), *prefix)
+                },
+            ))
+            .await;
+            sent[0].0.served();
+            let renewals = sent.into_iter().map(|(leases, name, value, prefix)| {
                 tokio::spawn(async move {
                     let kind = leases.unauthorized(refused()).kind();
-                    (kind, send(value).await.0, leases)
+                    assert_eq!(kind, ProviderErrorKind::CredentialExpired);
+                    assert_eq!(send(&name, &value).await.0, format!("{prefix}key-2"));
+                    leases
                 })
             });
-            let mut stale = Vec::new();
-            for renewal in futures_util::future::join_all(renewals).await {
-                let (kind, header, leases) = renewal.unwrap();
-                assert_eq!(kind, ProviderErrorKind::CredentialExpired);
-                assert_eq!(header, "key-2");
-                stale.push(leases);
-            }
+            let stale = futures_util::future::join_all(renewals).await;
             assert_eq!(runs(&count), 2);
-            let late = stale[0].unauthorized(refused());
-            assert_eq!(late.kind(), ProviderErrorKind::CredentialExpired);
-            assert_eq!(late.retry_after(), None);
-            assert_eq!(send(value.clone()).await.0, "key-2");
+            for (leases, (name, value, prefix)) in stale.into_iter().zip(schemes.iter().cycle()) {
+                let late = leases.unwrap().unauthorized(refused());
+                assert_eq!(late.kind(), ProviderErrorKind::CredentialExpired);
+                assert_eq!(late.retry_after(), None);
+                assert_eq!(send(name, value).await.0, format!("{prefix}key-2"));
+            }
             assert_eq!(runs(&count), 2);
         };
         crate::tests::bounded(run).await;
@@ -677,7 +710,7 @@ mod tests {
         let text = format!(
             "if test -e {quoted}; then printf retry-key; else printf '%s' $$ > {quoted}; exec sleep 30; fi"
         );
-        let value = CommandValue::new(text, None, ValueField::ApiKey);
+        let value = CommandValue::new(text, ValueField::ApiKey);
         let run = async {
             let pending = value.value();
             let pid = tokio::select! {

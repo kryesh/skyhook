@@ -26,8 +26,10 @@ approve_all: false
 # The CLI loads .env from its invocation directory (not --workspace or the config directory).
 # Existing process environment variables take precedence; no parent-directory search.
 # Host environment and .env values are not forwarded to remote targets.
-# Each entry names a dialect (the vendor's conventions) and a codec (the API family).
+# Each provider names a dialect (the vendor's conventions) and each model a codec (the API family).
 # A model is selected as provider/model, e.g. openai/openai.
+# Request settings (codec, placements, dialect fields such as tags) written beside `models`
+# are defaults; written beside `model`, they replace the default for that model.
 providers:
   openai:
     codec: "responses"
@@ -113,8 +115,8 @@ providers:
   #       max_output: 64000
   #       supports_images: true
 
-  # A LiteLLM proxy speaks every codec; the upstream family behind an alias is
-  # hidden from clients, so the entry names it.
+  # A LiteLLM virtual key is a bearer token for every codec, including messages.
+  # upstream asserts the family behind an alias; configure actual routing in LiteLLM.
   # proxy:
   #   codec: "chat_completions"
   #   dialect: "litellm"
@@ -129,6 +131,13 @@ providers:
   #       reasoning: "high"
   #       max_context: 200000
   #       max_output: 64000
+  #     gpt:
+  #       model: "gpt-alias"
+  #       codec: "responses"      # Different API and upstream, same connection/key.
+  #       upstream: "openai"
+  #       tags: []                # Replace the provider's tags, rather than inherit.
+  #       max_context: 1050000
+  #       max_output: 128000
 
   # Keyless local llama.cpp endpoint; the model alias matches --alias below.
   # Example text-only server (requires enough memory for the configured context):

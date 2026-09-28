@@ -25,16 +25,19 @@ providers:
 ```
 
 A literal secret is stored in plain text in the configuration file, and `skyhook dump config`
-prints it. Prefer `env` or `command` for secrets.
+prints it. Prefer `env` or `command` for secrets. `api_key` and `headers` are provider-only:
+all models in that provider instance share their credential resources, even when their codecs or
+request settings differ. A LiteLLM virtual key is sent as a bearer token for every codec,
+including `messages`.
 
 Environment-variable values the provider sends are resolved when it is built and must be present
 and nonblank. They are used as they are, not trimmed: a value with a trailing newline fails,
 naming the provider and field. A command runs only on the first model request that sends its value, not when
 configuration is loaded or a conversation is opened. A successful command's stdout is decoded as
 UTF-8 and trimmed of leading/trailing whitespace and newlines, then cached in memory for that
-provider instance. Concurrent requests and child conversations share the cache; a new process or
-provider instance resolves the value again. Failed commands are not cached and may be retried on a
-subsequent request. When the server refuses a cached value with HTTP 401, the value is discarded
+provider instance. All its models, concurrent requests, and child conversations share the cache;
+a new process or provider instance resolves the value again. Failed commands are not cached and
+may be retried on a subsequent request. When the server refuses a cached value with HTTP 401, the value is discarded
 and the next request runs the command again. If the refused value had been accepted before, as
 when a short-lived token expires, the model request is retried automatically; a value refused on
 its first use fails the request. Empty output, invalid UTF-8, output that is not a valid header

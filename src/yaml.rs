@@ -41,21 +41,9 @@ pub(crate) fn parse<T: serde::de::DeserializeOwned>(text: &str) -> Result<T, Yam
     Ok(serde_json::from_value(from_str(text)?)?)
 }
 
-/// Unset optional fields are omitted rather than written as `null`.
+/// Preserve the serialized JSON shape, including explicit `null` values.
 pub(crate) fn to_string(value: &impl serde::Serialize) -> Result<String, YamlError> {
-    fn prune(value: &mut Value) {
-        match value {
-            Value::Object(fields) => {
-                fields.retain(|_, field| !field.is_null());
-                fields.values_mut().for_each(prune);
-            }
-            Value::Array(items) => items.iter_mut().for_each(prune),
-            _ => {}
-        }
-    }
-    let mut value = serde_json::to_value(value)?;
-    prune(&mut value);
-    Ok(serde_saphyr::to_string(&value)?)
+    Ok(serde_saphyr::to_string(&serde_json::to_value(value)?)?)
 }
 
 // serde_json's ordinary visitor requests String keys, allowing the YAML
@@ -242,6 +230,26 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[test]
+    fn serialization_preserves_nulls_and_respects_declared_omission() {
+        #[derive(serde::Serialize)]
+        struct Written {
+            #[serde(skip_serializing_if = "Option::is_none")]
+            omitted: Option<bool>,
+            clear: Option<bool>,
+            nested: Value,
+        }
+        let written = Written {
+            omitted: None,
+            clear: None,
+            nested: json!({"routing": {"zdr": null}, "items": [null, {"key": null}]}),
+        };
+        assert_eq!(
+            from_str(&to_string(&written).unwrap()).unwrap(),
+            json!({"clear": null, "nested": written.nested})
+        );
+    }
 
     #[test]
     fn json_values_keep_types_order_and_literal_strings() {

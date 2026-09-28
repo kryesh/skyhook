@@ -12,7 +12,7 @@ use crate::{
     named_enum::named_enum,
     provider::{
         ProviderError,
-        codec::{Codec, CodecName, chat_completions, messages, responses},
+        codec::{Codec, CodecName},
         http::{Build, Headers, HttpProvider, Transport, headers::Value, transport::EVENT_STREAM},
     },
 };
@@ -22,19 +22,25 @@ mod api_key;
 pub mod codex;
 pub mod compatible;
 pub(crate) mod config;
+pub(crate) mod entry;
 pub mod litellm;
+pub(crate) mod models;
 pub mod openai;
 pub mod openrouter;
-mod overrides;
+mod placements;
 
 pub use crate::provider::http::headers::{HeaderText, InvalidHeaderText, ValueField};
+pub use crate::provider::settings::{MissingSetting, Setting};
 pub(crate) use api_key::Scheme;
 pub(crate) use config::Connection;
-use config::Pending;
 pub use config::{
-    AdmissionError, Common, EndpointError, ModelError, ModelSpec, Sourced, ValueError, ValueProblem,
+    AdmissionError, Common, EndpointError, ModelError, Sourced, ValueError, ValueProblem,
 };
-pub use overrides::{OverrideError, OverrideKey, Overrides, Placement, PlacementError};
+use config::{Pending, Sources};
+pub(crate) use entry::{AdmittedProvider, validate_entries};
+pub use entry::{ProviderModels, ProviderSettings, RawProviderConfig};
+pub use models::{ModelSpec, Request, RequestPatch, RequestSettings};
+pub use placements::{Placement, PlacementError, PlacementKey, Placements, PlacementsPatch};
 
 named_enum! {
     /// The preset a provider entry names.
@@ -58,12 +64,11 @@ pub(crate) enum BaseUrl {
     Default(&'static str),
 }
 
-/// The wire conventions an admitted entry fixes for one codec.
+/// The complete wire conventions of an admitted model.
 #[derive(Clone, Debug)]
 pub(crate) struct Profile {
     pub codec: Codec,
     pub transport: Transport,
-    pub base_url: BaseUrl,
     /// Names the dialect in replay scope, with whatever else changes the
     /// meaning of replayed state.
     pub scope: String,
@@ -80,10 +85,16 @@ impl Profile {
             headers: codec.headers(),
             codec,
             transport,
-            base_url: BaseUrl::Required,
             scope: dialect.as_str().to_owned(),
             key: Scheme::Bearer,
         }
+    }
+
+    /// Partition private replay for nonsecret routing and tenant selectors.
+    pub(crate) fn discriminate(&mut self, identity: &impl Serialize) {
+        self.scope.push(':');
+        self.scope
+            .push_str(&serde_json::to_string(identity).expect("replay identity serializes"));
     }
 
     /// Send `value` as `name` on every request.
@@ -106,8 +117,6 @@ pub enum DialectError {
     #[error(transparent)]
     Codec(#[from] UnsupportedCodec),
     #[error(transparent)]
-    Overrides(#[from] OverrideError),
-    #[error(transparent)]
     Openai(#[from] openai::Error),
     #[error(transparent)]
     Codex(#[from] codex::Error),
@@ -124,45 +133,23 @@ pub enum BuildError {
     Provider(#[from] ProviderError),
 }
 
-/// The base conventions of a family, which `compatible` serves as they are.
-pub(crate) fn base(codec: CodecName) -> Codec {
-    match codec {
-        CodecName::ChatCompletions => {
-            Codec::ChatCompletions(chat_completions::Dialect::compatible())
-        }
-        CodecName::Responses => Codec::Responses(responses::Dialect::stateless()),
-        CodecName::Messages => Codec::Messages(messages::Dialect::anthropic()),
-    }
-}
-
 /// What every dialect's settings provide.
-pub(crate) trait DialectConfig: Serialize + serde::de::DeserializeOwned {
-    /// The dialect's own checks and the conventions it fixes for `codec`. The
-    /// common fields, the endpoint and the models are checked once for every
-    /// dialect, so nothing here is proved again at build.
-    fn admit(&self, common: &Common, codec: CodecName) -> Result<Profile, DialectError>;
-
-    /// The credential headers: by default the entry's `api_key` as the
-    /// profile's scheme sends it, absent for a keyless endpoint.
-    fn credentials(
-        &self,
-        profile: &Profile,
-        connection: &Connection,
-    ) -> Result<Headers<Pending>, BuildError> {
-        let key = connection.api_key.as_ref();
-        Ok(key.map_or_else(Headers::default, |key| profile.key.credential(key)))
-    }
+pub(crate) trait DialectConfig {
+    /// Resolve wire conventions after inheritance. Connection and model-profile
+    /// validation are shared, and no admission is repeated at build.
+    fn admit(&self, codec: CodecName) -> Result<Profile, DialectError>;
 }
 
 /// Build the provider at the admitted endpoint. Header sources compose in
 /// order, each replacing a header or joining a list header: the profile's, the
 /// entry's `headers`, `credentials`, then the stream the transport reads. Only
 /// the environment values that remain are read.
-fn build(
+pub(crate) fn build(
     name: &str,
     profile: Profile,
     connection: &Connection,
     credentials: Headers<Pending>,
+    resources: &mut Resources,
 ) -> Result<HttpProvider, BuildError> {
     let ready = |value| Ok::<_, Infallible>(Pending::Ready(value));
     let Ok(mut headers) = profile.headers.try_map(ready);
@@ -173,84 +160,31 @@ fn build(
     headers.extend(credentials);
     let stream = Value::Fixed(HeaderValue::from_static(EVENT_STREAM));
     headers.insert(ACCEPT, Pending::Ready(stream));
-    let headers = headers.try_map(Pending::read)?;
+    let headers = headers.try_map(|pending| resources.sources.read(pending))?;
     Ok(HttpProvider::new(Build {
         name,
         scope_tag: &profile.scope,
-        endpoint: connection.endpoint.clone(),
+        client: resources.client.clone(),
+        endpoint: config::endpoint(&connection.root, profile.codec.name()),
         codec: profile.codec,
         transport: profile.transport,
         headers,
         timeouts: connection.timeouts,
-    })?)
+    }))
 }
 
-macro_rules! dialects {
-    ($($variant:ident => $module:ident),+ $(,)?) => {
-        /// A dialect's own settings.
-        #[derive(Clone, Debug, PartialEq)]
-        pub enum DialectSettings {
-            $($variant($module::Config)),+
-        }
-
-        impl DialectSettings {
-            /// The dialect's fields, from the entry's remaining YAML.
-            pub(crate) fn parse(
-                dialect: Dialect,
-                fields: serde_json::Value,
-            ) -> Result<Self, serde_path_to_error::Error<serde_json::Error>> {
-                Ok(match dialect {
-                    $(Dialect::$variant => Self::$variant(serde_path_to_error::deserialize(fields)?)),+
-                })
-            }
-
-            pub fn dialect(&self) -> Dialect {
-                match self {
-                    $(Self::$variant(_) => Dialect::$variant),+
-                }
-            }
-
-            pub(crate) fn admit(&self, common: &Common, codec: CodecName) -> Result<Profile, DialectError> {
-                match self {
-                    $(Self::$variant(config) => config.admit(common, codec)),+
-                }
-            }
-
-            /// The provider for an admitted profile. Environment values are read
-            /// here; a command runs on the first request that sends its value.
-            pub(crate) fn provider(
-                &self,
-                name: &str,
-                profile: Profile,
-                connection: &Connection,
-            ) -> Result<HttpProvider, BuildError> {
-                let credentials = match self {
-                    $(Self::$variant(config) => config.credentials(&profile, connection)?),+
-                };
-                build(name, profile, connection, credentials)
-            }
-
-            /// The dialect's fields, as YAML at the entry's level.
-            pub(crate) fn fields(&self) -> serde_json::Map<String, serde_json::Value> {
-                let value = match self {
-                    $(Self::$variant(config) => serde_json::to_value(config)),+
-                };
-                match value {
-                    Ok(serde_json::Value::Object(fields)) => fields,
-                    _ => unreachable!("dialect settings serialize as an object"),
-                }
-            }
-        }
-    };
+pub(crate) struct Resources {
+    client: reqwest::Client,
+    sources: Sources,
 }
 
-dialects! {
-    Compatible => compatible,
-    Openai => openai,
-    Anthropic => anthropic,
-    Codex => codex,
-    Litellm => litellm,
-    Openrouter => openrouter,
+impl Resources {
+    pub(crate) fn new() -> Result<Self, BuildError> {
+        Ok(Self {
+            client: crate::provider::http::transport::client()?,
+            sources: Sources::default(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -277,10 +211,23 @@ pub(crate) mod tests {
         codec: CodecName,
         common: &Common,
     ) -> HttpProvider {
-        let profile = settings.admit(common, codec).unwrap();
-        let connection = common.admit(profile.base_url, codec).unwrap();
-        let credentials = settings.credentials(&profile, &connection).unwrap();
-        build(name, profile, &connection, credentials).unwrap()
+        placed(name, settings, &Placements::default(), codec, common)
+    }
+
+    /// Admit, apply `placements`, and build, as configuration does.
+    pub(crate) fn placed(
+        name: &str,
+        settings: &impl DialectConfig,
+        placements: &Placements,
+        codec: CodecName,
+        common: &Common,
+    ) -> HttpProvider {
+        let mut profile = settings.admit(codec).unwrap();
+        profile.codec = placements.apply(profile.codec).unwrap();
+        let connection = common.admit(BaseUrl::Required).unwrap();
+        let credentials = connection.credentials(profile.key);
+        let mut resources = Resources::new().unwrap();
+        build(name, profile, &connection, credentials, &mut resources).unwrap()
     }
 
     /// The head of one request a keyed entry sends.
@@ -322,7 +269,7 @@ pub(crate) mod tests {
         body: serde_json::Value,
         retry_after: Option<std::time::Duration>,
     ) -> crate::provider::ProviderErrorKind {
-        let profile = settings.admit(&Common::default(), codec).unwrap();
+        let profile = settings.admit(codec).unwrap();
         let rejection = crate::provider::http::transport::Rejection {
             status,
             body,
@@ -338,7 +285,7 @@ pub(crate) mod tests {
         codec: CodecName,
         event: serde_json::Value,
     ) -> crate::provider::ProviderErrorKind {
-        let profile = settings.admit(&Common::default(), codec).unwrap();
+        let profile = settings.admit(codec).unwrap();
         let scope = crate::provider::codec::common::tests::scope();
         let signals = profile.transport.errors;
         let mut decoder = profile.codec.decoder("model".into(), scope, b"", signals);
@@ -359,18 +306,21 @@ pub(crate) mod tests {
     #[test]
     fn dialects_refuse_codecs_they_do_not_speak() {
         use CodecName::*;
-        let anthropic = || DialectSettings::Anthropic(anthropic::Config::default());
-        let codex = || DialectSettings::Codex(codex::Config::default());
-        for (settings, codec) in [
-            (anthropic(), ChatCompletions),
-            (anthropic(), Responses),
-            (DialectSettings::Openai(openai::Config::default()), Messages),
-            (codex(), ChatCompletions),
-            (codex(), Messages),
+        let anthropic = anthropic::Config::default();
+        let codex = codex::Config::default();
+        for (settings, dialect, codec) in [
+            (
+                &anthropic as &dyn DialectConfig,
+                Dialect::Anthropic,
+                ChatCompletions,
+            ),
+            (&anthropic, Dialect::Anthropic, Responses),
+            (&openai::Config::default(), Dialect::Openai, Messages),
+            (&codex, Dialect::Codex, ChatCompletions),
+            (&codex, Dialect::Codex, Messages),
         ] {
-            let dialect = settings.dialect();
             assert_eq!(
-                settings.admit(&Common::default(), codec).unwrap_err(),
+                settings.admit(codec).unwrap_err(),
                 UnsupportedCodec { dialect, codec }.into()
             );
         }
@@ -421,10 +371,10 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
         let command = format!("printf x >> '{}'; printf entry", count.to_str().unwrap());
-        let placed = compatible::Config(Overrides {
+        let selected = Placements {
             cache_key: Some(header("x-api-key")),
-            ..Overrides::default()
-        });
+            ..Placements::default()
+        };
         let heads = heads(2, async |root| {
             let mut common = common(root, Some(Sourced::Literal("k".into())));
             let entry = Sourced::Command { command };
@@ -433,8 +383,9 @@ pub(crate) mod tests {
                 env: "SKYHOOK_TEST_UNSET_X".into(),
             };
             common.headers.insert("accept".into(), unset);
-            for settings in [compatible::Config::default(), placed] {
-                let provider = provider("test", &settings, CodecName::Messages, &common);
+            for placements in [Placements::default(), selected] {
+                let settings = compatible::Config::default();
+                let provider = placed("test", &settings, &placements, CodecName::Messages, &common);
                 let mut context = provider.open_context("ctx".parse().unwrap()).unwrap();
                 drop(futures_util::StreamExt::next(&mut context.invoke(request())).await);
             }

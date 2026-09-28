@@ -18,6 +18,8 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 enum AuthError {
     #[error(transparent)]
     Config(#[from] skyhook::config::ConfigError),
+    #[error("invalid configuration: {0}")]
+    CodexIssuers(#[from] skyhook::provider::dialect::codex::IssuerConflict),
     #[error(transparent)]
     Codex(#[from] skyhook::provider::ProviderError),
 }
@@ -28,7 +30,9 @@ fn codex_issuer(
 ) -> Result<skyhook::provider::dialect::codex::auth::Issuer, AuthError> {
     use skyhook::config::ConfigError;
     match config {
-        Ok(config) => Ok(config.codex_issuer()?),
+        Ok(config) => Ok(skyhook::provider::dialect::codex::issuer(
+            &config.providers,
+        )?),
         Err(ConfigError::Missing(_)) => Ok(Default::default()),
         Err(error) => Err(error.into()),
     }

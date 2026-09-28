@@ -6,14 +6,14 @@ use std::{env, fmt, time::Duration};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-use super::{DialectError, OverrideError, Overrides, PlacementError};
+use super::{DialectError, PlacementError};
 use crate::provider::{
-    codec::{Codec, CodecName, EffortLevels},
+    codec::{CodecName, EffortLevels},
     http::{
         Timeouts,
-        headers::{CommandValue, Value, ValueField},
+        headers::{CommandValue, Value, ValueField, prefixed},
     },
-    profile::{LimitsError, ModelName, ModelProfile},
+    profile::{LimitsError, ModelName},
 };
 
 /// A configured value: written literally, read from the environment when the
@@ -108,107 +108,87 @@ impl Sourced {
 
 impl Source {
     /// The value for `field`, behind `prefix` as `Bearer ` precedes a bearer
-    /// token. Credentials are never logged, whatever their source; other
-    /// values only when written literally in the file. Environment values are
-    /// read once composition shows they are sent; commands stay lazy.
+    /// token, once composition shows it is sent.
     pub(crate) fn header(&self, field: ValueField, prefix: Option<&'static str>) -> Pending {
-        match self {
-            Self::Literal(value) => Pending::Ready(Value::Fixed(prefixed(
-                prefix,
-                value,
-                field == ValueField::ApiKey,
-            ))),
-            Self::Env(name) => Pending::Env {
-                name: name.clone(),
-                field,
-                prefix,
-            },
-            Self::Command(command) => Pending::Ready(Value::Command(CommandValue::new(
-                command.clone(),
-                prefix,
-                field,
-            ))),
+        Pending::Source {
+            source: self.clone(),
+            field,
+            prefix,
         }
+    }
+
+    /// Credentials are never logged, whatever their source; other values only
+    /// when written literally in the file. Environment values are read here;
+    /// commands stay lazy.
+    fn read(self, field: &ValueField) -> Result<Raw, ValueError> {
+        let sensitive = |mut value: HeaderValue, sensitive| {
+            value.set_sensitive(sensitive);
+            value
+        };
+        Ok(match self {
+            Self::Literal(value) => Raw::Fixed(sensitive(value, *field == ValueField::ApiKey)),
+            Self::Env(name) => {
+                let problem = match env::var(&name) {
+                    Ok(value) if !value.trim().is_empty() => match HeaderValue::from_str(&value) {
+                        Ok(value) => return Ok(Raw::Fixed(sensitive(value, true))),
+                        Err(_) => ValueProblem::InvalidEnvironment(name),
+                    },
+                    _ => ValueProblem::MissingEnvironment(name),
+                };
+                let field = field.clone();
+                return Err(ValueError { field, problem });
+            }
+            Self::Command(command) => Raw::Command(CommandValue::new(command, field.clone())),
+        })
     }
 }
 
-/// `value` behind `prefix`. Header values are checked byte by byte, so a valid
-/// value behind a valid prefix stays valid.
-fn prefixed(prefix: Option<&'static str>, value: &HeaderValue, sensitive: bool) -> HeaderValue {
-    let bytes = [prefix.unwrap_or("").as_bytes(), value.as_bytes()].concat();
-    let mut value = HeaderValue::from_bytes(&bytes).expect("a valid value behind a valid prefix");
-    value.set_sensitive(sensitive);
-    value
-}
-
-/// A header value while a provider is built: ready, or an environment
-/// variable read once composition shows the value is sent.
+/// A header value while a provider is built: ready, or a source read once
+/// composition shows the value is sent.
+#[derive(Clone)]
 pub(crate) enum Pending {
     Ready(Value),
-    Env {
-        name: String,
+    Source {
+        source: Source,
         field: ValueField,
         prefix: Option<&'static str>,
     },
 }
 
-impl Pending {
-    /// The value, reading the environment. Environment values are sent as
-    /// they are and are always sensitive.
-    pub(crate) fn read(self) -> Result<Value, ValueError> {
-        let (name, field, prefix) = match self {
-            Self::Ready(value) => return Ok(value),
-            Self::Env {
-                name,
+/// The sources one provider build has read, shared by all its models so that
+/// each reads the environment once and shares one command generation, whatever
+/// prefix its credential scheme puts in front.
+#[derive(Default)]
+pub(crate) struct Sources(Vec<(ValueField, Raw)>);
+
+/// A source's value before any prefix.
+#[derive(Clone)]
+enum Raw {
+    Fixed(HeaderValue),
+    Command(CommandValue),
+}
+
+impl Sources {
+    pub(crate) fn read(&mut self, pending: Pending) -> Result<Value, ValueError> {
+        let (source, field, prefix) = match pending {
+            Pending::Ready(value) => return Ok(value),
+            Pending::Source {
+                source,
                 field,
                 prefix,
-            } => (name, field, prefix),
+            } => (source, field, prefix),
         };
-        let problem = match env::var(&name) {
-            Ok(value) if !value.trim().is_empty() => match HeaderValue::from_str(&value) {
-                Ok(value) => return Ok(Value::Fixed(prefixed(prefix, &value, true))),
-                Err(_) => ValueProblem::InvalidEnvironment(name),
-            },
-            _ => ValueProblem::MissingEnvironment(name),
-        };
-        Err(ValueError { field, problem })
-    }
-}
-
-/// A model under a provider: its profile and, optionally, conventions of its own.
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
-pub struct ModelSpec {
-    #[serde(flatten)]
-    pub profile: ModelProfile,
-    #[serde(skip_serializing_if = "Overrides::is_empty")]
-    pub overrides: Overrides,
-}
-
-/// The profile's fields and `overrides` share one mapping.
-impl<'de> Deserialize<'de> for ModelSpec {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        struct Rest(Overrides);
-
-        impl<'de> crate::yaml::Rest<'de> for Rest {
-            fn read<A: serde::de::MapAccess<'de>>(
-                &mut self,
-                key: String,
-                map: &mut A,
-            ) -> Result<(), A::Error> {
-                if key != "overrides" {
-                    let message = format_args!("unknown field `{key}`");
-                    return Err(serde::de::Error::custom(message));
-                }
-                self.0 = map.next_value()?;
-                Ok(())
+        let raw = match self.0.iter().find(|(read, _)| *read == field) {
+            Some((_, raw)) => raw.clone(),
+            None => {
+                let raw = source.read(&field)?;
+                self.0.push((field, raw.clone()));
+                raw
             }
-        }
-
-        let mut rest = Rest(Overrides::default());
-        let profile = crate::yaml::split(deserializer, &mut rest)?;
-        Ok(Self {
-            profile,
-            overrides: rest.0,
+        };
+        Ok(match raw {
+            Raw::Fixed(value) => Value::Fixed(prefixed(prefix, &value)),
+            Raw::Command(value) => Value::Command(value.with_prefix(prefix)),
         })
     }
 }
@@ -216,9 +196,11 @@ impl<'de> Deserialize<'de> for ModelSpec {
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum ModelError {
     #[error(transparent)]
+    Settings(#[from] crate::provider::settings::MissingSetting),
+    #[error(transparent)]
+    Dialect(#[from] DialectError),
+    #[error(transparent)]
     Limits(#[from] LimitsError),
-    #[error("overrides: {0}")]
-    Overrides(#[from] OverrideError),
     #[error(transparent)]
     Placement(#[from] PlacementError),
     #[error("reasoning `{effort}` is not one of: {}", .levels.0.join(", "))]
@@ -226,24 +208,6 @@ pub enum ModelError {
         effort: String,
         levels: EffortLevels,
     },
-}
-
-impl ModelSpec {
-    /// The model's conventions: its overrides applied to the entry's, which
-    /// must place every value apart and accept its reasoning level.
-    pub(crate) fn admit(&self, conventions: &Codec) -> Result<Codec, ModelError> {
-        self.profile.validate_limits()?;
-        let codec = self.overrides.apply(conventions.clone())?;
-        super::overrides::check(&codec)?;
-        let levels = codec.effort().levels;
-        if let Some(effort) = &self.profile.reasoning
-            && !levels.accepts(effort)
-        {
-            let effort = effort.clone();
-            return Err(ModelError::Reasoning { effort, levels });
-        }
-        Ok(codec)
-    }
 }
 
 /// Why a provider entry was refused.
@@ -283,16 +247,25 @@ pub struct Common {
     /// Maximum interval between HTTP response body reads; absent takes the default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read_idle_timeout_secs: Option<u64>,
-    #[serde(default)]
-    pub models: indexmap::IndexMap<ModelName, ModelSpec>,
 }
 
 /// The common fields, admitted: what a provider is built from.
 pub(crate) struct Connection {
-    pub(super) endpoint: reqwest::Url,
+    pub(super) root: reqwest::Url,
     pub(super) api_key: Option<Source>,
     pub(super) headers: Vec<(HeaderName, Source)>,
     pub(super) timeouts: Timeouts,
+}
+
+impl Connection {
+    pub(crate) fn credentials(
+        &self,
+        scheme: super::Scheme,
+    ) -> crate::provider::http::Headers<Pending> {
+        self.api_key
+            .as_ref()
+            .map_or_else(Default::default, |key| scheme.credential(key))
+    }
 }
 
 impl Common {
@@ -308,19 +281,14 @@ impl Common {
         }
     }
 
-    /// Checks shared by every dialect, with the endpoint under the root the
-    /// profile needs.
-    pub(crate) fn admit(
-        &self,
-        base_url: super::BaseUrl,
-        codec: CodecName,
-    ) -> Result<Connection, AdmissionError> {
+    /// Admit the shared API root and sources without reading credentials.
+    pub(crate) fn admit(&self, base_url: super::BaseUrl) -> Result<Connection, AdmissionError> {
         let base = match (self.base_url.as_deref(), base_url) {
             (Some(base), _) => base,
             (None, super::BaseUrl::Default(base)) => base,
             (None, super::BaseUrl::Required) => return Err(EndpointError::Missing.into()),
         };
-        let endpoint = endpoint(base, codec)?;
+        let root = service_url(base)?;
         let timeouts = self.timeouts();
         timeouts.validate()?;
         let api_key = self
@@ -339,7 +307,7 @@ impl Common {
             headers.push((header, value));
         }
         Ok(Connection {
-            endpoint,
+            root,
             api_key,
             headers,
             timeouts,
@@ -381,15 +349,15 @@ pub(crate) fn service_url(text: &str) -> Result<reqwest::Url, EndpointError> {
 }
 
 /// The codec's endpoint under an API root.
-pub(crate) fn endpoint(base: &str, codec: CodecName) -> Result<reqwest::Url, EndpointError> {
-    let mut url = service_url(base)?;
+pub(crate) fn endpoint(root: &reqwest::Url, codec: CodecName) -> reqwest::Url {
+    let mut url = root.clone();
     let path = format!(
         "{}/{}",
         url.path().trim_end_matches('/'),
         codec.path_suffix()
     );
     url.set_path(&path);
-    Ok(url)
+    url
 }
 
 #[cfg(test)]
@@ -398,7 +366,8 @@ mod tests {
 
     #[test]
     fn endpoints_append_the_codec_path_and_refuse_secrets_in_urls() {
-        let url = endpoint("https://example.com/custom/v1/", CodecName::Responses).unwrap();
+        let root = service_url("https://example.com/custom/v1/").unwrap();
+        let url = endpoint(&root, CodecName::Responses);
         assert_eq!(url.as_str(), "https://example.com/custom/v1/responses");
         for invalid in [
             "/v1",
@@ -407,7 +376,7 @@ mod tests {
             "https://example.com/v1?q=secret",
             "https://example.com/v1#fragment",
         ] {
-            let error = endpoint(invalid, CodecName::ChatCompletions).unwrap_err();
+            let error = service_url(invalid).unwrap_err();
             assert!(!error.to_string().contains("secret"), "{invalid}");
         }
     }
@@ -459,7 +428,10 @@ mod tests {
         );
         let fixed = |text: &str, field: ValueField, prefix| {
             let source = parse(text).admit(field.clone()).unwrap();
-            match source.header(field, prefix).read().unwrap() {
+            match Sources::default()
+                .read(source.header(field, prefix))
+                .unwrap()
+            {
                 Value::Fixed(value) => value,
                 _ => panic!("{text} is read when the provider is built"),
             }

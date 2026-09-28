@@ -6,6 +6,7 @@ mod error;
 pub mod http;
 pub mod profile;
 pub mod protocol;
+pub(crate) mod settings;
 
 pub use error::{ProviderError, ProviderErrorKind};
 

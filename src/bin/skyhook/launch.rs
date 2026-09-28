@@ -281,6 +281,7 @@ impl Launch {
 mod tests {
     use super::*;
     use crate::cli::{self, Invocation};
+    use skyhook::provider::dialect::ProviderSettings;
 
     fn history_config(root: Option<PathBuf>) -> RuntimeConfig {
         let mut config = Config::from_yaml("providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: http://127.0.0.1:1/v1\n    models:\n      test:\n        model: fixture\n        max_context: 128000\n        max_output: 4096\n").unwrap();
@@ -304,7 +305,10 @@ mod tests {
     fn selection_precedence_and_stale_memory_preserve_the_runtime_owner() {
         let original = history_config(None);
         let mut config = original.config().clone();
-        let models = &mut config.providers["test"].common.models;
+        let ProviderSettings::Compatible(provider) = &mut config.providers["test"].settings else {
+            panic!("compatible fixture");
+        };
+        let models = &mut provider.models;
         let mut second = models["test"].clone();
         second.profile.model = "second-fixture".parse().unwrap();
         models.insert("another".parse().unwrap(), second);
@@ -337,9 +341,11 @@ mod tests {
         // newly admitted generation, even while an earlier selection is alive.
         let old = select_model(&original, None, None).unwrap();
         let mut reloaded = original.config().clone();
-        reloaded.providers["test"].common.models["test"]
-            .profile
-            .model = "reloaded-fixture".parse().unwrap();
+        let ProviderSettings::Compatible(provider) = &mut reloaded.providers["test"].settings
+        else {
+            panic!("compatible fixture");
+        };
+        provider.models["test"].profile.model = "reloaded-fixture".parse().unwrap();
         let reloaded = reloaded.into_runtime().unwrap();
         let rebound = select_model(&reloaded, None, Some(&old.name())).unwrap();
         assert_eq!(old.profile().model.as_str(), "fixture");
@@ -364,7 +370,11 @@ mod tests {
         drop(session);
 
         let mut reloaded = config.config().clone();
-        let models = &mut reloaded.providers["test"].common.models;
+        let ProviderSettings::Compatible(provider) = &mut reloaded.providers["test"].settings
+        else {
+            panic!("compatible fixture");
+        };
+        let models = &mut provider.models;
         let profile = models.shift_remove("test").unwrap();
         models.insert("replacement".parse().unwrap(), profile);
         let launch = launch(root.path(), &reloaded.into_runtime().unwrap()).await;
