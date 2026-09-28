@@ -110,9 +110,13 @@ impl Token {
     }
 }
 
+/// Recall that started from an empty draft; editing the recalled text ends it.
 struct HistoryBrowse {
     index: usize,
+    /// Empty, but its undo history comes back with it.
     draft: Composer,
+    /// The composer revision the recalled entry was set at.
+    revision: u64,
 }
 
 /// A draft becomes a session with its first submission or script; the draft's

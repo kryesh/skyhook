@@ -316,6 +316,14 @@ pub(super) fn draw_tree(
     let stats = AgentStatsColumns::new(&agent_stats);
     let row_width = width.saturating_sub(4);
     let columns = AgentColumns::new(agents, row_width, stats);
+    let track = r(width - 1, tree_y + 1, 1, tree_rows);
+    scroll_thumb(
+        frame,
+        track,
+        app.tree_scroll,
+        tree_agents.len(),
+        THEME.panel,
+    );
     let rows = tree_agents.iter().enumerate();
     for (index, &agent_index) in rows.skip(app.tree_scroll).take(tree_rows as usize) {
         let agent = &app.projection.agents[agent_index];

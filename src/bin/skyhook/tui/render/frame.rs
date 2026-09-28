@@ -4,6 +4,11 @@ use super::*;
 use crate::tui::{composer::ComposerLayout, keys::Command};
 use skyhook::agent::AgentActivity;
 
+/// One input row between the composer's padding rows.
+const EMPTY_COMPOSER_HEIGHT: u16 = 3;
+/// The composer may grow this tall even where that exceeds half the body.
+const MIN_COMPOSER_LIMIT: u16 = 7;
+
 /// Contextual labels for typed commands, rendered only when they are bound.
 fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
     let mut hints = Vec::new();
@@ -97,12 +102,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     app.editor.set_width(editor_width);
     let editor_layout = app.editor.layout(editor_width);
     let viewing_child = !app.selected.path().is_empty();
-    let editor_height =
-        (editor_layout.rows.len() as u16 + 2 + u16::from(!app.editor.attachments().is_empty()))
-            .clamp(3, 7)
-            .min(height.saturating_sub(footer_height + 3).max(3));
     let notice = notice(app, prompt_shown);
     let notice_height = u16::from(notice.is_some());
+    // The draft grows to at most half the rows between the header and footer.
+    let editor_limit = (height.saturating_sub(2 + footer_height + notice_height) / 2)
+        .max(MIN_COMPOSER_LIMIT)
+        .min(height.saturating_sub(footer_height + 3))
+        .max(EMPTY_COMPOSER_HEIGHT);
+    let editor_height =
+        (editor_layout.rows.len() as u16 + 2 + u16::from(!app.editor.attachments().is_empty()))
+            .clamp(EMPTY_COMPOSER_HEIGHT, editor_limit);
     let prompt_layout = prompt_shown.then(|| PromptLayout::new(app, width));
     let composer_height = if let Some(layout) = &prompt_layout {
         layout
@@ -116,10 +125,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     };
     let tree_agents: Vec<_> = app.projection.visible(&app.selected).collect();
     let composer_y = height.saturating_sub(footer_height + composer_height);
+    // A child's tree takes the hidden composer's empty height, whatever the draft's length.
     let tree_capacity = composer_y.saturating_sub(3 + notice_height).min(
         (height / 4).clamp(4, 10)
             + if viewing_child && !prompt_shown {
-                editor_height
+                EMPTY_COMPOSER_HEIGHT
             } else {
                 0
             },
@@ -378,22 +388,14 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
 /// width the tail link takes from the notice row.
 fn draw_scrollbar(frame: &mut Frame, app: &mut App) -> u16 {
     let content = app.content_rect;
-    let height = content.height as usize;
-    if app.render.rows.len() <= height || height == 0 {
+    let total = app.render.rows.len();
+    if total <= content.height as usize || content.height == 0 {
         return 0;
     }
-    let max = app.render.rows.len() - height;
-    let view = app.view();
-    let scroll = view.scroll.unwrap_or(max);
-    let thumb = content.y + (scroll as u64 * (height as u64 - 1) / max as u64) as u16;
-    text(
-        frame,
-        r(content.width - 1, thumb, 1, 1),
-        "▐",
-        THEME.muted,
-        THEME.base,
-    );
-    if view.scroll.is_none() {
+    let scroll = app.view().scroll;
+    let track = r(content.width - 1, content.y, 1, content.height);
+    scroll_thumb(frame, track, scroll.unwrap_or(total), total, THEME.base);
+    if scroll.is_none() {
         return 0;
     }
     let width = 17.min(content.width.saturating_sub(2));
@@ -430,6 +432,8 @@ fn draw_composer(frame: &mut Frame, app: &mut App, layout: &ComposerLayout) {
         let y = rect.y + 1 + i as u16;
         text(frame, r(2, y, text_width, 1), line, THEME.fg, THEME.input);
     }
+    let track = r(rect.width - 1, rect.y + 1, 1, visible as u16);
+    scroll_thumb(frame, track, top, layout.rows.len(), THEME.input);
     let attachments = app.editor.attachments();
     if !attachments.is_empty() {
         let names = attachments.iter().map(|attachment| {
@@ -829,6 +833,28 @@ mod tests {
             })
             .await;
         }
+    }
+
+    #[tokio::test]
+    async fn composer_grows_to_half_the_body_without_shaping_a_childs_tree() {
+        let (_root, mut app) = fixture().await;
+        let mut children = Vec::new();
+        for index in 1..=20 {
+            children.push(crate::tui::app::tests::push_child(&mut app, index).await);
+        }
+        app.editor.set("line\n".repeat(40));
+        let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let body = app.content_rect.height + app.tree_rect.height + app.composer_rect.height;
+        assert!(app.composer_rect.height > MIN_COMPOSER_LIMIT);
+        assert!(app.composer_rect.height <= body / 2);
+
+        app.selected = children[0].clone();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let tree = app.tree_rect;
+        app.editor.clear();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.tree_rect, tree);
     }
 
     #[tokio::test]

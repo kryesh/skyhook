@@ -247,13 +247,6 @@ impl Composer {
         }
         self.width = width;
     }
-    pub fn is_first_visual_row(&self) -> bool {
-        self.layout(self.width).cursor.0 == 0
-    }
-    pub fn is_last_visual_row(&self) -> bool {
-        let layout = self.layout(self.width);
-        layout.cursor.0 + 1 == layout.rows.len()
-    }
     pub fn expanded_text(&self) -> String {
         self.expand(0..self.text.len())
     }
@@ -390,13 +383,26 @@ impl Composer {
         self.text.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
-    pub fn insert_paste(&mut self, content: String) -> EditOutcome {
+    /// Insert `content` as an inline item. Pasting the same content again right
+    /// after its item expands that item into editable text instead.
+    pub fn insert_paste(&mut self, mut content: String) -> EditOutcome {
         if content.is_empty() {
             return EditOutcome::Handled;
         }
         self.normalize();
         self.save();
-        self.delete_selection();
+        if !self.delete_selection()
+            && let Some(offset) = self.cursor.checked_sub(OBJECT.len())
+            && self
+                .pastes
+                .get(&offset)
+                .is_some_and(|p| p.content == content)
+        {
+            self.delete_range(offset..self.cursor);
+            self.insert_raw(&content);
+            content.zeroize();
+            return EditOutcome::Changed;
+        }
         let offset = self.cursor;
         self.insert_raw(OBJECT);
         let id = self.next_id;
@@ -631,6 +637,30 @@ mod tests {
     }
 
     #[test]
+    fn pasting_the_same_content_after_its_item_expands_it() {
+        let mut editor = plain("a");
+        editor.insert_paste("long".into());
+        editor.insert_paste("other".into());
+        assert_eq!(editor.pastes().count(), 2);
+        editor.insert_paste("other".into());
+        assert_eq!(editor.text, format!("a{OBJECT}other"));
+        assert_eq!(editor.pastes().collect::<Vec<_>>(), [(1, "long")]);
+        assert_eq!(editor.cursor, editor.text.len());
+        undo(&mut editor);
+        assert_eq!(editor.pastes().count(), 2);
+    }
+
+    #[test]
+    fn home_and_end_move_by_line_and_with_ctrl_by_draft() {
+        let mut editor = plain("ab\ncd\nef");
+        editor.set_cursor(4);
+        step(&mut editor, KeyCode::Home, M::NONE, 3);
+        step(&mut editor, KeyCode::End, M::NONE, 5);
+        step(&mut editor, KeyCode::Home, M::CONTROL, 0);
+        step(&mut editor, KeyCode::End, M::CONTROL, 8);
+    }
+
+    #[test]
     fn paste_cursor_word_movement_and_deletion_are_atomic() {
         let mut editor = plain("L");
         editor.insert_paste("not individually editable".into());
@@ -752,12 +782,10 @@ mod tests {
         let mut editor = plain("abcdef\nx\nabcdef");
         editor.set_width(20);
         editor.set_selection(editor.anchor(), 5);
-        assert!(editor.is_first_visual_row());
         key(&mut editor, KeyCode::Down, M::NONE);
         assert_eq!(editor.layout(20).cursor, (1, 1));
         key(&mut editor, KeyCode::Down, M::SHIFT);
         assert_eq!(editor.layout(20).cursor, (2, 5));
-        assert!(editor.is_last_visual_row());
         assert_eq!(editor.selected_text().as_deref(), Some("\nabcde"));
         key(&mut editor, KeyCode::Up, M::NONE);
         step(&mut editor, KeyCode::Up, M::NONE, 5);
@@ -767,7 +795,6 @@ mod tests {
         editor.set_selection(editor.anchor(), "界".len());
         key(&mut editor, KeyCode::Down, M::NONE);
         assert_eq!(editor.layout(8).cursor, (1, 2));
-        assert!(!editor.is_first_visual_row());
         step(&mut editor, KeyCode::Up, M::NONE, "界".len());
     }
 

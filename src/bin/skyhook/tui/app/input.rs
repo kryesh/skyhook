@@ -279,11 +279,10 @@ impl App {
                         self.submit(submission);
                     }
                 }
-                KeyCode::Up if key.modifiers.is_empty() && self.editor.is_first_visual_row() => {
-                    self.prompt_history(false)
-                }
-                KeyCode::Down if key.modifiers.is_empty() && self.editor.is_last_visual_row() => {
-                    self.prompt_history(true)
+                KeyCode::Up | KeyCode::Down
+                    if key.modifiers.is_empty() && self.browses_history() =>
+                {
+                    self.prompt_history(key.code == KeyCode::Down)
                 }
                 KeyCode::Char('/') if self.editor.text().is_empty() => {
                     self.command(Command::Commands)
@@ -463,36 +462,35 @@ impl App {
             let _ = tx.send(Work::Interrupted { count });
         });
     }
-    pub(super) fn prompt_history(&mut self, forward: bool) {
+    /// Whether Up/Down recall prompts rather than move within the draft.
+    fn browses_history(&mut self) -> bool {
+        let revision = self.editor.revision();
+        self.history_browse
+            .take_if(|browse| browse.revision != revision);
+        self.history_browse.is_some() || self.editor.is_empty()
+    }
+    fn prompt_history(&mut self, forward: bool) {
         if self.history.is_empty() {
             return;
         }
         let n = self.history.len();
-        match self.history_browse.as_mut() {
+        let (index, draft) = match self.history_browse.take() {
             None if forward => return,
-            None => {
-                self.history_browse = Some(HistoryBrowse {
-                    index: n - 1,
-                    draft: std::mem::take(&mut self.editor),
-                });
-            }
-            Some(browse) => {
-                browse.index = if forward {
-                    browse.index.saturating_add(1)
-                } else {
-                    browse.index.saturating_sub(1)
-                };
-            }
+            None => (n - 1, std::mem::take(&mut self.editor)),
+            Some(browse) if forward => (browse.index + 1, browse.draft),
+            Some(browse) => (browse.index.saturating_sub(1), browse.draft),
+        };
+        if index >= n {
+            self.editor = draft;
+            return;
         }
-        let browse = self
-            .history_browse
-            .as_ref()
-            .expect("history browse started");
-        if browse.index >= n {
-            self.editor = self.history_browse.take().unwrap().draft;
-        } else {
-            self.editor.set(self.history[browse.index].clone());
-        }
+        self.editor.set(self.history[index].clone());
+        let revision = self.editor.revision();
+        self.history_browse = Some(HistoryBrowse {
+            index,
+            draft,
+            revision,
+        });
     }
 }
 
@@ -502,7 +500,7 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn composer_pastes_submit_in_place_and_restore_history_drafts() {
+    async fn composer_pastes_submit_in_place() {
         let (_root, mut app) = draft_fixture().await;
         // Keep the submitted message queued without starting a provider/session.
         let (path, model, mode) = ("pending.js".into(), app.model.clone(), app.mode.clone());
@@ -520,17 +518,6 @@ mod tests {
         app.copy();
         assert_eq!(app.clipboard.as_deref(), Some(expected.as_str()));
         app.editor.set_selection(None, app.editor.cursor());
-
-        let original_allocation = app.editor.text().as_ptr();
-        app.history.push("older prompt".into());
-        app.prompt_history(false);
-        assert_eq!(app.editor.expanded_text(), "older prompt");
-        app.prompt_history(true);
-        assert_eq!(app.editor.expanded_text(), expected);
-        assert_eq!(app.editor.pastes().count(), 2);
-        assert_eq!(app.editor.text().as_ptr(), original_allocation);
-        assert!(app.history_browse.is_none());
-
         key(&mut app, KeyCode::Enter, M::NONE);
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.queue[0].submission.text, expected);
@@ -562,20 +549,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn composer_wraps_words_and_vertical_arrows_do_not_skip_to_history() {
+    async fn arrows_recall_history_only_from_an_empty_draft() {
         let (_root, mut app) = draft_fixture().await;
         app.history.push("older prompt".into());
+        app.history.push("newer\nprompt".into());
         app.editor.insert(&format!("{}ending", "word ".repeat(16)));
         let expected = app.editor.expanded_text();
         assert!(draw(&mut app).contains("word word word"));
-        assert!(!app.editor.is_first_visual_row());
         let cursor = app.editor.cursor();
         key(&mut app, KeyCode::Up, M::NONE);
-        assert_eq!(app.editor.expanded_text(), expected);
-        assert!(app.editor.cursor() < cursor && app.history_browse.is_none());
+        assert!(app.editor.cursor() < cursor);
         app.editor.set_cursor(0);
         key(&mut app, KeyCode::Up, M::NONE);
-        assert_eq!(app.editor.expanded_text(), "older prompt");
+        assert_eq!(app.editor.expanded_text(), expected);
+
+        key(&mut app, KeyCode::Char('c'), M::CONTROL);
+        // A multi-line recalled prompt keeps stepping through history.
+        for (code, text) in [
+            (KeyCode::Up, "newer\nprompt"),
+            (KeyCode::Up, "older prompt"),
+            (KeyCode::Down, "newer\nprompt"),
+            (KeyCode::Down, ""),
+        ] {
+            key(&mut app, code, M::NONE);
+            assert_eq!(app.editor.expanded_text(), text);
+        }
+        // Leaving history restores the draft's undo history.
+        key(&mut app, KeyCode::Char('z'), M::CONTROL);
+        assert_eq!(app.editor.expanded_text(), expected);
+        key(&mut app, KeyCode::Char('c'), M::CONTROL);
+        key(&mut app, KeyCode::Up, M::NONE);
+        // Editing the recalled prompt makes it a draft the arrows move within.
+        app.editor.insert("!");
+        key(&mut app, KeyCode::Up, M::NONE);
+        assert_eq!(app.editor.expanded_text(), "newer\nprompt!");
+        assert_eq!(app.editor.cursor(), "newer".len());
     }
 
     #[tokio::test]

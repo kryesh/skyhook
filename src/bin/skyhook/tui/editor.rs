@@ -92,8 +92,10 @@ impl Edit {
             KeyCode::Left => Motion::Previous,
             KeyCode::Right if word => Motion::WordForward,
             KeyCode::Right => Motion::Next,
-            KeyCode::Home => Motion::Start,
-            KeyCode::End => Motion::End,
+            KeyCode::Home if ctrl => Motion::Start,
+            KeyCode::End if ctrl => Motion::End,
+            KeyCode::Home => Motion::LineStart,
+            KeyCode::End => Motion::LineEnd,
             KeyCode::Up => Motion::Up,
             KeyCode::Down => Motion::Down,
             KeyCode::Char('a') if ctrl => Motion::LineStart,
@@ -102,8 +104,13 @@ impl Edit {
             KeyCode::Char('b') if ctrl => Motion::Previous,
             KeyCode::Char('f') if alt => Motion::WordForward,
             KeyCode::Char('f') if ctrl => Motion::Next,
-            KeyCode::Char('-') if ctrl => return Some(Self::Undo),
-            KeyCode::Char('.') if ctrl => return Some(Self::Redo),
+            // Legacy terminals send Ctrl+Shift+Z as Ctrl+Z, so only some can redo with it.
+            KeyCode::Char('z') if ctrl && key.modifiers.contains(M::SHIFT) => {
+                return Some(Self::Redo);
+            }
+            KeyCode::Char('Z') if ctrl => return Some(Self::Redo),
+            KeyCode::Char('-' | 'z') if ctrl => return Some(Self::Undo),
+            KeyCode::Char('.' | 'y') if ctrl => return Some(Self::Redo),
             KeyCode::Char('u') if ctrl => return Some(Self::DeleteLine { forward: false }),
             KeyCode::Char('k') if ctrl => return Some(Self::DeleteLine { forward: true }),
             KeyCode::Backspace if word => return Some(Self::Delete(Motion::WordBack)),
@@ -415,6 +422,23 @@ mod tests {
 
     fn undo(editor: &mut Editor) {
         press(editor, KeyCode::Char('-'), M::CONTROL);
+    }
+
+    #[test]
+    fn undo_and_redo_accept_the_common_bindings() {
+        let parse = |c, modifiers| Edit::parse(KeyEvent::new(KeyCode::Char(c), modifiers));
+        for (c, modifiers) in [('z', M::CONTROL), ('-', M::CONTROL)] {
+            assert_eq!(parse(c, modifiers), Some(Edit::Undo));
+        }
+        let shift = M::CONTROL | M::SHIFT;
+        for (c, modifiers) in [
+            ('y', M::CONTROL),
+            ('.', M::CONTROL),
+            ('z', shift),
+            ('Z', shift),
+        ] {
+            assert_eq!(parse(c, modifiers), Some(Edit::Redo));
+        }
     }
 
     #[test]

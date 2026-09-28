@@ -149,9 +149,12 @@ agents and inspector tabs. Click the conversation, or pick an agent with `Ctrl+X
 Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`; Enter or Tab activates
 the selected item. The Agents
 palette labels its Output, Input (uncached), and Context statistics. The composer
-wraps at word boundaries and supports word movement, selection, `Ctrl+A/E`, `Ctrl+W`,
-`Ctrl+U/K`, and undo/redo with `Ctrl+-` / `Ctrl+.`. Up/Down moves through displayed input
-rows, reaching prompt history only from the first/last row.
+wraps at word boundaries and grows with its draft up to half the space between the top and
+bottom bars, then scrolls to follow the cursor. It supports word movement, selection, `Ctrl+A/E`,
+`Ctrl+W`, `Ctrl+U/K`, undo with `Ctrl+Z` or `Ctrl+-`, and redo with `Ctrl+Y`, `Ctrl+Shift+Z` or
+`Ctrl+.`. `Home`/`End` move to the start/end of the line, and `Ctrl+Home`/`Ctrl+End` to the
+start/end of the draft. Up/Down move through displayed input rows; in an empty composer they
+recall earlier prompts, and keep stepping through them until the recalled prompt is edited.
 Click agent and tool rows, scroll the relevant panel, or drag across text in user/agent messages
 and tool output, then copy the selected characters with `Ctrl+X Y` (or `y` while content is focused).
 Selection supports parts of a line and multiple lines; copying preserves Unicode and code indentation
@@ -166,7 +169,8 @@ repository or not), `.ignore` files, and Git's global and repository excludes. I
 `target` and `node_modules` directories, and does not follow symbolic links.
 Attachments are listed below the composer, and attached text is sent after the message. Pastes longer than 12 lines appear as inline items at the cursor. Type
 before, between, or after multiple paste items; move across, select, delete, and undo them as
-single editing units. Sending or copying expands their original contents in place. Shorter pastes
+single editing units; pasting the same text again right after its item expands it into editable
+text. Sending or copying expands their original contents in place. Shorter pastes
 remain ordinary editable text. Use `/attachments` to inspect or remove pasted items and attachments.
 Questions and permissions open even while inspecting the agent tree or
 conversation; open menus and search keep input focus until closed. `Esc` dismisses foreground

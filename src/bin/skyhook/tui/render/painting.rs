@@ -58,6 +58,21 @@ pub(super) fn text(
         Style::default().fg(fg).bg(bg),
     );
 }
+/// Mark the part of `total` rows a `track` shows from row `top`, sized to the
+/// share in view; nothing when every row fits.
+pub(super) fn scroll_thumb(frame: &mut Frame, track: Rect, top: usize, total: usize, bg: Color) {
+    let visible = track.height as usize;
+    if total <= visible || visible == 0 {
+        return;
+    }
+    let length = (visible * visible / total).max(1);
+    let overflow = total - visible;
+    let start = top.min(overflow) * (visible - length) / overflow;
+    for y in start..start + length {
+        let cell = r(track.x, track.y + y as u16, 1, 1);
+        text(frame, cell, "▐", THEME.muted, bg);
+    }
+}
 pub(super) fn r(x: u16, y: u16, width: u16, height: u16) -> Rect {
     Rect::new(x, y, width, height)
 }
@@ -442,6 +457,24 @@ mod tests {
             "↓ Latest activity"
         );
         assert!(cells.clone().all(|cell| cell.modifier.is_empty()));
+    }
+
+    #[test]
+    fn scroll_thumb_shows_the_share_and_position_in_view() {
+        let thumb = |top, total| {
+            let backend = ratatui::backend::TestBackend::new(1, 4);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            let frame = terminal
+                .draw(|frame| scroll_thumb(frame, r(0, 0, 1, 4), top, total, THEME.base))
+                .unwrap();
+            let cells = frame.buffer.content.iter();
+            cells.map(|cell| cell.symbol()).collect::<String>()
+        };
+        assert_eq!(thumb(0, 4), "    ");
+        assert_eq!(thumb(0, 8), "▐▐  ");
+        assert_eq!(thumb(4, 8), "  ▐▐");
+        assert_eq!(thumb(3, 100), "▐   ", "a long overflow keeps one cell");
+        assert_eq!(thumb(96, 100), "   ▐");
     }
 
     #[test]
