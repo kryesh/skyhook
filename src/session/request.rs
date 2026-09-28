@@ -257,8 +257,8 @@ pub(super) fn validate(
         }
         last = *sequence;
     }
-    // References preserve whole messages, but a checkpoint must also preserve the
-    // original assistant call and its complete run of per-call results.
+    // References preserve whole messages and every existing result of a retained
+    // exchange. Only the original trailing exchange may still be awaiting results.
     let originals: Vec<_> = preceding()
         .filter(|source| {
             source.agent == record.agent
@@ -298,20 +298,30 @@ pub(super) fn validate(
         let results: Vec<_> = (assistant + 1..originals.len())
             .take_while(|&index| matches!(message(index), Message::Tool(_)))
             .collect();
-        if !retained(assistant) || results.is_empty() || !results.iter().all(|&i| retained(i)) {
+        if !retained(assistant) || !results.iter().all(|&i| retained(i)) {
             return Err(invalid(CheckpointError::IncompleteExchange));
         }
+        let trailing = assistant + 1 + results.len() == originals.len();
         let tools: Vec<_> = results.into_iter().map(message).collect();
-        if !valid_tool_pair(message(assistant), &tools) {
-            return Err(invalid(CheckpointError::MismatchedExchange));
+        match tool_exchange(message(assistant), &tools) {
+            None => return Err(invalid(CheckpointError::MismatchedExchange)),
+            Some(ToolExchange::Pending) if !trailing => {
+                return Err(invalid(CheckpointError::IncompleteExchange));
+            }
+            Some(_) => {}
         }
     }
     Ok(())
 }
 
-fn valid_tool_pair(assistant: &Message, tools: &[&Message]) -> bool {
+enum ToolExchange {
+    Complete,
+    Pending,
+}
+
+fn tool_exchange(assistant: &Message, tools: &[&Message]) -> Option<ToolExchange> {
     let Message::Assistant(content) = assistant else {
-        return false;
+        return None;
     };
     let calls: Vec<_> = content
         .iter()
@@ -326,12 +336,22 @@ fn valid_tool_pair(assistant: &Message, tools: &[&Message]) -> bool {
         })
         .map(|result| (result.call_id.as_str(), result.name.as_str()))
         .collect();
-    let call_set: std::collections::HashSet<_> = calls.iter().copied().collect();
-    let result_set: std::collections::HashSet<_> = results.iter().copied().collect();
-    !calls.is_empty()
-        && calls.len() == call_set.len()
-        && results.len() == result_set.len()
-        && call_set == result_set
+    let call_map: std::collections::HashMap<_, _> = calls.iter().copied().collect();
+    let result_map: std::collections::HashMap<_, _> = results.iter().copied().collect();
+    if calls.is_empty()
+        || calls.len() != call_map.len()
+        || results.len() != result_map.len()
+        || !result_map
+            .iter()
+            .all(|(id, name)| call_map.get(id) == Some(name))
+    {
+        return None;
+    }
+    Some(if call_map == result_map {
+        ToolExchange::Complete
+    } else {
+        ToolExchange::Pending
+    })
 }
 
 /// Why a `ModelRequested` record cannot be replayed.
@@ -903,6 +923,7 @@ mod tests {
             (RetainedOrder, invalid(messages(&[first, calls]))),
             (RetainedOrder, invalid(messages(&[agent_context]))),
             (IncompleteExchange, invalid(messages(&[calls]))),
+            (IncompleteExchange, invalid(messages(&[calls, first]))),
             (IncompleteExchange, invalid(messages(&[first, second]))),
             (SummaryRequest, checkpoint(summary, vec![], summary)),
             (
@@ -954,6 +975,91 @@ mod tests {
             sequences(&projected),
             [installed, calls, first, second].map(RecordSeq::get)
         );
+    }
+
+    #[test]
+    fn checkpoints_admit_a_trailing_open_exchange_but_not_partial_retention() {
+        let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
+        let call = |id: &str, position| {
+            AssistantItem::tool_call(id, position, ToolCall::new(id, "exec", json!({})).unwrap())
+        };
+        let result = |id: &str| {
+            Message::Tool(vec![ToolResult {
+                call_id: id.into(),
+                name: "exec".into(),
+                result: json!({}),
+                images: vec![],
+                is_error: false,
+            }])
+        };
+        use CheckpointError::{IncompleteExchange, MismatchedExchange};
+        for (results, trailing, retained, expected) in [
+            (vec![], true, vec![1], None),
+            (vec!["b"], true, vec![1, 2], None),
+            (vec!["b", "a"], true, vec![1, 2, 3], None),
+            (vec![], false, vec![1], Some(IncompleteExchange)),
+            (vec!["b"], false, vec![1, 2], Some(IncompleteExchange)),
+            (vec!["b"], true, vec![1], Some(IncompleteExchange)),
+            (vec!["b"], true, vec![2], Some(IncompleteExchange)),
+            (vec!["b", "a"], true, vec![1, 2], Some(IncompleteExchange)),
+            (vec!["unknown"], true, vec![1, 2], Some(MismatchedExchange)),
+            (
+                vec!["b", "b"],
+                true,
+                vec![1, 2, 3],
+                Some(MismatchedExchange),
+            ),
+        ] {
+            let mut events = vec![committed(Message::Assistant(vec![
+                call("a", 0),
+                call("b", 1),
+            ]))];
+            events.extend(results.iter().map(|id| committed(result(id))));
+            if !trailing {
+                events.push(committed(text_message("later input")));
+            }
+            let frontier = RecordSeq::from(events.len() as u64);
+            let context_sequence = frontier.next();
+            events.push(context(ModelPurpose::Compaction, "p", "m", "s"));
+            let summary = context_sequence.next();
+            events.push(requested(
+                context_sequence,
+                None,
+                &[],
+                "sum",
+                HistoryLifetime::Detached,
+            ));
+            events.push(SessionEvent::Compaction {
+                checkpoint: CompactionCheckpoint {
+                    frontier,
+                    message: text_message("summary"),
+                    todos: Vec::new(),
+                    retained: retained.into_iter().map(MessageSeq::from).collect(),
+                    attempt: AttemptRef {
+                        request: summary.request(),
+                        attempt: 1,
+                    },
+                    before_tokens: 100,
+                    after_tokens: 10,
+                },
+            });
+            let records = events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| {
+                    crate::session::tests::record(&agent, index as u64 + 1, event)
+                })
+                .collect();
+            let admitted = admit_records(records).map(drop);
+            assert!(
+                match expected {
+                    None => admitted.is_ok(),
+                    Some(expected) => matches!(admitted,
+                        Err(SessionError::InvalidCompaction { reason, .. }) if reason == expected),
+                },
+                "{results:?}, trailing={trailing}: {admitted:?}"
+            );
+        }
     }
 
     #[test]

@@ -76,15 +76,8 @@ impl SessionRuntime {
                 let request = agent_context.request(tail.as_ref());
                 let (provider, meter) = (agent_context.provider.as_mut(), &mut agent_context.meter);
                 let snapshot = &agent_context.profile;
-                self.compact_history(
-                    &turn,
-                    provider,
-                    meter,
-                    snapshot,
-                    &request,
-                    profile.max_context.get(),
-                )
-                .await?;
+                self.compact_history(&turn, provider, meter, snapshot, &request, None)
+                    .await?;
                 force_compaction = false;
                 // Consume input received during compaction before starting the
                 // normal request, rather than delaying it by another request.
@@ -311,6 +304,42 @@ impl SessionRuntime {
                     capacity: profile.max_context.get(),
                 },
             });
+            if compact_completed_response {
+                agent_context.refresh(&self.store, agent).await?;
+                let current = agent_context.request(next_tail.as_ref());
+                let compacted = async {
+                    let (provider, meter) =
+                        (agent_context.provider.as_mut(), &mut agent_context.meter);
+                    let snapshot = &agent_context.profile;
+                    self.compact_history(&turn, provider, meter, snapshot, &current, Some(usage))
+                        .await?;
+                    agent_context.refresh(&self.store, agent).await?;
+                    // Persistence can finish after interruption, before any call has
+                    // a job for the interrupt path to cancel.
+                    if cancellation.is_cancelled() {
+                        return Err(HarnessError::Interrupted);
+                    }
+                    Ok(())
+                }
+                .await;
+                if let Err(error) = &compacted
+                    && !calls.is_empty()
+                {
+                    // The response is durable, but none of its calls ran. Close the
+                    // exchange so a later request never sends unanswered calls.
+                    let error = format!("not executed: the turn ended during compaction: {error}");
+                    let results = calls
+                        .iter()
+                        .map(|call| {
+                            let (id, name) = (call.id().to_owned(), call.name().to_owned());
+                            dispatch::unrun_tool_result(id, name, error.clone())
+                        })
+                        .collect();
+                    self.commit(agent, Message::Tool(results)).await?;
+                }
+                compacted?;
+                context_sequence = None;
+            }
             if !calls.is_empty() {
                 self.activity(agent, AgentActivity::Tools);
                 // Every call's job exists, in call order, before any runs: a `wait`
@@ -351,28 +380,6 @@ impl SessionRuntime {
                     }
                 }
                 committed?;
-            }
-            if compact_completed_response {
-                // The tool exchange is closed first: checkpoints retain whole exchanges.
-                agent_context.refresh(&self.store, agent).await?;
-                let current = agent_context.request(next_tail.as_ref());
-                let (provider, meter) = (agent_context.provider.as_mut(), &mut agent_context.meter);
-                let snapshot = &agent_context.profile;
-                let installed = self
-                    .compact_history(
-                        &turn,
-                        provider,
-                        meter,
-                        snapshot,
-                        &current,
-                        profile.max_context.get(),
-                    )
-                    .await?;
-                if !installed {
-                    agent_context.compaction_skipped(usage);
-                }
-                agent_context.refresh(&self.store, agent).await?;
-                context_sequence = None;
             }
             provider_attempt = 0;
             context_failures = 0;
@@ -737,9 +744,9 @@ mod tests {
         events
     }
 
-    // Exactly 80% of the harness's 128,000-token context. Each component is
+    // First whole token at 90% of (128,000 - 16,384). Each component is
     // necessary: neither input alone nor input plus cache reaches the threshold.
-    const THRESHOLD: (u64, u64, u64) = (80_000, 20_000, 2_400);
+    const THRESHOLD: (u64, u64, u64) = (80_000, 20_000, 455);
 
     fn threshold_usage() -> Usage {
         usage(THRESHOLD.0, THRESHOLD.1, THRESHOLD.2)
@@ -776,35 +783,48 @@ mod tests {
         response(vec![tool_call(0, "append-once", "exec", arguments)])
     }
 
-    async fn session_with_max_output(
-        max_output: u64,
-        responses: impl IntoIterator<Item = Vec<ResponseEvent>>,
-    ) -> (tempfile::TempDir, Requests, SessionHandle) {
+    #[tokio::test]
+    async fn high_usage_tool_response_compacts_before_tools_and_delivers_results_to_next_request() {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
-        let provider = scripted_provider(&requests, responses);
-        let profile = ModelProfile {
-            max_output: crate::tests::limit(max_output),
-            ..crate::tests::profile("test", false)
-        };
-        let harness = serving(root.path(), provider, [("test", profile)])
-            .build()
-            .await
-            .unwrap();
-        (root, requests, harness.new_session().await.unwrap())
-    }
-
-    #[tokio::test]
-    async fn high_usage_tool_response_closes_exchange_before_summary_and_next_normal_request() {
-        let (root, requests, session) = scripted_session([
-            with_usage(shell_response(), &[threshold_usage()]),
-            answer(summary_json().to_string()),
-            answer("original final"),
-        ])
-        .await;
+        let script = Script::new(
+            [
+                // The summary carries the triggering response as read-only evidence.
+                // Its input and output leave 1,000 tokens of the context available.
+                Step::new(with_usage(
+                    shell_response(),
+                    &[usage(100_000, 20_000, 7_000)],
+                )),
+                Step::new(answer(summary_json().to_string())).gated(),
+                Step::new(answer("original final")),
+            ],
+            &requests,
+        );
+        let harness =
+            test_harness(root.path(), &root.path().join("sessions"), script.clone()).await;
+        let session = harness.new_session().await.unwrap();
         // Enough old material to remove, but nowhere near the automatic threshold.
         seed_history(&session, 6_000).await;
-        let found = session.prompt("Run the tool.").await.unwrap();
+        let (found, ()) = bounded(async {
+            tokio::join!(session.prompt("Run the tool."), async {
+                script.request(1).await;
+                let records = session.runtime.store.records().await;
+                assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
+                assert_eq!(
+                    count!(
+                        &records,
+                        SessionEvent::MessageCommitted {
+                            message: Message::Tool(_)
+                        }
+                    ),
+                    0
+                );
+                assert!(!root.path().join("executions").exists());
+                script.release(1);
+            })
+        })
+        .await;
+        let found = found.unwrap();
         assert_eq!(found, "original final");
         let executions = fs::read_to_string(root.path().join("executions")).await;
         // compaction must not re-execute the tool
@@ -839,25 +859,216 @@ mod tests {
         let next = records
             .iter()
             .rposition(|record| purpose(&records, record) == Some(Agent));
-        assert!(tool < summary && summary < checkpoint && checkpoint < next.unwrap());
+        assert!(summary < checkpoint && checkpoint < tool && tool < next.unwrap());
         {
             let captured = requests.lock().unwrap();
             assert_eq!(captured.len(), 3);
             assert!(captured[0].response_schema.is_none());
             assert!(captured[1].response_schema.is_some());
             assert!(captured[1].tools.is_empty());
+            assert_eq!(
+                captured[1].max_output_tokens,
+                std::num::NonZeroU64::new(1_000)
+            );
+            assert_eq!(
+                captured[0].max_output_tokens,
+                std::num::NonZeroU64::new(16_384)
+            );
+            assert_eq!(captured[2].max_output_tokens, captured[0].max_output_tokens);
             assert!(captured[2].response_schema.is_none());
             assert_eq!(captured[0].tools, captured[2].tools);
             let sent_tool_message = tool_message.render();
-            for request in [&captured[1], &captured[2]] {
-                let index = request
+            assert!(
+                !captured[1]
                     .messages()
-                    .position(|message| message == &sent_tool_message)
-                    .expect("summary and continuation retain the actual tool result");
-                assert!(matches!(&request.history[index - 1], Sent::Assistant(items)
-                if items.iter().filter_map(|item| item.call()).any(|call| call.id() == "append-once")));
+                    .any(|message| message == &sent_tool_message)
+            );
+            assert!(!captured[1].messages().any(|message| matches!(message, Sent::Assistant(items)
+                if items.iter().filter_map(|item| item.call()).any(|call| call.id() == "append-once"))));
+            let index = captured[2]
+                .messages()
+                .position(|message| message == &sent_tool_message)
+                .expect("the first post-compaction call receives the actual tool result");
+            assert!(
+                matches!(&captured[2].history[index - 1], Sent::Assistant(items)
+                if items.iter().filter_map(|item| item.call()).any(|call| call.id() == "append-once"))
+            );
+            // The persisted summary boundary and the post-compaction call both replay exactly.
+            let requested = records
+                .iter()
+                .filter(|record| matches!(record.event, SessionEvent::ModelRequested { .. }));
+            for (record, sent) in requested.zip(captured.iter()) {
+                let (_, replayed) =
+                    crate::session::reconstruct_model_request(&records, record.sequence.request())
+                        .unwrap();
+                assert_eq!(&replayed, &sent.request);
             }
         }
+        shutdown_session(session).await;
+    }
+
+    /// Only a todo replacement the triggering response issued directly is superseded;
+    /// reads, replacements from its scripts and every other call run after compaction.
+    #[tokio::test]
+    async fn compaction_supersedes_only_direct_pending_todo_replacements() {
+        use crate::agent::TodoStatus;
+
+        let direct = vec![todo("Direct replacement", TodoStatus::Completed)];
+        let scripted = vec![todo("Script replacement", TodoStatus::Pending)];
+        let reconciled = vec![todo("Reconciled task", TodoStatus::InProgress)];
+        let source = format!(
+            "const before = await tool.todo({{}}); await tool.todo({{items:{}}}); return {{before, after: await tool.todo({{}})}};",
+            serde_json::to_string(&scripted).unwrap()
+        );
+        let calls = vec![
+            tool_call(0, "direct-write", "todo", json!({"items": direct})),
+            tool_call(1, "direct-read", "todo", json!({})),
+            tool_call(2, "scripted", "script", json!({"source": source})),
+            tool_call(
+                3,
+                "append-once",
+                "exec",
+                json!({"command": "printf 'executed\\n' >> executions"}),
+            ),
+        ];
+        let mut summary = summary_json();
+        summary["todos"] = json!(reconciled);
+        let (root, requests, session) = scripted_session([
+            with_usage(response(calls), &[threshold_usage()]),
+            answer(summary.to_string()),
+            answer("done"),
+        ])
+        .await;
+        seed_history(&session, 6_000).await;
+        assert_eq!(session.prompt("Continue the task.").await.unwrap(), "done");
+        let records = session.runtime.store.records().await;
+        assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
+        assert_eq!(
+            events!(&records, SessionEvent::TodosReplaced { items } => items.clone()),
+            vec![scripted.clone()]
+        );
+        assert_eq!(
+            fs::read_to_string(root.path().join("executions"))
+                .await
+                .unwrap(),
+            "executed\n"
+        );
+        {
+            let captured = requests.lock().unwrap();
+            let results: Vec<_> = captured[2]
+                .messages()
+                .filter_map(|message| match message {
+                    Sent::Tool(results) => Some(results),
+                    _ => None,
+                })
+                .flatten()
+                .collect();
+            for id in ["direct-write", "direct-read", "scripted", "append-once"] {
+                let result = results.iter().find(|result| result.call_id == id).unwrap();
+                let superseded = id == "direct-write";
+                assert_eq!(result.is_error, superseded, "{id}: {}", result.result);
+                if superseded {
+                    assert!(result.result.to_string().contains("superseded"));
+                }
+            }
+            let script = results
+                .iter()
+                .find(|result| result.call_id == "scripted")
+                .unwrap();
+            let value = &script.result["result"]["value"];
+            assert_eq!(value["before"]["result"]["items"], json!(reconciled));
+            assert_eq!(value["after"]["result"]["items"], json!(scripted));
+        }
+        shutdown_session(session).await;
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_settles_unexecuted_calls_before_a_live_retry() {
+        let (root, requests, session) = scripted_session([
+            with_usage(shell_response(), &[threshold_usage()]),
+            refusal(Vec::new()),
+            answer("retry done"),
+        ])
+        .await;
+        seed_history(&session, 6_000).await;
+        assert!(matches!(
+            session.prompt("Run the tool.").await,
+            Err(HarnessError::Refused(_))
+        ));
+        assert_calls_settled_unexecuted(root.path(), &requests, session, 0).await;
+    }
+
+    #[tokio::test]
+    async fn interruption_during_compaction_persistence_settles_unexecuted_calls() {
+        use crate::session::AppendBoundary;
+
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let script = Script::new(
+            [
+                Step::new(with_usage(shell_response(), &[threshold_usage()])),
+                Step::new(answer(summary_json().to_string())).gated(),
+                Step::new(answer("retry done")),
+            ],
+            &requests,
+        );
+        let harness =
+            test_harness(root.path(), &root.path().join("sessions"), script.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        seed_history(&session, 6_000).await;
+        let (result, ()) = bounded(async {
+            tokio::join!(session.prompt("Run the tool."), async {
+                script.request(1).await;
+                let store = &session.runtime.store;
+                let (usage, resume_usage) = store.pause_append_at(AppendBoundary::Write).await;
+                script.release(1);
+                usage.await.unwrap();
+                // Queue the next gate before releasing usage persistence: it must
+                // catch the checkpoint, after the summary has completed.
+                let persistence = store.pause_append_at(AppendBoundary::Write);
+                tokio::pin!(persistence);
+                assert!(futures_util::poll!(&mut persistence).is_pending());
+                resume_usage.send(()).unwrap();
+                let (persisting, resume) = persistence.await;
+                persisting.await.unwrap();
+                assert_eq!(session.interrupt().await, 1);
+                resume.send(()).unwrap();
+            })
+        })
+        .await;
+        assert!(matches!(result, Err(HarnessError::Interrupted)));
+        assert_calls_settled_unexecuted(root.path(), &requests, session, 1).await;
+    }
+
+    /// The response's call never ran, its exchange is closed with an error result, and
+    /// the next turn sends that result.
+    async fn assert_calls_settled_unexecuted(
+        root: &Path,
+        requests: &Requests,
+        session: SessionHandle,
+        compactions: usize,
+    ) {
+        assert!(!root.join("executions").exists());
+        let records = session.runtime.store.records().await;
+        assert_eq!(
+            count!(&records, SessionEvent::Compaction { .. }),
+            compactions
+        );
+        assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
+        let results = events!(&records, SessionEvent::MessageCommitted { message: Message::Tool(results) } => results.clone());
+        let [results] = results.as_slice() else {
+            panic!("one settled exchange: {results:?}")
+        };
+        assert!(
+            matches!(results.as_slice(), [result] if result.is_error && result.call_id == "append-once")
+        );
+        assert_eq!(session.prompt("Continue.").await.unwrap(), "retry done");
+        let expected = Message::Tool(results.clone()).render();
+        assert!(
+            requests.lock().unwrap()[2]
+                .messages()
+                .any(|message| message == &expected)
+        );
         shutdown_session(session).await;
     }
 
@@ -945,43 +1156,38 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn high_usage_final_response_compacts_before_returning_original_text_regardless_of_max_output()
-     {
-        for max_output in [1, 120_000] {
-            let final_answer = with_usage(answer("original final"), &[threshold_usage()]);
-            let summary = answer(summary_json().to_string());
-            let summary = with_usage(summary, &[usage(1_000_000, 0, 1)]);
-            let (_root, requests, session) =
-                session_with_max_output(max_output, [final_answer, summary]).await;
-            seed_history(&session, 6_000).await;
-            assert_eq!(session.prompt("Finish.").await.unwrap(), "original final");
-            // Live state must already show the reduced context, without further catch-up.
-            let observation = session.runtime.events.observe().snapshot;
-            let records = session.runtime.store.records().await;
-            let found = purposes(&records);
-            assert_eq!(found, vec![ModelPurpose::Agent, ModelPurpose::Compaction]);
-            let checkpoint =
-                events!(&records, SessionEvent::Compaction { checkpoint } => checkpoint);
-            let checkpoint = checkpoint[0];
-            let context = observation.context.get(&session.root).unwrap();
-            assert!(checkpoint.after_tokens < checkpoint.before_tokens);
-            // final-response compaction must refresh live occupancy before returning
-            assert_eq!(context.tokens, checkpoint.after_tokens);
-            assert_eq!(context.capacity, 128_000);
-            {
-                let captured = requests.lock().unwrap();
-                assert_eq!(captured.len(), 2);
-                // The summary's reported prompt size calibrates both sides of the checkpoint.
-                let estimate = super::super::compaction::estimate_request;
-                let scaled = estimate(&captured[0]) * 1_000_000 / estimate(&captured[1]);
-                assert!(checkpoint.before_tokens >= scaled);
-                assert!(captured[0].response_schema.is_none());
-                assert!(captured[1].response_schema.is_some());
-                assert!(captured[1].messages().any(|message| matches!(message,
-                Sent::Assistant(items) if *items == vec![AssistantItem::text("answer", 0, "original final")])));
-            }
-            shutdown_session(session).await;
+    async fn high_usage_final_response_compacts_before_returning_original_text() {
+        let final_answer = with_usage(answer("original final"), &[threshold_usage()]);
+        let summary = answer(summary_json().to_string());
+        let summary = with_usage(summary, &[usage(1_000_000, 0, 1)]);
+        let (_root, requests, session) = scripted_session([final_answer, summary]).await;
+        seed_history(&session, 6_000).await;
+        assert_eq!(session.prompt("Finish.").await.unwrap(), "original final");
+        // Live state must already show the reduced context, without further catch-up.
+        let observation = session.runtime.events.observe().snapshot;
+        let records = session.runtime.store.records().await;
+        let found = purposes(&records);
+        assert_eq!(found, vec![ModelPurpose::Agent, ModelPurpose::Compaction]);
+        let checkpoint = events!(&records, SessionEvent::Compaction { checkpoint } => checkpoint);
+        let checkpoint = checkpoint[0];
+        let context = observation.context.get(&session.root).unwrap();
+        assert!(checkpoint.after_tokens < checkpoint.before_tokens);
+        // final-response compaction must refresh live occupancy before returning
+        assert_eq!(context.tokens, checkpoint.after_tokens);
+        assert_eq!(context.capacity, 128_000);
+        {
+            let captured = requests.lock().unwrap();
+            assert_eq!(captured.len(), 2);
+            // The summary's reported prompt size calibrates both sides of the checkpoint.
+            let estimate = super::super::compaction::estimate_request;
+            let scaled = estimate(&captured[0]) * 1_000_000 / estimate(&captured[1]);
+            assert!(checkpoint.before_tokens >= scaled);
+            assert!(captured[0].response_schema.is_none());
+            assert!(captured[1].response_schema.is_some());
+            assert!(captured[1].messages().any(|message| matches!(message,
+            Sent::Assistant(items) if *items == vec![AssistantItem::text("answer", 0, "original final")])));
         }
+        shutdown_session(session).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -1093,7 +1299,7 @@ mod tests {
             with_usage(shell_response(), &snapshots),
             with_usage(answer("done"), &snapshots),
         ];
-        let (_root, _, session) = session_with_max_output(120_000, responses).await;
+        let (_root, _, session) = scripted_session(responses).await;
         seed_history(&session, 6_000).await;
         assert_eq!(session.prompt("Run then finish.").await.unwrap(), "done");
         let records = session.runtime.store.records().await;

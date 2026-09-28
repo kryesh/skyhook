@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::oneshot;
 
 use crate::{
-    agent::{ModelEntry, Question, TodoItem},
+    agent::{ModelEntry, Question, ReplaceError, TodoItem},
     provider::profile::ModelRef,
     session::UserPart,
     tool::{
@@ -157,9 +157,11 @@ fn register_todo(
                 TodoRequest::Replace(items) => registry::AdmittedInvocation::unit(move |context| async move {
                     let runtime = runtime.ok_or_else(runtime_unavailable)?;
                     let items = admit_todos("items", items)?;
-                    runtime.todos.replace(context.agent(), items).await.map_err(|error| {
-                        harness_error(error.into())
-                            .operation(Operation::Save, Subject::Label(format!("todos for agent {}", context.agent()))).effects(Effects::Unknown)
+                    let issued_by = runtime.jobs.call_origin(context.job()).await;
+                    let subject = Subject::Label(format!("todos for agent {}", context.agent()));
+                    runtime.todos.replace(context.agent(), items, issued_by).await.map_err(|error| match error {
+                        ReplaceError::Superseded => ToolError::failed(error).operation(Operation::Save, subject).effects(Effects::Unchanged),
+                        ReplaceError::Session(error) => harness_error(error.into()).operation(Operation::Save, subject).effects(Effects::Unknown),
                     })
                 }),
                 TodoRequest::Inspect(job) => registry::AdmittedInvocation::new(move |context| async move {

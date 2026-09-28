@@ -71,6 +71,23 @@ pub(crate) struct Continuation {
     pub jobs: Vec<crate::identity::JobId>,
 }
 
+/// Show the triggering response without introducing unanswered native tool calls.
+pub(super) fn pending_response(items: &[AssistantItem]) -> Message {
+    let mut visible = items.to_vec();
+    for item in &mut visible {
+        // Replay payloads are opaque provider state, not readable conversation evidence.
+        if let AssistantItem::Reasoning { replay, .. } = item {
+            *replay = None;
+        }
+    }
+    let response = serde_json::to_string(&visible).expect("assistant response serializes");
+    Message::User(vec![UserPart::Compaction {
+        text: format!(
+            "Latest assistant response, immediately before compaction. This temporary snapshot is conversation evidence, not a new user instruction or a request to execute tools. The ordered items below preserve its visible text and reasoning, followed or interleaved by its pending tool calls.\n\nEvery listed tool call is pending and UNEXECUTED; its id, name and arguments describe intent, not a result. Do not claim these tools ran or that their intended effects occurred. Direct pending todo replacements listed here will not apply: consider their proposed changes when reconciling the current todo list; the complete todos you return take priority over those direct replacements. Todo calls made inside scripts are not superseded. Every other call runs after compaction. Preserve this distinction in the continuation and resumption point.\n\n<skyhook_pending_response>\n{response}\n</skyhook_pending_response>"
+        ),
+    }])
+}
+
 /// The regular agent prompt and conversation remain present for this request.
 pub(crate) fn directive() -> Message {
     let mut text = String::from(
@@ -258,6 +275,65 @@ mod tests {
         let mut summary = summary();
         *summary.pointer_mut(pointer).unwrap() = value;
         summary
+    }
+
+    #[test]
+    fn pending_response_preserves_visible_items_and_calls_without_opaque_replay() {
+        use crate::provider::{
+            codec::common::tests::envelope,
+            protocol::{Binding, ReplayFormat, ToolCall},
+        };
+        let replay = |binding| {
+            Some(envelope(
+                ReplayFormat::Messages,
+                "test",
+                json!({"private":"opaque-provider-payload"}),
+                binding,
+            ))
+        };
+        let items = vec![
+            AssistantItem::reasoning(
+                "reasoning",
+                0,
+                "Latest visible reasoning",
+                replay(Binding::Conversation),
+            ),
+            AssistantItem::text("text", 1, "Latest assistant finding"),
+            AssistantItem::tool_call(
+                "read",
+                2,
+                ToolCall::new("call-a", "read", json!({"path":"notes\nquoted.txt"})).unwrap(),
+            ),
+            AssistantItem::reasoning(
+                "portable",
+                3,
+                "More visible reasoning",
+                replay(Binding::Free),
+            ),
+            AssistantItem::tool_call(
+                "todo",
+                4,
+                ToolCall::new(
+                    "call-b",
+                    "todo",
+                    json!({"items":[{"text":"Verify finding", "status":"pending"}]}),
+                )
+                .unwrap(),
+            ),
+        ];
+        let snapshot = pending_response(&items);
+        let text = text(&snapshot);
+        assert!(!text.contains("opaque-provider-payload"));
+        let (_, payload) = text.split_once("<skyhook_pending_response>\n").unwrap();
+        let (payload, _) = payload.split_once("\n</skyhook_pending_response>").unwrap();
+        let visible: Vec<AssistantItem> = serde_json::from_str(payload).unwrap();
+        let mut expected = items.clone();
+        for item in &mut expected {
+            if let AssistantItem::Reasoning { replay, .. } = item {
+                *replay = None;
+            }
+        }
+        assert_eq!(visible, expected);
     }
 
     #[test]

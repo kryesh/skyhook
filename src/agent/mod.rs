@@ -20,6 +20,7 @@ pub use runtime::{
     ContinueOutcome, Harness, HarnessBuilder, QueuedPrompt, QueuedPromptCancellation,
     QueuedPromptReceipt, Selection, SessionHandle, SessionMode, SessionModel,
 };
+pub(crate) use todo::ReplaceError;
 pub use todo::{TodoItem, TodoStatus};
 
 pub(crate) use interaction::QuestionOutput;

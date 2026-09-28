@@ -1,4 +1,4 @@
-//! Preserve complete tool exchanges and identify outputs already carried by history.
+//! Preserve whole available tool exchanges and identify outputs already carried by history.
 use super::compaction;
 use crate::{
     agent::CompactionError,

@@ -143,7 +143,6 @@ impl Encoder {
             | E::ModelRecoveryScheduled { .. }
             | E::Usage { .. }
             | E::Compaction { .. }
-            | E::CompactionSkipped { .. }
             | E::CompactionFailed { .. }
             | E::AgentFailed { .. } => self.request(db, entry, event),
             E::JobCreated { .. }

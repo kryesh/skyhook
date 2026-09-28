@@ -659,10 +659,6 @@ impl History {
                 let text = format!("Compaction failed; previous context retained\n{error}");
                 built.push(Entry::new(key, text, Surface::Error), None);
             }
-            SessionEvent::CompactionSkipped { .. } => {
-                let text = "Compaction skipped · a summary would not reduce context".to_owned();
-                built.push(Entry::new(key, text, Surface::Muted), None);
-            }
             _ => {}
         }
     }

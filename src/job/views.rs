@@ -518,6 +518,12 @@ impl JobManager {
         launches
     }
 
+    /// The committed response whose call launched job `id` directly.
+    pub(crate) async fn call_origin(&self, id: JobId) -> Option<crate::session::MessageSeq> {
+        let jobs = self.inner.jobs.lock().await;
+        Some(jobs.get(&id)?.origin.as_ref()?.message)
+    }
+
     /// Read from job `id`'s entry under the jobs lock.
     pub(super) async fn entry<T>(
         &self,

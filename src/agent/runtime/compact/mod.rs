@@ -1,10 +1,12 @@
 //! Runtime orchestration for transactional compaction. Original messages remain journaled.
 
+use std::num::NonZeroU64;
+
 use super::{HarnessError, SessionRuntime, TurnContext, compaction};
 use crate::{
     identity::AgentId,
     provider::{
-        ProviderContext,
+        ProviderContext, ProviderErrorKind,
         protocol::{ModelRequest, Usage},
     },
     session::{AttemptRef, CompactionFailure, EventRecord, ProfileSnapshot, SessionEvent},
@@ -19,7 +21,6 @@ mod checkpoint;
 mod retention;
 mod summary;
 use checkpoint::CompactionInput;
-pub(super) use retention::retention_budget;
 
 pub(super) async fn retry_delay(
     cancellation: &crate::job::CancellationToken,
@@ -80,8 +81,27 @@ impl TokenMeter {
     }
 }
 
+/// Reserve the larger of the completed response's reported occupancy and the summary's
+/// calibrated input: dropping tools may shrink the request, while its directive, schema
+/// and pending-response block can grow it.
+fn summary_max_output(
+    profile: &ProfileSnapshot,
+    meter: &TokenMeter,
+    summary: &ModelRequest,
+    completed: Option<Usage>,
+) -> Result<NonZeroU64, HarnessError> {
+    let occupied = completed.map_or(0, super::context::occupancy);
+    let input = meter.estimate(summary).max(occupied);
+    let available = profile.profile.max_context.get().saturating_sub(input);
+    NonZeroU64::new(profile.profile.max_output.get().min(available)).ok_or_else(|| {
+        ProviderErrorKind::ContextWindowExceeded
+            .error("compaction summary leaves no room for output within the model context window")
+            .into()
+    })
+}
+
 impl SessionRuntime {
-    /// Whether a checkpoint was installed; a summary that cannot shrink the context is skipped.
+    /// Install a valid checkpoint, retrying recoverable summary failures.
     pub(super) async fn compact_history(
         &self,
         turn: &TurnContext<'_>,
@@ -89,8 +109,8 @@ impl SessionRuntime {
         meter: &mut TokenMeter,
         profile: &ProfileSnapshot,
         input: &ModelRequest,
-        max_context: u64,
-    ) -> Result<bool, HarnessError> {
+        completed_usage: Option<Usage>,
+    ) -> Result<(), HarnessError> {
         let mut launches = self.jobs.active_launches(turn.agent).await;
         let mut model_attempt = 0;
         for attempt in 1..=MAX_COMPACTION_ATTEMPTS {
@@ -104,7 +124,7 @@ impl SessionRuntime {
                         meter,
                         profile,
                         request: input,
-                        max_context,
+                        completed_usage,
                         model_attempt: &mut model_attempt,
                     },
                     &mut request_sequence,
@@ -123,7 +143,7 @@ impl SessionRuntime {
                 Some(request) => CompactionFailure::Requested(request),
             };
             match result {
-                Ok(installed) => return Ok(installed),
+                Ok(()) => return Ok(()),
                 Err(error) => {
                     self.store
                         .append(
@@ -154,6 +174,7 @@ mod tests {
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
+    use super::{TokenMeter, summary_max_output};
     pub(super) use crate::agent::runtime::tests::{
         Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta, events, models,
         provider_name, recoverable, response, summary_json, test_builder, todo, usage,
@@ -170,9 +191,51 @@ mod tests {
                 ToolCall, Usage,
             },
         },
-        session::{Message, SessionEvent, UserPart, project_history},
+        session::{
+            Message, ModelContext, ModelPurpose, ProfileSnapshot, SessionEvent, UserPart,
+            project_history,
+        },
         tool::policy::CapabilitySet,
     };
+
+    fn summary_budget_fixture(input: u64) -> (ProfileSnapshot, TokenMeter, ModelRequest) {
+        let mut profile = crate::session::tests::profile();
+        profile.profile.max_context = crate::tests::limit(1_000);
+        profile.profile.max_output = crate::tests::limit(400);
+        let summary = ModelContext::test(ModelPurpose::Compaction, profile.clone()).template();
+        let mut meter = TokenMeter::default();
+        meter.observe(
+            compaction::estimate_request(&summary),
+            crate::session::tests::usage(input, 0, 0),
+        );
+        (profile, meter, summary)
+    }
+
+    #[test]
+    fn summary_output_budget_reserves_completed_occupancy_and_estimated_input() {
+        let usage = crate::session::tests::usage;
+        for (input, completed, expected) in [
+            (500, Some(usage(200, 200, 100)), Some(400)),
+            (600, Some(usage(200, 200, 200)), Some(400)),
+            (500, Some(usage(400, 200, 300)), Some(100)),
+            (900, Some(usage(200, 200, 100)), Some(100)),
+            (900, None, Some(100)),
+            (1_000, None, None),
+            (1_001, None, None),
+            (500, Some(usage(200, 300, 500)), None),
+        ] {
+            let (profile, meter, summary) = summary_budget_fixture(input);
+            match summary_max_output(&profile, &meter, &summary, completed) {
+                Ok(budget) => assert_eq!(Some(budget.get()), expected, "{input}, {completed:?}"),
+                Err(error) => assert!(
+                    expected.is_none()
+                        && matches!(error, HarnessError::Provider(ref error)
+                            if error.kind() == ProviderErrorKind::ContextWindowExceeded),
+                    "{input}, {completed:?}: {error}"
+                ),
+            }
+        }
+    }
 
     /// A summary answer after reasoning, which must not enter the continuation.
     pub(super) fn summary(text: impl std::fmt::Display) -> Vec<ResponseEvent> {
@@ -309,9 +372,9 @@ mod tests {
             };
             let mut provider = self.script.open_context(ContextId::from(agent))?;
             let (provider, meter) = (provider.as_mut(), &mut Default::default());
-            let compacted =
-                runtime.compact_history(&turn, provider, meter, &profile, &input, 128_000);
-            compacted.await.map(drop)
+            runtime
+                .compact_history(&turn, provider, meter, &profile, &input, None)
+                .await
         }
     }
 
@@ -343,7 +406,11 @@ mod tests {
         let agent = &fixture.session.root;
         fixture.add_history(20_000).await;
         let todos = vec![todo("Keep on interruption", TodoStatus::InProgress)];
-        runtime.todos.replace(agent, todos.clone()).await.unwrap();
+        runtime
+            .todos
+            .replace(agent, todos.clone(), None)
+            .await
+            .unwrap();
         let before = project_history(&fixture.records().await, agent);
         let cancellation = CancellationToken::new();
         let (result, ()) = bounded(async {
@@ -384,7 +451,7 @@ mod tests {
             let (todos, agent) = (&fixture.session.runtime.todos, &fixture.session.root);
             fixture.add_history(20_000).await;
             let old_todos = vec![todo("Preserve unfinished work", TodoStatus::InProgress)];
-            todos.replace(agent, old_todos.clone()).await.unwrap();
+            todos.replace(agent, old_todos.clone(), None).await.unwrap();
             let before = project_history(&fixture.records().await, agent);
             let error = fixture
                 .compact(&CancellationToken::new())
@@ -411,7 +478,7 @@ mod tests {
 
     /// A summary selecting an unknown job, or one whose output cannot be
     /// presented, may succeed on retry; a checkpoint the journal refuses, here
-    /// for an active job's unanswered call, cannot.
+    /// for an active job's non-trailing unanswered call, cannot.
     #[tokio::test(start_paused = true)]
     async fn only_a_retryable_failure_retries_without_installing_compaction() {
         for (journaled, invariant) in [(false, false), (true, false), (false, true)] {
@@ -445,6 +512,15 @@ mod tests {
                 let call = ToolCall::new("unanswered", "read", json!({"path":"file"})).unwrap();
                 let call = Message::Assistant(vec![AssistantItem::tool_call("call", 0, call)]);
                 let message = runtime.commit(root, call).await.unwrap();
+                runtime
+                    .commit(
+                        root,
+                        Message::User(vec![UserPart::Text {
+                            text: "Continue before the tool result.".into(),
+                        }]),
+                    )
+                    .await
+                    .unwrap();
                 let call_id = "unanswered".into();
                 let spec = crate::job::JobSpec {
                     origin: Some(crate::session::ModelCallOrigin { message, call_id }),

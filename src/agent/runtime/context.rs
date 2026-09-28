@@ -2,10 +2,7 @@
 
 use std::collections::HashMap;
 
-use super::{
-    HarnessError,
-    compact::{TokenMeter, retention_budget},
-};
+use super::{HarnessError, compact::TokenMeter};
 use crate::{
     agent::ContextUsage,
     identity::AgentId,
@@ -38,8 +35,6 @@ pub(super) struct AgentContext {
     through: RecordSeq,
     /// Checkpoint and retained messages, which precede later commits in `projected`.
     prefix: usize,
-    /// Occupancy at which a summary last failed to shrink the context.
-    skipped_at: Option<u64>,
 }
 
 impl AgentContext {
@@ -64,7 +59,6 @@ impl AgentContext {
             through: records
                 .last()
                 .map_or(RecordSeq::default(), |record| record.sequence),
-            skipped_at: None,
         }
     }
 
@@ -99,7 +93,6 @@ impl AgentContext {
             store
                 .visit_records_after(RecordSeq::default(), reproject)
                 .await;
-            self.skipped_at = None;
             return Ok(());
         }
         self.through = through;
@@ -127,20 +120,12 @@ impl AgentContext {
 
     pub fn needs_compaction(&self, usage: Usage) -> bool {
         // Only the completed response's reported occupancy, including cached input
-        // and generated output; estimates and output limits never trigger it.
+        // and generated output; estimates never trigger it.
         let tokens = occupancy(usage);
-        // A summary that could not shrink this context is not worth repeating until
-        // there is another retained tail's worth of history to fold into it.
-        let grown = self.skipped_at.is_none_or(|skipped| {
-            tokens
-                >= skipped.saturating_add(retention_budget(self.profile.profile.max_context.get()))
-        });
-        grown && self.reaches_compaction(tokens)
-    }
-
-    /// A summary at this occupancy could not shrink the context.
-    pub fn compaction_skipped(&mut self, usage: Usage) {
-        self.skipped_at = Some(occupancy(usage));
+        let (numerator, denominator) = COMPACTION_THRESHOLD;
+        let profile = &self.profile.profile;
+        let budget = profile.max_context.get() - profile.max_output.get();
+        u128::from(tokens) * denominator >= u128::from(budget) * numerator
     }
 
     /// A mode switch invalidates bound reasoning in the history before it.
@@ -150,12 +135,6 @@ impl AgentContext {
             .into_iter()
             .map(|(sequence, message)| (sequence, message.without_bound_reasoning()));
         self.projected.messages.extend(kept);
-    }
-
-    fn reaches_compaction(&self, tokens: u64) -> bool {
-        let (numerator, denominator) = COMPACTION_THRESHOLD;
-        u128::from(tokens) * denominator
-            >= u128::from(self.profile.profile.max_context.get()) * numerator
     }
 
     pub fn contains_images(&self) -> bool {
@@ -170,10 +149,11 @@ impl AgentContext {
     }
 }
 
-/// The share of the context window, as a fraction, whose reported use compacts it.
-const COMPACTION_THRESHOLD: (u128, u128) = (4, 5);
+/// The share of the input budget (the context window less the output reserve), as a
+/// fraction, whose reported use compacts it.
+const COMPACTION_THRESHOLD: (u128, u128) = (9, 10);
 
-fn occupancy(usage: Usage) -> u64 {
+pub(super) fn occupancy(usage: Usage) -> u64 {
     let input = usage.input_tokens.saturating_add(usage.cached_input_tokens);
     input.saturating_add(usage.output_tokens)
 }
@@ -287,7 +267,6 @@ mod tests {
             unavailable_tools: Default::default(),
             through: RecordSeq::default(),
             prefix: 0,
-            skipped_at: None,
         }
     }
 
@@ -318,45 +297,34 @@ mod tests {
     }
 
     #[test]
-    fn a_skipped_compaction_waits_for_another_retained_tail_of_growth() {
-        let mut context = test_context(128_000, 1_000);
-        let full = tests::usage(100_000, 2_000, 400);
-        assert!(context.needs_compaction(full));
-        context.compaction_skipped(full);
-        assert!(!context.needs_compaction(full));
-        assert!(!context.needs_compaction(tests::usage(100_000, 9_999, 400)));
-        assert!(context.needs_compaction(tests::usage(100_000, 10_000, 400)));
-    }
-
-    #[test]
-    fn completed_usage_compacts_at_eighty_percent_independently_of_output_budget() {
+    fn completed_usage_compacts_at_ninety_percent_after_reserving_configured_output() {
         let limits = [
-            (128_000, 102_400),
-            (128_001, 102_401),
-            (u64::MAX, 14_757_395_258_967_641_292),
+            (128_000, 16_384, 100_455),
+            (128_001, 1, 115_200),
+            (128_002, 1, 115_201),
+            (128_000, 127_999, 1),
+            (u64::MAX, 1, 16_602_069_666_338_596_453),
         ];
-        for (capacity, threshold) in limits {
-            for max_output in [1, capacity - 1] {
-                let context = test_context(capacity, max_output);
-                let total = |tokens: u64| Usage {
-                    input_tokens: tokens / 3,
-                    cached_input_tokens: tokens / 3,
-                    cache_write_input_tokens: 0,
-                    output_tokens: tokens - 2 * (tokens / 3),
-                };
-                assert!(!context.needs_compaction(Usage::default()));
-                for tokens in [threshold - 1, threshold, threshold + 1] {
-                    let expected = tokens >= threshold;
-                    assert_eq!(
-                        context.needs_compaction(total(tokens)),
-                        expected,
-                        "{tokens}"
-                    );
-                }
-                // Each partial sum overflows a u64; a wrapped total would be tiny.
-                for overflow in [tests::usage(u64::MAX, 1, 0), tests::usage(u64::MAX, 0, 1)] {
-                    assert!(context.needs_compaction(overflow));
-                }
+        for (capacity, max_output, threshold) in limits {
+            let context = test_context(capacity, max_output);
+            let total = |tokens: u64| Usage {
+                input_tokens: tokens / 3,
+                cached_input_tokens: tokens / 3,
+                // Cache writes are already included in input and must not count twice.
+                cache_write_input_tokens: tokens / 3,
+                output_tokens: tokens - 2 * (tokens / 3),
+            };
+            assert!(!context.needs_compaction(Usage::default()));
+            for tokens in [threshold - 1, threshold, threshold + 1] {
+                assert_eq!(
+                    context.needs_compaction(total(tokens)),
+                    tokens >= threshold,
+                    "{capacity} {max_output:?} {tokens}"
+                );
+            }
+            // Each partial sum overflows a u64; a wrapped total would be tiny.
+            for overflow in [tests::usage(u64::MAX, 1, 0), tests::usage(u64::MAX, 0, 1)] {
+                assert!(context.needs_compaction(overflow));
             }
         }
     }

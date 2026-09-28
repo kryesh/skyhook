@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 16). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 17). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 --
@@ -540,37 +540,27 @@ CREATE TABLE compaction_retained (
   PRIMARY KEY (compaction, source)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE compaction_outcome_kind (
-  name TEXT PRIMARY KEY REFERENCES entry_kind(name),
-  failed INTEGER NOT NULL CHECK (failed IN (0,1)),
-  UNIQUE (name, failed)
-) STRICT, WITHOUT ROWID;
 CREATE TABLE compaction_fault (
   name TEXT PRIMARY KEY,
   detailed INTEGER NOT NULL CHECK (detailed IN (0,1)),
   UNIQUE (name, detailed)
 ) STRICT, WITHOUT ROWID;
 CREATE TABLE checkpoint_error (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
-CREATE TABLE compaction_outcome (
+CREATE TABLE compaction_failure (              -- CompactionFailed only
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL,
+  kind TEXT NOT NULL DEFAULT 'compaction_failed' CHECK (kind = 'compaction_failed'),
   request INTEGER REFERENCES model_request(entry),
   -- The summary attempt this round used. It may also hold a model failure, so it is a
   -- reference rather than an attempt_outcome.
   attempt INTEGER,
-  -- Why a failed round failed; only failed kinds have a fault.
-  fault TEXT,
-  detailed INTEGER,
+  fault TEXT NOT NULL,
+  detailed INTEGER NOT NULL,
   detail TEXT,
-  failed INTEGER GENERATED ALWAYS AS (fault IS NOT NULL) VIRTUAL,
   -- A checkpoint fault's detail names the checkpoint error, a summary fault its failure.
   checkpoint TEXT GENERATED ALWAYS AS (CASE fault WHEN 'checkpoint' THEN detail END) VIRTUAL,
   summary TEXT GENERATED ALWAYS AS (CASE fault WHEN 'summary' THEN detail END) VIRTUAL,
-  CHECK (failed OR attempt IS NOT NULL),
   CHECK (attempt IS NULL OR request IS NOT NULL),
-  CHECK ((fault IS NULL) = (detailed IS NULL)),
-  CHECK (coalesce(detailed, 0) = (detail IS NOT NULL)),
-  FOREIGN KEY (kind, failed) REFERENCES compaction_outcome_kind(name, failed),
+  CHECK (detailed = (detail IS NOT NULL)),
   FOREIGN KEY (attempt, request) REFERENCES model_attempt(entry, request),
   FOREIGN KEY (fault, detailed) REFERENCES compaction_fault(name, detailed),
   FOREIGN KEY (checkpoint) REFERENCES checkpoint_error(name),

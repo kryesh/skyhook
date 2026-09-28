@@ -9,12 +9,12 @@ use super::{
     *,
 };
 use crate::{
-    agent::{CompactionFault, Failure, FaultKind, TodoItem},
+    agent::{CompactionFault, Failure, TodoItem},
     named_enum::named_enum,
     provider::protocol::Usage,
     session::{
         AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, EntryKind,
-        RequestSeq, SessionEvent,
+        SessionEvent,
     },
 };
 
@@ -103,11 +103,8 @@ impl Encoder {
                     params![seq, *failure, *delay_millis],
                 )
                 .map(drop),
-            SessionEvent::CompactionSkipped { attempt } => {
-                compaction_outcome(db, entry, Some(attempt.request), Some(*attempt), None)
-            }
             SessionEvent::CompactionFailed { failure, error } => {
-                compaction_outcome(db, entry, failure.request(), failure.attempt(), Some(error))
+                compaction_failure(db, seq, failure, error)
             }
             SessionEvent::Usage { request, usage } => db
                 .execute(
@@ -196,29 +193,28 @@ fn outcome(db: &Db, entry: Entry, attempt: AttemptRef) -> DbResult<()> {
     .map(drop)
 }
 
-/// A present attempt must exist on `request`.
-fn compaction_outcome(
+/// A present attempt must exist on its request.
+fn compaction_failure(
     db: &Db,
-    entry: Entry,
-    request: Option<RequestSeq>,
-    attempt: Option<AttemptRef>,
-    fault: Option<&CompactionFault>,
+    seq: u64,
+    failure: &CompactionFailure,
+    fault: &CompactionFault,
 ) -> DbResult<()> {
-    let attempt = attempt
+    let attempt = failure
+        .attempt()
         .map(|attempt| model_attempt(db, attempt))
         .transpose()?;
-    let kind = fault.map(CompactionFault::kind);
-    let (detail, _) = fault.map_or((None, None), CompactionFault::parts);
+    let kind = fault.kind();
+    let (detail, _) = fault.parts();
     db.execute(
-        "INSERT INTO compaction_outcome (entry, kind, request, attempt, fault, detailed, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO compaction_failure (entry, request, attempt, fault, detailed, detail) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         params![
-            entry.seq,
-            entry.kind,
-            request,
+            seq,
+            failure.request(),
             attempt,
             kind,
-            kind.map(FaultKind::detailed),
+            kind.detailed(),
             detail
         ],
     )
@@ -342,33 +338,24 @@ pub(super) fn events(
         },
     )?;
     events.load(
-        "SELECT o.entry, o.kind, o.request, a.attempt, o.fault, o.detail \
-         FROM compaction_outcome o LEFT JOIN model_attempt a ON a.entry = o.attempt",
+        "SELECT o.entry, o.request, a.attempt, o.fault, o.detail \
+         FROM compaction_failure o LEFT JOIN model_attempt a ON a.entry = o.attempt",
         |row| {
             let request = row
-                .get::<Option<i64>>(2)?
+                .get::<Option<i64>>(1)?
                 .map(|request| sequence(request).request());
-            let attempt = match (request, row.get::<Option<u64>>(3)?) {
-                (Some(request), Some(attempt)) => Some(AttemptRef { request, attempt }),
-                (_, None) => None,
+            let failure = match (request, row.get::<Option<u64>>(2)?) {
+                (None, None) => CompactionFailure::BeforeRequest,
+                (Some(request), None) => CompactionFailure::Requested(request),
+                (Some(request), Some(attempt)) => {
+                    CompactionFailure::Attempted(AttemptRef { request, attempt })
+                }
                 (None, Some(_)) => return Err(corrupt("compaction attempt has no request")),
             };
-            Ok(match enum_column(row, 1)? {
-                EntryKind::CompactionSkipped => SessionEvent::CompactionSkipped {
-                    attempt: attempt.ok_or_else(|| corrupt("skipped compaction has no attempt"))?,
-                },
-                EntryKind::CompactionFailed => SessionEvent::CompactionFailed {
-                    failure: match (request, attempt) {
-                        (None, _) => CompactionFailure::BeforeRequest,
-                        (Some(request), None) => CompactionFailure::Requested(request),
-                        (Some(_), Some(attempt)) => CompactionFailure::Attempted(attempt),
-                    },
-                    error: CompactionFault::from_parts(enum_column(row, 4)?, None, row.get(5)?)
-                        .ok_or_else(|| {
-                            corrupt("compaction fault detail does not match its kind")
-                        })?,
-                },
-                kind => return Err(corrupt(format!("{kind} entry has a compaction outcome"))),
+            Ok(SessionEvent::CompactionFailed {
+                failure,
+                error: CompactionFault::from_parts(enum_column(row, 3)?, None, row.get(4)?)
+                    .ok_or_else(|| corrupt("compaction fault detail does not match its kind"))?,
             })
         },
     )?;
@@ -392,6 +379,7 @@ pub(super) fn events(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::FaultKind;
     use crate::session::{
         ModelContext, ModelPurpose,
         db::tests::Fixture,
@@ -399,7 +387,7 @@ mod tests {
     };
 
     #[test]
-    fn compaction_outcomes_name_their_own_attempt_and_only_failures_have_a_fault() {
+    fn compaction_failures_name_their_own_attempt_and_a_fault_matching_its_detail() {
         let mut fixture = Fixture::new();
         let root = fixture.start("/w");
         let context = fixture.one(
@@ -416,14 +404,14 @@ mod tests {
         let [(request, own), (_, other)] = started[..] else {
             unreachable!()
         };
-        let (checkpoint, stale) = (Some(FaultKind::Checkpoint), Some("stale_todos"));
-        for (seq, attempt, fault, detailed, detail, accepted) in [
-            (100_u64, other, None, None, None, false),
-            (101, own, None, Some(true), stale, false),
-            (102, own, checkpoint, Some(true), stale, false),
-            (103, own, None, None, None, true),
+        let (checkpoint, stale) = (FaultKind::Checkpoint, Some("stale_todos"));
+        for (seq, attempt, detailed, detail, accepted) in [
+            (100_u64, other, true, stale, false),
+            (101, own, false, None, false),
+            (102, own, true, Some("not_a_checkpoint_error"), false),
+            (103, own, true, stale, true),
         ] {
-            let kind = EntryKind::CompactionSkipped;
+            let kind = EntryKind::CompactionFailed;
             fixture
                 .db
                 .execute(
@@ -433,10 +421,10 @@ mod tests {
                 )
                 .unwrap();
             let inserted = fixture.db.execute(
-                "INSERT INTO compaction_outcome \
-                 (entry, kind, request, attempt, fault, detailed, detail) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![seq, kind, request, attempt, fault, detailed, detail],
+                "INSERT INTO compaction_failure \
+                 (entry, request, attempt, fault, detailed, detail) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![seq, request, attempt, checkpoint, detailed, detail],
             );
             assert_eq!(inserted.is_ok(), accepted, "{seq}");
         }

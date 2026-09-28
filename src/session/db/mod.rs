@@ -32,7 +32,7 @@ pub use state::SessionSummary;
 pub(super) use state::summary;
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 16;
+pub(super) const USER_VERSION: i64 = 17;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
@@ -340,12 +340,6 @@ impl Dictionaries<'_> {
         ] {
             self.names(table, kinds)?;
         }
-        self.flagged(
-            "compaction_outcome_kind",
-            ["failed"],
-            &[E::CompactionSkipped, E::CompactionFailed],
-            |kind| [kind == E::CompactionFailed],
-        )?;
         self.names("target_source", &TargetSource::ALL)?;
         self.names("ssh_auth", &SshAuth::ALL)?;
         self.names("state_mode", &StateMode::ALL)?;

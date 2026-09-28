@@ -296,13 +296,6 @@ impl RequestLedger {
                 };
                 changes.named = self.settle(checkpoint.attempt.request, |_| completed);
             }
-            SessionEvent::CompactionSkipped { attempt, .. } => {
-                let completed = RequestPhase::Completed {
-                    attempt: attempt.attempt,
-                    at,
-                };
-                changes.named = self.settle(attempt.request, |_| completed);
-            }
             SessionEvent::CompactionFailed { failure, error } => {
                 let (request, attempt) = match failure {
                     CompactionFailure::BeforeRequest => return changes,
@@ -686,12 +679,8 @@ mod tests {
     }
 
     #[test]
-    fn compaction_outcomes_complete_their_request() {
+    fn a_checkpoint_completes_its_summary_request() {
         let mut journal = Journal::new();
-        let skipped = journal.attempted(ModelPurpose::Compaction);
-        let skip = journal.record(SessionEvent::CompactionSkipped {
-            attempt: attempt_ref(skipped, 1),
-        });
         let checkpointed = journal.attempted(ModelPurpose::Compaction);
         journal.record(SessionEvent::Compaction {
             checkpoint: CompactionCheckpoint {
@@ -704,9 +693,11 @@ mod tests {
                 after_tokens: 5,
             },
         });
-        let completed = |at| RequestPhase::Completed { attempt: 1, at };
-        assert_eq!(journal.phase(skipped), &completed(at(skip)));
-        assert_eq!(journal.phase(checkpointed), &completed(journal.now()));
+        let completed = RequestPhase::Completed {
+            attempt: 1,
+            at: journal.now(),
+        };
+        assert_eq!(journal.phase(checkpointed), &completed);
         let record = journal.record_of(checkpointed);
         assert_eq!(record.purpose, ModelPurpose::Compaction);
     }

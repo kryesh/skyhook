@@ -372,11 +372,6 @@ pub enum SessionEvent {
         /// Backoff scheduled before the next invocation.
         delay_millis: u64,
     },
-    /// The summary at `attempt` would not have shrunk the context, so the original
-    /// history stays.
-    CompactionSkipped {
-        attempt: AttemptRef,
-    },
     CompactionFailed {
         failure: CompactionFailure,
         error: CompactionFault,
@@ -468,7 +463,6 @@ named_enum! {
         ResponseCompleted = "response_completed",
         Usage = "usage",
         Compaction = "compaction",
-        CompactionSkipped = "compaction_skipped",
         CompactionFailed = "compaction_failed",
         JobCreated = "job_created",
         JobStateChanged = "job_state_changed",
@@ -501,7 +495,6 @@ impl SessionEvent {
             Self::ModelAttemptInterrupted { .. } => EntryKind::ModelAttemptInterrupted,
             Self::ResponseCompleted { .. } => EntryKind::ResponseCompleted,
             Self::ModelRecoveryScheduled { .. } => EntryKind::ModelRecoveryScheduled,
-            Self::CompactionSkipped { .. } => EntryKind::CompactionSkipped,
             Self::CompactionFailed { .. } => EntryKind::CompactionFailed,
             Self::Usage { .. } => EntryKind::Usage,
             Self::JobCreated { .. } => EntryKind::JobCreated,

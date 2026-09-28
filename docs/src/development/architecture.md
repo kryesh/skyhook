@@ -152,17 +152,33 @@ Empty text is never committed, even beside a tool call.
 
 The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a successful response's reported occupancy (uncached input,
-cached input, and output), not from a display estimate or output-token limit.
+cached input, and output), at 90% of `max_context - max_output`, not from a display estimate.
+It runs after committing that response and before creating or executing its tool calls.
 
 Summarization is a separate recorded request with a structured response schema and no callable
-tools. The runtime retains whole exchanges rather than orphaning tool results, and removes reasoning
-bound to the replaced context from the retained projection.
+tools. Native history ends before any trailing unanswered tool-call message, keeping the summary
+request valid for providers that require paired calls and results. The latest response is instead
+supplied in a temporary, journaled tail block: visible text and reasoning plus every pending call's
+ID, name, and arguments, marked as unexecuted. Opaque reasoning replay payloads are omitted.
+The checkpoint retains the entire available exchange, and every call runs afterward. The
+summarizer's reconciled list is authoritative: the todo store records each checkpoint's frontier
+and refuses, as superseded, a replacement called directly by a response at or before it.
+Replacements made by that response's scripts run normally.
+All results join the retained calls in the first normal post-compaction request. Completed
+exchanges cannot be partially retained. The retained projection removes reasoning bound to the
+replaced context.
+Compaction reserves the greater of reported occupancy and calibrated summary-input size,
+including the temporary response block, directive, and schema. Its output limit is the smaller
+of the configured limit and the remaining context space; no available output space fails before
+invoking the provider. Normal request settings are unchanged, and the summary's effective limit
+is journaled for exact reconstruction.
 
 History replacement and todo reconciliation become active only after checkpoint persistence.
-Validation prevents a stale summary from overwriting newer todo state. A continuation that does
-not shrink the context is skipped; replay uses the stored continuation rather than rerunning the
-summary or today's renderer. See [model-call reconstruction](embedding.md#reconstructing-model-calls)
-for the durable reference contract.
+Validation prevents a stale summary from overwriting newer todo state. Every valid, successfully
+persisted continuation replaces the context and reconciles todos, regardless of estimated size
+reduction. Replay uses the stored continuation rather than rerunning the summary or today's
+renderer. See [model-call reconstruction](embedding.md#reconstructing-model-calls) for the
+durable reference contract.
 
 ## Tools, jobs, and execution
 

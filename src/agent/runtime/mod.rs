@@ -87,8 +87,8 @@ struct HarnessInner {
     mcp: BTreeMap<String, McpServerConfig>,
     instructions: Vec<String>,
     skills: HostSkills,
-    /// Instruction and skill discovery diagnostics.
-    discovery_warnings: Vec<String>,
+    /// Model configuration, instruction, and skill diagnostics.
+    warnings: Vec<String>,
     max_child_depth: usize,
     /// The most a new session can hold.
     capabilities: CapabilitySet,

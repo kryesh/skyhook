@@ -10,7 +10,7 @@ use crate::{
     job::JobView,
     provider::{
         ProviderContext,
-        protocol::{HistoryLifetime, ModelRequest, ResponseSchema},
+        protocol::{HistoryLifetime, ModelRequest, ResponseSchema, Usage},
     },
     session::{
         AttemptRef, CompactionCheckpoint, Message, ModelCallOrigin, ModelPurpose, ProfileSnapshot,
@@ -23,7 +23,7 @@ pub(super) struct CompactionInput<'a> {
     pub(super) meter: &'a mut TokenMeter,
     pub(super) profile: &'a ProfileSnapshot,
     pub(super) request: &'a ModelRequest,
-    pub(super) max_context: u64,
+    pub(super) completed_usage: Option<Usage>,
     pub(super) model_attempt: &'a mut u64,
 }
 
@@ -35,12 +35,12 @@ impl SessionRuntime {
         source: CompactionInput<'_>,
         request_sequence: &mut Option<RequestSeq>,
         launches: &mut Vec<(JobId, Option<ModelCallOrigin>)>,
-    ) -> Result<bool, HarnessError> {
+    ) -> Result<(), HarnessError> {
         let CompactionInput {
             meter,
             profile,
             request: input,
-            max_context,
+            completed_usage,
             model_attempt,
         } = source;
         let agent = turn.agent;
@@ -85,7 +85,7 @@ impl SessionRuntime {
         // Keep only the original template for the post-compaction estimate.
         input.history.clear();
         input.tail.clear();
-        let summary_tail = vec![state, compaction::directive()];
+        let mut summary_tail = vec![state];
         let mut summary_request = input.clone();
         // Summarization cannot execute tools. Keep their historical calls/results
         // as evidence, but advertise no callable tools on this request.
@@ -95,16 +95,40 @@ impl SessionRuntime {
             schema: compaction::response_schema(),
         });
         let template = summary_request.clone();
+        let mut summary_history = projected.clone();
+        let pending = match summary_history.messages.last() {
+            Some((sequence, Message::Assistant(items))) => items
+                .iter()
+                .find_map(|item| item.call())
+                .map(|call| ModelCallOrigin {
+                    message: sequence.message(),
+                    call_id: call.id().to_owned(),
+                }),
+            _ => None,
+        };
+        // The summary sees this response as evidence in its tail, not unanswered
+        // native calls. Retain the original for actual results after compaction.
+        if pending.is_some()
+            && let Some((_, Message::Assistant(items))) = summary_history.messages.pop()
+        {
+            summary_tail.push(compaction::pending_response(&items));
+        }
+        summary_tail.push(compaction::directive());
+        let summary_through = summary_history.through();
         // Dropping tools changes the conversation, invalidating bound reasoning.
         summary_request.history = crate::session::render_history(
-            projected
-                .history()
-                .cloned()
-                .map(Message::without_bound_reasoning),
+            summary_history
+                .messages
+                .into_iter()
+                .map(|(_, message)| message.without_bound_reasoning()),
         );
         summary_request.tail = summary_tail.iter().map(Message::render).collect();
         // The checkpoint replaces this history once the summary completes.
         summary_request.history_lifetime = HistoryLifetime::Detached;
+        let limit = super::summary_max_output(profile, meter, &summary_request, completed_usage)?;
+        summary_request.max_output_tokens = Some(limit);
+        let mut summary_profile = profile.clone();
+        summary_profile.profile.max_output = limit;
         let summary_context = self
             .store
             .append(
@@ -112,7 +136,7 @@ impl SessionRuntime {
                 SessionEvent::ModelContext {
                     context: crate::session::ModelContext {
                         purpose: ModelPurpose::Compaction,
-                        profile: profile.clone(),
+                        profile: summary_profile,
                         system: template.system,
                         tools: template.tools,
                         response_schema: template.response_schema,
@@ -127,7 +151,7 @@ impl SessionRuntime {
                 SessionEvent::ModelRequested {
                     context: summary_context.sequence,
                     checkpoint: projected.checkpoint,
-                    through: projected.through(),
+                    through: summary_through,
                     tail: summary_tail,
                     history_lifetime: summary_request.history_lifetime,
                 },
@@ -159,8 +183,9 @@ impl SessionRuntime {
         let origins: Vec<_> = launches
             .iter()
             .filter_map(|(_, origin)| origin.clone())
+            .chain(pending)
             .collect();
-        let budget = retention_budget(max_context);
+        let budget = retention_budget(profile.profile.max_context.get());
         let retained = retained_sources(
             &records,
             agent,
@@ -264,11 +289,6 @@ impl SessionRuntime {
             request: requested.sequence.request(),
             attempt: *model_attempt,
         };
-        if after_tokens >= before_tokens {
-            let skipped = SessionEvent::CompactionSkipped { attempt };
-            self.store.append(agent.clone(), skipped).await?;
-            return Ok(false);
-        }
         if turn.cancellation.is_cancelled() {
             return Err(HarnessError::Interrupted);
         }
@@ -299,10 +319,10 @@ impl SessionRuntime {
                 agent: agent.clone(),
                 usage: crate::agent::ContextUsage {
                     tokens: after_tokens,
-                    capacity: max_context,
+                    capacity: profile.profile.max_context.get(),
                 },
             });
-        Ok(true)
+        Ok(())
     }
 }
 
@@ -329,6 +349,107 @@ mod tests {
 
     fn checkpoint(records: &[EventRecord]) -> &crate::session::CompactionCheckpoint {
         events!(records, SessionEvent::Compaction { checkpoint } => checkpoint)[0]
+    }
+
+    #[tokio::test]
+    async fn summary_sees_pending_response_as_evidence_and_checkpoint_retains_original_calls() {
+        use crate::provider::{
+            codec::common::tests::envelope,
+            protocol::{Binding, ReplayFormat},
+        };
+        use crate::session::{project_history, reconstruct_model_request, render_history};
+
+        let fixture = Fixture::new([
+            Step::new(summary(summary_json())),
+            Step::new(summary(summary_json())),
+        ])
+        .await;
+        let runtime = &fixture.session.runtime;
+        let agent = &fixture.session.root;
+        fixture.add_history(20_000).await;
+        fixture.compact(&CancellationToken::new()).await.unwrap();
+        fixture.add_history(20_000).await;
+        let prefix = project_history(&fixture.records().await, agent);
+        let replay = envelope(
+            ReplayFormat::Messages,
+            "test",
+            json!({"signature":"bound-to-old-history"}),
+            Binding::Conversation,
+        );
+        let call = |id: &str, position, name: &str, arguments| {
+            AssistantItem::tool_call(id, position, ToolCall::new(id, name, arguments).unwrap())
+        };
+        let items = vec![
+            AssistantItem::reasoning("reasoning", 0, "visible reasoning", Some(replay)),
+            AssistantItem::text("text", 1, "These calls are not executed yet."),
+            call("pending-a", 2, "read", json!({"path":"latest-finding.txt"})),
+            call(
+                "pending-b",
+                3,
+                "todo",
+                json!({"items":[{"text":"Verify latest finding", "status":"pending"}]}),
+            ),
+        ];
+        let snapshot = super::compaction::pending_response(&items);
+        let assistant = Message::Assistant(items);
+        let origin = runtime.commit(agent, assistant.clone()).await.unwrap();
+        fixture.compact(&CancellationToken::new()).await.unwrap();
+        fixture.assert_no_tool_execution().await;
+        let records = fixture.records().await;
+        let checkpoints = events!(&records, SessionEvent::Compaction { checkpoint } => checkpoint);
+        assert_eq!(checkpoints.len(), 2);
+        let checkpoint = checkpoints[1];
+        assert!(checkpoint.retained.contains(&origin));
+        assert!(checkpoint.frontier >= origin.into());
+        let requested =
+            crate::session::record_at(&records, checkpoint.attempt.request.into()).unwrap();
+        let SessionEvent::ModelRequested { through, tail, .. } = &requested.event else {
+            panic!("summary request")
+        };
+        assert_eq!(*through, prefix.through());
+        assert!(tail.contains(&snapshot));
+        let summary = fixture.script.request(2).await;
+        assert_eq!(summary.history, render_history(prefix.history()));
+        assert!(summary.tail.contains(&snapshot.render()));
+        assert!(!summary.messages().any(|message| matches!(
+            message, Sent::Assistant(items) if items.iter().any(|item| item.call().is_some())
+        )));
+        let (_, replayed) =
+            reconstruct_model_request(&records, checkpoint.attempt.request).unwrap();
+        assert_eq!(replayed, summary);
+        let projected = project_history(&records, agent);
+        assert_eq!(
+            projected.messages.last().unwrap().1,
+            assistant.without_bound_reasoning()
+        );
+        assert!(!projected.history().any(|message| message == &snapshot));
+        for (id, name) in [("pending-b", "todo"), ("pending-a", "read")] {
+            runtime
+                .commit(
+                    agent,
+                    Message::Tool(vec![ToolResult {
+                        call_id: id.into(),
+                        name: name.into(),
+                        result: json!({"finished": id}),
+                        images: vec![],
+                        is_error: false,
+                    }]),
+                )
+                .await
+                .unwrap();
+        }
+        let projected = project_history(&fixture.records().await, agent);
+        let history = render_history(projected.history());
+        let Some(Sent::Tool(results)) = history.last() else {
+            panic!("real results follow the retained assistant")
+        };
+        assert!(
+            results
+                .iter()
+                .map(|result| result.call_id.as_str())
+                .eq(["pending-a", "pending-b"])
+        );
+        fixture.session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -419,7 +540,11 @@ mod tests {
         let (result, ()) = bounded(async {
             tokio::join!(fixture.compact(&cancellation), async {
                 fixture.script.request(1).await;
-                runtime.todos.replace(agent, updated.clone()).await.unwrap();
+                runtime
+                    .todos
+                    .replace(agent, updated.clone(), None)
+                    .await
+                    .unwrap();
                 for job in [job, root_job] {
                     let outcome = JobOutcome::Completed(ToolOutput::default());
                     runtime.jobs.finish(job, outcome).await.unwrap();
@@ -471,7 +596,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn structured_continuation_and_reconciled_todos_activate_together() {
+    async fn valid_nonshrinking_continuation_and_reconciled_todos_activate_together() {
         let markdown = "Next: inspect the queue.";
         let original = vec![todo("Investigate the queue", TodoStatus::InProgress)];
         let reconciled = vec![
@@ -480,24 +605,28 @@ mod tests {
         ];
         let mut continuation = summary_json();
         continuation["plan"] = json!([markdown]);
+        continuation["findings"] = json!(["Additional context for the continuation. ".repeat(500)]);
         continuation["todos"] = json!(reconciled);
         continuation["todo_reconciliation"] =
             json!(["Queue investigation finished; verification was committed but not recorded."]);
         let fixture = Fixture::new([Step::new(summary(continuation))]).await;
         let runtime = &fixture.session.runtime;
         let agent = &fixture.session.root;
-        fixture.add_history(20_000).await;
-        runtime.todos.replace(agent, original).await.unwrap();
+        runtime.todos.replace(agent, original, None).await.unwrap();
         let workspace = fixture.workspace.path();
         let store = &runtime.store;
         let child = crate::session::tests::start_child(store, agent, 1, None, workspace).await;
         let child_todos = vec![todo("Independent delegated work", TodoStatus::InProgress)];
         let todos = &runtime.todos;
-        todos.replace(&child, child_todos.clone()).await.unwrap();
+        todos
+            .replace(&child, child_todos.clone(), None)
+            .await
+            .unwrap();
         let before_sequence = fixture.records().await.last().unwrap().sequence;
         fixture.compact(&CancellationToken::new()).await.unwrap();
         let records = fixture.records().await;
         let checkpoint = checkpoint(&records);
+        assert!(checkpoint.after_tokens >= checkpoint.before_tokens);
         assert!(
             matches!(&checkpoint.message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserPart::Compaction { text } if text.contains(markdown) && !text.contains("Reasoning before the answer"))))
         );
@@ -526,7 +655,11 @@ mod tests {
         let agent = &fixture.session.root;
         assert!(fixture.script.request(0).await.tail.is_empty());
         fixture.add_history(20_000).await;
-        runtime.todos.replace(agent, current.clone()).await.unwrap();
+        runtime
+            .todos
+            .replace(agent, current.clone(), None)
+            .await
+            .unwrap();
         fixture.compact(&CancellationToken::new()).await.unwrap();
         let request = fixture.script.request(1).await;
         let sent = crate::agent::runtime::tests::rendered(&request);

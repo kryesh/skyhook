@@ -65,10 +65,10 @@ impl SessionHandle {
         Some(granted.for_agent(depth))
     }
 
-    /// Instruction and skill discovery diagnostics that must not write
-    /// directly to a terminal.
+    /// Model configuration, instruction, and skill diagnostics that must not
+    /// write directly to a terminal.
     pub fn warnings(&self) -> &[String] {
-        &self.runtime.harness.discovery_warnings
+        &self.runtime.harness.warnings
     }
 
     pub fn directory(&self) -> &Path {
@@ -1325,7 +1325,7 @@ mod tests {
         summary["todo_reconciliation"] = json!(["Inspection finished"]);
         summary["todos"] = json!(reconciled);
         let mut completed = answer("checkpoint installed");
-        let usage = usage(48_000, 2_000, 1_200);
+        let usage = usage(48_000, 2_000, 3_914);
         completed.insert(completed.len() - 1, ResponseEvent::Usage(usage));
         let responses = [completed, answer(summary.to_string()), answer("resumed")];
         let provider = scripted_provider(&requests, responses);
@@ -1340,10 +1340,16 @@ mod tests {
         let session = harness.new_session().await.unwrap();
         let todos = &session.runtime.todos;
         let root_todos = vec![todo("Inspect queue", TodoStatus::InProgress)];
-        todos.replace(&session.root, root_todos).await.unwrap();
+        todos
+            .replace(&session.root, root_todos, None)
+            .await
+            .unwrap();
         let child = start_child(&session, 1, None).await;
         let child_todos = vec![todo("Independent child work", TodoStatus::InProgress)];
-        todos.replace(&child, child_todos.clone()).await.unwrap();
+        todos
+            .replace(&child, child_todos.clone(), None)
+            .await
+            .unwrap();
         // Exceed the retention tail; only the high-usage response triggers the checkpoint.
         let history = AssistantItem::text("history", 0, "research ".repeat(40_000));
         let history = Message::Assistant(vec![history]);

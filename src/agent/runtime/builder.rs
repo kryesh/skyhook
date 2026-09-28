@@ -275,10 +275,19 @@ impl HarnessBuilder {
         let session_root = self
             .session_root
             .unwrap_or_else(|| crate::config::workspace_session_root(&workspace));
-        let (mut instructions, mut discovery_warnings) =
-            load_agent_instructions(&workspace).await?;
+        let (mut instructions, mut warnings) = load_agent_instructions(&workspace).await?;
         let skills = HostSkills::discover(&workspace).await;
-        discovery_warnings.extend_from_slice(skills.warnings());
+        warnings.extend_from_slice(skills.warnings());
+        for (name, entry) in &catalog.models {
+            let max_context = entry.profile.max_context.get();
+            let max_output = entry.profile.max_output.get();
+            if max_output >= max_context.div_ceil(2) {
+                warnings.push(format!(
+                    "Model `{name}`: max_output ({max_output}) is at least 50% of max_context ({max_context}); \
+                     most of the context window will not be used for input before compaction. Consider lowering max_output."
+                ));
+            }
+        }
         let target_definitions = self.targets.definitions()?;
         TargetRegistry::from_definitions(target_definitions.clone())?;
         instructions.extend(self.instructions);
@@ -301,7 +310,7 @@ impl HarnessBuilder {
                 mcp: self.mcp,
                 instructions,
                 skills,
-                discovery_warnings,
+                warnings,
                 max_child_depth: self.max_child_depth,
                 capabilities: self.capabilities,
                 modes: catalog.modes,
@@ -514,6 +523,45 @@ mod tests {
             assert_eq!((model.to_string().as_str(), error), expected, "{case}");
         }
         assert!(base().build().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn models_reserving_half_their_context_for_output_warn_whether_selected_or_not() {
+        let root = tempfile::tempdir().unwrap();
+        let cases = [
+            (100, 49, false),
+            (100, 50, true),
+            (101, 50, false),
+            (101, 51, true),
+        ];
+        let models = cases
+            .iter()
+            .enumerate()
+            .map(|(index, &(context, output, _))| {
+                (
+                    format!("case-{index}").parse().unwrap(),
+                    ModelProfile {
+                        max_context: crate::tests::limit(context),
+                        max_output: crate::tests::limit(output),
+                        ..crate::tests::profile("test", false)
+                    },
+                )
+            });
+        let harness = HarnessBuilder::new(root.path())
+            .provider("test".parse().unwrap(), Arc::new(HangingProvider), models)
+            .default_model("test/case-0".parse().unwrap())
+            .build()
+            .await
+            .unwrap();
+        for (index, &(context, output, warns)) in cases.iter().enumerate() {
+            let name = format!("Model `test/case-{index}`:");
+            let warned = harness.inner.warnings.iter().any(|warning| {
+                warning.starts_with(&name)
+                    && warning.contains(&format!("max_output ({output})"))
+                    && warning.contains(&format!("max_context ({context})"))
+            });
+            assert_eq!(warned, warns, "{context}/{output}");
+        }
     }
 
     #[tokio::test]

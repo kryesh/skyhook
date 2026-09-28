@@ -109,7 +109,6 @@ pub struct RequestStats {
 pub struct CompactionStats {
     pub requested: u64,
     pub completed: u64,
-    pub skipped: u64,
     pub failed: u64,
     pub before_tokens: u64,
     pub after_tokens: u64,
@@ -161,7 +160,6 @@ impl CompactionStats {
     fn add(&mut self, other: Self) {
         self.requested += other.requested;
         self.completed += other.completed;
-        self.skipped += other.skipped;
         self.failed += other.failed;
         self.before_tokens = self.before_tokens.saturating_add(other.before_tokens);
         self.after_tokens = self.after_tokens.saturating_add(other.after_tokens);
@@ -279,11 +277,6 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                         .compactions
                         .after_tokens
                         .saturating_add(checkpoint.after_tokens);
-                }
-            }
-            SessionEvent::CompactionSkipped { .. } => {
-                if let Some(stats) = agents.get_mut(agent) {
-                    stats.compactions.skipped += 1;
                 }
             }
             SessionEvent::CompactionFailed { .. } => {

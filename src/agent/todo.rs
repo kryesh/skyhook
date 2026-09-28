@@ -10,7 +10,10 @@ use crate::{
     Prose,
     identity::{AgentId, JobId},
     named_enum::named_enum,
-    session::{CompactionCheckpoint, EventRecord, SessionError, SessionEvent, SessionStore},
+    session::{
+        CompactionCheckpoint, EventRecord, MessageSeq, RecordSeq, SessionError, SessionEvent,
+        SessionStore,
+    },
     tool::{
         ToolError,
         diagnostic::{Effects, Operation, Subject},
@@ -39,6 +42,21 @@ pub struct TodoItem<Text = Prose> {
 struct AgentTodos {
     owner_job: Option<JobId>,
     items: Vec<TodoItem>,
+    /// The latest checkpoint's frontier: its summary reconciled every response up to it.
+    reconciled: RecordSeq,
+}
+
+/// Why a replacement was not applied.
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ReplaceError {
+    /// The summary that installed the current list already reconciled this replacement.
+    #[error(
+        "superseded: compaction reconciled the todo list after the response that issued this call; \
+         the current list already accounts for it, so do not retry"
+    )]
+    Superseded,
+    #[error(transparent)]
+    Session(#[from] SessionError),
 }
 
 pub(super) struct TodoStore {
@@ -56,7 +74,11 @@ impl TodoStore {
                     continue;
                 }
                 SessionEvent::TodosReplaced { items } => items,
-                SessionEvent::Compaction { checkpoint } => &checkpoint.todos,
+                SessionEvent::Compaction { checkpoint } => {
+                    agents.entry(record.agent.clone()).or_default().reconciled =
+                        checkpoint.frontier;
+                    &checkpoint.todos
+                }
                 _ => continue,
             };
             let state = agents.entry(record.agent.clone()).or_default();
@@ -91,14 +113,25 @@ impl TodoStore {
         Ok(())
     }
 
-    pub async fn replace(&self, agent: &AgentId, items: Vec<TodoItem>) -> Result<(), SessionError> {
+    /// Replace `agent`'s list on behalf of the response `issued_by`, if a model call
+    /// issued it. A checkpoint that reconciled that response supersedes it.
+    pub async fn replace(
+        &self,
+        agent: &AgentId,
+        items: Vec<TodoItem>,
+        issued_by: Option<MessageSeq>,
+    ) -> Result<(), ReplaceError> {
         // Hold the lock across persistence so published snapshots and replay agree on order.
         let mut agents = self.agents.lock().await;
+        let state = agents.entry(agent.clone()).or_default();
+        if issued_by.is_some_and(|message| RecordSeq::from(message) <= state.reconciled) {
+            return Err(ReplaceError::Superseded);
+        }
         let replaced = SessionEvent::TodosReplaced {
             items: items.clone(),
         };
         self.store.append(agent.clone(), replaced).await?;
-        agents.entry(agent.clone()).or_default().items = items;
+        state.items = items;
         Ok(())
     }
 
@@ -110,11 +143,12 @@ impl TodoStore {
         checkpoint: CompactionCheckpoint,
     ) -> Result<(), SessionError> {
         let mut agents = self.agents.lock().await;
-        let items = checkpoint.todos.clone();
+        let (items, reconciled) = (checkpoint.todos.clone(), checkpoint.frontier);
         self.store
             .append(agent.clone(), SessionEvent::Compaction { checkpoint })
             .await?;
-        agents.entry(agent.clone()).or_default().items = items;
+        let state = agents.entry(agent.clone()).or_default();
+        (state.items, state.reconciled) = (items, reconciled);
         Ok(())
     }
 
@@ -154,6 +188,40 @@ impl TodoStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restored store still knows which responses its latest checkpoint reconciled.
+    #[tokio::test]
+    async fn replacements_from_reconciled_responses_are_superseded() {
+        let fixture = crate::session::tests::MemorySession::new().await;
+        let checkpoint = CompactionCheckpoint {
+            frontier: RecordSeq::from(5),
+            message: crate::session::Message::User(Vec::new()),
+            todos: Vec::new(),
+            retained: Vec::new(),
+            attempt: crate::session::AttemptRef {
+                request: RecordSeq::from(4).request(),
+                attempt: 1,
+            },
+            before_tokens: 2,
+            after_tokens: 1,
+        };
+        let compaction = SessionEvent::Compaction { checkpoint };
+        let records = [crate::session::tests::record(&fixture.agent, 6, compaction)];
+        let todos = TodoStore::restore(fixture.store, &records);
+        let replace = |issued_by: Option<u64>| {
+            let items = vec![TodoItem {
+                text: "Next".parse().unwrap(),
+                status: TodoStatus::Pending,
+            }];
+            todos.replace(&fixture.agent, items, issued_by.map(MessageSeq::from))
+        };
+        assert!(matches!(
+            replace(Some(5)).await,
+            Err(ReplaceError::Superseded)
+        ));
+        replace(Some(6)).await.unwrap();
+        replace(None).await.unwrap();
+    }
 
     #[tokio::test]
     async fn rejections_identify_the_rejected_job() {

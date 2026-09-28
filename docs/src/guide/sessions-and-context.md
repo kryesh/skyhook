@@ -41,16 +41,30 @@ and where to resume. Recent conversation and the original calls for active work 
 context; historical tool calls are not executed again. Compaction also reconciles the agent's
 todo list against the conversation without changing child-agent lists.
 
-Automatic compaction runs after a successful model response whose reported **input + cached
-input + output tokens reach 80% of `max_context`**. This is the completed response's usage,
-not cumulative session usage or an estimate of the next request. It is independent of
-`max_output`. Without reported usage, there is no estimate-based automatic trigger. Tool calls
-from the response finish before compaction so their results are available to the summary and
-the next request. Text-only responses can also trigger compaction before the turn returns.
+Automatic compaction runs directly after a successful model response when:
+
+```text
+U = input tokens + cached input tokens + output tokens
+U >= 0.9 × (max_context - max_output)
+```
+
+This is the completed response's reported usage, not cumulative session usage or an estimate
+of the next request. Without reported usage, there is no estimate-based automatic trigger.
+Compaction runs before executing tool calls from that response. The summarizer sees the entire
+latest response and its pending calls, explicitly marked as not yet executed. It reconciles the
+current todo list with the conversation and any pending todo changes; its reconciled list takes
+priority over direct pending `todo` replacements. Those direct replacements fail as superseded,
+so they cannot overwrite that list. Todo reads and replacements invoked through scripts run
+normally; a scripted replacement can update the reconciled list. The original calls and their
+results are included in the first normal post-compaction request; the summary does not consume
+those future results. If compaction fails, the turn ends and those calls are recorded as not
+executed.
+Text-only responses can also trigger compaction before the turn returns.
 
 The provider still decides whether a request fits. A recognized context-overflow error can
 trigger compaction and retry, including for an oversized initial request or new tool output.
-Skyhook does not silently reduce `max_output`. The context meter in the terminal is an estimate
+Normal requests keep the configured `max_output`. Compaction requests can use a smaller output
+limit when less context space remains. The context meter in the terminal is an estimate
 for display, not the automatic compaction trigger. Configure
 [model limits](../configuration/providers-and-models.md) to match the endpoint you use.
 
@@ -61,11 +75,12 @@ messages remain in the session log, but there is no agent-callable history tool.
 summary can still be incomplete or inaccurate.
 
 Invalid, truncated, cancelled, or unsaved summaries leave the preceding context and todos
-active. A summary that would not reduce context is skipped rather than installed. The terminal
-reports compaction start, estimated input reduction, skips, and failures without printing the
-summary. Eligible compaction failures, such as a truncated or invalid summary, have a bounded
-retry policy, separate from transient model failures, which retry until success or
-cancellation. A refused or aborted summary is not retried. See
+active. Every valid, successfully persisted summary installs a checkpoint and its reconciled
+todos, even if the replacement context is not smaller. The terminal reports compaction start,
+estimated context size, and failures without printing the summary. Eligible compaction failures,
+such as a truncated or invalid summary, have a bounded retry policy, separate from transient
+model failures, which retry until success or cancellation. A refused or aborted summary is not
+retried. See
 [model failure recovery](../configuration/providers-and-models.md#model-failure-recovery).
 
 For persistence and request reconstruction internals, see
