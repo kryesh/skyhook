@@ -251,7 +251,7 @@ diagnostics and result slots registered by their producer, such as an expected `
 rendered only when the viewer's capabilities permit exposing them. Host-site wording is relative
 to the viewer's target: “on session host” is omitted for host-local viewers and retained for remote
 viewers. Pages of a value enclosing a diagnostic slot stream from the viewer's own rendering of
-the saved document; nothing capability-sensitive is cached.
+the saved document.
 
 This rendering boundary does not guarantee that target aliases never appear in a restricted view.
 A privileged `jobs` output read saves its rendered view as an ordinary JSON snapshot. Later
@@ -309,8 +309,7 @@ of the caller, so dropping an await does not cancel a commit already in progress
 A writer lock excludes competing session owners, not read-only snapshot inspection. Closing the
 store rolls back any abandoned transaction and makes its shared SQLite connection read-only before
 releasing that lock, so retained output handles cannot write into a reopened session. Saved output
-can still be read; any derived rendering needed after close uses private temporary storage rather
-than being cached in the closed store. If a write's outcome becomes uncertain, the writer requires recovery
+can still be read. If a write's outcome becomes uncertain, the writer requires recovery
 instead of allowing later appends to pretend the commit failed. On resume, the runtime reconciles unfinished model attempts and
 committed tool calls lacking results before any agent runs. Agents retain their journaled prompt,
 tools, and capability contract; current configuration can narrow that contract, not silently

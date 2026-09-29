@@ -250,7 +250,7 @@ mod tests {
 
         let privileged: CapabilitySet = [Capability::Targets].into_iter().collect();
         let restricted = CapabilitySet::default();
-        // Alternating readers must never observe another capability's cached rendering.
+        // Alternating readers must never observe another capability's rendering.
         let views = async |jobs: &JobManager| {
             let mut views = Vec::new();
             for caps in [&privileged, &restricted, &privileged] {

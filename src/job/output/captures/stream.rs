@@ -64,15 +64,8 @@ impl PendingCapture {
         kind: CaptureKind,
     ) -> io::Result<Self> {
         Ok(Self::new(
-            StoredCapture::reserve(output, field, kind, false)?,
+            StoredCapture::reserve(output, field, kind)?,
             Abandon::Retain,
-        ))
-    }
-
-    pub(crate) fn rendering(output: &Output, field: &FieldPointer) -> io::Result<Self> {
-        Ok(Self::new(
-            StoredCapture::reserve(output, field, CaptureKind::Unknown, true)?,
-            Abandon::Discard,
         ))
     }
 }
@@ -84,15 +77,10 @@ pub(crate) struct StoredCapture {
 }
 
 impl StoredCapture {
-    fn reserve(
-        output: &Output,
-        field: &FieldPointer,
-        kind: CaptureKind,
-        rendered: bool,
-    ) -> io::Result<Self> {
+    fn reserve(output: &Output, field: &FieldPointer, kind: CaptureKind) -> io::Result<Self> {
         let capture = output
             .db
-            .create_capture(output.job.get(), field, kind, rendered)
+            .create_capture(output.job.get(), field, kind)
             .map_err(database)?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::AlreadyExists, "capture field is reserved")
@@ -164,7 +152,7 @@ impl JobManager {
         let output = self.output(job);
         crate::job::output::blocking(move || {
             Ok(PendingCapture::new(
-                StoredCapture::reserve(&output, &field, kind, false)?,
+                StoredCapture::reserve(&output, &field, kind)?,
                 Abandon::Discard,
             ))
         })
@@ -289,7 +277,6 @@ impl OutputSink for CaptureCollector {
                     &self.output,
                     &field,
                     kind,
-                    false,
                 )?));
             }
             CaptureEvent::Write { id, data } => writing(&mut captures, id)?.append(&data)?,
@@ -321,7 +308,7 @@ mod tests {
 
     fn text(output: &Output, field: TextCaptureField) -> PendingCapture {
         PendingCapture::new(
-            StoredCapture::reserve(output, &field.pointer(), CaptureKind::Text, false).unwrap(),
+            StoredCapture::reserve(output, &field.pointer(), CaptureKind::Text).unwrap(),
             Abandon::Discard,
         )
     }

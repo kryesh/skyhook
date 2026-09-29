@@ -26,8 +26,7 @@ pub use products::{
     OutputPreview, OutputSelection, OutputTruncation, PageLines, PresentedOutput,
 };
 pub(crate) use projection::complete_fields;
-pub(crate) use reader::Source;
-use render::disk_rendering;
+use reader::Source;
 pub(super) use saved::blocking;
 pub use saved::diagnostic_slot;
 pub(crate) use saved::{DiagnosticSlot, Output, Saved, diagnostic_slot_in, presented_size};
@@ -430,9 +429,7 @@ fn page(
                 "field is text: query applies to a JSON object or array",
             )),
             (_, Some(selection)) => {
-                let source = text.source(cancellation)?;
-                reader::page(Some(source), &selection, closed, cancellation)
-                    .map(OutputPreview::Lines)
+                reader::page(Some(text), &selection, closed, cancellation).map(OutputPreview::Lines)
             }
             (_, None) => Err(ToolError::invalid_arguments(
                 "field is text: page it with start and offset, not index",
@@ -846,7 +843,7 @@ mod tests {
         }
 
         // The whole document pages as members, streamed from its captures, so a
-        // presented diagnostic is each viewer's own and nothing shared is saved.
+        // presented diagnostic is each viewer's own.
         let output = manager.output(id);
         let mut saved = Saved::load(&output).unwrap();
         saved.diagnostic_fields.insert(diagnostic_slot());
@@ -869,7 +866,6 @@ mod tests {
             };
             assert_eq!(page.members["result"]["error"]["message"], message);
         }
-        assert_eq!(output.db.rendering(id.get(), &root).unwrap(), None);
     }
 
     /// Selectors follow the selected field's unit, queries apply to JSON, and a

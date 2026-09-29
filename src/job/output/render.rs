@@ -62,7 +62,7 @@ pub(super) struct Spliced {
 
 enum Part {
     Inline(Cursor<Vec<u8>>),
-    Json(Source),
+    Json(Box<dyn Read>),
     Text(EscapedText),
 }
 
@@ -79,11 +79,11 @@ impl Spliced {
         value: &Value,
         reading: Reading<'_>,
     ) -> Result<(), ToolError> {
-        if let Some(source) = saved.stored(field)? {
+        if let Some(source) = saved.stored(field) {
             self.flush();
             let part = match (value.is_string(), reading.clips(field)) {
                 (false, _) => Part::Json(source),
-                (true, false) => Part::Text(EscapedText::new(Box::new(source))),
+                (true, false) => Part::Text(EscapedText::new(source)),
                 (true, true) => {
                     let capture = saved
                         .captures
@@ -250,8 +250,7 @@ pub(super) enum Resolved {
 /// A text field's bytes.
 pub(super) enum TextField {
     Bytes(Source),
-    /// A reader positioned at a string inside a stored container, copied only
-    /// when it is paged.
+    /// A reader positioned at a string inside a stored container.
     Stored(Box<JsonField>),
 }
 
@@ -264,35 +263,6 @@ impl Resolved {
             _ => return Err(saved_json("a stored field is not an object or array")),
         };
         Ok(Self::Json { json, container })
-    }
-}
-
-impl TextField {
-    /// The field's bytes: a string inside a stored container is copied once to
-    /// disk, so text pages can seek within it.
-    pub(super) fn source(
-        self,
-        cancellation: &crate::job::CancellationToken,
-    ) -> Result<Source, ToolError> {
-        let mut json = match self {
-            Self::Bytes(source) => return Ok(source),
-            Self::Stored(json) => json,
-        };
-        let mut file = tempfile::tempfile()?;
-        let mut input = json.reader.next_string_reader().map_err(saved_json)?;
-        let mut buffer = vec![0; IO_BUFFER_BYTES];
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(ToolError::cancelled());
-            }
-            let count = input.read(&mut buffer)?;
-            if count == 0 {
-                break;
-            }
-            file.write_all(&buffer[..count])?;
-        }
-        std::io::Seek::rewind(&mut file)?;
-        Ok(Source::Temporary(file))
     }
 }
 
@@ -391,9 +361,9 @@ pub(super) fn resolve(
         && value.is_some_and(|value| value.is_object() || value.is_array())
     {
         let source = saved
-            .stored(field)?
+            .stored(field)
             .ok_or_else(|| ToolError::failed("saved output field is missing"))?;
-        return Resolved::json(JsonField::new(Box::new(source), Clipped::new())).map(Some);
+        return Resolved::json(JsonField::new(source, Clipped::new())).map(Some);
     }
     // Other captures, live or unfinished ones included, are their saved bytes.
     if let Some(source) = saved.capture(field) {
@@ -493,90 +463,5 @@ fn descend<R: Read>(
             reader.has_next().map_err(saved_json)
         }
         _ => Ok(false),
-    }
-}
-
-/// A rendering of the saved value at `field`, cached in the session.
-pub(super) fn disk_rendering(
-    saved: &Saved,
-    field: &FieldPointer,
-    write: impl FnOnce(&mut dyn Write) -> Result<(), ToolError>,
-) -> Result<Source, ToolError> {
-    let db = &saved.output.db;
-    if let Some(capture) = db
-        .rendering(saved.output.job.get(), field)
-        .map_err(database)?
-    {
-        return Ok(Source::Capture(reader::CaptureReader::new(
-            db.clone(),
-            capture,
-        )));
-    }
-    // Cache reservations are optional: contention or an unavailable cache can
-    // still use private disk storage, without buffering the whole output.
-    if let Ok(pending) = PendingCapture::rendering(&saved.output, field) {
-        let mut writer = pending.open();
-        write(&mut writer)?;
-        let capture = writer.finish()?.capture_id();
-        return Ok(Source::Capture(reader::CaptureReader::new(
-            db.clone(),
-            capture,
-        )));
-    }
-    let mut writer = std::io::BufWriter::new(tempfile::tempfile()?);
-    write(&mut writer)?;
-    let mut file = writer.into_inner().map_err(|error| error.into_error())?;
-    std::io::Seek::rewind(&mut file)?;
-    Ok(Source::Temporary(file))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Read as _;
-
-    /// Source failures still fail the read and leave its cache reservation reusable.
-    #[tokio::test]
-    async fn rendering_source_errors_propagate_without_poisoning_the_cache() {
-        let (_root, manager, id) = super::super::tests::fixture(Some(json!({}))).await;
-        manager.drain_supervisors().await;
-        let output = manager.output(id);
-        let saved = Saved::load(&output).unwrap();
-        let field = FieldPointer::result().property("sequence");
-        let failed = disk_rendering(&saved, &field, |writer| {
-            Ok(json::write_sequence(b"invalid JSON".as_slice(), writer)?)
-        });
-        assert!(failed.is_err());
-        assert_eq!(output.db.rendering(id.get(), &field).unwrap(), None);
-        let mut source = disk_rendering(&saved, &field, |writer| {
-            Ok(json::write_sequence(b"[1]\n[2]".as_slice(), writer)?)
-        })
-        .unwrap();
-        assert!(matches!(source, Source::Capture(_)));
-        let value: Value = serde_json::from_reader(&mut source).unwrap();
-        assert_eq!(value, json!([[1], [2]]));
-        assert!(output.db.rendering(id.get(), &field).unwrap().is_some());
-    }
-
-    /// Closing forbids cache writes, not reading a field that has never been rendered.
-    #[tokio::test]
-    async fn closed_output_still_renders_without_writing_a_cache() {
-        let (_root, manager, id) =
-            super::super::tests::fixture(Some(json!({"text": "saved"}))).await;
-        manager.drain_supervisors().await;
-        let output = manager.output(id);
-        let saved = Saved::load(&output).unwrap();
-        manager.store().close().await.unwrap();
-        let field = FieldPointer::result().property("text");
-        let mut source = disk_rendering(&saved, &field, |writer| {
-            writer.write_all(b"saved")?;
-            Ok(())
-        })
-        .unwrap();
-        assert!(matches!(source, Source::Temporary(_)));
-        let mut text = String::new();
-        source.read_to_string(&mut text).unwrap();
-        assert_eq!(text, "saved");
-        assert_eq!(output.db.rendering(id.get(), &field).unwrap(), None);
     }
 }

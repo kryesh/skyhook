@@ -32,7 +32,7 @@ pub use state::{SessionSummary, SessionTitle};
 pub(super) use state::{stopped_turn, summary, title};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 18;
+pub(super) const USER_VERSION: i64 = 19;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
@@ -839,8 +839,7 @@ mod tests {
             let entry = "INSERT INTO entry (seq, public_id, agent, created_millis, kind) \
                          VALUES (?1, randomblob(16), (SELECT min(id) FROM agent), 0, ?2)";
             fixture.db.execute(entry, params![seq, kind]).unwrap();
-            let failure = "INSERT INTO failure (entry, kind, failure, detailed) \
-                           VALUES (?1, ?2, 'empty', 0)";
+            let failure = "INSERT INTO failure (entry, kind, failure) VALUES (?1, ?2, 'empty')";
             let inserted = fixture.db.execute(failure, params![seq, kind]);
             assert_eq!(inserted.is_ok(), accepted, "{kind}");
         }
@@ -877,13 +876,8 @@ mod tests {
             images: Vec::new(),
         };
         let state = |state| SessionEvent::JobStateChanged { job, state };
-        let generation = |fixture: &Fixture| {
-            let sql = "SELECT generation FROM job_generation WHERE job = 1";
-            let row = fixture
-                .db
-                .query_row(sql, Vec::new(), |row| Ok(row.get::<i64>(0)?));
-            row.unwrap().unwrap()
-        };
+        let generation =
+            |fixture: &Fixture| super::output::generation(&fixture.db, job.get()).unwrap();
         for (event, expected) in [
             (state(JobTransition::Running), 0),
             (state(JobTransition::WaitingInput), 0),

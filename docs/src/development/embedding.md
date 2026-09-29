@@ -107,7 +107,7 @@ A root turn that failed or was interrupted before the session closed can still b
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases use format 18. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 19. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 

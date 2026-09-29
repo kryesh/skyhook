@@ -156,9 +156,9 @@ impl Encoder {
 fn failure(db: &Db, entry: Entry, failure: &Failure) -> DbResult<()> {
     let (kind, (detail, class)) = (failure.kind(), failure.parts());
     db.execute(
-        "INSERT INTO failure (entry, kind, failure, detailed, detail, provider) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![entry.seq, entry.kind, kind, kind.detailed(), detail, class],
+        "INSERT INTO failure (entry, kind, failure, detail, provider) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![entry.seq, entry.kind, kind, detail, class],
     )
     .map(drop)
 }
@@ -207,16 +207,9 @@ fn compaction_failure(
     let kind = fault.kind();
     let (detail, _) = fault.parts();
     db.execute(
-        "INSERT INTO compaction_failure (entry, request, attempt, fault, detailed, detail) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![
-            seq,
-            failure.request(),
-            attempt,
-            kind,
-            kind.detailed(),
-            detail
-        ],
+        "INSERT INTO compaction_failure (entry, request, attempt, fault, detail) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![seq, failure.request(), attempt, kind, detail],
     )
     .map(drop)
 }
@@ -405,11 +398,11 @@ mod tests {
             unreachable!()
         };
         let (checkpoint, stale) = (FaultKind::Checkpoint, Some("stale_todos"));
-        for (seq, attempt, detailed, detail, accepted) in [
-            (100_u64, other, true, stale, false),
-            (101, own, false, None, false),
-            (102, own, true, Some("not_a_checkpoint_error"), false),
-            (103, own, true, stale, true),
+        for (seq, attempt, detail, accepted) in [
+            (100_u64, other, stale, false),
+            (101, own, None, false),
+            (102, own, Some("not_a_checkpoint_error"), false),
+            (103, own, stale, true),
         ] {
             let kind = EntryKind::CompactionFailed;
             fixture
@@ -421,10 +414,9 @@ mod tests {
                 )
                 .unwrap();
             let inserted = fixture.db.execute(
-                "INSERT INTO compaction_failure \
-                 (entry, request, attempt, fault, detailed, detail) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                params![seq, request, attempt, checkpoint, detailed, detail],
+                "INSERT INTO compaction_failure (entry, request, attempt, fault, detail) \
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![seq, request, attempt, checkpoint, detail],
             );
             assert_eq!(inserted.is_ok(), accepted, "{seq}");
         }

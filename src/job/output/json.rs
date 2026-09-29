@@ -6,14 +6,11 @@ use std::{
     cell::RefCell,
     collections::HashSet,
     hash::{BuildHasher, RandomState},
-    io::{self, Read, Write},
+    io::{self, BufRead, Read},
 };
 
 use serde_json::Value;
-use struson::{
-    reader::{JsonReader, JsonStreamReader, ReaderSettings, ValueType},
-    writer::{JsonStreamWriter, JsonWriter},
-};
+use struson::reader::{JsonReader, JsonStreamReader, ReaderSettings, ValueType};
 
 use super::ToolError;
 use crate::named_enum::named_enum;
@@ -87,28 +84,92 @@ pub(crate) fn parse_text(text: &str) -> Option<Value> {
     }
 }
 
-/// Write a detected `Sequence` as the array it is read as, keeping every token's spelling.
-pub(crate) fn write_sequence(input: impl Read, output: impl Write) -> io::Result<()> {
-    let failure = RefCell::new(None);
-    let mut reader = detecting(input, &failure);
-    let mut writer = JsonStreamWriter::new(output);
-    let written = (|| -> Result<(), Box<dyn std::error::Error>> {
-        writer.begin_array()?;
-        let mut first = true;
-        while first || reader.has_next()? {
-            reader.transfer_to(&mut writer)?;
-            first = false;
+/// A detected `Sequence` read as the array it presents, keeping every byte of its
+/// values. Detection already validated the input as whitespace-separated objects
+/// and arrays, so only string and nesting state decide where commas go.
+pub(super) struct SequenceArray<R> {
+    input: R,
+    stage: Stage,
+    scan: Scan,
+    depth: u32,
+    /// A top-level value ended, so the next one is preceded by a comma.
+    separate: bool,
+}
+
+enum Stage {
+    Open,
+    Values,
+    Closed,
+}
+
+/// What the previous byte left the scan inside.
+#[derive(Clone, Copy)]
+enum Scan {
+    Structure,
+    String,
+    Escape,
+}
+
+impl<R: BufRead> SequenceArray<R> {
+    pub(super) fn new(input: R) -> Self {
+        Self {
+            input,
+            stage: Stage::Open,
+            scan: Scan::Structure,
+            depth: 0,
+            separate: false,
         }
-        writer.end_array()?;
-        writer.finish_document()?;
-        Ok(())
-    })();
-    drop(reader);
-    if let Some(error) = failure.into_inner() {
-        return Err(error);
     }
-    // Detection already validated these bytes, so any other failure is the output's.
-    written.map_err(|error| io::Error::other(error.to_string()))
+}
+
+impl<R: BufRead> Read for SequenceArray<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+        let Some(first) = buffer.first_mut() else {
+            return Ok(0);
+        };
+        match self.stage {
+            Stage::Open => {
+                *first = b'[';
+                self.stage = Stage::Values;
+                return Ok(1);
+            }
+            Stage::Closed => return Ok(0),
+            Stage::Values => {}
+        }
+        let bytes = self.input.fill_buf()?;
+        if bytes.is_empty() {
+            *first = b']';
+            self.stage = Stage::Closed;
+            return Ok(1);
+        }
+        let (mut read, mut written) = (0, 0);
+        while read < bytes.len() && written < buffer.len() {
+            let byte = bytes[read];
+            match (self.scan, byte) {
+                (Scan::Escape, _) => self.scan = Scan::String,
+                (Scan::String, b'\\') => self.scan = Scan::Escape,
+                (Scan::String, b'"') => self.scan = Scan::Structure,
+                (Scan::String, _) => {}
+                (Scan::Structure, b'{' | b'[') if self.depth == 0 && self.separate => {
+                    buffer[written] = b',';
+                    written += 1;
+                    self.separate = false;
+                    continue;
+                }
+                (Scan::Structure, b'"') => self.scan = Scan::String,
+                (Scan::Structure, b'{' | b'[') => self.depth += 1,
+                (Scan::Structure, b'}' | b']') => {
+                    self.depth -= 1;
+                    self.separate = self.depth == 0;
+                }
+                (Scan::Structure, _) => {}
+            }
+            buffer[written] = byte;
+            (read, written) = (read + 1, written + 1);
+        }
+        self.input.consume(read);
+        Ok(written)
+    }
 }
 
 /// A streaming reader over one saved JSON value.
@@ -322,14 +383,28 @@ mod tests {
         }
     }
 
+    /// Brackets and quotes inside strings are text, and a one-byte buffer still
+    /// sees every comma.
     #[test]
-    fn sequences_are_written_as_the_array_they_are_read_as() {
-        let text = "{\"id\": 1e100, \"s\": \"a\\u00e9\"}\n\n[1.50,\n 2]\n";
-        let mut array = Vec::new();
-        write_sequence(text.as_bytes(), &mut array).unwrap();
+    fn sequences_read_as_the_array_they_present() {
+        let text = "{\"s\": \"}{\\\"[\\\\\"}\n\n[1.50,\n [2]]{}\n";
+        let expected = "[{\"s\": \"}{\\\"[\\\\\"}\n\n,[1.50,\n [2]],{}\n]";
+        let mut whole = String::new();
+        SequenceArray::new(text.as_bytes())
+            .read_to_string(&mut whole)
+            .unwrap();
+        assert_eq!(whole, expected);
+        let mut bytewise = Vec::new();
+        let mut byte = [0];
+        let mut array = SequenceArray::new(text.as_bytes());
+        while array.read(&mut byte).unwrap() == 1 {
+            bytewise.push(byte[0]);
+        }
+        assert_eq!(bytewise, expected.as_bytes());
+        let value: Value = serde_json::from_str(&whole).unwrap();
         assert_eq!(
-            String::from_utf8(array).unwrap(),
-            r#"[{"id":1e100,"s":"aé"},[1.50,2]]"#
+            value,
+            serde_json::json!([{"s": "}{\"[\\"}, [1.50, [2]], {}])
         );
     }
 

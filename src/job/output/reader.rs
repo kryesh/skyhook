@@ -1,150 +1,42 @@
 //! Stateless line reads over immutable or append-only saved fields.
 use super::*;
+use super::{json::saved_json, render::TextField};
 use grep_matcher::Matcher as _;
 use std::{
     collections::VecDeque,
-    io::{BufRead, Cursor, Seek, SeekFrom},
+    io::{BufRead, Cursor},
 };
+use struson::reader::JsonReader as _;
 
 const READ_AHEAD: usize = 256 * 1024;
 /// The longest source line a pattern is matched against.
 const REGEX_LINE_BYTES: usize = 4 * 1024 * 1024;
 
-/// A pageable field: a stored capture, or a value rendered on demand.
-pub(crate) enum Source {
+/// A pageable field: a stored capture, or a value held in memory.
+pub(super) enum Source {
     Capture(CaptureReader),
-    /// Private renderings never enter shared storage; closing the file discards them.
-    Temporary(std::fs::File),
     Memory(Cursor<Vec<u8>>),
 }
 
 /// The readable extent observed when a page starts; later appends are left for
 /// the next page.
-pub(super) struct LineIndex {
+#[derive(Clone, Copy)]
+struct LineIndex {
     bytes: u64,
-    pub(super) total_lines: usize,
-}
-
-impl Source {
-    pub(super) fn index(
-        &mut self,
-        cancellation: &super::super::CancellationToken,
-    ) -> Result<LineIndex, ToolError> {
-        check_cancelled(cancellation)?;
-        Ok(match self {
-            Self::Capture(capture) => {
-                let extent = capture
-                    .db
-                    .capture_extent(capture.capture)
-                    .map_err(std::io::Error::other)?;
-                LineIndex {
-                    bytes: extent.bytes,
-                    total_lines: usize::try_from(extent.newlines).unwrap_or(usize::MAX)
-                        + usize::from(extent.bytes > 0 && !extent.ends_line),
-                }
-            }
-            Self::Temporary(file) => {
-                let position = file.stream_position()?;
-                file.rewind()?;
-                let mut reader = BufReader::new(file);
-                let mut index = LineIndex {
-                    bytes: 0,
-                    total_lines: 0,
-                };
-                let mut ends_line = true;
-                loop {
-                    check_cancelled(cancellation)?;
-                    let bytes = reader.fill_buf()?;
-                    if bytes.is_empty() {
-                        break;
-                    }
-                    index.bytes += bytes.len() as u64;
-                    index.total_lines += bytes.iter().filter(|&&byte| byte == b'\n').count();
-                    ends_line = bytes.last() == Some(&b'\n');
-                    let count = bytes.len();
-                    reader.consume(count);
-                }
-                index.total_lines += usize::from(!ends_line);
-                reader.seek(SeekFrom::Start(position))?;
-                index
-            }
-            Self::Memory(cursor) => {
-                let bytes = cursor.get_ref();
-                LineIndex {
-                    bytes: bytes.len() as u64,
-                    total_lines: bytes.iter().filter(|&&byte| byte == b'\n').count()
-                        + usize::from(bytes.last().is_some_and(|&byte| byte != b'\n')),
-                }
-            }
-        })
-    }
-
-    /// A position at or before the start of one-based `line`, and its line number.
-    fn checkpoint(&self, line: usize) -> Result<(u64, usize), ToolError> {
-        match self {
-            Self::Capture(capture) => {
-                let (offset, line) = capture
-                    .db
-                    .capture_line(capture.capture, line as u64)
-                    .map_err(std::io::Error::other)?;
-                Ok((offset, usize::try_from(line).unwrap_or(usize::MAX)))
-            }
-            Self::Temporary(_) | Self::Memory(_) => Ok((0, 1)),
-        }
-    }
-
-    fn seek_line(
-        reader: &mut BufReader<Self>,
-        index: &LineIndex,
-        line: usize,
-        cancellation: &super::super::CancellationToken,
-    ) -> Result<(), ToolError> {
-        let (offset, mut current) = reader.get_ref().checkpoint(line)?;
-        reader.seek(SeekFrom::Start(offset))?;
-        while current < line && reader.stream_position()? < index.bytes {
-            check_cancelled(cancellation)?;
-            let remaining =
-                (index.bytes - reader.stream_position()?).min(usize::MAX as u64) as usize;
-            let buffer = reader.fill_buf()?;
-            let buffer = &buffer[..buffer.len().min(remaining)];
-            if buffer.is_empty() {
-                break;
-            }
-            let count = buffer
-                .iter()
-                .position(|&b| b == b'\n')
-                .map_or(buffer.len(), |n| {
-                    current += 1;
-                    n + 1
-                });
-            reader.consume(count);
-        }
-        Ok(())
-    }
+    total_lines: usize,
 }
 
 impl Read for Source {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
         match self {
             Self::Capture(capture) => capture.read(buffer),
-            Self::Temporary(file) => file.read(buffer),
             Self::Memory(cursor) => cursor.read(buffer),
         }
     }
 }
 
-impl Seek for Source {
-    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        match self {
-            Self::Capture(capture) => capture.seek(position),
-            Self::Temporary(file) => file.seek(position),
-            Self::Memory(cursor) => cursor.seek(position),
-        }
-    }
-}
-
 /// Reads one capture's chunks on demand, holding the connection only per fetch.
-pub(crate) struct CaptureReader {
+pub(super) struct CaptureReader {
     db: crate::session::SharedDb,
     capture: i64,
     position: u64,
@@ -159,6 +51,24 @@ impl CaptureReader {
             position: 0,
             cached: (0, Vec::new()),
         }
+    }
+
+    fn index(&self) -> Result<LineIndex, ToolError> {
+        let extent = (self.db.capture_extent(self.capture)).map_err(std::io::Error::other)?;
+        Ok(LineIndex {
+            bytes: extent.bytes,
+            total_lines: usize::try_from(extent.newlines).unwrap_or(usize::MAX)
+                + usize::from(extent.bytes > 0 && !extent.ends_line),
+        })
+    }
+
+    /// Position the reader at or before the start of one-based `line`, returning
+    /// that offset and its line number.
+    fn checkpoint(&mut self, line: usize) -> Result<(u64, usize), ToolError> {
+        let (offset, line) =
+            (self.db.capture_line(self.capture, line as u64)).map_err(std::io::Error::other)?;
+        self.position = offset;
+        Ok((offset, usize::try_from(line).unwrap_or(usize::MAX)))
     }
 }
 
@@ -194,25 +104,6 @@ impl Read for CaptureReader {
         buffer[..count].copy_from_slice(&available[..count]);
         self.position += count as u64;
         Ok(count)
-    }
-}
-
-impl Seek for CaptureReader {
-    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
-        let target = match position {
-            SeekFrom::Start(offset) => Some(offset),
-            SeekFrom::Current(delta) => self.position.checked_add_signed(delta),
-            SeekFrom::End(delta) => self
-                .db
-                .capture_extent(self.capture)
-                .map_err(std::io::Error::other)?
-                .bytes
-                .checked_add_signed(delta),
-        };
-        self.position = target.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid capture seek")
-        })?;
-        Ok(self.position)
     }
 }
 
@@ -268,46 +159,131 @@ fn invalid_offset() -> ToolError {
     )
 }
 
-fn seek_offset(
-    reader: &mut BufReader<Source>,
-    offset: usize,
-    end: u64,
-    cancellation: &super::super::CancellationToken,
-) -> Result<(), ToolError> {
-    let mut remaining = offset;
-    let mut previous = None;
-    while remaining > 0 {
-        check_cancelled(cancellation)?;
-        let available = (end - reader.stream_position()?).min(usize::MAX as u64) as usize;
-        let buffer = reader.fill_buf()?;
-        let count = remaining.min(buffer.len()).min(available);
-        if count == 0 || buffer[..count].contains(&b'\n') {
-            return Err(invalid_offset());
+/// A text field read forward from a checkpoint, counting the lines it passes.
+struct Text<R> {
+    reader: R,
+    /// The line the next byte belongs to.
+    line: usize,
+    /// Whether the next byte starts a line. A checkpoint may fall inside its line,
+    /// but only before the line a page skips to, so this is exact once it matters.
+    line_start: bool,
+    /// The field's line count, when its extent was indexed up front.
+    total: Option<usize>,
+}
+
+impl<R: BufRead> Text<R> {
+    fn new(reader: R, line: usize, total: Option<usize>) -> Self {
+        Self {
+            reader,
+            line,
+            line_start: true,
+            total,
         }
-        previous = Some(buffer[count - 1]);
-        reader.consume(count);
-        remaining -= count;
     }
-    if reader.stream_position()? < end {
-        let next = reader.fill_buf()?.first().copied();
-        if next.is_some_and(|b| b & 0xc0 == 0x80)
-            || (previous == Some(b'\r') && next == Some(b'\n'))
-        {
-            return Err(invalid_offset());
+
+    /// Append the next piece of at most `maximum` bytes to `out`: up to and
+    /// including a newline, or as far as the text goes.
+    fn piece(&mut self, maximum: usize, out: &mut Vec<u8>) -> std::io::Result<usize> {
+        let start = out.len();
+        (&mut self.reader)
+            .take(maximum as u64)
+            .read_until(b'\n', out)?;
+        if let Some(&last) = out[start..].last() {
+            self.line_start = last == b'\n';
+            self.line += usize::from(self.line_start);
         }
+        Ok(out.len() - start)
+    }
+
+    fn at_end(&mut self) -> std::io::Result<bool> {
+        Ok(self.reader.fill_buf()?.is_empty())
+    }
+
+    fn skip_to(
+        &mut self,
+        line: usize,
+        cancellation: &super::super::CancellationToken,
+    ) -> Result<(), ToolError> {
+        let mut skipped = Vec::new();
+        while self.line < line {
+            check_cancelled(cancellation)?;
+            skipped.clear();
+            if self.piece(IO_BUFFER_BYTES, &mut skipped)? == 0 {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `line`, which this text was just skipped to, does not exist.
+    fn beyond(&mut self, line: usize) -> std::io::Result<bool> {
+        Ok(self.line < line || (self.line_start && self.at_end()?))
+    }
+
+    /// The field's line count: as indexed, or read through to the end.
+    fn total(
+        &mut self,
+        cancellation: &super::super::CancellationToken,
+    ) -> Result<usize, ToolError> {
+        if let Some(total) = self.total {
+            return Ok(total);
+        }
+        let mut skipped = Vec::new();
+        loop {
+            check_cancelled(cancellation)?;
+            skipped.clear();
+            if self.piece(IO_BUFFER_BYTES, &mut skipped)? == 0 {
+                return Ok(self.line - usize::from(self.line_start));
+            }
+        }
+    }
+
+    fn read_piece(&mut self, maximum: usize) -> std::io::Result<Vec<u8>> {
+        let mut raw = Vec::new();
+        self.piece(maximum, &mut raw)?;
+        Ok(raw)
+    }
+
+    fn seek_offset(
+        &mut self,
+        offset: usize,
+        cancellation: &super::super::CancellationToken,
+    ) -> Result<(), ToolError> {
+        let mut remaining = offset;
+        let mut previous = None;
+        while remaining > 0 {
+            check_cancelled(cancellation)?;
+            let buffer = self.reader.fill_buf()?;
+            let count = remaining.min(buffer.len());
+            if count == 0 || buffer[..count].contains(&b'\n') {
+                return Err(invalid_offset());
+            }
+            previous = Some(buffer[count - 1]);
+            self.reader.consume(count);
+            self.line_start = false;
+            remaining -= count;
+        }
+        check_offset_end(previous, self.reader.fill_buf()?.first().copied())
+    }
+}
+
+/// An offset may not split a character or a CRLF terminator.
+fn check_offset_end(previous: Option<u8>, next: Option<u8>) -> Result<(), ToolError> {
+    if next.is_some_and(|byte| byte & 0xc0 == 0x80)
+        || (previous == Some(b'\r') && next == Some(b'\n'))
+    {
+        return Err(invalid_offset());
     }
     Ok(())
 }
 
-fn read_piece(
-    reader: &mut BufReader<Source>,
-    end: u64,
-    maximum: usize,
-) -> Result<Vec<u8>, ToolError> {
-    let count = (end - reader.stream_position()?).min(maximum as u64);
-    let mut raw = Vec::new();
-    reader.take(count).read_until(b'\n', &mut raw)?;
-    Ok(raw)
+/// Validate `offset` against a starting line read whole, or as far as it exists.
+fn check_offset(raw: &[u8], offset: usize) -> Result<(), ToolError> {
+    if offset > raw.len() || raw[..offset].contains(&b'\n') {
+        return Err(invalid_offset());
+    }
+    let previous = offset.checked_sub(1).map(|index| raw[index]);
+    check_offset_end(previous, raw.get(offset).copied())
 }
 
 // Prefer a whole line, and only fragment on an otherwise empty page. Account for
@@ -357,41 +333,90 @@ fn fit_line(
 }
 
 pub(super) fn page(
-    source: Option<Source>,
+    text: Option<TextField>,
     selection: &Selection,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
 ) -> Result<LinePage, ToolError> {
-    let Some(mut source) = source else {
-        return Ok(empty(
+    match text {
+        None => Ok(empty(
             selection,
             if terminal { Some(0) } else { None },
             terminal,
-        ));
-    };
-    let index = source.index(cancellation)?;
-    let mut reader = BufReader::with_capacity(IO_BUFFER_BYTES, source);
-    if selection.start > index.total_lines {
-        if selection.offset != 0 {
-            return Err(invalid_offset());
+        )),
+        Some(TextField::Bytes(Source::Capture(capture))) => {
+            let index = capture.index()?;
+            observed(capture, index, selection, terminal, cancellation)
         }
-        return Ok(empty(selection, Some(index.total_lines), terminal));
+        // Finished text is read from its start, and counted by reading to its end.
+        Some(TextField::Bytes(Source::Memory(text))) => {
+            read(Text::new(text, 1, None), selection, terminal, cancellation)
+        }
+        Some(TextField::Stored(mut json)) => {
+            let string = json.reader.next_string_reader().map_err(saved_json)?;
+            let reader = BufReader::with_capacity(IO_BUFFER_BYTES, string);
+            read(
+                Text::new(reader, 1, None),
+                selection,
+                terminal,
+                cancellation,
+            )
+        }
     }
+}
+
+/// A page of saved bytes, read no further than the extent `index` observed as the
+/// page started.
+fn observed(
+    mut capture: CaptureReader,
+    index: LineIndex,
+    selection: &Selection,
+    terminal: bool,
+    cancellation: &super::super::CancellationToken,
+) -> Result<LinePage, ToolError> {
+    // Checked against the observed extent before checkpointing: chunks a producer
+    // appends later are chosen only for lines past that extent.
+    if selection.start > index.total_lines {
+        return beyond(selection, index.total_lines, terminal);
+    }
+    let (offset, line) = capture.checkpoint(first_line(selection))?;
+    // A producer that truncates and rewrites since the index can move a checkpoint
+    // past it; that page reads nothing, and the next one indexes afresh.
+    let observed = index.bytes.saturating_sub(offset);
+    let reader = BufReader::with_capacity(IO_BUFFER_BYTES, capture.take(observed));
+    let input = Text::new(reader, line, Some(index.total_lines));
+    read(input, selection, terminal, cancellation)
+}
+
+fn read<R: BufRead>(
+    mut input: Text<R>,
+    selection: &Selection,
+    terminal: bool,
+    cancellation: &super::super::CancellationToken,
+) -> Result<LinePage, ToolError> {
     if selection.matcher.is_some() {
-        return search(reader, &index, selection, terminal, cancellation);
+        return search(input, selection, terminal, cancellation);
     }
-    Source::seek_line(&mut reader, &index, selection.start, cancellation)?;
-    seek_offset(&mut reader, selection.offset, index.bytes, cancellation)?;
+    input.skip_to(selection.start, cancellation)?;
+    if input.beyond(selection.start)? {
+        return beyond(selection, input.total(cancellation)?, terminal);
+    }
+    input.seek_offset(selection.offset, cancellation)?;
     let mut line = selection.start;
     let mut offset = selection.offset;
     let mut lines = Vec::new();
     let mut used = 0;
-    while lines.len() < selection.limit && reader.stream_position()? < index.bytes {
+    let exhausted = loop {
+        if input.at_end()? {
+            break true;
+        }
+        if lines.len() == selection.limit {
+            break false;
+        }
         check_cancelled(cancellation)?;
-        let start = reader.stream_position()?;
-        let mut raw = read_piece(&mut reader, index.bytes, CONTENT_BYTES + 4)?;
+        let mut raw = input.read_piece(CONTENT_BYTES + 4)?;
         let newline = raw.ends_with(b"\n");
-        let full = newline || reader.stream_position()? == index.bytes;
+        let full = newline || input.at_end()?;
         let valid = match std::str::from_utf8(&raw) {
             Ok(_) => raw.len(),
             Err(error) if error.error_len().is_none() => error.valid_up_to(),
@@ -410,34 +435,28 @@ pub(super) fn page(
         let deferred = valid < raw.len();
         raw.truncate(valid);
         if raw.is_empty() {
-            reader.seek(SeekFrom::Start(start))?;
-            break;
+            break false;
         }
-        let text = without_terminator(std::str::from_utf8(&raw).expect("validated UTF-8"));
-        let Some((value, count, size)) = fit_line(text, used, CONTENT_BYTES, full && !deferred)?
+        let piece = without_terminator(std::str::from_utf8(&raw).expect("validated UTF-8"));
+        let Some((value, count, size)) = fit_line(piece, used, CONTENT_BYTES, full && !deferred)?
         else {
-            reader.seek(SeekFrom::Start(start))?;
-            break;
+            break false;
         };
         used += size;
         lines.push(value);
-        if count == text.len() && full && !deferred {
-            if newline {
-                line += 1;
-                offset = 0;
-            } else {
-                offset += count;
-            }
-        } else {
-            reader.seek(SeekFrom::Start(start + count as u64))?;
-            offset += count;
-            break;
+        offset += count;
+        if count < piece.len() || !full || deferred {
+            break false;
         }
-    }
-    let exhausted = reader.stream_position()? == index.bytes;
+        if newline {
+            line += 1;
+            offset = 0;
+        }
+    };
+    let total = input.total(cancellation)?;
     Ok(response(
         selection,
-        Some(index.total_lines),
+        Some(total),
         PageLines::Text(lines),
         if exhausted && terminal {
             None
@@ -447,19 +466,33 @@ pub(super) fn page(
     ))
 }
 
-fn search(
-    mut reader: BufReader<Source>,
-    index: &LineIndex,
+/// The empty page of a starting line past the end, where only offset 0 is valid.
+fn beyond(selection: &Selection, total: usize, terminal: bool) -> Result<LinePage, ToolError> {
+    if selection.offset != 0 {
+        return Err(invalid_offset());
+    }
+    Ok(empty(selection, Some(total), terminal))
+}
+
+/// The first line a page reads: its start, or with a pattern, its leading context.
+fn first_line(selection: &Selection) -> usize {
+    match selection.matcher {
+        Some(_) => selection.start.saturating_sub(selection.context).max(1),
+        None => selection.start,
+    }
+}
+
+fn search<R: BufRead>(
+    mut input: Text<R>,
     selection: &Selection,
     terminal: bool,
     cancellation: &super::super::CancellationToken,
 ) -> Result<LinePage, ToolError> {
     let matcher = selection.matcher.as_ref().expect("search matcher");
-    // Validate independently of whether the starting line matches.
-    Source::seek_line(&mut reader, index, selection.start, cancellation)?;
-    seek_offset(&mut reader, selection.offset, index.bytes, cancellation)?;
-    let mut line = selection.start.saturating_sub(selection.context).max(1);
-    Source::seek_line(&mut reader, index, line, cancellation)?;
+    let mut line = first_line(selection);
+    input.skip_to(line, cancellation)?;
+    // The starting line is validated when it is read, whether or not it matches.
+    let mut reached = false;
     let mut lookahead = VecDeque::<(String, bool)>::new();
     let mut after = 0;
     let mut lines = Vec::new();
@@ -476,12 +509,28 @@ fn search(
             break;
         }
         while lookahead.len() <= selection.context {
-            let raw = read_piece(&mut reader, index.bytes, REGEX_LINE_BYTES + 1)?;
+            let starting = line + lookahead.len() == selection.start;
+            if starting && input.beyond(selection.start)? {
+                return beyond(selection, input.total(cancellation)?, terminal);
+            }
+            let raw = input.read_piece(REGEX_LINE_BYTES + 1)?;
             if raw.len() > REGEX_LINE_BYTES {
+                // Leading context is only read for a starting line that exists; a
+                // stored string learns whether it does by reading on to it.
+                if line + lookahead.len() < selection.start {
+                    input.skip_to(selection.start, cancellation)?;
+                    if input.beyond(selection.start)? {
+                        return beyond(selection, input.total(cancellation)?, terminal);
+                    }
+                }
                 return Err(ToolError::failed(format!(
                     "regex source line exceeds {} MiB; read this field without a pattern",
                     REGEX_LINE_BYTES >> 20
                 )));
+            }
+            if starting {
+                check_offset(&raw, selection.offset)?;
+                reached = true;
             }
             if raw.is_empty() || (!terminal && !raw.ends_with(b"\n")) {
                 break;
@@ -536,18 +585,22 @@ fn search(
         } else {
             0
         };
-        if terminal && lookahead.is_empty() && reader.stream_position()? == index.bytes {
+        if terminal && lookahead.is_empty() && input.at_end()? {
             exhausted = true;
             break;
         }
+    }
+    if !reached {
+        return beyond(selection, input.total(cancellation)?, terminal);
     }
     if line < selection.start {
         line = selection.start;
         offset = selection.offset;
     }
+    let total = input.total(cancellation)?;
     Ok(response(
         selection,
-        Some(index.total_lines),
+        Some(total),
         PageLines::Numbered(lines),
         if exhausted {
             None
@@ -572,10 +625,20 @@ mod tests {
         }
     }
 
-    fn saved(text: &str) -> Option<Source> {
-        Some(Source::Memory(Cursor::new(text.as_bytes().to_vec())))
+    /// `text` as a field's own bytes, or as a string inside a stored container.
+    fn saved(text: &str, stored: bool) -> Option<TextField> {
+        Some(if stored {
+            let json = Box::new(Cursor::new(serde_json::to_vec(text).unwrap()));
+            TextField::Stored(super::super::render::JsonField::new(
+                json,
+                Default::default(),
+            ))
+        } else {
+            TextField::Bytes(Source::Memory(Cursor::new(text.as_bytes().to_vec())))
+        })
     }
 
+    /// A string streamed from a stored container pages exactly as its own bytes.
     #[test]
     fn whole_lines_are_preferred_and_large_lines_are_fully_accessible() {
         let text = format!(
@@ -584,19 +647,19 @@ mod tests {
             "b".repeat(CONTENT_BYTES / 2),
             "🦀\"\\".repeat(CONTENT_BYTES)
         );
-        let first = page(saved(&text), &selection(1, 0), true, &Default::default()).unwrap();
+        let read = |query: &Selection, stored| {
+            page(saved(&text, stored), query, true, &Default::default()).unwrap()
+        };
+        let first = read(&selection(1, 0), false);
         assert_eq!(first.lines(), [text.lines().next().unwrap()]);
         assert_eq!((first.next_start, first.next_offset), (Some(2), None));
         let mut query = selection(1, 0);
         let mut reconstructed = String::new();
         let mut previous = 1;
         for _ in 0..100 {
-            let view = page(saved(&text), &query, true, &Default::default()).unwrap();
+            let view = read(&query, false);
             assert!(serde_json::to_vec(&view).unwrap().len() <= PAGE_BYTES);
-            assert_eq!(
-                view,
-                page(saved(&text), &query, true, &Default::default()).unwrap()
-            );
+            assert_eq!(view, read(&query, true));
             for (index, row) in view.lines().into_iter().enumerate() {
                 let number = (query.start + index) as u64;
                 if number != previous {
@@ -619,7 +682,7 @@ mod tests {
         query.matcher = Some(super::super::args::pattern_matcher("ERROR").unwrap());
         query.context = 1;
         let live = "before\nERROR\npar";
-        let first = page(saved(live), &query, false, &Default::default()).unwrap();
+        let first = page(saved(live, false), &query, false, &Default::default()).unwrap();
         let numbered = |line, text: &str| NumberedLine {
             line,
             text: text.into(),
@@ -632,7 +695,7 @@ mod tests {
         // The producer appends before the next page is read.
         let text = format!("{live}tial\nlast\n");
         query.start = 2;
-        let rest = page(saved(&text), &query, true, &Default::default()).unwrap();
+        let rest = page(saved(&text, false), &query, true, &Default::default()).unwrap();
         assert_eq!(
             rest.lines,
             PageLines::Numbered(vec![numbered(2, "ERROR"), numbered(3, "partial")])
@@ -640,7 +703,157 @@ mod tests {
         assert!(rest.next_start.is_none());
         query.start = 3;
         query.offset = 1;
-        let rest = page(saved(&text), &query, true, &Default::default()).unwrap();
+        let rest = page(saved(&text, false), &query, true, &Default::default()).unwrap();
         assert_eq!(rest.lines, PageLines::Numbered(vec![numbered(3, "artial")]));
+    }
+
+    /// Offsets are validated at the starting line, whether or not a search
+    /// matches it, and a start past the end pages nothing.
+    #[test]
+    fn offsets_stay_within_the_starting_line_and_past_the_end_is_empty() {
+        let text = "é\r\nab\n";
+        let matcher = super::super::args::pattern_matcher("zzz").unwrap();
+        for (stored, matcher) in [false, true]
+            .into_iter()
+            .flat_map(|stored| [None, Some(matcher.clone())].map(|matcher| (stored, matcher)))
+        {
+            let read = |start, offset| {
+                let query = Selection {
+                    matcher: matcher.clone(),
+                    ..selection(start, offset)
+                };
+                page(saved(text, stored), &query, true, &Default::default())
+            };
+            for (start, offset) in [(1, 1), (1, 3), (2, 3), (3, 1)] {
+                let error = read(start, offset).unwrap_err();
+                assert_eq!(error.to_string(), invalid_offset().to_string());
+            }
+            for (start, offset) in [(1, 2), (2, 2)] {
+                assert!(read(start, offset).is_ok(), "{start}:{offset}");
+            }
+            let past = read(3, 0).unwrap();
+            assert_eq!((past.total_lines, past.next_start), (Some(2), None));
+            assert!(past.lines().is_empty());
+        }
+        // Past the end stays empty even behind context too long to search; the
+        // limit applies once the starting line exists.
+        let long = "x".repeat(REGEX_LINE_BYTES + 1);
+        for stored in [false, true] {
+            let read = |start| {
+                let query = Selection {
+                    matcher: Some(super::super::args::pattern_matcher(".").unwrap()),
+                    context: 1,
+                    ..selection(start, 0)
+                };
+                page(saved(&long, stored), &query, true, &Default::default())
+            };
+            let past = read(2).unwrap();
+            assert_eq!((past.total_lines, past.next_start), (Some(1), None));
+            assert!(read(1).is_err());
+        }
+    }
+
+    /// A running job's capture, appended one chunk per string.
+    async fn captured(
+        chunks: &[&str],
+    ) -> (tempfile::TempDir, crate::job::JobManager, SharedDb, i64) {
+        let (root, manager, id) = super::super::tests::fixture(None).await;
+        let db = manager.output(id).db;
+        let field = FieldPointer::result().property("stdout");
+        let capture = db.create_capture(id.get(), &field, CaptureKind::Text);
+        let capture = capture.unwrap().unwrap();
+        append(&db, capture, chunks);
+        (root, manager, db, capture)
+    }
+
+    fn append(db: &SharedDb, capture: i64, chunks: &[&str]) {
+        let mut extent = db.capture_extent(capture).unwrap();
+        for chunk in chunks {
+            extent = db
+                .append_capture(capture, extent, chunk.as_bytes())
+                .unwrap();
+        }
+    }
+
+    /// A capture page starts from the checkpoint of the first line it reads, a
+    /// search's leading context included, whether chunks end at lines or split them.
+    #[tokio::test]
+    async fn capture_pages_checkpoint_at_their_first_line() {
+        let numbered = |line, text: &str| NumberedLine {
+            line,
+            text: text.into(),
+        };
+        for chunks in [
+            &["one\n", "two\n", "three\n", "four\n"][..],
+            &["one\nt", "wo\nthr", "ee\nfour\n"],
+        ] {
+            let (_root, _manager, db, capture) = captured(chunks).await;
+            let read = |start, context, limit, pattern: bool| {
+                let query = Selection {
+                    matcher: pattern.then(|| super::super::args::pattern_matcher(".").unwrap()),
+                    context,
+                    limit,
+                    ..selection(start, 0)
+                };
+                let source = Source::Capture(CaptureReader::new(db.clone(), capture));
+                page(
+                    Some(TextField::Bytes(source)),
+                    &query,
+                    true,
+                    &Default::default(),
+                )
+                .unwrap()
+            };
+            let plain = read(3, 0, DEFAULT_LIMIT, false);
+            assert_eq!(plain.lines(), ["three", "four"]);
+            assert_eq!(plain.total_lines, Some(4));
+            let found = read(3, 2, DEFAULT_LIMIT, true);
+            let expected = vec![numbered(3, "three"), numbered(4, "four")];
+            assert_eq!(found.lines, PageLines::Numbered(expected));
+            let first = read(3, 2, 1, true);
+            assert_eq!(first.lines, PageLines::Numbered(vec![numbered(3, "three")]));
+            assert_eq!(first.next_start, Some(4));
+            let rest = read(4, 2, 1, true);
+            assert_eq!(rest.lines, PageLines::Numbered(vec![numbered(4, "four")]));
+            assert_eq!(rest.next_start, None);
+        }
+    }
+
+    /// A page reads the extent observed as it started; chunks appended since, even
+    /// ones holding lines it asks for, are left for the next page.
+    #[tokio::test]
+    async fn pages_stop_at_the_extent_observed_as_they_start() {
+        let (_root, _manager, db, capture) = captured(&[]).await;
+        let source = || CaptureReader::new(db.clone(), capture);
+        let cancellation = Default::default();
+        let before = source().index().unwrap();
+        append(&db, capture, &["one\n", "tw"]);
+        let partial = source().index().unwrap();
+        append(&db, capture, &["o\n", "three\n", "four\n"]);
+        let read = |index, start, offset| {
+            observed(
+                source(),
+                index,
+                &selection(start, offset),
+                false,
+                &cancellation,
+            )
+        };
+        let error = read(before, 4, 1).unwrap_err();
+        assert_eq!(error.to_string(), invalid_offset().to_string());
+        let past = read(before, 4, 0).unwrap();
+        assert_eq!((past.total_lines, past.next_start), (Some(0), Some(4)));
+        let past = read(partial, 4, 0).unwrap();
+        assert!(past.lines().is_empty());
+        let live = read(partial, 1, 0).unwrap();
+        assert_eq!(live.lines(), ["one", "tw"]);
+        assert_eq!((live.total_lines, live.next_start), (Some(2), Some(2)));
+        assert_eq!(live.next_offset, Some(2));
+        // A rewrite since the index checkpoints line 2 past the observed extent.
+        db.truncate_capture(capture, 0).unwrap();
+        append(&db, capture, &["aaaa", "bbbb", "cccc"]);
+        let rewritten = read(partial, 2, 0).unwrap();
+        assert!(rewritten.lines().is_empty());
+        assert_eq!(rewritten.next_start, Some(2));
     }
 }

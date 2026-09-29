@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 18). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 19). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 --
@@ -68,17 +68,17 @@ CREATE INDEX entry_agent_kind ON entry(agent, kind);
 -- title_cleared carry no subtype row.
 CREATE TABLE entry_text (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'status' CHECK (kind = 'status'),
+  kind TEXT GENERATED ALWAYS AS ('status') VIRTUAL,
   text TEXT NOT NULL,
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
 CREATE TABLE title_source (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
--- A title_cleared entry drops the user's earlier titles; session_title applies the rule.
+-- A title_cleared entry drops the user's earlier titles; db/state.rs TITLE applies the rule.
 CREATE TABLE title (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'title_set' CHECK (kind = 'title_set'),
+  kind TEXT GENERATED ALWAYS AS ('title_set') VIRTUAL,
   source TEXT NOT NULL REFERENCES title_source(name),
   text TEXT NOT NULL,
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
@@ -143,7 +143,7 @@ CREATE TABLE model_profile (
 -- profile is NULL for a tool-only agent without a model, such as a remote worker.
 CREATE TABLE agent_start (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'agent_started' CHECK (kind = 'agent_started'),
+  kind TEXT GENERATED ALWAYS AS ('agent_started') VIRTUAL,
   profile INTEGER REFERENCES model_profile(id),
   location_target INTEGER NOT NULL REFERENCES target(id),
   location_workspace BLOB NOT NULL,
@@ -191,7 +191,7 @@ CREATE TABLE agent_mode (
 
 CREATE TABLE model_selection (                   -- ModelChanged only
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'model_changed' CHECK (kind = 'model_changed'),
+  kind TEXT GENERATED ALWAYS AS ('model_changed') VIRTUAL,
   profile INTEGER NOT NULL REFERENCES model_profile(id),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
@@ -223,7 +223,7 @@ CREATE TABLE model_purpose (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 -- The agent's first purpose='agent' context is written in its agent_started transaction.
 CREATE TABLE model_context (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'model_context' CHECK (kind = 'model_context'),
+  kind TEXT GENERATED ALWAYS AS ('model_context') VIRTUAL,
   purpose TEXT NOT NULL REFERENCES model_purpose(name),
   profile INTEGER NOT NULL REFERENCES model_profile(id),
   system_prompt INTEGER NOT NULL REFERENCES system_prompt(id),
@@ -267,7 +267,7 @@ CREATE TABLE user_part_kind (
 CREATE TABLE user_part (
   id INTEGER PRIMARY KEY,
   message INTEGER NOT NULL,
-  role TEXT NOT NULL DEFAULT 'user' CHECK (role = 'user'),
+  role TEXT GENERATED ALWAYS AS ('user') VIRTUAL,
   position INTEGER NOT NULL CHECK (position >= 0),
   kind TEXT NOT NULL,
   text TEXT,
@@ -344,7 +344,7 @@ CREATE TABLE item_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE assistant_item (
   id INTEGER PRIMARY KEY,
   message INTEGER NOT NULL,
-  role TEXT NOT NULL DEFAULT 'assistant' CHECK (role = 'assistant'),
+  role TEXT GENERATED ALWAYS AS ('assistant') VIRTUAL,
   position INTEGER NOT NULL CHECK (position >= 0),
   provider_id TEXT NOT NULL CHECK (trim(provider_id) <> ''),
   kind TEXT NOT NULL REFERENCES item_kind(name),
@@ -361,7 +361,7 @@ CREATE TABLE replay_format (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE reasoning_replay (
   item INTEGER PRIMARY KEY,
-  item_kind TEXT NOT NULL DEFAULT 'reasoning' CHECK (item_kind = 'reasoning'),
+  item_kind TEXT GENERATED ALWAYS AS ('reasoning') VIRTUAL,
   format TEXT NOT NULL REFERENCES replay_format(name),
   model TEXT NOT NULL,
   scope TEXT NOT NULL CHECK (trim(scope) <> ''),
@@ -373,19 +373,18 @@ CREATE TABLE reasoning_replay (
 -- Readable blocks of text and reasoning items.
 CREATE TABLE block_item_kind (name TEXT PRIMARY KEY REFERENCES item_kind(name)) STRICT, WITHOUT ROWID;
 CREATE TABLE assistant_block (
-  id INTEGER PRIMARY KEY,
   item INTEGER NOT NULL,
   item_kind TEXT NOT NULL REFERENCES block_item_kind(name),
   position INTEGER NOT NULL CHECK (position >= 0),
   provider_id TEXT NOT NULL CHECK (trim(provider_id) <> ''),
   text TEXT NOT NULL,
-  UNIQUE (item, position),
+  PRIMARY KEY (item, position),
   FOREIGN KEY (item, item_kind) REFERENCES assistant_item(id, kind)
 ) STRICT;
 
 CREATE TABLE tool_call (
   item INTEGER PRIMARY KEY,
-  item_kind TEXT NOT NULL DEFAULT 'tool_call' CHECK (item_kind = 'tool_call'),
+  item_kind TEXT GENERATED ALWAYS AS ('tool_call') VIRTUAL,
   call_id TEXT NOT NULL,
   name TEXT NOT NULL,
   arguments TEXT NOT NULL CHECK (json_valid(arguments) AND json_type(arguments) = 'object'),
@@ -397,7 +396,7 @@ CREATE INDEX tool_call_id ON tool_call(call_id);
 -- result messages into one Message::Tool ordered by the call's item position.
 CREATE TABLE tool_result (
   message INTEGER PRIMARY KEY,
-  role TEXT NOT NULL DEFAULT 'tool' CHECK (role = 'tool'),
+  role TEXT GENERATED ALWAYS AS ('tool') VIRTUAL,
   call INTEGER NOT NULL UNIQUE REFERENCES tool_call(item),
   result TEXT NOT NULL CHECK (json_valid(result)),
   is_error INTEGER NOT NULL CHECK (is_error IN (0,1)),
@@ -415,7 +414,7 @@ CREATE TABLE tool_result_image (
 
 CREATE TABLE message_commit (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'message_committed' CHECK (kind = 'message_committed'),
+  kind TEXT GENERATED ALWAYS AS ('message_committed') VIRTUAL,
   message INTEGER NOT NULL UNIQUE REFERENCES message(id),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
@@ -440,7 +439,7 @@ CREATE TABLE history_lifetime (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE model_request (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'model_requested' CHECK (kind = 'model_requested'),
+  kind TEXT GENERATED ALWAYS AS ('model_requested') VIRTUAL,
   context INTEGER NOT NULL REFERENCES model_context(entry),
   -- History is the checkpoint, its retained sources, then the agent's commits after the
   -- checkpoint's frontier up to history_through.
@@ -459,7 +458,7 @@ CREATE TABLE model_request_tail (
 
 CREATE TABLE model_attempt (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'model_attempt_started' CHECK (kind = 'model_attempt_started'),
+  kind TEXT GENERATED ALWAYS AS ('model_attempt_started') VIRTUAL,
   request INTEGER NOT NULL REFERENCES model_request(entry),
   attempt INTEGER NOT NULL CHECK (attempt > 0),
   UNIQUE (request, attempt),
@@ -489,13 +488,12 @@ CREATE TABLE failure (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL REFERENCES failure_entry_kind(name),
   failure TEXT NOT NULL,
-  detailed INTEGER NOT NULL,
   detail TEXT,
+  detailed INTEGER GENERATED ALWAYS AS (detail IS NOT NULL) VIRTUAL,
   -- A provider failure's class; its detail is the provider's message.
   provider TEXT REFERENCES provider_error_kind(name),
   -- A model failure is its attempt's outcome; NULL leaves an agent failure unlinked.
   outcome TEXT GENERATED ALWAYS AS (CASE kind WHEN 'model_failed' THEN kind END) VIRTUAL,
-  CHECK (detailed = (detail IS NOT NULL)),
   CHECK ((failure = 'provider') = (provider IS NOT NULL)),
   FOREIGN KEY (failure, detailed) REFERENCES failure_kind(name, detailed),
   FOREIGN KEY (entry, outcome) REFERENCES attempt_outcome(entry, kind),
@@ -504,9 +502,9 @@ CREATE TABLE failure (
 
 CREATE TABLE model_recovery (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'model_recovery_scheduled' CHECK (kind = 'model_recovery_scheduled'),
+  kind TEXT GENERATED ALWAYS AS ('model_recovery_scheduled') VIRTUAL,
   failure INTEGER NOT NULL UNIQUE,
-  failure_kind TEXT NOT NULL DEFAULT 'model_failed' CHECK (failure_kind = 'model_failed'),
+  failure_kind TEXT GENERATED ALWAYS AS ('model_failed') VIRTUAL,
   delay_millis INTEGER NOT NULL CHECK (delay_millis >= 0),
   FOREIGN KEY (failure, failure_kind) REFERENCES attempt_outcome(entry, kind),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
@@ -518,7 +516,7 @@ CREATE TABLE cut_reason (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
 CREATE TABLE model_response (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'response_completed' CHECK (kind = 'response_completed'),
+  kind TEXT GENERATED ALWAYS AS ('response_completed') VIRTUAL,
   message INTEGER NOT NULL UNIQUE REFERENCES message_commit(message),
   outcome TEXT NOT NULL REFERENCES response_outcome(name),
   cut_reason TEXT REFERENCES cut_reason(name),
@@ -528,7 +526,7 @@ CREATE TABLE model_response (
 
 CREATE TABLE usage (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'usage' CHECK (kind = 'usage'),
+  kind TEXT GENERATED ALWAYS AS ('usage') VIRTUAL,
   request INTEGER NOT NULL REFERENCES model_request(entry),
   input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
   cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
@@ -541,7 +539,7 @@ CREATE TABLE usage (
 -- The summary attempt is the entry's attempt_outcome.
 CREATE TABLE compaction (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'compaction' CHECK (kind = 'compaction'),
+  kind TEXT GENERATED ALWAYS AS ('compaction') VIRTUAL,
   frontier INTEGER NOT NULL REFERENCES entry(seq),
   message INTEGER NOT NULL REFERENCES message(id),
   before_tokens INTEGER NOT NULL CHECK (before_tokens >= 0),
@@ -564,19 +562,18 @@ CREATE TABLE compaction_fault (
 CREATE TABLE checkpoint_error (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE compaction_failure (              -- CompactionFailed only
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'compaction_failed' CHECK (kind = 'compaction_failed'),
+  kind TEXT GENERATED ALWAYS AS ('compaction_failed') VIRTUAL,
   request INTEGER REFERENCES model_request(entry),
   -- The summary attempt this round used. It may also hold a model failure, so it is a
   -- reference rather than an attempt_outcome.
   attempt INTEGER,
   fault TEXT NOT NULL,
-  detailed INTEGER NOT NULL,
   detail TEXT,
+  detailed INTEGER GENERATED ALWAYS AS (detail IS NOT NULL) VIRTUAL,
   -- A checkpoint fault's detail names the checkpoint error, a summary fault its failure.
   checkpoint TEXT GENERATED ALWAYS AS (CASE fault WHEN 'checkpoint' THEN detail END) VIRTUAL,
   summary TEXT GENERATED ALWAYS AS (CASE fault WHEN 'summary' THEN detail END) VIRTUAL,
   CHECK (attempt IS NULL OR request IS NOT NULL),
-  CHECK (detailed = (detail IS NOT NULL)),
   FOREIGN KEY (attempt, request) REFERENCES model_attempt(entry, request),
   FOREIGN KEY (fault, detailed) REFERENCES compaction_fault(name, detailed),
   FOREIGN KEY (checkpoint) REFERENCES checkpoint_error(name),
@@ -598,7 +595,7 @@ CREATE TABLE job_state (
 CREATE TABLE job (
   id INTEGER PRIMARY KEY CHECK (id > 0),         -- JobId
   created INTEGER NOT NULL UNIQUE,
-  kind TEXT NOT NULL DEFAULT 'job_created' CHECK (kind = 'job_created'),
+  kind TEXT GENERATED ALWAYS AS ('job_created') VIRTUAL,
   parent INTEGER REFERENCES job(id),
   origin_call INTEGER UNIQUE REFERENCES tool_call(item),
   tool TEXT NOT NULL,
@@ -615,10 +612,10 @@ CREATE TABLE job (
 
 CREATE TABLE job_transition (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'job_state_changed' CHECK (kind = 'job_state_changed'),
+  kind TEXT GENERATED ALWAYS AS ('job_state_changed') VIRTUAL,
   job INTEGER NOT NULL REFERENCES job(id),
   state TEXT NOT NULL,
-  terminal INTEGER NOT NULL DEFAULT 0 CHECK (terminal = 0),
+  terminal INTEGER GENERATED ALWAYS AS (0) VIRTUAL,
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
   FOREIGN KEY (state, terminal) REFERENCES job_state(name, terminal)
 ) STRICT;
@@ -635,7 +632,6 @@ CREATE TABLE job_run (
 
 -- Output belongs to one run: a reset never presents an earlier run's output.
 CREATE TABLE job_output (
-  id INTEGER PRIMARY KEY,
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,
   -- Every capture the producer finished was admitted into the result.
@@ -645,7 +641,7 @@ CREATE TABLE job_output (
   result TEXT CHECK (result IS NULL OR json_valid(result)),
   -- Bytes of the result's automatic presentation, measured once it is saved.
   presented_bytes INTEGER CHECK (presented_bytes >= 0),
-  UNIQUE (job, generation),
+  PRIMARY KEY (job, generation),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
 ) STRICT;
 
@@ -662,13 +658,10 @@ CREATE TABLE job_capture (
   capture_kind TEXT NOT NULL REFERENCES capture_kind(name),
   final_bytes INTEGER CHECK (final_bytes >= 0),   -- set once when the writer finishes
   final_lines INTEGER CHECK (final_lines >= 0),
-  -- A cached page rendering of a saved value, not producer output.
-  rendered INTEGER NOT NULL DEFAULT 0 CHECK (rendered IN (0,1)),
   -- What a finished text capture its schema declares as JSON holds.
   detection TEXT REFERENCES capture_detection(name),
-  CHECK (detection IS NULL OR (final_bytes IS NOT NULL AND capture_kind = 'text' AND rendered = 0)),
-  -- A rendering of a saved value may share its pointer with the capture it reads.
-  UNIQUE (job, generation, pointer, rendered),
+  CHECK (detection IS NULL OR (final_bytes IS NOT NULL AND capture_kind = 'text')),
+  UNIQUE (job, generation, pointer),
   UNIQUE (id, job, generation),
   CHECK ((final_bytes IS NULL) = (final_lines IS NULL)),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
@@ -678,7 +671,7 @@ CREATE TABLE job_capture (
 -- a finished capture is classified once.
 CREATE TRIGGER job_capture_update_rules BEFORE UPDATE ON job_capture
 WHEN NEW.id IS NOT OLD.id OR NEW.job IS NOT OLD.job OR NEW.generation IS NOT OLD.generation
-  OR NEW.pointer IS NOT OLD.pointer OR NEW.rendered IS NOT OLD.rendered
+  OR NEW.pointer IS NOT OLD.pointer
   OR (NEW.capture_kind IS NOT OLD.capture_kind AND OLD.capture_kind <> 'unknown')
   OR (OLD.final_bytes IS NOT NULL
       AND (NEW.final_bytes IS NOT OLD.final_bytes OR NEW.final_lines IS NOT OLD.final_lines))
@@ -699,34 +692,32 @@ CREATE INDEX job_capture_line ON job_capture_chunk(capture, first_line);
 
 -- Captures the terminal document references; only these are complete results.
 CREATE TABLE job_output_field (
-  output INTEGER NOT NULL REFERENCES job_output(id) ON DELETE CASCADE,
-  capture INTEGER NOT NULL,
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,
-  PRIMARY KEY (output, capture),
+  capture INTEGER NOT NULL,
+  PRIMARY KEY (job, generation, capture),
+  FOREIGN KEY (job, generation) REFERENCES job_output(job, generation) ON DELETE CASCADE,
   FOREIGN KEY (capture, job, generation)
-    REFERENCES job_capture(id, job, generation) ON DELETE CASCADE,
-  FOREIGN KEY (job, generation) REFERENCES job_output(job, generation)
+    REFERENCES job_capture(id, job, generation) ON DELETE CASCADE
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX job_output_field_capture ON job_output_field(capture);
 
 -- Fields of a saved result that presentation never shortens: those its schema
 -- declares and those a script's returned tool results carry.
 CREATE TABLE job_complete_field (
-  id INTEGER PRIMARY KEY,
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,
   pointer TEXT NOT NULL,
-  UNIQUE (job, generation, pointer),
+  PRIMARY KEY (job, generation, pointer),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
-) STRICT;
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_finish (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'job_finished' CHECK (kind = 'job_finished'),
+  kind TEXT GENERATED ALWAYS AS ('job_finished') VIRTUAL,
   job INTEGER NOT NULL REFERENCES job(id),
   state TEXT NOT NULL,
-  terminal INTEGER NOT NULL DEFAULT 1 CHECK (terminal = 1),
+  terminal INTEGER GENERATED ALWAYS AS (1) VIRTUAL,
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
   FOREIGN KEY (state, terminal) REFERENCES job_state(name, terminal)
 ) STRICT;
@@ -841,7 +832,7 @@ CREATE TABLE resource_kind (
 -- are the child tables.
 CREATE TABLE approval_grant (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'approval_granted' CHECK (kind = 'approval_granted'),
+  kind TEXT GENERATED ALWAYS AS ('approval_granted') VIRTUAL,
   capability TEXT NOT NULL REFERENCES capability(name),
   resource_kind TEXT NOT NULL,
   target INTEGER REFERENCES target(id),
@@ -881,47 +872,7 @@ CREATE TABLE approval_grant_route_hop (
 -- Revocations are written in the same transaction as the targets_upserted that causes them.
 CREATE TABLE approval_revocation (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL DEFAULT 'approval_revoked' CHECK (kind = 'approval_revoked'),
+  kind TEXT GENERATED ALWAYS AS ('approval_revoked') VIRTUAL,
   grant_entry INTEGER NOT NULL UNIQUE REFERENCES approval_grant(entry),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
-
--- ───────────────────────── Views ─────────────────────────
-
-CREATE VIEW job_generation AS
-SELECT job, max(generation) AS generation FROM job_run GROUP BY job;
-
--- The user's newest title, unless a title_cleared follows it; else the newest automatic
--- one; else the first text the user sent the root agent, as a prompt title.
-CREATE VIEW session_title AS
-WITH chosen(entry) AS (
-  SELECT coalesce(
-    (SELECT max(u.entry) FROM title u
-      WHERE u.source = 'user' AND u.entry > coalesce(
-        (SELECT max(e.seq) FROM entry e
-          WHERE e.agent = (SELECT id FROM agent WHERE parent IS NULL) AND e.kind = 'title_cleared'),
-        0)),
-    (SELECT max(a.entry) FROM title a WHERE a.source <> 'user')))
-SELECT t.text, t.source FROM title t WHERE t.entry = (SELECT entry FROM chosen)
-UNION ALL
-SELECT * FROM (
-  SELECT p.text, 'prompt' FROM message_commit mc
-    JOIN entry e ON e.seq = mc.entry
-    JOIN agent a ON a.id = e.agent AND a.parent IS NULL
-    JOIN user_part p ON p.message = mc.message AND p.kind = 'text'
-   WHERE (SELECT entry FROM chosen) IS NULL
-   ORDER BY mc.entry, p.position LIMIT 1);
-
--- last_millis is the newest activity entry's time.
-CREATE VIEW session_summary AS
-SELECT
-  (SELECT e.created_millis FROM entry e JOIN entry_kind k ON k.name = e.kind
-    WHERE k.activity ORDER BY e.seq DESC LIMIT 1) AS last_millis,
-  (SELECT count(*) FROM entry) AS entries,
-  coalesce(
-     (SELECT ms.profile FROM model_selection ms JOIN entry x ON x.seq = ms.entry
-       JOIN agent a ON a.id = x.agent AND a.parent IS NULL ORDER BY ms.entry DESC LIMIT 1),
-     (SELECT s.profile FROM agent_start s JOIN entry x ON x.seq = s.entry
-       JOIN agent a ON a.id = x.agent AND a.parent IS NULL)) AS profile,
-  (SELECT m.name FROM agent_mode am JOIN mode m ON m.id = am.mode JOIN entry x ON x.seq = am.entry
-     JOIN agent a ON a.id = x.agent AND a.parent IS NULL ORDER BY am.entry DESC LIMIT 1) AS mode;

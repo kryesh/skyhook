@@ -46,12 +46,15 @@ fn pointer(row: &libsql::Row, index: i32) -> DbResult<FieldPointer> {
     FieldPointer::try_from(row.get::<String>(index)?).map_err(|error| corrupt(error.to_string()))
 }
 
-fn generation(db: &Db, job: u64) -> DbResult<i64> {
-    db.query_row(
-        "SELECT generation FROM job_generation WHERE job = ?1",
-        params![job],
-        |row| Ok(row.get::<i64>(0)?),
-    )?
+/// Job `?1`'s latest run. Output of an earlier run never stands in for a restarted
+/// job's, so reads select this generation rather than the newest output.
+const CURRENT_GENERATION: &str =
+    "SELECT generation FROM job_run WHERE job = ?1 ORDER BY generation DESC LIMIT 1";
+
+pub(super) fn generation(db: &Db, job: u64) -> DbResult<i64> {
+    db.query_row(CURRENT_GENERATION, params![job], |row| {
+        Ok(row.get::<i64>(0)?)
+    })?
     .ok_or_else(|| rejected(format!("job {job} has no journaled creation")))
 }
 
@@ -81,31 +84,14 @@ impl SharedDb {
         job: u64,
         pointer: &FieldPointer,
         kind: CaptureKind,
-        rendered: bool,
     ) -> Result<Option<i64>, DbError> {
         let db = self.lock();
         let generation = generation(&db, job)?;
         db.query_row(
-            "INSERT INTO job_capture (job, generation, pointer, capture_kind, rendered) \
-             VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT (job, generation, pointer, rendered) DO NOTHING \
+            "INSERT INTO job_capture (job, generation, pointer, capture_kind) \
+             VALUES (?1, ?2, ?3, ?4) ON CONFLICT (job, generation, pointer) DO NOTHING \
              RETURNING id",
-            params![job, generation, pointer, kind, rendered],
-            |row| Ok(row.get::<i64>(0)?),
-        )
-    }
-
-    /// A finished cached rendering of `pointer` in the current generation.
-    pub(crate) fn rendering(
-        &self,
-        job: u64,
-        pointer: &FieldPointer,
-    ) -> Result<Option<i64>, DbError> {
-        self.lock().query_row(
-            "SELECT c.id FROM job_capture c JOIN job_generation g \
-               ON g.job = c.job AND g.generation = c.generation \
-             WHERE c.job = ?1 AND c.pointer = ?2 AND c.rendered = 1 \
-               AND c.final_bytes IS NOT NULL",
-            params![job, pointer],
+            params![job, generation, pointer, kind],
             |row| Ok(row.get::<i64>(0)?),
         )
     }
@@ -152,11 +138,12 @@ impl SharedDb {
     /// Captures of the job's current generation, ordered by pointer.
     pub(crate) fn captures(&self, job: u64) -> Result<Vec<CaptureRow>, DbError> {
         self.lock().query(
-            "SELECT c.id, c.pointer, c.capture_kind, \
-               EXISTS (SELECT 1 FROM job_output_field f WHERE f.capture = c.id), c.detection \
-             FROM job_capture c JOIN job_generation g \
-               ON g.job = c.job AND g.generation = c.generation \
-             WHERE c.job = ?1 AND c.rendered = 0 ORDER BY c.pointer",
+            &format!(
+                "SELECT c.id, c.pointer, c.capture_kind, \
+                   EXISTS (SELECT 1 FROM job_output_field f WHERE f.capture = c.id), c.detection \
+                 FROM job_capture c \
+                 WHERE c.job = ?1 AND c.generation = ({CURRENT_GENERATION}) ORDER BY c.pointer"
+            ),
             params![job],
             |row| {
                 Ok(CaptureRow {
@@ -284,30 +271,21 @@ impl SharedDb {
         let db = self.lock();
         db.atomic(|| {
             let generation = generation(&db, job)?;
-            let output = db
-                .query_row(
-                    "INSERT INTO job_output (job, generation, captures_complete, result) \
-                     VALUES (?1, ?2, ?3, ?4) ON CONFLICT (job, generation) DO UPDATE \
-                     SET captures_complete = excluded.captures_complete, \
-                     result = excluded.result, presented_bytes = NULL RETURNING id",
-                    params![job, generation, captures_complete, result],
-                    |row| Ok(row.get::<i64>(0)?),
-                )?
-                .ok_or_else(|| rejected("job output upsert returned no row"))?;
             db.execute(
-                "DELETE FROM job_output_field WHERE output = ?1",
-                params![output],
+                "INSERT INTO job_output (job, generation, captures_complete, result) \
+                 VALUES (?1, ?2, ?3, ?4) ON CONFLICT (job, generation) DO UPDATE \
+                 SET captures_complete = excluded.captures_complete, \
+                 result = excluded.result, presented_bytes = NULL",
+                params![job, generation, captures_complete, result],
             )?;
-            // Renderings of the replaced document are stale.
             db.execute(
-                "DELETE FROM job_capture WHERE job = ?1 AND generation = ?2 AND rendered = 1",
+                "DELETE FROM job_output_field WHERE job = ?1 AND generation = ?2",
                 params![job, generation],
             )?;
             for capture in referenced {
                 db.execute(
-                    "INSERT INTO job_output_field (output, capture, job, generation) \
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![output, *capture, job, generation],
+                    "INSERT INTO job_output_field (job, generation, capture) VALUES (?1, ?2, ?3)",
+                    params![job, generation, *capture],
                 )?;
             }
             for pointer in complete {
@@ -350,10 +328,11 @@ impl SharedDb {
     /// The current generation's product, once the run finished.
     pub(crate) fn output(&self, job: u64) -> Result<Option<SavedOutput>, DbError> {
         let db = self.lock();
-        let Some((output, result, captures_complete)) = db.query_row(
-            "SELECT o.id, o.result, o.captures_complete FROM job_output o \
-             JOIN job_generation g ON g.job = o.job AND g.generation = o.generation \
-             WHERE o.job = ?1",
+        let Some((generation, result, captures_complete)) = db.query_row(
+            &format!(
+                "SELECT o.generation, o.result, o.captures_complete FROM job_output o \
+                 WHERE o.job = ?1 AND o.generation = ({CURRENT_GENERATION})"
+            ),
             params![job],
             |row| {
                 Ok((
@@ -368,8 +347,8 @@ impl SharedDb {
         };
         let fields = db.query(
             "SELECT c.pointer FROM job_output_field f JOIN job_capture c ON c.id = f.capture \
-             WHERE f.output = ?1 ORDER BY c.pointer",
-            params![output],
+             WHERE f.job = ?1 AND f.generation = ?2 ORDER BY c.pointer",
+            params![job, generation],
             |row| pointer(row, 0),
         )?;
         Ok(Some(SavedOutput {
@@ -404,9 +383,10 @@ impl SharedDb {
 
     pub(crate) fn complete_fields(&self, job: u64) -> Result<Vec<FieldPointer>, DbError> {
         self.lock().query(
-            "SELECT p.pointer FROM job_complete_field p JOIN job_generation g \
-               ON g.job = p.job AND g.generation = p.generation \
-             WHERE p.job = ?1 ORDER BY p.id",
+            &format!(
+                "SELECT p.pointer FROM job_complete_field p \
+                 WHERE p.job = ?1 AND p.generation = ({CURRENT_GENERATION}) ORDER BY p.pointer"
+            ),
             params![job],
             |row| pointer(row, 0),
         )
@@ -427,6 +407,68 @@ mod tests {
         job::{JobEnd, JobRole, JobTransition},
         session::{SessionError, SessionEvent, SessionStore, tests::on_disk},
     };
+
+    /// Saved fields reference the saved run's own captures. A capture of another job
+    /// or an earlier run is rejected, and the output it would replace stands.
+    #[tokio::test]
+    async fn output_fields_reference_only_the_saved_runs_captures() {
+        let (root, store, agent) = on_disk().await;
+        let append = |event| store.append(agent.clone(), event);
+        let [first, other] = [1, 2].map(|id| JobId::new(id).unwrap());
+        for job in [first, other] {
+            append(SessionEvent::JobCreated {
+                job,
+                parent: None,
+                origin: None,
+                tool: "agent".into(),
+                role: JobRole::Agent,
+                name: None,
+                arguments: serde_json::json!({}),
+                output_schema: None,
+                accepts_input: true,
+                background: false,
+                location: ExecutionLocation::root(root.path().to_owned()),
+            })
+            .await
+            .unwrap();
+        }
+        let db = store.outputs();
+        let field = |name| FieldPointer::result().property(name);
+        let reserve = |job: JobId, name| {
+            let capture = db.create_capture(job.get(), &field(name), CaptureKind::Text);
+            capture.unwrap().unwrap()
+        };
+        let save = |captures: &[i64]| db.save_output(first.get(), Some("{}"), true, captures, &[]);
+        let saved = |name| {
+            let output = db.output(first.get()).unwrap().unwrap();
+            assert_eq!(output.result.as_deref(), Some("{}"));
+            assert_eq!(output.fields, [field(name)]);
+        };
+        let earlier = reserve(first, "earlier");
+        save(&[earlier]).unwrap();
+        assert!(save(&[reserve(other, "foreign")]).is_err());
+        saved("earlier");
+
+        append(SessionEvent::JobFinished {
+            job: first,
+            state: JobEnd::Completed,
+            diagnostic: None,
+            output_diagnostic: None,
+            images: Vec::new(),
+        })
+        .await
+        .unwrap();
+        let running = JobTransition::Running;
+        let restart = SessionEvent::JobStateChanged {
+            job: first,
+            state: running,
+        };
+        append(restart).await.unwrap();
+        assert!(db.output(first.get()).unwrap().is_none());
+        save(&[reserve(first, "current")]).unwrap();
+        assert!(save(&[earlier]).is_err());
+        saved("current");
+    }
 
     /// Closing revokes every clone's writes, including SQL queries that insert rows
     /// and mutations that resolve the job's current generation only when they run.
@@ -455,11 +497,8 @@ mod tests {
             .unwrap();
         let old = store.outputs();
         let field = FieldPointer::result().property("text");
-        let reserve = |db: &SharedDb, kind| {
-            db.create_capture(job.get(), &field, kind, false)
-                .unwrap()
-                .unwrap()
-        };
+        let reserve =
+            |db: &SharedDb, kind| db.create_capture(job.get(), &field, kind).unwrap().unwrap();
         let previous = reserve(&old, CaptureKind::Unknown);
         let extent = old
             .append_capture(previous, CaptureExtent::default(), b"previous")
@@ -503,12 +542,7 @@ mod tests {
         for (operation, result) in [
             (
                 "reserve",
-                old.create_capture(job.get(), &extra, CaptureKind::Text, false)
-                    .map(drop),
-            ),
-            (
-                "render",
-                old.create_capture(job.get(), &field, CaptureKind::Text, true)
+                old.create_capture(job.get(), &extra, CaptureKind::Text)
                     .map(drop),
             ),
             (
@@ -540,7 +574,6 @@ mod tests {
         assert_eq!(saved.fields.as_slice(), std::slice::from_ref(&field));
         assert!(old.complete_fields(job.get()).unwrap().is_empty());
         assert_eq!(old.presented_bytes(job.get()).unwrap(), None);
-        assert_eq!(old.rendering(job.get(), &field).unwrap(), None);
         let captures = old.captures(job.get()).unwrap();
         assert_eq!(captures.len(), 1);
         assert_eq!(captures[0].id, capture);

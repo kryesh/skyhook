@@ -1,4 +1,4 @@
-//! Current-state queries over the schema's views.
+//! Current-state queries derived from the journal.
 
 use libsql::Row;
 
@@ -34,12 +34,50 @@ pub struct SessionTitle {
     pub source: TitleSource,
 }
 
+/// The session's title row, if any: the user's newest title, unless a title_cleared
+/// follows it; else the newest automatic one; else the first text the user sent the
+/// root agent, as a prompt title.
+const TITLE: &str = "\
+    WITH chosen(entry) AS (
+      SELECT coalesce(
+        (SELECT max(u.entry) FROM title u
+          WHERE u.source = 'user' AND u.entry > coalesce(
+            (SELECT max(e.seq) FROM entry e
+              WHERE e.agent = (SELECT id FROM agent WHERE parent IS NULL)
+                AND e.kind = 'title_cleared'),
+            0)),
+        (SELECT max(a.entry) FROM title a WHERE a.source <> 'user')))
+    SELECT t.text, t.source FROM title t WHERE t.entry = (SELECT entry FROM chosen)
+    UNION ALL
+    SELECT * FROM (
+      SELECT p.text, 'prompt' FROM message_commit mc
+        JOIN entry e ON e.seq = mc.entry
+        JOIN agent a ON a.id = e.agent AND a.parent IS NULL
+        JOIN user_part p ON p.message = mc.message AND p.kind = 'text'
+       WHERE (SELECT entry FROM chosen) IS NULL
+       ORDER BY mc.entry, p.position LIMIT 1)";
+
+/// Always one row, whether or not the session has a title or any activity.
 pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
     let stopped = stopped_turn(db)?;
+    let root = "JOIN agent a ON a.id = x.agent AND a.parent IS NULL";
     db.query_row(
-        "SELECT t.text, t.source, coalesce(last_millis, 0), entries, p.provider, p.name, mode \
-         FROM session_summary s LEFT JOIN session_title t ON true \
-         LEFT JOIN model_profile p ON p.id = s.profile",
+        &format!(
+            "SELECT t.text, t.source, \
+               coalesce((SELECT e.created_millis FROM entry e \
+                 JOIN entry_kind k ON k.name = e.kind \
+                 WHERE k.activity ORDER BY e.seq DESC LIMIT 1), 0), \
+               (SELECT count(*) FROM entry), p.provider, p.name, \
+               (SELECT m.name FROM agent_mode am JOIN mode m ON m.id = am.mode \
+                 JOIN entry x ON x.seq = am.entry {root} ORDER BY am.entry DESC LIMIT 1) \
+             FROM (SELECT coalesce( \
+                 (SELECT ms.profile FROM model_selection ms JOIN entry x ON x.seq = ms.entry \
+                   {root} ORDER BY ms.entry DESC LIMIT 1), \
+                 (SELECT s.profile FROM agent_start s JOIN entry x ON x.seq = s.entry {root}) \
+               ) AS profile) s \
+             LEFT JOIN ({TITLE}) t ON true \
+             LEFT JOIN model_profile p ON p.id = s.profile"
+        ),
         Vec::new(),
         |row| {
             let model = match (row.get::<Option<String>>(4)?, row.get::<Option<String>>(5)?) {
@@ -64,11 +102,7 @@ pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
 
 /// The session list's title.
 pub(in crate::session) fn title(db: &Db) -> DbResult<Option<SessionTitle>> {
-    let title = db.query_row(
-        "SELECT text, source FROM session_title",
-        Vec::new(),
-        |row| title_at(row, 0),
-    )?;
+    let title = db.query_row(TITLE, Vec::new(), |row| title_at(row, 0))?;
     Ok(title.flatten())
 }
 

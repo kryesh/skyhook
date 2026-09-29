@@ -135,20 +135,19 @@ impl Saved {
 
     /// The bytes of a referenced field, which the document stores as a placeholder.
     /// A detected sequence reads as the array it presents.
-    pub(super) fn stored(&self, field: &FieldPointer) -> Result<Option<Source>, ToolError> {
-        let Some(capture) = self
+    pub(super) fn stored(&self, field: &FieldPointer) -> Option<Box<dyn Read>> {
+        let capture = self
             .fields
             .contains(field)
             .then(|| self.captures.get(field))
-            .flatten()
-        else {
-            return Ok(None);
-        };
+            .flatten()?;
         let source = reader::CaptureReader::new(self.output.db.clone(), capture.id);
-        if capture.detection != Some(json::Detection::Sequence) {
-            return Ok(Some(Source::Capture(source)));
-        }
-        disk_rendering(self, field, |out| Ok(json::write_sequence(source, out)?)).map(Some)
+        Some(if capture.detection == Some(json::Detection::Sequence) {
+            let source = BufReader::with_capacity(IO_BUFFER_BYTES, source);
+            Box::new(json::SequenceArray::new(source))
+        } else {
+            Box::new(source)
+        })
     }
 }
 
@@ -376,7 +375,7 @@ fn hydrate_field(saved: &Saved, value: &mut Value, field: &FieldPointer) -> Resu
         .ok_or_else(|| ToolError::failed("invalid saved output field"))?;
     let mut bytes = Vec::new();
     saved
-        .stored(field)?
+        .stored(field)
         .ok_or_else(|| ToolError::failed("saved output field is missing"))?
         .read_to_end(&mut bytes)?;
     *target = if target.is_string() {
@@ -545,15 +544,10 @@ mod tests {
                     .captures
                     .contains_key(&FieldPointer::result().property("note"))
             );
-            // A sequence reads through a cached rendering of its array.
-            for _ in 0..2 {
-                assert_eq!(
-                    value(&output),
-                    json!({"note":"{\"x\":1}", "stdout": expected})
-                );
-            }
-            let rendering = output.db.rendering(id.get(), &stdout).unwrap();
-            assert_eq!(rendering.is_some(), detection == Some(Detection::Sequence));
+            assert_eq!(
+                value(&output),
+                json!({"note":"{\"x\":1}", "stdout": expected})
+            );
             if detection == Some(Detection::Sequence) {
                 let mut args = OutputArgs::new(id);
                 (args.field, args.index) = (Some(stdout.clone()), Some(1));
