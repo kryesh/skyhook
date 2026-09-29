@@ -504,7 +504,7 @@ def handle(request):
             return
     elif method == 'tools/call':
         name = params['name']
-        if os.environ.get('MCP_TEST_LARGE_RESULT') == '1':
+        if name == 'echo' and params.get('arguments', {}).get('oversized_result'):
             send({'jsonrpc': '2.0', 'id': ident, 'result': {'content': [{'type': 'text', 'text': 'x' * limits['result']}]}})
             return
         if name == 'rpc_error':
@@ -543,6 +543,11 @@ for line in sys.stdin:
 
     impl Fixture {
         pub(super) fn new() -> Option<Self> {
+            Self::batch().map(|[fixture]| fixture)
+        }
+
+        /// Compound tests share the availability probe, not their server directories.
+        pub(super) fn batch<const N: usize>() -> Option<[Self; N]> {
             let python = std::process::Command::new("python3")
                 .arg("--version")
                 .output();
@@ -550,8 +555,9 @@ for line in sys.stdin:
                 eprintln!("skipping MCP subprocess test: python3 is unavailable");
                 return None;
             }
-            let directory = tempfile::tempdir().expect("fixture directory");
-            Some(Self { directory })
+            Some(std::array::from_fn(|_| Self {
+                directory: tempfile::tempdir().expect("fixture directory"),
+            }))
         }
 
         pub(super) fn config(&self) -> crate::mcp::config::RawMcpServerConfig {
@@ -837,14 +843,10 @@ for line in sys.stdin:
         assert_eq!(reached, (Operation::Receive, Effects::MayHaveExecuted));
         // The session stays usable.
         fixture_call(&manager, "echo").await.unwrap();
-        shutdown(&manager).await;
         // Oversized results are rejected without exposing content.
-        let mut config = fixture.config();
-        config
-            .env
-            .insert("MCP_TEST_LARGE_RESULT".into(), "1".into());
-        let manager = connect(config).await;
-        let error = fixture_call(&manager, "echo").await.unwrap_err();
+        let arguments = Map::from_iter([("oversized_result".into(), Value::Bool(true))]);
+        let call = manager.call("fixture", "echo", arguments, CancellationToken::new());
+        let error = bounded(call).await.unwrap_err();
         assert!(is(&error, McpError::ResultTooLarge), "{error:?}");
         assert_eq!(
             stage(error),

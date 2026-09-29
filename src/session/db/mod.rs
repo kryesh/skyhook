@@ -417,29 +417,45 @@ impl Dictionaries<'_> {
         values: &[T],
         flags: impl Fn(T) -> [bool; N],
     ) -> DbResult<()> {
-        let slots: String = (2..=N + 1).map(|slot| format!(", ?{slot}")).collect();
         let columns: String = columns.map(|column| format!(", {column}")).concat();
-        let (columns, slots) = (format!("(name{columns})"), format!("(?1{slots})"));
+        let columns = format!("name{columns}");
         let Self(db, seeding) = *self;
-        let sql = match seeding {
-            Seeding::Fill => format!("INSERT INTO {table} {columns} VALUES {slots}"),
-            Seeding::Check => format!("SELECT count(*) FROM {table} WHERE {columns} = {slots}"),
-        };
-        let count = |sql: &str, params| {
-            let count = db.query_row(sql, params, |row| Ok(row.get::<u64>(0)?))?;
-            DbResult::Ok(count.unwrap_or_default())
-        };
-        let mut held = 0;
-        for value in values {
-            let mut params = params![*value];
-            params.extend(flags(*value).map(Sql::sql));
-            held += match seeding {
-                Seeding::Fill => db.execute(&sql, params)?,
-                Seeding::Check => count(&sql, params)?,
-            };
+        let mut expected: std::collections::BTreeMap<_, _> = values
+            .iter()
+            .map(|value| (value.as_str(), flags(*value).map(i64::from)))
+            .collect();
+        if let Seeding::Fill = seeding {
+            let slots: String = (2..=N + 1).map(|slot| format!(", ?{slot}")).collect();
+            let sql = format!("INSERT INTO {table} ({columns}) VALUES (?1{slots})");
+            let statement = ready(db.conn.prepare(&sql))?;
+            for value in values {
+                let mut params = params![*value];
+                params.extend(expected[value.as_str()].map(Sql::sql));
+                ready(statement.execute(params))?;
+                // Local libsql statements must be reset before rebinding.
+                statement.reset();
+            }
         }
-        let rows = count(&format!("SELECT count(*) FROM {table}"), Vec::new())?;
-        if held != values.len() as u64 || rows != held {
+        // Each row consumes its expected entry, so a repeat or unknown row fails.
+        db.query(
+            &format!("SELECT {columns} FROM {table}"),
+            Vec::new(),
+            |row| {
+                let Value::Text(name) = row.get_value(0)? else {
+                    return Err(DbError::Dictionary(table));
+                };
+                let Some(flags) = expected.remove(name.as_str()) else {
+                    return Err(DbError::Dictionary(table));
+                };
+                for (column, flag) in flags.into_iter().enumerate() {
+                    if row.get_value(column as i32 + 1)? != Value::Integer(flag) {
+                        return Err(DbError::Dictionary(table));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        if !expected.is_empty() {
             return Err(DbError::Dictionary(table));
         }
         Ok(())
@@ -789,10 +805,16 @@ mod tests {
 
     #[test]
     fn an_opened_journal_must_hold_this_builds_dictionaries() {
+        // An extra row, a missing row and a changed flag.
         for (table, tamper) in [
             (
                 "todo_status",
                 "INSERT INTO todo_status (name) VALUES ('abandoned')",
+            ),
+            (
+                "todo_status",
+                "DROP TRIGGER todo_status_append_only_delete; \
+                 DELETE FROM todo_status WHERE name = 'pending'",
             ),
             (
                 "job_state",

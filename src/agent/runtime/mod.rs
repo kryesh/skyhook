@@ -543,7 +543,7 @@ mod tests {
     };
 
     /// A request as the scripted context that received it saw it.
-    #[derive(Clone, Debug, PartialEq)]
+    #[derive(Debug, PartialEq)]
     pub(super) struct Served {
         pub(super) context: ContextId,
         pub(super) request: ModelRequest,
@@ -556,7 +556,7 @@ mod tests {
         }
     }
 
-    pub(super) type Requests = Arc<StdMutex<Vec<Served>>>;
+    pub(super) type Requests = Arc<StdMutex<Vec<Arc<Served>>>>;
 
     /// Counts records (or record references) whose event matches a pattern.
     macro_rules! count {
@@ -645,7 +645,7 @@ mod tests {
     /// A provider answering from `steps`, shared by every context it opens.
     pub(super) struct Script {
         steps: Vec<Step>,
-        served: StdMutex<Vec<(usize, ModelRequest)>>,
+        served: StdMutex<Vec<Option<ModelRequest>>>,
         /// Midstream steps whose stream reached its held terminal event.
         held: StdMutex<Vec<usize>>,
         changed: tokio::sync::Notify,
@@ -657,9 +657,11 @@ mod tests {
 
     impl Script {
         pub(super) fn new(steps: impl IntoIterator<Item = Step>, requests: &Requests) -> Arc<Self> {
+            let steps = steps.into_iter().collect::<Vec<_>>();
+            let served = vec![None; steps.len()];
             Arc::new_cyclic(|this| Self {
-                steps: steps.into_iter().collect(),
-                served: StdMutex::default(),
+                steps,
+                served: StdMutex::new(served),
                 held: StdMutex::default(),
                 changed: tokio::sync::Notify::new(),
                 requests: requests.clone(),
@@ -685,13 +687,7 @@ mod tests {
 
         /// The request that `step` served, once it arrives.
         pub(super) async fn request(&self, step: usize) -> ModelRequest {
-            let served = |script: &Self| {
-                let served = script.served.lock().unwrap();
-                served
-                    .iter()
-                    .find(|(id, _)| *id == step)
-                    .map(|(_, request)| request.clone())
-            };
+            let served = |script: &Self| script.served.lock().unwrap()[step].clone();
             self.when(served).await
         }
 
@@ -721,11 +717,16 @@ mod tests {
         /// Whether any step at or after `step` has been requested.
         pub(super) fn requested_from(&self, step: usize) -> bool {
             let served = self.served.lock().unwrap();
-            served.iter().any(|(seen, _)| *seen >= step)
+            served.iter().skip(step).any(Option::is_some)
         }
 
         pub(super) fn remaining(&self) -> usize {
-            self.steps.len() - self.served.lock().unwrap().len()
+            self.served
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|request| request.is_none())
+                .count()
         }
 
         pub(super) fn dropped(&self, context: &ContextId) -> bool {
@@ -769,7 +770,7 @@ mod tests {
                 let free = |(index, step): &(usize, &Step)| {
                     step.model
                         .is_none_or(|model| request.model.as_str() == model)
-                        && !served.iter().any(|(seen, _)| seen == index)
+                        && served[*index].is_none()
                 };
                 let (step, _) = script
                     .steps
@@ -777,11 +778,11 @@ mod tests {
                     .enumerate()
                     .find(free)
                     .expect("scripted response");
-                script.requests.lock().unwrap().push(Served {
+                script.requests.lock().unwrap().push(Arc::new(Served {
                     context: self.1.clone(),
                     request: request.clone(),
-                });
-                served.push((step, request));
+                }));
+                served[step] = Some(request);
                 step
             };
             script.changed.notify_waiters();

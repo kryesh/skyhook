@@ -109,16 +109,15 @@ mod tests {
 
     #[tokio::test]
     async fn discovery_limits_skip_and_reap_unusable_servers() {
-        let limits = [
+        const LIMITS: [(&str, DiscoveryLimit); 3] = [
             ("oversized_schema", DiscoveryLimit::ToolSize),
             ("many_tools", DiscoveryLimit::CatalogSize),
             ("repeated_cursor", DiscoveryLimit::RepeatedCursor),
         ];
-        let modes = limits.map(|(mode, _)| mode);
-        let Some(fixtures) = modes.map(|_| Fixture::new()).into_iter().collect() else {
+        let modes = LIMITS.map(|(mode, _)| mode);
+        let Some(fixtures) = Fixture::batch::<{ LIMITS.len() }>() else {
             return;
         };
-        let fixtures: Vec<Fixture> = fixtures;
         let configs = std::iter::zip(modes, &fixtures)
             .map(|(mode, fixture)| {
                 let mut config = fixture.config();
@@ -128,7 +127,7 @@ mod tests {
             .collect();
         let manager = McpManager::connect(&configs, &Default::default(), Default::default()).await;
         assert!(manager.catalog().is_empty());
-        for (mode, limit) in limits {
+        for (mode, limit) in LIMITS {
             assert!(matches!(*failure(&manager, mode), StartupError::Limit(l) if l == limit));
         }
         #[cfg(unix)]

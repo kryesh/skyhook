@@ -183,7 +183,7 @@ mod tests {
         async fn records(&self) -> Vec<EventRecord> {
             self.session.runtime.store.records().await
         }
-        fn requests(&self) -> Vec<Served> {
+        fn requests(&self) -> Vec<Arc<Served>> {
             self.script.requests.lock().unwrap().clone()
         }
 

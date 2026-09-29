@@ -293,7 +293,7 @@ impl Offload<'_> {
             }
         }
         !field.is_root()
-            && exceeds(value, OFFLOAD_BYTES)
+            && serialized_bytes(value, OFFLOAD_BYTES).is_err()
             && !(self.registered.keys())
                 .chain(self.stored.candidates)
                 .chain(self.stored.complete)
@@ -342,8 +342,11 @@ fn clear(value: &mut Value) {
     }
 }
 
-/// Whether `value` serializes to more than `limit` bytes, serializing at most that many.
-fn exceeds(value: &Value, limit: usize) -> bool {
+/// Count JSON bytes without retaining them, stopping on the first write over `limit`.
+pub(super) fn serialized_bytes(
+    value: &impl serde::Serialize,
+    limit: usize,
+) -> serde_json::Result<usize> {
     struct Budget(usize);
     impl Write for Budget {
         fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
@@ -357,7 +360,9 @@ fn exceeds(value: &Value, limit: usize) -> bool {
             Ok(())
         }
     }
-    serde_json::to_writer(Budget(limit), value).is_err()
+    let mut budget = Budget(limit);
+    serde_json::to_writer(&mut budget, value)?;
+    Ok(limit - budget.0)
 }
 
 /// Install referenced fields into the document.

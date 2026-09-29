@@ -678,12 +678,7 @@ mod tests {
             let text = format!("mailbox-child-reply-{index}");
             let reply = AssistantItem::text(format!("child-reply-{index}"), 0, text);
             // Any cheap tool keeps the child working after its reply.
-            let tool = call_at(
-                1,
-                &format!("child-tool-{index}"),
-                "todo",
-                json!({"items":[]}),
-            );
+            let tool = call_at(1, &format!("child-tool-{index}"), "todo", json!({}));
             steps.push(("child", vec![reply, tool]));
         }
         let child_final = steps.len();
@@ -706,7 +701,7 @@ mod tests {
             bounded(ready).await.unwrap();
         }
         for step in 2..child_final {
-            tracking.pass(step).await;
+            tracking.release(step);
         }
         // Publishing more replies than the mailbox holds must not deadlock the child.
         tracking.request(child_final).await;

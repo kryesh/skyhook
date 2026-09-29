@@ -11,7 +11,7 @@ use super::{
 use crate::job::output::{FieldPointer, OutputTruncation, shape::COLLECTION_MEMBERS};
 
 /// How much of each pooled value a fit shows.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct Fit {
     pub(super) samples: Samples,
     /// Bytes kept of a string inside a sample; `None` keeps all that was pooled.
@@ -29,7 +29,7 @@ impl Fit {
 }
 
 /// The children shown of each array or collection.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Samples {
     Every,
     First(usize),

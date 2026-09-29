@@ -552,6 +552,31 @@ async fn http_connect(
         .map_err(Box::new)
 }
 
+enum ReadinessError {
+    Unreachable,
+    Failed(McpError),
+}
+
+/// Retry only establishment, before any tool has been advertised or invoked.
+/// The first wait also gives the just-launched process time to open its listener.
+async fn wait_for_readiness<T, Attempt, Wait>(
+    mut attempt: impl FnMut() -> Attempt,
+    mut wait: impl FnMut() -> Wait,
+) -> Result<T, McpError>
+where
+    Attempt: Future<Output = Result<T, ReadinessError>>,
+    Wait: Future<Output = ()>,
+{
+    loop {
+        wait().await;
+        match attempt().await {
+            Ok(service) => return Ok(service),
+            Err(ReadinessError::Unreachable) => {}
+            Err(ReadinessError::Failed(error)) => return Err(error),
+        }
+    }
+}
+
 /// The caller supplies an outer startup deadline and retains ownership outside
 /// that future, so timeout/cancellation still explicitly kills and reaps children.
 pub(crate) async fn connect(
@@ -595,16 +620,21 @@ pub(crate) async fn connect(
                 Err(error) => return Err(initialize_error(*error)),
             };
             *process = Some(OwnedProcess::spawn(command, false)?);
-            // Retry only establishment, before any tool has been advertised or
-            // invoked. Authentication/protocol failures stop readiness immediately.
-            loop {
-                tokio::time::sleep(READINESS_POLL).await;
-                match http_connect(client.clone(), transport.clone()).await {
-                    Ok(service) => return Ok(service),
-                    Err(error) if unreachable(&error) => {}
-                    Err(error) => return Err(initialize_error(*error)),
-                }
-            }
+            wait_for_readiness(
+                || async {
+                    http_connect(client.clone(), transport.clone())
+                        .await
+                        .map_err(|error| {
+                            if unreachable(&error) {
+                                ReadinessError::Unreachable
+                            } else {
+                                ReadinessError::Failed(initialize_error(*error))
+                            }
+                        })
+                },
+                || tokio::time::sleep(READINESS_POLL),
+            )
+            .await
         }
     }
 }
@@ -614,6 +644,40 @@ mod tests {
     use super::*;
     use crate::tests::bounded;
     use tokio::io::AsyncReadExt;
+
+    /// Every attempt follows a wait; only an unreachable server is tried again.
+    #[tokio::test]
+    async fn readiness_waits_before_each_attempt_and_retries_only_unreachable() {
+        use ReadinessError::{Failed, Unreachable};
+        for (outcomes, ready) in [
+            (vec![Err(Unreachable), Err(Unreachable), Ok(())], true),
+            (
+                vec![
+                    Err(Unreachable),
+                    Err(Failed(McpError::AuthenticationRequired)),
+                ],
+                false,
+            ),
+        ] {
+            let attempts = outcomes.len();
+            let mut outcomes = outcomes.into_iter();
+            let steps = std::cell::RefCell::new(Vec::new());
+            let result = wait_for_readiness(
+                || {
+                    steps.borrow_mut().push("attempt");
+                    std::future::ready(outcomes.next().unwrap())
+                },
+                // Recorded only once the wait, pending at first, has completed.
+                || async {
+                    tokio::task::yield_now().await;
+                    steps.borrow_mut().push("waited");
+                },
+            )
+            .await;
+            assert_eq!(steps.into_inner(), ["waited", "attempt"].repeat(attempts));
+            assert_eq!(result.is_ok(), ready);
+        }
+    }
 
     #[tokio::test]
     async fn http_transport_errors_strip_url_secrets_before_sdk_logging() {

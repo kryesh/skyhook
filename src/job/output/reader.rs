@@ -625,39 +625,47 @@ mod tests {
         }
     }
 
-    /// `text` as a field's own bytes, or as a string inside a stored container.
-    fn saved(text: &str, stored: bool) -> Option<TextField> {
-        Some(if stored {
-            let json = Box::new(Cursor::new(serde_json::to_vec(text).unwrap()));
-            TextField::Stored(super::super::render::JsonField::new(
-                json,
-                Default::default(),
-            ))
-        } else {
-            TextField::Bytes(Source::Memory(Cursor::new(text.as_bytes().to_vec())))
-        })
+    /// Encode an immutable fixture once, reopening independent raw or stored readers.
+    fn saved(text: &str) -> impl Fn(bool) -> Option<TextField> + use<> {
+        let json: std::rc::Rc<[u8]> = serde_json::to_vec(text).unwrap().into();
+        let text = text.as_bytes().to_vec();
+        move |stored| {
+            Some(if stored {
+                let json = Box::new(Cursor::new(json.clone()));
+                TextField::Stored(super::super::render::JsonField::new(
+                    json,
+                    Default::default(),
+                ))
+            } else {
+                TextField::Bytes(Source::Memory(Cursor::new(text.clone())))
+            })
+        }
     }
 
     /// A string streamed from a stored container pages exactly as its own bytes.
     #[test]
     fn whole_lines_are_preferred_and_large_lines_are_fully_accessible() {
+        let escaped = "🦀\"\\";
         let text = format!(
             "{}\n{}\n{}",
             "a".repeat(CONTENT_BYTES / 2),
             "b".repeat(CONTENT_BYTES / 2),
-            "🦀\"\\".repeat(CONTENT_BYTES)
+            escaped.repeat((IO_BUFFER_BYTES + CONTENT_BYTES).div_ceil(escaped.len()))
         );
+        let source = saved(&text);
         let read = |query: &Selection, stored| {
-            page(saved(&text, stored), query, true, &Default::default()).unwrap()
+            page(source(stored), query, true, &Default::default()).unwrap()
         };
-        let first = read(&selection(1, 0), false);
-        assert_eq!(first.lines(), [text.lines().next().unwrap()]);
-        assert_eq!((first.next_start, first.next_offset), (Some(2), None));
         let mut query = selection(1, 0);
         let mut reconstructed = String::new();
         let mut previous = 1;
-        for _ in 0..100 {
+        let mut continuations = 0;
+        for index in 0..100 {
             let view = read(&query, false);
+            if index == 0 {
+                assert_eq!(view.lines(), [text.lines().next().unwrap()]);
+                assert_eq!((view.next_start, view.next_offset), (Some(2), None));
+            }
             assert!(serde_json::to_vec(&view).unwrap().len() <= PAGE_BYTES);
             assert_eq!(view, read(&query, true));
             for (index, row) in view.lines().into_iter().enumerate() {
@@ -671,8 +679,10 @@ mod tests {
             let Some(start) = view.next_start else {
                 break;
             };
+            continuations += usize::from(start == query.start);
             query = selection(start, view.next_offset.unwrap_or(0));
         }
+        assert!(continuations > 1);
         assert_eq!(reconstructed, text);
     }
 
@@ -682,7 +692,8 @@ mod tests {
         query.matcher = Some(super::super::args::pattern_matcher("ERROR").unwrap());
         query.context = 1;
         let live = "before\nERROR\npar";
-        let first = page(saved(live, false), &query, false, &Default::default()).unwrap();
+        let source = saved(live);
+        let first = page(source(false), &query, false, &Default::default()).unwrap();
         let numbered = |line, text: &str| NumberedLine {
             line,
             text: text.into(),
@@ -694,8 +705,9 @@ mod tests {
         assert_eq!(first.next_start.unwrap(), 2);
         // The producer appends before the next page is read.
         let text = format!("{live}tial\nlast\n");
+        let source = saved(&text);
         query.start = 2;
-        let rest = page(saved(&text, false), &query, true, &Default::default()).unwrap();
+        let rest = page(source(false), &query, true, &Default::default()).unwrap();
         assert_eq!(
             rest.lines,
             PageLines::Numbered(vec![numbered(2, "ERROR"), numbered(3, "partial")])
@@ -703,7 +715,7 @@ mod tests {
         assert!(rest.next_start.is_none());
         query.start = 3;
         query.offset = 1;
-        let rest = page(saved(&text, false), &query, true, &Default::default()).unwrap();
+        let rest = page(source(false), &query, true, &Default::default()).unwrap();
         assert_eq!(rest.lines, PageLines::Numbered(vec![numbered(3, "artial")]));
     }
 
@@ -711,7 +723,7 @@ mod tests {
     /// matches it, and a start past the end pages nothing.
     #[test]
     fn offsets_stay_within_the_starting_line_and_past_the_end_is_empty() {
-        let text = "é\r\nab\n";
+        let source = saved("é\r\nab\n");
         let matcher = super::super::args::pattern_matcher("zzz").unwrap();
         for (stored, matcher) in [false, true]
             .into_iter()
@@ -722,7 +734,7 @@ mod tests {
                     matcher: matcher.clone(),
                     ..selection(start, offset)
                 };
-                page(saved(text, stored), &query, true, &Default::default())
+                page(source(stored), &query, true, &Default::default())
             };
             for (start, offset) in [(1, 1), (1, 3), (2, 3), (3, 1)] {
                 let error = read(start, offset).unwrap_err();
@@ -737,15 +749,16 @@ mod tests {
         }
         // Past the end stays empty even behind context too long to search; the
         // limit applies once the starting line exists.
-        let long = "x".repeat(REGEX_LINE_BYTES + 1);
+        let source = saved(&"x".repeat(REGEX_LINE_BYTES + 1));
+        let matcher = super::super::args::pattern_matcher(".").unwrap();
         for stored in [false, true] {
             let read = |start| {
                 let query = Selection {
-                    matcher: Some(super::super::args::pattern_matcher(".").unwrap()),
+                    matcher: Some(matcher.clone()),
                     context: 1,
                     ..selection(start, 0)
                 };
-                page(saved(&long, stored), &query, true, &Default::default())
+                page(source(stored), &query, true, &Default::default())
             };
             let past = read(2).unwrap();
             assert_eq!((past.total_lines, past.next_start), (Some(1), None));

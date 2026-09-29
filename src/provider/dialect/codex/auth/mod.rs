@@ -157,14 +157,16 @@ struct Inner {
     issuer: Issuer,
 }
 
+fn directory() -> Result<PathBuf, ProviderError> {
+    crate::config::user_config_directory()
+        .ok_or_else(|| Authentication.error("Cannot locate the Skyhook configuration directory"))
+}
+
 impl AuthManager {
     /// Does not read credentials or perform network I/O. Login is deferred until
     /// explicitly requested; credentials() never launches an interactive flow.
     pub fn new(issuer: Issuer) -> Result<Self, ProviderError> {
-        let directory = crate::config::user_config_directory().ok_or_else(|| {
-            Authentication.error("Cannot locate the Skyhook configuration directory")
-        })?;
-        Self::at(directory, issuer)
+        Self::at(directory()?, issuer)
     }
 
     fn at(directory: PathBuf, issuer: Issuer) -> Result<Self, ProviderError> {
@@ -227,7 +229,7 @@ pub async fn status(issuer: Issuer) -> Result<AuthStatus, ProviderError> {
 }
 /// Removes Skyhook's local tokens only; does not revoke other sessions.
 pub async fn logout() -> Result<(), ProviderError> {
-    AuthManager::new(Issuer::default())?.logout().await
+    store::logout(directory()?).await
 }
 
 async fn blocking<T: Send + 'static>(

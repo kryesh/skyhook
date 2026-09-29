@@ -120,7 +120,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     const HTTP_FIXTURE: &str = r#"
-import http.server, json, os, threading, time
+import http.server, json, os, threading
 with open(os.environ['MCP_TEST_PID'] + '.tmp', 'w') as f:
     f.write(str(os.getpid()))
 os.replace(os.environ['MCP_TEST_PID'] + '.tmp', os.environ['MCP_TEST_PID'])
@@ -173,8 +173,6 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-# Force readiness polling rather than succeeding only if the first retry is late.
-time.sleep(0.15)
 # SO_REUSEPORT shares the port the test holds reserved without listening.
 class Server(http.server.ThreadingHTTPServer):
     allow_reuse_port = True
@@ -366,13 +364,12 @@ server.serve_forever()
     #[cfg(unix)]
     #[tokio::test]
     async fn startup_cancellation_reaps_child_and_does_not_launch_later_servers() {
-        let Some(queued) = Fixture::new() else { return };
+        let Some([queued, started @ ..]) = Fixture::batch::<{ STARTUP_CONCURRENCY + 1 }>() else {
+            return;
+        };
         // Fill every startup slot with hanging initialization, leaving one more
         // queued. Cancellation must drain/reap the started slots but never
         // launch the queued server.
-        let started: Vec<_> = (0..STARTUP_CONCURRENCY)
-            .map(|_| Fixture::new().unwrap())
-            .collect();
         let mut configs = BTreeMap::from([("z-queued".to_owned(), queued.config())]);
         for (index, fixture) in started.iter().enumerate() {
             configs.insert(format!("b-{index}"), hanging(fixture));

@@ -100,12 +100,19 @@ impl AgentContext {
         Ok(())
     }
 
-    /// The request's tail: the runtime state, unless the profile's state mode omits
-    /// it. A persisting profile commits it to history instead, before the request.
-    pub fn tail(&self, runtime: UserPart) -> Option<Message> {
-        match self.profile.profile.state_mode {
-            StateMode::None => None,
-            StateMode::Dynamic | StateMode::Persist => Some(Message::User(vec![runtime])),
+    /// Build the runtime-state tail only when the profile sends it. A persisting
+    /// profile commits it to history instead, before the request.
+    pub fn tail<F>(&self, runtime: F) -> impl Future<Output = Option<Message>> + use<F>
+    where
+        F: Future<Output = UserPart>,
+    {
+        // The future must not borrow the provider context, which need not be Sync.
+        let mode = self.profile.profile.state_mode;
+        async move {
+            match mode {
+                StateMode::None => None,
+                StateMode::Dynamic | StateMode::Persist => Some(Message::User(vec![runtime.await])),
+            }
         }
     }
 
@@ -275,7 +282,8 @@ mod tests {
         let mut context = test_context(128_000, 1_000);
         let request = |context: &super::AgentContext| {
             let text = "x".repeat(40_000);
-            context.request(context.tail(UserPart::Text { text }).as_ref())
+            let tail = Message::User(vec![UserPart::Text { text }]);
+            context.request(Some(&tail))
         };
         let raw = context.meter.estimate(&request(&context));
         for actual in [raw / 2, raw * 3] {

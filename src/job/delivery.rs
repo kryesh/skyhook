@@ -244,30 +244,34 @@ impl JobManager {
             let candidates = self.lifecycle_candidates(&jobs, owner, &messages);
             (messages, candidates)
         };
-        // Sized off the jobs lock; the held gate keeps the candidates pending.
-        let envelopes = output::blocking(move || {
-            let mut remaining = LIFECYCLE_BATCH_BYTES;
-            let mut pending = Vec::new();
-            for (envelope, output) in candidates {
-                if remaining == 0 {
-                    break;
+        let envelopes = if candidates.is_empty() {
+            Vec::new()
+        } else {
+            // Sized off the jobs lock; the held gate keeps the candidates pending.
+            output::blocking(move || {
+                let mut remaining = LIFECYCLE_BATCH_BYTES;
+                let mut pending = Vec::new();
+                for (envelope, output) in candidates {
+                    if remaining == 0 {
+                        break;
+                    }
+                    let metadata = serde_json::to_vec(&envelope)
+                        .map_or(output::PAGE_BYTES, |bytes| bytes.len());
+                    let cost = output::presented_size(&output)
+                        .saturating_add(metadata)
+                        .saturating_add(ENVELOPE_OVERHEAD);
+                    if cost > remaining && !pending.is_empty() {
+                        // A later completion may still fit; an oversized first one is admitted.
+                        continue;
+                    }
+                    pending.push(envelope);
+                    remaining = remaining.saturating_sub(cost);
                 }
-                let metadata =
-                    serde_json::to_vec(&envelope).map_or(output::PAGE_BYTES, |bytes| bytes.len());
-                let cost = output::presented_size(&output)
-                    .saturating_add(metadata)
-                    .saturating_add(ENVELOPE_OVERHEAD);
-                if cost > remaining && !pending.is_empty() {
-                    // A later completion may still fit; an oversized first one is admitted.
-                    continue;
-                }
-                pending.push(envelope);
-                remaining = remaining.saturating_sub(cost);
-            }
-            Ok(pending)
-        })
-        .await
-        .map_err(|error| JobError::Output(Box::new(error)))?;
+                Ok(pending)
+            })
+            .await
+            .map_err(|error| JobError::Output(Box::new(error)))?
+        };
         Ok(PendingDelivery {
             manager: self.clone(),
             owner: owner.clone(),

@@ -1,4 +1,4 @@
-pub use events::{Hit, Work};
+pub use events::{Hit, Operation, Work};
 pub use input::InputTarget;
 use lifecycle::{PendingStart, StartState};
 pub use menus::{ConfirmAction, Item, ItemRef, MenuId, MenuKind, Overlay, SavedState, SessionRef};

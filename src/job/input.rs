@@ -562,15 +562,20 @@ mod tests {
     /// which releases waiters and prevents resumption.
     #[tokio::test]
     async fn interrupted_retained_child_resumes_on_send_unless_cancelled() {
+        let (_root, jobs, agent) = super::super::tests::runtime().await;
         for cancel in [false, true] {
-            let (_root, jobs, agent) = super::super::tests::runtime().await;
             let (lease, calls) = retained(&jobs, &agent).await;
             jobs.finish(lease.id(), ToolError::interrupted().into())
                 .await
                 .unwrap();
             let sent = if cancel {
-                jobs.cancel(lease.id()).await.unwrap();
-                assert_eq!(settled(&jobs, lease.id()).await.state, JobState::Cancelled);
+                let (cancelled, _) = crate::tests::expire(
+                    jobs.wait(lease.id(), None, true),
+                    async { jobs.cancel(lease.id()).await.unwrap() },
+                    super::super::cancellation::CANCELLATION_GRACE,
+                )
+                .await;
+                assert_eq!(cancelled.unwrap().state, JobState::Cancelled);
                 jobs.send(lease.id(), serde_json::json!("retry")).await
             } else {
                 jobs.send(lease.id(), serde_json::json!("retry")).await

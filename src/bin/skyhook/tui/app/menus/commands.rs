@@ -1,7 +1,7 @@
 //! Commands, from the palette, a shortcut or a typed `/command`.
 use super::{ConfirmAction, Item, MenuKind};
 use crate::state;
-use crate::tui::app::{App, Focus, HostRequest, StartState, Work};
+use crate::tui::app::{App, Focus, HostRequest, Operation, StartState, Work};
 use crate::tui::keys::{COMMANDS, Command};
 use crate::tui::model::{self, Tab, View};
 
@@ -173,10 +173,12 @@ impl App {
         };
         // Only own a new root operation if the old one has already ended.
         // Resuming suspended children must leave a waiting parent alone.
-        let owns_operation = !self.operation && self.root_interrupted();
-        if owns_operation {
+        let operation = if !self.operation && self.root_interrupted() {
             self.operation = true;
-        }
+            Operation::Owned
+        } else {
+            Operation::Joined
+        };
         // A pending model or mode choice is otherwise captured only by a submitted
         // message. Forward it here too: a refusal repeats deterministically
         // on the same model, so "swap then continue" must actually swap.
@@ -216,11 +218,7 @@ impl App {
                 }
                 Err(error) => Err(error.into()),
             };
-            if owns_operation {
-                let _ = tx.send(Work::Done { result });
-            } else if let Err(error) = result {
-                notices.send(error.to_string());
-            }
+            let _ = tx.send(Work::Continued { operation, result });
         });
     }
 
@@ -259,9 +257,9 @@ mod tests {
     use crossterm::event::{KeyCode, KeyModifiers as M};
     use skyhook::agent::ObservationSnapshot;
     use skyhook::identity::JobId;
-    use skyhook::session::SessionEvent;
+    use skyhook::session::{RecordSeq, SessionEvent};
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn retry_children_without_selection_preserves_the_waiting_root_operation() {
         let (_root, mut app) = permanent_failure_fixture().await;
         let session = app.session().cloned().unwrap();
@@ -290,6 +288,8 @@ mod tests {
         app.snapshot.activity.insert(root.clone(), waiting.clone());
         assert_eq!(app.selected, root);
         app.operation = true;
+        let initial_input = Some((root.clone(), RecordSeq::default()));
+        app.initial_input = initial_input.clone();
         let mut rx = capture_work(&mut app);
         assert!(app.busy());
 
@@ -300,17 +300,35 @@ mod tests {
             }
         })
         .await;
+        // The child's failure doesn't mean the detached continue task has finished;
+        // its last work item does.
+        let continued = bounded(async {
+            loop {
+                match rx.recv().await.unwrap() {
+                    work @ Work::Continued { .. } => break work,
+                    work => {
+                        assert!(!matches!(work, Work::Done { .. }));
+                        app.work(work);
+                    }
+                }
+            }
+        })
+        .await;
+        assert!(matches!(
+            continued,
+            Work::Continued {
+                operation: Operation::Joined,
+                result: Ok(()),
+            }
+        ));
+        app.work(continued);
         assert!(!snapshot.records.values().any(|record| {
             record.agent == root && matches!(record.event, SessionEvent::ModelRequested { .. })
         }));
         // Child retry neither replaces nor finishes the pending root operation.
         assert!(app.operation);
+        assert_eq!(app.initial_input, initial_input);
         assert_eq!(app.snapshot.activity.get(&root), Some(&waiting));
-        while let Ok(work) = rx.try_recv() {
-            assert!(!matches!(work, Work::Done { .. }));
-            app.work(work);
-        }
-        assert!(app.operation);
         session.shutdown().await.unwrap();
     }
 

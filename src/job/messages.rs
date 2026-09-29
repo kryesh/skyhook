@@ -475,7 +475,12 @@ mod tests {
             // Text fields up to the allowance keep their own limits, so the
             // presentation stays large.
             let result: serde_json::Map<_, _> = (0..8)
-                .map(|field| (format!("f{field}"), "z".repeat(output::PAGE_BYTES).into()))
+                .map(|field| {
+                    (
+                        format!("f{field}"),
+                        "z".repeat(output::PAGE_BYTES / 4).into(),
+                    )
+                })
                 .collect();
             let result = serde_json::Value::Object(result);
             manager.test_finish(job, result).await;
@@ -483,6 +488,7 @@ mod tests {
         }
         let receipt = manager.pending_delivery(&owner).await.unwrap();
         let admitted = envelope_ids(&receipt);
+        assert!(!admitted.is_empty());
         assert!(admitted.len() < jobs.len(), "admitted {admitted:?}");
         let capabilities = crate::tool::policy::CapabilitySet::default();
         let mut presented = 0;

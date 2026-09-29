@@ -565,10 +565,8 @@ mod tests {
         let key = CodeKey::admit(&CodeSource::from(source.as_str()), "js").unwrap();
         cache.schedule(std::iter::repeat_n(key.clone(), CACHE_SECTIONS + 1));
         assert_eq!(cache.entries.len(), 1);
-        let keys = (0..CACHE_BYTES / source.len() + 8).map(|index| {
-            let text = format!("{index}\n{}", &source[..source.len() - 8]);
-            CodeKey::admit(&CodeSource::from(text.as_str()), "js").unwrap()
-        });
+        let keys = (0..CACHE_BYTES / source.len() + 8)
+            .map(|index| CodeKey::admit(&key.source, &format!("test-language-{index}")).unwrap());
         cache.schedule(keys);
         assert!(source_bytes(&cache) <= CACHE_BYTES);
         assert!(cache.entries.len() < CACHE_SECTIONS);

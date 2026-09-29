@@ -88,18 +88,6 @@ impl Node {
         // Pointers are only needed to find complete fields.
         marker.mark(value, (!complete.is_empty()).then(|| field.clone()), true)
     }
-
-    pub(super) fn depth(&self) -> usize {
-        match self {
-            Self::Array { items, .. } => {
-                1 + (items.iter().map(|(_, node)| node.depth()).max()).unwrap_or(0)
-            }
-            Self::Object { members, .. } => {
-                1 + (members.iter().map(|(_, _, node)| node.depth()).max()).unwrap_or(0)
-            }
-            Self::Value(_) | Self::Complete(_) | Self::Text(_) => 0,
-        }
-    }
 }
 
 /// How an in-memory value's nodes are classified, as a streamed one's are.

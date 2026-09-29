@@ -378,7 +378,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn stream_overflow_below_threshold_compacts_once() {
         let overflow = ProviderErrorKind::ContextWindowExceeded.error("prompt is too long");
         let steps = [

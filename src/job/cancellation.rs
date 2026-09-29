@@ -62,8 +62,10 @@ impl JobManager {
             if scope.covers(entry) && !entry.cancellation_watchdog_started {
                 entry.cancellation_watchdog_started = true;
                 let jobs = self.clone();
+                // Scheduling the watchdog must not extend the admitted grace period.
+                let grace = tokio::time::sleep(CANCELLATION_GRACE);
                 tokio::spawn(async move {
-                    tokio::time::sleep(CANCELLATION_GRACE).await;
+                    grace.await;
                     jobs.force_cancel(job).await;
                 });
             }

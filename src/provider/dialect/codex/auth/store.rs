@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Seek, SeekFrom, Write},
-    path::Path,
+    path::{Path, PathBuf},
     time::Duration,
 };
 use zeroize::Zeroizing;
@@ -120,28 +120,6 @@ impl AuthManager {
         })
     }
 
-    pub async fn logout(&self) -> Result<(), ProviderError> {
-        let directory = self.inner.directory.clone();
-        blocking(move || {
-            let mut lock = lock_store(&directory)?;
-            // Persist an epoch even when already logged out: an in-progress
-            // login must not resurrect credentials after explicit logout.
-            let epoch = random_string()?;
-            lock.seek(SeekFrom::Start(0))
-                .and_then(|_| lock.write_all(epoch.as_bytes()))
-                .and_then(|_| lock.set_len(epoch.len() as u64))
-                .and_then(|_| lock.sync_all())
-                .map_err(|_| Authentication.error("Cannot invalidate in-progress Codex login"))?;
-            match fs::remove_file(directory.join(STORE_FILE)) {
-                Ok(()) => sync_directory(&directory).map_err(|_| directory_sync_error()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(_) => Err(Authentication.error("Cannot remove Skyhook Codex credentials")),
-            }
-            // Do not remove the lock file: other processes may have its inode open.
-        })
-        .await
-    }
-
     pub(super) async fn load(&self) -> Result<(File, Saved), ProviderError> {
         let directory = self.inner.directory.clone();
         blocking(move || {
@@ -160,6 +138,27 @@ impl AuthManager {
         })
         .await
     }
+}
+
+pub(super) async fn logout(directory: PathBuf) -> Result<(), ProviderError> {
+    blocking(move || {
+        let mut lock = lock_store(&directory)?;
+        // Persist an epoch even when already logged out: an in-progress
+        // login must not resurrect credentials after explicit logout.
+        let epoch = random_string()?;
+        lock.seek(SeekFrom::Start(0))
+            .and_then(|_| lock.write_all(epoch.as_bytes()))
+            .and_then(|_| lock.set_len(epoch.len() as u64))
+            .and_then(|_| lock.sync_all())
+            .map_err(|_| Authentication.error("Cannot invalidate in-progress Codex login"))?;
+        match fs::remove_file(directory.join(STORE_FILE)) {
+            Ok(()) => sync_directory(&directory).map_err(|_| directory_sync_error()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(_) => Err(Authentication.error("Cannot remove Skyhook Codex credentials")),
+        }
+        // Do not remove the lock file: other processes may have its inode open.
+    })
+    .await
 }
 
 // OS locking is performed in spawn_blocking, never on a Tokio worker. Bounded
@@ -379,12 +378,12 @@ pub(super) mod tests {
             AuthStatus::LoggedIn { .. }
         ));
         assert!(!format!("{:?}", manager.credentials().await.unwrap()).contains("old-access"));
-        manager.logout().await.unwrap();
+        logout(temp.path().join("skyhook")).await.unwrap();
         let (lock, _) = manager.load().await.unwrap();
         let epoch = read_epoch(&lock).unwrap();
         drop(lock);
         // Even an already-empty store must invalidate an in-progress login.
-        manager.logout().await.unwrap();
+        logout(temp.path().join("skyhook")).await.unwrap();
         let (lock, saved) = manager.load().await.unwrap();
         assert!(matches!(saved, Saved::Absent));
         assert_ne!(epoch, read_epoch(&lock).unwrap());

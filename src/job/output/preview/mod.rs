@@ -6,6 +6,7 @@
 //! outside the budget, until together they use up the text allowance, and complete
 //! fields are shown whole outside it. Arrays and collection objects share one
 //! sample count; strings inside samples are clipped.
+mod fit;
 mod pool;
 mod present;
 
@@ -15,7 +16,7 @@ use serde_json::Value;
 
 use pool::Node;
 pub(super) use pool::pool;
-use present::{Fit, Samples};
+use present::Fit;
 
 use super::{
     CONTENT_BYTES, FieldPointer, OutputTruncation, ToolError, json, render::Clipped, shape::Shape,
@@ -159,38 +160,13 @@ impl Pooled {
         complete: &BTreeSet<FieldPointer>,
         budget: usize,
     ) -> Preview {
-        let [clip, shorter @ ..] = SAMPLE_TEXT_BYTES;
-        let deepest = |samples, clip| Fit {
-            samples,
-            clip: Some(clip),
-            depth: None,
-        };
-        let every = (self.covered)
-            .then_some([Fit::WHOLE, deepest(Samples::Every, clip)])
-            .into_iter()
-            .flatten();
-        // Showing more samples can cost less: records of fully shown arrays, and
-        // without any cut the shape, drop out. Every count is tried.
-        let counts = (1..=SAMPLES)
-            .rev()
-            .map(|count| deepest(Samples::First(count), clip));
-        let shorter = shorter
-            .into_iter()
-            .map(|clip| deepest(Samples::First(1), clip));
-        let [.., shortest] = SAMPLE_TEXT_BYTES;
-        let shallower = |depth| Fit {
-            samples: Samples::First(1),
-            clip: Some(shortest),
-            depth: Some(depth),
-        };
-        every
-            .chain(counts)
-            .chain(shorter)
-            .chain((1..self.node.depth()).rev().map(shallower))
+        let limits = fit::Limits::of(&self.node);
+        limits
+            .distinct(limits.candidates(self.covered))
             .map(|fit| self.attempt(field, complete, fit))
             .find(|(_, bytes)| *bytes <= budget)
             .map_or_else(
-                || self.attempt(field, complete, shallower(0)).0,
+                || self.attempt(field, complete, fit::shallower(0)).0,
                 |(preview, _)| preview,
             )
     }
@@ -229,7 +205,7 @@ fn protects(complete: &BTreeSet<FieldPointer>, field: &FieldPointer) -> bool {
 }
 
 pub(super) fn json_bytes(value: &impl serde::Serialize) -> usize {
-    serde_json::to_vec(value).map_or(0, |bytes| bytes.len())
+    super::saved::serialized_bytes(value, usize::MAX).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -258,7 +234,9 @@ mod tests {
 
     /// Bytes the budget counts, when no text field or complete value is shown.
     fn budgeted(preview: &Preview) -> usize {
-        json_bytes(&preview.value) + json_bytes(&preview.shape) + json_bytes(&preview.truncated)
+        serde_json::to_vec(&preview.value).unwrap().len()
+            + serde_json::to_vec(&preview.shape).unwrap().len()
+            + serde_json::to_vec(&preview.truncated).unwrap().len()
     }
 
     fn cut<'a>(preview: &'a Preview, field: &str) -> &'a OutputTruncation {
@@ -316,6 +294,13 @@ mod tests {
         let preview = run(&value, &[]);
         assert_eq!(preview.value["stdout"], "done\n");
         assert_eq!(preview.value["exit_code"], 0);
+        let items = preview.value["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        let sample = items[0].as_object().unwrap();
+        assert_eq!(
+            sample.keys().collect::<Vec<_>>(),
+            heavy.keys().collect::<Vec<_>>()
+        );
         assert!(budgeted(&preview) <= PREVIEW_BUDGET);
     }
 
@@ -530,17 +515,24 @@ mod tests {
 
     #[test]
     fn massive_strings_are_read_past_to_a_prefix_with_their_whole_extent() {
-        let log = "line\n".repeat(1_000_000);
+        // Exceed the retained prefix and span many decoder buffers.
+        let total_lines = 4 * PREVIEW_BUDGET;
+        let log = "line\n".repeat(total_lines);
         let rows: Vec<_> = (0..2000).map(|index| json!({"row": index})).collect();
         let preview = run(&json!({"logs": [log], "rows": rows}), &[]);
         let prefix = preview.value["logs"][0].as_str().unwrap();
         assert!(prefix.len() <= PREVIEW_BUDGET && log.starts_with(prefix));
         assert!(matches!(
             cut(&preview, "/result/logs/0"),
-            OutputTruncation::Text {
-                total_lines: 1_000_000,
-                ..
-            }
+            OutputTruncation::Text { total_lines: lines, .. } if *lines == total_lines
+        ));
+        let shown = preview.value["rows"].as_array().unwrap();
+        assert!(!shown.is_empty());
+        assert_eq!(shown, &rows[..shown.len()]);
+        assert!(matches!(
+            cut(&preview, "/result/rows"),
+            OutputTruncation::Elements { shown: listed, total_elements, kept: None, .. }
+                if *listed == shown.len() && *total_elements == rows.len()
         ));
         assert!(budgeted(&preview) <= PREVIEW_BUDGET);
     }
@@ -549,16 +541,18 @@ mod tests {
     fn cuts_beyond_the_listed_count_are_summarized_at_their_common_parent() {
         // Each sample holds several cut arrays, more cuts in all than are listed.
         let values: Vec<_> = (0..200).collect();
-        let items: Vec<_> = (0..200)
+        let items: Vec<_> = (0..=SAMPLES)
             .map(|_| json!({"a": values, "b": values, "c": values, "d": values, "e": values}))
             .collect();
+        let total_cuts = 1 + SAMPLES * items[0].as_object().unwrap().len();
         let preview = run(&json!({"items": items}), &[]);
         assert_eq!(preview.truncated.len(), LISTED_CUTS);
         // A container's own record, which continues it, comes before those inside.
         assert_eq!(preview.truncated[0].field().as_str(), "/result/items");
         assert!(matches!(
             preview.truncated.last().unwrap(),
-            OutputTruncation::Summary { field, .. } if field.as_str() == "/result/items"
+            OutputTruncation::Summary { field, cuts }
+                if field.as_str() == "/result/items" && *cuts == total_cuts - (LISTED_CUTS - 1)
         ));
         assert!(budgeted(&preview) <= PREVIEW_BUDGET);
     }

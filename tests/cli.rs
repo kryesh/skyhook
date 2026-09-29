@@ -10,6 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 
+struct Artifacts {
+    journal: String,
+    outputs: String,
+}
+
 struct Fixture {
     root: tempfile::TempDir,
     cwd: PathBuf,
@@ -77,13 +82,13 @@ impl Fixture {
         self.write("run.js", source);
         output(self.batch().arg("-s").arg(self.path("run.js")).args(extra))
     }
-    /// Every job's output as the host inspects it, captures included.
-    fn artifacts(&self, output: &Output) -> String {
+    /// The journal and every job's output as the host inspects it, captures included.
+    fn artifacts(&self, output: &Output) -> Artifacts {
         use skyhook::{job::JobOutputQuery as Query, session::SessionEvent::JobCreated};
-        let id = std::str::from_utf8(&output.stdout).unwrap().trim();
+        let id = session_id(output);
         let sessions = self.path(".skyhook/sessions");
         block_on(async {
-            let opened = skyhook::session::SessionStore::open(&sessions, id.parse().unwrap());
+            let opened = skyhook::session::SessionStore::open(&sessions, id);
             let (store, records) = opened.await.unwrap();
             let jobs = skyhook::job::JobManager::restore(store, &records).await;
             let (jobs, mut text, all) = (jobs.unwrap(), String::new(), <_>::default());
@@ -94,34 +99,44 @@ impl Fixture {
                     text += &view.await.unwrap().into_view().to_string();
                 }
             }
-            text
+            Artifacts {
+                journal: journal(&records),
+                outputs: text,
+            }
         })
     }
     /// Records as JSON lines.
     fn journal(&self, output: &Output) -> String {
-        let records = self.records(output);
-        let lines = records
-            .iter()
-            .map(|record| serde_json::to_string(record).unwrap());
-        lines.map(|line| line + "\n").collect()
+        journal(&self.records(output))
     }
     /// The committed records of the session whose id `output` printed.
     fn records(&self, output: &Output) -> Vec<skyhook::session::EventRecord> {
-        // Only a failure writes to stderr.
-        assert_eq!(
-            output.stderr.is_empty(),
-            output.status.success(),
-            "stderr: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = std::str::from_utf8(&output.stdout).unwrap();
-        let id = stdout
-            .strip_suffix('\n')
-            .expect("session id ends with newline");
-        let id = id.parse().expect("stdout contains only one session ID");
+        let id = session_id(output);
         let sessions = self.path(".skyhook/sessions");
         block_on(skyhook::session::SessionStore::read_records(&sessions, id)).unwrap()
     }
+}
+
+fn session_id(output: &Output) -> skyhook::identity::SessionId {
+    // Only a failure writes to stderr.
+    assert_eq!(
+        output.stderr.is_empty(),
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = std::str::from_utf8(&output.stdout).unwrap();
+    let id = stdout
+        .strip_suffix('\n')
+        .expect("session id ends with newline");
+    id.parse().expect("stdout contains only one session ID")
+}
+
+fn journal(records: &[skyhook::session::EventRecord]) -> String {
+    let lines = records
+        .iter()
+        .map(|record| serde_json::to_string(record).unwrap());
+    lines.map(|line| line + "\n").collect()
 }
 
 fn block_on<T>(future: impl Future<Output = T>) -> T {
@@ -321,20 +336,29 @@ mod dotenv {
 
     #[test]
     fn dotenv_selects_the_config_directory_and_supplies_provider_credentials() {
+        let f = fixture();
+        // HOME holds no configuration, so only the dotenv value can locate it.
+        let config = f.path("config");
+        let source = format!(
+            "{KEY}=dotenv-api-key\nXDG_CONFIG_HOME='{}'\n",
+            config.display()
+        );
+        f.write("invocation/.env", &source);
+        // Logout finds the credentials through the dotenv directory as well.
+        f.write("config/skyhook/codex-oauth.json", "removed without parsing");
+        let out = output(
+            f.bare_command()
+                .env_remove("XDG_CONFIG_HOME")
+                .args(["auth", "logout"]),
+        );
+        assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
+        assert!(!config.join("skyhook/codex-oauth.json").exists());
         for credential in [
             format!("api_key: {{env: '{KEY}'}}"),
             format!("api_key: {{command: \"printf '%s' \\\"${KEY}\\\"\"}}"),
         ] {
-            let f = fixture();
             let (endpoint, server) = mock_provider();
             f.provider_config(&endpoint, "", &credential);
-            // HOME holds no configuration, so only the dotenv value can locate it.
-            let config = f.path("config");
-            let source = format!(
-                "{KEY}=dotenv-api-key\nXDG_CONFIG_HOME='{}'\n",
-                config.display()
-            );
-            f.write("invocation/.env", &source);
             let mut command = f.bare_command();
             command
                 .env_remove("XDG_CONFIG_HOME")
@@ -345,15 +369,6 @@ mod dotenv {
             let (headers, _) = server.join().unwrap();
             let headers = headers.to_ascii_lowercase();
             assert!(headers.contains("authorization: bearer dotenv-api-key\r\n"));
-            // Logout finds the credentials through the dotenv directory as well.
-            f.write("config/skyhook/codex-oauth.json", "removed without parsing");
-            let out = output(
-                f.bare_command()
-                    .env_remove("XDG_CONFIG_HOME")
-                    .args(["auth", "logout"]),
-            );
-            assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
-            assert!(!config.join("skyhook/codex-oauth.json").exists());
         }
     }
 }
@@ -567,6 +582,7 @@ mod stats {
         let run = f.script("return 7;", &[]);
         assert!(run.status.success(), "{}", f.journal(&run));
         let id = std::str::from_utf8(&run.stdout).unwrap().trim().to_owned();
+        fs::remove_file(f.path("config/skyhook/config.yaml")).unwrap();
         let stats = |format: &[&str]| {
             let out = output(
                 f.bare_command()
@@ -681,10 +697,12 @@ mod headless {
         // A workflow read from a FIFO completes like one read from a file.
         let (child, reader) = spawn_fifo(&f, &source);
         let out = finish(child, reader);
-        let before = f.journal(&out);
+        let Artifacts {
+            journal: before,
+            outputs,
+        } = f.artifacts(&out);
         assert!(out.status.success(), "{before}");
-        let artifacts = f.artifacts(&out);
-        assert!(artifacts.contains("journal-only-console") && artifacts.contains("\"answer\":42"));
+        assert!(outputs.contains("journal-only-console") && outputs.contains("\"answer\":42"));
         assert!(before.contains("Completed"));
         assert_drained(&f, &before);
         let id = std::str::from_utf8(&out.stdout).unwrap().trim();
@@ -692,8 +710,9 @@ mod headless {
         let resumed = f.script(source, &["--resume", id]);
         assert!(resumed.status.success());
         assert_eq!(out.stdout, resumed.stdout);
-        assert!(f.journal(&resumed).starts_with(&before));
-        assert!(f.artifacts(&resumed).contains("resumed-result"));
+        let artifacts = f.artifacts(&resumed);
+        assert!(artifacts.journal.starts_with(&before));
+        assert!(artifacts.outputs.contains("resumed-result"));
     }
 
     #[test]
@@ -704,8 +723,11 @@ mod headless {
         );
         let out = f.script(&source, &["--approve-all"]);
         assert!(!out.status.success());
-        let log = f.journal(&out);
-        assert!(f.artifacts(&out).contains("before-throw"));
+        let Artifacts {
+            journal: log,
+            outputs,
+        } = f.artifacts(&out);
+        assert!(outputs.contains("before-throw"));
         assert!(log.contains("deliberate-failure") && log.contains("Failed:"));
         assert_drained(&f, &log);
         for args in [
@@ -731,12 +753,12 @@ mod headless {
         let denied = f.script(READ_CONFIG, &["--approve-all"]);
         assert!(!denied.status.success());
         assert!(f.journal(&denied).contains("Failed:"));
-        for args in [&["--capabilities", "read"], &["--mode", "look"]] {
+        let [_, started] = [&["--capabilities", "read"], &["--mode", "look"]].map(|args| {
             let allowed = f.script(READ_CONFIG, args);
             assert!(allowed.status.success(), "{}", f.journal(&allowed));
-        }
+            allowed
+        });
         // A resumed job keeps the mode it was last in, not the default.
-        let started = f.script(READ_CONFIG, &["--mode", "look"]);
         let id = String::from_utf8(started.stdout).unwrap();
         let resumed = f.script(READ_CONFIG, &["--resume", id.trim()]);
         assert!(resumed.status.success(), "{}", f.journal(&resumed));
@@ -749,10 +771,6 @@ mod headless {
             let resumed = f.script(READ_CONFIG, args);
             assert!(resumed.status.success(), "{}", f.journal(&resumed));
         }
-        f.config(
-            "http://127.0.0.1:1/v1",
-            "default_mode: none\nmodes:\n  none:\n    capabilities: []\n  look:\n    capabilities: [read]",
-        );
         f.config("http://127.0.0.1:1/v1", "");
         let unapproved =
             "return (await tool.exec({command:['sh','-c','echo not-approved']})).unwrap();";
@@ -766,9 +784,11 @@ mod headless {
         }
         let approved = f.script("return (await tool.exec({command:['sh','-c','echo approved-output; echo approved-stderr >&2']})).unwrap();", &["--capabilities", "exec", "--approve-all"]);
         assert!(approved.status.success());
-        f.journal(&approved);
         let artifacts = f.artifacts(&approved);
-        assert!(artifacts.contains("approved-output") && artifacts.contains("approved-stderr"));
+        assert!(
+            artifacts.outputs.contains("approved-output")
+                && artifacts.outputs.contains("approved-stderr")
+        );
     }
 
     #[test]

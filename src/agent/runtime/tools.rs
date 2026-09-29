@@ -1054,7 +1054,7 @@ for line in sys.stdin:
             .build()
             .await
             .unwrap();
-        let session = harness.new_session().await.unwrap();
+        let session = ephemeral_session(&harness).await;
         let name = mcp_name(&session);
         session.prompt("root request").await.unwrap();
         let child =

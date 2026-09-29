@@ -70,8 +70,7 @@ impl SessionRuntime {
                     record.sequence
                 }
             };
-            let state = self.runtime_state(&turn).await;
-            let tail = agent_context.tail(state);
+            let tail = agent_context.tail(self.runtime_state(&turn)).await;
             if force_compaction {
                 let request = agent_context.request(tail.as_ref());
                 let (provider, meter) = (agent_context.provider.as_mut(), &mut agent_context.meter);
@@ -289,8 +288,7 @@ impl SessionRuntime {
             // Decide once from the successful completed response, never from an
             // estimate that includes newly produced tool results or queued input.
             let compact_completed_response = agent_context.needs_compaction(usage);
-            let state = self.runtime_state(&turn).await;
-            let next_tail = agent_context.tail(state);
+            let next_tail = agent_context.tail(self.runtime_state(&turn)).await;
             // The next request is this one with the response in its history and a new tail.
             let tail_tokens = next_tail
                 .as_ref()
@@ -1066,7 +1064,7 @@ mod tests {
         shutdown_session(session).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn state_mode_persists_or_omits_runtime_state() {
         use crate::provider::profile::StateMode;
         let state = |message: &&Sent| {
@@ -1076,13 +1074,8 @@ mod tests {
         for mode in [StateMode::None, StateMode::Persist] {
             let root = tempfile::tempdir().unwrap();
             let requests = Requests::default();
-            let shell = response(vec![tool_call(
-                0,
-                "first",
-                "exec",
-                json!({"command": "true"}),
-            )]);
-            let provider = scripted_provider(&requests, [shell, answer("done")]);
+            let inspect = response(vec![tool_call(0, "first", "todo", json!({}))]);
+            let provider = scripted_provider(&requests, [inspect, answer("done")]);
             let mut profile = crate::tests::profile("test", false);
             profile.state_mode = mode;
             let harness = serving(root.path(), provider, [("test", profile)])
@@ -1100,6 +1093,17 @@ mod tests {
                 assert!(request.tail.is_empty());
                 assert_eq!(request.history.iter().filter(state).count(), states);
             }
+            let inspected = second
+                .messages()
+                .flat_map(|message| match message {
+                    Sent::Tool(results) => results.as_slice(),
+                    _ => &[],
+                })
+                .find(|result| result.call_id == "first")
+                .expect("todo result in the next request");
+            assert_eq!(inspected.name, "todo");
+            assert!(!inspected.is_error, "todo failed: {inspected:?}");
+            assert_eq!(inspected.result["result"], json!({"items": []}));
             // Append-only: everything sent before is resent unchanged.
             let sent: Vec<_> = first.messages().collect();
             assert!(second.messages().take(sent.len()).eq(sent));
@@ -1221,7 +1225,7 @@ mod tests {
         }
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn usage_with_cache_writes_above_input_fails_the_response_with_the_last_valid_usage() {
         // Cache writes may equal input, never exceed it.
         let valid = Usage {

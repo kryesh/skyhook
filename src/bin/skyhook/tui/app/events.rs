@@ -11,6 +11,12 @@ async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> LoadedOu
         .map_err(|error| error.to_string())
 }
 
+/// Whether a continuation owns the root's UI operation or leaves it untouched.
+pub enum Operation {
+    Owned,
+    Joined,
+}
+
 pub enum Work {
     QueueCommitted {
         id: QueuedInputId,
@@ -19,6 +25,10 @@ pub enum Work {
         result: Result<(), skyhook::agent::HarnessError>,
     },
     Done {
+        result: Result<(), crate::launch::OperationError>,
+    },
+    Continued {
+        operation: Operation,
         result: Result<(), crate::launch::OperationError>,
     },
     Output {
@@ -94,12 +104,24 @@ impl App {
                     self.toast("Nothing to interrupt");
                 }
             }
-            Work::Done { result } => {
+            Work::Done { result }
+            | Work::Continued {
+                operation: Operation::Owned,
+                result,
+            } => {
                 self.operation = false;
                 self.initial_input = None;
                 if let Err(error) = result {
                     self.root_notifier().send(error.to_string());
                     self.pause_queue();
+                }
+            }
+            Work::Continued {
+                operation: Operation::Joined,
+                result,
+            } => {
+                if let Err(error) = result {
+                    self.root_notifier().send(error.to_string());
                 }
             }
             Work::Output {

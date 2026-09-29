@@ -489,6 +489,7 @@ mod tests {
         after: impl IntoIterator<Item = Step>,
     ) -> (
         tempfile::TempDir,
+        Harness,
         Arc<Script>,
         SessionHandle,
         tokio::task::JoinHandle<Result<String, HarnessError>>,
@@ -513,7 +514,7 @@ mod tests {
             let session = session.clone();
             async move { session.prompt("delegate").await }
         });
-        provider.request(2).await;
+        provider.held(2).await;
         let child = session.root.child(1);
         let exec = bounded(async {
             loop {
@@ -530,14 +531,14 @@ mod tests {
         assert_eq!(turn(&session, &child), TurnState::Held);
         assert_eq!(turn(&session, &session.root), TurnState::Held);
         until(&session, exec, |job| job.state == JobState::Cancelled).await;
-        (root, provider, session, parent)
+        (root, harness, provider, session, parent)
     }
 
     /// Continuing a held chain restarts the grandchild, and the whole tree answers
     /// through the preserved waits.
     #[tokio::test]
     async fn continue_resumes_a_turn_held_on_a_retained_child_beside_cancelled_work() {
-        let (_root, provider, session, parent) = held_chain([
+        let (_root, _harness, provider, session, parent) = held_chain([
             Step::new(answer("grandchild recovered")),
             Step::new(answer("child done")),
             Step::new(answer("parent done")),
@@ -555,12 +556,10 @@ mod tests {
     #[tokio::test]
     async fn shutdown_leaves_a_held_chain_resumable() {
         let recovered = (0..8).map(|_| Step::new(answer("recovered")));
-        let (root, provider, session, parent) = held_chain(recovered).await;
+        let (_root, harness, _provider, session, parent) = held_chain(recovered).await;
         let id = session.id();
         shutdown_session(session).await;
         assert!(bounded(parent).await.unwrap().is_err());
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, provider).await;
         let resumed = harness.resume_session(id).await.unwrap();
         let child = resumed.root.child(1);
         let delegated = async |owner: &AgentId| {
@@ -585,7 +584,7 @@ mod tests {
     /// interrupted and the prompt answers.
     #[tokio::test]
     async fn prompt_redirects_a_chain_held_on_a_retained_grandchild() {
-        let (_root, provider, session, parent) =
+        let (_root, _harness, provider, session, parent) =
             held_chain([Step::new(answer("redirected"))]).await;
         assert_eq!(
             bounded(session.prompt("new direction")).await.unwrap(),

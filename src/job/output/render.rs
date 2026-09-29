@@ -220,6 +220,7 @@ impl Read for EscapedText {
 
 /// JSON string escapes for saved UTF-8 text; other bytes pass through.
 fn escape(bytes: &[u8], out: &mut Vec<u8>) {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut run = 0;
     for (index, &byte) in bytes.iter().enumerate() {
         if !matches!(byte, b'"' | b'\\' | 0..=31) {
@@ -228,7 +229,14 @@ fn escape(bytes: &[u8], out: &mut Vec<u8>) {
         out.extend_from_slice(&bytes[run..index]);
         match byte {
             b'"' | b'\\' => out.extend_from_slice(&[b'\\', byte]),
-            _ => out.extend_from_slice(format!("\\u{byte:04x}").as_bytes()),
+            _ => out.extend_from_slice(&[
+                b'\\',
+                b'u',
+                b'0',
+                b'0',
+                HEX[usize::from(byte >> 4)],
+                HEX[usize::from(byte & 0xf)],
+            ]),
         }
         run = index + 1;
     }
@@ -463,5 +471,23 @@ fn descend<R: Read>(
             reader.has_next().map_err(saved_json)
         }
         _ => Ok(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_text_escapes_every_control_byte() {
+        let text: String = (0u8..=31)
+            .map(char::from)
+            .chain("\"\\é🦀".chars())
+            .collect();
+        let mut escaped = Vec::new();
+        EscapedText::new(Box::new(Cursor::new(text.clone().into_bytes())))
+            .read_to_end(&mut escaped)
+            .unwrap();
+        assert_eq!(serde_json::from_slice::<String>(&escaped).unwrap(), text);
     }
 }

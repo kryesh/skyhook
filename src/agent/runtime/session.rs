@@ -821,7 +821,7 @@ mod tests {
     /// A continue waiting for an interruption to publish while closing publishes
     /// it finds the session closed: it journals nothing, and the interruption
     /// resumes when the session reopens.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_continue_pending_across_shutdown_leaves_the_interruption_resumable() {
         use crate::job::JobState;
         let child_task = json!({"prompt": "child task", "depth": 0});

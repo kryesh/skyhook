@@ -64,7 +64,10 @@ async fn load_sessions(
     peers: Vec<Peer>,
     today: NaiveDate,
 ) -> Result<Vec<Item<SessionRef>>, String> {
-    let mut saved = load_saved(&root).await?;
+    Ok(session_rows(load_saved(&root).await?, &peers, today))
+}
+
+fn session_rows(mut saved: Vec<Saved>, peers: &[Peer], today: NaiveDate) -> Vec<Item<SessionRef>> {
     let time = |last| local_time(last, today, &Local, Precision::Minutes);
     let mut rows: Vec<_> = peers
         .iter()
@@ -108,7 +111,7 @@ async fn load_sessions(
         (false, Recency::At(last), item)
     }));
     rows.sort_by_key(|(working, recency, _)| std::cmp::Reverse((*working, *recency)));
-    Ok(rows.into_iter().map(|(_, _, item)| item).collect())
+    rows.into_iter().map(|(_, _, item)| item).collect()
 }
 
 /// Sessions scanned at once.
@@ -190,34 +193,65 @@ impl App {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::tests::*;
     use super::*;
 
     #[tokio::test]
     async fn switch_menu_pins_working_sessions_then_orders_by_last_activity() {
+        use skyhook::execution::ExecutionLocation;
+        use skyhook::identity::AgentId;
         use skyhook::job::JobState;
         use skyhook::session::{Message, SessionEvent, UserPart};
-        let (_root, app) = draft_fixture().await;
-        let root = app.launch.sessions.clone();
-        let mut ids = vec![];
-        for _ in 0..6 {
-            let session = app.launch.create(None).await.unwrap();
-            session.shutdown().await.unwrap();
-            session.close().await.unwrap();
-            ids.push(session.id());
+        let root = tempfile::tempdir().unwrap();
+        let started = [
+            SessionEvent::SessionStarted {
+                targets: Vec::new(),
+                capabilities: Vec::new(),
+            },
+            SessionEvent::AgentStarted {
+                owner_job: None,
+                profile: None,
+                available_depth: 0,
+                mode: None,
+                capabilities: Vec::new(),
+                location: ExecutionLocation::root(root.path().to_owned()),
+            },
+        ];
+        let mut stores = vec![];
+        for index in 0..6 {
+            let store = SessionStore::create(root.path()).await.unwrap();
+            let agent = AgentId::root(store.id());
+            let mut events = started.to_vec();
+            // A prompt no answer followed resumes interrupted.
+            if index == 3 {
+                let text = "unanswered".into();
+                let message = Message::User(vec![UserPart::Text { text }]);
+                events.push(SessionEvent::MessageCommitted { message });
+            }
+            let records = store
+                .append_all(
+                    events
+                        .into_iter()
+                        .map(|event| (agent.clone(), event))
+                        .collect(),
+                )
+                .await
+                .unwrap();
+            let committed = records.last().unwrap().timestamp_millis;
+            // Keep one store's original lock held through the scan.
+            if index != 4 {
+                store.close().await.unwrap();
+            }
+            stores.push((store, committed));
         }
-        // A prompt no answer followed resumes interrupted; a session another
-        // instance holds is locked.
-        let (store, _) = SessionStore::open(&root, ids[3]).await.unwrap();
-        let text = "unanswered".into();
-        let message = Message::User(vec![UserPart::Text { text }]);
-        let prompt = SessionEvent::MessageCommitted { message };
-        store
-            .append(skyhook::identity::AgentId::root(ids[3]), prompt)
-            .await
-            .unwrap();
-        drop(store);
-        let (_held, _) = SessionStore::open(&root, ids[4]).await.unwrap();
+        let ids: Vec<_> = stores.iter().map(|(store, _)| store.id()).collect();
+        let mut saved = load_saved(root.path()).await.unwrap();
+        assert_eq!(saved.len(), 6);
+        for row in &mut saved {
+            let index = ids.iter().position(|id| *id == row.id).unwrap();
+            assert_eq!(row.last, stores[index].1);
+            // Appends use wall time; row ordering must not depend on clock resolution.
+            row.last = [5, 6, 20, 40, 30, 7][index];
+        }
         let keys: Vec<_> = std::iter::successors(Some(SlotKey::default()), |key| Some(key.next()))
             .take(4)
             .collect();
@@ -240,27 +274,24 @@ mod tests {
             peer(keys[3], PeerSession::Started(ids[5]), false),
         ];
         let today = Local::now().date_naive();
-        let items = load_sessions(root, peers, today).await.unwrap();
+        let items = session_rows(saved, &peers, today);
         let rows: Vec<_> = items.iter().map(|item| item.value).collect();
         let live = [keys[1], keys[2], keys[3]].map(SessionRef::Live);
         assert!(rows.len() == 7 && rows[..3] == live);
         assert!(rows[6] == SessionRef::Live(keys[0]));
-        for (id, state) in [
-            (ids[2], SavedState::Closed(AgentDisplayState::Ready)),
-            (
+        let saved = [
+            SessionRef::Saved(
                 ids[3],
                 SavedState::Closed(AgentDisplayState::Job(JobState::Interrupted)),
             ),
-            (ids[4], SavedState::Locked),
-        ] {
-            assert!(
-                rows[3..6].contains(&SessionRef::Saved(id, state)),
-                "{state:?}"
-            );
-        }
+            SessionRef::Saved(ids[4], SavedState::Locked),
+            SessionRef::Saved(ids[2], SavedState::Closed(AgentDisplayState::Ready)),
+        ];
+        assert!(rows[3..6] == saved);
         let time = |index: usize| items[index].columns.last().unwrap().as_str();
         assert_eq!(time(6), local_time(1, today, &Local, Precision::Minutes));
         assert_eq!(items[6].columns[0], ids[0].to_string());
         assert!(time(1) == "draft" && time(2) == "draft");
+        stores[4].0.close().await.unwrap();
     }
 }
