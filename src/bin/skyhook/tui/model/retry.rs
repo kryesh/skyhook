@@ -1,6 +1,6 @@
 //! One journal-derived status block per failed, retrying or interrupted request,
 //! not per attempt.
-use super::{Entry, EntryKey, Surface};
+use super::{Entry, EntryKey, Surface, Timing};
 use crate::text::brief;
 use skyhook::agent::{Failure, ObservationSnapshot};
 use skyhook::identity::AgentId;
@@ -26,6 +26,7 @@ pub(super) fn retry_entry(
     request: RequestSeq,
 ) -> Option<Entry> {
     let phase = &snapshot.ledger.get(request)?.phase;
+    let mut timing = Timing::Untimed;
     let mut text = match phase {
         RequestPhase::Requested
         | RequestPhase::Open { .. }
@@ -49,14 +50,17 @@ pub(super) fn retry_entry(
         }
         RequestPhase::Retrying {
             attempt,
-            delay,
             failure,
-        } => format!(
-            "Retrying · attempt {} · retry delay {} ms\n{}",
-            attempt + 1,
-            delay.as_millis(),
-            diagnostic(failure)
-        ),
+            due,
+        } => {
+            // A scheduled retry counts down to its next attempt.
+            timing = Timing::Until(*due);
+            format!(
+                "Retrying · attempt {}\n{}",
+                attempt + 1,
+                diagnostic(failure)
+            )
+        }
         RequestPhase::Interrupted {
             attempt: Some(attempt),
             ..
@@ -91,6 +95,6 @@ pub(super) fn retry_entry(
         Surface::Status
     };
     let mut entry = Entry::new(EntryKey::Retry(request), text, surface);
-    entry.running = matches!(phase, RequestPhase::Retrying { .. });
+    entry.timing = timing;
     Some(entry)
 }

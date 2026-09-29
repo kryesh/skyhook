@@ -28,11 +28,11 @@ mod state;
 pub(super) use decode::{decode_records, u64_of};
 pub(super) use encode::Encoder;
 pub(crate) use output::{CaptureExtent, CaptureRow};
-pub use state::SessionSummary;
-pub(super) use state::summary;
+pub use state::{SessionSummary, SessionTitle};
+pub(super) use state::{stopped_turn, summary, title};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 17;
+pub(super) const USER_VERSION: i64 = 18;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
@@ -305,7 +305,7 @@ impl Dictionaries<'_> {
                 profile::StateMode,
                 protocol::{Binding, HistoryLifetime, ItemKind, ReplayFormat},
             },
-            session::{EntryKind as E, ModelPurpose, Truncation},
+            session::{EntryKind as E, ModelPurpose, TitleSource, Truncation},
             target::{SshAuth, TargetSource},
             tool::{
                 diagnostic::{Effects, IoKind, Operation, PathRole},
@@ -313,13 +313,14 @@ impl Dictionaries<'_> {
             },
         };
         self.names("capability", &Capability::ALL)?;
-        self.names("entry_kind", &E::ALL)?;
+        self.flagged("entry_kind", ["activity"], &E::ALL, |kind| {
+            [kind.is_activity()]
+        })?;
         // The entry kinds each subset dictionary admits to the subtype table it narrows.
         for (table, kinds) in [
-            ("text_entry_kind", &[E::TitleSet, E::Status][..]),
             (
                 "targets_entry_kind",
-                &[E::SessionStarted, E::TargetsUpserted],
+                &[E::SessionStarted, E::TargetsUpserted][..],
             ),
             ("mode_entry_kind", &[E::AgentStarted, E::ModeChanged]),
             ("todos_entry_kind", &[E::TodosReplaced, E::Compaction]),
@@ -340,6 +341,7 @@ impl Dictionaries<'_> {
         ] {
             self.names(table, kinds)?;
         }
+        self.names("title_source", &TitleSource::ALL)?;
         self.names("target_source", &TargetSource::ALL)?;
         self.names("ssh_auth", &SshAuth::ALL)?;
         self.names("state_mode", &StateMode::ALL)?;
@@ -458,6 +460,13 @@ impl Db {
             return Err(DbError::Unsupported(version));
         }
         Ok(())
+    }
+
+    /// Freeze the shared connection before relinquishing ownership. SQLite also
+    /// rejects writes made through queries with RETURNING; retained output handles
+    /// keep reading but cannot mutate this or a later owner's output generation.
+    pub(super) fn close_writes(&self) -> DbResult<()> {
+        self.batch("PRAGMA query_only = ON")
     }
 
     pub(super) fn batch(&self, sql: &str) -> DbResult<()> {
@@ -890,5 +899,37 @@ mod tests {
             fixture.one(root.clone(), event);
             assert_eq!(generation(&fixture), expected);
         }
+    }
+
+    /// Reopening a session, and closing it, which interrupts its agents, leave its
+    /// last activity where it was; a message moves it on.
+    #[test]
+    fn last_activity_ignores_reopening_and_closing() {
+        let mut fixture = Fixture::new();
+        let root = fixture.start("/w");
+        let text = "prompt".into();
+        let message = SessionEvent::MessageCommitted {
+            message: Message::User(vec![UserPart::Text { text }]),
+        };
+        let (reopened, interrupted) = (
+            SessionEvent::SessionReopened,
+            SessionEvent::AgentInterrupted,
+        );
+        let mut last_after = |events: Vec<SessionEvent>, activity: usize| {
+            let events = events.into_iter().map(|event| (root.clone(), event));
+            let sequences = fixture.commit(events.collect()).unwrap();
+            // A commit's records are a millisecond apart, in order.
+            let at = |index: usize| {
+                let sequence = sequences[index];
+                let record = fixture.records.iter().find(|r| r.sequence == sequence);
+                record.unwrap().timestamp_millis
+            };
+            let last = super::state::summary(&fixture.db).unwrap().last_millis;
+            assert_eq!(last, at(activity));
+            last
+        };
+        let before = last_after(vec![message.clone(), reopened.clone(), interrupted], 0);
+        let after = last_after(vec![reopened, message], 1);
+        assert!(after > before);
     }
 }

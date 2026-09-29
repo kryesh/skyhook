@@ -963,7 +963,13 @@ mod tests {
     async fn running_tools(session: &SessionHandle, agent: &AgentId) {
         bounded(async {
             while !matches!(
-                session.observe().await.snapshot.activity.get(agent),
+                session
+                    .observe()
+                    .await
+                    .snapshot
+                    .activity
+                    .get(agent)
+                    .map(|a| &a.state),
                 Some(AgentActivity::Tools)
             ) {
                 poll().await;
@@ -1051,10 +1057,10 @@ mod tests {
         settled(delegated, JobState::Interrupted).await;
         assert!(!tracking.requested_from(2));
         // A suspended child keeps the parent's `agent` call waiting for `continue`;
-        // cancelling it releases the turn, which ends without another request.
+        // cancelling it releases the held turn, which runs on.
         session.cancel_job(delegated).await.unwrap();
-        assert!(bounded(turn).await.unwrap().is_err());
-        assert!(!tracking.requested_from(2));
+        tracking.pass(2).await;
+        assert_eq!(bounded(turn).await.unwrap().unwrap(), "done");
         session.shutdown().await.unwrap();
     }
 

@@ -396,6 +396,11 @@ impl JobEntry {
         self.end().is_none_or(|end| end == JobEnd::Interrupted)
     }
 
+    /// Cancelled with an outcome its cancellation has yet to settle.
+    pub(super) fn cancelling(&self) -> bool {
+        self.cancellation_watchdog_started && self.cancellable()
+    }
+
     /// Finished in a way input can restart, given a handler.
     pub(super) fn resumable_end(&self) -> bool {
         matches!(

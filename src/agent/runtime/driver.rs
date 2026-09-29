@@ -341,7 +341,7 @@ impl SessionRuntime {
                     phase.fail(failure);
                     control.set_turn(TurnState::Parked);
                     if child {
-                        self.interrupt_tree(&id).await;
+                        self.interrupt_tree(&id, CancelScope::Outcome).await;
                         break;
                     }
                     continue;
@@ -437,7 +437,11 @@ impl SessionRuntime {
             self.settle_answered(&id, owner_job, &mut phase, &control, &mut rx, &mut deferred)
                 .await;
         }
-        if let Some(job) = owner_job {
+        // A closing session leaves an interruption suspended, as the journal leaves
+        // it for the next process: settling it would let a released owner claim it.
+        if let Some(job) = owner_job
+            && !self.shutting_down.load(Ordering::Acquire)
+        {
             self.jobs.clear_resume_handler(job).await;
         }
         self.agents_mut().remove(&id);
@@ -567,8 +571,8 @@ mod tests {
         assert!(!parent.is_finished());
         assert_eq!(turn(&session, &session.root), TurnState::Busy);
         assert_eq!(
-            session.observe().await.snapshot.activity.get(&session.root),
-            Some(&crate::agent::AgentActivity::WaitingChildren)
+            session.observe().await.snapshot.activity[&session.root].state,
+            crate::agent::AgentActivity::WaitingChildren
         );
         let records = session.runtime.store.records().await;
         let interrupted = count!(&records, SessionEvent::JobFinished { state, .. } if *state == JobEnd::Interrupted);

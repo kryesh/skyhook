@@ -1,5 +1,6 @@
-//! Read-only column beside the transcript: the viewed agent's capabilities and
-//! todos, and the MCP servers. A section with nothing to list is left out.
+//! Column beside the transcript: the session's title, which opens a rename when
+//! clicked, the viewed agent's capabilities and todos, and the MCP servers. A
+//! section with nothing to list is left out.
 
 use super::*;
 use skyhook::{agent::TodoStatus, mcp::McpServerStatus, tool::policy::Capability};
@@ -19,8 +20,10 @@ enum SidebarLine {
 pub(super) fn sidebar_width(app: &App, width: u16) -> u16 {
     let servers = !app.launch.model.config().config().mcp.is_empty();
     let todos = app.projection.todos.get(&app.selected);
-    let listed =
-        servers || todos.is_some_and(|todos| !todos.is_empty()) || !capabilities(app).is_empty();
+    let listed = app.title.is_some()
+        || servers
+        || todos.is_some_and(|todos| !todos.is_empty())
+        || !capabilities(app).is_empty();
     if app.sidebar && listed && width >= SIDEBAR_MIN_TERMINAL {
         // A quarter of a wide terminal, within readable bounds.
         (width / 4).clamp(32, 48)
@@ -29,7 +32,7 @@ pub(super) fn sidebar_width(app: &App, width: u16) -> u16 {
     }
 }
 
-pub(super) fn draw_sidebar(frame: &mut Frame, app: &App, rect: Rect) {
+pub(super) fn draw_sidebar(frame: &mut Frame, app: &mut App, rect: Rect) {
     let mut sections: Vec<Vec<SidebarLine>> = Vec::new();
 
     let mut section = vec![SidebarLine::Title("MCP servers".into())];
@@ -101,6 +104,24 @@ pub(super) fn draw_sidebar(frame: &mut Frame, app: &App, rect: Rect) {
         rect.width,
         rect.height.saturating_sub(2),
     );
+    // The title stands alone on the first row, above a blank one.
+    let rect = match app.title.as_ref().filter(|_| rect.height > 0) {
+        Some(title) => {
+            let row = r(rect.x + 1, rect.y, rect.width.saturating_sub(3), 1);
+            let title = model::clean(&title.text).replace('\n', " ");
+            let title = Line::styled(title, Style::default().add_modifier(Modifier::BOLD));
+            let title = clipped(title, row.width as usize);
+            text(frame, row, title, THEME.primary, THEME.panel);
+            app.hits.push((row, Hit::SessionTitle));
+            r(
+                rect.x,
+                rect.y + 2,
+                rect.width,
+                rect.height.saturating_sub(2),
+            )
+        }
+        None => rect,
+    };
     // Capabilities keep the bottom rows; the rest scrolls off above a blank row.
     let pinned = wrapped(&pinned, rect.width);
     let pinned_height = (pinned.len() as u16).min(rect.height);

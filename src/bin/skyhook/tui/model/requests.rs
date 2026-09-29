@@ -1,6 +1,8 @@
 //! Metadata-only request rows and request timing.
 
-use super::{Entry, clean, number};
+use super::{Entry, Timing, clean, number};
+use crate::tui::format::{Precision, local_time};
+use chrono::{Local, NaiveDate};
 use skyhook::provider::protocol::Usage;
 use skyhook::session::{ModelPurpose, RequestPhase, RequestRecord, RequestSeq};
 
@@ -24,11 +26,6 @@ impl RequestStatus {
             Self::Interrupted => "Interrupted",
         }
     }
-
-    /// The request is still in progress, so its row animates and its elapsed ticks.
-    pub fn running(self) -> bool {
-        matches!(self, Self::Running | Self::Retrying)
-    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -39,13 +36,16 @@ pub struct RequestRow {
     pub status: RequestStatus,
     /// None until an attempt reports usage.
     pub usage: Option<Usage>,
-    pub elapsed_tenths: Option<u64>,
+    /// When the request was sent, on the local clock.
+    pub sent: String,
+    pub timing: Timing,
 }
 
 impl RequestRow {
-    pub fn metadata(&self) -> [String; 4] {
+    pub fn metadata(&self) -> [String; 5] {
         [
             format!("Request #{}", self.sequence),
+            self.sent.clone(),
             match self.purpose {
                 ModelPurpose::Agent => "Agent",
                 ModelPurpose::Compaction => "Compaction",
@@ -62,27 +62,37 @@ impl RequestRow {
             tokens(|usage| number(usage.output_tokens)),
             tokens(|usage| number(usage.input_tokens)),
             tokens(|usage| number(usage.cached_input_tokens)),
-            self.elapsed_tenths.map_or_else(
-                || "—".into(),
-                |tenths| format!("{}.{}s", tenths / 10, tenths % 10),
-            ),
+            self.timing.took().unwrap_or_default(),
         ]
     }
 }
 
-pub(super) fn request_entry(sequence: RequestSeq, record: &RequestRecord) -> Entry {
-    let status = request_status(&record.phase);
-    let row = RequestRow {
+pub(super) fn request_entry(
+    sequence: RequestSeq,
+    record: &RequestRecord,
+    today: NaiveDate,
+) -> Entry {
+    Entry::request_entry(RequestRow {
         sequence,
         purpose: record.purpose,
         model: clean(record.profile.profile.model.as_str()).replace('\n', " "),
-        status,
+        status: request_status(&record.phase),
         usage: reported(record.usage),
-        elapsed_tenths: request_elapsed(record),
-    };
-    let mut e = Entry::request_entry(row);
-    e.running = status.running();
-    e
+        sent: local_time(record.requested_millis, today, &Local, Precision::Seconds),
+        timing: request_timing(record),
+    })
+}
+
+/// From the request until it settled, counting while it may still produce an outcome.
+pub(super) fn request_timing(record: &RequestRecord) -> Timing {
+    let start = record.requested_millis;
+    match record.phase.settled_at() {
+        Some(until) => Timing::Took {
+            since: start,
+            until,
+        },
+        None => Timing::Since(start),
+    }
 }
 
 fn request_status(phase: &RequestPhase) -> RequestStatus {
@@ -98,18 +108,4 @@ fn request_status(phase: &RequestPhase) -> RequestStatus {
 /// The runtime journals usage only once an attempt observed some.
 fn reported(usage: Usage) -> Option<Usage> {
     (usage != Usage::default()).then_some(usage)
-}
-
-/// Tenths of a second from the request until it settled, or until now while it
-/// is still pending.
-pub(super) fn request_elapsed(record: &RequestRecord) -> Option<u64> {
-    let start = record.requested_millis;
-    let end = record.phase.settled_at().unwrap_or_else(|| {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(start, |duration| {
-                duration.as_millis().min(i64::MAX as u128) as i64
-            })
-    });
-    Some(end.saturating_sub(start).max(0) as u64 / 100)
 }

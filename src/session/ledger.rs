@@ -1,10 +1,7 @@
 //! The lifecycle of every model request folded from the journal: how each request
 //! ended and which committed message answered it. Session statistics and host
 //! projections share this one fold instead of re-deriving it from attempt events.
-use std::{
-    collections::{BTreeMap, BTreeSet, HashMap},
-    time::Duration,
-};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::{
     agent::{CompactionFault, Failure},
@@ -18,8 +15,8 @@ use crate::{
 
 /// Where a request is in its lifecycle. Requests are sequential per agent, so an
 /// assistant message committed while the agent's newest request is open belongs to
-/// it; `ResponseCompleted` confirms the link when its record lands. A settled phase
-/// carries `at`, when the request left its last attempt.
+/// it; `ResponseCompleted` confirms the link when its record lands. Times are epoch
+/// milliseconds; a settled phase carries `at`, when the request left its last attempt.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RequestPhase {
     /// Journaled, with no attempt started yet.
@@ -30,12 +27,12 @@ pub enum RequestPhase {
         attempt: u64,
         message: Option<MessageSeq>,
     },
-    /// The attempt failed and the next one starts after `delay`. Only a provider
+    /// The attempt failed and the next one starts at `due`. Only a provider
     /// failure is retried.
     Retrying {
         attempt: u64,
-        delay: Duration,
         failure: ProviderError,
+        due: i64,
     },
     /// The last attempt failed, or none started before the request failed. A
     /// provider abort commits its partial response as `message` before failing; a
@@ -266,35 +263,33 @@ impl RequestLedger {
                 {
                     failed.phase = RequestPhase::Retrying {
                         attempt: *attempt,
-                        delay: Duration::from_millis(*delay_millis),
                         failure: kind.error(message.clone()),
+                        due: at.saturating_add_unsigned(*delay_millis),
                     };
                     changes.named = Some(request);
                 }
             }
             SessionEvent::ModelAttemptInterrupted(attempt) => {
-                let interrupted = RequestPhase::Interrupted {
+                changes.named = self.settle(attempt.request, |_| RequestPhase::Interrupted {
                     attempt: Some(attempt.attempt),
                     at,
-                };
-                changes.named = self.settle(attempt.request, |_| interrupted);
+                });
             }
             SessionEvent::ResponseCompleted {
                 attempt, message, ..
             } => {
                 self.messages.insert(*message, attempt.request);
-                let completed = RequestPhase::Completed {
+                changes.named = self.settle(attempt.request, |_| RequestPhase::Completed {
                     attempt: attempt.attempt,
                     at,
-                };
-                changes.named = self.settle(attempt.request, |_| completed);
+                });
             }
             SessionEvent::Compaction { checkpoint } => {
-                let completed = RequestPhase::Completed {
-                    attempt: checkpoint.attempt.attempt,
+                let attempt = &checkpoint.attempt;
+                changes.named = self.settle(attempt.request, |_| RequestPhase::Completed {
+                    attempt: attempt.attempt,
                     at,
-                };
-                changes.named = self.settle(checkpoint.attempt.request, |_| completed);
+                });
             }
             SessionEvent::CompactionFailed { failure, error } => {
                 let (request, attempt) = match failure {
@@ -361,16 +356,11 @@ impl RequestLedger {
 
     /// Close the agent's pending request, if any, as interrupted, returning it.
     fn interrupt(&mut self, agent: &AgentId, at: i64) -> Option<RequestSeq> {
-        let request = *self.latest.get(agent)?;
-        let pending = self.requests.get_mut(&request)?;
-        if pending.phase.settled_at().is_some() {
-            return None;
-        }
-        pending.phase = RequestPhase::Interrupted {
-            attempt: pending.phase.last_attempt(),
+        let request = self.open(agent)?;
+        self.settle(request, |phase| RequestPhase::Interrupted {
+            attempt: phase.last_attempt(),
             at,
-        };
-        Some(request)
+        })
     }
 
     #[must_use]
@@ -529,10 +519,6 @@ mod tests {
         AttemptRef { request, attempt }
     }
 
-    fn open(attempt: u64, message: Option<MessageSeq>) -> RequestPhase {
-        RequestPhase::Open { attempt, message }
-    }
-
     fn failed(attempt: Option<u64>, message: Option<MessageSeq>, at: i64) -> RequestPhase {
         RequestPhase::Failed {
             attempt,
@@ -565,8 +551,8 @@ mod tests {
         assert_eq!(journal.changed, [request]);
         let retrying = RequestPhase::Retrying {
             attempt: 1,
-            delay: Duration::from_millis(250),
             failure: ProviderErrorKind::Transport.error("boom"),
+            due: journal.now() + 250,
         };
         assert_eq!(journal.phase(request), &retrying);
         assert_eq!(journal.open(), Some(request));
@@ -576,11 +562,15 @@ mod tests {
         assert_eq!(journal.changed, []);
 
         journal.attempt(request, 2);
-        assert_eq!(journal.phase(request), &open(2, None));
+        let open = |message| RequestPhase::Open {
+            attempt: 2,
+            message,
+        };
+        assert_eq!(journal.phase(request), &open(None));
         journal.usage(request, usage(10, 2, 3));
         journal.usage(request, usage(1, 1, 1));
         let message = journal.reply();
-        assert_eq!(journal.phase(request), &open(2, Some(message)));
+        assert_eq!(journal.phase(request), &open(Some(message)));
         assert_eq!(journal.request_of(message), Some(request));
         let completed = journal.record(SessionEvent::ResponseCompleted {
             attempt: attempt_ref(request, 2),

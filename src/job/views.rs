@@ -6,7 +6,8 @@ use crate::tool::{diagnostic::DiagnosticViewer, output::complete};
 /// An agent's live work, as an interrupt and a `wait` each need to see it.
 #[derive(Default)]
 pub(crate) struct LiveWork {
-    /// A foreground child agent, which an interrupt retains.
+    /// A foreground child agent that an interrupt retains: one no blocking job
+    /// launched, as cancelling that job would cancel it too.
     pub(crate) children: bool,
     /// Foreground non-agent jobs. They hold the turn and have no resume point, so an
     /// interrupt cancels them; retained children and background work survive it.
@@ -61,7 +62,8 @@ fn classify(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> LiveWork {
             continue;
         }
         match entry.child() {
-            Some(_) => work.children = true,
+            Some(_) if !launched_by_blocking(jobs, entry) => work.children = true,
+            Some(_) => {}
             None => work.blocking.push(*id),
         }
         if !parked.contains(id) && !entry.suspended() {
@@ -69,6 +71,19 @@ fn classify(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> LiveWork {
         }
     }
     work
+}
+
+/// Whether `entry` descends from blocking work: a live non-agent job of the same
+/// agent, foreground wherever `entry` is.
+fn launched_by_blocking(jobs: &HashMap<JobId, JobEntry>, entry: &JobEntry) -> bool {
+    let mut next = entry.parent.and_then(|parent| jobs.get(&parent));
+    while let Some(host) = next.filter(|host| host.agent == entry.agent) {
+        if host.live() && host.child().is_none() {
+            return true;
+        }
+        next = host.parent.and_then(|parent| jobs.get(&parent));
+    }
+    false
 }
 
 /// Whether `id` or any ancestor launched by the same agent is background: a

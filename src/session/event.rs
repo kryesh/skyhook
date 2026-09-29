@@ -34,6 +34,19 @@ named_enum! {
 }
 
 named_enum! {
+    /// Where a session title came from. A title the user set is never replaced by
+    /// an automatic one.
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+    pub enum TitleSource {
+        /// The session's first prompt.
+        Prompt = "prompt",
+        User = "user",
+        /// A summary of the conversation.
+        Generated = "generated",
+    }
+}
+
+named_enum! {
     /// Why a completed response ended early. Refusals and aborts fail the turn
     /// instead, so they are never journaled as a completed response.
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -291,9 +304,15 @@ pub enum SessionEvent {
         targets: Vec<TargetDefinition>,
         capabilities: Vec<Capability>,
     },
+    /// A later process reopened the session, on its root agent. What it then closes
+    /// for the previous process is dated when that process last did something.
+    SessionReopened,
     TitleSet {
         title: String,
+        source: TitleSource,
     },
+    /// The user's titles no longer apply; the automatic title shows again.
+    TitleCleared,
     TargetsUpserted {
         targets: Vec<TargetDefinition>,
     },
@@ -443,7 +462,9 @@ named_enum! {
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub(crate) enum EntryKind {
         SessionStarted = "session_started",
+        SessionReopened = "session_reopened",
         TitleSet = "title_set",
+        TitleCleared = "title_cleared",
         TargetsUpserted = "targets_upserted",
         AgentStarted = "agent_started",
         AgentCompleted = "agent_completed",
@@ -475,11 +496,26 @@ named_enum! {
     }
 }
 
+impl EntryKind {
+    pub(crate) fn is_activity(self) -> bool {
+        !matches!(self, Self::SessionReopened | Self::AgentInterrupted)
+    }
+}
+
 impl SessionEvent {
+    /// Whether this record is the session's activity, as the session list orders
+    /// by. Reopening a session is not, nor is closing it, which interrupts its agents.
+    #[must_use]
+    pub fn is_activity(&self) -> bool {
+        self.kind().is_activity()
+    }
+
     pub(crate) fn kind(&self) -> EntryKind {
         match self {
             Self::SessionStarted { .. } => EntryKind::SessionStarted,
+            Self::SessionReopened => EntryKind::SessionReopened,
             Self::TitleSet { .. } => EntryKind::TitleSet,
+            Self::TitleCleared => EntryKind::TitleCleared,
             Self::TargetsUpserted { .. } => EntryKind::TargetsUpserted,
             Self::AgentStarted { .. } => EntryKind::AgentStarted,
             Self::TodosReplaced { .. } => EntryKind::TodosReplaced,

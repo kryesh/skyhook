@@ -82,6 +82,7 @@ impl App {
         *observation = prepared.active;
         self.snapshot = *prepared.snapshot;
         self.reset_projection();
+        self.load_title();
     }
 }
 
@@ -158,6 +159,7 @@ mod tests {
         let event = RuntimeEvent::Activity {
             agent: agent.clone(),
             activity,
+            at: 0,
         };
         deliver(&mut app, event);
         assert!(

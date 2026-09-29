@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::tui::{composer::ComposerLayout, keys::Command};
-use skyhook::agent::AgentActivity;
+use skyhook::job::JobState;
 
 /// One input row between the composer's padding rows.
 const EMPTY_COMPOSER_HEIGHT: u16 = 3;
@@ -31,7 +31,7 @@ fn leader_hints(app: &App) -> Vec<(Command, &'static str)> {
         .snapshot
         .activity
         .values()
-        .any(AgentActivity::is_retryable)
+        .any(|activity| activity.state.is_retryable())
     {
         hints.push((Command::Retry, "Continue"));
     }
@@ -114,10 +114,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             .clamp(EMPTY_COMPOSER_HEIGHT, editor_limit);
     let prompt_layout = prompt_shown.then(|| PromptLayout::new(app, width));
     let composer_height = if let Some(layout) = &prompt_layout {
-        layout
-            .height()
-            .max(7)
-            .min(height.saturating_sub(footer_height + 2 + notice_height))
+        (layout.height()).min(height.saturating_sub(footer_height + 2 + notice_height))
     } else if viewing_child {
         0
     } else {
@@ -251,7 +248,8 @@ fn draw_header(frame: &mut Frame, app: &mut App, width: u16) {
     }
 }
 
-/// The transcript rows in view, with selection, focus and running spinners.
+/// The transcript rows in view, with selection, focus, running spinners and
+/// live counters.
 fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
     let content_width = app.content_rect.width;
     if app.tab == Tab::Requests
@@ -293,6 +291,13 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
             THEME.base,
         );
     }
+    // A job card's glyph gives way to the spinner only while it runs; waiting
+    // for input keeps its glyph beside the counter.
+    let jobs = app.projection.jobs();
+    let running = |job| {
+        jobs.get(&job)
+            .is_none_or(|job| job.state == JobState::Running)
+    };
     let mut cursor_drawn = false;
     for (offset, row) in app
         .render
@@ -360,18 +365,27 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
         if row.layout.is_spacer() {
             continue;
         }
+        // Spinners and live counters are painted over the laid-out header row,
+        // into cells its layout reserved, so ticks never rebuild entries.
         if row.layout.header()
-            && let Some(entry) = entry.filter(|entry| entry.running)
+            && let Some(entry) = entry.filter(|entry| entry.timing.live())
         {
             app.animating = true;
-            // Paint only the spinner; cached reasoning rows need no relayout on ticks.
-            let x = row.x + if expandable { 2 } else { 0 };
-            let color = if entry.header().is_some() {
-                THEME.primary
-            } else {
-                THEME.muted
-            };
-            text(frame, r(x, y, 1, 1), spinner(app.tick_count), color, bg);
+            if entry.job_id().is_none_or(running) {
+                let x = row.x + if expandable { 2 } else { 0 };
+                // A card's spinner stands in for its state glyph, in the glyph's accent.
+                let color = if entry.header().is_some() {
+                    THEME.primary
+                } else {
+                    THEME.muted
+                };
+                text(frame, r(x, y, 1, 1), spinner(app.tick_count), color, bg);
+            }
+            if let Some(counter) = entry.timing.text(app.clock) {
+                let width = (counter.width() as u16).min(text_rect.width);
+                let x = text_rect.right() - width;
+                text(frame, r(x, y, width, 1), counter, THEME.muted, bg);
+            }
         }
         if focused && !cursor_drawn {
             focus_cursor(frame, row.x.saturating_sub(1), y, THEME.base);
@@ -422,7 +436,9 @@ fn draw_composer(frame: &mut Frame, app: &mut App, layout: &ComposerLayout) {
     let text_width = rect.width.saturating_sub(4);
     let (cursor_line, cursor_column) = layout.cursor;
     let visible = rect.height.saturating_sub(2) as usize;
-    let top = cursor_line.saturating_sub(visible.saturating_sub(1));
+    let bottom = layout.rows.len().saturating_sub(visible);
+    let follow = cursor_line.saturating_sub(visible.saturating_sub(1));
+    let top = app.composer_scroll.map_or(follow, |top| top.min(bottom));
     let paste = Style::default()
         .fg(THEME.primary)
         .remove_modifier(Modifier::all());
@@ -456,7 +472,9 @@ fn draw_composer(frame: &mut Frame, app: &mut App, layout: &ComposerLayout) {
         );
         app.hits.push((r(0, y, rect.width, 1), Hit::Attachments));
     }
-    if app.focus == Focus::Composer && matches!(app.input_target(), InputTarget::Composer) {
+    let shown = (top..top + visible).contains(&cursor_line);
+    if shown && app.focus == Focus::Composer && matches!(app.input_target(), InputTarget::Composer)
+    {
         frame.set_cursor_position((
             2 + (cursor_column as u16).min(text_width),
             rect.y + 1 + (cursor_line - top) as u16,
@@ -576,6 +594,81 @@ mod tests {
         app.refresh();
     }
 
+    /// A live job card paints its counter at its header row's right edge, so the
+    /// clock moves it without changing the card. A running card spins in place of
+    /// its glyph; one waiting for input keeps its glyph.
+    #[tokio::test]
+    async fn live_job_cards_paint_counters_and_only_running_ones_spin() {
+        use skyhook::{identity::JobId, job::JobTransition};
+        let (_root, mut app) = fixture().await;
+        let job = JobId::new(1).unwrap();
+        let created = SessionEvent::JobCreated {
+            job,
+            parent: None,
+            origin: None,
+            tool: "exec".into(),
+            role: skyhook::job::JobRole::Tool,
+            name: None,
+            arguments: serde_json::json!({"command": ["true"]}),
+            output_schema: None,
+            accepts_input: true,
+            background: false,
+            location: skyhook::execution::ExecutionLocation::root("/workspace".into()),
+        };
+        push_record(&mut app, created).await;
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut screen = |app: &mut App| {
+            terminal.draw(|frame| draw(frame, app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let row = |y| {
+                (0..60)
+                    .map(|x| buffer[(x, y)].symbol().to_owned())
+                    .collect()
+            };
+            (0..12).map(row).collect::<Vec<Vec<_>>>()
+        };
+        for (state, header) in [
+            (
+                JobTransition::Running,
+                format!("{} exec true · Running · #1", spinner(0)),
+            ),
+            (
+                JobTransition::WaitingInput,
+                "? exec true · Waiting for input · #1".into(),
+            ),
+        ] {
+            push_record(&mut app, SessionEvent::JobStateChanged { job, state }).await;
+            app.refresh();
+            app.tick_count = 0;
+            let model::Timing::Since(since) = app.projection.jobs()[&job].timing else {
+                panic!("a live job counts from when it started");
+            };
+            app.clock = model::Clock::at(since + 12_400);
+            let before = screen(&mut app);
+            let y = (before.iter())
+                .position(|line| line.concat().contains(&header))
+                .unwrap();
+            let row = app.render.rows.get(0).unwrap();
+            let right = usize::from(row.paragraph_x() + row.text_width);
+            assert_eq!(before[y][right - 5..right].concat(), "12.4s");
+            let entries = app.content_cache.entries().to_vec();
+            app.clock = model::Clock::at(since + 75_000);
+            app.refresh();
+            let after = screen(&mut app);
+            assert!(app.content_cache.entries() == entries);
+            assert_eq!(after[y][right - 6..right].concat(), "1m 15s");
+            for (line, (old, new)) in before.iter().zip(&after).enumerate() {
+                let changed = (old.iter().zip(new).enumerate()).filter(|(_, (a, b))| a != b);
+                for (x, _) in changed {
+                    assert!(
+                        line == y && (right - 6..right).contains(&x),
+                        "({x}, {line})"
+                    );
+                }
+            }
+        }
+    }
+
     #[tokio::test]
     async fn sidebar_narrows_only_the_transcript_and_persists_its_toggle() {
         use skyhook::agent::{TodoItem, TodoStatus};
@@ -681,7 +774,7 @@ mod tests {
         }
         app.tab = Tab::Requests;
         app.refresh();
-        for (width, header) in [(80, true), (40, false)] {
+        for (width, header) in [(140, true), (40, false)] {
             let mut terminal = Terminal::new(TestBackend::new(width, 25)).unwrap();
             for scroll in [0, 5] {
                 app.view().scroll = Some(scroll);

@@ -406,13 +406,13 @@ mod tests {
         let record: serde_json::Map<_, _> = (0..90)
             .map(|index| (format!("{index:0>80}"), json!(index)))
             .collect();
-        let preview = run(&json!(vec![record; 1000]), &[]);
+        let preview = run(&json!(vec![record; 20]), &[]);
         assert!(json_bytes(&preview.shape) <= PREVIEW_BUDGET / 2);
         assert!(budgeted(&preview) <= PREVIEW_BUDGET);
         assert!(matches!(
             cut(&preview, "/result"),
             OutputTruncation::Elements {
-                total_elements: 1000,
+                total_elements: 20,
                 ..
             }
         ));

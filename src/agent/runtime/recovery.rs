@@ -539,7 +539,7 @@ mod tests {
         assert_eq!(received.unwrap().unwrap(), "child recovered");
         while let Ok(event) = events.try_recv() {
             assert!(
-                !matches!(event.event, RuntimeEvent::Activity { agent, activity: AgentActivity::Stopped(_) } if agent == child)
+                !matches!(event.event, RuntimeEvent::Activity { agent, activity: AgentActivity::Stopped(_), .. } if agent == child)
             );
         }
         let requests = fixture.requests();

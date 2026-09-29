@@ -166,6 +166,7 @@ impl JobManager {
                         claim,
                     ),
                     WaitMode::Terminal => (entry.settled(), false),
+                    WaitMode::Final => (!entry.cancellable(), false),
                 };
                 let claimed_agent =
                     (ready && claim && entry.unacknowledged()).then(|| entry.agent.clone());

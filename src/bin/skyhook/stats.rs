@@ -2,7 +2,7 @@
 
 use super::{
     cli::{StatsFormat, StatsRequest, StatsTarget},
-    text::brief,
+    text::{brief, duration},
 };
 use chrono::{DateTime, Utc};
 use skyhook::{
@@ -108,18 +108,6 @@ fn timestamp(time: DateTime<Utc>) -> String {
     time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
-fn duration(from: DateTime<Utc>, to: DateTime<Utc>) -> String {
-    let seconds = (to - from).num_seconds().max(0);
-    let (hours, minutes, seconds) = (seconds / 3600, seconds % 3600 / 60, seconds % 60);
-    if hours > 0 {
-        format!("{hours}h {minutes:02}m {seconds:02}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds:02}s")
-    } else {
-        format!("{seconds}s")
-    }
-}
-
 /// A prompt on one line: whitespace runs collapsed, other controls escaped, at most
 /// `limit` characters.
 fn one_line(text: &str, limit: usize) -> String {
@@ -147,7 +135,7 @@ fn elapsed(agent: &AgentStats) -> String {
     agent
         .outcome
         .finished_at()
-        .map_or_else(|| "—".into(), |finished| duration(agent.started, finished))
+        .map_or_else(|| "—".into(), |finished| duration(finished - agent.started))
 }
 
 fn tool_calls(agent: &AgentStats) -> u64 {
@@ -230,7 +218,7 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
         output,
         "{bullet}Started: {} · Duration: {}",
         timestamp(stats.started),
-        duration(stats.started, stats.finished)
+        duration(stats.finished - stats.started)
     );
     let _ = writeln!(
         output,
@@ -286,7 +274,7 @@ fn tables(stats: &SessionStats, markdown: bool) -> String {
         number(totals.tool_calls.calls),
     ];
     total.extend(usage_cells(&totals.usage));
-    total.push(duration(stats.started, stats.finished));
+    total.push(duration(stats.finished - stats.started));
     agents.rows.push(total);
     let models = Table {
         header: &["Model", "Calls", "Input", "Cached", "Written", "Output"],
@@ -366,7 +354,7 @@ fn listing(sessions: &[SessionStats]) -> String {
                     number(stats.totals.tool_calls.calls),
                 ];
                 row.extend(usage_cells(&stats.totals.usage));
-                row.push(duration(stats.started, stats.finished));
+                row.push(duration(stats.finished - stats.started));
                 row
             })
             .collect(),
@@ -411,7 +399,7 @@ fn tree(stats: &SessionStats) -> String {
         totals.agents,
         ratio(&totals.requests),
         number(totals.tool_calls.calls),
-        duration(stats.started, stats.finished),
+        duration(stats.finished - stats.started),
     );
     output
 }
@@ -477,14 +465,10 @@ mod tests {
     }
 
     #[test]
-    fn numbers_and_durations_format_for_people() {
+    fn numbers_format_for_people() {
         assert_eq!(number(0), "0");
         assert_eq!(number(999), "999");
         assert_eq!(number(1000), "1,000");
         assert_eq!(number(10_816_684), "10,816,684");
-        let at = |millis| DateTime::from_timestamp_millis(millis).unwrap();
-        assert_eq!(duration(at(0), at(5_000)), "5s");
-        assert_eq!(duration(at(0), at(65_000)), "1m 05s");
-        assert_eq!(duration(at(0), at(3_725_000)), "1h 02m 05s");
     }
 }

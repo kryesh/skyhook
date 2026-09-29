@@ -41,6 +41,7 @@ commands! {
     New => ("new", "New session", "ctrl+x n", &[], true),
     Sessions => ("sessions", "Switch session", "ctrl+x s", &["switch"], true),
     Close => ("close", "Close session", "ctrl+x w", &[], true),
+    Rename => ("rename", "Rename session", "ctrl+x l", &[], true),
     Model => ("model", "Model", "ctrl+x m", &["models"], true),
     Mode => ("mode", "Mode", "ctrl+x p", &["modes"], true),
     Agents => ("agents", "Inspect agent", "ctrl+x a", &[], true),

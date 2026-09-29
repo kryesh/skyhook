@@ -21,6 +21,12 @@ impl App {
     pub fn observe(&mut self, event: ObservedEvent) -> bool {
         if let RuntimeEvent::Record(record) = &event.event {
             observe_initial_input(&mut self.initial_input, record);
+            if matches!(
+                record.event,
+                SessionEvent::TitleSet { .. } | SessionEvent::TitleCleared
+            ) {
+                self.load_title();
+            }
         }
         // Response updates replace the live response or a settled one at its
         // journal position; records reach history through the projection.
@@ -31,7 +37,9 @@ impl App {
                 self.content_cache.observe_response(agent, *request);
                 (false, agent == &self.selected, agent == &self.selected)
             }
-            RuntimeEvent::Activity { agent, activity } => {
+            RuntimeEvent::Activity {
+                agent, activity, ..
+            } => {
                 // Stopping settles the agent's unsettled responses.
                 if matches!(activity, AgentActivity::Stopped(_)) {
                     for ((owner, request), response) in &self.snapshot.responses {
@@ -94,6 +102,7 @@ impl App {
                     tab: self.tab,
                     view,
                     all_details: self.details,
+                    today: self.clock.day(),
                 },
                 &self.outputs,
                 self.content_revision,
@@ -108,7 +117,7 @@ impl App {
         self.snapshot
             .activity
             .get(self.root_agent())
-            .is_some_and(AgentActivity::is_retryable)
+            .is_some_and(|activity| activity.state.is_retryable())
     }
 
     pub fn busy(&self) -> bool {
@@ -121,7 +130,7 @@ impl App {
                 .snapshot
                 .activity
                 .get(self.root_agent())
-                .is_some_and(AgentActivity::is_busy)
+                .is_some_and(|activity| activity.state.is_busy())
     }
     pub(super) fn active_work(&self) -> bool {
         self.busy() || self.projection.has_open_jobs()

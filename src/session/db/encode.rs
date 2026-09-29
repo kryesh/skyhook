@@ -120,10 +120,16 @@ impl Encoder {
             | E::ModeChanged { .. }
             | E::ModelChanged { .. }
             | E::ModelContext { .. } => self.contract(db, entry, event),
-            E::TitleSet { title: text } | E::Status { message: text } => db
+            E::TitleSet { title, source } => db
                 .execute(
-                    "INSERT INTO entry_text (entry, kind, text) VALUES (?1, ?2, ?3)",
-                    params![entry.seq, entry.kind, text],
+                    "INSERT INTO title (entry, source, text) VALUES (?1, ?2, ?3)",
+                    params![entry.seq, *source, title],
+                )
+                .map(drop),
+            E::Status { message } => db
+                .execute(
+                    "INSERT INTO entry_text (entry, text) VALUES (?1, ?2)",
+                    params![entry.seq, message],
                 )
                 .map(drop),
             E::TodosReplaced { items } => super::message::todos(db, entry.seq, entry.kind, items),
@@ -158,7 +164,9 @@ impl Encoder {
                     params![entry.seq, *grant],
                 )
                 .map(drop),
-            E::AgentCompleted | E::AgentInterrupted => Ok(()),
+            E::SessionReopened | E::TitleCleared | E::AgentCompleted | E::AgentInterrupted => {
+                Ok(())
+            }
         }
     }
 
@@ -226,7 +234,7 @@ mod tests {
         session::{
             AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, JobEvent,
             Message, ModelCallOrigin, ModelContext, ModelPurpose, RecordSeq, RuntimeState,
-            SessionEvent, StateJob, StateJobKind, Truncation, UserPart,
+            SessionEvent, StateJob, StateJobKind, TitleSource, Truncation, UserPart,
             db::tests::{Fixture, result, user},
             tests::{child_started, profile},
         },
@@ -673,8 +681,19 @@ mod tests {
                 message: "status".into(),
             },
             SessionEvent::TitleSet {
-                title: "title".into(),
+                title: "prompt".into(),
+                source: TitleSource::Prompt,
             },
+            SessionEvent::TitleSet {
+                title: "user".into(),
+                source: TitleSource::User,
+            },
+            SessionEvent::TitleSet {
+                title: "generated".into(),
+                source: TitleSource::Generated,
+            },
+            SessionEvent::TitleCleared,
+            SessionEvent::SessionReopened,
             SessionEvent::AgentCompleted,
             SessionEvent::AgentInterrupted,
         ] {

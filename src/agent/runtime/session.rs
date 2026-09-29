@@ -1,19 +1,24 @@
 //! Public session submission, inspection, and shutdown API.
 
 use super::*;
+use crate::session::{SessionTitle, TitleSource};
 
 impl Harness {
     pub async fn new_session(&self) -> Result<SessionHandle, HarnessError> {
         let store = SessionStore::create(&self.inner.session_root).await?;
-        let runtime = SessionRuntime::build(self.inner.clone(), store, &[]).await?;
+        let jobs = JobManager::new(store.clone());
+        let runtime = SessionRuntime::build(self.inner.clone(), store, jobs, &[]).await?;
         runtime.start_root(runtime.new_root()?).await
     }
 
     pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
-        let (store, records) = SessionStore::open(&self.inner.session_root, id).await?;
-        let runtime = SessionRuntime::build(self.inner.clone(), store, &records).await?;
+        let (store, mut records) = SessionStore::open(&self.inner.session_root, id).await?;
         // Settlement closes only what this already reads as stopped.
-        let stopped = runtime.stopped_turn(&records, &AgentId::root(id));
+        let stopped = store.stopped_turn().await?;
+        let reopened = SessionEvent::SessionReopened;
+        records.push(store.append(AgentId::root(id), reopened).await?);
+        let jobs = JobManager::restore(store.clone(), &records).await?;
+        let runtime = SessionRuntime::build(self.inner.clone(), store, jobs, &records).await?;
         let resumed = stopped.map_or(Resumed::Idle, Resumed::Parked);
         runtime.settle_interrupted_work(&records).await?;
         runtime.start_root(AgentLaunch::Resume(resumed)).await
@@ -75,7 +80,8 @@ impl SessionHandle {
         self.runtime.store.directory()
     }
 
-    /// Name the session once; later titles leave the first in place.
+    /// Name the session after its first prompt; a session already titled keeps
+    /// its title.
     pub async fn set_title(&self, title: String) -> Result<(), HarnessError> {
         let titled = |records: &[EventRecord]| {
             (records.iter()).any(|record| matches!(record.event, SessionEvent::TitleSet { .. }))
@@ -86,10 +92,35 @@ impl SessionHandle {
             .await
         {
             store
-                .append(self.root.clone(), SessionEvent::TitleSet { title })
+                .append(
+                    self.root.clone(),
+                    SessionEvent::TitleSet {
+                        title,
+                        source: TitleSource::Prompt,
+                    },
+                )
                 .await?;
         }
         Ok(())
+    }
+
+    /// Give the session the user's title, or with `None` return it to its
+    /// automatic title.
+    pub async fn rename(&self, title: Option<String>) -> Result<(), HarnessError> {
+        let event = match title {
+            Some(title) => SessionEvent::TitleSet {
+                title,
+                source: TitleSource::User,
+            },
+            None => SessionEvent::TitleCleared,
+        };
+        self.runtime.store.append(self.root.clone(), event).await?;
+        Ok(())
+    }
+
+    /// The title the session list shows.
+    pub async fn title(&self) -> Result<Option<SessionTitle>, HarnessError> {
+        Ok(self.runtime.store.title().await?)
     }
 
     /// Persist a host-facing status without adding it to the agent's model context.
@@ -180,6 +211,10 @@ impl SessionHandle {
         self.admit_selection(&options)?;
         // An immediate resume must not miss children still journaling.
         self.runtime.settle_interrupts().await;
+        // Admitted before closing begins, or refused before anything changes.
+        // Closing waits for what this restarts to be running, so no longer.
+        let admitted = self.runtime.jobs.admit_resumption();
+        let admitted = admitted.ok_or(HarnessError::AgentStopped)?;
         // A held wait resumes with its children. Mark it busy before they restart,
         // while its turn cannot move on.
         let agents: Vec<_> = (self.runtime.agents().iter())
@@ -191,7 +226,9 @@ impl SessionHandle {
                 self.runtime.activity(&agent, waiting);
             }
         }
-        let children_resumed = self.runtime.jobs.continue_resumable_children().await?;
+        let jobs = &self.runtime.jobs;
+        let children_resumed = jobs.continue_resumable_children(&admitted).await?;
+        drop(admitted);
         let root = self
             .runtime
             .agents()
@@ -368,25 +405,32 @@ impl SessionHandle {
     }
 
     /// Stop runtime producers and drain their accepted work. The journal stays
-    /// open so a host can record its final status after observing shutdown errors.
-    /// Await that status append before dropping the session/store owner.
+    /// open so a host can record its final status after observing shutdown errors,
+    /// then [`close`](Self::close) it.
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
+        // What resumed before this is running work; nothing resumes after it.
+        self.runtime.jobs.close_resumption().await;
         self.runtime
             .shutting_down
             .store(true, std::sync::atomic::Ordering::Release);
-        self.runtime.interrupt_tree(&self.root).await;
+        // Interruptions stay resumable. One accepted just before closing may still
+        // be unwinding, and must not be taken for running work and cancelled.
+        self.runtime.conclude_interrupts().await;
+        self.runtime
+            .interrupt_tree(&self.root, CancelScope::Running)
+            .await;
         // Completed children retain idle loops for resumption, and must also stop.
-        let senders = self
-            .runtime
-            .agents()
-            .values()
-            .map(|agent| agent.sender.clone())
+        let agents = (self.runtime.agents().iter())
+            .map(|(id, agent)| (id.clone(), agent.sender.clone()))
             .collect::<Vec<_>>();
-        for sender in &senders {
+        for (agent, sender) in &agents {
+            // Interruptions stay resumable, so a turn held on one is released
+            // rather than cancelled.
+            self.runtime.jobs.release_held(agent).await;
             let _ = sender.send(AgentCommand::Shutdown).await;
         }
         self.runtime.jobs.cancel_and_drain().await?;
-        for sender in senders {
+        for (_, sender) in agents {
             sender.closed().await;
         }
         // Agent loops can finish scheduling cancellation-owned descendants while
@@ -397,6 +441,12 @@ impl SessionHandle {
         self.runtime.jobs.drain_creations().await;
         self.runtime.store.drain().await?;
         Ok(())
+    }
+
+    /// Close the journal of a session already shut down, so it can be opened
+    /// again at once rather than when every handle has dropped.
+    pub async fn close(&self) -> Result<(), HarnessError> {
+        Ok(self.runtime.store.close().await?)
     }
 
     /// Interrupt active turns while retaining child jobs for retry. Explicit
@@ -491,8 +541,11 @@ mod tests {
     }
 
     /// A crash during a retry backoff, or between a request and its first attempt,
-    /// leaves a request waiting for an attempt that never comes. Resume settles it
-    /// as interrupted, once, like an open attempt.
+    /// leaves a request waiting for an attempt that never comes. Resume journals its
+    /// reopening, then settles the request as interrupted, once, like an open
+    /// attempt. What it closes, a running job too, is dated when the crashed process
+    /// last did something, so reopening leaves the session's last activity alone,
+    /// and so does closing it again with the job still interrupted.
     #[tokio::test]
     async fn resume_settles_requests_left_waiting_for_an_attempt() {
         use crate::session::{AttemptRef, EventRecord, RequestLedger, RequestPhase, RequestSeq};
@@ -512,22 +565,46 @@ mod tests {
         let root_agent = session.root.clone();
         let id = session.id();
         shutdown_session(session).await;
-        // The attempt an interruption settled the request after.
-        let interrupted_after = |records: &[EventRecord], request: RequestSeq| {
+        let settled = |records: &[EventRecord], request: RequestSeq| {
             let mut ledger = RequestLedger::default();
             for record in records {
                 ledger.observe(record);
             }
-            match ledger.get(request).unwrap().phase {
-                RequestPhase::Interrupted { attempt, .. } => Some(attempt),
-                _ => None,
-            }
+            ledger.get(request).unwrap().phase.clone()
         };
         let interrupted = |records: &[EventRecord]| count!(records, SessionEvent::AgentInterrupted);
+        // The one reopening, on the root, is journaled ahead of what resume settles.
+        let reopened_after = |records: &[EventRecord], last: &EventRecord| {
+            let resumed =
+                &records[records.partition_point(|record| record.sequence <= last.sequence)..];
+            assert_eq!(count!(resumed, SessionEvent::SessionReopened), 1);
+            assert!(matches!(resumed[0].event, SessionEvent::SessionReopened));
+            assert_eq!(resumed[0].agent, root_agent);
+        };
 
-        // What a killed process leaves behind: failed once, with the retry
-        // scheduled but never started.
+        // What a killed process leaves behind: a running job, and a request failed
+        // once, with the retry scheduled but never started.
         let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
+        let job = crate::identity::JobId::new(1).unwrap();
+        use crate::job::JobTransition::{AwaitingApproval, Running};
+        let created = SessionEvent::JobCreated {
+            job,
+            parent: None,
+            origin: None,
+            tool: "exec".into(),
+            role: crate::job::JobRole::Tool,
+            name: None,
+            arguments: serde_json::json!({}),
+            output_schema: None,
+            accepts_input: false,
+            background: false,
+            location: crate::execution::ExecutionLocation::root(root.path().to_owned()),
+        };
+        let started =
+            [AwaitingApproval, Running].map(|state| SessionEvent::JobStateChanged { job, state });
+        let running = [created].into_iter().chain(started);
+        let running = running.map(|event| (root_agent.clone(), event)).collect();
+        store.append_all(running).await.unwrap();
         let retrying = store
             .append(root_agent.clone(), requested(context))
             .await
@@ -551,15 +628,45 @@ mod tests {
             failure: failed.sequence,
             delay_millis: 60_000,
         };
-        store.append(root_agent.clone(), scheduled).await.unwrap();
+        let last = store.append(root_agent.clone(), scheduled).await.unwrap();
         let before = interrupted(&store.records().await);
         drop(store);
+        let last_activity = async || {
+            let summary = SessionStore::summary(&sessions, id).await.unwrap();
+            summary.last_millis
+        };
+        assert_eq!(last_activity().await, last.timestamp_millis);
+        // Reopen strictly later, so a repair dated now would show.
+        bounded(async {
+            while chrono::Utc::now().timestamp_millis() <= last.timestamp_millis {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
         let resumed = harness.resume_session(id).await.unwrap();
         let records = resumed.runtime.store.records().await;
         let request = retrying.sequence.request();
-        assert_eq!(interrupted_after(&records, request), Some(Some(1)));
+        let cut = |attempt| RequestPhase::Interrupted {
+            attempt,
+            at: last.timestamp_millis,
+        };
+        assert_eq!(settled(&records, request), cut(Some(1)));
         assert_eq!(interrupted(&records), before + 1);
+        reopened_after(&records, &last);
+        let repairs = records.iter().filter(|record| {
+            record.sequence > last.sequence
+                && matches!(
+                    record.event,
+                    SessionEvent::JobFinished { .. } | SessionEvent::AgentInterrupted
+                )
+        });
+        let repaired = repairs
+            .map(|record| record.timestamp_millis)
+            .collect::<Vec<_>>();
+        assert_eq!(repaired, [last.timestamp_millis; 2]);
+        assert_eq!(last_activity().await, last.timestamp_millis);
         shutdown_session(resumed).await;
+        assert_eq!(last_activity().await, last.timestamp_millis);
 
         // Requested, and never attempted.
         let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
@@ -572,12 +679,17 @@ mod tests {
         let resumed = harness.resume_session(id).await.unwrap();
         let records = resumed.runtime.store.records().await;
         let request = waiting.sequence.request();
-        assert_eq!(interrupted_after(&records, request), Some(None));
+        let cut = RequestPhase::Interrupted {
+            attempt: None,
+            at: waiting.timestamp_millis,
+        };
+        assert_eq!(settled(&records, request), cut);
         assert_eq!(interrupted(&records), before + 1);
+        reopened_after(&records, &waiting);
         shutdown_session(resumed).await;
 
         // Nothing left to settle: an attempt its agent's interruption closed without
-        // an outcome of its own is settled already, so a further resume journals
+        // an outcome of its own is settled already, so a further resume settles
         // nothing, yet the interrupted turn can still be continued.
         let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
         let closed = store
@@ -600,6 +712,182 @@ mod tests {
         shutdown_session(resumed).await;
     }
 
+    /// A session whose root is held on a child it interrupted mid-response. The
+    /// child's retry answers next, then the root's continuation.
+    async fn held_on_interrupted_child(
+        root: &Path,
+    ) -> (
+        Harness,
+        SessionHandle,
+        Requests,
+        tokio::task::JoinHandle<Result<String, HarnessError>>,
+        JobId,
+    ) {
+        let child = json!({"prompt": "child task", "depth": 0});
+        let steps = [
+            Step::new(response(vec![tool_call(0, "agent-0", "agent", child)])),
+            Step::new(Vec::new()).midstream(),
+            Step::new(answer("child recovered")),
+            Step::new(answer("root continued")),
+        ];
+        let requests = Requests::default();
+        let provider = Script::new(steps, &requests);
+        let harness = test_harness(root, &root.join("sessions"), provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("delegate").await }
+        });
+        provider.request(1).await;
+        root_waiting(&session).await;
+        assert_eq!(session.interrupt().await, 2);
+        assert_eq!(turn(&session, &session.root), TurnState::Held);
+        let job = session.inspect_jobs(&session.root).await[0].id;
+        (harness, session, requests, parent, job)
+    }
+
+    /// Closing ends running work, not an interruption, even one closing follows
+    /// at once: a turn held on an interrupted child is released, and when the
+    /// session reopens the child resumes and its result reaches the parent.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_leaves_interrupted_children_resumable() {
+        use crate::job::JobState;
+        let root = tempfile::tempdir().unwrap();
+        let (harness, session, requests, parent, job) =
+            held_on_interrupted_child(root.path()).await;
+        let id = session.id();
+        shutdown_session(session).await;
+        assert!(bounded(parent).await.unwrap().is_err());
+
+        let resumed = harness.resume_session(id).await.unwrap();
+        let state = resumed.runtime.jobs.snapshot(job).await.unwrap().state;
+        assert_eq!(state, JobState::Interrupted);
+        resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
+        until(&resumed, job, |job| job.state == JobState::Completed).await;
+        assert_eq!(resumed.continue_turn().await.unwrap(), "root continued");
+        let last = requests.lock().unwrap().last().unwrap().request.clone();
+        assert!(format!("{last:?}").contains("child recovered"));
+        shutdown_session(resumed).await;
+    }
+
+    /// Closing a session whose interruption has settled, with nothing left
+    /// running, leaves its last activity where it was.
+    #[tokio::test(start_paused = true)]
+    async fn closing_a_settled_interruption_is_not_activity() {
+        use crate::job::JobState;
+        let root = tempfile::tempdir().unwrap();
+        let (_harness, session, _requests, parent, job) =
+            held_on_interrupted_child(root.path()).await;
+        until(&session, job, |job| job.state == JobState::Interrupted).await;
+        let sessions = root.path().join("sessions");
+        let id = session.id();
+        let last_activity = async || {
+            SessionStore::summary(&sessions, id)
+                .await
+                .unwrap()
+                .last_millis
+        };
+        let before = last_activity().await;
+        // Close strictly later, so an entry dated now would show.
+        bounded(async {
+            while chrono::Utc::now().timestamp_millis() <= before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        shutdown_session(session).await;
+        assert!(bounded(parent).await.unwrap().is_err());
+        assert_eq!(last_activity().await, before);
+    }
+
+    /// Closing stops agents in no particular order. A child stopping before the
+    /// turn held on it is released leaves that turn releasable.
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_releases_a_turn_whose_interrupted_child_stopped_first() {
+        use crate::job::JobState;
+        let root = tempfile::tempdir().unwrap();
+        let (_harness, session, _requests, parent, job) =
+            held_on_interrupted_child(root.path()).await;
+        until(&session, job, |job| job.state == JobState::Interrupted).await;
+        let child = session.root.child(1);
+        let sender = session.runtime.agent_sender(&child).unwrap();
+        (session.runtime.shutting_down).store(true, std::sync::atomic::Ordering::Release);
+        sender.send(AgentCommand::Shutdown).await.unwrap();
+        bounded(sender.closed()).await;
+        shutdown_session(session).await;
+        assert!(bounded(parent).await.unwrap().is_err());
+    }
+
+    /// A continue waiting for an interruption to publish while closing publishes
+    /// it finds the session closed: it journals nothing, and the interruption
+    /// resumes when the session reopens.
+    #[tokio::test]
+    async fn a_continue_pending_across_shutdown_leaves_the_interruption_resumable() {
+        use crate::job::JobState;
+        let child_task = json!({"prompt": "child task", "depth": 0});
+        let delegate = Step::new(response(vec![tool_call(0, "agent-0", "agent", child_task)]));
+        let recovered = (0..4).map(|_| Step::new(answer("recovered")));
+        let steps = [delegate, Step::new(Vec::new()).midstream()];
+        let provider = Script::new(steps.into_iter().chain(recovered), &Requests::default());
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("delegate").await }
+        });
+        provider.request(1).await;
+        root_waiting(&session).await;
+        let job = session.inspect_jobs(&session.root).await[0].id;
+        // The child's interruption publishes only once its turn completes.
+        let child = session.root.child(1);
+        let gate = session.runtime.agents()[&child].control.invocation.clone();
+        let completing = gate.lock().await;
+        assert_eq!(session.interrupt().await, 2);
+        let mut continued = Box::pin(session.continue_turn());
+        assert!(futures_util::poll!(continued.as_mut()).is_pending());
+        let shutdown = tokio::spawn({
+            let session = session.clone();
+            async move { session.shutdown().await }
+        });
+        until(&session, job, |job| job.state == JobState::Interrupted).await;
+        drop(completing);
+        bounded(shutdown).await.unwrap().unwrap();
+        assert!(bounded(parent).await.unwrap().is_err());
+        let closed = session.runtime.store.records().await;
+        let refused = bounded(continued).await;
+        assert!(
+            matches!(refused, Err(HarnessError::AgentStopped)),
+            "{refused:?}"
+        );
+        assert_eq!(session.runtime.store.records().await, closed);
+        session.close().await.unwrap();
+
+        let resumed = harness.resume_session(session.id()).await.unwrap();
+        let state = resumed.runtime.jobs.snapshot(job).await.unwrap().state;
+        assert_eq!(state, JobState::Interrupted);
+        bounded(resumed.continue_turn()).await.unwrap();
+        assert_eq!(terminal(&resumed, job).await.state, JobState::Completed);
+        shutdown_session(resumed).await;
+    }
+
+    /// Closing frees the session for another open while its handle lives on, and
+    /// work still winding down behind it can no longer write.
+    #[tokio::test]
+    async fn a_closed_session_reopens_while_its_handle_lives() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
+        let session = harness.new_session().await.unwrap();
+        session.shutdown().await.unwrap();
+        session.close().await.unwrap();
+        let resumed = harness.resume_session(session.id()).await.unwrap();
+        let late = session.record_status(session.root.clone(), "late".into());
+        assert!(late.await.is_err());
+        shutdown_session(resumed).await;
+    }
+
     /// A turn that failed or was interrupted before the session closed reopens
     /// stopped for that reason and is continued; a finished one leaves nothing to
     /// continue.
@@ -608,7 +896,7 @@ mod tests {
         use crate::agent::{AgentActivity, Failure, TurnFailure};
         let stopped = async |session: &SessionHandle| {
             let activity = session.observe().await.snapshot.activity;
-            match &activity[&session.root] {
+            match &activity[&session.root].state {
                 AgentActivity::Stopped(failure) => Some(failure.clone()),
                 _ => None,
             }
@@ -1292,9 +1580,8 @@ mod tests {
         let summary = SessionStore::summary(&sessions, session.id())
             .await
             .unwrap();
-        assert_eq!(summary.title, None);
         assert_eq!(
-            summary.preview.as_deref(),
+            summary.title.map(|title| title.text).as_deref(),
             Some("list me by my first prompt")
         );
         assert_eq!(summary.model, Some(model_ref("test")));
@@ -1303,7 +1590,10 @@ mod tests {
         let summary = SessionStore::summary(&sessions, session.id())
             .await
             .unwrap();
-        assert_eq!(summary.title.as_deref(), Some("first title"));
+        assert_eq!(
+            summary.title.map(|title| title.text).as_deref(),
+            Some("first title")
+        );
         let records = session.runtime.store.records().await;
         assert_eq!(summary.entries, records.len() as u64);
         assert_eq!(

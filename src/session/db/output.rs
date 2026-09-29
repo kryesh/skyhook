@@ -417,3 +417,147 @@ impl SharedDb {
         self.lock().batch(sql).unwrap();
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        execution::ExecutionLocation,
+        identity::JobId,
+        job::{JobEnd, JobRole, JobTransition},
+        session::{SessionError, SessionEvent, SessionStore, tests::on_disk},
+    };
+
+    /// Closing revokes every clone's writes, including SQL queries that insert rows
+    /// and mutations that resolve the job's current generation only when they run.
+    #[tokio::test]
+    async fn closed_output_handles_cannot_write_to_a_reopened_session() {
+        let (root, store, agent) = on_disk().await;
+        let job = JobId::new(1).unwrap();
+        store
+            .append(
+                agent.clone(),
+                SessionEvent::JobCreated {
+                    job,
+                    parent: None,
+                    origin: None,
+                    tool: "agent".into(),
+                    role: JobRole::Agent,
+                    name: None,
+                    arguments: serde_json::json!({}),
+                    output_schema: None,
+                    accepts_input: true,
+                    background: false,
+                    location: ExecutionLocation::root(root.path().to_owned()),
+                },
+            )
+            .await
+            .unwrap();
+        let old = store.outputs();
+        let field = FieldPointer::result().property("text");
+        let reserve = |db: &SharedDb, kind| {
+            db.create_capture(job.get(), &field, kind, false)
+                .unwrap()
+                .unwrap()
+        };
+        let previous = reserve(&old, CaptureKind::Unknown);
+        let extent = old
+            .append_capture(previous, CaptureExtent::default(), b"previous")
+            .unwrap();
+        store
+            .append(
+                agent.clone(),
+                SessionEvent::JobFinished {
+                    job,
+                    state: JobEnd::Interrupted,
+                    diagnostic: None,
+                    output_diagnostic: None,
+                    images: Vec::new(),
+                },
+            )
+            .await
+            .unwrap();
+        store.close().await.unwrap();
+        assert!(old.append_capture(previous, extent, b"late").is_err());
+
+        let (reopened, _) = SessionStore::open(root.path(), store.id()).await.unwrap();
+        let restart = SessionEvent::JobStateChanged {
+            job,
+            state: JobTransition::Running,
+        };
+        let stale = store.append(agent.clone(), restart.clone()).await;
+        assert!(matches!(stale, Err(SessionError::Closed)));
+        reopened.append(agent, restart).await.unwrap();
+        let current = reopened.outputs();
+        let capture = reserve(&current, CaptureKind::Text);
+        current
+            .append_capture(capture, CaptureExtent::default(), b"current")
+            .unwrap();
+        current.finish_capture(capture).unwrap();
+        let document = r#"{"text":""}"#;
+        current
+            .save_output(job.get(), Some(document), false, &[capture], &[])
+            .unwrap();
+
+        let extra = FieldPointer::result().property("late");
+        for (operation, result) in [
+            (
+                "reserve",
+                old.create_capture(job.get(), &extra, CaptureKind::Text, false)
+                    .map(drop),
+            ),
+            (
+                "render",
+                old.create_capture(job.get(), &field, CaptureKind::Text, true)
+                    .map(drop),
+            ),
+            (
+                "append",
+                old.append_capture(previous, extent, b"late").map(drop),
+            ),
+            ("truncate", old.truncate_capture(previous, 0).map(drop)),
+            ("delete", old.delete_capture(previous)),
+            (
+                "kind",
+                old.resolve_capture_kind(previous, CaptureKind::Text),
+            ),
+            ("detection", old.set_detection(capture, Detection::NotJson)),
+            ("finish", old.finish_capture(previous)),
+            (
+                "document",
+                old.save_output(job.get(), Some("null"), true, &[], &[]),
+            ),
+            ("complete", old.save_complete_fields(job.get(), &[extra])),
+            ("size", old.set_presented_bytes(job.get(), 42)),
+        ] {
+            assert!(result.is_err(), "closed handle wrote {operation}");
+        }
+
+        // Retained readers see the new owner's committed data, without changing it.
+        let saved = old.output(job.get()).unwrap().unwrap();
+        assert_eq!(saved.result.as_deref(), Some(document));
+        assert!(!saved.captures_complete);
+        assert_eq!(saved.fields.as_slice(), std::slice::from_ref(&field));
+        assert!(old.complete_fields(job.get()).unwrap().is_empty());
+        assert_eq!(old.presented_bytes(job.get()).unwrap(), None);
+        assert_eq!(old.rendering(job.get(), &field).unwrap(), None);
+        let captures = old.captures(job.get()).unwrap();
+        assert_eq!(captures.len(), 1);
+        assert_eq!(captures[0].id, capture);
+        assert_eq!(captures[0].kind, CaptureKind::Text);
+        assert_eq!(captures[0].detection, None);
+        for (capture, bytes) in [
+            (previous, b"previous".as_slice()),
+            (capture, b"current".as_slice()),
+        ] {
+            let chunks = old.capture_chunks(capture, 0, usize::MAX).unwrap();
+            assert_eq!(chunks, [(0, bytes.to_vec())]);
+        }
+        current
+            .resolve_capture_kind(previous, CaptureKind::Text)
+            .unwrap();
+        current.finish_capture(previous).unwrap();
+        current.set_detection(capture, Detection::NotJson).unwrap();
+        reopened.close().await.unwrap();
+    }
+}

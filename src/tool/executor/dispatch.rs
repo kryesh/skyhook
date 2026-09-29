@@ -549,7 +549,13 @@ mod tests {
         }
         factory.wait_for_hello().await;
         assert_eq!(factory.starts.load(Ordering::SeqCst), 1);
-        assert_eq!(runtime.jobs.cancel_all(&runtime.agent).await, 5);
+        assert_eq!(
+            runtime
+                .jobs
+                .cancel_all(&runtime.agent, crate::job::CancelScope::Outcome)
+                .await,
+            5
+        );
         for task in tasks {
             assert!(task.await.unwrap().is_err());
         }

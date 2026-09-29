@@ -1,5 +1,5 @@
 use super::entries::{Dep, History, Inputs};
-use super::live::{live_tail_response, live_tail_responses, response_entries, working_entry};
+use super::live::{live_tail, live_tail_responses};
 use super::{Entry, EntryKey, EntryView, Projection, Tab};
 use crate::tui::app::OutputStore;
 use skyhook::agent::ObservationSnapshot;
@@ -11,7 +11,8 @@ use std::collections::{HashMap, HashSet};
 /// History folds new records and rebuilds only the entries whose sources changed;
 /// the live tail and working indicator are rebuilt on each update. The caller
 /// bumps `revision` for presentation changes, which rebuild everything, as do a
-/// new agent, tab or detail setting; a toggled entry rebuilds only its source.
+/// new agent, tab or detail setting, and a new day, since earlier times then show
+/// their date; a toggled entry rebuilds only its source.
 ///
 /// Entries and all indices share one owner. Render/export borrow the entries;
 /// historical strings and documents are never cloned at the update boundary.
@@ -19,12 +20,22 @@ use std::collections::{HashMap, HashSet};
 pub struct ContentCache {
     entries: Vec<Entry>,
     overlay_len: usize,
-    identity: Option<(AgentId, Tab, bool, u64)>,
+    identity: Option<Identity>,
     history: History,
     /// Requests whose responses form the live tail.
     live: Vec<RequestSeq>,
     dirty_responses: HashMap<AgentId, HashSet<RequestSeq>>,
     invalid: HashSet<Dep>,
+}
+
+/// What every entry was built for; any change rebuilds them all.
+#[derive(PartialEq)]
+struct Identity {
+    agent: AgentId,
+    tab: Tab,
+    all_details: bool,
+    revision: u64,
+    today: chrono::NaiveDate,
 }
 
 impl ContentCache {
@@ -102,18 +113,22 @@ impl ContentCache {
         let mut changed = projection.take_changes();
         let projection = &*projection;
         let EntryView {
-            agent, tab, view, ..
+            agent,
+            tab,
+            all_details,
+            today,
+            ..
         } = presentation;
-        let identity = (agent.clone(), tab, presentation.all_details, revision);
+        let identity = Identity {
+            agent: agent.clone(),
+            tab,
+            all_details,
+            revision,
+            today,
+        };
         let dirty_responses = self.dirty_responses.remove(agent).unwrap_or_default();
         changed.extend(dirty_responses.iter().copied().map(Dep::Request));
         changed.extend(self.invalid.drain());
-        if tab == Tab::Requests
-            && let Some(request) = snapshot.ledger.open(agent)
-        {
-            // Elapsed time changes without a new journal record.
-            changed.insert(Dep::Request(request));
-        }
         let inputs = Inputs {
             snapshot,
             projection,
@@ -135,10 +150,8 @@ impl ContentCache {
         if tab == Tab::Conversation {
             // Native events can replace equal-length text, reorder items, or end
             // blocks: the live suffix is rebuilt whole, never journal entries.
-            let agent_name = projection.agent_name(agent);
             let requests: Vec<_> = if rebuild {
-                let responses = live_tail_responses(snapshot, agent);
-                responses.into_iter().map(|(request, _)| request).collect()
+                live_tail_responses(snapshot, agent)
             } else {
                 let mut requests: Vec<_> =
                     self.live.iter().copied().chain(dirty_responses).collect();
@@ -146,17 +159,7 @@ impl ContentCache {
                 requests.dedup();
                 requests
             };
-            self.live.clear();
-            for request in requests {
-                if let Some(response) = live_tail_response(snapshot, agent, request) {
-                    self.live.push(request);
-                    entries.extend(response_entries(request, response, view, agent_name));
-                }
-            }
-            // The working indicator is a synthetic tail, never part of history.
-            let live = &entries[self.history.len()..];
-            let running = self.history.running > 0 || live.iter().any(|entry| entry.running);
-            entries.extend(working_entry(snapshot, agent, running));
+            self.live = live_tail(snapshot, projection, presentation, requests, entries);
         }
         if rebuild {
             // Unchanged entries keep their layout. An insertion or removal shifts
@@ -183,7 +186,7 @@ fn changed_indices(old: &[Entry], new: &[Entry], offset: usize) -> Vec<usize> {
 mod tests {
     use super::super::entries::entries as history_entries;
     use super::super::tests::{Journal, created, finished, loaded, replay, root, update};
-    use super::super::{EntryKey, ResponseRef, Surface, Title, View};
+    use super::super::{Clock, EntryKey, ResponseRef, Surface, Timing, Title, View};
     use super::*;
     use skyhook::agent::{AgentActivity, RuntimeEvent};
     use skyhook::job::JobRole;
@@ -199,6 +202,7 @@ mod tests {
             tab: Tab::Conversation,
             view,
             all_details,
+            today: Default::default(),
         }
     }
 
@@ -223,6 +227,82 @@ mod tests {
             "the retained history differs from a fresh build"
         );
         dirty
+    }
+
+    /// Entries carry live timings for the renderer to paint and settle to what
+    /// they took; nothing unchanged rebuilds until a new local day dates earlier
+    /// times.
+    #[tokio::test]
+    async fn entries_carry_timings_and_only_a_new_day_rebuilds_them() {
+        use skyhook::job::JobTransition;
+        use skyhook::session::AttemptRef;
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
+        let request = journal.request(&agent, None).await.request;
+        journal
+            .record(&agent, created(1, "exec", JobRole::Tool))
+            .await;
+        let running = SessionEvent::JobStateChanged {
+            job: JobId::new(1).unwrap(),
+            state: JobTransition::Running,
+        };
+        journal.record(&agent, running).await;
+        let live = journal.stamped();
+        let attempt = AttemptRef {
+            request,
+            attempt: 1,
+        };
+        journal.record(&agent, finished(1)).await;
+        let interrupted = SessionEvent::ModelAttemptInterrupted(attempt);
+        journal.record(&agent, interrupted).await;
+        let mut settled = journal.stamped();
+        let idle = RuntimeEvent::Activity {
+            agent: agent.clone(),
+            activity: AgentActivity::Idle,
+            at: 0,
+        };
+        update(&mut settled, idle);
+        let turn = Timing::Since(live.activity[&agent].since);
+        let today = Clock::default().day();
+        let later = today + chrono::Days::new(2);
+        for tab in [Tab::Conversation, Tab::Requests, Tab::Jobs] {
+            let (mut cache, outputs, view) = Default::default();
+            let on = |today| EntryView {
+                tab,
+                today,
+                ..show(&agent, &view, false)
+            };
+            let mut projection = Projection::default();
+            projection.rebuild(&live);
+            refresh(&mut cache, (&live, &mut projection), on(today), &outputs, 0);
+            let counting = cache.entries().iter().filter(|entry| entry.timing.live());
+            let expected = if tab == Tab::Conversation { 2 } else { 1 };
+            assert_eq!(counting.count(), expected, "{tab:?}");
+            let state = (&live, &mut projection);
+            assert!(refresh(&mut cache, state, on(today), &outputs, 0).is_empty());
+            if tab == Tab::Conversation {
+                let working = cache.entries().last().unwrap();
+                assert_eq!((working.text(), working.timing), ("Working", turn));
+            }
+            projection.rebuild(&settled);
+            refresh(
+                &mut cache,
+                (&settled, &mut projection),
+                on(today),
+                &outputs,
+                0,
+            );
+            let timings: Vec<_> = (cache.entries().iter())
+                .map(|entry| entry.timing)
+                .filter(|timing| *timing != Timing::Untimed)
+                .collect();
+            let took = |timing: &Timing| matches!(timing, Timing::Took { .. });
+            assert!(!timings.is_empty() && timings.iter().all(took), "{tab:?}");
+            // Days later, only request rows change: their send time gains its date.
+            let state = (&settled, &mut projection);
+            let dated = refresh(&mut cache, state, on(later), &outputs, 0);
+            assert_eq!(dated.is_empty(), tab != Tab::Requests, "{tab:?}");
+        }
     }
 
     #[tokio::test]
@@ -362,7 +442,7 @@ mod tests {
         .unwrap();
         journal.response(&agent, request, ResponseEvent::End(ended));
         sync(&mut cache, &journal.snapshot, &mut projection);
-        assert!(!cache.entries()[0].running);
+        assert!(!cache.entries()[0].timing.live());
         assert_eq!(
             cache.entries()[0].title(),
             Some(&Title::disclosed("Reasoning", false))
@@ -416,6 +496,7 @@ mod tests {
             let event = RuntimeEvent::Activity {
                 agent: agent.clone(),
                 activity,
+                at: 0,
             };
             update(&mut snapshot, event);
             refresh(
@@ -529,9 +610,14 @@ mod tests {
             };
             assert_eq!(commit!(scheduled), [0]);
             assert_eq!(cache.entries().len(), 1);
+            // The card counts down to the next attempt.
+            let scheduled_at = journal.snapshot.records.values().next_back().unwrap();
+            let due = Timing::Until(scheduled_at.timestamp_millis + 1000);
+            assert_eq!(cache.entries()[0].timing, due);
             let text = cache.entries()[0].text();
-            let retrying = format!("Retrying · attempt {}", attempt + 1);
-            for part in [retrying.as_str(), "HTTP 503", "retry delay 1000 ms"] {
+            let attempt_part = format!(" · attempt {}\n", attempt + 1);
+            assert!(text.starts_with("Retrying · "), "{text}");
+            for part in [attempt_part.as_str(), "HTTP 503"] {
                 assert!(text.contains(part), "{text}");
             }
             assert!(text.ends_with(&format!("partial {attempt} updated")));
@@ -562,7 +648,10 @@ mod tests {
         };
         commit!(failed);
         assert_eq!(cache.entries().len(), 2);
-        assert!(cache.entries().contains(&committed));
+        // Only its footer changes, now that the request has settled.
+        let intact =
+            |entry: &Entry| entry.key() == committed.key() && entry.text() == committed.text();
+        assert!(cache.entries().iter().any(intact));
         let failures: Vec<_> = cache
             .entries()
             .iter()
@@ -614,6 +703,7 @@ mod tests {
         let working = RuntimeEvent::Activity {
             agent: agent.clone(),
             activity: AgentActivity::Working,
+            at: 0,
         };
         update(&mut journal.snapshot, working);
         step(&journal, "working", &[]);
@@ -751,6 +841,7 @@ mod tests {
         let stopped = RuntimeEvent::Activity {
             agent: agent.clone(),
             activity: AgentActivity::Stopped(skyhook::agent::TurnFailure::Interrupted),
+            at: 0,
         };
         update(&mut journal.snapshot, stopped);
         // Stopping settles the interrupted response, moving it to its journal position.

@@ -124,6 +124,19 @@ impl App {
                     self.cancel_prompt();
                     return;
                 }
+                // As in the composer: clear typed text, and back out of an empty field.
+                KeyCode::Char('c') if key.modifiers.contains(M::CONTROL) => {
+                    if takes_text && !self.prompt_input().editor.text().is_empty() {
+                        self.prompts
+                            .front_mut()
+                            .expect("active prompt")
+                            .clear_input();
+                        text_changed = true;
+                    } else {
+                        self.cancel_prompt();
+                        return;
+                    }
+                }
                 KeyCode::PageUp | KeyCode::PageDown => {
                     let options = key.modifiers.contains(M::CONTROL);
                     let height = if options {
@@ -207,12 +220,16 @@ impl App {
                 self.cycle_mode(reverse);
                 return;
             }
-            KeyCode::PageUp => {
-                self.scroll(-(self.content_rect.height as isize));
-                return;
-            }
-            KeyCode::PageDown => {
-                self.scroll(self.content_rect.height as isize);
+            KeyCode::PageUp | KeyCode::PageDown => {
+                let down = key.code == KeyCode::PageDown;
+                // A draft taller than its box pages itself; otherwise the conversation.
+                if self.focus == Focus::Composer && self.composer_overflows() {
+                    self.editor.page(self.composer_rows(), down);
+                    self.composer_scroll = None;
+                } else {
+                    let page = self.content_rect.height as isize;
+                    self.scroll(if down { page } else { -page });
+                }
                 return;
             }
             KeyCode::Char('u' | 'd') if key.modifiers.contains(M::CONTROL | M::ALT) => {
@@ -249,6 +266,9 @@ impl App {
                 return;
             }
             _ => {}
+        }
+        if self.focus == Focus::Composer {
+            self.composer_scroll = None;
         }
         match self.focus {
             Focus::Composer => match key.code {
@@ -346,6 +366,24 @@ impl App {
                 _ => {}
             },
         }
+    }
+    /// Whether the draft is taller than its box, so scrolling moves through it.
+    pub(super) fn composer_overflows(&self) -> bool {
+        self.editor.rows() > self.composer_rows()
+    }
+    /// Draft rows the composer box shows.
+    fn composer_rows(&self) -> usize {
+        self.composer_rect.height.saturating_sub(2) as usize
+    }
+    /// Scroll the draft's view without moving its cursor.
+    pub(super) fn scroll_composer(&mut self, step: isize) {
+        let visible = self.composer_rows();
+        let bottom = self.editor.rows().saturating_sub(visible);
+        // From the rows shown, which a resize may have clamped below the stored top.
+        let top = (self.composer_scroll)
+            .map_or_else(|| self.editor.cursor_top(visible), |top| top.min(bottom));
+        self.composer_scroll = Some(top.saturating_add_signed(step).min(bottom));
+        self.dirty = true;
     }
     fn latest_row(&self) -> usize {
         let rows = self.render.rows.len();
@@ -498,6 +536,45 @@ impl App {
 mod tests {
     use super::super::tests::*;
     use super::*;
+
+    /// A draft taller than its box scrolls under the wheel without moving its cursor,
+    /// pages its cursor with Page Up, and follows the cursor again once edited.
+    #[tokio::test]
+    async fn a_tall_draft_scrolls_and_pages_in_its_box() {
+        let (_root, mut app) = draft_fixture().await;
+        let lines: Vec<_> = (0..40).map(|line| format!("line {line}")).collect();
+        app.editor.insert(&lines.join("\n"));
+        draw(&mut app);
+        assert!(app.composer_overflows());
+        let visible = app.composer_rect.height as usize - 2;
+        let cursor = app.editor.cursor();
+        let inside = Rect::new(2, app.composer_rect.y + 1, 1, 1);
+        mouse(&mut app, inside, MouseEventKind::ScrollUp);
+        let top = app.composer_scroll.unwrap();
+        assert!(top < 40 - visible);
+        assert_eq!(app.editor.cursor(), cursor);
+        let screen = draw(&mut app);
+        assert!(screen.contains(&format!("line {top} ")) && !screen.contains("line 39"));
+
+        key(&mut app, KeyCode::PageUp, M::NONE);
+        assert_eq!(app.composer_scroll, None);
+        let screen = draw(&mut app);
+        let row = 39 - visible;
+        assert!(screen.contains(&format!("line {row} ")) && !screen.contains("line 39"));
+        key(&mut app, KeyCode::Char('x'), M::NONE);
+        assert_eq!(app.composer_scroll, None);
+
+        // Wheel movement starts from the rows shown, even when a resize has since
+        // clamped a stored top that no longer fits.
+        let bottom = 40 - visible;
+        app.composer_scroll = Some(bottom + 20);
+        mouse(&mut app, inside, MouseEventKind::ScrollUp);
+        assert_eq!(app.composer_scroll, Some(bottom - SCROLL_STEP as usize));
+        // A paste long enough to collapse follows the cursor again too.
+        let pasted = "pasted\n".repeat(PASTE_COLLAPSE_LINES + 1);
+        app.event(Event::Paste(pasted));
+        assert_eq!(app.composer_scroll, None);
+    }
 
     #[tokio::test]
     async fn composer_pastes_submit_in_place() {

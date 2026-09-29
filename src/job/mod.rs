@@ -24,7 +24,9 @@ use crate::{
     identity::{AgentId, JobId},
     media::ImageRef,
     named_enum::named_enum,
-    session::{EventRecord, MessageSeq, RecordSeq, SessionError, SessionEvent, SessionStore},
+    session::{
+        Dated, EventRecord, MessageSeq, RecordSeq, SessionError, SessionEvent, SessionStore,
+    },
     tool::{
         ToolError, ToolOutput,
         diagnostic::{Diagnostic, PartialDiagnostic},
@@ -40,7 +42,7 @@ pub use output::{
     OutputSelection, OutputTruncation, PresentedOutput, diagnostic_slot, omit_null_fields,
 };
 mod cancellation;
-pub(crate) use cancellation::CANCELLATION_GRACE;
+pub(crate) use cancellation::{CANCELLATION_GRACE, CancelScope};
 mod delivery;
 mod entry;
 mod error;
@@ -254,8 +256,12 @@ pub(crate) type ResumeHandler = Arc<
 #[derive(Clone, Copy)]
 enum WaitMode {
     Foreground,
-    Explicit { claim: bool },
+    Explicit {
+        claim: bool,
+    },
     Terminal,
+    /// Until nothing, a cancellation included, can change the outcome.
+    Final,
 }
 
 struct JobManagerInner {
@@ -267,6 +273,9 @@ struct JobManagerInner {
     /// Shared by concurrent creations; exclusive for drain.
     /// Never acquired while holding a jobs, delivery, or per-job operation lock.
     creation_operation: Arc<tokio::sync::RwLock<()>>,
+    /// Shared by each admitted resumption until its job is running again;
+    /// exclusive for closing, after which none is admitted.
+    resumption: Arc<tokio::sync::RwLock<Resumption>>,
     next_id: AtomicU64,
     completions: broadcast::Sender<JobCompletion>,
     /// Per agent, fires when one of its jobs newly parks in a `wait`, releasing
@@ -275,6 +284,20 @@ struct JobManagerInner {
     /// Per parent job, its issued calls whose jobs are not published yet.
     issuing: std::sync::Mutex<HashMap<JobId, usize>>,
     issued: Notify,
+}
+
+/// Whether interrupted jobs may still restart.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Resumption {
+    Open,
+    Closed,
+}
+
+/// Resumption admitted before closing, held until the jobs it restarts are
+/// running: closing then finds them running rather than restarting behind it.
+#[derive(Clone)]
+pub(crate) struct Admitted {
+    _open: Arc<tokio::sync::OwnedRwLockReadGuard<Resumption>>,
 }
 
 /// A call from its issue until its job is published or refused.
@@ -361,6 +384,7 @@ impl JobManager {
                 supervision: Arc::new(supervisor::Supervision::default()),
                 delivery_operation: Arc::new(Mutex::new(())),
                 creation_operation: Arc::default(),
+                resumption: Arc::new(tokio::sync::RwLock::new(Resumption::Open)),
                 next_id: AtomicU64::new(next_id),
                 completions,
                 parked: std::sync::Mutex::default(),
@@ -370,6 +394,8 @@ impl JobManager {
         }
     }
 
+    /// Replay a journal's jobs. Those its process left running end interrupted,
+    /// when that process last did something.
     pub async fn restore(store: SessionStore, records: &[EventRecord]) -> Result<Self, JobError> {
         persistence::restore(store, records).await
     }

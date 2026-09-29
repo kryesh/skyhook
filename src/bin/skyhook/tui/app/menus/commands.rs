@@ -4,7 +4,6 @@ use crate::state;
 use crate::tui::app::{App, Focus, HostRequest, StartState, Work};
 use crate::tui::keys::{COMMANDS, Command};
 use crate::tui::model::{self, Tab, View};
-use skyhook::agent::AgentActivity;
 
 impl App {
     pub fn command(&mut self, command: Command) {
@@ -13,7 +12,7 @@ impl App {
                 let palette = COMMANDS.iter().filter(|spec| spec.palette);
                 let items = palette.map(|spec| {
                     let binding = self.keys.binding(spec.command).unwrap_or_default();
-                    Item::new(spec.command, spec.label, binding)
+                    Item::columned(spec.command, spec.label, "", vec![binding])
                 });
                 self.open("Commands", MenuKind::Commands(items.collect()));
             }
@@ -114,6 +113,7 @@ impl App {
                 }
             }
             Command::Sessions => self.open_sessions(),
+            Command::Rename => self.rename_session(),
             Command::Files => self.open_files(None),
             Command::Sidebar => {
                 self.sidebar = !self.sidebar;
@@ -163,7 +163,7 @@ impl App {
                 .snapshot
                 .activity
                 .values()
-                .any(AgentActivity::is_retryable)
+                .any(|activity| activity.state.is_retryable())
         {
             self.notice("No failed or interrupted turns to retry");
             return;
@@ -230,6 +230,7 @@ impl App {
             tab: Tab::Conversation,
             view: &View::default(),
             all_details: true,
+            today: self.clock.day(),
         };
         let entries = model::entries(&self.snapshot, &self.projection, view, &self.outputs, true);
         let text = entries.iter().map(|entry| entry.text()).collect::<Vec<_>>();
@@ -282,7 +283,10 @@ mod tests {
         assert_eq!(failures(&snapshot), 1);
         app.snapshot = snapshot.clone();
         let root = session.root_agent().clone();
-        let waiting = AgentActivity::WaitingChildren;
+        let waiting = skyhook::agent::ObservedActivity {
+            state: skyhook::agent::AgentActivity::WaitingChildren,
+            since: 0,
+        };
         app.snapshot.activity.insert(root.clone(), waiting.clone());
         assert_eq!(app.selected, root);
         app.operation = true;
@@ -327,8 +331,8 @@ mod tests {
         ] {
             let item = items.iter().find(|item| item.value == command).unwrap();
             assert_eq!(
-                (item.label.as_str(), item.detail.as_str()),
-                (label, shortcut)
+                (item.label.as_str(), item.columns.as_slice()),
+                (label, &[shortcut.to_owned()][..])
             );
         }
         for (query, expected) in [

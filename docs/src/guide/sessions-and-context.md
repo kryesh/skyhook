@@ -11,27 +11,50 @@ saved sessions only in `<workspace>/.skyhook/sessions`, where `--workspace` sele
 (default: the current directory). It does not search parent or sibling workspaces. Sessions
 written by an incompatible earlier session format cannot be reopened.
 
-The terminal keeps several sessions open at once. `/new` opens a draft beside the current
-session, and `/sessions` lists open sessions, marked with their live status, above the
-workspace's saved ones: choosing an open session switches to it, choosing a saved one opens it
-alongside. Sessions you switch away from keep working, and the notice line reports when one of
-them has a pending question or permission request or has failed. `/close` shuts down the
-current session only; quitting shuts down all of them. Model selection
-and UI state are described in the [terminal guide](terminal-interface.md#model-selection-and-ui-state).
+The terminal keeps several sessions open at once. `/new` opens a draft beside the current session,
+and `/sessions` lists the open and saved sessions: sessions still working come first, then every
+other session by most recent activity; opening a session and closing it again with nothing running
+does not count as activity. The current session is marked `>`. Open sessions show their live status,
+and saved ones how they would resume: idle, interrupted, or failed. A lock marks a session that was
+held open when the list was shown, by another Skyhook instance or because it was still closing here.
+Choosing one that was closing here opens it once it has closed; one another instance holds cannot be
+opened until that instance closes it, and choosing it says so. A saved session whose status cannot
+be read shows no status symbol. Each row's id, event count, mode, and last activity time sit at the
+right. When a row is too narrow, they give way from the left, id first, then event count, mode, and
+time, so titles keep at least 30 columns; longer titles are cut short with `…`. Choosing an open
+session switches to it, choosing a saved one opens it alongside. Sessions you switch away from keep
+working, and the notice line reports when one of them has a pending question or permission request
+or has failed. A session you switch away from with nothing running, nothing waiting on you, and
+nothing typed or queued is closed, so other Skyhook instances can open it; it stays in the list as a
+saved session. `/close` shuts down the current session only; quitting shuts down all of them.
+
+A session is named after the first message you send it. Rename it with `/rename` (`Ctrl+X L`) or
+by clicking its title in the sidebar. A title you set stays until you change it, whatever the
+session does later, and renaming starts from it; renaming a session with an automatic title starts
+empty, and saving an empty title returns the session to its automatic title. A session
+without a title is listed by its first message. Model selection and
+UI state are described in the [terminal guide](terminal-interface.md#model-selection-and-ui-state).
 
 Interrupting a session stops active model requests and cancels foreground tools, scripts, and
 questions. Delegated child agents retain their conversations and can continue with `/retry`;
-parents waiting on their work keep those waits. Sending new input lets a parent proceed while
-its retained child remains available in the background. Background jobs otherwise keep running,
+parents waiting on their work keep those waits. Sending new input breaks those waits at every
+depth: the session proceeds, and each retained child remains interrupted in the background, where
+`/retry` can still continue it. Background jobs otherwise keep running,
 except those owned by a cancelled script. Explicit job cancellation and session shutdown stop
-work rather than leaving it running for later recovery.
+work rather than leaving it running for later recovery. Shutdown leaves work that was already
+interrupted as it is, so a child interrupted before the session closed can still be continued
+after it reopens. Closing a session with nothing running does not change its last activity time;
+work that closing cuts short ends when it closes.
 
 Child agents must finish or cancel their owned work before completing. The root agent may leave
 background services running while the session remains open, but they do not survive shutdown
 or a process restart. On resume, unfinished jobs are marked interrupted and job IDs are not
-reused. Retained child agents can be resumed; ordinary process and tool jobs cannot. Pending
-child replies remain available after resume. See [jobs and agents](../scripting/jobs-and-agents.md)
-for delegation, notifications, and cancellation from scripts.
+reused. Requests, jobs, and tool calls the previous process left running are recorded as ending
+when it last did something, so their durations stop there and reopening a session does not change
+its last activity time. Retained child agents can be resumed; ordinary process and tool jobs
+cannot. Pending child replies remain available after resume. See
+[jobs and agents](../scripting/jobs-and-agents.md) for delegation, notifications, and cancellation
+from scripts.
 
 ## Conversation compaction
 

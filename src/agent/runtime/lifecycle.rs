@@ -6,6 +6,7 @@ impl SessionRuntime {
     pub(super) async fn build(
         harness: Arc<HarnessInner>,
         store: SessionStore,
+        jobs: JobManager,
         prior_records: &[EventRecord],
     ) -> Result<Arc<Self>, HarnessError> {
         // A session never holds more than it started with: its journaled ceiling
@@ -32,7 +33,6 @@ impl SessionRuntime {
         let mut modes = harness.modes.clone();
         let pinned = crate::session::pinned_modes(prior_records);
         modes.extend(pinned.map(|(name, mode)| (name.clone(), mode.clone())));
-        let jobs = JobManager::restore(store.clone(), prior_records).await?;
         let targets = TargetRegistry::from_definitions(definitions)?;
         for record in prior_records {
             if let SessionEvent::TargetsUpserted { targets: restored } = &record.event {
@@ -122,48 +122,12 @@ impl SessionRuntime {
         Ok(runtime)
     }
 
-    /// Why the agent's journaled turn stopped short of its answer, so `continue` has
-    /// something to resume: its turn failed, or it was cut short while its
-    /// conversation still awaited the model or its latest request of any purpose
-    /// had not completed.
-    pub(super) fn stopped_turn(
-        &self,
-        records: &[EventRecord],
-        agent: &AgentId,
-    ) -> Option<TurnFailure> {
-        let mut stopped = None;
-        for record in records.iter().filter(|record| &record.agent == agent) {
-            match &record.event {
-                SessionEvent::MessageCommitted { message } => {
-                    let awaiting = match message {
-                        Message::Assistant(items) => items.iter().any(|item| item.call().is_some()),
-                        Message::User(_) | Message::Tool(_) => true,
-                    };
-                    stopped = awaiting.then_some(TurnFailure::Interrupted);
-                }
-                SessionEvent::AgentFailed { failure } => {
-                    stopped = Some(TurnFailure::Failed(failure.clone()));
-                }
-                _ => {}
-            }
-        }
-        stopped.or_else(|| {
-            self.events.ledger(|ledger| {
-                let latest = ledger
-                    .latest(agent)
-                    .and_then(|request| ledger.get(request))?;
-                let completed =
-                    matches!(latest.phase, crate::session::RequestPhase::Completed { .. });
-                (!completed).then_some(TurnFailure::Interrupted)
-            })
-        })
-    }
-
     /// Close what a stopped process left open, in one transaction, before any agent
     /// resumes: attempts without an outcome, requests still waiting for an attempt
     /// (their first, or the retry after a failure), and committed calls without a
     /// result. Their agents' turns end interrupted. A settled call to a retained
-    /// child releases it: nothing waits on it any more.
+    /// child releases it: nothing waits on it any more. What this closes is dated
+    /// when the stopped process last did something.
     pub(super) async fn settle_interrupted_work(
         &self,
         records: &[EventRecord],
@@ -218,7 +182,8 @@ impl SessionRuntime {
         agents.dedup();
         let interrupted = agents.iter().cloned();
         events.extend(interrupted.map(|agent| (agent, SessionEvent::AgentInterrupted)));
-        self.store.append_all(events).await?;
+        let dated = crate::session::Dated::LastActivity;
+        self.store.append_dated(events, dated).await?;
         for agent in &agents {
             self.jobs.release_held(agent).await;
         }
@@ -289,10 +254,16 @@ impl SessionRuntime {
             };
             let work = self.jobs.live_work(agent).await;
             // Preserve a genuine wait on retained children, which `continue`
-            // restarts, and leave the background work beside them running.
-            if work.children && work.blocking.is_empty() {
+            // restarts, and leave the background work beside them running. Blocking
+            // work beside them is cancelled, but the drain still waits on them, so
+            // the turn is held rather than cancelled.
+            if work.children {
+                let blocked = !work.blocking.is_empty();
+                for job in work.blocking {
+                    let _ = self.jobs.cancel(job).await;
+                }
                 if work.holding.is_some() {
-                    holders.push((agent.clone(), control));
+                    holders.push((agent.clone(), control, blocked));
                 }
                 continue;
             }
@@ -323,11 +294,11 @@ impl SessionRuntime {
         }
         // A held child is retained too; its holder shows interrupted meanwhile.
         let mut interrupted = cancelled.len();
-        for (holder, control) in holders {
+        for (holder, control, blocked) in holders {
             let descendant_cancelled = cancelled
                 .iter()
                 .any(|agent| agent != &holder && agent.is_within(&holder));
-            if descendant_cancelled
+            if (blocked || descendant_cancelled)
                 && self.stop(&holder, &control, &[TurnState::Busy], TurnState::Held)
             {
                 interrupted += 1;
@@ -353,25 +324,63 @@ impl SessionRuntime {
         stopped
     }
 
-    /// Wait for interrupted agents' jobs to settle: an interrupt cancels model
-    /// futures before their owning job has finished journaling.
-    pub(super) async fn settle_interrupts(&self) {
-        let interrupted = self
-            .agents()
-            .iter()
-            .filter(|(_, agent)| agent.control.retryable_interrupt.load(Ordering::Acquire))
+    fn agents_where(&self, stopped: impl Fn(&AgentControl) -> bool) -> Vec<AgentId> {
+        (self.agents().iter())
+            .filter(|(_, agent)| stopped(&agent.control))
             .map(|(id, _)| id.clone())
-            .collect::<Vec<_>>();
+            .collect()
+    }
+
+    /// Wait for the jobs of agents whose turn an interrupt stopped to settle: an
+    /// interrupt cancels model futures before their owning job has finished
+    /// journaling. A held turn is not among them: it unwinds only once `continue`
+    /// or new input moves it on.
+    pub(super) async fn settle_interrupts(&self) {
+        let interrupted = self.agents_where(AgentControl::interrupted);
         self.jobs.settle_interrupted_agents(&interrupted).await;
     }
 
-    /// New input for the root holding a retained job breaks the link: the job goes
-    /// on in the background and the held wait returns. Queued input then joins the
-    /// turn's next request; a direct prompt ends the turn (`cancel`) to start the next.
+    /// Publish the jobs of interrupted agents, held ones included, interrupted
+    /// now, without waiting for their turns to unwind: a turn can be held on work
+    /// only a later step releases.
+    pub(super) async fn conclude_interrupts(&self) {
+        let stopped =
+            |control: &AgentControl| control.interrupted() || control.turn() == TurnState::Held;
+        let interrupted = self.agents_where(stopped);
+        self.jobs.finish_interrupted_agents(&interrupted).await;
+    }
+
+    /// New input for the root breaks every held link beneath it: retained jobs go
+    /// on in the background and the held waits return. A held descendant has no
+    /// input to join, so its turn ends interrupted, deepest first, and its holder
+    /// then releases it like any retained child. Queued input joins the root's next
+    /// request; a direct prompt ends the root's turn (`cancel`) to start the next.
+    /// A turn that ends is cancelled before its wait releases: the released wait
+    /// must not reach an uncancelled request boundary.
     pub(super) async fn redirect(&self, root: &AgentId, cancel: bool) {
         self.settle_interrupts().await;
-        // Cancel before releasing: the released wait must not reach an uncancelled
-        // request boundary.
+        let mut held = (self.agents().iter())
+            .filter(|(agent, live)| {
+                *agent != root && agent.is_within(root) && live.control.turn() == TurnState::Held
+            })
+            .map(|(agent, live)| {
+                (
+                    agent.clone(),
+                    live.control.clone(),
+                    live.cancellation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        held.sort_by_key(|(agent, ..)| std::cmp::Reverse(agent.depth()));
+        for (agent, control, cancellation) in held {
+            if self.stop(&agent, &control, &[TurnState::Held], TurnState::Parked) {
+                control.retryable_interrupt.store(true, Ordering::Release);
+                cancellation.cancel();
+                self.jobs.release_held(&agent).await;
+                // Its holder can release it only once it is retained.
+                self.settle_interrupts().await;
+            }
+        }
         if cancel
             && self.jobs.has_suspended(root).await
             && let Some(live) = self.agents().get(root)
@@ -381,7 +390,7 @@ impl SessionRuntime {
         self.jobs.release_held(root).await;
     }
 
-    pub(super) async fn interrupt_tree(&self, root: &AgentId) -> usize {
+    pub(super) async fn interrupt_tree(&self, root: &AgentId, scope: CancelScope) -> usize {
         let targets = self
             .agents()
             .iter()
@@ -392,7 +401,7 @@ impl SessionRuntime {
         for (agent, cancellation) in targets {
             cancellation.cancel();
             self.activity(&agent, AgentActivity::Stopped(TurnFailure::Interrupted));
-            cancelled += self.jobs.cancel_all(&agent).await;
+            cancelled += self.jobs.cancel_all(&agent, scope).await;
         }
         cancelled
     }
@@ -402,6 +411,7 @@ impl SessionRuntime {
 mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
+    use crate::job::JobState;
 
     /// Results omit an absent field rather than sending null, so no result schema
     /// has a nullable property: a required one is an `Option` serialized as null,
@@ -469,6 +479,164 @@ mod tests {
         }
         assert!(checked.contains(&"skill"), "{checked:?}");
         assert!(found.is_empty(), "nullable properties: {found:#?}");
+    }
+
+    /// Root → child → grandchild, interrupted while the grandchild streams beside
+    /// the child's blocking `exec`: the exec is cancelled, the grandchild retained,
+    /// and the child's and root's turns stay held on it. `after` scripts the
+    /// requests that follow the interrupted three.
+    async fn held_chain(
+        after: impl IntoIterator<Item = Step>,
+    ) -> (
+        tempfile::TempDir,
+        Arc<Script>,
+        SessionHandle,
+        tokio::task::JoinHandle<Result<String, HarnessError>>,
+    ) {
+        let delegate = |id: &str, depth: u32| {
+            let arguments = json!({"prompt": format!("{id} task"), "depth": depth});
+            tool_call(0, id, "agent", arguments)
+        };
+        let sleep = tool_call(1, "sleep", "exec", json!({"command": "sleep 30"}));
+        let steps = [
+            Step::new(response(vec![delegate("child", 1)])),
+            Step::new(response(vec![delegate("grandchild", 0), sleep])),
+            Step::new(Vec::new()).midstream(),
+        ];
+        let requests = Requests::default();
+        let provider = Script::new(steps.into_iter().chain(after), &requests);
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("delegate").await }
+        });
+        provider.request(2).await;
+        let child = session.root.child(1);
+        let exec = bounded(async {
+            loop {
+                let jobs = session.inspect_jobs(&child).await;
+                if let Some(exec) = jobs.iter().find(|job| job.tool == "exec") {
+                    return exec.id;
+                }
+                poll().await;
+            }
+        })
+        .await;
+        until(&session, exec, |job| job.state == JobState::Running).await;
+        assert_eq!(session.interrupt().await, 3);
+        assert_eq!(turn(&session, &child), TurnState::Held);
+        assert_eq!(turn(&session, &session.root), TurnState::Held);
+        until(&session, exec, |job| job.state == JobState::Cancelled).await;
+        (root, provider, session, parent)
+    }
+
+    /// Continuing a held chain restarts the grandchild, and the whole tree answers
+    /// through the preserved waits.
+    #[tokio::test]
+    async fn continue_resumes_a_turn_held_on_a_retained_child_beside_cancelled_work() {
+        let (_root, provider, session, parent) = held_chain([
+            Step::new(answer("grandchild recovered")),
+            Step::new(answer("child done")),
+            Step::new(answer("parent done")),
+        ])
+        .await;
+        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
+        assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
+        let resumed = rendered(&provider.request(4).await);
+        assert!(resumed.contains("grandchild recovered"), "{resumed}");
+        session.shutdown().await.unwrap();
+    }
+
+    /// Closing leaves every link of a held chain interrupted, as it leaves any
+    /// interruption: reopened, `continue` restarts the child and grandchild.
+    #[tokio::test]
+    async fn shutdown_leaves_a_held_chain_resumable() {
+        let recovered = (0..8).map(|_| Step::new(answer("recovered")));
+        let (root, provider, session, parent) = held_chain(recovered).await;
+        let id = session.id();
+        shutdown_session(session).await;
+        assert!(bounded(parent).await.unwrap().is_err());
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider).await;
+        let resumed = harness.resume_session(id).await.unwrap();
+        let child = resumed.root.child(1);
+        let delegated = async |owner: &AgentId| {
+            let jobs = resumed.runtime.jobs.list(owner).await;
+            jobs.into_iter().find(|job| job.tool == "agent").unwrap()
+        };
+        for owner in [&resumed.root, &child] {
+            let state = delegated(owner).await.state;
+            assert_eq!(state, JobState::Interrupted, "{owner}");
+        }
+        bounded(resumed.continue_turn()).await.unwrap();
+        for owner in [&resumed.root, &child] {
+            let job = delegated(owner).await.id;
+            let state = terminal(&resumed, job).await.state;
+            assert_eq!(state, JobState::Completed, "{owner}");
+        }
+        shutdown_session(resumed).await;
+    }
+
+    /// A new prompt breaks the link at every depth: the held child ends its turn
+    /// interrupted rather than asking its model, so each link is retained
+    /// interrupted and the prompt answers.
+    #[tokio::test]
+    async fn prompt_redirects_a_chain_held_on_a_retained_grandchild() {
+        let (_root, provider, session, parent) =
+            held_chain([Step::new(answer("redirected"))]).await;
+        assert_eq!(
+            bounded(session.prompt("new direction")).await.unwrap(),
+            "redirected"
+        );
+        assert!(bounded(parent).await.unwrap().is_err());
+        let child = session.root.child(1);
+        for owner in [&session.root, &child] {
+            let jobs = session.runtime.jobs.list(owner).await;
+            let agent = jobs.iter().find(|job| job.tool == "agent").unwrap();
+            assert_eq!(agent.state, JobState::Interrupted, "{owner}");
+        }
+        let records = session.runtime.store.records().await;
+        let released = records.iter().filter(|record| record.agent == child);
+        let released = count!(released, SessionEvent::MessageCommitted { message: Message::Tool(results) }
+            if results.iter().any(|result| result.call_id == "grandchild"));
+        assert_eq!(released, 1);
+        let redirected = rendered(&provider.request(3).await);
+        assert!(
+            redirected.contains("interrupted") && redirected.contains("new direction"),
+            "{redirected}"
+        );
+        session.shutdown().await.unwrap();
+    }
+
+    /// A child launched by a foreground script dies with it, so the interrupt
+    /// holds nothing: the root's turn ends interrupted instead of taking the
+    /// script's cancellation to its model.
+    #[tokio::test]
+    async fn interrupt_ends_a_turn_whose_child_dies_with_its_script() {
+        let source = json!({"source": "return await tool.agent({prompt: 'work', depth: 0});"});
+        let steps = [
+            Step::new(response(vec![tool_call(0, "script", "script", source)])),
+            Step::new(Vec::new()).midstream(),
+            Step::new(answer("unprompted")),
+        ];
+        let provider = Script::new(steps, &Requests::default());
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent = tokio::spawn({
+            let session = session.clone();
+            async move { session.prompt("delegate").await }
+        });
+        provider.request(1).await;
+        assert_eq!(session.interrupt().await, 2);
+        let ended = bounded(parent).await.unwrap();
+        assert!(matches!(ended, Err(HarnessError::Interrupted)), "{ended:?}");
+        assert!(!provider.requested_from(2));
+        session.shutdown().await.unwrap();
     }
 
     /// Interrupt stops only a running turn: one that ended while the interrupt

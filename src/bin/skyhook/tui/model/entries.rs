@@ -6,23 +6,23 @@
 use crate::tui::app::OutputStore;
 
 use super::jobs::{call_entry, job_entry};
-use super::live::{
-    block_key, live_tail_responses, reasoning_entry, response_entries, working_entry,
-};
+use super::live::{block_key, live_tail, live_tail_responses, reasoning_entry, response_entries};
 use super::notifications::job_event_entries;
 use super::projection::JobInfo;
-use super::requests::request_entry;
+use super::requests::{request_entry, request_timing};
 use super::{
-    Clean, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Title, number, pretty,
+    Clean, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Timing, Title,
+    number, pretty, span,
 };
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
 use skyhook::provider::protocol::{AssistantItem, BlockRef, ToolResult};
 use skyhook::session::{
-    EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestPhase, RequestSeq, SessionEvent,
-    UserPart,
+    EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestLedger, RequestSeq, SessionEvent,
+    Turns, UserPart,
 };
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 use std::ops::Range;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -185,6 +185,25 @@ impl Pairing {
     }
 }
 
+/// When each assistant message's turn began, folded as the journal records turns.
+#[derive(Default)]
+struct TurnStarts {
+    turns: Turns,
+    messages: HashMap<MessageSeq, i64>,
+}
+impl TurnStarts {
+    fn observe(&mut self, record: &EventRecord, ledger: &RequestLedger) {
+        self.turns.observe(record, ledger);
+        if let SessionEvent::MessageCommitted {
+            message: Message::Assistant(_),
+        } = &record.event
+            && let Some(started) = self.turns.started(&record.agent)
+        {
+            self.messages.insert(record.sequence.message(), started);
+        }
+    }
+}
+
 /// What an update changed: entries replaced in place, and the first entry from
 /// which later entries moved.
 #[derive(Default)]
@@ -204,6 +223,7 @@ pub struct History {
     /// How many of the agent's records have been folded.
     folded: usize,
     pairing: Pairing,
+    turns: TurnStarts,
     segments: Vec<Segment>,
     index: HashMap<Source, usize>,
     deps: HashMap<Dep, Vec<Source>>,
@@ -211,8 +231,6 @@ pub struct History {
     groups: Vec<Option<ToolGroup>>,
     /// Each job card's place and group.
     jobs: HashMap<JobId, Placed>,
-    /// How many entries are running.
-    pub(super) running: usize,
 }
 
 impl History {
@@ -308,7 +326,10 @@ impl History {
         {
             let source = Source::Record(record.sequence);
             match presentation.tab {
-                Tab::Conversation => self.pairing.observe(record, changed),
+                Tab::Conversation => {
+                    self.pairing.observe(record, changed);
+                    self.turns.observe(record, &snapshot.ledger);
+                }
                 Tab::Requests if !matches!(record.event, SessionEvent::ModelRequested { .. }) => {
                     continue;
                 }
@@ -370,7 +391,7 @@ impl History {
         let built = self.build_source(source, inputs);
         self.register(source, &built.deps);
         let len = built.entries.len();
-        self.splice(entries, start..start, built.entries);
+        entries.splice(start..start, built.entries);
         self.groups.splice(start..start, built.groups);
         self.segments
             .insert(position, Segment { place, start, len });
@@ -403,7 +424,7 @@ impl History {
         let built = self.build_source(source, inputs);
         self.register(source, &built.deps);
         let new_len = built.entries.len();
-        let old = self.splice(entries, start..start + len, built.entries);
+        let old: Vec<_> = entries.splice(start..start + len, built.entries).collect();
         self.groups.splice(start..start + len, built.groups);
         self.compact(
             inputs,
@@ -424,21 +445,6 @@ impl History {
             }
             result.shift(start);
         }
-    }
-
-    /// Every change to history's entries goes through here, so the running
-    /// count cannot drift from them.
-    fn splice(
-        &mut self,
-        entries: &mut Vec<Entry>,
-        range: Range<usize>,
-        new: Vec<Entry>,
-    ) -> Vec<Entry> {
-        let running = |entries: &[Entry]| entries.iter().filter(|entry| entry.running).count();
-        self.running += running(&new);
-        let old: Vec<_> = entries.splice(range, new).collect();
-        self.running -= running(&old);
-        old
     }
 
     fn register(&mut self, source: Source, deps: &[Dep]) {
@@ -483,10 +489,7 @@ impl History {
         built.deps.push(Dep::Job(job));
         let info = inputs.projection.jobs().get(&job)?;
         let placed = self.jobs.get(&job)?;
-        let EntryView {
-            view, all_details, ..
-        } = inputs.presentation;
-        let mut entry = job_entry(info, inputs.projection, view, inputs.outputs, all_details);
+        let mut entry = job_entry(info, inputs.projection, inputs.outputs, inputs.presentation);
         entry.indent = (placed.place.depth().min(MAX_NESTING) * NEST_INDENT) as u16;
         Some((entry, placed.group))
     }
@@ -513,7 +516,7 @@ impl History {
                         let request = sequence.request();
                         built.deps.push(Dep::Request(request));
                         if let Some(record) = snapshot.ledger.get(request) {
-                            built.push(request_entry(request, record), None);
+                            built.push(request_entry(request, record, presentation.today), None);
                         }
                     } else {
                         self.conversation(record, inputs, &mut built);
@@ -548,12 +551,13 @@ impl History {
                 }
                 // A settled response no commit replaced (an interrupted attempt)
                 // stays at its journal position; a failure's is part of its card.
-                let phase = snapshot.ledger.get(request).map(|record| &record.phase);
-                if phase.is_some_and(RequestPhase::settled_in_place)
+                if let Some(requested) = snapshot.ledger.get(request)
+                    && requested.phase.settled_in_place()
                     && let Some(response) = snapshot.responses.get(&(agent.clone(), request))
                     && response.settlement().is_some()
                 {
-                    for entry in response_entries(request, response, view, agent_name) {
+                    let since = requested.requested_millis;
+                    for entry in response_entries(request, response, view, agent_name, since) {
                         built.push(entry, None);
                     }
                 }
@@ -689,7 +693,20 @@ impl History {
         let response = request.map_or(ResponseRef::Message(message), ResponseRef::Request);
         let footer = request
             .and_then(|request| snapshot.ledger.get(request))
-            .map(|request| Clean::from(request.profile.profile.model.as_str()));
+            .map(|request| {
+                let mut footer = request.profile.profile.model.as_str().to_owned();
+                // Once the answer settles: how long it took, and its whole turn
+                // when that began with an earlier request.
+                if let Timing::Took { since, until } = request_timing(request) {
+                    let _ = write!(footer, " · {}", span(since, until));
+                    if let Some(&turn) = self.turns.messages.get(&message)
+                        && turn < since
+                    {
+                        let _ = write!(footer, " · turn {}", span(turn, until));
+                    }
+                }
+                Clean::from(footer)
+            });
         // The model footer sits under the last visible text of an answer; a working
         // turn (one with calls) has none.
         let final_text = (!items.iter().any(|item| item.call().is_some()))
@@ -775,14 +792,8 @@ pub fn entries(
     };
     let (_, mut entries) = History::build(inputs);
     if include_live && presentation.tab == Tab::Conversation {
-        let agent = presentation.agent;
-        let agent_name = projection.agent_name(agent);
-        let responses = live_tail_responses(snapshot, agent);
-        entries.extend(responses.into_iter().flat_map(|(request, response)| {
-            response_entries(request, response, presentation.view, agent_name)
-        }));
-        let running = entries.iter().any(|entry| entry.running);
-        entries.extend(working_entry(snapshot, agent, running));
+        let requests = live_tail_responses(snapshot, presentation.agent);
+        live_tail(snapshot, projection, presentation, requests, &mut entries);
     }
     entries
 }
@@ -809,6 +820,7 @@ mod tests {
             tab: Tab::Conversation,
             view: &view,
             all_details: details,
+            today: Default::default(),
         };
         entries(snapshot, &projection, view, &outputs, true)
     }
@@ -822,6 +834,46 @@ mod tests {
 
     fn user(text: &str) -> Message {
         Message::User(vec![UserPart::Text { text: text.into() }])
+    }
+
+    /// Records land a second apart. The first answer settles 3 s after its request
+    /// and 9 s after the request whose tool round began its turn; the second answer
+    /// is a turn of its own.
+    #[tokio::test]
+    async fn answer_footers_time_their_response_and_a_longer_turn() {
+        use skyhook::session::{AttemptRef, CompletedOutcome};
+        let mut journal = Journal::new().await;
+        let agent = journal.agent();
+        let completed = |request, message, outcome| SessionEvent::ResponseCompleted {
+            attempt: AttemptRef {
+                request,
+                attempt: 1,
+            },
+            message,
+            outcome,
+        };
+        let first = journal.request(&agent, None).await;
+        let call = journal.call_record(&agent, "call").await;
+        let used = completed(first.request, call, CompletedOutcome::ToolUse);
+        journal.record(&agent, used).await;
+        journal.result_record(&agent, "call", false).await;
+        // Input queued mid-turn does not start another.
+        commit(&mut journal, &agent, user("also this")).await;
+        for _ in 0..2 {
+            let request = journal.request(&agent, Some(first.context)).await.request;
+            let answer = Message::Assistant(vec![AssistantItem::text("text", 0, "done")]);
+            let message = commit(&mut journal, &agent, answer).await;
+            let answered = completed(request, message, CompletedOutcome::Answer);
+            journal.record(&agent, answered).await;
+        }
+        let footers: Vec<_> = render(&journal.stamped(), &agent, false)
+            .into_iter()
+            .filter_map(|entry| entry.footer.as_deref().map(str::to_owned))
+            .collect();
+        assert_eq!(
+            footers,
+            ["fixture-model · 3.0s · turn 9.0s", "fixture-model · 3.0s"]
+        );
     }
 
     #[tokio::test]
@@ -1036,6 +1088,7 @@ mod tests {
         let event = RuntimeEvent::Activity {
             agent: agent.clone(),
             activity,
+            at: 0,
         };
         update(&mut journal.snapshot, event);
         let cut = skyhook::session::AttemptRef {

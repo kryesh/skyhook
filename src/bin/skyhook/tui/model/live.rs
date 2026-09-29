@@ -1,24 +1,30 @@
 //! Live response cards, reasoning expansion, and stable native block identities.
 
-use super::{AgentDisplayState, Entry, EntryKey, ResponseRef, Surface, Title, View};
+use super::{
+    AgentDisplayState, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Timing, Title,
+    View,
+};
 use skyhook::agent::{AgentActivity, ObservationSnapshot, ObservedResponse};
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::{BlockRef, ItemKind};
-use skyhook::session::{RequestPhase, RequestSeq};
+use skyhook::session::{RequestPhase, RequestRecord, RequestSeq};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum ReasoningStatus {
-    Running,
+    /// Streaming, counting from when its request began.
+    Running {
+        since: i64,
+    },
     Complete,
     Incomplete,
 }
 
-pub(super) fn working_entry(
+fn working_entry(
     snapshot: &ObservationSnapshot,
     agent: &AgentId,
-    running: bool,
+    streaming: bool,
 ) -> Option<Entry> {
-    if running {
+    if streaming {
         return None;
     }
     // A request's own status card carries failure and recovery at its journal
@@ -31,9 +37,10 @@ pub(super) fn working_entry(
     if latest.is_some_and(RequestPhase::has_status_card) {
         return None;
     }
-    let state = match snapshot.activity.get(agent) {
+    let activity = snapshot.activity.get(agent)?;
+    let state = match &activity.state {
         // A committed answer needs no indicator under it while activity catches up.
-        Some(AgentActivity::Working)
+        AgentActivity::Working
             if !matches!(
                 latest,
                 Some(
@@ -47,19 +54,18 @@ pub(super) fn working_entry(
         {
             AgentDisplayState::Working
         }
-        Some(AgentActivity::Reconnecting { attempt }) => {
+        AgentActivity::Reconnecting { attempt } => {
             AgentDisplayState::Reconnecting { attempt: *attempt }
         }
-        Some(AgentActivity::Compacting) => AgentDisplayState::Compacting,
+        AgentActivity::Compacting => AgentDisplayState::Compacting,
         _ => return None,
     };
-
     let mut entry = Entry::new(
         EntryKey::Working(agent.clone()),
         state.label(),
         Surface::Muted,
     );
-    entry.running = true;
+    entry.timing = Timing::Since(activity.since);
     Some(entry)
 }
 
@@ -69,22 +75,21 @@ pub(super) fn reasoning_entry(
     view: &View,
     status: ReasoningStatus,
 ) -> Entry {
-    let label = match status {
-        ReasoningStatus::Running | ReasoningStatus::Complete => "Reasoning",
-        ReasoningStatus::Incomplete => "Reasoning · incomplete",
+    let (label, timing) = match status {
+        ReasoningStatus::Running { since } => ("Reasoning", Timing::Since(since)),
+        ReasoningStatus::Complete => ("Reasoning", Timing::Untimed),
+        ReasoningStatus::Incomplete => ("Reasoning · incomplete", Timing::Untimed),
     };
-    let running = status == ReasoningStatus::Running;
     // Source lines determine collapsibility; terminal wrapping must not change interaction.
     let text = text.trim_matches(['\r', '\n']);
-    if text.lines().count() <= 1 {
-        let mut entry = Entry::new(key, text.to_owned(), Surface::Reasoning);
-        entry.running = running;
-        return entry;
-    }
-    let open = view.is_expanded(&key, running);
-    let body = if open { text.to_owned() } else { String::new() };
-    let mut entry = Entry::titled(key, Title::disclosed(label, open), body, Surface::Reasoning);
-    entry.running = running;
+    let mut entry = if text.lines().count() <= 1 {
+        Entry::new(key, text.to_owned(), Surface::Reasoning)
+    } else {
+        let open = view.is_expanded(&key, timing.live());
+        let body = if open { text.to_owned() } else { String::new() };
+        Entry::titled(key, Title::disclosed(label, open), body, Surface::Reasoning)
+    };
+    entry.timing = timing;
     entry
 }
 
@@ -96,33 +101,56 @@ pub(super) fn block_key(response: ResponseRef, block: &BlockRef) -> EntryKey {
     }
 }
 
+/// The live tail after history: the responses of `requests` still streaming there,
+/// then the working indicator unless reasoning streams. Returns the requests shown.
+pub(super) fn live_tail(
+    snapshot: &ObservationSnapshot,
+    projection: &Projection,
+    presentation: EntryView<'_>,
+    requests: impl IntoIterator<Item = RequestSeq>,
+    entries: &mut Vec<Entry>,
+) -> Vec<RequestSeq> {
+    let EntryView { agent, view, .. } = presentation;
+    let agent_name = projection.agent_name(agent);
+    let start = entries.len();
+    let mut shown = Vec::new();
+    for request in requests {
+        if let Some((record, response)) = live_tail_response(snapshot, agent, request) {
+            shown.push(request);
+            let since = record.requested_millis;
+            entries.extend(response_entries(request, response, view, agent_name, since));
+        }
+    }
+    let streaming = entries[start..].iter().any(|entry| entry.timing.live());
+    entries.extend(working_entry(snapshot, agent, streaming));
+    shown
+}
+
 /// A response streams at the tail until its commit is observed; failures and
 /// interruptions move it into the request's status card at its journal position.
-pub(super) fn live_tail_response<'a>(
+fn live_tail_response<'a>(
     snapshot: &'a ObservationSnapshot,
     agent: &AgentId,
     request: RequestSeq,
-) -> Option<&'a ObservedResponse> {
-    let live = (snapshot.ledger.get(request)).is_some_and(|record| record.phase.is_live_tail());
-    live.then(|| snapshot.responses.get(&(agent.clone(), request)))
-        .flatten()
+) -> Option<(&'a RequestRecord, &'a ObservedResponse)> {
+    let record = (snapshot.ledger.get(request)).filter(|record| record.phase.is_live_tail())?;
+    Some((record, snapshot.responses.get(&(agent.clone(), request))?))
 }
 
-pub(super) fn live_tail_responses<'a>(
-    snapshot: &'a ObservationSnapshot,
+pub(super) fn live_tail_responses(
+    snapshot: &ObservationSnapshot,
     agent: &AgentId,
-) -> Vec<(RequestSeq, &'a ObservedResponse)> {
-    let mut responses: Vec<_> = snapshot
+) -> Vec<RequestSeq> {
+    let mut requests: Vec<_> = snapshot
         .responses
         .keys()
-        .filter(|(owner, _)| owner == agent)
-        .filter_map(|(_, request)| {
-            let request = *request;
-            live_tail_response(snapshot, agent, request).map(|response| (request, response))
+        .filter(|(owner, request)| {
+            owner == agent && live_tail_response(snapshot, agent, *request).is_some()
         })
+        .map(|(_, request)| *request)
         .collect();
-    responses.sort_by_key(|(request, _)| *request);
-    responses
+    requests.sort_unstable();
+    requests
 }
 
 pub(super) fn response_entries(
@@ -130,6 +158,7 @@ pub(super) fn response_entries(
     response: &ObservedResponse,
     view: &View,
     agent_name: &str,
+    since: i64,
 ) -> Vec<Entry> {
     let mut entries = Vec::new();
     for block in response.blocks() {
@@ -143,7 +172,7 @@ pub(super) fn response_entries(
                     &block.text,
                     view,
                     if response.streaming(block) {
-                        ReasoningStatus::Running
+                        ReasoningStatus::Running { since }
                     } else if response.incomplete() {
                         ReasoningStatus::Incomplete
                     } else {
@@ -198,7 +227,7 @@ mod tests {
 
     #[test]
     fn reasoning_expansion_respects_defaults_and_explicit_overrides() {
-        use ReasoningStatus::{Complete, Running};
+        use ReasoningStatus::Complete;
         let mut view = View::default();
         let block = BlockRef {
             item: ItemId::try_from("item".to_owned()).unwrap(),
@@ -207,13 +236,15 @@ mod tests {
         let key = block_key(ResponseRef::Request(RequestSeq::default()), &block);
         let entry =
             |view: &View, text: &str, status| reasoning_entry(key.clone(), text, view, status);
-        let active = entry(&view, "\nFirst\nSecond\r\n", Running);
+        // Streaming reasoning counts from its request.
+        let running = ReasoningStatus::Running { since: 1_000 };
+        let active = entry(&view, "\nFirst\nSecond\r\n", running);
         assert_eq!(active.title(), Some(&Title::disclosed("Reasoning", true)));
         assert_eq!(active.body(), "First\nSecond");
         assert_eq!(active.text(), "▾ Reasoning\nFirst\nSecond");
-        assert!(active.running);
+        assert_eq!(active.timing, Timing::Since(1_000));
         view.set_expanded(key.clone(), false);
-        let collapsed = entry(&view, "First\nSecond", Running);
+        let collapsed = entry(&view, "First\nSecond", running);
         assert_eq!(
             collapsed.title(),
             Some(&Title::disclosed("Reasoning", false))
@@ -225,7 +256,7 @@ mod tests {
             complete.title(),
             Some(&Title::disclosed("Reasoning", false))
         );
-        assert!(!complete.running);
+        assert!(!complete.timing.live());
         view.set_expanded(key.clone(), true);
         assert_eq!(
             entry(&view, "First\nSecond", Complete).body(),
@@ -239,7 +270,7 @@ mod tests {
     #[test]
     fn text_visibility_preserves_whitespace_and_failed_response_attribution() {
         let rows = |live: &ObservedResponse| {
-            response_entries(RequestSeq::default(), live, &View::default(), "Agent")
+            response_entries(RequestSeq::default(), live, &View::default(), "Agent", 0)
         };
         for text in ["", "\n\n", "  "] {
             assert!(rows(&response(text)).is_empty());

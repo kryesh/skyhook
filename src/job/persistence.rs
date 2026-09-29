@@ -1,4 +1,4 @@
-use crate::session::{EventRecord, Message, SessionEvent, SessionStore};
+use crate::session::{Dated, EventRecord, Message, SessionEvent, SessionStore};
 
 use super::{Finished, JobChange, JobEntry, JobError, JobManager, JobSpec};
 use crate::tool::ToolError;
@@ -140,7 +140,8 @@ pub(super) async fn restore(
     let manager = JobManager::with_jobs(store, jobs, maximum.saturating_add(1).max(1));
     manager.inner.progress.lock().await.project(records);
     for job in active {
-        manager.finish(job, ToolError::interrupted().into()).await?;
+        let interrupted = ToolError::interrupted().into();
+        (manager.finish_dated(job, interrupted, Dated::LastActivity)).await?;
     }
     Ok(manager)
 }

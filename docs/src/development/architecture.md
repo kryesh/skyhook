@@ -121,11 +121,32 @@ the request lifecycle. Observation snapshots embed it, and session statistics, r
 (open attempts to interrupt) and the terminal interface read request outcomes, retry state, usage
 and message attribution from it. Folding a record reports the requests it changed, and the ledger
 lists the requests changed after a given record, so a host folding records incrementally refreshes
-just those. Interrupt and continue read each agent loop's own turn state instead: idle,
-busy, parked after a failed or interrupted turn, when only new input resumes it and job
-notifications wait for that input's request, or held: interrupted while waiting on retained
-children, which `continue` restarts together with it. The host's observation is a display, never an
-input to that decision.
+just those. `session::Turns` is likewise the one journal fold of turns, shared by statistics and the
+terminal's reply footers: a turn runs from an agent's first agent-purpose (non-compaction) model
+request after the last one ended until a response ends it without calling tools or the agent stops.
+Whether resuming continues a stopped root turn is a store query that does not decode the session,
+shared by resume (`SessionStore::stopped_turn`) and the session summary the terminal's session list
+reads. The summary also holds the one rule choosing a session's title from its title records,
+reported with the winning title's source, which the terminal reads rather than folding them. Its
+last activity skips entry kinds that `EntryKind::is_activity` excludes, through a flag the
+`entry_kind` dictionary is seeded with, so the SQL and a host's live fold of
+`SessionEvent::is_activity` share one definition. Resume journals `SessionReopened`, then settles
+leftover work (interrupted jobs as it restores them, then open requests, calls, and turns) in
+appends dated at the journal's newest activity record (`Dated::LastActivity`), so every fold ends
+that work there and reopening changes no session's last activity; entry times need not increase with
+sequence. Shutdown first closes resumption: a `continue` admitted before it has restarted its jobs,
+which count as running, and one after it is refused before journaling a restart. Shutdown then
+publishes interruptions it finds still unwinding, held agents' included, cancels only jobs still
+running (`CancelScope::Running`), and releases turns held on interrupted ones; a stopping agent
+leaves its own interruption suspended. What released turns commit is dated the same way, so closing neither
+ends an interruption's resumability nor journals activity for it; explicit cancellation
+(`CancelScope::Outcome`) does both. Interrupt and continue read each agent loop's own turn state
+instead: idle, busy, parked after a failed or interrupted turn, when only new input resumes it and
+job notifications wait for that input's request, or held: interrupted while waiting on retained
+children, which `continue` restarts together with it. New input instead breaks every held link
+beneath the root: each held descendant's turn ends interrupted, deepest first, so its holder's wait
+releases it as a retained child in turn. The host's observation is a display, never an input to
+that decision.
 
 Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized `ProviderErrorKind` values rather than error-message text: rate limits, timeouts,
@@ -285,9 +306,12 @@ results and pages a job event presented. Related state transitions are appended 
 before their in-memory projections are published. Accepted writer work is owned independently
 of the caller, so dropping an await does not cancel a commit already in progress.
 
-A writer lock excludes competing session owners, not read-only snapshot inspection. If a write's
-outcome becomes uncertain, the writer requires recovery instead of allowing later appends to
-pretend the commit failed. On resume, the runtime reconciles unfinished model attempts and
+A writer lock excludes competing session owners, not read-only snapshot inspection. Closing the
+store rolls back any abandoned transaction and makes its shared SQLite connection read-only before
+releasing that lock, so retained output handles cannot write into a reopened session. Saved output
+can still be read; any derived rendering needed after close uses private temporary storage rather
+than being cached in the closed store. If a write's outcome becomes uncertain, the writer requires recovery
+instead of allowing later appends to pretend the commit failed. On resume, the runtime reconciles unfinished model attempts and
 committed tool calls lacking results before any agent runs. Agents retain their journaled prompt,
 tools, and capability contract; current configuration can narrow that contract, not silently
 expand it. Observation is a host projection of durable records plus live state, not a second

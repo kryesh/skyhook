@@ -1,7 +1,7 @@
 //! Per-agent and per-model accounting over a session journal: where tokens went,
 //! how model requests ended, what was delegated, and which tools were called.
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fmt::Write as _,
 };
 
@@ -14,8 +14,8 @@ use crate::{
     job::JobRole,
     provider::{profile::ModelRef, protocol::Usage},
     session::{
-        CompletedOutcome, EventRecord, Message, ModelPurpose, RequestLedger, RequestPhase,
-        SessionEvent, UserPart,
+        EventRecord, Message, ModelPurpose, RequestLedger, RequestPhase, SessionEvent, Turns,
+        UserPart,
     },
 };
 
@@ -25,7 +25,7 @@ pub struct SessionStats {
     /// The first text the user sent the root agent.
     pub initial_prompt: Option<String>,
     pub started: DateTime<Utc>,
-    /// The last journal entry.
+    /// The latest journal entry.
     pub finished: DateTime<Utc>,
     /// Sorted by path, root first.
     pub agents: Vec<AgentStats>,
@@ -210,10 +210,8 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     // Tool calls without a result yet, per agent: call id to tool name.
     let mut open_calls: HashMap<AgentId, HashMap<String, String>> = HashMap::new();
     let mut models: BTreeMap<ModelRef, ModelStats> = BTreeMap::new();
-    // Agents inside a turn: from a model request until a response ends it or the
-    // agent completes or fails.
-    let mut in_turn: HashSet<AgentId> = HashSet::new();
-    // As the session list's preview: the first text in the root's user messages.
+    let mut turns = Turns::default();
+    // As an untitled session is listed: the first text in the root's user messages.
     let initial_prompt = records.iter().find_map(|record| match &record.event {
         SessionEvent::MessageCommitted {
             message: Message::User(parts),
@@ -225,6 +223,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     });
     for record in records {
         ledger.observe(record);
+        let ended = turns.observe(record, &ledger);
         let agent = &record.agent;
         match &record.event {
             SessionEvent::AgentStarted {
@@ -256,14 +255,6 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     if request.purpose == ModelPurpose::Compaction {
                         stats.compactions.requested += 1;
                     }
-                }
-                if request.purpose == ModelPurpose::Agent {
-                    in_turn.insert(agent.clone());
-                }
-            }
-            SessionEvent::ResponseCompleted { outcome, .. } => {
-                if *outcome != CompletedOutcome::ToolUse {
-                    in_turn.remove(agent);
                 }
             }
             SessionEvent::Compaction { checkpoint } => {
@@ -329,13 +320,12 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                 }
             }
             SessionEvent::AgentCompleted => {
-                in_turn.remove(agent);
                 finish(&mut agents, record, |at| AgentOutcome::Completed { at });
             }
             SessionEvent::AgentInterrupted => {
                 // Shutdown interrupts every agent: one already finished stays so, an
                 // idle root is done, and anything else was cut short.
-                let mid_turn = in_turn.remove(agent);
+                let mid_turn = ended.is_some();
                 let unfinished = agents
                     .get(agent)
                     .is_some_and(|stats| stats.outcome == AgentOutcome::Running);
@@ -349,7 +339,6 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                 }
             }
             SessionEvent::AgentFailed { failure } => {
-                in_turn.remove(agent);
                 let failure = failure.clone();
                 finish(&mut agents, record, |at| AgentOutcome::Failed {
                     at,
@@ -431,7 +420,14 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
         session,
         initial_prompt,
         started: time(records.first().map_or(0, |record| record.timestamp_millis)),
-        finished: time(records.last().map_or(0, |record| record.timestamp_millis)),
+        // Resuming dates what it closes before its own reopening.
+        finished: time(
+            records
+                .iter()
+                .map(|record| record.timestamp_millis)
+                .max()
+                .unwrap_or(0),
+        ),
         agents: agents.into_values().collect(),
         models,
         tools,
@@ -461,7 +457,8 @@ mod tests {
         job::{JobEnd, JobRole},
         provider::protocol::{AssistantItem, ToolCall, ToolResult},
         session::{
-            AttemptRef, MessageSeq, ModelContext, ModelPurpose, RequestSeq, SessionEvent,
+            AttemptRef, CompletedOutcome, MessageSeq, ModelContext, ModelPurpose, RequestSeq,
+            SessionEvent,
             tests::{self, MemorySession, attempt, requested, usage},
         },
     };

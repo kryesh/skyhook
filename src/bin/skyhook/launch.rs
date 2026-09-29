@@ -127,6 +127,16 @@ pub enum LaunchError {
     #[error(transparent)]
     Harness(#[from] HarnessError),
 }
+impl LaunchError {
+    /// Another handle, in this process or another, holds the session's lock.
+    pub fn already_open(&self) -> bool {
+        matches!(
+            self,
+            Self::Session(SessionError::AlreadyOpen(_))
+                | Self::Harness(HarnessError::Session(SessionError::AlreadyOpen(_)))
+        )
+    }
+}
 
 #[derive(Clone)]
 pub struct Launch {

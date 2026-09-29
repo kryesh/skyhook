@@ -95,12 +95,13 @@ impl QuestionBatchState {
     }
 }
 
-/// Authentication owns a separate input, never an approval draft or a
-/// question answer.
+/// Authentication and renaming each own a separate input, never an approval
+/// draft or a question answer.
 enum PromptState {
     Approval(PromptInput),
     Questions(QuestionBatchState),
     Authentication(PromptInput),
+    Rename(PromptInput),
 }
 pub struct UiPrompt {
     request: Prompt,
@@ -128,6 +129,11 @@ impl UiPrompt {
             PromptKind::Authentication { .. } => {
                 PromptState::Authentication(PromptInput::default())
             }
+            PromptKind::Rename { current, .. } => {
+                let mut input = PromptInput::default();
+                input.editor.set(current.clone());
+                PromptState::Rename(input)
+            }
         };
         Self {
             request,
@@ -138,13 +144,17 @@ impl UiPrompt {
     }
     fn input(&self) -> &PromptInput {
         match &self.state {
-            PromptState::Authentication(input) | PromptState::Approval(input) => input,
+            PromptState::Authentication(input)
+            | PromptState::Approval(input)
+            | PromptState::Rename(input) => input,
             PromptState::Questions(batch) => batch.input(),
         }
     }
     fn input_mut(&mut self) -> &mut PromptInput {
         match &mut self.state {
-            PromptState::Authentication(input) | PromptState::Approval(input) => input,
+            PromptState::Authentication(input)
+            | PromptState::Approval(input)
+            | PromptState::Rename(input) => input,
             PromptState::Questions(batch) => batch.input_mut(),
         }
     }
@@ -162,6 +172,16 @@ impl UiPrompt {
     }
     pub(super) fn reject(self, error: String) {
         self.request.reject(error);
+    }
+    /// A secret is wiped with its editing history; other text stays undoable.
+    pub(super) fn clear_input(&mut self) {
+        match &mut self.state {
+            PromptState::Authentication(input) => input.editor.clear_sensitive(),
+            _ => {
+                let editor = &mut self.input_mut().editor;
+                editor.erase(0..editor.text().len());
+            }
+        }
     }
 }
 impl Drop for PromptState {
@@ -268,9 +288,10 @@ impl App {
         self.prompts.front().is_some_and(|prompt| prompt.shown)
     }
     pub fn prompt(&mut self, prompt: Prompt) {
-        if matches!(prompt.kind, PromptKind::Authentication { .. }) {
-            // Authentication is FIFO before ordinary prompts. Ordinary state
-            // stays attached to its own queued request, including every page.
+        if prompt.preempts() {
+            // Authentication is FIFO before every other prompt, and a rename goes
+            // straight after it. Ordinary state stays attached to its own queued
+            // request, including every page.
             let index = self
                 .prompts
                 .iter()
@@ -323,6 +344,7 @@ impl App {
     pub(super) fn cancel_prompt(&mut self) {
         let error = match self.prompts.front().map(|prompt| &prompt.kind) {
             Some(PromptKind::Authentication { .. }) => "authentication cancelled",
+            Some(PromptKind::Rename { .. }) => "rename cancelled",
             Some(PromptKind::Questions {
                 background: true, ..
             }) => "questions cancelled",
@@ -387,7 +409,7 @@ impl App {
             PromptKind::Authentication { prompt, .. } if prompt.kind.is_confirmation() => {
                 labels(confirmation_items())
             }
-            PromptKind::Authentication { .. } => vec![],
+            PromptKind::Authentication { .. } | PromptKind::Rename { .. } => vec![],
         }
     }
     pub fn prompt_text(&self) -> String {
@@ -434,6 +456,9 @@ impl App {
                     .map_or_else(String::new, |target| format!(" · {target}"));
                 let origin = crate::tui::model::target_suffix(&prompt.origin);
                 format!("Authentication{target}{origin}\n{}", prompt.message)
+            }
+            PromptKind::Rename { .. } => {
+                "Rename session\nLeave empty to use the automatic title".into()
             }
         }
     }
@@ -537,7 +562,8 @@ impl App {
                     return;
                 }
             }
-            (PromptKind::Authentication { .. }, PromptState::Authentication(_)) => {}
+            (PromptKind::Authentication { .. }, PromptState::Authentication(_))
+            | (PromptKind::Rename { .. }, PromptState::Rename(_)) => {}
             _ => unreachable!("request and draft are constructed together and cannot be replaced"),
         }
         let front = self.prompts[0].id;
@@ -573,6 +599,9 @@ impl App {
                     PromptAnswer::Secret(input.editor.take_sensitive())
                 };
                 let _ = reply.send(Ok(answer));
+            }
+            (PromptKind::Rename { reply, .. }, PromptState::Rename(input)) => {
+                let _ = reply.send(Ok(input.editor.text().to_owned()));
             }
             _ => unreachable!("request and draft are constructed together"),
         }
@@ -828,6 +857,105 @@ mod tests {
             assert_eq!(answer, expected);
         }
         assert!(app.prompts.is_empty());
+    }
+
+    /// Ctrl+c clears a prompt's text as it clears the composer's, then backs out of
+    /// the empty prompt; the composer's draft is never touched.
+    #[tokio::test]
+    async fn ctrl_c_clears_prompt_text_then_cancels() {
+        let (_root, mut app) = fixture().await;
+        paste(&mut app, "composer draft");
+        let ssh = authentication(&mut app, 100, SensitivePromptKind::Password);
+        paste(&mut app, "secret");
+        key(&mut app, Char('c'), M::CONTROL);
+        assert!(app.prompt_input().editor.text().is_empty());
+        assert_eq!(app.prompts.len(), 1);
+        key(&mut app, Char('c'), M::CONTROL);
+        assert!(ssh.await.unwrap().is_err());
+        assert!(app.prompts.is_empty());
+        assert_eq!(app.editor.text(), "composer draft");
+    }
+
+    /// A rename edits the title in its own input and never touches the composer.
+    /// It starts from the user's title, or empty from an automatic one. Esc keeps
+    /// the title; Enter saves a user title, or clears it when empty.
+    /// Every prompt keeps a margin above its text and a row either side of its input.
+    #[tokio::test]
+    async fn prompts_space_their_text_input_and_help() {
+        let (_root, mut app) = fixture().await;
+        let rows = |app: &mut App| {
+            let screen = draw(app);
+            let rect = app.composer_rect;
+            let rows: Vec<String> = screen.lines().map(|row| row.trim().to_owned()).collect();
+            rows[rect.y as usize..rect.bottom() as usize].to_vec()
+        };
+        app.rename_session();
+        app.prompt_input_mut().editor.set("My title".into());
+        let rename = rows(&mut app);
+        let expected = [
+            "",
+            "Rename session",
+            "Leave empty to use the automatic title",
+            "",
+            "My title",
+            "",
+        ];
+        assert_eq!(rename[..expected.len()], expected);
+        assert!(rename[expected.len()].starts_with("↑↓ choose"));
+        assert_eq!(rename.len(), expected.len() + 1);
+        app.prompts.clear();
+        let _ssh = authentication(&mut app, 100, SensitivePromptKind::Password);
+        paste(&mut app, "secret");
+        let askpass = rows(&mut app);
+        let masked = "●".repeat("secret".len());
+        let expected = [
+            "",
+            "Authentication",
+            "SSH prompt 100",
+            "",
+            masked.as_str(),
+            "",
+        ];
+        assert_eq!(askpass[..expected.len()], expected);
+    }
+
+    #[tokio::test]
+    async fn rename_prompt_edits_the_title_apart_from_the_draft() {
+        use skyhook::session::{SessionTitle, TitleSource};
+        let (_root, mut app) = fixture().await;
+        let title = |text: &str, source| {
+            let text = text.into();
+            Some(SessionTitle { text, source })
+        };
+        app.title = title("first prompt", TitleSource::Prompt);
+        paste(&mut app, "composer draft");
+        app.rename_session();
+        assert!(app.prompt_shown());
+        assert!(app.prompt_input().editor.text().is_empty());
+        assert!(draw(&mut app).contains("Rename session"));
+        paste(&mut app, "discarded");
+        key(&mut app, Esc, M::NONE);
+        assert!(app.prompts.is_empty());
+        app.rename_session();
+        app.prompt_input_mut().editor.set(" My \n title ".into());
+        key(&mut app, Enter, M::NONE);
+        // Were the cancelled rename saved, its title would be observed first.
+        let renamed = SessionEvent::TitleSet {
+            title: "My title".into(),
+            source: TitleSource::User,
+        };
+        assert_eq!(next_title_change(&mut app).await, renamed);
+        app.title = title("My title", TitleSource::User);
+        app.rename_session();
+        assert_eq!(app.prompt_input().editor.text(), "My title");
+        key(&mut app, Char('c'), M::CONTROL);
+        key(&mut app, Enter, M::NONE);
+        assert_eq!(
+            next_title_change(&mut app).await,
+            SessionEvent::TitleCleared
+        );
+        assert!(app.prompts.is_empty());
+        assert_eq!(app.editor.text(), "composer draft");
     }
 
     #[tokio::test]

@@ -50,6 +50,10 @@ pub enum Work {
     Interrupted {
         count: usize,
     },
+    Title {
+        ticket: Token,
+        title: Result<Option<SessionTitle>, String>,
+    },
     Stopped,
     HighlightsReady,
 }
@@ -63,6 +67,7 @@ pub enum Hit {
     Attachments,
     Attention,
     Sessions,
+    SessionTitle,
     Queue,
     PromptChoice(usize),
     Latest,
@@ -152,6 +157,16 @@ impl App {
                 }
                 self.push_local(agent, message);
             }
+            Work::Title { ticket, title } if ticket.matches(&self.title_ticket) => {
+                match title {
+                    Ok(title) => self.title = title,
+                    Err(error) => {
+                        self.local_notice(format!("Could not read session title: {error}"))
+                    }
+                }
+                self.dirty = true;
+            }
+            Work::Title { .. } => {}
             Work::Stopped => self.exit = true,
             Work::HighlightsReady => {}
         }
@@ -159,6 +174,12 @@ impl App {
     }
     pub fn tick(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
+        let clock = model::Clock::now();
+        // Live counters are painted; only a new day changes entries, dating earlier times.
+        if std::mem::replace(&mut self.clock, clock).day() != clock.day() {
+            self.content_dirty = true;
+            self.dirty = true;
+        }
         if self
             .toast
             .as_ref()
@@ -298,11 +319,13 @@ impl App {
                             self.invalidate_question_answer();
                         }
                     }
-                    InputTarget::Composer if text.lines().count() > PASTE_COLLAPSE_LINES => {
-                        self.editor.insert_paste(text);
-                    }
                     InputTarget::Composer => {
-                        self.editor.insert(&text);
+                        if text.lines().count() > PASTE_COLLAPSE_LINES {
+                            self.editor.insert_paste(text);
+                        } else {
+                            self.editor.insert(&text);
+                        }
+                        self.composer_scroll = None;
                     }
                     InputTarget::Prompt | InputTarget::None => {}
                 }
@@ -322,6 +345,11 @@ impl App {
                         {
                             let options = self.prompt_options_rect.contains(point.into());
                             self.scroll_prompt(options, step);
+                        } else if matches!(self.input_target(), InputTarget::Composer)
+                            && self.composer_rect.contains(point.into())
+                            && self.composer_overflows()
+                        {
+                            self.scroll_composer(step);
                         } else if self.tree_rect.contains(point.into()) {
                             self.tree_scroll = self.tree_scroll.saturating_add_signed(step);
                         } else {
@@ -362,6 +390,7 @@ impl App {
                                 Hit::Attachments => self.command(Command::Attachments),
                                 Hit::Attention => self.activate_prompt(),
                                 Hit::Sessions => self.command(Command::Sessions),
+                                Hit::SessionTitle => self.command(Command::Rename),
                                 Hit::Queue => self.command(Command::Queue),
                                 Hit::PromptChoice(index) => {
                                     // A cancellation can arrive before stale hit geometry is redrawn.

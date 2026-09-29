@@ -42,6 +42,14 @@ impl AgentActivity {
     }
 }
 
+/// An agent's activity and when it last started or stopped being busy (epoch
+/// milliseconds): its turn start while busy, its turn end otherwise.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ObservedActivity {
+    pub state: AgentActivity,
+    pub since: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ContextUsage {
     pub tokens: u64,
@@ -128,7 +136,7 @@ pub struct ObservationSnapshot {
     /// Every request's lifecycle, folded from `records`.
     pub ledger: RequestLedger,
     pub responses: HashMap<(AgentId, RequestSeq), ObservedResponse>,
-    pub activity: HashMap<AgentId, AgentActivity>,
+    pub activity: HashMap<AgentId, ObservedActivity>,
     pub context: HashMap<AgentId, ContextUsage>,
 }
 
@@ -159,15 +167,15 @@ impl ObservationSnapshot {
                         self.responses.insert(key, ObservedResponse::default());
                     }
                     SessionEvent::AgentCompleted => {
-                        self.activity.insert(agent.clone(), AgentActivity::Idle);
+                        self.end_turn(agent, AgentActivity::Idle, record.timestamp_millis);
                     }
                     SessionEvent::AgentInterrupted => {
                         let stopped = AgentActivity::Stopped(TurnFailure::Interrupted);
-                        self.activity.insert(agent.clone(), stopped);
+                        self.end_turn(agent, stopped, record.timestamp_millis);
                     }
                     SessionEvent::AgentFailed { failure } => {
                         let stopped = AgentActivity::Stopped(failure.clone().into());
-                        self.activity.insert(agent.clone(), stopped);
+                        self.end_turn(agent, stopped, record.timestamp_millis);
                     }
                     SessionEvent::ModelFailed { attempt, failure } => {
                         // The runtime's own settlement is authoritative and may
@@ -207,7 +215,7 @@ impl ObservationSnapshot {
                     _ => {}
                 }
                 if changed {
-                    self.follow_request(&record.agent);
+                    self.follow_request(&record.agent, record.timestamp_millis);
                 }
                 self.records.insert(record.sequence, *record);
             }
@@ -239,7 +247,11 @@ impl ObservationSnapshot {
                     how => self.responses.entry(key).or_default().settle(how),
                 }
             }
-            RuntimeEvent::Activity { agent, activity } => {
+            RuntimeEvent::Activity {
+                agent,
+                activity,
+                at,
+            } => {
                 if let AgentActivity::Stopped(failure) = &activity {
                     for ((owner, _), response) in &mut self.responses {
                         if owner == &agent && response.settlement().is_none() {
@@ -247,7 +259,7 @@ impl ObservationSnapshot {
                         }
                     }
                 }
-                self.activity.insert(agent, activity);
+                self.set_activity(&agent, activity, at);
             }
             RuntimeEvent::Context { agent, usage } => {
                 self.context.insert(agent, usage);
@@ -260,10 +272,10 @@ impl ObservationSnapshot {
     /// request, the agent's pending request gives its activity: a scheduled recovery
     /// reconnects and a compaction compacts. Records never move a reported agent into
     /// or out of a request, so one forwarded late cannot regress newer activity.
-    fn follow_request(&mut self, agent: &AgentId) {
+    fn follow_request(&mut self, agent: &AgentId, at: i64) {
         let in_request = self.activity.get(agent).is_none_or(|activity| {
             matches!(
-                activity,
+                activity.state,
                 AgentActivity::Working
                     | AgentActivity::Compacting
                     | AgentActivity::Reconnecting { .. }
@@ -283,7 +295,24 @@ impl ObservationSnapshot {
             (_, ModelPurpose::Compaction) => AgentActivity::Compacting,
             _ => AgentActivity::Working,
         };
-        self.activity.insert(agent.clone(), activity);
+        self.set_activity(agent, activity, at);
+    }
+
+    /// A change within a turn keeps its start; entering or leaving one moves it.
+    fn set_activity(&mut self, agent: &AgentId, state: AgentActivity, at: i64) {
+        let since = match self.activity.get(agent) {
+            Some(current) if current.state.is_busy() == state.is_busy() => current.since,
+            _ => at,
+        };
+        self.activity
+            .insert(agent.clone(), ObservedActivity { state, since });
+    }
+
+    /// A turn's end record ends it at its own time, whether or not this snapshot saw
+    /// the turn begin: replay never does once an earlier turn has ended.
+    fn end_turn(&mut self, agent: &AgentId, state: AgentActivity, at: i64) {
+        self.activity
+            .insert(agent.clone(), ObservedActivity { state, since: at });
     }
 }
 
@@ -362,14 +391,20 @@ mod tests {
         provider::protocol::{BlockRef, ItemKind, ResponseEvent},
     };
 
+    /// Journals `event` at `sequence` seconds past the epoch.
     fn record(hub: &RuntimeEvents, agent: &AgentId, sequence: u64, event: SessionEvent) {
-        let record = tests::record(agent, sequence, event);
+        let mut record = tests::record(agent, sequence, event);
+        record.timestamp_millis = sequence as i64 * 1000;
         hub.send(RuntimeEvent::Record(Box::new(record)));
     }
 
-    fn activity(hub: &RuntimeEvents, agent: &AgentId, activity: AgentActivity) {
+    fn activity(hub: &RuntimeEvents, agent: &AgentId, activity: AgentActivity, at: i64) {
         let agent = agent.clone();
-        hub.send(RuntimeEvent::Activity { agent, activity });
+        hub.send(RuntimeEvent::Activity {
+            agent,
+            activity,
+            at,
+        });
     }
 
     /// Journals request `request` for `purpose`, its context just before it.
@@ -444,7 +479,7 @@ mod tests {
             .observe()
             .snapshot;
         assert_eq!(
-            snapshot.activity[&agent],
+            snapshot.activity[&agent].state,
             AgentActivity::Stopped(refused.into())
         );
     }
@@ -454,26 +489,51 @@ mod tests {
         let hub = RuntimeEvents::new(&[]);
         let agent = AgentId::root(SessionId::from_bytes([4; 16]));
         let current = || hub.observe().snapshot.activity[&agent].clone();
-        activity(&hub, &agent, AgentActivity::Working);
+        let observed = |state, since| ObservedActivity { state, since };
+        activity(&hub, &agent, AgentActivity::Working, 500);
         request(&hub, &agent, 2, ModelPurpose::Agent);
-        activity(&hub, &agent, AgentActivity::Tools);
+        activity(&hub, &agent, AgentActivity::Tools, 2500);
         record(&hub, &agent, 3, attempt(2.into(), 1));
-        assert_eq!(current(), AgentActivity::Tools);
-        activity(&hub, &agent, AgentActivity::Working);
+        // Every busy state belongs to the turn that began at 500.
+        assert_eq!(current(), observed(AgentActivity::Tools, 500));
+        activity(&hub, &agent, AgentActivity::Working, 3500);
         record(&hub, &agent, 4, failed(2, 1, "connection lost"));
-        assert_eq!(current(), AgentActivity::Working);
+        assert_eq!(current(), observed(AgentActivity::Working, 500));
         record(&hub, &agent, 5, scheduled(4));
-        assert_eq!(current(), AgentActivity::Reconnecting { attempt: 2 });
+        assert_eq!(
+            current(),
+            observed(AgentActivity::Reconnecting { attempt: 2 }, 500)
+        );
         record(&hub, &agent, 6, attempt(2.into(), 2));
-        assert_eq!(current(), AgentActivity::Working);
+        assert_eq!(current(), observed(AgentActivity::Working, 500));
         request(&hub, &agent, 8, ModelPurpose::Compaction);
-        assert_eq!(current(), AgentActivity::Compacting);
+        assert_eq!(current(), observed(AgentActivity::Compacting, 500));
         record(&hub, &agent, 9, attempt(8.into(), 1));
         record(&hub, &agent, 10, failed(8, 1, "connection lost"));
         record(&hub, &agent, 11, scheduled(10));
-        assert_eq!(current(), AgentActivity::Reconnecting { attempt: 2 });
+        assert_eq!(current().state, AgentActivity::Reconnecting { attempt: 2 });
         record(&hub, &agent, 12, SessionEvent::AgentInterrupted);
-        assert_eq!(current(), AgentActivity::Stopped(TurnFailure::Interrupted));
+        let stopped = observed(AgentActivity::Stopped(TurnFailure::Interrupted), 12_000);
+        assert_eq!(current(), stopped);
+        let records: Vec<_> = hub.observe().snapshot.records.into_values().collect();
+        let replayed = RuntimeEvents::new(&records).observe().snapshot;
+        assert_eq!(replayed.activity[&agent], stopped);
+        activity(&hub, &agent, AgentActivity::Working, 13_000);
+        assert_eq!(current(), observed(AgentActivity::Working, 13_000));
+        // A later turn ends at its end record's time, whether the runtime reports
+        // the end before or after it, and so does its replay.
+        request(&hub, &agent, 15, ModelPurpose::Agent);
+        record(&hub, &agent, 16, SessionEvent::AgentCompleted);
+        activity(&hub, &agent, AgentActivity::Idle, 16_500);
+        assert_eq!(current(), observed(AgentActivity::Idle, 16_000));
+        activity(&hub, &agent, AgentActivity::Working, 17_000);
+        activity(&hub, &agent, AgentActivity::Idle, 18_000);
+        record(&hub, &agent, 19, SessionEvent::AgentCompleted);
+        let idle = observed(AgentActivity::Idle, 19_000);
+        assert_eq!(current(), idle);
+        let records: Vec<_> = hub.observe().snapshot.records.into_values().collect();
+        let replayed = RuntimeEvents::new(&records).observe().snapshot;
+        assert_eq!(replayed.activity[&agent], idle);
     }
 
     #[test]
@@ -515,16 +575,16 @@ mod tests {
             let records: Vec<_> = snapshot.records.values().cloned().collect();
             RuntimeEvents::new(&records).observe().snapshot
         };
-        activity(&hub, &agent, AgentActivity::Working);
+        activity(&hub, &agent, AgentActivity::Working, 0);
         request(&hub, &agent, 7, ModelPurpose::Agent);
         delta(&hub, &agent, 7, "partial answer");
         record(&hub, &agent, 8, failed(7, 1, "connection lost"));
         record(&hub, &agent, 9, scheduled(8));
         let snapshot = hub.observe().snapshot;
         let reconnecting = AgentActivity::Reconnecting { attempt: 2 };
-        assert_eq!(snapshot.activity[&agent], reconnecting);
+        assert_eq!(snapshot.activity[&agent].state, reconnecting);
         // Replay has no runtime to report the agent, so the journal alone does.
-        assert_eq!(replayed(&snapshot).activity[&agent], reconnecting);
+        assert_eq!(replayed(&snapshot).activity[&agent].state, reconnecting);
         let response = &snapshot.responses[&key];
         assert_eq!(response.settlement(), Some(&lost()));
         assert_eq!(response.blocks()[0].text, "partial answer");
@@ -533,7 +593,7 @@ mod tests {
         let recovery = snapshot.records[&9.into()].clone();
         hub.send(RuntimeEvent::Record(Box::new(recovery)));
         let started = hub.observe().snapshot;
-        assert_eq!(started.activity[&agent], AgentActivity::Working);
+        assert_eq!(started.activity[&agent].state, AgentActivity::Working);
         for response in [
             &started.responses[&key],
             &replayed(&started).responses[&key],
@@ -547,8 +607,11 @@ mod tests {
         assert_eq!(json(&started), json(&snapshot));
         record(&hub, &agent, 11, SessionEvent::AgentCompleted);
         let completed = hub.observe().snapshot;
-        assert_eq!(completed.activity[&agent], AgentActivity::Idle);
-        assert_eq!(replayed(&completed).activity[&agent], AgentActivity::Idle);
+        assert_eq!(completed.activity[&agent].state, AgentActivity::Idle);
+        assert_eq!(
+            replayed(&completed).activity[&agent].state,
+            AgentActivity::Idle
+        );
     }
 
     /// The runtime's settlement is authoritative in either order against the
@@ -583,7 +646,7 @@ mod tests {
         // A stop settles the open response but leaves settled ones alone.
         delta(&hub, &agent, 9, "open");
         let stopped = AgentActivity::Stopped(TurnFailure::Interrupted);
-        activity(&hub, &agent, stopped);
+        activity(&hub, &agent, stopped, 0);
         let interrupted = Settlement::Failed(TurnFailure::Interrupted);
         assert_eq!(settlement(9), Some(interrupted));
         assert_eq!(settlement(7), Some(Settlement::Aborted(3.into())));

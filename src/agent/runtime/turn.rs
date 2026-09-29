@@ -693,14 +693,8 @@ mod tests {
         let error = session.prompt("Abort this turn.").await.unwrap_err();
         assert!(matches!(error, HarnessError::ProviderAborted));
         assert_eq!(
-            session
-                .runtime
-                .events
-                .observe()
-                .snapshot
-                .activity
-                .get(&session.root),
-            Some(&AgentActivity::Stopped(Failure::Aborted.into()))
+            session.runtime.events.observe().snapshot.activity[&session.root].state,
+            AgentActivity::Stopped(Failure::Aborted.into())
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(journaled_usage(&session).await, observed);

@@ -17,7 +17,7 @@ mod sessions;
 
 pub use draft::DraftItem;
 pub use output::OutputAction;
-pub use sessions::SessionRef;
+pub use sessions::{SavedState, SessionRef};
 
 /// Rows PageUp and PageDown move a menu's selection by.
 const MENU_PAGE: usize = 10;
@@ -45,23 +45,38 @@ pub enum ConfirmChoice {
     KeepWorking,
     Proceed(ConfirmAction),
 }
+/// A menu row. Its text is cleaned once, so it measures as it paints.
 #[derive(Clone)]
 pub struct Item<T> {
     pub value: T,
     pub label: String,
     /// Searchable metadata, rendered separately from the label.
     pub detail: String,
-    /// The label and detail lowercased once, for filtering on every key.
+    /// Searchable metadata aligned at the right edge, such as a shortcut or a
+    /// time. Short of room, the leftmost goes first.
+    pub columns: Vec<String>,
+    /// The label, detail and columns lowercased once, for filtering on every key.
     search: String,
 }
 impl<T> Item<T> {
     pub(super) fn new(value: T, label: impl Into<String>, detail: impl Into<String>) -> Self {
-        let (label, detail) = (label.into(), detail.into());
-        let search = format!("{label} {detail}").to_lowercase();
+        Self::columned(value, label, detail, Vec::new())
+    }
+
+    fn columned(
+        value: T,
+        label: impl Into<String>,
+        detail: impl Into<String>,
+        columns: Vec<String>,
+    ) -> Self {
+        let (label, detail) = (model::clean(&label.into()), model::clean(&detail.into()));
+        let columns: Vec<_> = columns.iter().map(|value| model::clean(value)).collect();
+        let search = format!("{label} {detail} {}", columns.join(" ")).to_lowercase();
         Self {
             value,
             label,
             detail,
+            columns,
             search,
         }
     }
@@ -88,6 +103,7 @@ pub struct ItemRef<'a> {
     pub index: usize,
     pub label: &'a str,
     pub detail: &'a str,
+    pub columns: &'a [String],
     pub search: &'a str,
 }
 impl MenuKind {
@@ -100,6 +116,7 @@ impl MenuKind {
                     index,
                     label: &item.label,
                     detail: &item.detail,
+                    columns: &item.columns,
                     search: &item.search,
                 })
                 .collect()
@@ -331,12 +348,12 @@ impl App {
             (MenuKind::Models(items), Some(index)) => self.model.clone_from(&items[index].value),
             (MenuKind::Modes(items), Some(index)) => self.mode.clone_from(&items[index].value),
             (MenuKind::Agents(items), Some(index)) => self.select(items[index].value.clone()),
-            (MenuKind::Sessions(items), Some(index)) => {
-                self.host = Some(match items[index].value {
-                    SessionRef::Live(key) => HostRequest::Activate(key),
-                    SessionRef::Saved(id) => HostRequest::Open(id),
-                });
-            }
+            (MenuKind::Sessions(items), Some(index)) => match items[index].value {
+                SessionRef::Live(key) => self.host = Some(HostRequest::Activate(key)),
+                // A lock may have been let go since the list was read: the host,
+                // which knows its own closing sessions, decides.
+                SessionRef::Saved(id, _) => self.host = Some(HostRequest::Open(id)),
+            },
             (MenuKind::Files(items, at), Some(index)) => self.attach_file(&items[index].value, at),
             (MenuKind::Attachments(items), Some(index)) => {
                 self.inspect_draft_item(items[index].value)

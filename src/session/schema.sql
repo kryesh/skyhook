@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 17). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 18). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 --
@@ -45,8 +45,12 @@ CREATE TABLE agent (
 ) STRICT;
 CREATE UNIQUE INDEX agent_single_root ON agent((parent IS NULL)) WHERE parent IS NULL;
 
--- Subtype tables narrow kind to the kinds they hold.
-CREATE TABLE entry_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+-- Subtype tables narrow kind to the kinds they hold. Activity kinds are the session's
+-- activity; reopening and closing it are not.
+CREATE TABLE entry_kind (
+  name TEXT PRIMARY KEY,
+  activity INTEGER NOT NULL CHECK (activity IN (0,1))
+) STRICT, WITHOUT ROWID;
 
 CREATE TABLE entry (
   seq INTEGER PRIMARY KEY,                       -- insert NULL ... RETURNING seq
@@ -57,13 +61,25 @@ CREATE TABLE entry (
   UNIQUE (seq, kind)
 ) STRICT;
 CREATE UNIQUE INDEX entry_one_agent_start ON entry(agent) WHERE kind = 'agent_started';
+-- An agent's latest entry of a kind, for state read without decoding the journal.
+CREATE INDEX entry_agent_kind ON entry(agent, kind);
 
--- Free-text payloads. agent_completed / agent_interrupted / session_started carry no
--- subtype row.
-CREATE TABLE text_entry_kind (name TEXT PRIMARY KEY REFERENCES entry_kind(name)) STRICT, WITHOUT ROWID;
+-- Status text. agent_completed / agent_interrupted / session_started / session_reopened /
+-- title_cleared carry no subtype row.
 CREATE TABLE entry_text (
   entry INTEGER PRIMARY KEY,
-  kind TEXT NOT NULL REFERENCES text_entry_kind(name),
+  kind TEXT NOT NULL DEFAULT 'status' CHECK (kind = 'status'),
+  text TEXT NOT NULL,
+  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
+) STRICT;
+
+CREATE TABLE title_source (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
+-- A title_cleared entry drops the user's earlier titles; session_title applies the rule.
+CREATE TABLE title (
+  entry INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL DEFAULT 'title_set' CHECK (kind = 'title_set'),
+  source TEXT NOT NULL REFERENCES title_source(name),
   text TEXT NOT NULL,
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
@@ -875,15 +891,32 @@ CREATE TABLE approval_revocation (
 CREATE VIEW job_generation AS
 SELECT job, max(generation) AS generation FROM job_run GROUP BY job;
 
+-- The user's newest title, unless a title_cleared follows it; else the newest automatic
+-- one; else the first text the user sent the root agent, as a prompt title.
+CREATE VIEW session_title AS
+WITH chosen(entry) AS (
+  SELECT coalesce(
+    (SELECT max(u.entry) FROM title u
+      WHERE u.source = 'user' AND u.entry > coalesce(
+        (SELECT max(e.seq) FROM entry e
+          WHERE e.agent = (SELECT id FROM agent WHERE parent IS NULL) AND e.kind = 'title_cleared'),
+        0)),
+    (SELECT max(a.entry) FROM title a WHERE a.source <> 'user')))
+SELECT t.text, t.source FROM title t WHERE t.entry = (SELECT entry FROM chosen)
+UNION ALL
+SELECT * FROM (
+  SELECT p.text, 'prompt' FROM message_commit mc
+    JOIN entry e ON e.seq = mc.entry
+    JOIN agent a ON a.id = e.agent AND a.parent IS NULL
+    JOIN user_part p ON p.message = mc.message AND p.kind = 'text'
+   WHERE (SELECT entry FROM chosen) IS NULL
+   ORDER BY mc.entry, p.position LIMIT 1);
+
+-- last_millis is the newest activity entry's time.
 CREATE VIEW session_summary AS
 SELECT
-  (SELECT t.text FROM entry_text t WHERE t.kind = 'title_set' ORDER BY t.entry DESC LIMIT 1) AS title,
-  (SELECT p.text FROM message_commit mc
-     JOIN entry e ON e.seq = mc.entry
-     JOIN agent a ON a.id = e.agent AND a.parent IS NULL
-     JOIN user_part p ON p.message = mc.message AND p.kind = 'text'
-   ORDER BY mc.entry, p.position LIMIT 1) AS preview,
-  (SELECT max(created_millis) FROM entry) AS last_millis,
+  (SELECT e.created_millis FROM entry e JOIN entry_kind k ON k.name = e.kind
+    WHERE k.activity ORDER BY e.seq DESC LIMIT 1) AS last_millis,
   (SELECT count(*) FROM entry) AS entries,
   coalesce(
      (SELECT ms.profile FROM model_selection ms JOIN entry x ON x.seq = ms.entry

@@ -13,12 +13,18 @@ enum Framing {
     Flush,
 }
 
+/// Cells reserved for the counter painted at the right edge of a live entry's
+/// header row, as wide as "in 9h 59m 59s".
+pub(super) const COUNTER_WIDTH: u16 = 13;
+
 /// Geometry and framing shared by every entry layout.
 pub(super) struct EntryGeometry {
     pub(super) x: u16,
     width: u16,
     row_width: u16,
     pub(super) body_width: u16,
+    /// The header row's text width: a live entry's leaves its counter and a gap.
+    header_width: u16,
     framing: Framing,
     surface: Surface,
     entry: usize,
@@ -42,6 +48,10 @@ impl EntryGeometry {
             available
         };
         let indent = entry.indent.min(available / 3);
+        let body_width = block_width
+            .saturating_sub(if boxed { 4 } else { indent })
+            .max(1);
+        let counter = u16::from(entry.timing.live()) * (COUNTER_WIDTH + 1);
         Self {
             x: if entry.surface == Surface::User {
                 width.saturating_sub(block_width + 1)
@@ -52,9 +62,8 @@ impl EntryGeometry {
             },
             width,
             row_width: block_width.saturating_sub(if boxed { 0 } else { indent }),
-            body_width: block_width
-                .saturating_sub(if boxed { 4 } else { indent })
-                .max(1),
+            body_width,
+            header_width: body_width.saturating_sub(counter).max(1),
             framing,
             surface: entry.surface,
             entry: index,
@@ -100,13 +109,17 @@ impl EntryGeometry {
             ..self.edge()
         }
     }
-    /// Wrap logical lines; later lines and continuations share the hanging indent.
+    /// Wrap logical lines, the first as the header row; later lines and
+    /// continuations share the hanging indent.
     fn push_wrapped(&self, rows: &mut Vec<Row>, lines: Vec<(Line<'static>, Wrap)>) {
-        let body_width = self.body_width as usize;
         let indent = usize::from(self.framing == Framing::Hanging);
-        let hanging = body_width.saturating_sub(indent).max(1);
+        let hanging = (self.body_width as usize).saturating_sub(indent).max(1);
         for (index, (line, wrap)) in lines.into_iter().enumerate() {
-            let first = if index == 0 { body_width } else { hanging };
+            let first = if index == 0 {
+                self.header_width as usize
+            } else {
+                hanging
+            };
             let wrapped = match wrap {
                 Wrap::Hard => wrap_line(line, first, hanging),
                 Wrap::Words => wrap_words(line, first),
@@ -132,21 +145,18 @@ pub(super) fn update_entry_rows(
     let boxed = geometry.framing == Framing::Boxed;
     rows.clear();
     if let Some(request) = entry.request() {
-        let line = request_columns.line(request, geometry.body_width);
+        let line = request_columns.line(request, geometry.body_width, geometry.header_width);
         rows.push(geometry.row(line, true, false));
         return Document::default();
     }
     if boxed {
         rows.push(geometry.edge());
     }
-    // A running entry leaves its first cells to the spinner: after the
+    // A live entry leaves its first cells to the spinner: after the
     // disclosure glyph of a title, or before an untitled body.
-    let title = entry.title().map(|title| title.line(entry.running));
-    let gutter = if title.is_none() && entry.running {
-        "  "
-    } else {
-        ""
-    };
+    let live = entry.timing.live();
+    let title = entry.title().map(|title| title.line(live));
+    let gutter = if title.is_none() && live { "  " } else { "" };
     let mut fences = Document::default();
     if let Some(header) = entry.header() {
         let mut lines = vec![(header_line(header), Wrap::Hard)];
@@ -172,8 +182,13 @@ pub(super) fn update_entry_rows(
         let body = entry.body();
         // Expanded reasoning omits the empty body; message boxes retain it.
         if !entry.expandable() || !body.is_empty() || boxed {
-            let body_width = geometry.body_width as usize;
-            let layout = stream::layout_highlighted(body, body_width, gutter, Some(highlights));
+            // A body that starts at the header row wraps whole at the header's width.
+            let width = if rows.is_empty() {
+                geometry.header_width
+            } else {
+                geometry.body_width
+            };
+            let layout = stream::layout_highlighted(body, width.into(), gutter, Some(highlights));
             fences = layout.fences;
             for line in layout.lines {
                 let header = rows.is_empty();
@@ -391,6 +406,26 @@ mod tests {
             );
             // Past the disclosure glyph.
             assert_eq!(styled(rows)[1..], styled(layout(&expanded, width))[1..]);
+        }
+    }
+
+    /// A live entry's header row leaves room for its painted counter; a settled
+    /// entry's fills the row.
+    #[test]
+    fn live_header_rows_reserve_their_counter() {
+        let text = "word ".repeat(40);
+        for surface in [Surface::Muted, Surface::Reasoning] {
+            for (timing, live) in [
+                (model::Timing::Since(0), true),
+                (model::Timing::Untimed, false),
+            ] {
+                let key = model::EntryKey::UnsavedStatus(1);
+                let mut entry = model::Entry::new(key, text.clone(), surface);
+                entry.timing = timing;
+                let rows = layout(&entry, 60);
+                let free = rows[0].text_width - rows[0].text().trim_end().width() as u16;
+                assert_eq!(free > COUNTER_WIDTH, live, "{surface:?}");
+            }
         }
     }
 

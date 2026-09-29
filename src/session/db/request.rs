@@ -164,7 +164,7 @@ fn failure(db: &Db, entry: Entry, failure: &Failure) -> DbResult<()> {
 }
 
 /// A failure selected as (failure, provider, detail) from column `at`.
-fn failure_at(row: &Row, at: i32) -> DbResult<Failure> {
+pub(super) fn failure_at(row: &Row, at: i32) -> DbResult<Failure> {
     Failure::from_parts(enum_column(row, at)?, row.get(at + 1)?, row.get(at + 2)?)
         .ok_or_else(|| corrupt("failure detail does not match its kind"))
 }

@@ -13,8 +13,8 @@ pub use interaction::{
     QuestionReply, RuntimeEvent,
 };
 pub use observation::{
-    AgentActivity, ContextUsage, Observation, ObservationSnapshot, ObservedEvent, ObservedResponse,
-    Settlement,
+    AgentActivity, ContextUsage, Observation, ObservationSnapshot, ObservedActivity, ObservedEvent,
+    ObservedResponse, Settlement,
 };
 pub use runtime::{
     ContinueOutcome, Harness, HarnessBuilder, QueuedPrompt, QueuedPromptCancellation,

@@ -14,16 +14,15 @@ impl JobManager {
         Ok(())
     }
 
+    /// Without a handler an interrupted job is no longer suspended but settled,
+    /// which a wait on it must see even when nothing releases it.
     pub(crate) async fn clear_resume_handler(&self, id: JobId) {
-        if let Some(child) = self
-            .inner
-            .jobs
-            .lock()
-            .await
-            .get_mut(&id)
-            .and_then(JobEntry::child_mut)
+        let mut jobs = self.inner.jobs.lock().await;
+        if let Some(entry) = jobs.get_mut(&id)
+            && let Some(child) = entry.child_mut()
         {
             child.resume = None;
+            entry.notify.notify_waiters();
         }
     }
 
@@ -100,7 +99,11 @@ impl JobManager {
                 }
                 if entry.resumable_end() {
                     drop(jobs);
-                    return self.resume_locked(id, Some(value), guard).await;
+                    let admitted = self.admit_resumption().ok_or(JobError::InputUnavailable {
+                        job: id,
+                        reason: InputUnavailableReason::Closing,
+                    })?;
+                    return self.resume_locked(id, Some(value), guard, admitted).await;
                 }
                 if !matches!(entry.phase, Phase::Running | Phase::WaitingInput(_)) {
                     return Err(JobError::InputUnavailable {
@@ -152,15 +155,8 @@ impl JobManager {
         loop {
             let pending = {
                 let jobs = self.inner.jobs.lock().await;
-                jobs.values()
-                    .find(|entry| {
-                        entry.end().is_none()
-                            && entry
-                                .child()
-                                .and_then(|launched| launched.agent.as_ref())
-                                .is_some_and(|child| agents.contains(child))
-                    })
-                    .map(|entry| entry.notify.clone().notified_owned())
+                (unpublished_interruptions(&jobs, agents).next())
+                    .map(|(_, entry)| entry.notify.clone().notified_owned())
             };
             let Some(pending) = pending else {
                 return;
@@ -169,8 +165,38 @@ impl JobManager {
         }
     }
 
+    /// Publish requested child interruptions now, as their unwinding turns would:
+    /// what still runs in them is cancelled otherwise.
+    pub(crate) async fn finish_interrupted_agents(&self, agents: &[AgentId]) {
+        let jobs = {
+            let jobs = self.inner.jobs.lock().await;
+            let unpublished = unpublished_interruptions(&jobs, agents);
+            unpublished.map(|(id, _)| *id).collect::<Vec<_>>()
+        };
+        for id in jobs {
+            self.settle(id, ToolError::interrupted().into()).await;
+        }
+    }
+
+    /// Admit resumption, unless closing has begun. Never waits, so a caller can
+    /// hold it across other locks.
+    pub(crate) fn admit_resumption(&self) -> Option<Admitted> {
+        let open = self.inner.resumption.clone().try_read_owned().ok()?;
+        (*open == Resumption::Open).then(|| Admitted {
+            _open: Arc::new(open),
+        })
+    }
+
+    /// Refuse resumption from now on, once what was admitted is running.
+    pub(crate) async fn close_resumption(&self) {
+        *self.inner.resumption.write().await = Resumption::Closed;
+    }
+
     /// Restart every session-retryable child, deepest descendants first.
-    pub(crate) async fn continue_resumable_children(&self) -> Result<usize, JobError> {
+    pub(crate) async fn continue_resumable_children(
+        &self,
+        admitted: &Admitted,
+    ) -> Result<usize, JobError> {
         let mut jobs = {
             let entries = self.inner.jobs.lock().await;
             entries
@@ -199,7 +225,7 @@ impl JobManager {
             if !eligible {
                 continue;
             }
-            match self.resume_locked(id, None, guard).await {
+            match self.resume_locked(id, None, guard, admitted.clone()).await {
                 Ok(()) => resumed += 1,
                 // Cancellation or handler removal can invalidate eligibility
                 // without the operation lock.
@@ -217,10 +243,12 @@ impl JobManager {
         id: JobId,
         value: Option<Value>,
         guard: OwnedMutexGuard<()>,
+        admitted: Admitted,
     ) -> Result<(), JobError> {
-        // Accepted resumption owns its operation gate through mailbox/output
-        // publication and worker handoff even when the sender disappears.
-        let held = (guard, self.inner.supervision.enter());
+        // Accepted resumption owns its operation gate and admission through
+        // mailbox/output publication and worker handoff even when the sender
+        // disappears.
+        let held = (guard, admitted, self.inner.supervision.enter());
         self.spawn_owned(held, "job resumption", move |manager| async move {
             let handler = {
                 let jobs = manager.inner.jobs.lock().await;
@@ -255,6 +283,7 @@ impl JobManager {
                 .journal_change(
                     id,
                     JobChange::Advance(JobTransition::Running),
+                    Dated::Now,
                     Rejected::input,
                     |entry| {
                         entry.input = input;
@@ -297,10 +326,22 @@ impl JobManager {
         let held = (operation, self.inner.supervision.enter());
         self.spawn_owned(held, "job input publication", move |manager| async move {
             let _delivery = manager.inner.delivery_operation.lock().await;
-            (manager.journal_change(id, change, Rejected::input, |_| ())).await
+            (manager.journal_change(id, change, Dated::Now, Rejected::input, |_| ())).await
         })
         .await
     }
+}
+
+/// Running jobs of `agents`: an interruption they accepted has yet to publish.
+fn unpublished_interruptions<'a>(
+    jobs: &'a HashMap<JobId, JobEntry>,
+    agents: &'a [AgentId],
+) -> impl Iterator<Item = (&'a JobId, &'a JobEntry)> {
+    jobs.iter().filter(|(_, entry)| {
+        entry.end().is_none()
+            && (entry.child().and_then(|launched| launched.agent.as_ref()))
+                .is_some_and(|child| agents.contains(child))
+    })
 }
 
 #[cfg(test)]
@@ -444,6 +485,25 @@ mod tests {
         }
     }
 
+    /// An agent stopping clears its job's handler, settling its interruption. A
+    /// wait held on it returns though nothing released it first.
+    #[tokio::test]
+    async fn removing_the_resume_handler_ends_a_wait_held_on_an_interruption() {
+        use futures_util::FutureExt;
+        let (_root, jobs, agent) = super::super::tests::runtime().await;
+        let (lease, _) = retained(&jobs, &agent).await;
+        let id = lease.id();
+        jobs.finish(id, ToolError::interrupted().into())
+            .await
+            .unwrap();
+        let wait = jobs.wait_foreground(id);
+        tokio::pin!(wait);
+        assert!((&mut wait).now_or_never().is_none());
+        jobs.clear_resume_handler(id).await;
+        let envelope = crate::tests::bounded(wait).await.unwrap();
+        assert_eq!(envelope.state, JobState::Interrupted);
+    }
+
     #[tokio::test]
     async fn session_retry_skips_children_changed_after_its_snapshot() {
         for end in [None, Some(JobEnd::Completed), Some(JobEnd::Cancelled)] {
@@ -461,7 +521,8 @@ mod tests {
             }
             let a = jobs.operation(candidates[0].0.id()).await.unwrap();
             let guard = a.lock().await;
-            let sweep = jobs.continue_resumable_children();
+            let admitted = jobs.admit_resumption().unwrap();
+            let sweep = jobs.continue_resumable_children(&admitted);
             tokio::pin!(sweep);
             // All other locks are free: one poll takes the snapshot and blocks at A.
             assert!(futures_util::poll!(&mut sweep).is_pending());

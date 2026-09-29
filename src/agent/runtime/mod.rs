@@ -17,7 +17,7 @@ use tokio::{
 
 use crate::{
     identity::{AgentId, JobId, SessionId},
-    job::{CancellationToken, JobManager},
+    job::{CancelScope, CancellationToken, JobManager},
     mcp::{McpServerConfig, manager::McpManager},
     media::{MAX_IMAGE_BYTES, MAX_IMAGE_BYTES_PER_SUBMISSION, MAX_IMAGES_PER_SUBMISSION},
     provider::profile::{ModelName, ModelProfile, ModelRef, ProviderName},
@@ -284,6 +284,11 @@ impl AgentControl {
         *self.turn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// An interrupt stopped the turn, which has not begun again since.
+    fn interrupted(&self) -> bool {
+        self.retryable_interrupt.load(Ordering::Acquire)
+    }
+
     fn set_turn(&self, turn: TurnState) {
         *self.turn.lock().unwrap_or_else(PoisonError::into_inner) = turn;
     }
@@ -403,6 +408,7 @@ impl SessionRuntime {
         self.events.send(RuntimeEvent::Activity {
             agent: agent.clone(),
             activity,
+            at: chrono::Utc::now().timestamp_millis(),
         });
     }
 
@@ -495,11 +501,17 @@ impl SessionRuntime {
         agent: &AgentId,
         message: Message,
     ) -> Result<MessageSeq, SessionError> {
-        let record = self
-            .store
-            .append(agent.clone(), SessionEvent::MessageCommitted { message })
-            .await?;
-        Ok(record.sequence.message())
+        // Closing is not activity. What a closing session's turns still commit, such
+        // as the result of a call its release answered, takes the newest activity's
+        // time; work that closing ended has already dated its own outcome.
+        let dated = if self.shutting_down.load(Ordering::Acquire) {
+            crate::session::Dated::LastActivity
+        } else {
+            crate::session::Dated::Now
+        };
+        let event = SessionEvent::MessageCommitted { message };
+        let records = self.store.append_dated(vec![(agent.clone(), event)], dated);
+        Ok(records.await?[0].sequence.message())
     }
 }
 
@@ -831,7 +843,8 @@ mod tests {
     pub(super) async fn ephemeral_session(harness: &Harness) -> SessionHandle {
         let store = SessionStore::create_ephemeral(&harness.inner.session_root);
         let store = store.await.unwrap();
-        let runtime = SessionRuntime::build(harness.inner.clone(), store, &[]);
+        let jobs = JobManager::new(store.clone());
+        let runtime = SessionRuntime::build(harness.inner.clone(), store, jobs, &[]);
         let runtime = runtime.await.unwrap();
         runtime
             .start_root(runtime.new_root().unwrap())
@@ -1006,7 +1019,7 @@ mod tests {
         bounded(async {
             let activity = async || session.observe().await.snapshot.activity;
             while !matches!(
-                activity().await.get(&session.root),
+                activity().await.get(&session.root).map(|a| &a.state),
                 Some(Tools | WaitingChildren)
             ) {
                 poll().await;
@@ -1095,16 +1108,8 @@ mod tests {
     }
 
     pub(super) async fn shutdown_session(session: SessionHandle) {
-        let runtime = Arc::downgrade(&session.runtime);
-        session.shutdown().await.unwrap();
-        drop(session);
-        // The journal lock is released with the runtime; a resume needs it.
-        bounded(async {
-            while runtime.strong_count() != 0 {
-                poll().await;
-            }
-        })
-        .await;
+        bounded(session.shutdown()).await.unwrap();
+        session.close().await.unwrap();
     }
 
     pub(super) fn mode_name(name: &str) -> ModeName {

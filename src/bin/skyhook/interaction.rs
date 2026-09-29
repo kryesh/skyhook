@@ -30,6 +30,11 @@ pub enum PromptKind {
         prompt: SensitivePrompt,
         reply: Reply<PromptAnswer>,
     },
+    /// The user renaming the session, starting from the title they set, if any.
+    Rename {
+        current: String,
+        reply: Reply<String>,
+    },
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ApprovalReply {
@@ -52,9 +57,21 @@ impl Prompt {
     }
 
     /// Whether typed text is part of the answer: a question's answer or comment,
-    /// or a secret. Approvals and confirmations are answered by choice alone.
+    /// a title, or a secret. Approvals and confirmations are answered by choice alone.
     pub fn takes_text(&self) -> bool {
-        matches!(&self.kind, PromptKind::Questions { .. }) || self.secret()
+        matches!(
+            &self.kind,
+            PromptKind::Questions { .. } | PromptKind::Rename { .. }
+        ) || self.secret()
+    }
+
+    /// Shown at once, ahead of ordinary prompts: authentication, which a remote
+    /// side is waiting on, and a rename the user just asked for.
+    pub fn preempts(&self) -> bool {
+        matches!(
+            &self.kind,
+            PromptKind::Authentication { .. } | PromptKind::Rename { .. }
+        )
     }
 
     pub fn is_closed(&self) -> bool {
@@ -62,6 +79,7 @@ impl Prompt {
             PromptKind::Approval { reply, .. } => reply.is_closed(),
             PromptKind::Questions { reply, .. } => reply.is_closed(),
             PromptKind::Authentication { reply, .. } => reply.is_closed(),
+            PromptKind::Rename { reply, .. } => reply.is_closed(),
         }
     }
 
@@ -71,6 +89,7 @@ impl Prompt {
             PromptKind::Approval { reply, .. } => drop(reply.send(Err(error))),
             PromptKind::Questions { reply, .. } => drop(reply.send(Err(error))),
             PromptKind::Authentication { reply, .. } => drop(reply.send(Err(error))),
+            PromptKind::Rename { reply, .. } => drop(reply.send(Err(error))),
         }
     }
 }
@@ -90,17 +109,38 @@ impl UiInteraction {
             rx,
         )
     }
+    /// A prompt and its answer, for whoever shows the prompt to deliver.
+    fn pending<T, F: FnOnce(Reply<T>) -> PromptKind>(
+        &self,
+        pack: F,
+    ) -> (Prompt, impl Future<Output = Result<T, String>> + use<T, F>) {
+        let (reply, answer) = oneshot::channel();
+        let prompt = Prompt {
+            id: self.counter.fetch_add(1, Ordering::Relaxed),
+            kind: pack(reply),
+        };
+        let answer = async move {
+            answer
+                .await
+                .map_err(|_| "interaction cancelled".to_owned())?
+        };
+        (prompt, answer)
+    }
     async fn request<T>(&self, pack: impl FnOnce(Reply<T>) -> PromptKind) -> Result<T, String> {
-        let (reply, result) = oneshot::channel();
+        let (prompt, answer) = self.pending(pack);
         self.tx
-            .send(Prompt {
-                id: self.counter.fetch_add(1, Ordering::Relaxed),
-                kind: pack(reply),
-            })
+            .send(prompt)
             .map_err(|_| "interface closed".to_owned())?;
-        result
-            .await
-            .map_err(|_| "interaction cancelled".to_owned())?
+        answer.await
+    }
+
+    /// A prompt for the session's new title, starting from `current`. The
+    /// interface asking shows it itself, before handling any further input.
+    pub fn rename(
+        &self,
+        current: String,
+    ) -> (Prompt, impl Future<Output = Result<String, String>> + use<>) {
+        self.pending(|reply| PromptKind::Rename { current, reply })
     }
 }
 fn requires_prompt(permission: &PermissionUse) -> bool {

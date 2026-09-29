@@ -1,9 +1,11 @@
 //! Pending calls and admitted jobs rendered as structured tool cards.
 
 use super::super::tool_view::{Document, Hints, Role, Run, starts_child};
-use super::{Entry, EntryKey, JobInfo, Projection, View};
+use super::{Entry, EntryKey, EntryView, JobInfo, Projection};
 use crate::text::brief;
 use crate::tui::app::OutputStore;
+use crate::tui::format::{Precision, local_time};
+use chrono::Local;
 use serde_json::Value;
 use skyhook::identity::AgentId;
 use skyhook::job::JobState;
@@ -115,13 +117,18 @@ pub(super) fn call_entry(
 pub(super) fn job_entry(
     job: &JobInfo,
     projection: &Projection,
-    view: &View,
     outputs: &OutputStore,
-    all: bool,
+    presentation: EntryView<'_>,
 ) -> Entry {
+    let EntryView {
+        view,
+        all_details,
+        today,
+        ..
+    } = presentation;
     let key = EntryKey::Job(job.id);
     let hints = Hints::new(&job.tool, &job.args);
-    let header = vec![
+    let mut header = vec![
         Run::new(state_glyph(job.state), state_role(job.state)),
         Run::new(" ", Role::Plain),
         Run::new(job.tool.clone(), Role::ToolName),
@@ -132,12 +139,19 @@ pub(super) fn job_entry(
         ),
         Run::new(" · ", Role::Muted),
         Run::new(state_name(job.state), state_role(job.state)),
-        Run::new(" · ", Role::Muted),
-        Run::new(format!("#{}", job.id), Role::Muted),
     ];
-    let document = view.is_expanded(&key, all).then(|| {
+    if let Some(took) = job.timing.took() {
+        header.push(Run::new(format!(" · {took}"), Role::Muted));
+    }
+    header.push(Run::new(format!(" · #{}", job.id), Role::Muted));
+    let document = view.is_expanded(&key, all_details).then(|| {
         let mut body = Document::default();
-        body.line(job.location_label(), Role::Muted);
+        let mut location = job.location_label();
+        if let Some(since) = job.timing.since() {
+            let started = local_time(since, today, &Local, Precision::Seconds);
+            location.push_str(&format!(" · started {started}"));
+        }
+        body.line(location, Role::Muted);
         body.arguments(hints);
         let output = outputs.get(&job.id);
         if output.is_some() || job.error.is_some() {
@@ -164,7 +178,9 @@ pub(super) fn job_entry(
         );
         body
     });
-    Entry::card(key, header, document)
+    let mut entry = Entry::card(key, header, document);
+    entry.timing = job.timing;
+    entry
 }
 
 #[cfg(test)]
@@ -172,9 +188,54 @@ mod tests {
     use super::super::super::tool_view::Section;
     use super::super::clean;
     use super::super::tests::{header_text, job_info, loaded, root};
+    use super::super::{Tab, View};
     use super::*;
+    use crate::tui::format::Timing;
     use skyhook::job::JobRole;
     use skyhook::provider::protocol::ToolCall;
+
+    /// `job`'s card with every detail `open` or none.
+    fn card(job: &JobInfo, outputs: &OutputStore, open: bool) -> Entry {
+        let (agent, view) = (root(1), View::default());
+        let presentation = EntryView {
+            agent: &agent,
+            tab: Tab::Conversation,
+            view: &view,
+            all_details: open,
+            today: chrono::NaiveDate::default(),
+        };
+        job_entry(job, &Projection::default(), outputs, presentation)
+    }
+
+    #[test]
+    fn job_cards_time_their_run_and_show_when_it_started_once_expanded() {
+        let outputs = OutputStore::default();
+        let started = local_time(1_000, Default::default(), &Local, Precision::Seconds);
+        // A running job's counter is painted, never part of its header.
+        for (state, timing, time) in [
+            (JobState::Queued, Timing::Untimed, ""),
+            (JobState::Running, Timing::Since(1_000), ""),
+            (
+                JobState::Completed,
+                Timing::Took {
+                    since: 1_000,
+                    until: 4_200,
+                },
+                " · 3.2s",
+            ),
+        ] {
+            let job = JobInfo {
+                timing,
+                ..job_info(&root(5), 42, JobRole::Tool, state)
+            };
+            let entry = |open| card(&job, &outputs, open);
+            let header = header_text(entry(false).header().unwrap());
+            assert!(header.ends_with(&format!("{}{time} · #42", state_name(state))));
+            let expanded = entry(true).text().contains(&format!("started {started}"));
+            assert_eq!(expanded, timing != Timing::Untimed, "{state:?}");
+            assert_eq!(entry(false).timing, timing);
+        }
+    }
 
     fn has_code(entry: &Entry, test: impl Fn(&str) -> bool) -> bool {
         let sections = &entry.document().unwrap().sections;
@@ -206,7 +267,7 @@ mod tests {
         let kept = serde_json::json!({"items": [null, {"keep": false}]});
         for entry in [
             call_entry(EntryKey::UnsavedStatus(0), call, &agent, &projection, true),
-            job_entry(&job, &projection, &View::default(), &outputs, true),
+            card(&job, &outputs, true),
         ] {
             assert!(!entry.text().contains("absent") && !entry.text().contains("\"error\""));
             assert!(has_code(&entry, |source| source == "  literal null    \n"));
@@ -223,7 +284,6 @@ mod tests {
             error: Some("failed exactly".into()),
             ..job_info(&root(74), 42, JobRole::Tool, JobState::Failed)
         };
-        let projection = Projection::default();
         for output in [
             None,
             Some(serde_json::json!({"error": "failed exactly",
@@ -234,11 +294,11 @@ mod tests {
             if let Some(output) = output.clone() {
                 loaded(&mut outputs, job.id, output);
             }
-            let collapsed = job_entry(&job, &projection, &View::default(), &outputs, false);
+            let collapsed = card(&job, &outputs, false);
             assert_eq!(collapsed.text().lines().count(), 1);
             assert!(!collapsed.text().contains("failed exactly"));
             assert!(collapsed.document().is_none());
-            let expanded = job_entry(&job, &projection, &View::default(), &outputs, true);
+            let expanded = card(&job, &outputs, true);
             assert!(expanded.text().contains("Output\n  failed exactly"));
             assert_eq!(expanded.text().matches("failed exactly").count(), 1);
             assert!(!expanded.text().contains("Loading output"));

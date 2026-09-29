@@ -9,7 +9,7 @@ mod projection;
 mod requests;
 mod retry;
 
-pub use super::format::{Clean, clean, footer, number, pretty};
+pub use super::format::{Clean, Clock, Timing, clean, footer, number, pretty, span};
 pub use cache::ContentCache;
 pub use entries::entries;
 pub use jobs::{state_glyph, state_name, state_role, target_suffix};
@@ -210,7 +210,7 @@ pub struct Entry {
     key: EntryKey,
     body: EntryBody,
     pub surface: Surface,
-    pub running: bool,
+    pub timing: Timing,
     pub footer: Option<Clean>,
     pub indent: u16,
     /// Omit the separator before a related sibling tool or this script's first child.
@@ -310,7 +310,7 @@ impl Entry {
                 body,
             },
             surface,
-            running: false,
+            timing: Timing::Untimed,
             footer: None,
             indent: 0,
             compact_after: false,
@@ -344,6 +344,7 @@ impl Entry {
     pub(crate) fn request_entry(row: RequestRow) -> Self {
         let key = EntryKey::Request(row.sequence);
         Self {
+            timing: row.timing,
             body: EntryBody::Request {
                 text: row.metadata().join(" · "),
                 row,
@@ -358,6 +359,8 @@ pub struct EntryView<'a> {
     pub tab: Tab,
     pub view: &'a View,
     pub all_details: bool,
+    /// The local day, on which times show without their date.
+    pub today: chrono::NaiveDate,
 }
 
 #[cfg(test)]
@@ -429,6 +432,17 @@ mod tests {
 
         pub(super) fn agent(&self) -> AgentId {
             self.app.session().unwrap().root_agent().clone()
+        }
+
+        /// The journal replayed with each record `sequence` seconds past the epoch.
+        pub(super) fn stamped(&self) -> ObservationSnapshot {
+            let mut snapshot = ObservationSnapshot::default();
+            for record in self.snapshot.records.values() {
+                let mut record = record.clone();
+                record.timestamp_millis = record.sequence.get() as i64 * 1000;
+                update(&mut snapshot, RuntimeEvent::Record(Box::new(record)));
+            }
+            snapshot
         }
 
         pub(super) async fn record(&mut self, agent: &AgentId, event: SessionEvent) -> RecordSeq {
@@ -592,6 +606,7 @@ mod tests {
             state,
             location: skyhook::execution::ExecutionLocation::root("/workspace".into()),
             error: None,
+            timing: Timing::Untimed,
         }
     }
 }

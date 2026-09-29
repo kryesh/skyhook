@@ -117,6 +117,7 @@ impl JobManager {
         &self,
         id: JobId,
         change: JobChange,
+        dated: Dated,
         refused: fn(Rejected, JobId) -> JobError,
         settle: impl FnOnce(&mut JobEntry) -> T,
     ) -> Result<T, JobError> {
@@ -128,7 +129,8 @@ impl JobManager {
                 .map_err(|rejected| refused(rejected, id))?;
             entry.agent.clone()
         };
-        self.inner.store.append(agent, change.event(id)).await?;
+        let event = vec![(agent, change.event(id))];
+        self.inner.store.append_dated(event, dated).await?;
         self.apply_change(id, change, settle).await
     }
 
@@ -166,7 +168,13 @@ impl JobManager {
             "transition publication",
             move |manager| async move {
                 manager
-                    .journal_change(id, JobChange::Advance(state), Rejected::lifecycle, |_| ())
+                    .journal_change(
+                        id,
+                        JobChange::Advance(state),
+                        Dated::Now,
+                        Rejected::lifecycle,
+                        |_| (),
+                    )
                     .await
             },
         )
@@ -183,6 +191,16 @@ impl JobManager {
     }
 
     pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
+        self.finish_dated(id, outcome, Dated::Now).await
+    }
+
+    /// Finish a job, its outcome's record dated `dated`.
+    pub(super) async fn finish_dated(
+        &self,
+        id: JobId,
+        outcome: JobOutcome,
+        dated: Dated,
+    ) -> Result<(), JobError> {
         let operation = self.operation(id).await?.lock_owned().await;
         self.spawn_owned(
             operation,
@@ -250,9 +268,8 @@ impl JobManager {
                     .map_err(|error| JobError::Output(Box::new(error)))?;
                 }
                 finished.diagnostic = diagnostic.map(PartialDiagnostic::resolve);
-                manager
-                    .journal_change(id, JobChange::Finish(finished), Rejected::lifecycle, |_| ())
-                    .await
+                let finish = JobChange::Finish(finished);
+                (manager.journal_change(id, finish, dated, Rejected::lifecycle, |_| ())).await
             },
         )
         .await

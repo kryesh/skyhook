@@ -529,3 +529,54 @@ pub(super) fn disk_rendering(
     std::io::Seek::rewind(&mut file)?;
     Ok(Source::Temporary(file))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Read as _;
+
+    /// Source failures still fail the read and leave its cache reservation reusable.
+    #[tokio::test]
+    async fn rendering_source_errors_propagate_without_poisoning_the_cache() {
+        let (_root, manager, id) = super::super::tests::fixture(Some(json!({}))).await;
+        manager.drain_supervisors().await;
+        let output = manager.output(id);
+        let saved = Saved::load(&output).unwrap();
+        let field = FieldPointer::result().property("sequence");
+        let failed = disk_rendering(&saved, &field, |writer| {
+            Ok(json::write_sequence(b"invalid JSON".as_slice(), writer)?)
+        });
+        assert!(failed.is_err());
+        assert_eq!(output.db.rendering(id.get(), &field).unwrap(), None);
+        let mut source = disk_rendering(&saved, &field, |writer| {
+            Ok(json::write_sequence(b"[1]\n[2]".as_slice(), writer)?)
+        })
+        .unwrap();
+        assert!(matches!(source, Source::Capture(_)));
+        let value: Value = serde_json::from_reader(&mut source).unwrap();
+        assert_eq!(value, json!([[1], [2]]));
+        assert!(output.db.rendering(id.get(), &field).unwrap().is_some());
+    }
+
+    /// Closing forbids cache writes, not reading a field that has never been rendered.
+    #[tokio::test]
+    async fn closed_output_still_renders_without_writing_a_cache() {
+        let (_root, manager, id) =
+            super::super::tests::fixture(Some(json!({"text": "saved"}))).await;
+        manager.drain_supervisors().await;
+        let output = manager.output(id);
+        let saved = Saved::load(&output).unwrap();
+        manager.store().close().await.unwrap();
+        let field = FieldPointer::result().property("text");
+        let mut source = disk_rendering(&saved, &field, |writer| {
+            writer.write_all(b"saved")?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(matches!(source, Source::Temporary(_)));
+        let mut text = String::new();
+        source.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "saved");
+        assert_eq!(output.db.rendering(id.get(), &field).unwrap(), None);
+    }
+}

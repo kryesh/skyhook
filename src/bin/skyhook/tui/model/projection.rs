@@ -2,14 +2,14 @@
 
 use super::super::format::agent_label;
 use super::entries::Dep;
-use super::state_name;
+use super::{Timing, state_name};
 use serde_json::Value;
 use skyhook::agent::{AgentActivity, ObservationSnapshot, TodoItem, TurnFailure};
 use skyhook::execution::ExecutionLocation;
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobRole, JobState, JobTransition};
 use skyhook::provider::protocol::Usage;
-use skyhook::session::{MessageSeq, RecordSeq, SessionEvent};
+use skyhook::session::{MessageSeq, RecordSeq, SessionEvent, Turns};
 use skyhook::target::TargetRef;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ops::Bound;
@@ -40,6 +40,14 @@ pub enum AgentDisplayState {
 }
 
 impl AgentDisplayState {
+    /// A turn that ended without its answer, as its job would have ended.
+    pub fn stopped(failure: &TurnFailure) -> Self {
+        match failure {
+            TurnFailure::Interrupted => Self::Job(JobState::Interrupted),
+            TurnFailure::Cancelled | TurnFailure::Failed(_) => Self::Job(JobState::Failed),
+        }
+    }
+
     pub fn running(self) -> bool {
         matches!(
             self,
@@ -134,6 +142,8 @@ pub struct JobInfo {
     pub state: JobState,
     pub location: ExecutionLocation,
     pub error: Option<String>,
+    /// From its first run to its end; untimed while it has not run.
+    pub timing: Timing,
 }
 
 impl JobInfo {
@@ -166,6 +176,9 @@ pub struct Projection {
     pub(super) tool_origins: HashSet<(AgentId, MessageSeq, String)>,
     /// What records folded since the last `take_changes` touched.
     changes: HashSet<Dep>,
+    turns: Turns,
+    /// Each agent's most recently finished turn.
+    last_turn: HashMap<AgentId, Timing>,
 }
 impl Projection {
     pub fn jobs(&self) -> &BTreeMap<JobId, JobInfo> {
@@ -211,9 +224,17 @@ impl Projection {
 
     /// Every job state change goes through here, so the open index follows each
     /// transition, including a finished child resumed under its own job.
-    fn set_job_state(&mut self, job: JobId, state: JobState) -> Option<&mut JobInfo> {
+    fn set_job_state(&mut self, job: JobId, state: JobState, at: i64) -> Option<&mut JobInfo> {
         let info = self.jobs.get_mut(&job)?;
         info.state = state;
+        info.timing = match (state, info.timing) {
+            (JobState::Running | JobState::WaitingInput, Timing::Since(_)) => info.timing,
+            (JobState::Running | JobState::WaitingInput, _) => Timing::Since(at),
+            (state, Timing::Since(since)) if state.is_terminal() => {
+                Timing::Took { since, until: at }
+            }
+            (_, timing) => timing,
+        };
         let open = self.open_jobs.entry(info.agent.clone()).or_default();
         if state.is_terminal() {
             open.remove(&job);
@@ -221,6 +242,21 @@ impl Projection {
             open.insert(job);
         }
         Some(info)
+    }
+
+    /// An agent's clock: its turn while busy and not terminal, otherwise its owner
+    /// job's run, or for an agent no job owns (the root) its last finished turn.
+    /// Replay can leave a terminal agent busy after a crash.
+    pub fn timing(&self, agent: &AgentInfo, snapshot: &ObservationSnapshot) -> Timing {
+        match snapshot.activity.get(&agent.id) {
+            Some(activity) if !agent.terminal() && activity.state.is_busy() => {
+                Timing::Since(activity.since)
+            }
+            _ => match agent.owner.and_then(|job| self.jobs.get(&job)) {
+                Some(job) => job.timing,
+                None => (self.last_turn.get(&agent.id).copied()).unwrap_or(Timing::Untimed),
+            },
+        }
     }
 
     pub fn rebuild(&mut self, snapshot: &ObservationSnapshot) {
@@ -233,6 +269,11 @@ impl Projection {
                 .entry(record.agent.clone())
                 .or_default()
                 .push(record.sequence);
+            if let Some(since) = self.turns.observe(record, &snapshot.ledger) {
+                let until = record.timestamp_millis;
+                self.last_turn
+                    .insert(record.agent.clone(), Timing::Took { since, until });
+            }
             match &record.event {
                 SessionEvent::AgentStarted {
                     profile,
@@ -294,13 +335,14 @@ impl Projection {
                             state: JobState::Queued,
                             location: location.clone(),
                             error: None,
+                            timing: Timing::Untimed,
                         },
                     );
-                    self.set_job_state(*job, JobState::Queued);
+                    self.set_job_state(*job, JobState::Queued, record.timestamp_millis);
                 }
                 SessionEvent::JobStateChanged { job, state } => {
                     self.changes.insert(Dep::Job(*job));
-                    self.set_job_state(*job, (*state).into());
+                    self.set_job_state(*job, (*state).into(), record.timestamp_millis);
                     // Resuming a retained child reuses its owner job and does not
                     // emit AgentStarted again. Reopen its tree row on that job's
                     // Running event, not on ordinary model/tool activity updates.
@@ -327,13 +369,18 @@ impl Projection {
                         .find(|agent| agent.id == record.agent)
                         .map(|agent| agent.capabilities.iter().copied().collect())
                         .unwrap_or_else(skyhook::tool::policy::CapabilitySet::empty);
-                    if let Some(info) = self.set_job_state(*job, (*state).into()) {
+                    let at = record.timestamp_millis;
+                    if let Some(info) = self.set_job_state(*job, (*state).into(), at) {
                         info.error = diagnostic
                             .as_ref()
                             .map(|diagnostic| diagnostic.render(&capabilities));
                     }
                 }
-                SessionEvent::AgentCompleted | SessionEvent::AgentInterrupted => {
+                // Stopping the root ends its process, not the agent: a reopened
+                // session resumes it, and its activity says how.
+                SessionEvent::AgentCompleted | SessionEvent::AgentInterrupted
+                    if record.agent.parent().is_some() =>
+                {
                     self.complete_agent(&record.agent);
                 }
                 SessionEvent::ModelChanged { profile } => {
@@ -445,16 +492,17 @@ impl Projection {
         {
             return State::Waiting(WaitReason::ParentInput);
         }
-        match snapshot.activity.get(&agent.id) {
+        match snapshot
+            .activity
+            .get(&agent.id)
+            .map(|activity| &activity.state)
+        {
             Some(AgentActivity::Working) => State::Working,
             Some(AgentActivity::Reconnecting { attempt }) => {
                 State::Reconnecting { attempt: *attempt }
             }
             Some(AgentActivity::Compacting) => State::Compacting,
-            Some(AgentActivity::Stopped(TurnFailure::Interrupted)) => {
-                State::Job(JobState::Interrupted)
-            }
-            Some(AgentActivity::Stopped(_)) => State::Job(JobState::Failed),
+            Some(AgentActivity::Stopped(failure)) => State::stopped(failure),
             Some(AgentActivity::WaitingChildren) => State::Waiting(WaitReason::Child),
             activity => {
                 let open = self.open_jobs.get(&agent.id).into_iter().flatten();
@@ -488,6 +536,7 @@ impl Projection {
 mod tests {
     use super::super::tests::{Journal, created, finished};
     use super::*;
+    use skyhook::agent::ObservedActivity;
 
     fn agent(id: AgentId) -> AgentInfo {
         AgentInfo {
@@ -505,6 +554,149 @@ mod tests {
     fn changed(id: u64, state: JobTransition) -> SessionEvent {
         let job = JobId::new(id).unwrap();
         SessionEvent::JobStateChanged { job, state }
+    }
+
+    /// A journal whose projection folds each record, stamped `sequence` seconds in.
+    struct Folded {
+        journal: Journal,
+        projection: Projection,
+    }
+
+    impl Folded {
+        async fn new() -> Self {
+            let (journal, projection) = (Journal::new().await, Projection::default());
+            Self {
+                journal,
+                projection,
+            }
+        }
+
+        /// Record `event` on the root and fold it, returning when it landed.
+        async fn step(&mut self, event: SessionEvent) -> i64 {
+            let root = self.journal.agent();
+            let at = self.journal.record(&root, event).await.get() as i64 * 1000;
+            self.projection.rebuild(&self.journal.stamped());
+            at
+        }
+
+        fn timing(&self, job: u64) -> Timing {
+            self.projection.jobs()[&JobId::new(job).unwrap()].timing
+        }
+    }
+
+    /// An agent no job owns (the root) shows its last finished turn once idle,
+    /// so a resumed session's root has a time before it does anything.
+    #[tokio::test]
+    async fn an_idle_root_shows_its_last_turn() {
+        use skyhook::session::{AttemptRef, CompletedOutcome};
+        let mut journal = Journal::new().await;
+        let root = journal.agent();
+        let mut projection = Projection::default();
+        let request = journal.request(&root, None).await.request;
+        let answer = skyhook::provider::protocol::AssistantItem::text("text", 0, "done");
+        let message = SessionEvent::MessageCommitted {
+            message: skyhook::session::Message::Assistant(vec![answer]),
+        };
+        let message = journal.record(&root, message).await.message();
+        let completed = SessionEvent::ResponseCompleted {
+            attempt: AttemptRef {
+                request,
+                attempt: 1,
+            },
+            message,
+            outcome: CompletedOutcome::Answer,
+        };
+        let until = journal.record(&root, completed).await.get() as i64 * 1000;
+        let mut snapshot = journal.stamped();
+        projection.rebuild(&snapshot);
+        // A root's turn end isn't journaled: the resumed runtime reports it idle.
+        let idle = ObservedActivity {
+            state: AgentActivity::Idle,
+            since: until,
+        };
+        snapshot.activity.insert(root.clone(), idle);
+        let since = RecordSeq::from(request).get() as i64 * 1000;
+        let took = Timing::Took { since, until };
+        assert_eq!(projection.timing(&agent(root), &snapshot), took);
+    }
+
+    /// A job is timed from its first run to its end, through waits for input, and
+    /// again from a resumed run; one that never ran stays untimed. An agent shows
+    /// its turn while busy and its owner job's run otherwise.
+    #[tokio::test]
+    async fn jobs_time_their_run_and_agents_their_turn_or_job() {
+        use JobTransition::{AwaitingApproval, Running, WaitingInput};
+        let mut folded = Folded::new().await;
+        let id = folded.journal.agent().child(1);
+        let mut child = agent(id.clone());
+        child.owner = JobId::new(1).ok();
+        for event in [
+            created(1, "agent", JobRole::Agent),
+            changed(1, AwaitingApproval),
+        ] {
+            folded.step(event).await;
+            assert_eq!(folded.timing(1), Timing::Untimed);
+        }
+        let since = folded.step(changed(1, Running)).await;
+        for transition in [WaitingInput, Running] {
+            folded.step(changed(1, transition)).await;
+            assert_eq!(folded.timing(1), Timing::Since(since));
+        }
+        let until = folded.step(finished(1)).await;
+        let took = Timing::Took { since, until };
+        assert_eq!(folded.timing(1), took);
+        let mut snapshot = folded.journal.stamped();
+        assert_eq!(folded.projection.timing(&child, &snapshot), took);
+        let working = ObservedActivity {
+            state: AgentActivity::Working,
+            since: 7,
+        };
+        snapshot.activity.insert(id, working);
+        assert_eq!(
+            folded.projection.timing(&child, &snapshot),
+            Timing::Since(7)
+        );
+        // A crash before its completion record leaves a finished child's replayed
+        // activity busy: its finished owner job still times it.
+        child.lifecycle = AgentLifecycle::Terminal {
+            grace_started: None,
+        };
+        assert_eq!(folded.projection.timing(&child, &snapshot), took);
+        let resumed = folded.step(changed(1, Running)).await;
+        assert_eq!(folded.timing(1), Timing::Since(resumed));
+
+        folded.step(created(2, "exec", JobRole::Tool)).await;
+        folded
+            .step(SessionEvent::JobFinished {
+                job: JobId::new(2).unwrap(),
+                state: skyhook::job::JobEnd::Cancelled,
+                diagnostic: None,
+                output_diagnostic: None,
+                images: Vec::new(),
+            })
+            .await;
+        assert_eq!(folded.timing(2), Timing::Untimed);
+    }
+
+    /// Closing a session stops its root, which a reopen resumes: the session shows
+    /// how it resumes, as the session list does before opening it, never completed.
+    #[tokio::test]
+    async fn a_stopped_root_resumes_rather_than_completing() {
+        use crate::tui::app::{
+            SlotKey,
+            tests::{fixture, push_record},
+        };
+        let (_root, mut app) = fixture().await;
+        let root = app.root_agent().clone();
+        push_record(&mut app, SessionEvent::AgentInterrupted).await;
+        let idle = ObservedActivity {
+            state: AgentActivity::Idle,
+            since: 0,
+        };
+        app.snapshot.activity.insert(root, idle);
+        app.refresh();
+        let peer = app.peer(SlotKey::default(), true);
+        assert_eq!(peer.state, AgentDisplayState::Ready);
     }
 
     fn status(
@@ -525,7 +717,8 @@ mod tests {
         let id = root.child(1);
         let mut agent = agent(id.clone());
         let mut projection = Projection::default();
-        let activity = |journal: &mut Journal, activity| {
+        let activity = |journal: &mut Journal, state| {
+            let activity = ObservedActivity { state, since: 0 };
             journal.snapshot.activity.insert(id.clone(), activity);
         };
         activity(&mut journal, AgentActivity::Reconnecting { attempt: 2 });
@@ -652,10 +845,13 @@ mod tests {
         assert_eq!(projection.visible(&root).count(), 0);
         assert_eq!(projection.visible(&child.child(2)).count(), 1);
         // Ordinary activity cannot reopen a completed agent with a waiting owner.
-        journal
-            .snapshot
-            .activity
-            .insert(child.clone(), AgentActivity::Working);
+        journal.snapshot.activity.insert(
+            child.clone(),
+            ObservedActivity {
+                state: AgentActivity::Working,
+                since: 0,
+            },
+        );
         projection.rebuild(&journal.snapshot);
         assert!(projection.agents[0].terminal());
         journal

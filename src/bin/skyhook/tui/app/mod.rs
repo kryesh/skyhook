@@ -1,7 +1,7 @@
 pub use events::{Hit, Work};
 pub use input::InputTarget;
 use lifecycle::{PendingStart, StartState};
-pub use menus::{ConfirmAction, Item, ItemRef, MenuId, MenuKind, Overlay, SessionRef};
+pub use menus::{ConfirmAction, Item, ItemRef, MenuId, MenuKind, Overlay, SavedState, SessionRef};
 use prompts::UiPrompt;
 use queue::{QueueDelivery, RowState};
 pub use queue::{QueuedInput, QueuedInputId};
@@ -20,7 +20,7 @@ use output::{LoadedOutput, OutputAttempt};
 mod prompts;
 mod queue;
 mod session;
-pub use session::{HostRequest, Peer, SlotKey};
+pub use session::{HostRequest, Peer, PeerSession, SlotKey};
 
 use super::{
     Launch,
@@ -42,7 +42,7 @@ use skyhook::{
     },
     identity::{AgentId, JobId, SessionId},
     job::JobOutputQuery,
-    session::{EventRecord, Message, RecordSeq, SessionEvent},
+    session::{EventRecord, Message, RecordSeq, SessionEvent, SessionTitle},
 };
 use std::{
     collections::{HashMap, VecDeque},
@@ -170,7 +170,7 @@ pub struct App {
     pub overlay: Option<Overlay>,
     /// Taken by the host after each event.
     pub host: Option<HostRequest>,
-    /// Every open session, this one included; kept current by the host.
+    /// Every open session not closing, this one included; kept current by the host.
     pub peers: Vec<Peer>,
     next_menu_id: MenuId,
     // Pending attachment reads belong to one composer draft, not the next submission/session.
@@ -179,7 +179,10 @@ pub struct App {
     pub status: super::status::StatusLog,
     // UI-only notices, including startup diagnostics and failed status writes.
     unsaved_status: Vec<(AgentId, String)>,
-    stopping: bool,
+    /// The session's title as the session list shows it.
+    pub title: Option<SessionTitle>,
+    title_ticket: Token,
+    pub stopping: bool,
     pub animating: bool,
     pub details: bool,
     pub outputs: OutputStore,
@@ -190,9 +193,14 @@ pub struct App {
     pub toast: Option<(String, Instant)>,
     pub dirty: bool,
     pub content_dirty: bool,
+    /// The composer's first shown row while scrolled away from the cursor; none
+    /// follows the cursor.
+    pub composer_scroll: Option<usize>,
     content_revision: u64,
     pub(super) content_cache: model::ContentCache,
     pub tick_count: usize,
+    /// The wall time timings are shown at, advanced each tick.
+    pub clock: model::Clock,
     pub exit: bool,
     pub clipboard: Option<String>,
     pub hits: Vec<(Rect, Hit)>,
@@ -285,6 +293,8 @@ impl App {
             draft_ticket: Token::default(),
             status: super::status::StatusLog::new(tx.clone()),
             unsaved_status: Vec::new(),
+            title: None,
+            title_ticket: Token::default(),
             stopping: false,
             animating: false,
             details: false,
@@ -296,9 +306,11 @@ impl App {
             toast: None,
             dirty: true,
             content_dirty: true,
+            composer_scroll: None,
             content_revision: 0,
             content_cache: model::ContentCache::default(),
             tick_count: 0,
+            clock: model::Clock::now(),
             exit: false,
             clipboard: None,
             hits: vec![],
@@ -323,6 +335,7 @@ impl App {
             app.select_mode(&mode);
         }
         app.show_warnings();
+        app.load_title();
         app
     }
 }
@@ -495,6 +508,27 @@ pub(super) mod tests {
         app.tx = tx;
         rx
     }
+    /// Observe records until a title change, which is returned.
+    pub(super) async fn next_title_change(app: &mut App) -> SessionEvent {
+        bounded(async {
+            loop {
+                let event = app.recv_observation().await.expect("observation open");
+                let title = match &event.event {
+                    RuntimeEvent::Record(record) => matches!(
+                        record.event,
+                        SessionEvent::TitleSet { .. } | SessionEvent::TitleCleared
+                    )
+                    .then(|| record.event.clone()),
+                    _ => None,
+                };
+                app.observe(event);
+                if let Some(title) = title {
+                    return title;
+                }
+            }
+        })
+        .await
+    }
     pub(super) async fn next_lifecycle(rx: &mut mpsc::UnboundedReceiver<Work>) -> Work {
         bounded(async {
             loop {
@@ -617,29 +651,13 @@ pub(super) mod tests {
         let row = app.entries().iter().position(|e| e.job_id() == Some(job));
         app.view().row = row.unwrap();
     }
-    /// Reopen a session once the agent loops of its previous handle release it.
-    pub(super) async fn reopen(app: &App, id: SessionId) -> SessionHandle {
-        bounded(async {
-            loop {
-                match app.launch.create(Some(id)).await {
-                    Ok(session) => break session,
-                    Err(crate::launch::LaunchError::Harness(
-                        skyhook::agent::HarnessError::Session(
-                            skyhook::session::SessionError::AlreadyOpen(_),
-                        ),
-                    )) => {
-                        tokio::time::sleep(Duration::from_millis(1)).await;
-                    }
-                    Err(error) => panic!("could not reopen session: {error}"),
-                }
-            }
-        })
-        .await
-    }
     /// Startup warnings are shown once, survive rebuilds and are never journaled.
     async fn assert_startup_warnings_ui_only(app: &mut App) {
         let session = app.session().unwrap().clone();
-        let warnings = session.startup_warnings().to_vec();
+        let warnings: Vec<_> = (session.warnings().iter())
+            .chain(session.startup_warnings())
+            .cloned()
+            .collect();
         assert!(!warnings.is_empty());
         let root = session.root_agent().clone();
         for warning in &warnings {
@@ -693,10 +711,11 @@ pub(super) mod tests {
         draft.session_started(PreparedObservation::subscribe(session.clone()).await);
         assert_startup_warnings_ui_only(&mut draft).await;
         session.shutdown().await.unwrap();
+        session.close().await.unwrap();
         let mut resumed = draft.sibling(None, draft.launch.clone(), draft.tx.clone());
         drop((initial, draft, session));
 
-        let session = reopen(&resumed, id).await;
+        let session = resumed.launch.create(Some(id)).await.unwrap();
         attach(&mut resumed, session).await;
         assert_startup_warnings_ui_only(&mut resumed).await;
         resumed.session().unwrap().shutdown().await.unwrap();

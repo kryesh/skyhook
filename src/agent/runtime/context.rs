@@ -424,7 +424,10 @@ mod tests {
             sender.send(input).await.unwrap();
             if !fail {
                 script.request(0).await;
-                session.runtime.interrupt_tree(&child).await;
+                session
+                    .runtime
+                    .interrupt_tree(&child, CancelScope::Outcome)
+                    .await;
             }
             assert!(received.await.unwrap().is_err());
             let context = ContextId::from(&child);

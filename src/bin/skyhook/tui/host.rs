@@ -63,6 +63,9 @@ pub struct Host {
     /// Peers are summarized on each tick, or at once when the slots change.
     peers_due: bool,
     opening: Vec<SessionId>,
+    /// Sessions asked for while a closing slot still holds their lock, with who
+    /// asked: opened once that slot is gone.
+    waiting: Vec<(SessionId, (SlotKey, u64))>,
     opened_tx: mpsc::UnboundedSender<Opened>,
     opened: mpsc::UnboundedReceiver<Opened>,
 }
@@ -90,6 +93,7 @@ impl Host {
             quitting: false,
             peers_due: true,
             opening: Vec::new(),
+            waiting: Vec::new(),
             opened_tx,
             opened,
         };
@@ -141,9 +145,12 @@ impl Host {
         self.peers_due = true;
         if previous != index && previous < self.slots.len() {
             self.slots[index].app.sidebar = self.slots[previous].app.sidebar;
-            if self.slots[previous].app.untouched() {
+            let left = &mut self.slots[previous].app;
+            if left.untouched() {
                 self.slots.remove(previous);
                 self.active -= usize::from(previous < index);
+            } else if left.settled() {
+                left.shutdown();
             }
         }
         self.app().dirty = true;
@@ -226,6 +233,11 @@ impl Host {
                     self.app().toast("Session opened");
                 }
             }
+            // Only the toast: the session on screen is not what failed to open.
+            Err(error) if error.already_open() => {
+                self.app()
+                    .toast("Session is open in another Skyhook instance");
+            }
             Err(error) => self.app().local_notice(error.to_string()),
         }
     }
@@ -235,14 +247,15 @@ impl Host {
             Some(HostRequest::New) if !self.app().untouched() => self.draft(),
             Some(HostRequest::New) | None => {}
             Some(HostRequest::Activate(key)) => {
-                if let Some(index) = self.slots.iter().position(|slot| slot.key == key) {
+                let live = |slot: &Slot| slot.key == key && !slot.app.stopping;
+                if let Some(index) = self.slots.iter().position(live) {
                     self.activate(index);
                 }
             }
             Some(HostRequest::Open(id)) => self.open(id),
             Some(HostRequest::Quit) => self.quit(),
         }
-        if !self.quitting && self.slots.iter().all(|slot| slot.app.exit) {
+        if !self.quitting && self.app().exit && self.slots.iter().all(|slot| slot.app.stopping) {
             // Closing the last session leaves a fresh draft, not an empty screen.
             self.draft();
         }
@@ -255,14 +268,24 @@ impl Host {
         match self.slots.iter().position(|slot| slot.key == active) {
             Some(index) => self.active = index,
             None => {
-                self.active = self.active.min(self.slots.len() - 1);
+                let live = self.slots.iter().position(|slot| !slot.app.stopping);
+                self.active = live.unwrap_or_default();
                 self.app().sidebar = sidebar;
                 self.app().dirty = true;
             }
         }
+        // Launching reads the active slot, so only once `active` is valid again.
+        if !self.quitting {
+            let slots = &self.slots;
+            let held = |id| slots.iter().any(|slot| slot.app.session_id() == Some(id));
+            let released: Vec<_> = (self.waiting.extract_if(.., |(id, _)| !held(*id))).collect();
+            for (id, from) in released {
+                self.launch(id, from);
+            }
+        }
         if std::mem::take(&mut self.peers_due) {
             let current = self.key();
-            let peers = self.slots.iter();
+            let peers = self.slots.iter().filter(|slot| !slot.app.stopping);
             let peers: Vec<_> = peers
                 .map(|slot| slot.app.peer(slot.key, slot.key == current))
                 .collect();
@@ -275,16 +298,25 @@ impl Host {
         true
     }
     fn open(&mut self, id: SessionId) {
-        let live = |slot: &Slot| slot.app.session_id() == Some(id);
-        if let Some(index) = self.slots.iter().position(live) {
+        let holds = |slot: &Slot| slot.app.session_id() == Some(id);
+        let held = self.slots.iter().position(holds);
+        if let Some(index) = held
+            && !self.slots[index].app.stopping
+        {
             return self.activate(index);
         }
         self.app().toast("Opening session…");
-        if self.opening.contains(&id) {
+        if self.opening.contains(&id) || self.waiting.iter().any(|(waiting, _)| *waiting == id) {
             return;
         }
-        self.opening.push(id);
         let from = (self.key(), self.app().editor.revision());
+        match held {
+            Some(_) => self.waiting.push((id, from)),
+            None => self.launch(id, from),
+        }
+    }
+    fn launch(&mut self, id: SessionId, from: (SlotKey, u64)) {
+        self.opening.push(id);
         let (launch, prompts) = with_prompts(self.app().launch.clone());
         let opened = self.opened_tx.clone();
         tokio::spawn(async move {
@@ -340,7 +372,8 @@ impl Host {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tui::{app::tests::draft_fixture, keys::Command};
+    use crate::tui::{app::tests::draft_fixture, editor::TextField, keys::Command};
+    use skyhook::session::SessionStore;
 
     async fn host() -> (tempfile::TempDir, Host) {
         let (root, draft) = draft_fixture().await;
@@ -352,6 +385,7 @@ mod tests {
     async fn saved(host: &mut Host) -> SessionId {
         let session = host.app().launch.create(None).await.unwrap();
         session.shutdown().await.unwrap();
+        session.close().await.unwrap();
         session.id()
     }
     /// Pump events until `done`; false when the host closed first.
@@ -371,55 +405,142 @@ mod tests {
     fn live(host: &Host, id: SessionId) -> bool {
         host.slots.iter().any(|s| s.app.session_id() == Some(id))
     }
-    /// Open `id` as a user would, again if its previous owner had not let go yet.
+    /// Open `id` as a user would.
     async fn open(host: &mut Host, id: SessionId) {
-        while !live(host, id) {
-            host.app().host = Some(HostRequest::Open(id));
-            let settled = |host: &Host| !host.opening.contains(&id);
-            assert!(drive(host, settled).await);
-        }
+        host.app().host = Some(HostRequest::Open(id));
+        assert!(drive(host, |host| live(host, id)).await);
     }
     fn sessions(host: &Host) -> Vec<Option<SessionId>> {
         host.slots.iter().map(|s| s.app.session_id()).collect()
     }
+    /// Choose `id` from the session switcher, which shows it locked. Only the
+    /// active slot's work is handled, so a closing slot keeps its lock meanwhile.
+    async fn choose_locked(host: &mut Host, id: SessionId) {
+        use crate::tui::app::{MenuKind, SavedState, SessionRef};
+        use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
+        host.app().command(Command::Sessions);
+        let slot = &mut host.slots[host.active];
+        let row = SessionRef::Saved(id, SavedState::Locked);
+        let row = crate::tests::bounded(async {
+            loop {
+                let work = slot.work.recv().await.expect("work channel open");
+                slot.app.work(work);
+                if let Some(MenuKind::Sessions(items)) = slot.app.menu().map(|menu| &menu.kind)
+                    && !items.is_empty()
+                {
+                    break items.iter().position(|item| item.value == row);
+                }
+            }
+        })
+        .await;
+        slot.app.menu_mut().unwrap().selected = row.expect("a locked row");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        slot.app.event(Event::Key(enter));
+    }
 
+    /// Switching away keeps a session only while there is something to come back
+    /// to; one left settled is closed, freeing its lock for the saved list.
     #[tokio::test]
-    async fn sessions_open_alongside_each_other_and_close_one_at_a_time() {
+    async fn switching_away_closes_only_settled_sessions() {
         let (_root, mut host) = host().await;
+        let sessions_root = host.app().launch.sessions.clone();
         let (first, second) = (saved(&mut host).await, saved(&mut host).await);
         open(&mut host, first).await;
-        // The untouched draft made way; an open session does not.
+        // The untouched draft made way.
         assert_eq!(sessions(&host), [Some(first)]);
+        // An unsent draft keeps a session open beside the next.
+        host.app().editor.set("unsent".into());
         open(&mut host, second).await;
         assert_eq!(sessions(&host), [Some(first), Some(second)]);
         assert_eq!(host.app().session_id(), Some(second));
         assert_eq!(host.app().peers.len(), 2);
-        // Opening a live session again only brings it forward.
+        // Opening a live session again only brings it forward, and the settled one
+        // left behind is closed.
         host.app().host = Some(HostRequest::Open(first));
         host.settle();
         assert_eq!(host.app().session_id(), Some(first));
-        assert_eq!(host.slots.len(), 2);
+        assert!(drive(&mut host, |host| sessions(host) == [Some(first)]).await);
+        assert!(!SessionStore::is_open(&sessions_root, second).await.unwrap());
 
         host.app().command(Command::New);
-        assert!(drive(&mut host, |host| host.slots.len() == 3).await);
+        assert!(drive(&mut host, |host| host.slots.len() == 2).await);
         assert!(host.app().untouched());
         host.app().command(Command::New);
         host.settle();
-        assert_eq!(host.slots.len(), 3, "an untouched draft is reused");
-
-        let key = host.slots[1].key;
+        assert_eq!(host.slots.len(), 2, "an untouched draft is reused");
+        let key = host.slots[0].key;
         host.app().host = Some(HostRequest::Activate(key));
         host.settle();
-        assert_eq!(sessions(&host), [Some(first), Some(second)]);
+        assert_eq!(sessions(&host), [Some(first)]);
+
         host.app().command(Command::Close);
-        let closed = |host: &Host| sessions(host) == [Some(first)];
-        assert!(drive(&mut host, closed).await);
+        assert!(drive(&mut host, |host| sessions(host) == [None]).await);
         // Closing released the session: it can be opened again.
-        open(&mut host, second).await;
+        open(&mut host, first).await;
 
         host.app().command(Command::Exit);
         assert!(!drive(&mut host, |_| false).await);
         assert!(host.slots.is_empty());
+        host.close().await.unwrap();
+    }
+
+    /// A session being closed is gone as far as switching goes: choosing it again,
+    /// though the switcher shows it locked meanwhile, opens it afresh once the
+    /// closing slot lets go of it.
+    #[tokio::test]
+    async fn a_closing_session_is_reopened_not_brought_back() {
+        let (_root, mut host) = host().await;
+        let (first, second) = (saved(&mut host).await, saved(&mut host).await);
+        open(&mut host, first).await;
+        host.app().editor.set("unsent".into());
+        open(&mut host, second).await;
+        let closing = host.key();
+        host.app().host = Some(HostRequest::Open(first));
+        host.settle();
+        assert!(host.slots[1].app.stopping);
+        assert_eq!(host.app().peers.len(), 1);
+        host.app().host = Some(HostRequest::Activate(closing));
+        host.settle();
+        assert_eq!(host.app().session_id(), Some(first));
+        // Still holding its lock, it is listed as locked; choosing it waits.
+        choose_locked(&mut host, second).await;
+        host.settle();
+        assert_eq!(host.app().session_id(), Some(first));
+
+        let reopened = |host: &Host| host.slots[host.active].app.session_id() == Some(second);
+        assert!(drive(&mut host, reopened).await);
+        assert_ne!(host.key(), closing);
+        assert_eq!(sessions(&host), [Some(first), Some(second)]);
+        host.quit();
+        assert!(!drive(&mut host, |_| false).await);
+        host.close().await.unwrap();
+    }
+
+    /// Reopening waits the same when the closing slot sits before the active one, so
+    /// removing it shifts the active slot's place.
+    #[tokio::test]
+    async fn a_closing_session_before_the_active_one_is_reopened() {
+        let (_root, mut host) = host().await;
+        let (first, second) = (saved(&mut host).await, saved(&mut host).await);
+        open(&mut host, first).await;
+        host.app().editor.set("unsent".into());
+        open(&mut host, second).await;
+        host.app().editor.set("unsent".into());
+        host.app().host = Some(HostRequest::Activate(host.slots[0].key));
+        host.settle();
+        // With its draft gone the first session is settled: leaving it closes it.
+        host.app().editor.set(String::new());
+        host.app().host = Some(HostRequest::Activate(host.slots[1].key));
+        host.settle();
+        assert!(host.slots[0].app.stopping && host.active == 1);
+        host.app().host = Some(HostRequest::Open(first));
+        host.settle();
+
+        let reopened = |host: &Host| host.slots[host.active].app.session_id() == Some(first);
+        assert!(drive(&mut host, reopened).await);
+        assert_eq!(sessions(&host), [Some(second), Some(first)]);
+        host.quit();
+        assert!(!drive(&mut host, |_| false).await);
         host.close().await.unwrap();
     }
 
@@ -450,11 +571,38 @@ mod tests {
         host.close().await.unwrap();
     }
 
+    /// A session another instance holds fails to open with a toast alone: the
+    /// session on screen keeps its draft and gains no notice.
+    #[tokio::test]
+    async fn a_session_open_elsewhere_is_only_toasted() {
+        let (_root, mut host) = host().await;
+        let id = saved(&mut host).await;
+        let sessions_root = host.app().launch.sessions.clone();
+        let _elsewhere = SessionStore::open(&sessions_root, id).await.unwrap();
+        host.app().editor.set("unsent".into());
+        choose_locked(&mut host, id).await;
+        assert!(drive(&mut host, |host| !host.opening.contains(&id)).await);
+        assert_eq!(sessions(&host), [None]);
+        assert_eq!(host.app().editor.text(), "unsent");
+        let toast = host
+            .app()
+            .toast
+            .as_ref()
+            .map(|(message, _)| message.as_str());
+        assert_eq!(toast, Some("Session is open in another Skyhook instance"));
+        assert!(!crate::tui::app::tests::draw(host.app()).contains("Status ·"));
+        host.quit();
+        assert!(!drive(&mut host, |_| false).await);
+        host.close().await.unwrap();
+    }
+
     #[tokio::test]
     async fn a_background_prompt_stays_with_its_session_and_is_announced() {
         let (_root, mut host) = host().await;
         let (first, second) = (saved(&mut host).await, saved(&mut host).await);
         open(&mut host, first).await;
+        // A draft keeps the first session open once the second is on screen.
+        host.app().editor.set("unsent".into());
         open(&mut host, second).await;
         let background = host.slots[0].app.session().unwrap().clone();
         let script = tokio::spawn(async move {

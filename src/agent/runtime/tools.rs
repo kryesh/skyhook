@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     agent::{ModelEntry, Question, ReplaceError, TodoItem},
+    job::CancelScope,
     provider::profile::ModelRef,
     session::UserPart,
     tool::{
@@ -473,7 +474,7 @@ async fn run_child_request(
                     Ok(value) => value,
                     Err(error) => {
                         runtime.questions.cancel_child_question(context.job()).await;
-                        runtime.interrupt_tree(child).await;
+                        runtime.interrupt_tree(child, CancelScope::Outcome).await;
                         return Err(failure(Operation::Receive, Effects::Started)(error));
                     }
                 };

@@ -620,7 +620,13 @@ mod tests {
         let pending =
             tokio::spawn(async move { executor.run_host(&agent, "fetch", arguments).await });
         server.request().await;
-        assert_eq!(runtime.jobs.cancel_all(&runtime.agent).await, 1);
+        assert_eq!(
+            runtime
+                .jobs
+                .cancel_all(&runtime.agent, crate::job::CancelScope::Outcome)
+                .await,
+            1
+        );
         let result = crate::tests::bounded(pending).await;
         assert!(result.unwrap().is_err());
         drop(server);

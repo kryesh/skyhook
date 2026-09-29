@@ -15,10 +15,13 @@ The agent tree appears above the composer while children are active or a child a
 viewed. Click an agent to inspect its conversation without mixing its output with other agents.
 Each agent retains its reading position and expanded rows. Agents using the `wait` tool show
 **Waiting** rather than **Running tools**. Tree rows show `@target` for remote agents and their
-own token totals and context usage: output · input (uncached) · context.
+own token totals, context usage and time: output · input (uncached) · context · time. The time is
+how long a busy agent's current turn has run; once it isn't busy, how long a child ran its job, or
+how long the root agent's last turn took.
 Agent call previews show the child's target even while queued or running; an omitted target
 inherits the caller's target. Completed final replies identify the model that answered in a
-footer below the reply.
+footer below the reply, with how long that response took and, when tool rounds came first, how
+long the whole turn took.
 
 The composer always sends to the root agent. While root is busy, Enter queues a follow-up
 for its next model request, without interrupting the current request or tools. It does not wait
@@ -35,19 +38,20 @@ discarded when its session is closed.
 `/retry` continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
 which agent is selected. Parents with pending waits stay in those waits.
-Automatic model retries display the attempt number, next delay, and latest diagnostic in one
-error block. Partial output from the failed attempt clears when the next attempt starts;
-successful replies have no retry labels. Retries continue until success or cancellation for
-[transient model failures](../configuration/providers-and-models.md#model-failure-recovery).
+Automatic model retries display the attempt number, a countdown to the next attempt, and the
+latest diagnostic in one error block. Partial output from the failed attempt clears when the next
+attempt starts; successful replies have no retry labels. Retries continue until success or
+cancellation for [transient model failures](../configuration/providers-and-models.md#model-failure-recovery).
 
 The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
 tab, while reading positions and expanded rows remain separate for each agent. Requests include
-compaction requests and token summaries; transient retries appear under the same request, which
-reads **Retrying** while the next attempt is pending. Full request bodies are available in the
-session log, not rendered in the UI. Status messages, including
-skill warnings, interruptions, and errors, appear in the conversation and are saved with the
-session, but are not sent to the model. Connection and MCP startup warnings describe this
-installation rather than the session, so they are shown but not saved.
+compaction requests, when each was sent, token summaries, and how long each took; transient
+retries appear under the same request, which reads **Retrying** while the next attempt is pending.
+Full request bodies are available in the session log, not rendered in the UI. Status messages,
+such as interruptions and errors, appear in the conversation and are saved with the session, but
+are not sent to the model. Startup warnings (skills, configuration, connections and MCP servers)
+describe this installation rather than the session, so the terminal shows them but does not save
+them.
 
 Job output is paged and searchable without acknowledging the agent's pending notifications.
 Select a job and press `o` for output fields, regex search, and the next page; `c` requests
@@ -60,7 +64,12 @@ Provider-supplied reasoning streams in a separate expanded block and collapses w
 starts or the response finishes. Click a multi-line block or press Enter when selected to reopen
 it, including after resuming a session. Single-line reasoning stays inline without an
 expand/collapse control and is not selectable, even when it wraps in a narrow terminal.
-Spinners indicate that a request is still active.
+Spinners indicate that work is still active, and a counter at the end of the row shows for how
+long. The working indicator counts the whole turn, across model requests and tool rounds;
+streaming reasoning counts from its request. Running tool calls count up and keep their duration
+once finished; expanding one shows when it started. A running tool waiting for input keeps its
+status symbol while its counter runs, and a retry counts down to its next attempt. Copied and
+exported text includes finished durations but not running counters.
 
 ## Model selection and UI state
 
@@ -85,7 +94,8 @@ The interface stores the last submitted model and mode and the sidebar setting i
 `.skyhook/state.json`, beside its sessions, without changing the model configuration.
 Session titles are saved with their history.
 
-A sidebar beside the conversation lists each configured MCP server with its startup status and the
+A sidebar beside the conversation shows the session's title on its first line; click it to rename
+the session. Below, it lists each configured MCP server with its startup status and the
 viewed agent's todos, with the viewed agent's capabilities pinned to its bottom. For the root agent
 these are what the mode of the next message grants. A section with nothing to list
 is left out, title included. The sidebar is shown by default; `Ctrl+X B` or `/sidebar` toggles it.
@@ -110,6 +120,7 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | --- | --- |
 | `Ctrl+P`, `/` | Commands |
 | `Ctrl+X N`, `Ctrl+X S`, `Ctrl+X W` | New session, switch session, close session |
+| `Ctrl+X L`, `/rename` | Rename the session |
 | `Ctrl+X M`, `/model` | Model for subsequent user messages |
 | `Ctrl+X A` | Agent picker |
 | `Ctrl+X I`, `/queue` | Edit queued follow-ups |
@@ -127,13 +138,13 @@ The command palette and `/help` also list these shortcuts. `Ctrl+X` is a leader:
 | Click a pane | Focus composer, tree, or conversation |
 | `Enter` | Send/queue, select, expand |
 | `Alt+Enter`, `Ctrl+J`, supported `Shift+Enter` | Newline |
-| `PageUp`, `PageDown` | Scroll history |
+| `PageUp`, `PageDown` | Scroll history; page through a draft taller than its box |
 | `Ctrl+Alt+U`, `Ctrl+Alt+D` | Half-page scrolling |
 | `Home`, `End` in content | Beginning, latest |
 | `/`, `n`, `N` in content | Search, next/previous match |
 | `[`, `]` in content | Previous/next inspector tab |
 | `Esc` | Close local UI, dismiss/cancel prompts, otherwise interrupt work, cancelling the running foreground tool |
-| `Ctrl+C` | Clear draft, otherwise interrupt (as `Esc`)/quit |
+| `Ctrl+C` | Clear draft, otherwise interrupt (as `Esc`)/quit; in a prompt, clear its text, otherwise as `Esc` |
 | `Ctrl+X H`, `/help` | Help and shortcuts |
 | `Ctrl+X Q` | Quit |
 
@@ -147,10 +158,11 @@ Type `/` in an empty composer to open the command palette. Search by command nam
 The command palette omits navigation-only actions; the `Ctrl+X` arrows step through
 agents and inspector tabs. Click the conversation, or pick an agent with `Ctrl+X A`, to focus it.
 Menus use arrows, mouse hover, the mouse wheel, or `Ctrl+P/N`; Enter or Tab activates
-the selected item. The Agents
-palette labels its Output, Input (uncached), and Context statistics. The composer
+the selected item. The Agents palette labels its Status column and its Output, Input (uncached),
+Context, and Time statistics. The composer
 wraps at word boundaries and grows with its draft up to half the space between the top and
-bottom bars, then scrolls to follow the cursor. It supports word movement, selection, `Ctrl+A/E`,
+bottom bars, then scrolls to follow the cursor; the mouse wheel over a taller draft scrolls it
+without moving the cursor. It supports word movement, selection, `Ctrl+A/E`,
 `Ctrl+W`, `Ctrl+U/K`, undo with `Ctrl+Z` or `Ctrl+-`, and redo with `Ctrl+Y`, `Ctrl+Shift+Z` or
 `Ctrl+.`. `Home`/`End` move to the start/end of the line, and `Ctrl+Home`/`Ctrl+End` to the
 start/end of the draft. Up/Down move through displayed input rows; in an empty composer they
@@ -180,6 +192,11 @@ Submitting a new prompt rejects any pending question batches; those batches can 
 For background questions and SSH authentication/askpass prompts, `Esc` cancels the request;
 cancelled requests cannot be reopened. SSH authentication prompts take priority over questions,
 permissions, menus, and search; interrupted question drafts resume afterward.
+
+Renaming opens a prompt of its own, ahead of pending questions and permissions, with the title you
+set ready to edit, or empty while the title is automatic; the composer and its draft are left
+alone. `Enter` saves the title, and saving it empty returns the session to its automatic title.
+`Esc` cancels the rename. A draft has nothing to rename until its first message is sent.
 
 Within questions and permissions, `↑`/`↓` selects an answer, `PageUp`/`PageDown` scrolls
 the prompt text, and `Ctrl+PageUp`/`Ctrl+PageDown` scrolls long answer descriptions.

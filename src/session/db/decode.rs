@@ -142,13 +142,14 @@ pub(in crate::session) fn decode_records(
         db,
         by_entry: HashMap::new(),
     };
-    events.load("SELECT entry, kind, text FROM entry_text", |row| {
-        let text = row.get(2)?;
-        Ok(match enum_column(row, 1)? {
-            EntryKind::TitleSet => SessionEvent::TitleSet { title: text },
-            EntryKind::Status => SessionEvent::Status { message: text },
-            kind => return Err(corrupt(format!("{kind} entry has a text row"))),
-        })
+    events.load("SELECT entry, text FROM entry_text", |row| {
+        let message = row.get(1)?;
+        Ok(SessionEvent::Status { message })
+    })?;
+    events.load("SELECT entry, source, text FROM title", |row| {
+        let source = enum_column(row, 1)?;
+        let title = row.get(2)?;
+        Ok(SessionEvent::TitleSet { title, source })
     })?;
     contract::events(&mut events)?;
     messages.events(&mut events)?;
@@ -188,8 +189,10 @@ pub(in crate::session) fn decode_records(
             EntryKind::TodosReplaced => SessionEvent::TodosReplaced {
                 items: todos.get(&seq).cloned().unwrap_or_default(),
             },
+            EntryKind::SessionReopened => SessionEvent::SessionReopened,
             EntryKind::AgentCompleted => SessionEvent::AgentCompleted,
             EntryKind::AgentInterrupted => SessionEvent::AgentInterrupted,
+            EntryKind::TitleCleared => SessionEvent::TitleCleared,
             _ => events
                 .by_entry
                 .remove(&seq)

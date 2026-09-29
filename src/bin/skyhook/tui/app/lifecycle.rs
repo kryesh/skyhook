@@ -98,6 +98,7 @@ impl App {
         self.render.reset_session();
         self.reset_projection();
         self.show_warnings();
+        self.load_title();
         if self.stopping {
             self.finish_shutdown();
             return;
@@ -198,12 +199,17 @@ impl App {
         let status = self.status.clone();
         tokio::spawn(async move {
             status.flush().await;
-            if let Some(session) = session
+            if let Some(session) = &session
                 && let Err(e) = session.shutdown().await
             {
                 notices.send(e.to_string());
             }
             status.flush().await;
+            // Closed before the host lets go of the slot, so it reopens at once;
+            // shutdown has reported any journal failure.
+            if let Some(session) = session {
+                let _ = session.close().await;
+            }
             let _ = tx.send(Work::Stopped);
         });
     }
@@ -303,9 +309,11 @@ mod tests {
         assert!(!session.warnings().is_empty());
         for warning in session.warnings() {
             let status = format!("Startup warning: {warning}");
-            assert!(snapshot.records.values().any(|record| matches!(
+            assert!(!snapshot.records.values().any(|record| matches!(
                 &record.event, SessionEvent::Status { message } if message == &status
             )));
+            let local = (session.root_agent().clone(), status);
+            assert!(app.unsaved_status.contains(&local));
         }
         session.shutdown().await.unwrap();
     }

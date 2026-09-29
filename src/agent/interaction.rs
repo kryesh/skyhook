@@ -87,6 +87,8 @@ pub enum RuntimeEvent {
     Activity {
         agent: AgentId,
         activity: super::AgentActivity,
+        /// Epoch milliseconds, on the journal's clock.
+        at: i64,
     },
     Context {
         agent: AgentId,

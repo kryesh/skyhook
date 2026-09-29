@@ -14,6 +14,13 @@ pub(super) struct PromptLayout {
     input_label: Vec<String>,
 }
 
+struct PromptAreas {
+    body: Rect,
+    options: Rect,
+    input: Rect,
+    help: Rect,
+}
+
 impl PromptLayout {
     pub(super) fn new(app: &App, width: u16) -> Self {
         let width = width.saturating_sub(4);
@@ -87,17 +94,40 @@ impl PromptLayout {
     }
 
     pub(super) fn height(&self) -> u16 {
-        (self.body.len() + self.options.len() + self.input_rows() + 1).min(u16::MAX as usize) as u16
+        let sections = self.body.len() + self.options.len() + self.input_rows();
+        let padding = self.padding().into_iter().sum::<u16>();
+        (sections + usize::from(padding) + 1).min(u16::MAX as usize) as u16
+    }
+
+    /// The top margin, gap above any input, and gap above the shortcut help.
+    fn padding(&self) -> [u16; 3] {
+        [1, u16::from(self.input_rows() > 0), 1]
     }
 
     fn input_rows(&self) -> usize {
         self.input.as_ref().map_or(0, |input| input.rows.len()) + self.input_label.len()
     }
 
-    fn row_heights(&self, height: u16) -> [u16; 3] {
+    fn areas(&self, rect: Rect) -> PromptAreas {
         let wanted = [self.body.len(), self.options.len(), self.input_rows()];
+        let help_height = rect.height.min(1);
+        let mut remaining = rect.height - help_height;
+        // Padding gives way before clipping content or hiding the editable answer.
+        let mut spare = usize::from(remaining).saturating_sub(wanted.iter().sum()) as u16;
+        let padding = self.padding().map(|wanted| {
+            let rows = wanted.min(spare);
+            spare -= rows;
+            remaining -= rows;
+            rows
+        });
         let mut rows = [0; 3];
-        let mut remaining = height.saturating_sub(1);
+        // Reserve a row per section, with the editable answer first if not all fit.
+        for index in [2, 0, 1] {
+            if remaining > 0 && wanted[index] > 0 {
+                rows[index] = 1;
+                remaining -= 1;
+            }
+        }
         // Share a screen-limited box between its sections, giving unused rows
         // back to longer sections rather than always splitting it in half.
         while remaining > 0 {
@@ -113,7 +143,16 @@ impl PromptLayout {
                 break;
             }
         }
-        rows
+        let [body_height, option_height, input_height] = rows;
+        let top = rect.y + padding[0];
+        let help_y = rect.bottom() - help_height;
+        let area = |y, height| r(2, y, rect.width.saturating_sub(4), height);
+        PromptAreas {
+            body: area(top, body_height),
+            options: area(top + body_height, option_height),
+            input: area(help_y - padding[2] - input_height, input_height),
+            help: area(help_y, help_height),
+        }
     }
 }
 
@@ -122,14 +161,11 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
     let lines = &layout.body;
     let option_lines = &layout.options;
     let selected_start = layout.selected_start;
-    let [body_height, option_height, input_height] = layout.row_heights(rect.height);
-    app.prompt_body_rect = r(2, rect.y, rect.width.saturating_sub(4), body_height);
-    app.prompt_options_rect = r(
-        2,
-        rect.y + body_height,
-        rect.width.saturating_sub(4),
-        option_height,
-    );
+    let areas = layout.areas(rect);
+    let (body_height, option_height, input_height) =
+        (areas.body.height, areas.options.height, areas.input.height);
+    app.prompt_body_rect = areas.body;
+    app.prompt_options_rect = areas.options;
     app.prompt_body_rows = lines.len();
     app.prompt_input_mut().body_scroll = app
         .prompt_input()
@@ -153,7 +189,12 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
         };
         render_line(
             &Line::from(line.as_str()),
-            r(2, rect.y + offset as u16, rect.width.saturating_sub(4), 1),
+            r(
+                2,
+                areas.body.y + offset as u16,
+                rect.width.saturating_sub(4),
+                1,
+            ),
             frame.buffer_mut(),
             style.bg(THEME.input),
         );
@@ -176,7 +217,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
     {
         let row = r(
             2,
-            rect.y + body_height + offset as u16,
+            areas.options.y + offset as u16,
             rect.width.saturating_sub(4),
             1,
         );
@@ -200,7 +241,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
         .input_label
         .len()
         .min(input_height.saturating_sub(1) as usize) as u16;
-    let input_y = rect.bottom().saturating_sub(input_height + 1);
+    let input_y = areas.input.y;
     for (offset, label) in layout
         .input_label
         .iter()
@@ -273,13 +314,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
             (hint, THEME.muted)
         }
     };
-    let footer = r(
-        2,
-        rect.bottom().saturating_sub(1),
-        rect.width.saturating_sub(4),
-        1,
-    );
-    text(frame, footer, hint, color, THEME.input);
+    text(frame, areas.help, hint, color, THEME.input);
 }
 
 /// Move a `height`-row window's first row as little as possible to show `cursor`.
@@ -311,7 +346,7 @@ pub(super) fn draw_tree(
         .map(|&index| &app.projection.agents[index]);
     let agent_stats: Vec<_> = agents
         .clone()
-        .map(|agent| app.projection.agent_stats(&app.snapshot, &agent.id))
+        .map(|agent| agent_stats(app, agent))
         .collect();
     let stats = AgentStatsColumns::new(&agent_stats);
     let row_width = width.saturating_sub(4);
@@ -340,10 +375,11 @@ pub(super) fn draw_tree(
         let row = AgentRow {
             agent,
             state: app.agent_status(agent),
+            timing: app.projection.timing(agent, &app.snapshot),
             stats: &agent_stats[index],
             marker: if selected { "> " } else { "  " },
         };
-        app.animating |= row.state.running();
+        app.animating |= row.animates();
         let x = draw_agent_row(frame, rect, row, &columns, app.tick_count, bg);
         if focused {
             focus_cursor(frame, x, y, bg);
@@ -417,6 +453,130 @@ fn prompt_option_lines(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::interaction::{Prompt, PromptKind};
+    use crate::tui::app::tests::draft_fixture;
+    use crossterm::event::Event;
+    use skyhook::agent::Question;
+    use skyhook::remote::{SensitivePrompt, SensitivePromptKind};
+    use tokio::sync::oneshot;
+
+    fn assert_prompt_render(app: &mut App, width: u16, height: u16, answer: Option<&str>) {
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::tui::render::draw(frame, app))
+            .unwrap();
+        let cursor = terminal.get_cursor_position().unwrap();
+        let buffer = terminal.backend().buffer();
+        let row = |y| {
+            (0..width)
+                .map(|x| buffer[(x, y)].symbol())
+                .collect::<String>()
+        };
+        let layout = PromptLayout::new(app, width);
+        let areas = layout.areas(app.composer_rect);
+        assert!(areas.body.height > 0);
+        if !layout.options.is_empty() {
+            assert!(areas.options.height > 0);
+            assert!(app.hits.iter().any(|(rect, hit)| {
+                matches!(hit, Hit::PromptChoice(_))
+                    && areas.options.contains((rect.x, rect.y).into())
+            }));
+        }
+        if let Some(answer) = answer {
+            assert!(areas.input.contains(cursor), "{width}x{height}: {cursor:?}");
+            assert!(row(cursor.y).contains(answer), "{width}x{height}");
+            assert_eq!(cursor.x, areas.input.x + answer.width() as u16);
+        }
+        let content_rows = layout.body.len() + layout.options.len() + layout.input_rows();
+        if usize::from(app.composer_rect.height) > content_rows {
+            assert_eq!(usize::from(areas.body.height), layout.body.len());
+            assert_eq!(usize::from(areas.options.height), layout.options.len());
+            assert_eq!(usize::from(areas.input.height), layout.input_rows());
+        }
+        if app.composer_rect.height == layout.height() {
+            assert_eq!(areas.body.y, app.composer_rect.y + 1);
+            assert!(row(app.composer_rect.y).trim().is_empty());
+            if layout.input.is_some() {
+                assert_eq!(areas.input.y, areas.options.bottom() + 1);
+                assert!(row(areas.input.y - 1).trim().is_empty());
+            }
+            let last = if layout.input.is_some() {
+                areas.input.bottom()
+            } else {
+                areas.options.bottom()
+            };
+            assert_eq!(areas.help.y, last + 1);
+            assert!(row(areas.help.y - 1).trim().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn question_answer_and_cursor_survive_collapsed_prompt_padding() {
+        let (_root, mut app) = draft_fixture().await;
+        let (reply, _answer) = oneshot::channel();
+        app.prompt(Prompt {
+            id: 1,
+            kind: PromptKind::Questions {
+                agent: app.root_agent().clone(),
+                questions: vec![Question {
+                    id: "answer".into(),
+                    prompt: "What should I call you?".into(),
+                    options: vec![],
+                }],
+                background: false,
+                reply,
+            },
+        });
+        app.event(Event::Paste("visible answer".into()));
+        for (width, height) in [(80, 9), (40, 12), (80, 24)] {
+            assert_prompt_render(&mut app, width, height, Some("visible answer"));
+        }
+        app.event(Event::Paste(format!("{}visible answer", "\n".repeat(20))));
+        assert_prompt_render(&mut app, 80, 9, Some("visible answer"));
+    }
+
+    #[tokio::test]
+    async fn authentication_and_rename_prompts_fit_with_optional_sections() {
+        for kind in [
+            SensitivePromptKind::Password,
+            SensitivePromptKind::HostConfirmation,
+        ] {
+            let (_root, mut app) = draft_fixture().await;
+            let (reply, _answer) = oneshot::channel();
+            app.prompt(Prompt {
+                id: 1,
+                kind: PromptKind::Authentication {
+                    prompt: SensitivePrompt {
+                        kind,
+                        message: "SSH authentication".into(),
+                        target: None,
+                        origin: skyhook::target::TargetRef::Root,
+                    },
+                    reply,
+                },
+            });
+            let answer = (!kind.is_confirmation()).then_some("●●●●●●");
+            if answer.is_some() {
+                app.event(Event::Paste("secret".into()));
+            }
+            for (width, height) in [(80, 9), (40, 12), (80, 24)] {
+                assert_prompt_render(&mut app, width, height, answer);
+            }
+        }
+        let (_root, mut app) = draft_fixture().await;
+        let (reply, _answer) = oneshot::channel();
+        app.prompt(Prompt {
+            id: 1,
+            kind: PromptKind::Rename {
+                current: "visible title".into(),
+                reply,
+            },
+        });
+        for (width, height) in [(80, 9), (40, 12), (80, 24)] {
+            assert_prompt_render(&mut app, width, height, Some("visible title"));
+        }
+    }
 
     #[test]
     fn prompt_choices_wrap_without_losing_unicode_or_selection_targets() {

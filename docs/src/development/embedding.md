@@ -36,6 +36,14 @@ retain the active model and mode. A mode change applies to the root agent from t
 consumes it, not retroactively to children it already started. A session pins each mode's
 definition on first use and cannot outgrow its original capability ceiling.
 
+Each `SessionEvent::TitleSet` records its `TitleSource`: `Prompt`, `User` or `Generated`.
+`SessionHandle::set_title(title)` gives a session an automatic title from its first input (a prompt
+or a script) and leaves a titled session alone; `rename(Some(title))` sets the user's title, and
+`rename(None)` journals a `TitleCleared` that returns the session to its automatic title.
+`title().await` reads the title the session list shows, as a `SessionTitle` with its text and
+`TitleSource`: the user's newest title unless cleared since, otherwise the newest `Prompt` or
+`Generated` title, otherwise the first text the user sent the root agent, as a `Prompt` title.
+
 Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
 and an embedded shim catalog. A `SensitivePromptHandler` answers each `SensitivePrompt` with a
 `PromptAnswer`: `Secret` for passwords, passphrases and keyboard-interactive prompts, and
@@ -60,7 +68,8 @@ It contains:
   those records. Host statistics and displays read request state from it.
 - Request-scoped live responses keyed by agent and logical request: their streamed blocks in
   arrival order, then the authoritative blocks once the response has ended.
-- Current agent activity and context-usage estimates.
+- Current agent activity, with when its turn began (or, once it is no longer busy, when that
+  turn ended), and context-usage estimates.
 
 Live response deltas are provisional, not additional committed messages. A new attempt of the
 same logical request resets its live response without removing durable attempt records. On
@@ -89,20 +98,25 @@ answer from resumed children and reports whether the selection applied: restarti
 not imply that a waiting or live root also ran. `continue_turn` uses default options and returns
 the root answer, or an empty string when there is none.
 
-Use `Harness::resume_session` to reopen durable state. The runtime reconciles interrupted work
-before starting agents and opens fresh provider contexts; it does not reuse old network resources.
+Use `Harness::resume_session` to reopen durable state. The runtime journals the reopen, then
+reconciles interrupted work before starting agents. Work the previous process left open is
+recorded as ending when that process last did something, so reopening a session is not activity;
+record times therefore need not increase with sequence. It opens fresh provider contexts and does
+not reuse old network resources.
 A root turn that failed or was interrupted before the session closed can still be continued.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases use format 15. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 18. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 
 Await `SessionHandle::shutdown()` before releasing the host's session owner. Shutdown stops runtime
 producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
 remains available so the host can append a final status after observing shutdown errors; await
-that append before dropping the session/store owner.
+that append, then `SessionHandle::close()`, which releases the session so it can be opened again
+at once rather than once every handle has dropped. Closing also prevents retained output handles
+from writing to the session; already saved output remains readable.
 
 ## Embedded shim catalog
 
@@ -122,6 +136,13 @@ behavior.
 `SessionStore::read_records(root, id).await` returns sequence-ordered records from a read-only
 database snapshot without acquiring the session's writer lock. A live owner may continue writing;
 archive inspection neither takes ownership nor resumes unfinished work.
+`SessionStore::is_open(root, id).await` reports whether a store in any process holds the session.
+It takes the session lock shared for an instant; an open racing it retries once before failing
+with `AlreadyOpen`. `SessionStore::summary(root, id).await` reads a session list row without
+decoding the session, including its title as `SessionHandle::title` reads it, in `last_millis` the
+time of its newest record that `SessionEvent::is_activity` (reopening a session and closing it are
+not), and, in `stopped`, the failed or interrupted turn that resuming the root agent would continue,
+if any.
 
 The SQLite layout is versioned by `session::SESSION_FORMAT_VERSION`. Opening a database validates
 its identity and version; there is no migration or compatibility layer for earlier layouts.

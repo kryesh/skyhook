@@ -437,6 +437,36 @@ impl Composer {
         let attachments = attachments.into_iter().map(Arc::unwrap_or_clone).collect();
         Submission { text, attachments }
     }
+    /// Rows the draft takes at the composer's width.
+    pub fn rows(&self) -> usize {
+        self.layout(self.width).rows.len()
+    }
+    /// The first of `visible` rows shown while the view follows the cursor.
+    pub fn cursor_top(&self, visible: usize) -> usize {
+        let (row, _) = self.layout(self.width).cursor;
+        row.saturating_sub(visible.saturating_sub(1))
+    }
+    /// Move the cursor `rows` rows, keeping its column, as a page key does.
+    pub fn page(&mut self, rows: usize, down: bool) {
+        let cursor = self.rows_away(rows, down);
+        self.place(cursor, None);
+    }
+    /// Where the cursor lands `rows` rows away, nearest its preferred column.
+    fn rows_away(&mut self, rows: usize, down: bool) -> usize {
+        let layout = self.layout(self.width);
+        let (row, column) = layout.cursor;
+        let column = *self.preferred_column.get_or_insert(column);
+        let target = if down {
+            (row + rows).min(layout.rows.len() - 1)
+        } else {
+            row.saturating_sub(rows)
+        };
+        if target == row {
+            self.cursor
+        } else {
+            layout.closest(target, column)
+        }
+    }
     /// Replace the draft with a submission taken back for editing.
     pub fn set_submission(&mut self, submission: Submission) {
         self.set(submission.text);
@@ -471,19 +501,7 @@ impl TextField for Composer {
         self.pastes.contains_key(&unit.start)
     }
     fn vertical(&mut self, down: bool) -> usize {
-        let layout = self.layout(self.width);
-        let (row, column) = layout.cursor;
-        let column = *self.preferred_column.get_or_insert(column);
-        let target = if down {
-            (row + 1).min(layout.rows.len() - 1)
-        } else {
-            row.saturating_sub(1)
-        };
-        if target == row {
-            self.cursor
-        } else {
-            layout.closest(target, column)
-        }
+        self.rows_away(1, down)
     }
     fn forget_column(&mut self) {
         self.preferred_column = None;

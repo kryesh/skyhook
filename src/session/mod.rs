@@ -10,6 +10,7 @@ use thiserror::Error;
 use tokio::sync::{Mutex, broadcast, oneshot};
 
 use crate::{
+    agent::TurnFailure,
     identity::{AgentId, EventId, SessionId},
     provider::protocol::ModelRequest,
 };
@@ -21,23 +22,25 @@ mod ledger;
 mod request;
 pub mod stats;
 mod template;
+mod turns;
 
 pub(crate) use template::ModelRequestTemplate;
 
 pub use content::{JobEvent, Message, RuntimeState, StateJob, StateJobKind, UserPart};
 pub(crate) use db::{CaptureExtent, CaptureRow, SharedDb};
-pub use db::{DbError, SessionSummary};
+pub use db::{DbError, SessionSummary, SessionTitle};
 pub(crate) use event::EntryKind;
 pub use event::{
     AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, EventRecord, MessageSeq,
     ModeSelection, ModelCallOrigin, ModelContext, ModelPurpose, ProfileSnapshot, RecordSeq,
-    RequestSeq, SessionEvent, Truncation,
+    RequestSeq, SessionEvent, TitleSource, Truncation,
 };
 pub use ledger::{RequestChanges, RequestFailure, RequestLedger, RequestPhase, RequestRecord};
 pub use request::{
     CheckpointError, Projection, ReplayError, project_history, reconstruct_model_request,
     record_at, render_history, request_context,
 };
+pub use turns::Turns;
 
 /// The database schema version; earlier formats are intentionally unsupported.
 pub const SESSION_FORMAT_VERSION: i64 = db::USER_VERSION;
@@ -67,6 +70,10 @@ impl Drop for SessionLock {
     }
 }
 
+/// How long an open waits before its one retry of a held lock: `is_open` holds
+/// it shared for an instant, which must not make an open fail.
+const LOCK_RETRY: std::time::Duration = std::time::Duration::from_millis(50);
+
 fn lock_session(directory: &Path, id: SessionId) -> Result<SessionLock, SessionError> {
     let lock = StdOpenOptions::new()
         .create(true)
@@ -75,6 +82,10 @@ fn lock_session(directory: &Path, id: SessionId) -> Result<SessionLock, SessionE
         .write(true)
         .open(directory.join(LOCK_FILE))?;
     lock.try_lock_exclusive()
+        .or_else(|_| {
+            std::thread::sleep(LOCK_RETRY);
+            lock.try_lock_exclusive()
+        })
         .map_err(|_| SessionError::AlreadyOpen(id))?;
     Ok(SessionLock(lock))
 }
@@ -184,6 +195,17 @@ type Acceptance = oneshot::Sender<Result<Vec<AppendIdentity>, SessionError>>;
 /// Builds events that reference the first entry's sequence, in the same transaction.
 type Follow = Box<dyn FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send>;
 
+/// When an append's entries are dated.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Dated {
+    /// When the writer accepts them.
+    Now,
+    /// At the session's newest activity entry, so they do not advance its last
+    /// activity; entry times need not follow sequence order. What reopening or
+    /// closing a session settles is dated so, as the stopped work it ends.
+    LastActivity,
+}
+
 struct State {
     records: Vec<EventRecord>,
     health: WriterHealth,
@@ -227,7 +249,7 @@ impl Shared {
 /// cannot cancel accepted work.
 struct Writer {
     db: db::SharedDb,
-    _lock: Option<SessionLock>,
+    lock: Option<SessionLock>,
     shared: Arc<Shared>,
     encoder: db::Encoder,
     #[cfg(test)]
@@ -241,12 +263,13 @@ impl Writer {
         &mut self,
         entries: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
+        dated: Dated,
         accepted: Acceptance,
     ) -> Result<Result<Vec<EventRecord>, SessionError>, (Acceptance, SessionError)> {
         // Output writers share the connection; hold it from BEGIN through COMMIT.
         let connection = self.db.clone();
         let db = connection.lock();
-        let records = match self.accept(&db, entries, follow) {
+        let records = match self.accept(&db, entries, follow, dated) {
             Ok(records) => records,
             Err(error) => return Err((accepted, error)),
         };
@@ -347,6 +370,7 @@ impl Writer {
         db: &db::Db,
         mut entries: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
+        dated: Dated,
     ) -> Result<Vec<EventRecord>, SessionError> {
         let state = self.shared.read();
         state.require_healthy()?;
@@ -357,7 +381,13 @@ impl Writer {
             .records
             .last()
             .map_or(RecordSeq::new(1), |record| record.sequence.next());
-        let timestamp_millis = Utc::now().timestamp_millis();
+        let now = || Utc::now().timestamp_millis();
+        let timestamp_millis = match dated {
+            Dated::Now => now(),
+            Dated::LastActivity => (state.records.iter().rev())
+                .find(|record| record.event.is_activity())
+                .map_or_else(now, |record| record.timestamp_millis),
+        };
         if let Some(follow) = follow {
             entries.extend(follow(first));
         }
@@ -479,7 +509,7 @@ impl SessionStore {
     pub(crate) async fn inherit_lock(&self) -> Option<std::fs::File> {
         let turn = self.turn().await;
         turn.writer
-            ._lock
+            .lock
             .as_ref()
             .and_then(|lock| lock.0.try_clone().ok())
     }
@@ -492,6 +522,28 @@ impl SessionStore {
         Self::read_only(root, id, move |db| db::decode_records(db, id))
             .await
             .and_then(request::admit_records)
+    }
+
+    /// Whether a store, in this process or another, holds the session open. The
+    /// probe shares the lock for an instant; an open racing it waits that out.
+    pub async fn is_open(root: &Path, id: SessionId) -> Result<bool, SessionError> {
+        let path = root.join(id.to_string()).join(LOCK_FILE);
+        blocking(move || {
+            let lock = match StdOpenOptions::new().read(true).open(&path) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(error) => return Err(error.into()),
+            };
+            match FileExt::try_lock_shared(&lock) {
+                Ok(()) => {
+                    FileExt::unlock(&lock)?;
+                    Ok(false)
+                }
+                Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(true),
+                Err(error) => Err(error.into()),
+            }
+        })
+        .await?
     }
 
     /// A session list row, without decoding the session or taking its lock.
@@ -583,7 +635,7 @@ impl SessionStore {
         let db = SharedDb::new(db);
         let writer = Writer {
             db: db.clone(),
-            _lock: lock,
+            lock,
             shared: shared.clone(),
             encoder: db::Encoder::default(),
             #[cfg(test)]
@@ -682,7 +734,16 @@ impl SessionStore {
         &self,
         events: Vec<(AgentId, SessionEvent)>,
     ) -> Result<Vec<EventRecord>, SessionError> {
-        self.commit_batch(events, None).await
+        self.append_dated(events, Dated::Now).await
+    }
+
+    /// Accept and await several events committed in one transaction, dated `dated`.
+    pub(crate) async fn append_dated(
+        &self,
+        events: Vec<(AgentId, SessionEvent)>,
+        dated: Dated,
+    ) -> Result<Vec<EventRecord>, SessionError> {
+        self.commit_batch(events, None, dated).await
     }
 
     /// Commit `event` with the events `follow` builds from its sequence, in one
@@ -693,7 +754,7 @@ impl SessionStore {
         event: SessionEvent,
         follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
     ) -> Result<Vec<EventRecord>, SessionError> {
-        self.commit_batch(vec![(agent, event)], Some(Box::new(follow)))
+        self.commit_batch(vec![(agent, event)], Some(Box::new(follow)), Dated::Now)
             .await
     }
 
@@ -701,8 +762,9 @@ impl SessionStore {
         &self,
         events: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
+        dated: Dated,
     ) -> Result<Vec<EventRecord>, SessionError> {
-        let (identities, committed) = self.accept(events, follow).await?;
+        let (identities, committed) = self.accept(events, follow, dated).await?;
         let identity = *identities.last().expect("appends carry at least one entry");
         receipt(identity, committed).await
     }
@@ -714,7 +776,8 @@ impl SessionStore {
         agent: AgentId,
         event: SessionEvent,
     ) -> Result<AcceptedAppend, SessionError> {
-        let (mut identities, committed) = self.accept(vec![(agent, event)], None).await?;
+        let (mut identities, committed) =
+            self.accept(vec![(agent, event)], None, Dated::Now).await?;
         Ok(AcceptedAppend {
             identity: identities.pop().expect("one identity per entry"),
             committed,
@@ -725,6 +788,7 @@ impl SessionStore {
         &self,
         entries: Vec<(AgentId, SessionEvent)>,
         follow: Option<Follow>,
+        dated: Dated,
     ) -> Result<(Vec<AppendIdentity>, Receipt), SessionError> {
         let (accepted, acceptance) = oneshot::channel();
         let (committed, receipt) = oneshot::channel();
@@ -733,7 +797,7 @@ impl SessionStore {
             // Release the writer before any report, even when the writer panics, so
             // a caller that closes and reopens on the answer finds the lock free.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                turn.writer.append(entries, follow, accepted)
+                turn.writer.append(entries, follow, dated, accepted)
             }));
             drop(turn);
             match result {
@@ -756,13 +820,34 @@ impl SessionStore {
         self.inner.shared.read().require_healthy()
     }
 
-    /// Stop admission, wait out operations already queued, and report
-    /// recovery-required state; the lease lasts until the store drops.
+    /// Stop admission, wait out operations already queued, release the session
+    /// for another open, and report recovery-required state. Retained handles,
+    /// including output streams, can still read but can no longer write.
     pub async fn close(&self) -> Result<(), SessionError> {
-        let _turn = self.inner.turn.lock().await;
-        let mut state = self.inner.shared.write();
-        state.closed = true;
-        state.require_healthy()
+        self.with_writer(|writer| {
+            // Taking the connection rolls back a transaction a panicked holder left
+            // open, which would otherwise keep the next owner from writing.
+            let db = writer.db.lock();
+            db.close_writes()?;
+            let mut state = writer.shared.write();
+            state.closed = true;
+            writer.lock = None;
+            state.require_healthy()
+        })
+        .await?
+    }
+
+    /// The title the session list shows: see [`SessionSummary::title`].
+    pub async fn title(&self) -> Result<Option<SessionTitle>, SessionError> {
+        let db = self.inner.db.clone();
+        Ok(blocking(move || db::title(&db.lock())).await??)
+    }
+
+    /// Why the root agent's journaled turn stopped short of its answer, as resuming
+    /// continues it: see [`SessionSummary::stopped`].
+    pub async fn stopped_turn(&self) -> Result<Option<TurnFailure>, SessionError> {
+        let db = self.inner.db.clone();
+        Ok(blocking(move || db::stopped_turn(&db.lock())).await??)
     }
 
     /// The connection job output streams read and write through.
@@ -1221,7 +1306,8 @@ pub(crate) mod tests {
 
     /// Failures after acceptance poison the writer with the exact recovery identity,
     /// keeping a failed commit's database error; reopening resolves the append from
-    /// what the database actually committed.
+    /// what the database actually committed, and the new owner can write while the
+    /// closed handle lives on.
     #[tokio::test]
     async fn failures_poison_the_writer_and_reopen_resolves_the_commit() {
         use {AppendBoundary::*, RecoveryReason::*};
@@ -1253,15 +1339,10 @@ pub(crate) mod tests {
                 store.reconciled_records().await.map(drop),
                 false
             ));
-            let retry = store
-                .append(agent.clone(), SessionEvent::AgentCompleted)
-                .await;
-            assert!(recovery_is(retry.map(drop), false));
             assert!(matches!(
                 store.close().await,
                 Err(SessionError::AppendUnavailable(_))
             ));
-            drop(store);
             let (reopened, replay) = SessionStore::open(root.path(), id).await.unwrap();
             assert_eq!(replay.len(), before + usize::from(durable));
             assert_eq!(
@@ -1270,11 +1351,13 @@ pub(crate) mod tests {
             );
             assert_eq!(reopened.reconciled_records().await.unwrap(), replay);
             let next = reopened
-                .append(agent, SessionEvent::AgentCompleted)
+                .append(agent.clone(), SessionEvent::AgentCompleted)
                 .await
                 .unwrap();
             assert_eq!(next.sequence.get(), replay.len() as u64 + 1);
             assert_ne!(next.id, identity.event);
+            let retry = store.append(agent, SessionEvent::AgentCompleted).await;
+            assert!(recovery_is(retry.map(drop), false));
         }
     }
 
@@ -1338,8 +1421,8 @@ pub(crate) mod tests {
         crate::tests::bounded(draining).await.unwrap();
     }
 
-    /// `close` waits until queued work has let go of the lease, so dropping the
-    /// last handle frees the session at once, and admission stays closed.
+    /// `close` waits out queued work, then frees the session for another open
+    /// while the closed handle lives on, its admission closed.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn close_under_traffic_stops_admission_and_frees_the_lease_for_reopen() {
         let (root, store, id, agent) = fresh().await;
@@ -1352,18 +1435,27 @@ pub(crate) mod tests {
             store.close().await
         };
         let (blob, closed) = tokio::join!(store.store_blob(b"racing"), traffic);
-        blob.unwrap();
+        let blob = blob.unwrap();
         closed.unwrap();
         let late = store.append(agent, SessionEvent::AgentCompleted).await;
         assert!(matches!(late, Err(SessionError::Closed)));
-        drop(store);
-        let (_, records) = SessionStore::open(root.path(), id).await.unwrap();
+        let (reopened, records) = SessionStore::open(root.path(), id).await.unwrap();
         assert_eq!(records.len(), 5);
+        assert!(store.store_blob(b"late").await.is_err());
+        let current = reopened.store_blob(b"current").await.unwrap();
+        for (blob, bytes) in [
+            (blob, b"racing".as_slice()),
+            (current, b"current".as_slice()),
+        ] {
+            assert_eq!(store.read_blob(&blob, usize::MAX).await.unwrap(), bytes);
+        }
     }
 
     #[tokio::test]
     async fn owner_lock_excludes_competing_writers_but_not_readers() {
         let (root, store, id, agent) = fresh().await;
+        let missing = SessionId::from_bytes([9; 16]);
+        assert!(!SessionStore::is_open(root.path(), missing).await.unwrap());
         store
             .append(agent.clone(), SessionEvent::AgentInterrupted)
             .await
@@ -1374,6 +1466,7 @@ pub(crate) mod tests {
             SessionStore::open(root.path(), id).await,
             Err(SessionError::AlreadyOpen(locked)) if locked == id
         ));
+        assert!(SessionStore::is_open(root.path(), id).await.unwrap());
         assert_eq!(std::fs::read(&path).unwrap(), before);
         // Readers see committed records while the owner is live.
         let read = SessionStore::read_records(root.path(), id).await.unwrap();
@@ -1383,12 +1476,149 @@ pub(crate) mod tests {
         drop(store);
         let (store, records) = SessionStore::open(root.path(), id).await.unwrap();
         drop(inherited_lock);
+        assert!(SessionStore::is_open(root.path(), id).await.unwrap());
         assert_eq!(records, read);
         let appended = store
             .append(agent, SessionEvent::AgentCompleted)
             .await
             .unwrap();
         assert_eq!(store.records().await.last(), Some(&appended));
+        drop(store);
+        assert!(!SessionStore::is_open(root.path(), id).await.unwrap());
+    }
+
+    /// Resume continues a root whose conversation still awaits the model, whose
+    /// latest request of any purpose never completed, or whose turn failed;
+    /// otherwise it is idle. A child's conversation is its own.
+    #[tokio::test]
+    async fn summary_reads_how_the_root_would_resume() {
+        use crate::agent::Failure;
+        use crate::provider::protocol::{AssistantItem, ToolCall, ToolResult};
+        let (root, store, id, agent) = fresh().await;
+        let stopped = async || {
+            SessionStore::summary(root.path(), id)
+                .await
+                .unwrap()
+                .stopped
+        };
+        let append = async |event| store.append(agent.clone(), event).await.unwrap().sequence;
+        let commit = async |message| append(SessionEvent::MessageCommitted { message }).await;
+        let text = |text: &str| Message::User(vec![UserPart::Text { text: text.into() }]);
+        let answer = || Message::Assistant(vec![AssistantItem::text("answer", 0, "done")]);
+        let interrupted = Some(TurnFailure::Interrupted);
+        assert_eq!(stopped().await, None);
+        commit(text("prompt")).await;
+        assert_eq!(stopped().await, interrupted);
+        let context = ModelContext::test(ModelPurpose::Agent, profile());
+        let context = append(SessionEvent::ModelContext { context }).await;
+        let request = async || {
+            let request = append(requested(context)).await.request();
+            append(attempt(request, 1)).await;
+            request
+        };
+        request().await;
+        let call = ToolCall::new("call", "exec", serde_json::json!({})).unwrap();
+        commit(Message::Assistant(vec![AssistantItem::tool_call(
+            "tool", 0, call,
+        )]))
+        .await;
+        assert_eq!(stopped().await, interrupted);
+        let result = ToolResult {
+            call_id: "call".into(),
+            name: "exec".into(),
+            result: serde_json::json!({}),
+            images: vec![],
+            is_error: false,
+        };
+        commit(Message::Tool(vec![result])).await;
+        assert_eq!(stopped().await, interrupted);
+        let second = request().await;
+        let answered = commit(answer()).await;
+        // An answer whose request never completed was cut short.
+        assert_eq!(stopped().await, interrupted);
+        let completed = SessionEvent::ResponseCompleted {
+            attempt: AttemptRef {
+                request: second,
+                attempt: 1,
+            },
+            message: answered.message(),
+            outcome: CompletedOutcome::Answer,
+        };
+        append(completed).await;
+        assert_eq!(stopped().await, None);
+
+        let context = ModelContext::test(ModelPurpose::Compaction, profile());
+        let context = append(SessionEvent::ModelContext { context }).await;
+        let summary = append(requested(context)).await.request();
+        append(attempt(summary, 1)).await;
+        assert_eq!(stopped().await, interrupted);
+        let checkpoint = CompactionCheckpoint {
+            frontier: answered,
+            message: text("summary"),
+            todos: Vec::new(),
+            retained: Vec::new(),
+            attempt: AttemptRef {
+                request: summary,
+                attempt: 1,
+            },
+            before_tokens: 10,
+            after_tokens: 5,
+        };
+        append(SessionEvent::Compaction { checkpoint }).await;
+        assert_eq!(stopped().await, None);
+        let child = start_child(&store, &agent, 1, None, root.path()).await;
+        let message = text("child prompt");
+        let prompt = SessionEvent::MessageCommitted { message };
+        store.append(child, prompt).await.unwrap();
+        assert_eq!(stopped().await, None);
+
+        let failure = Failure::Other("boom".into());
+        append(SessionEvent::AgentFailed {
+            failure: failure.clone(),
+        })
+        .await;
+        assert_eq!(stopped().await, Some(TurnFailure::Failed(failure)));
+        commit(text("again")).await;
+        assert_eq!(stopped().await, interrupted);
+    }
+
+    /// The user's title holds until cleared, whatever automatic titles follow;
+    /// otherwise the newest automatic title shows, and before any, the first prompt.
+    /// Each reports where it came from.
+    #[tokio::test]
+    async fn summary_title_prefers_the_users_then_the_newest_automatic_one() {
+        use TitleSource::{Generated, Prompt, User};
+        let session = MemorySession::new().await;
+        let title = async |event| {
+            let store = &session.store;
+            store.append(session.agent.clone(), event).await.unwrap();
+            store.title().await.unwrap()
+        };
+        let set = |title: &str, source| SessionEvent::TitleSet {
+            title: title.into(),
+            source,
+        };
+        let shown = |text: &str, source| {
+            let text = text.into();
+            Some(SessionTitle { text, source })
+        };
+        assert_eq!(session.store.title().await.unwrap(), None);
+        let message = Message::User(vec![UserPart::Text {
+            text: "first prompt".into(),
+        }]);
+        let committed = SessionEvent::MessageCommitted { message };
+        assert_eq!(title(committed).await, shown("first prompt", Prompt));
+        for (event, expected) in [
+            (set("prompt", Prompt), shown("prompt", Prompt)),
+            (set("generated", Generated), shown("generated", Generated)),
+            (set("user", User), shown("user", User)),
+            (set("later prompt", Prompt), shown("user", User)),
+            (set("regenerated", Generated), shown("user", User)),
+            (SessionEvent::TitleCleared, shown("regenerated", Generated)),
+            (set("renamed", User), shown("renamed", User)),
+        ] {
+            assert_eq!(title(event).await, expected);
+        }
     }
 
     #[tokio::test]

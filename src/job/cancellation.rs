@@ -5,6 +5,26 @@ use super::*;
 /// How long a cancelled worker may take to stop before it is aborted.
 pub(crate) const CANCELLATION_GRACE: Duration = Duration::from_millis(250);
 
+/// Which jobs a cancellation ends.
+#[derive(Clone, Copy)]
+pub(crate) enum CancelScope {
+    /// Any whose outcome it changes: running work stops, and an interruption
+    /// is no longer resumable.
+    Outcome,
+    /// Only work still running. Closing a session leaves an interruption as it
+    /// is, resumable when the session reopens; ending it would be new activity.
+    Running,
+}
+
+impl CancelScope {
+    fn covers(self, entry: &JobEntry) -> bool {
+        match self {
+            Self::Outcome => entry.cancellable(),
+            Self::Running => entry.end().is_none(),
+        }
+    }
+}
+
 impl JobManager {
     /// Request cancellation of this job and its descendants. The returned
     /// metadata is a snapshot, not proof that cancellation has completed; a
@@ -14,13 +34,19 @@ impl JobManager {
         if !jobs.contains_key(&id) {
             return Err(JobError::Unknown(id));
         }
-        self.cancel_trees(&mut jobs, vec![id]);
+        self.cancel_trees(&mut jobs, vec![id], CancelScope::Outcome);
         Ok(jobs[&id].metadata(id))
     }
 
     /// Cancel `roots` and all their descendants, starting the forced-abort
-    /// watchdog of each whose outcome cancellation can still change.
-    fn cancel_trees(&self, jobs: &mut HashMap<JobId, JobEntry>, mut worklist: Vec<JobId>) {
+    /// watchdog of each `scope` covers. The watchdog settles whatever outcome its
+    /// cancellation still changes, an interruption the cancellation caused too.
+    fn cancel_trees(
+        &self,
+        jobs: &mut HashMap<JobId, JobEntry>,
+        mut worklist: Vec<JobId>,
+        scope: CancelScope,
+    ) {
         let mut children = HashMap::<JobId, Vec<JobId>>::new();
         for (&id, entry) in jobs.iter() {
             if let Some(parent) = entry.parent {
@@ -33,7 +59,7 @@ impl JobManager {
                 continue;
             };
             entry.cancellation.cancel();
-            if entry.cancellable() && !entry.cancellation_watchdog_started {
+            if scope.covers(entry) && !entry.cancellation_watchdog_started {
                 entry.cancellation_watchdog_started = true;
                 let jobs = self.clone();
                 tokio::spawn(async move {
@@ -44,38 +70,41 @@ impl JobManager {
         }
     }
 
-    pub async fn cancel_all(&self, owner: &AgentId) -> usize {
+    pub(crate) async fn cancel_all(&self, owner: &AgentId, scope: CancelScope) -> usize {
         let mut jobs = self.inner.jobs.lock().await;
         let ids = jobs
             .iter()
-            .filter_map(|(id, entry)| (&entry.agent == owner && entry.cancellable()).then_some(*id))
+            .filter_map(|(id, entry)| (&entry.agent == owner && scope.covers(entry)).then_some(*id))
             .collect::<Vec<_>>();
         let count = ids.len();
-        self.cancel_trees(&mut jobs, ids);
+        self.cancel_trees(&mut jobs, ids, scope);
         count
     }
 
-    /// Cancel every remaining job and await its persisted terminal outcome.
-    /// Unlike an ordinary wait, a pending question is not a completion. Repeat
-    /// the snapshot to include descendants created while cancellation propagates.
+    /// Cancel every job still running and await its persisted terminal outcome,
+    /// and that of every cancellation already in flight. Unlike an ordinary
+    /// wait, a pending question is not a completion. Repeat the snapshot to
+    /// include descendants created while cancellation propagates.
     pub(crate) async fn cancel_and_drain(&self) -> Result<(), JobError> {
         loop {
-            let ids = {
+            let pending = {
                 let mut jobs = self.inner.jobs.lock().await;
-                let ids = jobs
+                let running = jobs
                     .iter()
-                    .filter_map(|(id, entry)| entry.cancellable().then_some(*id))
-                    .collect::<Vec<_>>();
-                self.cancel_trees(&mut jobs, ids.clone());
-                ids
+                    .filter_map(|(id, entry)| CancelScope::Running.covers(entry).then_some(*id))
+                    .collect();
+                self.cancel_trees(&mut jobs, running, CancelScope::Running);
+                jobs.iter()
+                    .filter_map(|(id, entry)| entry.cancelling().then_some(*id))
+                    .collect::<Vec<_>>()
             };
-            if ids.is_empty() {
+            if pending.is_empty() {
                 // Terminal publication may precede supervisor cleanup.
                 self.drain_supervisors().await;
                 return Ok(());
             }
-            for id in ids {
-                self.wait_inner(id, None, WaitMode::Terminal).await?;
+            for id in pending {
+                self.wait_inner(id, None, WaitMode::Final).await?;
             }
         }
     }
@@ -232,9 +261,20 @@ mod tests {
         }
     }
 
+    /// The drain ends running work and settles cancellations in flight, but
+    /// leaves an interruption as it is, journaling nothing for it.
     #[tokio::test]
-    async fn cancellation_drain_waits_for_terminal_questions_and_descendants() {
+    async fn cancellation_drain_settles_running_work_and_leaves_interruptions() {
         let (_root, jobs, agent) = crate::job::tests::runtime().await;
+        let interrupted = async || {
+            let id = jobs.test_create(JobSpec::test(agent.clone(), "exec")).await;
+            jobs.finish(id, ToolError::interrupted().into())
+                .await
+                .unwrap();
+            id
+        };
+        let (kept, cancelling) = (interrupted().await, interrupted().await);
+        jobs.cancel(cancelling).await.unwrap();
         let parent = jobs
             .test_running(JobSpec::test(agent.clone(), "script"))
             .await;
@@ -252,14 +292,20 @@ mod tests {
         );
         bounded(jobs.cancel_and_drain()).await.unwrap();
         let records = jobs.store().records().await;
-        for id in [parent.id(), question.id()] {
+        let finished = |id| {
+            let finished = |record: &&EventRecord| matches!(&record.event, SessionEvent::JobFinished { job, .. } if *job == id);
+            records.iter().filter(finished).count()
+        };
+        assert_eq!(
+            jobs.snapshot(kept).await.unwrap().state,
+            JobState::Interrupted
+        );
+        assert_eq!(finished(kept), 1);
+        for id in [parent.id(), question.id(), cancelling] {
             assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Cancelled);
-            assert!(
-                records.iter().any(|record| {
-                    matches!(&record.event, SessionEvent::JobFinished { job, .. } if *job == id)
-                }),
-                "terminal cancellation must be journaled before shutdown returns"
-            );
+            let expected = if id == cancelling { 2 } else { 1 };
+            // Journaled before shutdown returns.
+            assert_eq!(finished(id), expected, "job {id:?}");
         }
     }
 

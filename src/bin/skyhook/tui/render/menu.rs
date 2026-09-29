@@ -15,13 +15,30 @@ fn agent_status_color(state: model::AgentDisplayState) -> Color {
     }
 }
 
+/// An agent's statistics, ending with how long it has been at it.
+pub(super) fn agent_stats(app: &App, agent: &model::AgentInfo) -> [String; 4] {
+    let [output, input, context] = app.projection.agent_stats(&app.snapshot, &agent.id);
+    let timing = app.projection.timing(agent, &app.snapshot);
+    let time = timing.text(app.clock).unwrap_or_else(|| "—".into());
+    [output, input, context, time]
+}
+
 /// One agent in a tree or agents menu row.
 pub(super) struct AgentRow<'a> {
     pub(super) agent: &'a model::AgentInfo,
     pub(super) state: model::AgentDisplayState,
-    pub(super) stats: &'a [String; 3],
+    /// How long the agent has been at it, counting while live.
+    pub(super) timing: model::Timing,
+    pub(super) stats: &'a [String; 4],
     /// Precedes the status symbol, e.g. the selected agent's `>`.
     pub(super) marker: &'a str,
+}
+
+impl AgentRow<'_> {
+    /// Whether the row changes as time passes: its spinner or its counter.
+    pub(super) fn animates(&self) -> bool {
+        self.state.running() || self.timing.live()
+    }
 }
 
 /// Fill `rect` with the row's identity, status and statistics. Returns where
@@ -39,6 +56,7 @@ pub(super) fn draw_agent_row(
         state,
         stats,
         marker,
+        ..
     } = row;
     fill(frame, rect, bg);
     let color = agent_status_color(state);
@@ -75,7 +93,9 @@ pub(super) fn draw_agent_row(
             columns.status_width,
             1,
         );
-        text(frame, status, state.label(), color, bg);
+        let label = Line::from(Span::styled(state.label(), Style::default().fg(color)));
+        let label = clipped(label, usize::from(columns.status_width));
+        text(frame, status, label, color, bg);
     }
     if columns.stats_width > 0 {
         let stats_rect = r(
@@ -110,56 +130,43 @@ fn agent_symbol(state: model::AgentDisplayState, tick: usize) -> &'static str {
         _ => "·",
     }
 }
+/// A session row's marker, a status cell wide enough for the lock, and a gap.
+const SESSION_PREFIX: u16 = 4;
+const LOCKED: &str = "🔒";
+
 pub(super) fn draw_menu_item(
     frame: &mut Frame,
     row: Rect,
     item: &super::super::app::ItemRef<'_>,
     kind: &MenuKind,
+    columns: &MenuColumns,
     selected: bool,
     bg: Color,
 ) {
-    let label = model::clean(item.label);
-    let detail = model::clean(item.detail);
     let fg = if selected && !matches!(kind, MenuKind::Output(_, _)) {
         THEME.primary
     } else {
         THEME.fg
     };
-    if matches!(kind, MenuKind::Commands(_)) {
-        // Paint the whole row, including the gap between label and shortcut.
-        fill(frame, row, bg);
-        // Never sacrifice label space for a shortcut. Visible hints share the
-        // right edge; an overlong/custom hint is hidden as a whole.
-        let hint_width = detail.width();
-        let show_hint = hint_width > 0 && label.width() + 2 + hint_width <= row.width as usize;
-        let label_width = if show_hint {
-            row.width.saturating_sub(hint_width as u16 + 2)
-        } else {
-            row.width
-        };
-        text(frame, r(row.x, row.y, label_width, 1), label, fg, bg);
-        if show_hint {
-            text(
-                frame,
-                r(row.right() - hint_width as u16, row.y, hint_width as u16, 1),
-                detail,
-                THEME.muted,
-                bg,
-            );
-        }
+    // Paint the whole row, including the gap before the columns.
+    fill(frame, row, bg);
+    let columns_width = columns.width() as u16;
+    let text_width = row.width.saturating_sub(columns_width);
+    let detail = if item.detail.is_empty() {
+        String::new()
     } else {
-        let line = Line::from(vec![
-            Span::styled(label, Style::default().fg(fg)),
-            Span::styled(
-                if detail.is_empty() {
-                    detail
-                } else {
-                    format!("   {detail}")
-                },
-                Style::default().fg(THEME.muted),
-            ),
-        ]);
-        text(frame, row, line, fg, bg);
+        format!("   {}", item.detail)
+    };
+    let line = Line::from(vec![
+        Span::styled(item.label.to_owned(), Style::default().fg(fg)),
+        Span::styled(detail, Style::default().fg(THEME.muted)),
+    ]);
+    let line = clipped(line, usize::from(text_width));
+    text(frame, r(row.x, row.y, text_width, 1), line, fg, bg);
+    if columns_width > 0 {
+        let rect = r(row.right() - columns_width, row.y, columns_width, 1);
+        let columns = format!("{MENU_GAP}{}", columns.format(item.columns));
+        text(frame, rect, columns, THEME.muted, bg);
     }
 }
 
@@ -198,30 +205,31 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
     let agent_menu = matches!(menu.kind, MenuKind::Agents(_));
     let agents = &app.projection.agents;
     let agent_stats: Vec<_> = if agent_menu {
-        let stats = agents
-            .iter()
-            .map(|agent| app.projection.agent_stats(&app.snapshot, &agent.id));
-        stats.collect()
+        agents.iter().map(|agent| agent_stats(app, agent)).collect()
     } else {
         Vec::new()
     };
     let row_width = width.saturating_sub(2);
     let columns = AgentColumns::new(agents, row_width, AgentStatsColumns::menu(&agent_stats));
+    let prefix = if matches!(menu.kind, MenuKind::Sessions(_)) {
+        SESSION_PREFIX
+    } else {
+        0
+    };
+    let item_columns = MenuColumns::new(&menu.kind.items(), row_width.saturating_sub(prefix));
     let stats_width = columns.stats_width;
-    let header_height = u16::from(agent_menu && stats_width > 0);
-    if header_height > 0 {
-        text(
-            frame,
-            r(
-                rect.right() - 1 - stats_width,
-                rect.y + 2,
-                stats_width,
-                header_height.min(rect.height.saturating_sub(2)),
-            ),
-            columns.stats.format(&AGENT_STATS_HEADERS.map(String::from)),
-            THEME.muted,
-            THEME.input,
-        );
+    // Headed columns: the status, then the statistics when they fit.
+    let header_height = u16::from(agent_menu && columns.status_width > 0);
+    if header_height > 0 && rect.height > 2 {
+        let y = rect.y + 2;
+        let status_x = rect.x + 1 + columns.identity_width + 2;
+        let status = r(status_x, y, columns.status_width, 1);
+        text(frame, status, "Status", THEME.muted, THEME.input);
+        if stats_width > 0 {
+            let stats = r(rect.right() - 1 - stats_width, y, stats_width, 1);
+            let headers = columns.stats.format(&AGENT_STATS_HEADERS.map(String::from));
+            text(frame, stats, headers, THEME.muted, THEME.input);
+        }
     }
     let height = rect.height.saturating_sub(3 + header_height) as usize;
     // A text page has nothing to pick: its selection is the first visible line.
@@ -246,29 +254,47 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
                 let agent_row = AgentRow {
                     agent,
                     state: app.agent_status(agent),
+                    timing: app.projection.timing(agent, &app.snapshot),
                     stats: &agent_stats[item.index],
                     marker: "",
                 };
-                app.animating |= agent_row.state.running();
+                app.animating |= agent_row.animates();
                 draw_agent_row(frame, row, agent_row, &columns, app.tick_count, bg);
             }
         } else if let MenuKind::Sessions(sessions) = &menu.kind {
-            // Open sessions carry their live status; saved ones align beneath them.
+            // Open sessions carry their live status, saved ones how they would
+            // resume: the current one is marked, and one held elsewhere is locked.
             fill(frame, row, bg);
-            let peer = match sessions[item.index].value {
-                SessionRef::Live(key) => app.peers.iter().find(|peer| peer.key == key),
-                SessionRef::Saved(_) => None,
+            let glyph = r(row.x + 1, y, 2, 1);
+            let state = match sessions[item.index].value {
+                SessionRef::Live(key) => {
+                    let peer = app.peers.iter().find(|peer| peer.key == key);
+                    if peer.is_some_and(|peer| peer.current) {
+                        text(frame, r(row.x, y, 1, 1), ">", THEME.primary, bg);
+                    }
+                    peer.map(|peer| peer.state)
+                }
+                SessionRef::Saved(_, SavedState::Closed(state)) => Some(state),
+                SessionRef::Saved(_, SavedState::Locked) => {
+                    text(frame, glyph, LOCKED, THEME.muted, bg);
+                    None
+                }
+                SessionRef::Saved(_, SavedState::Unknown) => None,
             };
-            if let Some(peer) = peer {
-                app.animating |= peer.state.running();
-                let symbol = agent_symbol(peer.state, app.tick_count);
-                let color = agent_status_color(peer.state);
-                text(frame, r(row.x, y, 1, 1), symbol, color, bg);
+            if let Some(state) = state {
+                app.animating |= state.running();
+                let symbol = agent_symbol(state, app.tick_count);
+                text(frame, glyph, symbol, agent_status_color(state), bg);
             }
-            let row = r(row.x + 2, y, row.width.saturating_sub(2), 1);
-            draw_menu_item(frame, row, item, &menu.kind, selected, bg);
+            let row = r(
+                row.x + SESSION_PREFIX,
+                y,
+                row.width.saturating_sub(SESSION_PREFIX),
+                1,
+            );
+            draw_menu_item(frame, row, item, &menu.kind, &item_columns, selected, bg);
         } else {
-            draw_menu_item(frame, row, item, &menu.kind, selected, bg);
+            draw_menu_item(frame, row, item, &menu.kind, &item_columns, selected, bg);
         }
         if selected {
             focus_cursor(frame, rect.x, y, THEME.input);
@@ -365,7 +391,10 @@ mod tests {
             };
             // One clear row separates the palette from the bars above and below it.
             assert!(line(0).trim().is_empty() && line(9).trim().is_empty());
-            assert_eq!(line(3).contains("Input (uncached)"), stats);
+            // Headers name the status column, and the statistics when they show.
+            assert_eq!(line(3).contains("Status"), status);
+            let headed = line(3).contains("Input (uncached)") && line(3).contains("Time");
+            assert_eq!(headed, stats);
             let hits = app.hits.iter();
             let rows: Vec<_> = hits
                 .filter_map(|(rect, hit)| matches!(hit, Hit::Menu(_)).then_some(*rect))
@@ -374,7 +403,7 @@ mod tests {
             for (index, row) in rows.iter().enumerate() {
                 assert_eq!(
                     (row.height, row.y),
-                    (1, 3 + u16::from(stats) + index as u16)
+                    (1, 3 + u16::from(status) + index as u16)
                 );
             }
             for (row, child) in rows[1..].iter().zip(&children) {
@@ -385,21 +414,62 @@ mod tests {
         }
     }
 
+    /// The state fills its column whole and the time sits right-aligned with the
+    /// other statistics.
+    #[tokio::test]
+    async fn an_agents_time_is_a_statistic_beside_its_state() {
+        let (_root, mut app) = crate::tui::app::tests::fixture().await;
+        app.refresh();
+        let agent = &app.projection.agents[0];
+        let stats = ["1", "2", "3", "1h 02m 03s"].map(String::from);
+        let columns = AgentColumns::new([agent], 90, AgentStatsColumns::new([&stats]));
+        let state = model::AgentDisplayState::Waiting(model::WaitReason::ParentInput);
+        let mut terminal = Terminal::new(TestBackend::new(90, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                let row = AgentRow {
+                    agent,
+                    state,
+                    timing: model::Timing::Untimed,
+                    stats: &stats,
+                    marker: "",
+                };
+                draw_agent_row(frame, frame.area(), row, &columns, 0, THEME.panel);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let line: String = (0..90).map(|x| buffer[(x, 0)].symbol()).collect();
+        assert!(line.contains(&state.label()), "{line}");
+        assert!(line.ends_with("1 · 2 · 3 · 1h 02m 03s"), "{line}");
+    }
+
+    /// Columns stay whole and right-aligned; the label keeps its room, so the
+    /// leftmost columns go first, and the detail gives way to both.
     #[test]
-    fn menu_hints_are_muted_right_aligned_and_yield_to_labels() {
+    fn menu_columns_are_muted_right_aligned_and_yield_to_labels() {
         let kind = MenuKind::Commands(vec![]);
-        for (label, hint) in [
-            ("New session", "ctrl+x n"),
-            ("界面", "ctrl+shift+p"),
-            ("Unbound", ""),
+        let owned = |values: &[&str]| -> Vec<String> {
+            values.iter().map(|value| value.to_string()).collect()
+        };
+        for (label, detail, columns) in [
+            ("New session", "", owned(&["ctrl+x n"])),
+            ("界面", "", owned(&["ctrl+shift+p"])),
+            ("Unbound", "", owned(&[""])),
+            (
+                "A long session title",
+                "detail",
+                owned(&["0123456789abcdef", "9 events", "14:02"]),
+            ),
         ] {
-            let item = super::super::super::app::ItemRef {
+            let item = ItemRef {
                 index: 0,
                 label,
-                detail: hint,
+                detail,
+                columns: &columns,
                 search: "",
             };
-            for width in [0, 2, 8, 12, 21, 80] {
+            for width in [0, 2, 8, 12, 21, 30, 44, 80] {
+                let layout = MenuColumns::new(std::slice::from_ref(&item), width);
                 for selected in [false, true] {
                     let mut terminal = Terminal::new(TestBackend::new(90, 3)).unwrap();
                     let row = r(3, 1, width, 1);
@@ -412,7 +482,7 @@ mod tests {
                         .draw(|frame| {
                             fill(frame, frame.area(), THEME.base);
                             fill(frame, row, bg);
-                            draw_menu_item(frame, row, &item, &kind, selected, bg);
+                            draw_menu_item(frame, row, &item, &kind, &layout, selected, bg);
                         })
                         .unwrap();
                     let buffer = terminal.backend().buffer();
@@ -427,27 +497,37 @@ mod tests {
                         x += cell(x).symbol().width().max(1) as u16;
                     }
                     let actual: String = painted.iter().map(|&x| cell(x).symbol()).collect();
-                    let fits =
-                        !hint.is_empty() && label.width() + hint.width() + 2 <= width as usize;
-                    if fits {
-                        assert!(actual.ends_with(hint), "{actual:?}");
-                        let start = row.right() - hint.width() as u16;
+                    let room = usize::from(width) - layout.width();
+                    let kept = label.width().min(MENU_LABEL_ROOM).min(usize::from(width));
+                    assert!(room >= kept, "{actual:?}");
+                    // Shown columns are a suffix, whole and muted at the right edge.
+                    let shown: Vec<_> = columns
+                        .iter()
+                        .map(|value| !value.is_empty() && actual.contains(value.as_str()))
+                        .collect();
+                    assert!(shown.is_sorted(), "{actual:?}");
+                    if let Some(last) = columns.last().filter(|_| layout.width() > 0) {
+                        assert!(actual.ends_with(last.as_str()), "{actual:?}");
+                        let start = row.right() - last.width() as u16;
                         assert!((start..row.right()).all(|x| cell(x).fg == THEME.muted));
-                    } else if !hint.is_empty() {
-                        assert!(!actual.contains(hint), "{actual:?}");
                     }
-                    if label.width() <= width as usize {
+                    if label.width() <= room {
                         assert!(actual.starts_with(label), "{actual:?}");
+                    } else if room > 0 {
+                        // A cut title ends in an ellipsis, just before any columns.
+                        let text: String = actual.chars().take(room).collect();
+                        assert!(text.trim_end().ends_with('…'), "{actual:?}");
+                    }
+                    if !detail.is_empty() {
+                        let fits = label.width() + 3 + detail.width() <= room;
+                        assert_eq!(actual.contains(detail), fits, "{actual:?}");
                     }
                     if width > 0 && !label.contains('界') {
                         let fg = if selected { THEME.primary } else { THEME.fg };
                         assert_eq!(cell(row.x).fg, fg);
                     }
                     let filled = painted.iter().all(|&x| cell(x).bg == bg);
-                    assert!(
-                        filled,
-                        "row background: {label:?}, {hint:?}, width={width}, selected={selected}"
-                    );
+                    assert!(filled, "row background: {label:?}, width={width}");
                     assert_eq!(cell(row.right()).bg, THEME.base);
                 }
             }

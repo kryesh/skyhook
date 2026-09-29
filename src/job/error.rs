@@ -7,6 +7,8 @@ pub enum InputUnavailableReason {
     State(JobState),
     CancellationRequested,
     ResumeUnavailable,
+    /// The session is closing, which restarts nothing.
+    Closing,
 }
 
 impl std::fmt::Display for InputUnavailableReason {
@@ -17,6 +19,7 @@ impl std::fmt::Display for InputUnavailableReason {
             Self::ResumeUnavailable => {
                 formatter.write_str("no retained resume handler is available")
             }
+            Self::Closing => formatter.write_str("the session is closing"),
         }
     }
 }
