@@ -57,6 +57,12 @@ pub enum EntryKey {
         response: ResponseRef,
         block: BlockRef,
     },
+    /// A reasoning block's `section`th part, split at its standalone titles.
+    Reasoning {
+        response: ResponseRef,
+        block: BlockRef,
+        section: usize,
+    },
     ToolCall {
         message: MessageSeq,
         call: String,
@@ -126,34 +132,64 @@ impl Disclosure {
     }
 }
 
-/// A generated heading above an entry's body. A disclosure makes the entry
+/// A heading above an entry's body. A disclosure makes the entry
 /// expandable and is drawn as its glyph; the spinner gutter is a render decision.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Title {
-    label: Clean,
+    pub label: Label,
+    /// Plain text after the label, outside any Markdown styling.
+    pub suffix: Option<&'static str>,
     pub disclosure: Option<Disclosure>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Label {
+    Plain(Clean),
+    /// Source rendered with the body's Markdown styling; `definitions` are link
+    /// definitions its references resolve against without being part of it.
+    Markdown {
+        source: Clean,
+        definitions: Clean,
+    },
+}
+
 impl Title {
-    pub fn plain(label: impl Into<Clean>) -> Self {
+    fn new(label: Label, disclosure: Option<Disclosure>) -> Self {
         Self {
-            label: label.into(),
-            disclosure: None,
+            label,
+            suffix: None,
+            disclosure,
         }
+    }
+
+    pub fn plain(label: impl Into<Clean>) -> Self {
+        Self::new(Label::Plain(label.into()), None)
     }
 
     pub fn disclosed(label: impl Into<Clean>, open: bool) -> Self {
-        Self {
-            label: label.into(),
-            disclosure: Some(Disclosure::new(open)),
-        }
+        Self::new(Label::Plain(label.into()), Some(Disclosure::new(open)))
     }
 
-    /// The heading line; `gutter` reserves the spinner's two cells before the label.
-    pub fn line(&self, gutter: bool) -> String {
+    pub fn markdown(source: impl Into<Clean>, definitions: impl Into<Clean>, open: bool) -> Self {
+        let label = Label::Markdown {
+            source: source.into(),
+            definitions: definitions.into(),
+        };
+        Self::new(label, Some(Disclosure::new(open)))
+    }
+
+    /// What precedes the label; `gutter` reserves the spinner's two cells.
+    pub fn prefix(&self, gutter: bool) -> String {
         let glyph = self.disclosure.map_or("", Disclosure::glyph);
         let gutter = if gutter { "  " } else { "" };
-        format!("{glyph}{gutter}{}", &*self.label)
+        format!("{glyph}{gutter}")
+    }
+
+    /// The heading as plain text, its label as source.
+    pub fn line(&self, gutter: bool) -> String {
+        let (Label::Plain(label) | Label::Markdown { source: label, .. }) = &self.label;
+        let suffix = self.suffix.unwrap_or_default();
+        format!("{}{}{suffix}", self.prefix(gutter), &**label)
     }
 }
 

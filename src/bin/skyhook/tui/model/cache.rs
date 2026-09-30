@@ -453,9 +453,10 @@ mod tests {
         };
         let response_ref = ResponseRef::Request(request);
         let keys = vec![
-            EntryKey::Block {
+            EntryKey::Reasoning {
                 response: response_ref,
                 block: block_ref(&item, &block),
+                section: 0,
             },
             EntryKey::Block {
                 response: response_ref,

@@ -155,7 +155,7 @@ pub(super) fn update_entry_rows(
     // A live entry leaves its first cells to the spinner: after the
     // disclosure glyph of a title, or before an untitled body.
     let live = entry.timing.live();
-    let title = entry.title().map(|title| title.line(live));
+    let title = entry.title();
     let gutter = if title.is_none() && live { "  " } else { "" };
     let mut fences = Document::default();
     if let Some(header) = entry.header() {
@@ -169,15 +169,21 @@ pub(super) fn update_entry_rows(
         Surface::User | Surface::Agent | Surface::Reasoning
     ) {
         if let Some(title) = title {
-            let title = if boxed {
-                Line::from(Span::styled(
-                    title,
-                    Style::default().add_modifier(Modifier::BOLD),
-                ))
-            } else {
-                Line::from(title)
+            let mut line = match &title.label {
+                model::Label::Plain(label) => Line::from(label.to_string()),
+                model::Label::Markdown {
+                    source,
+                    definitions,
+                } => {
+                    markdown::title(&format!("{}{}", &**definitions, &**source)).unwrap_or_default()
+                }
             };
-            geometry.push_wrapped(rows, vec![(title, Wrap::Words)]);
+            line.spans.insert(0, Span::raw(title.prefix(live)));
+            line.spans.extend(title.suffix.map(Span::raw));
+            if boxed {
+                line = line.style(Style::default().add_modifier(Modifier::BOLD));
+            }
+            geometry.push_wrapped(rows, vec![(line, Wrap::Words)]);
         }
         let body = entry.body();
         // Expanded reasoning omits the empty body; message boxes retain it.
@@ -203,6 +209,7 @@ pub(super) fn update_entry_rows(
         let body = (title.is_none() || !body.is_empty()).then_some(body);
         let body = body.iter().flat_map(|body| body.split('\n')).enumerate();
         let lines = title
+            .map(|title| title.line(live))
             .into_iter()
             .chain(body.map(|(index, line)| {
                 let gutter = if index == 0 { gutter } else { "" };
@@ -427,6 +434,28 @@ mod tests {
                 assert_eq!(free > COUNTER_WIDTH, live, "{surface:?}");
             }
         }
+    }
+
+    #[test]
+    fn markdown_titles_keep_their_styling_between_disclosure_and_suffix() {
+        let mut title = model::Title::markdown("**Inspecting scripts**", "", false);
+        title.suffix = Some(" · incomplete");
+        let key = model::EntryKey::UnsavedStatus(1);
+        let entry = model::Entry::titled(key, title, String::new(), Surface::Reasoning);
+        let rows = layout(&entry, 60);
+        assert_eq!(
+            rows[0].text().trim_end(),
+            "▸ Inspecting scripts · incomplete"
+        );
+        let spans = &rows[0].line.spans;
+        let fg = |text: &str| {
+            spans
+                .iter()
+                .find(|span| span.content == text)
+                .map(|span| span.style.fg)
+        };
+        assert_eq!(fg("Inspecting scripts"), Some(Some(THEME.strong)));
+        assert_eq!(fg(" · incomplete"), Some(None));
     }
 
     #[test]

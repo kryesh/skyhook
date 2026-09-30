@@ -15,6 +15,7 @@ mod wrapping;
 
 pub use cache::RenderState;
 pub use frame::draw;
+pub(super) use markdown::{Section, sections};
 pub use rows::RowBlocks;
 pub use selection::{Row, TextPosition, selected_text};
 

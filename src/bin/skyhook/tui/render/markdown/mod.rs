@@ -4,6 +4,7 @@
 
 mod layout;
 mod parser;
+mod sections;
 mod tables;
 
 use super::super::tool_view::Document;
@@ -12,6 +13,8 @@ use ratatui::text::Line;
 pub(super) use layout::layout_highlighted;
 #[cfg(test)]
 pub(super) use parser::tests::{render, render_highlighted};
+pub(super) use sections::title;
+pub(in crate::tui) use sections::{Section, sections};
 
 /// Source and decoration stay separate: wrapping and code padding must not add
 /// bytes/newlines to selection. Prefix boundaries are recorded by the parser,

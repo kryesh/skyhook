@@ -63,7 +63,10 @@ output becomes available as it is transferred to the host.
 Provider-supplied reasoning streams in a separate expanded block and collapses when answer text
 starts or the response finishes. Click a multi-line block or press Enter when selected to reopen
 it, including after resuming a session. Single-line reasoning stays inline without an
-expand/collapse control and is not selectable, even when it wraps in a narrow terminal.
+expand/collapse control and is not selectable, even when it wraps in a narrow terminal. A
+heading or wholly bold or italic line followed by a blank line starts a new reasoning section,
+titled by that line and collapsible like any multi-line block; only the section still streaming
+stays expanded. A title with nothing under it stays inline.
 Spinners indicate that work is still active, and a counter at the end of the row shows for how
 long. The working indicator counts the whole turn, across model requests and tool rounds;
 streaming reasoning counts from its request. Running tool calls count up and keep their duration

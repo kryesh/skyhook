@@ -2,7 +2,7 @@
 use super::super::super::tool_view::{self, Document, Section};
 use super::super::THEME;
 use super::tables::Table;
-use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, OffsetIter, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Modifier, Style},
     text::{Line, Span},
@@ -40,8 +40,11 @@ pub(super) struct Parsed {
     pub(super) table_first: bool,
 }
 
-fn options() -> Options {
-    Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS
+/// Every Markdown consumer reads source with the same parser configuration.
+pub(super) fn events(text: &str) -> OffsetIter<'_> {
+    let options =
+        Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TABLES | Options::ENABLE_TASKLISTS;
+    Parser::new_ext(text, options).into_offset_iter()
 }
 
 /// Pulldown emits an end event even for an unfinished fence. Its source range
@@ -542,7 +545,7 @@ pub(super) fn parse(
         fences: Document::default(),
         table_first: false,
     };
-    for (event, range) in Parser::new_ext(text, options()).into_offset_iter() {
+    for (event, range) in events(text) {
         renderer.event(event, range);
     }
     renderer.flush(false);

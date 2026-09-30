@@ -4,6 +4,7 @@ use super::{
     AgentDisplayState, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Timing, Title,
     View,
 };
+use crate::tui::render::{Section, sections};
 use skyhook::agent::{AgentActivity, ObservationSnapshot, ObservedResponse};
 use skyhook::identity::AgentId;
 use skyhook::provider::protocol::{BlockRef, ItemKind};
@@ -69,25 +70,62 @@ fn working_entry(
     Some(entry)
 }
 
-pub(super) fn reasoning_entry(
-    key: EntryKey,
+/// One entry per section of a reasoning block. Earlier sections are settled;
+/// only the last carries the block's status.
+pub(super) fn reasoning_entries(
+    response: ResponseRef,
+    block: &BlockRef,
     text: &str,
     view: &View,
     status: ReasoningStatus,
+) -> Vec<Entry> {
+    let sections = sections(text);
+    let last = sections.len().saturating_sub(1);
+    let entries = sections.into_iter().enumerate().map(|(index, section)| {
+        let key = EntryKey::Reasoning {
+            response,
+            block: block.clone(),
+            section: index,
+        };
+        let status = if index == last {
+            status
+        } else {
+            ReasoningStatus::Complete
+        };
+        reasoning_entry(key, section, view, status)
+    });
+    entries.collect()
+}
+
+/// A titled section is collapsible under its title unless it has no body.
+fn reasoning_entry(
+    key: EntryKey,
+    Section { title, body }: Section<'_>,
+    view: &View,
+    status: ReasoningStatus,
 ) -> Entry {
-    let (label, timing) = match status {
-        ReasoningStatus::Running { since } => ("Reasoning", Timing::Since(since)),
-        ReasoningStatus::Complete => ("Reasoning", Timing::Untimed),
-        ReasoningStatus::Incomplete => ("Reasoning · incomplete", Timing::Untimed),
+    let timing = match status {
+        ReasoningStatus::Running { since } => Timing::Since(since),
+        ReasoningStatus::Complete | ReasoningStatus::Incomplete => Timing::Untimed,
     };
     // Source lines determine collapsibility; terminal wrapping must not change interaction.
-    let text = text.trim_matches(['\r', '\n']);
-    let mut entry = if text.lines().count() <= 1 {
-        Entry::new(key, text.to_owned(), Surface::Reasoning)
+    let inline = match &title {
+        Some(title) => body.text.is_empty().then_some(title),
+        None => (body.text.lines().count() <= 1).then_some(&body),
+    };
+    let mut entry = if let Some(source) = inline {
+        Entry::new(key, source.markdown(), Surface::Reasoning)
     } else {
         let open = view.is_expanded(&key, timing.live());
-        let body = if open { text.to_owned() } else { String::new() };
-        Entry::titled(key, Title::disclosed(label, open), body, Surface::Reasoning)
+        let mut title = match title {
+            Some(title) => Title::markdown(title.text, title.definitions, open),
+            None => Title::disclosed("Reasoning", open),
+        };
+        if status == ReasoningStatus::Incomplete {
+            title.suffix = Some(" · incomplete");
+        }
+        let body = if open { body.markdown() } else { String::new() };
+        Entry::titled(key, title, body, Surface::Reasoning)
     };
     entry.timing = timing;
     entry
@@ -161,14 +199,15 @@ pub(super) fn response_entries(
     since: i64,
 ) -> Vec<Entry> {
     let mut entries = Vec::new();
+    let response_ref = ResponseRef::Request(request);
     for block in response.blocks() {
-        let key = block_key(ResponseRef::Request(request), &block.block);
         match block.kind {
-            ItemKind::Reasoning if !block.text.trim().is_empty() => {
+            ItemKind::Reasoning => {
                 // Reasoning keeps streaming until a later block takes over or the
                 // response ends.
-                let entry = reasoning_entry(
-                    key,
+                entries.extend(reasoning_entries(
+                    response_ref,
+                    &block.block,
                     &block.text,
                     view,
                     if response.streaming(block) {
@@ -178,8 +217,7 @@ pub(super) fn response_entries(
                     } else {
                         ReasoningStatus::Complete
                     },
-                );
-                entries.push(entry);
+                ));
             }
             ItemKind::Text if !block.text.trim().is_empty() => {
                 let (title, surface) = if response.incomplete() {
@@ -188,7 +226,7 @@ pub(super) fn response_entries(
                     (agent_name, Surface::Agent)
                 };
                 entries.push(Entry::titled(
-                    key,
+                    block_key(response_ref, &block.block),
                     Title::plain(title),
                     block.text.clone(),
                     surface,
@@ -225,17 +263,26 @@ mod tests {
             .unwrap()
     }
 
+    fn block() -> BlockRef {
+        BlockRef {
+            item: ItemId::try_from("item".to_owned()).unwrap(),
+            block: BlockId::try_from("block".to_owned()).unwrap(),
+        }
+    }
+
     #[test]
     fn reasoning_expansion_respects_defaults_and_explicit_overrides() {
         use ReasoningStatus::Complete;
         let mut view = View::default();
-        let block = BlockRef {
-            item: ItemId::try_from("item".to_owned()).unwrap(),
-            block: BlockId::try_from("block".to_owned()).unwrap(),
+        let key = EntryKey::Reasoning {
+            response: ResponseRef::Request(RequestSeq::default()),
+            block: block(),
+            section: 0,
         };
-        let key = block_key(ResponseRef::Request(RequestSeq::default()), &block);
-        let entry =
-            |view: &View, text: &str, status| reasoning_entry(key.clone(), text, view, status);
+        let entry = |view: &View, text, status| {
+            let section = sections(text).pop().unwrap();
+            reasoning_entry(key.clone(), section, view, status)
+        };
         // Streaming reasoning counts from its request.
         let running = ReasoningStatus::Running { since: 1_000 };
         let active = entry(&view, "\nFirst\nSecond\r\n", running);
@@ -265,6 +312,43 @@ mod tests {
         let single = entry(&view, "single line", Complete);
         assert!(!single.expandable() && single.title().is_none());
         assert_eq!(single.text(), "single line");
+    }
+
+    #[test]
+    fn reasoning_titles_disclose_the_sections_they_open() {
+        let text = "Intro\n\n**First**\n\nbody\n\n## Second\n\n*Third*\n\ntail";
+        let (response, block) = (ResponseRef::Request(RequestSeq::default()), block());
+        let entries = |status| reasoning_entries(response, &block, text, &View::default(), status);
+        let running = entries(ReasoningStatus::Running { since: 1_000 });
+        let keys: Vec<_> = running.iter().map(|entry| entry.key().clone()).collect();
+        let expected: Vec<_> = (0..4)
+            .map(|section| EntryKey::Reasoning {
+                response,
+                block: block.clone(),
+                section,
+            })
+            .collect();
+        assert_eq!(keys, expected);
+        // A title without a body stays inline like single-line reasoning.
+        assert!(!running[0].expandable() && !running[2].expandable());
+        assert_eq!(running[2].text(), "## Second");
+        // Settled sections collapse under their titles; the streaming one stays open.
+        assert_eq!(
+            running[1].title(),
+            Some(&Title::markdown("**First**", "", false))
+        );
+        assert_eq!(
+            running[3].title(),
+            Some(&Title::markdown("*Third*", "", true))
+        );
+        assert_eq!(running[3].body(), "tail");
+        let live = running.iter().map(|entry| entry.timing.live());
+        assert!(live.eq([false, false, false, true]));
+        let incomplete = entries(ReasoningStatus::Incomplete);
+        let suffixes = incomplete
+            .iter()
+            .map(|entry| entry.title().and_then(|title| title.suffix));
+        assert!(suffixes.skip(1).eq([None, None, Some(" · incomplete")]));
     }
 
     #[test]

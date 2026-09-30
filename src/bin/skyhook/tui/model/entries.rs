@@ -6,7 +6,9 @@
 use crate::tui::app::OutputStore;
 
 use super::jobs::{call_entry, job_entry};
-use super::live::{block_key, live_tail, live_tail_responses, reasoning_entry, response_entries};
+use super::live::{
+    ReasoningStatus, block_key, live_tail, live_tail_responses, reasoning_entries, response_entries,
+};
 use super::notifications::job_event_entries;
 use super::projection::JobInfo;
 use super::requests::{request_entry, request_timing};
@@ -740,18 +742,17 @@ impl History {
                     }
                 }
                 AssistantItem::Reasoning { id, blocks, .. } => {
-                    for block in blocks.iter().filter(|block| !block.text.trim().is_empty()) {
+                    for block in blocks {
                         let block_ref = BlockRef {
                             item: id.clone(),
                             block: block.id.clone(),
                         };
-                        let entry = reasoning_entry(
-                            block_key(response, &block_ref),
-                            &block.text,
-                            view,
-                            super::live::ReasoningStatus::Complete,
-                        );
-                        built.push(entry, None);
+                        let status = ReasoningStatus::Complete;
+                        for entry in
+                            reasoning_entries(response, &block_ref, &block.text, view, status)
+                        {
+                            built.push(entry, None);
+                        }
                     }
                 }
                 AssistantItem::ToolCall { call, .. } => {
