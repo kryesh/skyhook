@@ -80,7 +80,7 @@ pub async fn run(
         mode: explicit,
     } = request;
     let config = super::launch::load_config(&request.config, true).await?;
-    let (saved, warning) = crate::state::load(&request.config.workspace);
+    let (saved, warning) = crate::state::load(&request.config.source.workspace);
     let model = super::launch::select_model(&config, request.model.as_ref(), saved.model.as_ref())?;
     // Like the model: an explicit mode, then the last one used, then the default. A
     // resumed session may know an explicit mode the configuration no longer has.

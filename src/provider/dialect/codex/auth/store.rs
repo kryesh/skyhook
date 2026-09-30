@@ -1,29 +1,28 @@
 //! Private atomic credential persistence and cross-process refresh/login coordination.
-use super::{AuthManager, AuthStatus, Issuer, LoginRequired, blocking, random_string};
-use crate::fs::{AtomicWriteStage, CommitMode, PermissionPolicy, StagedFile, sync_directory};
+use super::{AuthManager, Issuer, blocking};
+use crate::fs::{AtomicWriteStage, CommitMode, PermissionPolicy, StagedFile};
 use crate::newtype::string_newtype;
 use crate::provider::{
     ProviderError,
     ProviderErrorKind::{Authentication, Unavailable},
+    dialect::{AuthStatus, LoginReason, LoginRequired},
+    profile::ProviderName,
 };
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::Read,
     path::{Path, PathBuf},
     time::Duration,
 };
 use zeroize::Zeroizing;
 
-/// The credential format; version 1 records predate issuer binding.
-const FORMAT: u32 = 2;
-pub(super) const STORE_FILE: &str = "codex-oauth.json";
-/// Held while credentials are read, refreshed or written, by every process.
-const LOCK_FILE: &str = "codex-oauth.lock";
+const FORMAT: u32 = 1;
 const MAX_STORE_BYTES: u64 = 1024 * 1024;
-const MAX_EPOCH_BYTES: u64 = 128;
+/// The longest provider name that is a file name beside `.json` or `.lock`.
+const MAX_NAME_BYTES: usize = 250;
 const MAX_TOKEN_BYTES: usize = 128 * 1024;
 const MAX_ACCOUNT_BYTES: usize = 256;
 const LOCK_TIMEOUT: Duration = Duration::from_secs(60);
@@ -88,89 +87,136 @@ pub(super) struct Stored {
     pub(super) expires_at: u64,
 }
 
-/// What the credential file holds.
-pub(super) enum Saved {
-    Absent,
-    /// A record from before credentials named their issuer.
-    Unbound,
-    Current(Stored),
+/// One provider's credential file and the lock every process holds while it
+/// reads, refreshes or writes them, named after the provider in a private
+/// directory.
+#[derive(Clone)]
+pub(super) struct Files {
+    directory: PathBuf,
+    store: PathBuf,
+    lock: PathBuf,
 }
 
-impl Saved {
-    pub(super) fn current(&self) -> Option<&Stored> {
-        match self {
-            Self::Current(stored) => Some(stored),
-            Self::Absent | Self::Unbound => None,
+/// A provider name no credential file can carry.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "provider `{0}` cannot name a credentials file; use a name without NUL of at most {MAX_NAME_BYTES} bytes"
+)]
+pub struct UnfileableName(ProviderName);
+
+impl From<UnfileableName> for ProviderError {
+    fn from(error: UnfileableName) -> Self {
+        Authentication.error(error.to_string())
+    }
+}
+
+impl Files {
+    /// Provider names hold no `/`, so each is one file name once it fits the
+    /// file system's limit beside its extension.
+    pub(super) fn new(directory: PathBuf, provider: &ProviderName) -> Result<Self, UnfileableName> {
+        let name = provider.as_str();
+        if name.len() > MAX_NAME_BYTES || name.contains('\0') {
+            return Err(UnfileableName(provider.clone()));
         }
+        Ok(Self {
+            store: directory.join(format!("{provider}.json")),
+            lock: directory.join(format!("{provider}.lock")),
+            directory,
+        })
     }
 }
 
 impl AuthManager {
-    pub async fn status(&self) -> Result<AuthStatus, ProviderError> {
-        let (_lock, saved) = self.load().await?;
-        Ok(match saved {
-            Saved::Current(stored) if stored.issuer != self.inner.issuer => {
-                AuthStatus::LoginRequired(LoginRequired::OtherIssuer)
-            }
-            Saved::Current(stored) => AuthStatus::LoggedIn {
+    pub(in crate::provider::dialect) async fn status(&self) -> Result<AuthStatus, ProviderError> {
+        Ok(match self.usable(self.read().await?) {
+            Ok((_, stored)) => AuthStatus::LoggedIn {
                 expires_at: stored.expires_at,
             },
-            Saved::Absent => AuthStatus::LoginRequired(LoginRequired::LoggedOut),
-            Saved::Unbound => AuthStatus::LoginRequired(LoginRequired::Unbound),
+            Err(required) => AuthStatus::LoginRequired(required),
         })
     }
 
-    pub(super) async fn load(&self) -> Result<(File, Saved), ProviderError> {
-        let directory = self.inner.directory.clone();
+    /// The saved credentials under their lock, unless absent or another issuer granted them.
+    pub(super) fn usable(
+        &self,
+        saved: Option<(File, Stored)>,
+    ) -> Result<(File, Stored), LoginRequired> {
+        match saved {
+            Some((lock, stored)) if stored.issuer == self.inner.issuer => Ok((lock, stored)),
+            Some(_) => Err(self.required(LoginReason::OtherIssuer)),
+            None => Err(self.required(LoginReason::LoggedOut)),
+        }
+    }
+
+    pub(in crate::provider::dialect) fn required(&self, reason: LoginReason) -> LoginRequired {
+        LoginRequired {
+            command: self.inner.command.clone(),
+            reason,
+        }
+    }
+
+    /// The saved credentials under the held lock; reading creates nothing.
+    pub(super) async fn read(&self) -> Result<Option<(File, Stored)>, ProviderError> {
+        let files = self.inner.files.clone();
         blocking(move || {
-            let lock = lock_store(&directory)?;
-            let stored = read_store(&directory)?;
+            let Some(lock) = lock_saved(&files)? else {
+                return Ok(None);
+            };
+            Ok(read_store(&files)?.map(|stored| (lock, stored)))
+        })
+        .await
+    }
+
+    /// The held lock and the saved credentials, if any, creating the store.
+    pub(super) async fn load(&self) -> Result<(File, Option<Stored>), ProviderError> {
+        let files = self.inner.files.clone();
+        blocking(move || {
+            let lock = lock_store(&files)?;
+            let stored = read_store(&files)?;
             Ok((lock, stored))
         })
         .await
     }
 
     pub(super) async fn save(&self, lock: File, stored: Stored) -> Result<(), ProviderError> {
-        let directory = self.inner.directory.clone();
+        let files = self.inner.files.clone();
         blocking(move || {
             let _lock = lock;
-            write_store(&directory, &stored)
+            write_store(&files, &stored)
         })
         .await
     }
 }
 
-pub(super) async fn logout(directory: PathBuf) -> Result<(), ProviderError> {
-    blocking(move || {
-        let mut lock = lock_store(&directory)?;
-        // Persist an epoch even when already logged out: an in-progress
-        // login must not resurrect credentials after explicit logout.
-        let epoch = random_string()?;
-        lock.seek(SeekFrom::Start(0))
-            .and_then(|_| lock.write_all(epoch.as_bytes()))
-            .and_then(|_| lock.set_len(epoch.len() as u64))
-            .and_then(|_| lock.sync_all())
-            .map_err(|_| Authentication.error("Cannot invalidate in-progress Codex login"))?;
-        match fs::remove_file(directory.join(STORE_FILE)) {
-            Ok(()) => sync_directory(&directory).map_err(|_| directory_sync_error()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(_) => Err(Authentication.error("Cannot remove Skyhook Codex credentials")),
-        }
-        // Do not remove the lock file: other processes may have its inode open.
-    })
-    .await
+/// Lock the store, creating its private directory and lock file.
+pub(super) fn lock_store(files: &Files) -> Result<File, ProviderError> {
+    create_directory(&files.directory)?;
+    lock(files)
+}
+
+/// Lock the store where credentials are saved; nothing is created where none
+/// are. A saved file whose lock is missing, as a restore may leave it, gets one.
+fn lock_saved(files: &Files) -> Result<Option<File>, ProviderError> {
+    if !private_directory(&files.directory)? {
+        return Ok(None);
+    }
+    match fs::symlink_metadata(&files.store) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(Authentication.error("Cannot inspect Skyhook Codex credentials")),
+    }
+    lock(files).map(Some)
 }
 
 // OS locking is performed in spawn_blocking, never on a Tokio worker. Bounded
 // try-lock polling also bounds the lifetime of a cancelled blocking operation.
-pub(super) fn lock_store(directory: &Path) -> Result<File, ProviderError> {
-    secure_directory(directory)?;
-    let file = private_open(&directory.join(LOCK_FILE), true)
+fn lock(files: &Files) -> Result<File, ProviderError> {
+    let lock = private_open(&files.lock, true)
         .map_err(|_| Authentication.error("Cannot open Skyhook Codex credential lock"))?;
     let start = std::time::Instant::now();
     loop {
-        match file.try_lock_exclusive() {
-            Ok(()) => return Ok(file),
+        match lock.try_lock_exclusive() {
+            Ok(()) => return Ok(lock),
             Err(e) if e.kind() != std::io::ErrorKind::WouldBlock => {
                 return Err(Authentication.error("Cannot lock Skyhook Codex credentials"));
             }
@@ -186,32 +232,52 @@ pub(super) fn lock_store(directory: &Path) -> Result<File, ProviderError> {
 }
 
 #[cfg(unix)]
-fn secure_directory(directory: &Path) -> Result<(), ProviderError> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let mut builder = fs::DirBuilder::new();
-    builder.recursive(true).mode(0o700);
-    builder
+fn create_directory(directory: &Path) -> Result<(), ProviderError> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
         .create(directory)
         .map_err(|_| Authentication.error("Cannot create Skyhook credential directory"))?;
-    let metadata = fs::symlink_metadata(directory)
-        .map_err(|_| Authentication.error("Cannot inspect Skyhook credential directory"))?;
+    private_directory(directory).map(drop)
+}
+
+/// Whether the credential directory exists; it must be private to its owner.
+#[cfg(unix)]
+fn private_directory(directory: &Path) -> Result<bool, ProviderError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(Authentication.error("Cannot inspect Skyhook credential directory")),
+    };
     if !metadata.is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
         return Err(Authentication
             .error("Skyhook credential directory must be an owned, non-symlink directory"));
     }
-    // Existing config directories may intentionally contain readable config.
-    // Do not chmod unrelated configuration; private files protect token contents.
-    if metadata.permissions().mode() & 0o022 != 0 {
-        return Err(Authentication
-            .error("Skyhook credential directory must not be writable by other users"));
+    // Skyhook makes it 0700; one made elsewhere is refused rather than chmodded.
+    if metadata.permissions().mode() & 0o077 != 0 {
+        return Err(Authentication.error(format!(
+            "Skyhook credential directory {} must be private to its owner (chmod 700)",
+            directory.display()
+        )));
     }
-    Ok(())
+    Ok(true)
+}
+
+// Do not pretend Unix mode bits provide a private ACL on another OS.
+#[cfg(not(unix))]
+fn create_directory(_directory: &Path) -> Result<(), ProviderError> {
+    Err(unsupported())
 }
 #[cfg(not(unix))]
-fn secure_directory(_directory: &Path) -> Result<(), ProviderError> {
-    // Do not pretend Unix mode bits provide a private ACL on another OS.
-    Err(Authentication
-        .error("Private Skyhook Codex credential storage is currently supported on Unix only"))
+fn private_directory(_directory: &Path) -> Result<bool, ProviderError> {
+    Err(unsupported())
+}
+#[cfg(not(unix))]
+fn unsupported() -> ProviderError {
+    Authentication
+        .error("Private Skyhook Codex credential storage is currently supported on Unix only")
 }
 
 fn private_open(path: &Path, create: bool) -> std::io::Result<File> {
@@ -240,10 +306,10 @@ fn private_open(path: &Path, create: bool) -> std::io::Result<File> {
     Ok(file)
 }
 
-fn read_store(directory: &Path) -> Result<Saved, ProviderError> {
-    let file = match private_open(&directory.join(STORE_FILE), false) {
+fn read_store(files: &Files) -> Result<Option<Stored>, ProviderError> {
+    let file = match private_open(&files.store, false) {
         Ok(file) => file,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Saved::Absent),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(_) => {
             return Err(Authentication.error(
                 "Cannot read Skyhook Codex credentials; require an owned private regular file",
@@ -263,16 +329,15 @@ fn read_store(directory: &Path) -> Result<Saved, ProviderError> {
     struct Version {
         version: u32,
     }
-    match serde_json::from_slice::<Version>(&bytes).map_err(|_| malformed())? {
-        Version { version: 1 } => return Ok(Saved::Unbound),
-        Version { version: FORMAT } => {}
-        Version { .. } => return Err(malformed()),
+    let Version { version } = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
+    if version != FORMAT {
+        return Err(malformed());
     }
     let stored = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
-    Ok(Saved::Current(stored))
+    Ok(Some(stored))
 }
 
-pub(super) fn write_store(directory: &Path, stored: &Stored) -> Result<(), ProviderError> {
+pub(super) fn write_store(files: &Files, stored: &Stored) -> Result<(), ProviderError> {
     #[derive(Serialize)]
     struct Versioned<'a> {
         version: u32,
@@ -287,7 +352,7 @@ pub(super) fn write_store(directory: &Path, stored: &Stored) -> Result<(), Provi
         serde_json::to_vec(&versioned)
             .map_err(|_| Authentication.error("Cannot serialize Skyhook Codex credentials"))?,
     );
-    let mut staged = StagedFile::create(&directory.join(STORE_FILE), PermissionPolicy::Private)
+    let mut staged = StagedFile::create(&files.store, PermissionPolicy::Private)
         .map_err(|_| Authentication.error("Cannot create private Skyhook credential file"))?;
     staged
         .write(&bytes)
@@ -296,24 +361,11 @@ pub(super) fn write_store(directory: &Path, stored: &Stored) -> Result<(), Provi
         .commit(CommitMode::Replace)
         .map_err(|failure| match failure.stage {
             AtomicWriteStage::OpenDirectory | AtomicWriteStage::SyncDirectory => {
-                directory_sync_error()
+                Authentication.error("Cannot sync Skyhook credential directory")
             }
             _ => Authentication.error("Cannot atomically save Skyhook Codex credentials"),
         })
 }
-fn directory_sync_error() -> ProviderError {
-    Authentication.error("Cannot sync Skyhook credential directory")
-}
-pub(super) fn read_epoch(mut lock: &File) -> Result<Vec<u8>, ProviderError> {
-    lock.seek(SeekFrom::Start(0))
-        .map_err(|_| Authentication.error("Cannot inspect Codex login generation"))?;
-    let mut epoch = Vec::new();
-    lock.take(MAX_EPOCH_BYTES)
-        .read_to_end(&mut epoch)
-        .map_err(|_| Authentication.error("Cannot read Codex login generation"))?;
-    Ok(epoch)
-}
-
 pub(super) fn store_fingerprint(stored: &Stored) -> Vec<u8> {
     let mut hash = Sha256::new();
     hash.update(stored.access_token.as_str());
@@ -324,7 +376,7 @@ pub(super) fn store_fingerprint(stored: &Stored) -> Vec<u8> {
 
 #[cfg(all(test, unix))]
 pub(super) mod tests {
-    use super::super::now;
+    use super::super::{login_command, manager_at, now};
     use super::*;
 
     pub(in super::super) fn stored(issuer: &Issuer, expiry: u64) -> Stored {
@@ -337,36 +389,35 @@ pub(super) mod tests {
         }
     }
 
+    /// Each provider keeps its own credentials in a shared directory; reading
+    /// creates nothing, and deleting a provider's file signs it out.
     #[tokio::test]
-    async fn persisted_private_atomic_credentials_and_logout() {
+    async fn persisted_private_atomic_credentials_per_provider() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
+        let directory = temp.path().join("credentials");
         let issuer = Issuer::parse("http://127.0.0.1:1").unwrap();
-        let manager = AuthManager::at(temp.path().join("skyhook"), issuer.clone()).unwrap();
-        assert_eq!(
-            manager.status().await.unwrap(),
-            AuthStatus::LoginRequired(LoginRequired::LoggedOut)
-        );
-        assert_eq!(
-            manager.credentials().await.unwrap_err(),
-            LoginRequired::LoggedOut.into()
-        );
+        let manager = manager_at(temp.path(), &issuer);
+        let command = login_command(temp.path(), "other");
+        let other = AuthManager::new(command, issuer.clone()).unwrap();
+        let logged_out = |manager: &AuthManager| manager.required(LoginReason::LoggedOut);
+        let status = |manager| AuthStatus::LoginRequired(logged_out(manager));
+        assert_eq!(manager.status().await.unwrap(), status(&manager));
+        let error = manager.credentials().await.unwrap_err();
+        assert_eq!(error, logged_out(&manager).into());
+        assert!(!directory.exists());
         let (lock, _) = manager.load().await.unwrap();
         manager
             .save(lock, stored(&issuer, now().unwrap() + 3600))
             .await
             .unwrap();
-        let path = manager.inner.directory.join(STORE_FILE);
+        let path = directory.join("test.json");
         assert_eq!(
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
         assert_eq!(
-            fs::metadata(&manager.inner.directory)
-                .unwrap()
-                .permissions()
-                .mode()
-                & 0o777,
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
             0o700
         );
         assert_eq!(
@@ -378,53 +429,57 @@ pub(super) mod tests {
             AuthStatus::LoggedIn { .. }
         ));
         assert!(!format!("{:?}", manager.credentials().await.unwrap()).contains("old-access"));
-        logout(temp.path().join("skyhook")).await.unwrap();
-        let (lock, _) = manager.load().await.unwrap();
-        let epoch = read_epoch(&lock).unwrap();
-        drop(lock);
-        // Even an already-empty store must invalidate an in-progress login.
-        logout(temp.path().join("skyhook")).await.unwrap();
-        let (lock, saved) = manager.load().await.unwrap();
-        assert!(matches!(saved, Saved::Absent));
-        assert_ne!(epoch, read_epoch(&lock).unwrap());
-        drop(lock);
-        assert!(!path.exists());
-        assert!(manager.inner.directory.join(LOCK_FILE).exists());
-        assert_eq!(
+        assert_eq!(other.status().await.unwrap(), status(&other));
+        assert!(!directory.join("other.lock").exists());
+        // A restore that skips the lock file still reads as signed in.
+        fs::remove_file(directory.join("test.lock")).unwrap();
+        assert!(matches!(
             manager.status().await.unwrap(),
-            AuthStatus::LoginRequired(LoginRequired::LoggedOut)
-        );
+            AuthStatus::LoggedIn { .. }
+        ));
+        fs::remove_file(&path).unwrap();
+        assert_eq!(manager.status().await.unwrap(), status(&manager));
     }
 
     #[test]
     fn private_store_rejects_symlinks_permissive_files_and_invalid_json() {
         use std::os::unix::fs::{PermissionsExt, symlink};
         let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join(STORE_FILE);
+        let name = |text: String| text.parse::<ProviderName>().unwrap();
+        let files = |provider: String| Files::new(temp.path().to_path_buf(), &name(provider));
+        assert!(files("a".repeat(MAX_NAME_BYTES)).is_ok());
+        assert!(files("a".repeat(MAX_NAME_BYTES + 1)).is_err());
+        assert!(files("a\0b".into()).is_err());
+        let files = files("test".into()).unwrap();
+        let path = files.store.clone();
         let unrelated = temp.path().join("unrelated");
         fs::write(&unrelated, b"DO-NOT-READ").unwrap();
         symlink(&unrelated, &path).unwrap();
-        assert!(read_store(temp.path()).is_err());
+        assert!(read_store(&files).is_err());
         fs::remove_file(&path).unwrap();
         fs::write(&path, b"TOP-SECRET invalid JSON").unwrap();
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(read_store(temp.path()).is_err());
+        assert!(read_store(&files).is_err());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let err = read_store(temp.path()).err().unwrap();
+        let err = read_store(&files).err().unwrap();
         assert!(!format!("{err:?}").contains("TOP-SECRET"));
     }
 
+    /// An existing directory must already be private; it is never chmodded.
     #[test]
-    fn existing_configuration_permissions_are_not_changed() {
+    fn credential_directory_must_be_private() {
         use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
-        secure_directory(temp.path()).unwrap();
-        assert_eq!(
-            fs::metadata(temp.path()).unwrap().permissions().mode() & 0o777,
-            0o755
-        );
-        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o777)).unwrap();
-        assert!(secure_directory(temp.path()).is_err());
+        let mode = |mode| fs::set_permissions(temp.path(), fs::Permissions::from_mode(mode));
+        assert!(!private_directory(&temp.path().join("absent")).unwrap());
+        mode(0o700).unwrap();
+        assert!(private_directory(temp.path()).unwrap());
+        for permissive in [0o750, 0o705] {
+            mode(permissive).unwrap();
+            assert!(private_directory(temp.path()).is_err());
+            assert!(create_directory(temp.path()).is_err());
+            let metadata = fs::metadata(temp.path()).unwrap();
+            assert_eq!(metadata.permissions().mode() & 0o777, permissive);
+        }
     }
 }

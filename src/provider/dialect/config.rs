@@ -8,9 +8,9 @@ use serde::{Deserialize, Serialize};
 
 use super::{DialectError, PlacementError};
 use crate::provider::{
-    codec::{CodecName, EffortLevels},
+    codec::EffortLevels,
     http::{
-        Timeouts,
+        Headers, Timeouts,
         headers::{CommandValue, Value, ValueField, prefixed},
     },
     profile::{LimitsError, ModelName},
@@ -232,8 +232,8 @@ pub enum AdmissionError {
 /// Fields every dialect accepts, as written. A dialect's own fields sit beside them.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Common {
-    /// The API root; Skyhook appends the codec's path. Absent only where the
-    /// dialect has its own service (Codex).
+    /// The API root; Skyhook appends the path of the service it calls. Absent
+    /// only where the dialect has its own service (Codex).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -348,16 +348,23 @@ pub(crate) fn service_url(text: &str) -> Result<reqwest::Url, EndpointError> {
     Ok(url)
 }
 
-/// The codec's endpoint under an API root.
-pub(crate) fn endpoint(root: &reqwest::Url, codec: CodecName) -> reqwest::Url {
-    let mut url = root.clone();
-    let path = format!(
-        "{}/{}",
-        url.path().trim_end_matches('/'),
-        codec.path_suffix()
-    );
-    url.set_path(&path);
-    url
+impl Connection {
+    /// The entry's `headers`, read once composition shows they are sent.
+    pub(crate) fn configured_headers(&self) -> Headers<Pending> {
+        let mut headers = Headers::default();
+        for (header, value) in &self.headers {
+            let field = ValueField::Header(header.clone());
+            headers.insert(header.clone(), value.header(field, None));
+        }
+        headers
+    }
+
+    /// `path` beneath the API root.
+    pub(crate) fn url(&self, path: &str) -> reqwest::Url {
+        let mut url = self.root.clone();
+        url.set_path(&format!("{}/{path}", url.path().trim_end_matches('/')));
+        url
+    }
 }
 
 #[cfg(test)]
@@ -365,10 +372,17 @@ mod tests {
     use super::*;
 
     #[test]
-    fn endpoints_append_the_codec_path_and_refuse_secrets_in_urls() {
-        let root = service_url("https://example.com/custom/v1/").unwrap();
-        let url = endpoint(&root, CodecName::Responses);
-        assert_eq!(url.as_str(), "https://example.com/custom/v1/responses");
+    fn endpoints_append_paths_and_refuse_secrets_in_urls() {
+        let common = Common {
+            base_url: Some("https://example.com/custom/v1/".into()),
+            ..Common::default()
+        };
+        let connection = common.admit(super::super::BaseUrl::Required).unwrap();
+        let url = connection.url("codex/responses");
+        assert_eq!(
+            url.as_str(),
+            "https://example.com/custom/v1/codex/responses"
+        );
         for invalid in [
             "/v1",
             "ftp://example.com/v1",

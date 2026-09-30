@@ -3,7 +3,7 @@
 ```text
 skyhook [OPTIONS]
 skyhook batch [OPTIONS] <--prompt TEXT|--script PATH>
-skyhook auth <login|status|logout> [codex]
+skyhook auth <login|status> <PROVIDER> [OPTIONS]
 skyhook dump [config|skills] [OPTIONS]
 skyhook stats <SESSION_ID|--list> [OPTIONS]
 ```
@@ -151,18 +151,20 @@ earlier session format are refused with a nonzero exit.
 ## Authentication commands
 
 ```sh
-skyhook auth login
-skyhook auth login --headless
-skyhook auth status
-skyhook auth logout
+skyhook auth login codex
+skyhook auth login codex --headless
+skyhook auth status codex
+skyhook auth status codex --check
 ```
 
-The optional provider argument currently accepts only `codex`, which is the default.
-`auth login --headless` selects device authorization rather than a browser; it is separate
-from `skyhook batch`. Login needs no configuration file; when one exists it must load, and login
-signs in to the `auth_url` its `codex` providers share (entries naming different ones are refused),
-or OpenAI's issuer when none names one. `auth status` checks the stored credentials against that
-issuer; `auth logout` reads no configuration.
+The argument names a configured provider whose dialect Skyhook signs in to; currently that is any
+`codex` provider. The configuration is found as for a session: `--workspace PATH` selects the
+workspace whose `.skyhook/config.yaml` overlays the user file, and `--config path.yaml` loads only
+that file. It must load and define the provider. `auth login --headless` selects device
+authorization rather than a browser; it is separate from `skyhook batch`. Login signs in to the
+provider's `auth_url`. `auth status` checks that provider's stored credentials against it without
+contacting the service; `--check` also presents them to the service in a request that spends no
+quota, and fails unless the provider is logged in and the service accepts them. To sign out, delete the provider's credentials file.
 See [authentication](../configuration/authentication.md) for credential ownership and storage.
 
 ## Related settings

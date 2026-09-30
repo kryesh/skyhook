@@ -344,15 +344,27 @@ mod dotenv {
             config.display()
         );
         f.write("invocation/.env", &source);
-        // Logout finds the credentials through the dotenv directory as well.
-        f.write("config/skyhook/codex-oauth.json", "removed without parsing");
+        // Auth finds the provider, and the credentials beside its file, through
+        // the dotenv directory as well: a planted malformed file is read.
+        let subscription = "providers:\n  sub:\n    dialect: codex\n    codec: responses\n";
+        f.write("config/skyhook/config.yaml", subscription);
+        f.write("config/skyhook/credentials/sub.json", "not credentials");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let private = |path: &str, mode| {
+                fs::set_permissions(f.path(path), fs::Permissions::from_mode(mode)).unwrap()
+            };
+            private("config/skyhook/credentials", 0o700);
+            private("config/skyhook/credentials/sub.json", 0o600);
+        }
         let out = output(
             f.bare_command()
                 .env_remove("XDG_CONFIG_HOME")
-                .args(["auth", "logout"]),
+                .args(["auth", "status", "sub"]),
         );
-        assert!(out.status.success() && out.stderr.is_empty(), "{out:?}");
-        assert!(!config.join("skyhook/codex-oauth.json").exists());
+        assert!(!out.status.success(), "{out:?}");
+        let stderr = String::from_utf8(out.stderr).unwrap();
+        assert!(stderr.contains("malformed"), "{stderr}");
         for credential in [
             format!("api_key: {{env: '{KEY}'}}"),
             format!("api_key: {{command: \"printf '%s' \\\"${KEY}\\\"\"}}"),
@@ -432,9 +444,10 @@ mod dump {
             ".skyhook/config.yaml",
             "providers:\n  test:\n    models:\n      first:\n        max_output: 0\n",
         );
+        // A workspace entry replaces the user's whole.
         f.write(
             "project/.skyhook/config.yaml",
-            "providers:\n  test:\n    models:\n      first:\n        max_output: 8192\n",
+            "providers:\n  test:\n    dialect: compatible\n    codec: chat_completions\n    base_url: 'http://127.0.0.1:1/v1'\n    models:\n      first:\n        model: fixture\n        max_context: 128000\n        max_output: 8192\n",
         );
         let project = f.path("project");
         let merged = output(f.bare_command().args(["dump", "--workspace"]).arg(&project));

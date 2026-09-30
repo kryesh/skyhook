@@ -40,7 +40,7 @@ pub async fn run(request: BatchRequest, input: InitialInput) -> Result<(), Batch
         .await
         .map_err(LaunchError::from)?;
     // Model memory is shared with terminal launches, but UI settings are never read.
-    let (saved, state_warning) = super::state::load(&request.config.workspace);
+    let (saved, state_warning) = super::state::load(&request.config.source.workspace);
     let model = launch::select_model(&config, request.model.as_ref(), saved.model.as_ref())?;
     // A named mode also applies to a resumed session, from this prompt on.
     let mode = match &permissions {

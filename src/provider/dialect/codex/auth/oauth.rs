@@ -1,9 +1,10 @@
 //! Public-client OAuth, PKCE callbacks, device authorization, and token validation.
-use super::store::{Stored, read_epoch, store_fingerprint};
-use super::{AccountId, AuthManager, Issuer, Token, blocking, now, random_string};
+use super::super::BodyError;
+use super::store::{Stored, store_fingerprint};
+use super::{AccountId, AuthManager, Issuer, Token, now, random_string};
 use crate::provider::{
     ProviderError,
-    ProviderErrorKind::{Authentication, Transport},
+    ProviderErrorKind::{Authentication, Timeout, Transport},
     codec::common::{lenient, lenient_count},
     http::{
         errors::{ErrorSignals, Reading},
@@ -27,7 +28,6 @@ const CALLBACK_READ_TIMEOUT: Duration = Duration::from_secs(5);
 const CALLBACK_REPLY_TIMEOUT: Duration = Duration::from_secs(2);
 const BROWSER_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_CALLBACK_BYTES: usize = 16 * 1024;
-const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 const MAX_CLAIMS_BYTES: usize = 1024 * 1024;
 const MAX_USER_CODE_BYTES: usize = 128;
 const DEFAULT_POLL_SECS: u64 = 5;
@@ -48,26 +48,20 @@ impl AuthManager {
 
     /// Persist the tokens `flow` obtains. The lock is not held while a human
     /// signs in: the previous generation is snapshotted, and a concurrent
-    /// logout, login or refresh is never overwritten. Login never reads any
+    /// login or refresh is never overwritten. Login never reads any
     /// official-client credential file.
     async fn sign_in(
         &self,
         flow: impl Future<Output = Result<TokenResponse, ProviderError>>,
     ) -> Result<(), ProviderError> {
-        let (lock, previous) = self.load().await?;
-        let previous = previous.current().map(store_fingerprint);
-        let epoch = blocking(move || read_epoch(&lock)).await?;
+        let (_, previous) = self.load().await?;
+        let previous = previous.as_ref().map(store_fingerprint);
         let token = tokio::time::timeout(LOGIN_TIMEOUT, flow)
             .await
             .map_err(|_| Authentication.error("Codex login timed out; start login again"))??;
         let stored = token.into_stored(&self.inner.issuer, None)?;
         let (lock, current) = self.load().await?;
-        let (lock, current_epoch) = blocking(move || {
-            let epoch = read_epoch(&lock)?;
-            Ok((lock, epoch))
-        })
-        .await?;
-        if current_epoch != epoch || current.current().map(store_fingerprint) != previous {
+        if current.as_ref().map(store_fingerprint) != previous {
             return Err(
                 Authentication.error("Codex credentials changed during login; start login again")
             );
@@ -344,7 +338,7 @@ impl Claims {
 }
 
 async fn response_json<T: serde::de::DeserializeOwned>(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
 ) -> Result<T, ProviderError> {
     if !response.status().is_success() {
         // Never include response bodies, URLs, reqwest errors, or OAuth error
@@ -364,17 +358,15 @@ async fn response_json<T: serde::de::DeserializeOwned>(
         };
         return Err(kind.error(message).with_retry_after(retry_after));
     }
-    let mut bytes = Zeroizing::new(Vec::new());
-    while let Some(chunk) = response
-        .chunk()
+    let bytes = super::super::body(response, super::REQUEST_TIMEOUT)
         .await
-        .map_err(|_| Transport.error("Cannot read Codex authentication response"))?
-    {
-        if bytes.len().saturating_add(chunk.len()) > MAX_RESPONSE_BYTES {
-            return Err(Authentication.error("Codex authentication response is too large"));
-        }
-        bytes.extend_from_slice(&chunk);
-    }
+        .map_err(|error| match error {
+            BodyError::Unreadable => Transport.error("Cannot read Codex authentication response"),
+            BodyError::Stalled => Timeout.error("Codex authentication response stalled"),
+            BodyError::TooLarge => {
+                Authentication.error("Codex authentication response is too large")
+            }
+        })?;
     serde_json::from_slice(&bytes).map_err(|_| {
         Authentication.error("Codex authentication server returned a malformed response")
     })
@@ -478,6 +470,7 @@ async fn launch_browser(url: &str) {
 
 #[cfg(all(test, unix))]
 pub(super) mod tests {
+    use super::super::manager_at;
     use super::super::store::tests::stored;
     use super::*;
     use crate::provider::http::transport::tests::read_request as read_http_request;
@@ -497,7 +490,7 @@ pub(super) mod tests {
     }
 
     /// A loopback-only HTTP mock; joins are always awaited by callers.
-    pub(in super::super) async fn mock(
+    pub(in crate::provider::dialect::codex) async fn mock(
         replies: Vec<(u16, serde_json::Value)>,
     ) -> (
         String,
@@ -572,8 +565,7 @@ pub(super) mod tests {
             (200, serde_json::json!({"authorization_code":"issued-code","code_verifier":"issued-verifier","code_challenge":"unused"})),
             (200, token_body()),
         ]).await;
-        let manager =
-            AuthManager::at(temp.path().to_path_buf(), Issuer::parse(&url).unwrap()).unwrap();
+        let manager = manager_at(temp.path(), &Issuer::parse(&url).unwrap());
         let paced = std::sync::Mutex::new(Vec::new());
         let pace = |interval| {
             paced.lock().unwrap().push(interval);
@@ -601,7 +593,7 @@ pub(super) mod tests {
             manager.credentials().await.unwrap().account_id.as_str(),
             "account-123"
         );
-        assert!(temp.path().join(super::super::store::STORE_FILE).exists());
+        assert!(temp.path().join("credentials/test.json").exists());
     }
 
     #[test]

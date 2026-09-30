@@ -7,7 +7,7 @@ use super::{ModelError, Placements};
 use crate::provider::{
     codec::{Codec, CodecName},
     profile::ModelProfile,
-    settings::{Patch, find_field},
+    settings::Patch,
 };
 
 crate::provider::settings::settings! {
@@ -60,7 +60,7 @@ impl<'de, P: Patch> Deserialize<'de> for RequestSettings<P> {
         }
         let (request, dialect) = fields
             .into_iter()
-            .partition(|(key, _)| find_field(RequestPatch::FIELDS, key).is_some());
+            .partition(|(key, _)| RequestPatch::FIELDS.contains(&key.as_str()));
         Ok(Self {
             request: parse(request)?,
             dialect: parse(dialect)?,

@@ -2,17 +2,19 @@
 //! credentials, a sticky per-turn routing header, and cache affinity by header.
 //! Authentication never imports the official client's credentials.
 pub mod auth;
+mod usage;
 
-use std::sync::Arc;
+pub use usage::Account;
+
+use std::{sync::Arc, time::Duration};
 
 use futures_util::future::BoxFuture;
-use indexmap::IndexMap;
 use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+use zeroize::Zeroizing;
 
 use super::{
-    AdmissionError, BaseUrl, BuildError, Common, Connection, Dialect, DialectConfig, DialectError,
-    Pending, Profile, UnsupportedCodec,
-    entry::{ProviderOptions, ProviderSettings, RawProviderConfig},
+    AdmissionError, BaseUrl, Common, ConfigHome, Connection, Dialect, DialectConfig, DialectError,
+    Login, LoginCommand, Pending, Profile, UnsupportedCodec, entry::ProviderOptions,
 };
 use crate::provider::{
     ProviderError,
@@ -25,9 +27,15 @@ use crate::provider::{
 };
 
 const ACCOUNT_HEADER: HeaderName = HeaderName::from_static("chatgpt-account-id");
+/// Names Skyhook as the client on every request to the service.
+const ORIGINATOR: &str = "originator";
+const SKYHOOK: HeaderValue = HeaderValue::from_static("skyhook");
+/// The most of a JSON answer's body that is read.
+const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// The subscription service's API root, unless the entry names another.
-const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api/codex";
+/// The ChatGPT backend's API root, unless the entry names another. Codex
+/// inference and account usage are services beneath it.
+const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
 
 /// The subscription service's Responses conventions: `instructions` is required, no
 /// output limit is accepted, cache affinity travels as a header, completed items
@@ -60,7 +68,7 @@ fn transport() -> Transport {
 }
 
 crate::provider::settings::settings! {
-    /// Codex takes no key: `skyhook auth login` stores its credentials. `base_url`
+    /// Codex takes no key: `skyhook auth login` stores each entry's credentials. `base_url`
     /// and `auth_url` default to OpenAI's service and are named only for a mirror.
     #[derive(Default)]
     pub struct Options => OptionsPatch {
@@ -77,10 +85,8 @@ crate::provider::settings::settings! {
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 pub enum Error {
-    #[error("api_key does not apply to codex; run `skyhook auth login`")]
+    #[error("api_key does not apply to codex; run `skyhook auth login <provider>`")]
     ApiKey,
-    #[error(transparent)]
-    Issuers(#[from] IssuerConflict),
 }
 
 impl ProviderOptions for Options {
@@ -92,69 +98,25 @@ impl ProviderOptions for Options {
         Ok(connection)
     }
 
-    fn authentication(&self) -> Result<Option<Headers<Pending>>, BuildError> {
-        Ok(Some(subscription(auth::AuthManager::new(self.issuer())?)))
-    }
-
-    fn validate<'a>(
-        entries: impl Iterator<Item = (&'a ProviderName, &'a Self)>,
-    ) -> Result<(), DialectError>
-    where
-        Self: 'a,
-    {
-        shared_issuer(entries).map_err(Error::from)?;
-        Ok(())
+    fn login(
+        &self,
+        name: &ProviderName,
+        home: &ConfigHome,
+        connection: &Connection,
+    ) -> Result<Option<Login>, ProviderError> {
+        let command = LoginCommand {
+            provider: name.clone(),
+            home: home.clone(),
+        };
+        let manager = auth::AuthManager::new(command, self.issuer())?;
+        Ok(Some(Login::Codex(Account::new(manager, connection))))
     }
 }
 
 impl Options {
     /// The issuer the entry names, or OpenAI's.
-    pub fn issuer(&self) -> auth::Issuer {
+    fn issuer(&self) -> auth::Issuer {
         self.auth_url.clone().unwrap_or_default()
-    }
-}
-
-/// Codex entries naming different issuers, where one credential store serves one.
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error(
-    "codex providers `{first}` and `{second}` name different auth_url issuers, but Skyhook \
-     keeps one Codex login; give them the same auth_url"
-)]
-pub struct IssuerConflict {
-    pub first: ProviderName,
-    pub second: ProviderName,
-}
-
-/// The issuer every Codex entry names, since one credential store serves one;
-/// OpenAI's when no entry names one.
-pub fn issuer(
-    providers: &IndexMap<ProviderName, RawProviderConfig>,
-) -> Result<auth::Issuer, IssuerConflict> {
-    shared_issuer(
-        providers
-            .iter()
-            .filter_map(|(name, entry)| match &entry.settings {
-                ProviderSettings::Codex(entry) => Some((name, &entry.options)),
-                _ => None,
-            }),
-    )
-}
-
-fn shared_issuer<'a>(
-    entries: impl IntoIterator<Item = (&'a ProviderName, &'a Options)>,
-) -> Result<auth::Issuer, IssuerConflict> {
-    let mut issuers = entries
-        .into_iter()
-        .map(|(name, options)| (name, options.issuer()));
-    let Some((first, issuer)) = issuers.next() else {
-        return Ok(auth::Issuer::default());
-    };
-    match issuers.find(|(_, other)| *other != issuer) {
-        Some((second, _)) => Err(IssuerConflict {
-            first: first.clone(),
-            second: second.clone(),
-        }),
-        None => Ok(issuer),
     }
 }
 
@@ -168,13 +130,43 @@ impl DialectConfig for Config {
             .into());
         }
         let mut profile = Profile::new(Codec::Responses(responses()), transport(), Dialect::Codex);
-        profile.fixed("originator", HeaderValue::from_static("skyhook"));
+        profile.service = Some("codex");
+        profile.fixed(ORIGINATOR, SKYHOOK);
         Ok(profile)
     }
 }
 
+/// Why a JSON answer's body could not be read.
+enum BodyError {
+    Unreadable,
+    /// No read completed within the idle limit.
+    Stalled,
+    TooLarge,
+}
+
+/// A JSON answer's body, bounded, each read within `read_idle`, and wiped on drop.
+async fn body(
+    mut response: reqwest::Response,
+    read_idle: Duration,
+) -> Result<Zeroizing<Vec<u8>>, BodyError> {
+    let mut bytes = Zeroizing::new(Vec::new());
+    loop {
+        let chunk = tokio::time::timeout(read_idle, response.chunk())
+            .await
+            .map_err(|_| BodyError::Stalled)?
+            .map_err(|_| BodyError::Unreadable)?;
+        let Some(chunk) = chunk else {
+            return Ok(bytes);
+        };
+        if bytes.len().saturating_add(chunk.len()) > MAX_BODY_BYTES {
+            return Err(BodyError::TooLarge);
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+}
+
 /// The stored subscription credentials, under each header they set.
-fn subscription(manager: auth::AuthManager) -> Headers<Pending> {
+pub(super) fn subscription(manager: auth::AuthManager) -> Headers<Pending> {
     let source: Arc<dyn Authenticator> = Arc::new(Subscription(manager));
     let mut headers = Headers::default();
     for name in [AUTHORIZATION, ACCOUNT_HEADER] {
@@ -272,7 +264,7 @@ mod tests {
         assert_eq!(reduced.items()[0].text_content().as_deref(), Some("OK"));
         let requests = server.finish().await;
         let (head, body) = requests[0].split_once("\r\n\r\n").unwrap();
-        assert!(head.starts_with("POST /responses HTTP/1.1"));
+        assert!(head.starts_with("POST /codex/responses HTTP/1.1"));
         assert_eq!(
             header_values(head, "authorization"),
             ["Bearer test-access-token"]
@@ -288,8 +280,6 @@ mod tests {
         assert_eq!(body["instructions"], "");
     }
 
-    /// One credential store serves one issuer, so every codex entry names the
-    /// same one; the default counts as OpenAI's.
     #[test]
     fn takes_no_key_at_the_service_or_a_mirror() {
         // Refused whether or not the entry has models yet.
@@ -303,7 +293,7 @@ mod tests {
         Config::default().admit(CodecName::Responses).unwrap();
         assert_eq!(
             options.admit(&Common::default()).unwrap().root.as_str(),
-            "https://chatgpt.com/backend-api/codex"
+            "https://chatgpt.com/backend-api"
         );
         for base_url in [None, Some("https://api.example/codex".to_owned())] {
             let common = Common {

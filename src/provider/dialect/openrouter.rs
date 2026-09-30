@@ -242,7 +242,7 @@ mod tests {
 
     #[test]
     fn routing_overlay_is_fieldwise_and_null_resets_the_whole_object() {
-        use crate::provider::settings::{FieldKind, Patch as _, Settings, find_field};
+        use crate::provider::settings::{Patch as _, Settings};
         use serde_json::json;
 
         let lower: Patch = serde_json::from_value(json!({"routing": {
@@ -273,13 +273,6 @@ mod tests {
         );
         assert_eq!(lower.overlay(&empty), lower);
         assert!(serde_json::from_value::<Patch>(json!({"routing": {"unknown": 1}})).is_err());
-
-        let FieldKind::Object(fields) = find_field(Patch::FIELDS, "routing").unwrap().kind else {
-            panic!("routing must expose its nested fields");
-        };
-        assert!(find_field(fields, "allow_fallbacks").is_some());
-        assert!(find_field(fields, "fallback_models").is_some());
-        assert!(find_field(fields, "provider").is_none());
     }
 
     #[tokio::test]

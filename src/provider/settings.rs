@@ -12,26 +12,11 @@ pub trait Settings: Sized {
 }
 
 pub trait Patch: Clone + Debug + Default + Serialize + DeserializeOwned {
-    const FIELDS: &'static [Field];
+    /// The serialized field names, flattened groups included.
+    const FIELDS: &'static [&'static str];
 
     /// Apply the higher-precedence partial settings without resolving defaults.
     fn overlay(&self, higher: &Self) -> Self;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Field {
-    pub name: &'static str,
-    pub kind: FieldKind,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FieldKind {
-    Atomic,
-    Object(&'static [Field]),
-}
-
-pub fn find_field(fields: &'static [Field], name: &str) -> Option<&'static Field> {
-    fields.iter().find(|field| field.name == name)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -115,12 +100,9 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Setting<T> {
     }
 }
 
-/// Join metadata for flattened settings without maintaining another field list.
-pub(crate) const fn fields<const N: usize>(groups: &[&[Field]]) -> [Field; N] {
-    let mut fields = [Field {
-        name: "",
-        kind: FieldKind::Atomic,
-    }; N];
+/// Join the field names of flattened settings without maintaining another list.
+pub(crate) const fn fields<const N: usize>(groups: &[&[&'static str]]) -> [&'static str; N] {
+    let mut fields = [""; N];
     let mut offset = 0;
     let mut group = 0;
     while group < groups.len() {
@@ -138,7 +120,7 @@ pub(crate) const fn fields<const N: usize>(groups: &[&[Field]]) -> [Field; N] {
 /// Declare resolved settings and their presence-preserving patch together.
 /// `required` has no default; `default` resolves only after overlaying layers.
 /// `object(T)` merges a nullable nested settings object field by field. A
-/// `@flatten` group shares another settings declaration's fields and metadata.
+/// `@flatten` group shares another settings declaration's fields.
 /// Field serde attributes describe the resolved form, never the patch.
 macro_rules! settings {
     (
@@ -167,16 +149,13 @@ macro_rules! settings {
         }
 
         impl $crate::provider::settings::Patch for $patch {
-            const FIELDS: &'static [$crate::provider::settings::Field] = &{
+            const FIELDS: &'static [&'static str] = &{
                 $crate::provider::settings::fields::<{
                     0 $($(+ <<$flat_ty as $crate::provider::settings::Settings>::Patch as $crate::provider::settings::Patch>::FIELDS.len())*)?
                         $(+ { let _ = stringify!($field); 1 })*
                 }>(&[
                     $($(<<$flat_ty as $crate::provider::settings::Settings>::Patch as $crate::provider::settings::Patch>::FIELDS,)*)?
-                    &[$($crate::provider::settings::Field {
-                        name: stringify!($field),
-                        kind: $crate::provider::settings::settings!(@kind $kind $(($inner))?),
-                    },)*],
+                    &[$(stringify!($field),)*],
                 ])
             };
 
@@ -203,12 +182,6 @@ macro_rules! settings {
         $crate::provider::settings::Setting<Option<<$inner as $crate::provider::settings::Settings>::Patch>>
     };
     (@type $ty:ty, $kind:ident) => { $crate::provider::settings::Setting<$ty> };
-    (@kind object($inner:ty)) => {
-        $crate::provider::settings::FieldKind::Object(
-            <<$inner as $crate::provider::settings::Settings>::Patch as $crate::provider::settings::Patch>::FIELDS
-        )
-    };
-    (@kind $kind:ident) => { $crate::provider::settings::FieldKind::Atomic };
     (@overlay $lower:expr, $higher:expr, object($inner:ty)) => { $lower.overlay_object(&$higher) };
     (@overlay $lower:expr, $higher:expr, $kind:ident) => { $lower.overlay(&$higher) };
     (@resolve $value:expr, $field:ident, required) => { $value.required(stringify!($field))? };

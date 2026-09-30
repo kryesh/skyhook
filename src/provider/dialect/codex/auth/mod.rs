@@ -11,13 +11,11 @@
 mod oauth;
 mod store;
 
-use store::Saved;
 pub use store::{AccountId, InvalidAccount, InvalidToken, Token};
 
-use crate::provider::{ProviderError, ProviderErrorKind::Authentication};
+use crate::provider::{ProviderError, ProviderErrorKind::Authentication, dialect::LoginCommand};
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use std::{
-    path::PathBuf,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -107,25 +105,6 @@ impl std::fmt::Display for Issuer {
     }
 }
 
-/// Why stored credentials cannot be used until the user logs in again.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum LoginRequired {
-    #[error("Codex is not logged in; run `skyhook auth login codex`")]
-    LoggedOut,
-    #[error("Skyhook's Codex credentials predate issuer binding; run `skyhook auth login codex`")]
-    Unbound,
-    #[error(
-        "Skyhook's Codex credentials were issued by another auth_url; run `skyhook auth login codex`"
-    )]
-    OtherIssuer,
-}
-
-impl From<LoginRequired> for ProviderError {
-    fn from(required: LoginRequired) -> Self {
-        Authentication.error(required.to_string())
-    }
-}
-
 /// The token is deliberately absent from Debug.
 #[derive(Clone)]
 pub struct Credentials {
@@ -138,38 +117,26 @@ impl std::fmt::Debug for Credentials {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AuthStatus {
-    LoginRequired(LoginRequired),
-    /// Local state only; status does not refresh or validate against the server.
-    LoggedIn {
-        expires_at: u64,
-    },
-}
-
 #[derive(Clone)]
 pub struct AuthManager {
     inner: Arc<Inner>,
 }
 struct Inner {
-    directory: PathBuf,
+    files: store::Files,
+    /// Named when the credentials need a login.
+    command: LoginCommand,
     client: reqwest::Client,
     issuer: Issuer,
-}
-
-fn directory() -> Result<PathBuf, ProviderError> {
-    crate::config::user_config_directory()
-        .ok_or_else(|| Authentication.error("Cannot locate the Skyhook configuration directory"))
 }
 
 impl AuthManager {
     /// Does not read credentials or perform network I/O. Login is deferred until
     /// explicitly requested; credentials() never launches an interactive flow.
-    pub fn new(issuer: Issuer) -> Result<Self, ProviderError> {
-        Self::at(directory()?, issuer)
-    }
-
-    fn at(directory: PathBuf, issuer: Issuer) -> Result<Self, ProviderError> {
+    pub(in crate::provider::dialect) fn new(
+        command: LoginCommand,
+        issuer: Issuer,
+    ) -> Result<Self, ProviderError> {
+        let files = store::Files::new(command.home.credentials()?, &command.provider)?;
         let client = reqwest::Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(CONNECT_TIMEOUT)
@@ -178,7 +145,8 @@ impl AuthManager {
             .map_err(|_| Authentication.error("Cannot initialize Codex OAuth HTTP client"))?;
         Ok(Self {
             inner: Arc::new(Inner {
-                directory,
+                files,
+                command,
                 client,
                 issuer,
             }),
@@ -190,15 +158,7 @@ impl AuthManager {
     /// remains owned across the network await and is released on cancellation.
     /// Credentials another issuer granted are never used or sent.
     pub async fn credentials(&self) -> Result<Credentials, ProviderError> {
-        let (lock, saved) = self.load().await?;
-        let stored = match saved {
-            Saved::Absent => return Err(LoginRequired::LoggedOut.into()),
-            Saved::Unbound => return Err(LoginRequired::Unbound.into()),
-            Saved::Current(stored) if stored.issuer != self.inner.issuer => {
-                return Err(LoginRequired::OtherIssuer.into());
-            }
-            Saved::Current(stored) => stored,
-        };
+        let (lock, stored) = self.usable(self.read().await?)?;
         if stored.expires_at > now()?.saturating_add(REFRESH_SKEW) {
             return Ok(Credentials {
                 access_token: stored.access_token,
@@ -220,18 +180,6 @@ impl AuthManager {
     }
 }
 
-pub async fn login(issuer: Issuer, headless: bool) -> Result<(), ProviderError> {
-    AuthManager::new(issuer)?.login(headless).await
-}
-/// Local state only: whether stored credentials exist and serve `issuer`.
-pub async fn status(issuer: Issuer) -> Result<AuthStatus, ProviderError> {
-    AuthManager::new(issuer)?.status().await
-}
-/// Removes Skyhook's local tokens only; does not revoke other sessions.
-pub async fn logout() -> Result<(), ProviderError> {
-    store::logout(directory()?).await
-}
-
 async fn blocking<T: Send + 'static>(
     f: impl FnOnce() -> Result<T, ProviderError> + Send + 'static,
 ) -> Result<T, ProviderError> {
@@ -247,15 +195,34 @@ fn random_string() -> Result<String, ProviderError> {
     Ok(URL_SAFE_NO_PAD.encode(*bytes))
 }
 
+/// How the test provider `name` defined in `root` is signed in; its
+/// credentials are kept in `root`'s `credentials` directory.
+#[cfg(test)]
+pub(super) fn login_command(root: &std::path::Path, name: &str) -> LoginCommand {
+    LoginCommand {
+        provider: name.parse().unwrap(),
+        home: super::super::ConfigHome::File(root.join("config.yaml")),
+    }
+}
+
+/// A manager for the provider `test` defined in `root`, at `issuer`.
+#[cfg(test)]
+pub(super) fn manager_at(root: &std::path::Path, issuer: &Issuer) -> AuthManager {
+    AuthManager::new(login_command(root, "test"), issuer.clone()).unwrap()
+}
+
+#[cfg(all(test, unix))]
+pub(super) use oauth::tests::mock as oauth_mock;
+
 /// A manager holding unexpired credentials from a loopback issuer, for the
 /// codex provider's tests.
 #[cfg(test)]
-pub(super) fn test_manager(directory: PathBuf) -> AuthManager {
+pub(super) fn test_manager(directory: std::path::PathBuf) -> AuthManager {
     let issuer = Issuer::parse("http://127.0.0.1:1").unwrap();
-    let manager = AuthManager::at(directory, issuer.clone()).unwrap();
-    let _lock = store::lock_store(&manager.inner.directory).unwrap();
+    let manager = manager_at(&directory, &issuer);
+    let _lock = store::lock_store(&manager.inner.files).unwrap();
     store::write_store(
-        &manager.inner.directory,
+        &manager.inner.files,
         &store::Stored {
             issuer,
             access_token: Token::try_from("test-access-token".to_owned()).unwrap(),
@@ -273,6 +240,7 @@ mod tests {
     use super::oauth::tests::{mock, token_body};
     use super::store::tests::stored;
     use super::*;
+    use crate::provider::dialect::{AuthStatus, LoginReason, LoginRequired};
     use std::sync::atomic::Ordering;
 
     /// Refresh joins its path beneath the issuer's prefix.
@@ -281,8 +249,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let (url, count, server) = mock(vec![(200, token_body())]).await;
         let issuer = Issuer::parse(&format!("{url}/tenant")).unwrap();
-        let one = AuthManager::at(temp.path().to_path_buf(), issuer.clone()).unwrap();
-        let two = AuthManager::at(temp.path().to_path_buf(), issuer.clone()).unwrap();
+        let one = manager_at(temp.path(), &issuer);
+        let two = manager_at(temp.path(), &issuer);
         let (lock, _) = one.load().await.unwrap();
         one.save(lock, stored(&issuer, 1)).await.unwrap();
         let (a, b) = tokio::join!(one.credentials(), two.credentials());
@@ -293,44 +261,31 @@ mod tests {
         assert!(requests[0].contains("grant_type=refresh_token"));
         assert!(requests[0].contains("refresh_token=old-refresh"));
         let (_, saved) = one.load().await.unwrap();
-        assert_eq!(
-            saved.current().unwrap().refresh_token.as_str(),
-            "rotated-refresh"
-        );
+        assert_eq!(saved.unwrap().refresh_token.as_str(), "rotated-refresh");
     }
 
-    /// Credentials another issuer granted, fresh or due for refresh, and a
-    /// record from before issuer binding ask for a login, in use and in
-    /// status, and send nothing.
+    /// Credentials another issuer granted, fresh or due for refresh, ask for a
+    /// login, in use and in status, and send nothing.
     #[tokio::test]
-    async fn credentials_of_another_or_no_issuer_require_login_and_send_nothing() {
-        use std::os::unix::fs::PermissionsExt;
+    async fn credentials_of_another_issuer_require_login_and_send_nothing() {
         let temp = tempfile::tempdir().unwrap();
         let (url, count, server) = mock(vec![(200, token_body())]).await;
-        let manager =
-            AuthManager::at(temp.path().to_path_buf(), Issuer::parse(&url).unwrap()).unwrap();
+        let manager = manager_at(temp.path(), &Issuer::parse(&url).unwrap());
         let other = Issuer::parse("https://auth.example/").unwrap();
+        let required = LoginRequired {
+            command: login_command(temp.path(), "test"),
+            reason: LoginReason::OtherIssuer,
+        };
         for expiry in [1, now().unwrap() + 3600] {
             let (lock, _) = manager.load().await.unwrap();
             manager.save(lock, stored(&other, expiry)).await.unwrap();
             let error = manager.credentials().await.unwrap_err();
-            assert_eq!(error, LoginRequired::OtherIssuer.into());
+            assert_eq!(error, required.clone().into());
             assert_eq!(
                 manager.status().await.unwrap(),
-                AuthStatus::LoginRequired(LoginRequired::OtherIssuer)
+                AuthStatus::LoginRequired(required.clone())
             );
         }
-        let path = temp.path().join(store::STORE_FILE);
-        let unbound = serde_json::json!({"version": 1, "access_token": "old-access",
-            "refresh_token": "old-refresh", "account_id": "account-123", "expires_at": 1});
-        std::fs::write(&path, unbound.to_string()).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
-        let error = manager.credentials().await.unwrap_err();
-        assert_eq!(error, LoginRequired::Unbound.into());
-        assert_eq!(
-            manager.status().await.unwrap(),
-            AuthStatus::LoginRequired(LoginRequired::Unbound)
-        );
         assert_eq!(count.load(Ordering::SeqCst), 0);
         server.abort();
     }
@@ -345,7 +300,7 @@ mod tests {
         let replies = [400, 429, 503].map(|status| (status, secret.clone()));
         let (url, _, server) = mock(replies.to_vec()).await;
         let issuer = Issuer::parse(&url).unwrap();
-        let manager = AuthManager::at(temp.path().to_path_buf(), issuer.clone()).unwrap();
+        let manager = manager_at(temp.path(), &issuer);
         let (lock, _) = manager.load().await.unwrap();
         manager.save(lock, stored(&issuer, 1)).await.unwrap();
         let mut kinds = Vec::new();
@@ -357,13 +312,10 @@ mod tests {
         }
         server.await.unwrap();
         let (_, saved) = manager.load().await.unwrap();
-        assert_eq!(
-            saved.current().unwrap().refresh_token.as_str(),
-            "old-refresh"
-        );
+        assert_eq!(saved.unwrap().refresh_token.as_str(), "old-refresh");
         let refused = crate::tests::RefusedPort::new();
         let issuer = Issuer::parse(&format!("http://{}", refused.address())).unwrap();
-        let manager = AuthManager::at(temp.path().to_path_buf(), issuer.clone()).unwrap();
+        let manager = manager_at(temp.path(), &issuer);
         let (lock, _) = manager.load().await.unwrap();
         manager.save(lock, stored(&issuer, 1)).await.unwrap();
         kinds.push(manager.credentials().await.unwrap_err().kind());

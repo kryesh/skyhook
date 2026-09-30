@@ -26,9 +26,11 @@ select machines and workspaces; tools still operate on those machines' files.
 ## Configuration and provider entries
 
 `config` loads and layers configuration, admits it, resolves model selections, and builds the
-model catalog; it does not interpret provider entries. `provider::dialect` owns them
+model catalog; it does not interpret provider entries. Layering takes each named entry whole from one
+file and stamps every provider with that file (`ConfigHome`), beside which its Skyhook-managed
+credentials live. `provider::dialect` owns the entries
 (`RawProviderConfig`, `ProviderSettings`, `ProviderModels`): each dialect module declares its
-provider-only `Options` (connection rules, authentication, cross-entry constraints) and its
+provider-only `Options` (connection rules and any Skyhook-managed `Login`) and its
 inheritable request settings. Request defaults and model settings are typed partial declarations
 (`provider::settings`) that keep inheritance intent until admission resolves each model into a
 complete, independently validated codec and transport profile.

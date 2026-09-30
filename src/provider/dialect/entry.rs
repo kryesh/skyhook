@@ -1,6 +1,6 @@
 //! Dialect-owned provider declarations, admission, and shared-resource construction.
 
-use std::{fmt::Debug, sync::Arc};
+use std::{fmt::Debug, path::PathBuf, sync::Arc};
 
 use indexmap::IndexMap;
 use serde::{
@@ -11,22 +11,21 @@ use serde_json::{Map, Value};
 
 use super::{
     self as dialect, AdmissionError, BaseUrl, BuildError, Common, Connection, Dialect,
-    DialectConfig, DialectError, ModelError, ModelSpec, Profile, Request, RequestPatch,
-    RequestSettings, anthropic, codex, compatible,
-    config::Pending,
-    litellm,
+    DialectConfig, ModelError, ModelSpec, Profile, Request, RequestSettings, anthropic, codex,
+    compatible, litellm,
+    login::{Login, LoginError},
     models::{Fields, object},
     openai, openrouter,
 };
 use crate::provider::{
-    Provider,
-    http::Headers,
+    Provider, ProviderError,
+    ProviderErrorKind::Authentication,
     profile::{ModelName, ModelProfile, ProviderName},
-    settings::{Empty, Field, Patch, Settings, find_field},
+    settings::{Empty, Patch, Settings},
 };
 
-/// Provider-only options own connection rules, authentication, and constraints
-/// shared by entries of the same backend. Request settings never carry them.
+/// Provider-only options own connection rules and authentication. Request
+/// settings never carry them.
 pub(crate) trait ProviderOptions:
     Settings + Clone + Debug + Serialize + DeserializeOwned
 {
@@ -34,17 +33,15 @@ pub(crate) trait ProviderOptions:
         common.admit(BaseUrl::Required)
     }
 
-    fn authentication(&self) -> Result<Option<Headers<Pending>>, BuildError> {
+    /// The credentials `skyhook auth` manages for the entry `name`, which replace
+    /// its `api_key`; `home` is where the entry was defined.
+    fn login(
+        &self,
+        _name: &ProviderName,
+        _home: &ConfigHome,
+        _connection: &Connection,
+    ) -> Result<Option<Login>, ProviderError> {
         Ok(None)
-    }
-
-    fn validate<'a>(
-        _entries: impl Iterator<Item = (&'a ProviderName, &'a Self)>,
-    ) -> Result<(), DialectError>
-    where
-        Self: 'a,
-    {
-        Ok(())
     }
 }
 
@@ -67,7 +64,7 @@ impl<P: Patch, O> ProviderModels<P, O> {
             .unwrap_or_else(|| Value::Object(Map::new()));
         let (options, defaults) = fields
             .into_iter()
-            .partition(|(key, _)| find_field(<O::Patch as Patch>::FIELDS, key).is_some());
+            .partition(|(key, _)| <O::Patch as Patch>::FIELDS.contains(&key.as_str()));
         let options = serde_path_to_error::deserialize(Value::Object(options))
             .map_err(|error| error.to_string())?;
         let models =
@@ -91,7 +88,11 @@ impl<P: Patch, O> ProviderModels<P, O> {
         fields
     }
 
-    fn admit<C>(&self, common: &Common) -> Result<AdmittedEntry<O>, AdmissionError>
+    fn admit<C>(
+        &self,
+        common: &Common,
+        home: &ConfigHome,
+    ) -> Result<AdmittedEntry<O>, AdmissionError>
     where
         C: Settings<Patch = P> + DialectConfig,
         O: ProviderOptions,
@@ -123,6 +124,7 @@ impl<P: Patch, O> ProviderModels<P, O> {
             connection,
             models,
             options: self.options.clone(),
+            home: home.clone(),
         })
     }
 }
@@ -150,10 +152,24 @@ macro_rules! providers {
                 match self { $(Self::$variant(entry) => entry.fields()),+ }
             }
 
-            fn admit(&self, common: &Common) -> Result<AdmittedProvider, AdmissionError> {
+            fn admit(&self, common: &Common, home: &ConfigHome) -> Result<AdmittedProvider, AdmissionError> {
                 Ok(match self {
                     $(Self::$variant(entry) => {
-                        AdmittedProvider::$variant(entry.admit::<$module::Config>(common)?)
+                        AdmittedProvider::$variant(entry.admit::<$module::Config>(common, home)?)
+                    }),+
+                })
+            }
+
+            fn login(
+                &self,
+                name: &ProviderName,
+                common: &Common,
+                home: &ConfigHome,
+            ) -> Result<Option<Login>, LoginError> {
+                Ok(match self {
+                    $(Self::$variant(entry) => {
+                        let connection = entry.options.admit(common)?;
+                        entry.options.login(name, home, &connection)?
                     }),+
                 })
             }
@@ -173,41 +189,6 @@ macro_rules! providers {
             }
         }
 
-        impl Dialect {
-            pub(crate) fn request_field(self, name: &str) -> Option<&'static Field> {
-                find_field(RequestPatch::FIELDS, name)
-                    .or_else(|| find_field(self.request_fields(), name))
-            }
-
-            pub(crate) fn provider_field(self, name: &str) -> Option<&'static Field> {
-                let fields = match self {
-                    $(Self::$variant => <<$module::Options as Settings>::Patch as Patch>::FIELDS),+
-                };
-                find_field(fields, name).or_else(|| self.request_field(name))
-            }
-
-            pub(crate) fn owns_request_field(self, name: &str) -> bool {
-                find_field(self.request_fields(), name).is_some()
-            }
-
-            fn request_fields(self) -> &'static [Field] {
-                match self { $(Self::$variant => $module::Patch::FIELDS),+ }
-            }
-        }
-
-        /// Cross-entry constraints belong to each backend, not the config loader.
-        pub(crate) fn validate_entries(
-            entries: &IndexMap<ProviderName, RawProviderConfig>,
-        ) -> Result<(), DialectError> {
-            $(
-                let options = entries.iter().filter_map(|(name, entry)| match &entry.settings {
-                    ProviderSettings::$variant(entry) => Some((name, &entry.options)),
-                    _ => None,
-                });
-                <$module::Options as ProviderOptions>::validate(options)?;
-            )+
-            Ok(())
-        }
     };
 }
 
@@ -220,11 +201,35 @@ providers! {
     Openrouter => openrouter,
 }
 
+/// The configuration file that defined an entry, and so where the state it
+/// owns is kept.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub enum ConfigHome {
+    /// A document read from no file, homed in the user configuration directory.
+    #[default]
+    Unfiled,
+    File(PathBuf),
+}
+
+impl ConfigHome {
+    /// Where the credentials `skyhook auth` stores are kept.
+    pub fn credentials(&self) -> Result<PathBuf, ProviderError> {
+        let directory = match self {
+            Self::Unfiled => crate::config::user_config_directory().ok_or_else(|| {
+                Authentication.error("Cannot locate the Skyhook configuration directory")
+            })?,
+            Self::File(file) => file.parent().unwrap_or(file).to_path_buf(),
+        };
+        Ok(directory.join("credentials"))
+    }
+}
+
 /// Mutable declarations; model inheritance is resolved only on admission.
 #[derive(Clone, Debug)]
 pub struct RawProviderConfig {
     pub common: Common,
     pub settings: ProviderSettings,
+    pub home: ConfigHome,
 }
 
 impl<'de> Deserialize<'de> for RawProviderConfig {
@@ -236,7 +241,11 @@ impl<'de> Deserialize<'de> for RawProviderConfig {
             .ok_or_else(|| de::Error::missing_field("dialect"))?;
         let dialect = Dialect::deserialize(dialect).map_err(de::Error::custom)?;
         let settings = ProviderSettings::parse(dialect, fields).map_err(de::Error::custom)?;
-        Ok(Self { common, settings })
+        Ok(Self {
+            common,
+            settings,
+            home: ConfigHome::default(),
+        })
     }
 }
 
@@ -254,7 +263,11 @@ impl Serialize for RawProviderConfig {
 
 impl RawProviderConfig {
     pub(crate) fn admit(&self) -> Result<AdmittedProvider, AdmissionError> {
-        self.settings.admit(&self.common)
+        self.settings.admit(&self.common, &self.home)
+    }
+
+    pub(crate) fn login(&self, name: &ProviderName) -> Result<Option<Login>, LoginError> {
+        self.settings.login(name, &self.common, &self.home)
     }
 }
 
@@ -262,6 +275,7 @@ pub(crate) struct AdmittedEntry<O> {
     connection: Connection,
     models: IndexMap<ModelName, AdmittedModel>,
     options: O,
+    home: ConfigHome,
 }
 
 pub(crate) struct AdmittedModel {
@@ -288,7 +302,10 @@ impl<O: ProviderOptions> AdmittedEntry<O> {
             return Ok(Vec::new());
         }
         let mut resources = dialect::Resources::new()?;
-        let authentication = self.options.authentication()?;
+        let authentication = self
+            .options
+            .login(name, &self.home, &self.connection)?
+            .map(|login| login.headers());
         self.models
             .iter()
             .map(|(model, admitted)| {
@@ -538,27 +555,6 @@ providers:
                 .to_string();
             assert!(error.contains(expected), "{error}");
         }
-    }
-
-    #[test]
-    fn codex_entries_share_one_issuer() {
-        let entry = |name: &str, auth_url: &str| {
-            format!("  {name}:\n    dialect: codex\n    codec: responses\n{auth_url}")
-        };
-        let mirror = "    auth_url: https://auth.example/tenant\n";
-        for second in ["    auth_url: https://auth.example/other\n", ""] {
-            let text = format!("providers:\n{}{}", entry("a", mirror), entry("b", second));
-            let refused = error(&text);
-            assert!(
-                refused.contains("codex providers `a` and `b` name different auth_url issuers"),
-                "{refused}"
-            );
-        }
-        let same = "    auth_url: https://auth.example/tenant/\n";
-        let text = format!("providers:\n{}{}", entry("a", mirror), entry("b", same));
-        let config = Config::from_yaml(&text).unwrap();
-        let issuer = codex::issuer(&config.providers).unwrap();
-        assert_eq!(issuer.as_str(), "https://auth.example/tenant/");
     }
 
     #[test]

@@ -33,8 +33,8 @@ absolute HTTP(S) `url`. It connects first, and only starts the optional command 
 unreachable—not on authentication, protocol, or other server errors. `cwd` and `env` apply only to
 `start_command`; HTTP connections without a startup command must omit them. Relative `cwd` is
 resolved against the directory of the source configuration file that defines the value, not the
-agent workspace. When user and workspace config are layered, an inherited user `cwd` retains its
-user-file base; an overlaid workspace `cwd` uses `<workspace>/.skyhook`. Timeouts must be positive
+agent workspace. Each server entry comes whole from one file, so a user server's `cwd` is relative to
+the user file's directory and a workspace server's to `<workspace>/.skyhook`. Timeouts must be positive
 whole seconds. Unknown settings and invalid transport combinations are rejected. Environment
 values must be strings; quote numeric-looking values such as `WORKERS: "4"`.
 

@@ -9,7 +9,7 @@ mod state;
 mod stats;
 mod text;
 mod tui;
-use cli::{AuthCommand, AuthProvider, Invocation};
+use cli::{AuthCommand, AuthTarget, Invocation};
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -18,56 +18,68 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 enum AuthError {
     #[error(transparent)]
     Config(#[from] skyhook::config::ConfigError),
-    #[error("invalid configuration: {0}")]
-    CodexIssuers(#[from] skyhook::provider::dialect::codex::IssuerConflict),
     #[error(transparent)]
-    Codex(#[from] skyhook::provider::ProviderError),
+    Login(#[from] skyhook::provider::dialect::LoginError),
+    #[error(transparent)]
+    Provider(#[from] skyhook::provider::ProviderError),
+    #[error(transparent)]
+    Check(#[from] skyhook::provider::dialect::BuildError),
+    #[error(transparent)]
+    LoginRequired(#[from] skyhook::provider::dialect::LoginRequired),
 }
 
-/// The issuer the admitted codex entries share; without a config, OpenAI's.
-fn codex_issuer(
-    config: Result<skyhook::config::Config, skyhook::config::ConfigError>,
-) -> Result<skyhook::provider::dialect::codex::auth::Issuer, AuthError> {
-    use skyhook::config::ConfigError;
-    match config {
-        Ok(config) => Ok(skyhook::provider::dialect::codex::issuer(
-            &config.providers,
-        )?),
-        Err(ConfigError::Missing(_)) => Ok(Default::default()),
-        Err(error) => Err(error.into()),
-    }
+/// Print `text` with its terminal controls escaped: provider names, paths and
+/// what the service reports all reach the terminal.
+fn say(text: impl std::fmt::Display) {
+    println!("{}", skyhook::tool::diagnostic::escape_controls(text));
 }
 
 async fn run_auth(command: AuthCommand) -> Result<(), AuthError> {
-    use skyhook::{config::Config, provider::dialect::codex::auth};
-    let issuer =
-        async || codex_issuer(Config::load_for_workspace(std::path::Path::new("."), None).await);
+    use skyhook::provider::dialect::AuthStatus;
+    let AuthTarget { provider, source } = command.target();
+    let config = skyhook::config::Config::resolve(&source.workspace, source.config.as_deref())
+        .await?
+        .config;
+    let login = config.login(provider)?;
     match command {
-        AuthCommand::Login {
-            provider: AuthProvider::Codex,
-            headless,
-        } => {
-            auth::login(issuer().await?, headless).await?;
-            println!("Signed in to Codex for Skyhook.");
+        AuthCommand::Login { headless, .. } => {
+            login.login(headless).await?;
+            say(format_args!("Signed in `{provider}` for Skyhook."));
         }
-        AuthCommand::Status {
-            provider: AuthProvider::Codex,
-        } => match auth::status(issuer().await?).await? {
-            auth::AuthStatus::LoginRequired(required) => println!("{required}."),
-            auth::AuthStatus::LoggedIn { expires_at } => println!(
-                "Codex: Skyhook credentials present (access token expires at Unix time {expires_at}; refreshed automatically when needed)."
-            ),
+        AuthCommand::Status { check, .. } => match login.status().await? {
+            AuthStatus::LoginRequired(required) if check => return Err(required.into()),
+            AuthStatus::LoginRequired(required) => say(format_args!("{required}.")),
+            AuthStatus::LoggedIn { expires_at } => {
+                say(format_args!(
+                    "`{provider}`: Skyhook credentials present (access token expires at Unix time {expires_at}; refreshed automatically when needed)."
+                ));
+                if check {
+                    let usage = login.check().await?;
+                    say(format_args!("`{provider}`: {}.", accepted(&usage)));
+                }
+            }
         },
-        AuthCommand::Logout {
-            provider: AuthProvider::Codex,
-        } => {
-            auth::logout().await?;
-            println!(
-                "Removed Skyhook's Codex credentials. Other applications' credentials were not changed."
-            );
-        }
     }
     Ok(())
+}
+
+/// What a check found: the service accepted the credentials, with the plan
+/// and window use it reported.
+fn accepted(usage: &skyhook::provider::dialect::Usage) -> String {
+    let mut text = String::from("the service accepted the credentials");
+    if let Some(plan) = &usage.plan {
+        text += &format!("; plan {plan}");
+    }
+    for window in &usage.windows {
+        let limit = match window.length.map(|length| length.as_secs()) {
+            Some(seconds) if seconds % 86_400 == 0 => format!("the {}d limit", seconds / 86_400),
+            Some(seconds) if seconds % 3_600 == 0 => format!("the {}h limit", seconds / 3_600),
+            Some(seconds) => format!("the {}m limit", seconds / 60),
+            None => "a limit".to_owned(),
+        };
+        text += &format!("; {}% of {limit} used", window.used_percent);
+    }
+    text
 }
 
 /// Exit when `result` failed, reporting the error under `label` with its
@@ -111,9 +123,6 @@ async fn run(invocation: Invocation) {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use skyhook::config::ConfigError;
-
     /// Await `future`, failing the test at the caller if it stalls.
     #[track_caller]
     pub(crate) fn bounded<T>(future: impl Future<Output = T>) -> impl Future<Output = T> {
@@ -123,14 +132,5 @@ mod tests {
                 .await
                 .unwrap_or_else(|_| panic!("test synchronization timed out at {caller}"))
         }
-    }
-
-    #[test]
-    fn login_issuer_defaults_without_config_and_propagates_config_errors() {
-        let issuer = |config| codex_issuer(config).map(|issuer| issuer.to_string());
-        let missing = ConfigError::Missing(Default::default());
-        assert_eq!(issuer(Err(missing)).unwrap(), "https://auth.openai.com/");
-        let other = ConfigError::Empty;
-        assert!(matches!(issuer(Err(other)), Err(AuthError::Config(_))));
     }
 }

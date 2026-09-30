@@ -2,7 +2,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 use skyhook::{
     identity::SessionId,
-    provider::profile::ModelRef,
+    provider::profile::{ModelRef, ProviderName},
     tool::policy::{Capability, ModeName},
 };
 use std::path::PathBuf;
@@ -134,40 +134,58 @@ enum Command {
         format: Option<StatsFormat>,
     },
 }
-#[derive(Clone, Copy, ValueEnum)]
-pub(super) enum AuthProvider {
-    Codex,
+/// A configured provider whose credentials Skyhook manages.
+#[derive(clap::Args)]
+pub(super) struct AuthTarget {
+    /// The provider's name in the configuration.
+    pub(super) provider: ProviderName,
+    #[command(flatten)]
+    pub(super) source: ConfigSource,
 }
+
 #[derive(Subcommand)]
 pub(super) enum AuthCommand {
     /// Sign in using a browser, or the public device flow on a headless machine.
     Login {
-        #[arg(value_enum, default_value = "codex")]
-        provider: AuthProvider,
+        #[command(flatten)]
+        target: AuthTarget,
         #[arg(long)]
         headless: bool,
     },
     /// Inspect Skyhook's credentials without displaying tokens.
     Status {
-        #[arg(value_enum, default_value = "codex")]
-        provider: AuthProvider,
-    },
-    /// Delete only Skyhook's locally stored credentials.
-    Logout {
-        #[arg(value_enum, default_value = "codex")]
-        provider: AuthProvider,
+        #[command(flatten)]
+        target: AuthTarget,
+        /// Also present them to the service, in a request that spends no quota.
+        #[arg(long)]
+        check: bool,
     },
 }
-/// Configuration discovery and CLI policy overrides, shared by execution and
-/// config inspection. No model selection, input, or session state belongs here.
+
+impl AuthCommand {
+    pub(super) fn target(&self) -> &AuthTarget {
+        match self {
+            Self::Login { target, .. } | Self::Status { target, .. } => target,
+        }
+    }
+}
+/// Configuration discovery, shared by execution, config inspection and login.
 #[derive(clap::Args)]
-pub(super) struct ConfigRequest {
-    /// Workspace visible to coding tools.
+pub(super) struct ConfigSource {
+    /// Workspace whose `.skyhook/config.yaml` overlays the user config; sessions' coding tools work in it.
     #[arg(short, long, default_value = ".")]
     pub(super) workspace: PathBuf,
     /// Use only this YAML config, regardless of extension; disable user/workspace discovery and merging.
     #[arg(short, long)]
     pub(super) config: Option<PathBuf>,
+}
+
+/// Configuration discovery and CLI policy overrides, shared by execution and
+/// config inspection. No model selection, input, or session state belongs here.
+#[derive(clap::Args)]
+pub(super) struct ConfigRequest {
+    #[command(flatten)]
+    pub(super) source: ConfigSource,
     /// Approve every tool invocation without prompting.
     #[arg(short, long)]
     pub(super) approve_all: bool,
@@ -255,12 +273,12 @@ impl TryFrom<Args> for Invocation {
                 what: DumpKind::Skills,
                 config,
             }) => {
-                if config.config.is_some() || config.approve_all {
+                if config.source.config.is_some() || config.approve_all {
                     return Err(conflict(
                         "dump skills uses skill discovery, not --config or --approve-all",
                     ));
                 }
-                return Ok(Self::Inspect(Inspection::Skills(config.workspace)));
+                return Ok(Self::Inspect(Inspection::Skills(config.source.workspace)));
             }
             Some(Command::Dump {
                 what: DumpKind::Config,
@@ -350,23 +368,20 @@ mod tests {
     fn auth_batch_and_permission_arguments_parse_or_are_rejected() {
         let command = |args: &[&str]| parse(args).unwrap().command;
         assert!(matches!(
-            command(&["auth", "login", "--headless"]),
+            command(&["auth", "login", "work", "--headless"]),
             Some(Command::Auth {
                 command: AuthCommand::Login { headless: true, .. }
             })
         ));
-        assert!(matches!(
-            command(&["auth", "status", "codex"]),
-            Some(Command::Auth {
-                command: AuthCommand::Status { .. }
-            })
-        ));
-        assert!(matches!(
-            command(&["auth", "logout"]),
-            Some(Command::Auth {
-                command: AuthCommand::Logout { .. }
-            })
-        ));
+        let Some(Command::Auth { command: status }) =
+            command(&["auth", "status", "work", "-w", "w"])
+        else {
+            panic!("auth invocation");
+        };
+        assert!(matches!(status, AuthCommand::Status { .. }));
+        let target = status.target();
+        assert_eq!(target.provider.as_str(), "work");
+        assert_eq!(target.source.workspace, Path::new("w"));
         assert!(command(&["--prompt", "hello"]).is_none());
         // A batch job takes exactly one input; allowlists must name real capabilities.
         for (args, valid) in [
@@ -454,7 +469,7 @@ mod tests {
             &["--script", "run.js"],
             &["--model", "local/first"],
             &["--resume", ID],
-            &["auth", "status"],
+            &["auth", "status", "codex"],
         ] {
             assert!(parse(&[&["dump", "config"], extra].concat()).is_none());
             assert!(parse(&[extra, &["dump", "config"]].concat()).is_none());
@@ -508,10 +523,10 @@ mod tests {
     #[test]
     fn invocation_conversion_matrix_preserves_input_presence_and_modes() {
         assert!(matches!(
-            parse_from(["skyhook", "auth", "status"]).unwrap(),
+            parse_from(["skyhook", "auth", "status", "codex"]).unwrap(),
             Invocation::Auth(AuthCommand::Status { .. })
         ));
-        assert!(parse_from(["skyhook", "--approve-all", "auth", "status"]).is_err());
+        assert!(parse_from(["skyhook", "--approve-all", "auth", "status", "codex"]).is_err());
         assert!(matches!(
             parse_from(["skyhook", "dump"]).unwrap(),
             Invocation::Inspect(Inspection::Config(_))

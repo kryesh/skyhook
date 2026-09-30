@@ -25,25 +25,16 @@ Missing optional user files are fine: a complete workspace-only configuration ca
 A broken user file is not silently treated as missing if no fallback succeeds. The effective
 configuration must be valid; defaults are applied **after merging**.
 
-Mappings merge recursively; sequences and scalar values replace the earlier value. The exception is
-**named entries under `targets` and `modes`**: a workspace entry replaces the *whole* user
-entry of the same name, without inheriting omitted fields. For example, `targets.build`
-replaces that target's SSH, authentication, workspace, and routing settings; `modes.general`
-replaces that mode's capabilities, instructions, and hint. Other named entries remain available.
-A provider entry that changes `dialect` likewise replaces the earlier provider's settings, which
-belong to the other dialect, while the models declared under it still merge by name, keeping their
-profile, `codec`, and placements but not the earlier dialect's fields. Within a
-provider, a later layer replaces `api_key` and each `headers` value whole, and likewise each
-convention choice (`cache_key`, `output_limit`, `reasoning_effort`, `reasoning_replay`,
-`tool_stream`, `user_id`) directly on the provider or model: a workspace
-`api_key: {command: ...}` or `cache_key: {body: ...}` takes the place of a user `{env: ...}` or
-`{header: ...}` rather than combining with it. An explicit `null` replaces the earlier value: it
-clears a nullable field, but is not a deletion operator for map entries. Required fields and named
-entries must still have valid values.
+The workspace file overlays the user file key by key, and each key's value is replaced whole. The
+exception is the named maps `providers`, `modes`, `targets`, and `mcp`. These merge by name, and each
+entry comes whole from the last file that defines it. A workspace entry replaces the user entry of
+the same name without inheriting its omitted fields, and entries with other names stay available.
+For example, a workspace `providers.openai` must repeat the dialect, endpoint, credentials, and
+every model it keeps. A replaced entry keeps its position in the user file's order. Entries only
+the workspace defines come after the user's.
 
-Layers merge first; only then does each model inherit the request settings it omits from its
-provider (see [provider defaults and model settings](providers-and-models.md#provider-defaults-and-model-settings)).
-An explicit `null`, `false`, or `[]` stays explicit through layering.
+An explicit `null` is a value, not a deletion: `providers: null` or `providers.openai: null` makes
+the configuration invalid rather than removing entries.
 
 ### Example: user models, workspace targets
 
@@ -92,7 +83,7 @@ targets:
     workspace: "/srv/project"
 ```
 
-The effective configuration retains `providers.openai`, `models.default`, and `targets.bastion`.
+The effective configuration retains `providers.openai`, with its `default` model, and `targets.bastion`.
 A named mode or target is replaced whole, not merged: `modes.general` grants exactly the listed
 capabilities, and `targets.build` uses the new host and workspace,
 with default authentication/routing behavior: neither the old key nor `via: "bastion"` survives.

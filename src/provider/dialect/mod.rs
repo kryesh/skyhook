@@ -24,6 +24,7 @@ pub mod compatible;
 pub(crate) mod config;
 pub(crate) mod entry;
 pub mod litellm;
+mod login;
 pub(crate) mod models;
 pub mod openai;
 pub mod openrouter;
@@ -37,8 +38,11 @@ pub use config::{
     AdmissionError, Common, EndpointError, ModelError, Sourced, ValueError, ValueProblem,
 };
 use config::{Pending, Sources};
-pub(crate) use entry::{AdmittedProvider, validate_entries};
-pub use entry::{ProviderModels, ProviderSettings, RawProviderConfig};
+pub(crate) use entry::AdmittedProvider;
+pub use entry::{ConfigHome, ProviderModels, ProviderSettings, RawProviderConfig};
+pub use login::{
+    AuthStatus, Login, LoginCommand, LoginError, LoginReason, LoginRequired, Usage, UsageWindow,
+};
 pub use models::{ModelSpec, Request, RequestPatch, RequestSettings};
 pub use placements::{Placement, PlacementError, PlacementKey, Placements, PlacementsPatch};
 
@@ -77,6 +81,9 @@ pub(crate) struct Profile {
     pub headers: Headers,
     /// How the entry's `api_key` travels.
     pub key: Scheme,
+    /// The service beneath an API root that serves several, which the codec's
+    /// path joins (Codex's `codex`).
+    pub service: Option<&'static str>,
 }
 
 impl Profile {
@@ -87,6 +94,16 @@ impl Profile {
             transport,
             scope: dialect.as_str().to_owned(),
             key: Scheme::Bearer,
+            service: None,
+        }
+    }
+
+    /// The codec's path beneath the API root.
+    fn path(&self) -> String {
+        let codec = self.codec.name().path_suffix();
+        match self.service {
+            Some(service) => format!("{service}/{codec}"),
+            None => codec.to_owned(),
         }
     }
 
@@ -151,12 +168,10 @@ pub(crate) fn build(
     credentials: Headers<Pending>,
     resources: &mut Resources,
 ) -> Result<HttpProvider, BuildError> {
+    let endpoint = connection.url(&profile.path());
     let ready = |value| Ok::<_, Infallible>(Pending::Ready(value));
     let Ok(mut headers) = profile.headers.try_map(ready);
-    for (header, value) in &connection.headers {
-        let field = ValueField::Header(header.clone());
-        headers.insert(header.clone(), value.header(field, None));
-    }
+    headers.extend(connection.configured_headers());
     headers.extend(credentials);
     let stream = Value::Fixed(HeaderValue::from_static(EVENT_STREAM));
     headers.insert(ACCEPT, Pending::Ready(stream));
@@ -165,7 +180,7 @@ pub(crate) fn build(
         name,
         scope_tag: &profile.scope,
         client: resources.client.clone(),
-        endpoint: config::endpoint(&connection.root, profile.codec.name()),
+        endpoint,
         codec: profile.codec,
         transport: profile.transport,
         headers,

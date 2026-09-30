@@ -55,7 +55,7 @@ with redirected input/output support and automatic exit; see [Headless execution
 
 An unused startup draft creates no saved session. The first sent message or explicitly run
 script creates the session. Use `--workspace PATH` to select another workspace. Normally,
-`<workspace>/.skyhook/config.yaml` overlays the selected user configuration. Use
+`<workspace>/.skyhook/config.yaml` overlays the selected user configuration, entry by entry. Use
 `--config path.yaml` to load **only** that file instead, with no user/workspace config merging.
 See [configuration layering](../configuration/overview.md#file-selection-and-layering), including
 its workspace trust boundary.

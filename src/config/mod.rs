@@ -8,7 +8,7 @@ use std::{
 use crate::{
     mcp::config::McpServerConfig,
     provider::{
-        dialect::{self, AdmissionError, AdmittedProvider, RawProviderConfig},
+        dialect::{AdmissionError, AdmittedProvider, Login, LoginError, RawProviderConfig},
         profile::{ModelRef, ProviderName},
     },
     target::TargetsConfig,
@@ -123,11 +123,6 @@ fn default_modes() -> indexmap::IndexMap<ModeName, Mode> {
 }
 
 impl Config {
-    /// Loads an explicit config, or resolves user and current-workspace layers.
-    pub async fn load(explicit: Option<&Path>) -> Result<Self, ConfigError> {
-        Self::load_for_workspace(Path::new("."), explicit).await
-    }
-
     /// Resolve without constructing providers, reading credentials, or executing commands.
     /// An explicit file disables all user/workspace configuration discovery.
     pub async fn resolve(
@@ -135,13 +130,6 @@ impl Config {
         explicit: Option<&Path>,
     ) -> Result<ResolvedConfig, ConfigError> {
         loader::resolve(workspace, explicit).await
-    }
-
-    pub async fn load_for_workspace(
-        workspace: &Path,
-        explicit: Option<&Path>,
-    ) -> Result<Self, ConfigError> {
-        Ok(Self::resolve(workspace, explicit).await?.config)
     }
 
     /// Every capability some mode grants: the most a session can switch to.
@@ -164,7 +152,9 @@ impl Config {
     }
 
     /// Typed extraction naming the offending field, then admission.
-    fn from_value(value: &serde_json::Value) -> Result<Self, ConfigError> {
+    fn from_value<'de>(
+        value: impl serde::Deserializer<'de, Error = serde_json::Error>,
+    ) -> Result<Self, ConfigError> {
         let config: Self =
             serde_path_to_error::deserialize(value).map_err(ConfigError::Structure)?;
         config.admit()?;
@@ -187,8 +177,16 @@ impl Config {
                 Ok((name.clone(), provider))
             })
             .collect::<Result<_, EntryError>>()?;
-        dialect::validate_entries(&self.providers)?;
         Ok(providers)
+    }
+
+    /// The Skyhook-managed login of the provider `name`.
+    pub fn login(&self, name: &ProviderName) -> Result<Login, LoginError> {
+        let entry = (self.providers.get(name)).ok_or_else(|| LoginError::Unknown(name.clone()))?;
+        entry.login(name)?.ok_or_else(|| LoginError::Unmanaged {
+            provider: name.clone(),
+            dialect: entry.settings.dialect(),
+        })
     }
 }
 
@@ -221,8 +219,6 @@ pub enum ConfigError {
     Targets(#[from] crate::target::TargetError),
     #[error("no Skyhook config found; pass --config or create ~/.config/skyhook/config.yaml{0}")]
     Missing(ConfigReport),
-    #[error("invalid configuration: {0}")]
-    Dialect(#[from] dialect::DialectError),
     #[error("provider `{provider}` could not be initialized: {error}")]
     Provider {
         provider: ProviderName,
@@ -274,6 +270,7 @@ impl ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::dialect::{AuthStatus, ConfigHome};
 
     const ANTHROPIC_MISSING_KEY: &str = r#"
 providers:
@@ -305,7 +302,10 @@ providers:
         supports_images: false
 "#;
         tokio::fs::write(&path, text).await.unwrap();
-        let config = Config::load(Some(&path)).await.unwrap();
+        let config = Config::resolve(Path::new("."), Some(&path))
+            .await
+            .unwrap()
+            .config;
         assert!(
             serde_json::to_value(&config.providers["local"]).unwrap()["models"]
                 .get("local")
@@ -317,26 +317,38 @@ providers:
     }
 
     #[tokio::test]
-    async fn mcp_cwd_is_relative_to_selected_config_directory() {
+    async fn cwd_and_credentials_are_relative_to_selected_config_directory() {
         let current = std::env::current_dir().unwrap();
         let root = tempfile::tempdir_in(&current).unwrap();
         let path = root.path().join("mcp.yaml");
         let absolute = root.path().join("absolute");
         let server = "    transport: stdio\n    start_command: [server]";
         let text = format!(
-            "mcp:\n  relative:\n{server}\n    cwd: work\n  absolute:\n{server}\n    cwd: {}\n  default:\n{server}",
+            "providers:\n  sub:\n    dialect: codex\n    codec: responses\n  keyed:\n    dialect: openai\n    codec: responses\n    base_url: https://example.com/v1\nmcp:\n  relative:\n{server}\n    cwd: work\n  absolute:\n{server}\n    cwd: {}\n  default:\n{server}",
             serde_json::to_string(&absolute).unwrap()
         );
         tokio::fs::write(&path, text).await.unwrap();
         // A relative --config path must still produce absolute process directories.
-        let config = Config::load(Some(path.strip_prefix(&current).unwrap()))
+        let relative = path.strip_prefix(&current).unwrap();
+        let config = Config::resolve(Path::new("."), Some(relative))
             .await
-            .unwrap();
+            .unwrap()
+            .config;
         let work = root.path().join("work");
         let cwd = |name: &str| crate::mcp::RawMcpServerConfig::from(config.mcp[name].clone()).cwd;
         assert_eq!(cwd("relative"), Some(work));
         assert_eq!(cwd("absolute"), Some(absolute));
         assert_eq!(cwd("default"), None);
+        let login = |name: &str| config.login(&name.parse().unwrap());
+        assert!(matches!(login("missing"), Err(LoginError::Unknown(_))));
+        assert!(matches!(login("keyed"), Err(LoginError::Unmanaged { .. })));
+        // A selected file is named in the login a request asks for; reading creates nothing.
+        let AuthStatus::LoginRequired(required) = login("sub").unwrap().status().await.unwrap()
+        else {
+            panic!("nothing was saved");
+        };
+        assert_eq!(required.command.home, ConfigHome::File(path.clone()));
+        assert!(!root.path().join("credentials").exists());
     }
 
     #[test]

@@ -75,13 +75,13 @@ providers:
         max_output: 128000
         supports_images: true
 
-  # Run `skyhook auth login` (or `skyhook auth login --headless`) first.
+  # Run `skyhook auth login codex` (or `skyhook auth login codex --headless`) first.
   # Credentials belong to Skyhook; official Codex client credentials are never accessed.
   codex:
     codec: "responses"
     dialect: "codex"
     # The service and its OAuth issuer default to OpenAI's; name them only for a mirror:
-    # base_url: "https://chatgpt.com/backend-api/codex"
+    # base_url: "https://chatgpt.com/backend-api"
     # auth_url: "https://auth.openai.com"
     # Stored credentials are bound to the auth_url; changing it requires a new login.
     models:

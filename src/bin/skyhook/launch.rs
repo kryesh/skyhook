@@ -227,7 +227,8 @@ pub async fn resolve_config(
 ) -> Result<skyhook::config::ResolvedConfig, ConfigError> {
     // The core resolver owns ordering and workspace resolution, including its
     // diagnostics. Explicit files bypass workspace probing there entirely.
-    let mut resolved = Config::resolve(&request.workspace, request.config.as_deref()).await?;
+    let mut resolved =
+        Config::resolve(&request.source.workspace, request.source.config.as_deref()).await?;
     resolved.config.approve_all |= request.approve_all;
 
     Ok(resolved)
@@ -270,7 +271,7 @@ impl Launch {
         permissions: Permissions,
         interaction: Option<Arc<UiInteraction>>,
     ) -> Result<Self, LaunchError> {
-        let workspace = tokio::fs::canonicalize(&request.config.workspace)
+        let workspace = tokio::fs::canonicalize(&request.config.source.workspace)
             .await
             .map_err(LaunchError::Workspace)?;
         // CLI history belongs only to the selected workspace, never to an

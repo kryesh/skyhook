@@ -75,18 +75,45 @@ fails startup without printing its contents.
 
 ## Codex subscription login
 
-The `codex` provider uses **Skyhook-owned** OAuth credentials. Run `skyhook auth login` for browser
-authorization or `skyhook auth login --headless` for device authorization. `skyhook auth status`
-reports local login status for the configured issuer and `skyhook auth logout` removes Skyhook's
-credentials. Login does not require a model configuration; when the discovered config has a
-`codex` provider with `auth_url`, login and token refresh use that issuer instead of
-`https://auth.openai.com`, and `base_url` likewise replaces `https://chatgpt.com/backend-api/codex`
-for requests. `auth_url` must use HTTPS (HTTP only on a loopback host) and carry no credentials,
-query, or fragment; a path prefix is kept. A configuration whose `codex` providers name different
-issuers is refused: one login serves one issuer. Skyhook never imports, reads, or modifies the
-official Codex client's credential files. Secure Codex credential storage currently requires Unix;
-other platforms fail explicitly rather than writing tokens without private file permissions.
+A `codex` provider uses **Skyhook-owned** OAuth credentials, one login per provider. Name the
+provider as it is configured: for a provider named `codex`, run `skyhook auth login codex` for browser
+authorization or `skyhook auth login codex --headless` for device authorization.
+`skyhook auth status codex` reports that provider's local login status without contacting the
+service, so it cannot tell whether the service still accepts the login. `skyhook auth status codex
+--check` also presents the credentials to the service with the provider's `headers`, refreshing
+them first if a request would, and reports the plan and rate-limit use it returns. It fails when
+the provider is not logged in or the service rejects the credentials. The check reads the account's
+usage, which runs no model and spends no quota; that endpoint is not publicly documented by OpenAI, so what it
+reports may change. Several `codex` providers can sign in to different accounts or issuers
+independently. Login does not require the provider to have models.
 
-Stored credentials are bound to the issuer that granted them. When a provider's issuer differs, or
-the credentials were saved by an older Skyhook, requests fail without sending them and ask you to
-run `skyhook auth login codex` again.
+When the provider sets `auth_url`, login and token refresh use that issuer instead of
+`https://auth.openai.com`. `base_url` likewise replaces the ChatGPT backend root,
+`https://chatgpt.com/backend-api`. Requests go to `codex/responses` beneath it, and `--check` to
+`wham/usage`, so a mirror serves both beneath one root. `auth_url` must
+use HTTPS (HTTP only on a loopback host) and carry no credentials, query, or fragment; a path prefix
+is kept. Skyhook never imports, reads, or modifies the official Codex client's credential files.
+Secure Codex credential storage currently requires Unix; other platforms fail explicitly rather than
+writing tokens without private file permissions.
+
+Credentials are kept in a `credentials/` directory next to the configuration file that defines the
+provider, as `<provider>.json`. For a provider in the user configuration that is
+`~/.config/skyhook/credentials/` (or under `$XDG_CONFIG_HOME/skyhook`). For a provider the workspace
+configuration defines, it is `<workspace>/.skyhook/credentials/`; keep that directory out of version
+control. For `--config path.yaml`, it is beside that file. Skyhook creates the directory when you
+first log in, readable only by you, and refuses to use one that grants any access to other users.
+Checking status or starting a session creates nothing there, except a missing lock file beside saved
+credentials.
+
+To sign a provider out, delete its `credentials/<provider>.json` while no session is using it.
+Nothing is revoked on the server, so this is also how to clear credentials for a provider you have
+removed from your configuration.
+
+A provider name becomes a file name, so it must contain no NUL character and be at most 250 bytes.
+On a case-insensitive file system, such as macOS by default, names that differ only in case (`Work`
+and `work`) share one credentials file; give such providers distinct names.
+
+Stored credentials are bound to the issuer that granted them. When a provider's issuer differs,
+requests fail without sending them and name the command that signs it in again. That command
+selects the provider's configuration file with `-c`, so it signs in the same entry the session used
+wherever you run it.
