@@ -148,7 +148,8 @@ impl SessionHandle {
             .await
     }
 
-    /// Inspect output and hydrate eligible automatic capture text.
+    /// Inspect output and hydrate eligible automatic capture text: a running
+    /// job's from each capture's last page.
     pub async fn inspect_output_with_captures(
         &self,
         query: crate::job::JobOutputQuery,

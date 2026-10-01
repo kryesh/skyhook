@@ -205,6 +205,11 @@ impl OutputPreview {
 }
 
 impl LinePage {
+    /// The field's lines so far; none when its output is unavailable.
+    pub fn total_lines(&self) -> Option<usize> {
+        self.total_lines
+    }
+
     /// The page's text, without search line numbers.
     pub fn lines(&self) -> Vec<&str> {
         match &self.lines {
@@ -247,6 +252,16 @@ impl Match {
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(untagged)]
 pub enum OutputTruncation {
+    /// A string showing its first and last lines around a marker line: the lines
+    /// from `next_start` up to, but not including, `tail_start` are left out.
+    TextGap {
+        field: FieldPointer,
+        total_lines: usize,
+        #[schemars(range(min = 1))]
+        next_start: usize,
+        #[schemars(range(min = 2))]
+        tail_start: usize,
+    },
     /// A string, continued by line position.
     Text {
         field: FieldPointer,
@@ -281,7 +296,8 @@ pub enum OutputTruncation {
 impl OutputTruncation {
     pub fn field(&self) -> &FieldPointer {
         match self {
-            Self::Text { field, .. }
+            Self::TextGap { field, .. }
+            | Self::Text { field, .. }
             | Self::Elements { field, .. }
             | Self::Members { field, .. }
             | Self::Summary { field, .. } => field,
@@ -297,6 +313,13 @@ impl OutputTruncation {
             None => shown,
         };
         match self {
+            Self::TextGap {
+                field, next_start, ..
+            } => Some(Continuation::Lines {
+                field: Some(field),
+                start: *next_start,
+                offset: None,
+            }),
             Self::Text {
                 field,
                 next_start,
@@ -329,10 +352,18 @@ pub struct PresentedOutput {
     pub state: JobState,
     pub(crate) view: JobView,
     pub images: Vec<ImageRef>,
-    /// Captures absent from a whole presentation, as `(captures index, field)`
-    /// in the descriptor's stable order. Hydration is opt-in through
-    /// `inspect_output_with_captures`.
-    pub(super) capture_targets: Vec<(usize, FieldPointer)>,
+    /// Captures absent from a whole presentation, in the descriptor's stable
+    /// order. Hydration is opt-in through `inspect_output_with_captures`.
+    pub(super) capture_targets: Vec<HydrationTarget>,
+}
+
+/// A capture host inspection pages into its descriptor.
+#[derive(Clone, Debug)]
+pub(super) struct HydrationTarget {
+    /// The descriptor's index among the presentation's captures.
+    pub(super) index: usize,
+    pub(super) field: FieldPointer,
+    pub(super) capture: i64,
 }
 
 impl PresentedOutput {

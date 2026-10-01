@@ -119,7 +119,7 @@ pub(super) fn shallower(depth: usize) -> Fit {
 mod tests {
     use super::super::{Accounting, Pooled, pool::pool};
     use super::*;
-    use crate::job::output::{FieldPointer, render::Clipped, shape::Shape};
+    use crate::job::output::{FieldPointer, projection::Presented, render::Clipped, shape::Shape};
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
 
@@ -158,10 +158,14 @@ mod tests {
     fn both_paths(value: &Value, complete: &BTreeSet<FieldPointer>) {
         let field = FieldPointer::result();
         let bytes = serde_json::to_vec(value).unwrap();
+        let presented = Presented {
+            complete: complete.clone(),
+            ends: BTreeSet::new(),
+        };
         for accounting in [Accounting::Preview, Accounting::Page] {
             let memory = Pooled::new(
                 Shape::of(value),
-                Node::of(value.clone(), &field, complete, accounting),
+                Node::of(value.clone(), &field, &presented, accounting),
                 true,
                 accounting,
             );
@@ -170,7 +174,7 @@ mod tests {
             let streamed = pool(
                 &mut reader,
                 &field,
-                complete,
+                &presented,
                 &Clipped::new(),
                 &Default::default(),
                 accounting,
@@ -224,16 +228,20 @@ mod tests {
             ("members", json!(collection(&record)), "key009"),
         ] {
             let value = json!({(key): contents, "later": [0, 1, 2, 3, 4]});
-            let complete = [FieldPointer::result()
+            let complete: BTreeSet<_> = [FieldPointer::result()
                 .property(key)
                 .property(protected)
                 .property("answer")]
             .into_iter()
             .collect();
+            let presented = Presented {
+                complete: complete.clone(),
+                ends: BTreeSet::new(),
+            };
             let mut node = Node::of(
                 value.clone(),
                 &FieldPointer::result(),
-                &complete,
+                &presented,
                 Accounting::Preview,
             );
             let Node::Object { members, .. } = &mut node else {

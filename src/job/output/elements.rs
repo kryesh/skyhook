@@ -11,6 +11,7 @@ use super::{
     ToolError,
     json::saved_json,
     preview::{self, Accounting, Pooled},
+    projection::Presented,
     render::JsonField,
 };
 
@@ -56,11 +57,10 @@ pub(super) fn page(
         let child = key
             .as_ref()
             .map_or_else(|| field.index(position), |key| field.property(key));
-        let complete = BTreeSet::new();
         let pooled = preview::pool(
             reader,
             &child,
-            &complete,
+            &Presented::default(),
             clipped,
             cancellation,
             Accounting::Page,

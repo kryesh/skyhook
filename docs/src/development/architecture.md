@@ -267,15 +267,16 @@ outermost larger containers, unless they enclose a capture, JSON-declared text, 
 a long string reached through object members alone, or the diagnostic slot. Text a schema
 declares as `contentMediaType: application/json` is classified once at finalization, unless its
 output was cut off, and when it is JSON is read as that value from its original bytes.
-Finalization also records the fields presentation never shortens, those marked
-`x-skyhook-complete` in the output schema joining those a script's returned tool results carry,
-and then the size of the result's automatic presentation, which notification batching budgets
-without previewing it again. Jobs persist their output schemas so resumed and remote results use
-the same rules.
+Finalization also records the fields whose presentation the output schema declares with
+`x-skyhook-preview`, joining those a script's returned tool results carry: `complete` fields are
+never shortened, and `ends` text keeps its first and last lines. It then records the size of the
+result's automatic presentation, which notification batching budgets without previewing it again.
+Jobs persist their output schemas so resumed and remote results use the same rules.
 
 All saved JSON is read through streaming readers built in `job::output::json`. Previews, pages,
 and navigation into stored containers hold a bounded pool of what they may show rather than the
-value, and sampled readings take stored text only up to its prefix, with its extent from storage.
+value, and sampled readings take stored text only up to its prefix, with its extent from storage,
+and the last bytes of text declared to keep both ends.
 Memory still grows with the largest single key or number, which the reader buffers whole; with the
 keys of each open object while detection tracks duplicates by hash; with fields marked complete,
 which are read whole; and with a JSONPath query's selected field, which is loaded within a cap

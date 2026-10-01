@@ -3,13 +3,15 @@
 use serde::Serialize;
 use serde_json::Value;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
+
+use crate::{job::FieldPointer, tool::output::FieldPresentation};
 
 /// Variant-specific fields are grouped here and serialized without patching JSON objects.
 pub(super) enum HostResponse {
     Success {
         value: Value,
-        complete: Option<BTreeSet<String>>,
+        presented: Option<BTreeMap<FieldPointer, FieldPresentation>>,
     },
     // Tool failures travel in Success.value as public JobViews; only receive
     // failures use this private bridge error.
@@ -23,7 +25,7 @@ impl HostResponse {
             ok: bool,
             value: &'a Value,
             #[serde(skip_serializing_if = "Option::is_none")]
-            complete: &'a Option<BTreeSet<String>>,
+            presented: &'a Option<BTreeMap<FieldPointer, FieldPresentation>>,
         }
         #[derive(Serialize)]
         struct Failure<'a> {
@@ -31,10 +33,10 @@ impl HostResponse {
             error: &'a str,
         }
         match self {
-            Self::Success { value, complete } => serde_json::to_string(&Success {
+            Self::Success { value, presented } => serde_json::to_string(&Success {
                 ok: true,
                 value,
-                complete,
+                presented,
             }),
             Self::Failure(error) => serde_json::to_string(&Failure { ok: false, error }),
         }
@@ -48,21 +50,26 @@ mod tests {
 
     #[test]
     fn response_codecs_keep_omissions_and_null_payloads() {
-        let complete = ["/result/text".to_owned()].into_iter().collect();
+        let presented = [
+            ("/result/text".parse().unwrap(), FieldPresentation::Complete),
+            ("/result/stdout".parse().unwrap(), FieldPresentation::Ends),
+        ]
+        .into_iter()
+        .collect();
         for (response, expected) in [
             (
                 HostResponse::Success {
                     value: Value::Null,
-                    complete: None,
+                    presented: None,
                 },
                 json!({"ok":true,"value":null}),
             ),
             (
                 HostResponse::Success {
                     value: json!(12),
-                    complete: Some(complete),
+                    presented: Some(presented),
                 },
-                json!({"ok":true,"value":12,"complete":["/result/text"]}),
+                json!({"ok":true,"value":12,"presented":{"/result/text":"complete","/result/stdout":"ends"}}),
             ),
             (
                 HostResponse::Failure("failure".into()),

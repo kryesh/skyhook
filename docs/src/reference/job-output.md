@@ -89,9 +89,15 @@ JavaScript receives complete result data. The model's automatic view of a finish
 preview:
 
 - **Text fields**, strings reached only through objects of at most 100 members, such as `stdout`,
-  file `content`, or `body.text`, each keep at most 100 lines or 8 KiB (8192 bytes), whichever
+  file `content`, or `body.text`, each keep at most 200 lines or 16 KiB (16384 bytes), whichever
   comes first, counting UTF-8 content bytes before JSON escaping. Together they keep at most
-  32 KiB; later strings are shortened like everything else.
+  64 KiB; later strings are shortened like everything else.
+- **Command streams**, the `stdout` and `stderr` text fields of `exec`, keep both ends within
+  those limits: their first whole lines, up to 60 lines and 30% of the bytes, then a marker line
+  such as `… lines 61–4860 omitted …`, then their last whole lines, up to 140 and the bytes the
+  first lines left. The marker line is not part of the output and is not counted. A stream whose
+  last line alone is over those bytes keeps only its start, like other text fields. An `exec`
+  response a script returns keeps both ends of its streams in the script's result too.
 - **Everything else** shares one 8 KiB preview budget, which also counts the shape and truncation
   records below. When it is exceeded, strings keep their first 256 bytes; if every element then
   fits, all are kept. Otherwise arrays keep their first elements, with one count shared by every
@@ -116,6 +122,8 @@ its deepest levels to `"{…}"` and `[count, "…"]`.
 
 - `{field, total_lines, next_start, next_offset?}` for a string, with the exact position to
   continue from; `next_offset` is present only when that position is inside a line.
+- `{field, total_lines, next_start, tail_start}` for a command stream shown around a marker line:
+  lines `next_start` up to, but not including, `tail_start` were left out.
 - `{field, shown, total_elements, kept?}` for an array.
 - `{field, shown, total_members, kept?}` for an object.
 - `{field, cuts}` for further cuts within `field`, beyond the first 32 listed.
@@ -242,11 +250,12 @@ reconnecting to the remote machine.
 
 The TUI's automatic output view shows the structured result and previews any available captures
 not represented there. This exposes both process streams while live and preserves stderr and exit
-status on completion. Explicit field, page, and search selections remain selected; choose
-**automatic output** in the Saved output menu to return to automatic viewing. The menu lists up to
-100 fields one level below the one shown, from the page of it shown, starting with the result's
-fields and captures, and the field above it; **more fields** shows the field from where the
-list stops, so the menu lists the rest.
+status on completion. While a job runs, each capture shows its latest lines, up to 100 within a
+page's bytes, and follows them as output arrives. Explicit field, page, and search selections
+remain selected; choose **automatic output** in the Saved output menu to return to automatic
+viewing. The menu lists up to 100 fields one level below the one shown, from the page of it shown,
+starting with the result's fields and captures, and the field above it; **more fields** shows the
+field from where the list stops, so the menu lists the rest.
 
 Recorded model requests keep the previews, pages, and notifications the model actually saw;
 they are not regenerated from saved output.

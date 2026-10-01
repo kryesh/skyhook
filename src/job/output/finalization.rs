@@ -79,12 +79,13 @@ pub(crate) fn save_completed(
         true => projection::json_text_fields(&document["result"], &root, schema),
         false => BTreeSet::new(),
     };
-    let mut complete = projection::complete_fields(&document["result"], &root, schema);
+    let mut presented: Presented =
+        (projection::presented_fields(&document["result"], &root, schema).into_iter()).collect();
     // A result with an output diagnostic saves its slot as null; presentation
     // renders each viewer's diagnostic into it, whole.
     let slot = diagnostic_slot();
     if document.pointer(slot.as_str()) == Some(&Value::Null) {
-        complete.insert(slot);
+        presented.complete.insert(slot);
     }
     let result = has_result.then(|| document["result"].take());
     save_document(
@@ -95,7 +96,7 @@ pub(crate) fn save_completed(
         &Stored {
             referenced: &references,
             candidates: &candidates,
-            complete: &complete,
+            presented: &presented,
         },
     )
 }

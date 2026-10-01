@@ -63,12 +63,35 @@ impl schemars::JsonSchema for FieldPointer {
     }
 }
 
-/// The schema keyword marking a field presentation never shortens.
-pub(crate) const COMPLETE: &str = "x-skyhook-complete";
+/// The schema keyword declaring how presentation shows a field.
+pub(crate) const PREVIEW: &str = "x-skyhook-preview";
+
+named_enum! {
+    /// How a preview shows a field whose schema declares it. Other fields are
+    /// shortened from their end, or sampled.
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+    pub(crate) enum FieldPresentation {
+        /// Never shortened.
+        Complete = "complete",
+        /// Text shortened in its middle, keeping its first and last lines.
+        Ends = "ends",
+    }
+}
+
+impl FieldPresentation {
+    fn mark(self, schema: &mut schemars::Schema) {
+        schema.insert(PREVIEW.into(), self.as_str().into());
+    }
+}
 
 /// Mark `schema` complete: `#[schemars(transform = complete)]` on a field or type.
 pub(crate) fn complete(schema: &mut schemars::Schema) {
-    schema.insert(COMPLETE.into(), true.into());
+    FieldPresentation::Complete.mark(schema);
+}
+
+/// Mark `schema` as text keeping both ends: `#[schemars(transform = ends)]` on a field.
+pub(crate) fn ends(schema: &mut schemars::Schema) {
+    FieldPresentation::Ends.mark(schema);
 }
 
 /// Schema of `T` for a result presentation never shortens.

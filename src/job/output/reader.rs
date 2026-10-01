@@ -53,6 +53,16 @@ impl CaptureReader {
         }
     }
 
+    /// The last bytes, up to `limit`, of the `bytes` the capture was observed
+    /// to hold.
+    pub(super) fn end(mut self, bytes: u64, limit: usize) -> std::io::Result<Vec<u8>> {
+        self.position = bytes.saturating_sub(limit as u64);
+        let mut end = Vec::new();
+        let observed = bytes - self.position;
+        self.take(observed).read_to_end(&mut end)?;
+        Ok(end)
+    }
+
     fn index(&self) -> Result<LineIndex, ToolError> {
         let extent = (self.db.capture_extent(self.capture)).map_err(std::io::Error::other)?;
         Ok(LineIndex {
@@ -105,6 +115,22 @@ impl Read for CaptureReader {
         self.position += count as u64;
         Ok(count)
     }
+}
+
+/// The first line of a capture's last page: its trailing whole lines that a
+/// default page holds, or its last line when that alone is over one.
+pub(super) fn last_page_start(
+    db: &crate::session::SharedDb,
+    capture: i64,
+) -> Result<usize, ToolError> {
+    let reader = CaptureReader::new(db.clone(), capture);
+    let index = reader.index()?;
+    // A page's lines take no fewer bytes of it than they have.
+    let end = reader.end(index.bytes, CONTENT_BYTES)?;
+    let whole = end.len() as u64 == index.bytes;
+    let size = |line: &[u8]| line_size(without_terminator(&String::from_utf8_lossy(line)));
+    let (_, lines) = preview::trailing_lines(&end, whole, DEFAULT_LIMIT, CONTENT_BYTES, size);
+    Ok(index.total_lines.saturating_sub(lines.max(1)) + 1)
 }
 
 fn check_cancelled(cancellation: &super::super::CancellationToken) -> Result<(), ToolError> {
@@ -286,15 +312,20 @@ fn check_offset(raw: &[u8], offset: usize) -> Result<(), ToolError> {
     check_offset_end(previous, raw.get(offset).copied())
 }
 
-// Prefer a whole line, and only fragment on an otherwise empty page. Account for
-// actual JSON escaping, rather than assuming six output bytes per source byte.
+/// The bytes of a page's budget a line showing `text` takes: its JSON encoding,
+/// rather than an assumed six output bytes per source byte, and its separator.
+fn line_size(text: &str) -> usize {
+    preview::json_bytes(&text) + 1
+}
+
+// Prefer a whole line, and only fragment on an otherwise empty page.
 // `budget` is the page's content budget less any per-line framing.
 fn fit_line(
     text: &str,
     used: usize,
     budget: usize,
     full_line: bool,
-) -> Result<Option<(String, usize, usize)>, ToolError> {
+) -> Option<(String, usize, usize)> {
     let mut maximum = text.len().min(budget);
     while !text.is_char_boundary(maximum) {
         maximum -= 1;
@@ -302,13 +333,13 @@ fn fit_line(
     let full_line = full_line && maximum == text.len();
     let text = &text[..maximum];
     if full_line {
-        let size = serde_json::to_vec(text)?.len() + 1;
+        let size = line_size(text);
         if used + size <= budget {
-            return Ok(Some((text.to_owned(), text.len(), size)));
+            return Some((text.to_owned(), text.len(), size));
         }
     }
     if used != 0 {
-        return Ok(None);
+        return None;
     }
     let mut low = 0;
     let boundaries: Vec<usize> = text
@@ -319,7 +350,7 @@ fn fit_line(
     let mut high = boundaries.len() - 1;
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        let size = serde_json::to_vec(&text[..boundaries[middle]])?.len() + 1;
+        let size = line_size(&text[..boundaries[middle]]);
         if size <= budget {
             low = middle;
         } else {
@@ -328,8 +359,8 @@ fn fit_line(
     }
     let stop = boundaries[low];
     let value = text[..stop].to_owned();
-    let size = serde_json::to_vec(&value)?.len() + 1;
-    Ok(Some((value, stop, size)))
+    let size = line_size(&value);
+    Some((value, stop, size))
 }
 
 pub(super) fn page(
@@ -438,7 +469,7 @@ fn read<R: BufRead>(
             break false;
         }
         let piece = without_terminator(std::str::from_utf8(&raw).expect("validated UTF-8"));
-        let Some((value, count, size)) = fit_line(piece, used, CONTENT_BYTES, full && !deferred)?
+        let Some((value, count, size)) = fit_line(piece, used, CONTENT_BYTES, full && !deferred)
         else {
             break false;
         };
@@ -563,7 +594,7 @@ fn search<R: BufRead>(
             })?
             .len();
             let budget = CONTENT_BYTES - framing;
-            let Some((fitted, count, size)) = fit_line(&text[offset..], used, budget, true)? else {
+            let Some((fitted, count, size)) = fit_line(&text[offset..], used, budget, true) else {
                 break;
             };
             used += size + framing;

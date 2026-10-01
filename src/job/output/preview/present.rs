@@ -5,8 +5,9 @@ use serde_json::Value;
 
 use super::{
     LISTED_CUTS, TEXT_BYTES, TEXT_LINES, json_bytes,
-    pool::{Node, Text, TextRole},
+    pool::{Keep, Node, TextRole},
     protects,
+    text::{ends, shorten},
 };
 use crate::job::output::{FieldPointer, OutputTruncation, shape::COLLECTION_MEMBERS};
 
@@ -69,7 +70,12 @@ pub(super) fn present(
         exempt: 0,
     };
     let value = presenter.present(node, field, 0);
-    let cut = (presenter.cuts.iter()).any(|cut| !matches!(cut, OutputTruncation::Text { .. }));
+    let cut = (presenter.cuts.iter()).any(|cut| {
+        !matches!(
+            cut,
+            OutputTruncation::Text { .. } | OutputTruncation::TextGap { .. }
+        )
+    });
     let mut truncated = presenter.fields;
     truncated.extend(summarize(presenter.cuts));
     Shown {
@@ -98,8 +104,11 @@ impl Presenter<'_> {
                 value.clone()
             }
             Node::Text(text) => match text.role {
-                TextRole::Field => {
-                    let (value, cut) = shorten(text, field, TEXT_BYTES, Some(TEXT_LINES));
+                TextRole::Field(keep) => {
+                    let (value, cut) = match keep {
+                        Keep::Head => shorten(text, field, TEXT_BYTES, Some(TEXT_LINES)),
+                        Keep::Ends => ends(text, field),
+                    };
                     self.exempt += json_bytes(&value);
                     self.fields.extend(cut);
                     value
@@ -202,54 +211,6 @@ fn kept<T>(shown: &[(usize, FieldPointer, T)]) -> Option<Vec<[usize; 2]>> {
         }
         ranges
     })
-}
-
-/// The prefix of `text` kept within `bytes` (and `lines`, preferring whole lines
-/// there), and its record when it is shorter than the string.
-fn shorten(
-    text: &Text,
-    field: &FieldPointer,
-    bytes: usize,
-    lines: Option<usize>,
-) -> (Value, Option<OutputTruncation>) {
-    let prefix = &text.prefix;
-    let line_end = lines.and_then(|lines| {
-        prefix
-            .iter()
-            .enumerate()
-            .filter(|(_, byte)| **byte == b'\n')
-            .nth(lines - 1)
-            .map(|(index, _)| index + 1)
-    });
-    let mut end = bytes.min(prefix.len()).min(line_end.unwrap_or(usize::MAX));
-    end = match std::str::from_utf8(&prefix[..end]) {
-        Ok(_) => end,
-        Err(error) => error.valid_up_to(),
-    };
-    if lines.is_some()
-        && end < text.bytes
-        && let Some(last) = prefix[..end].iter().rposition(|&byte| byte == b'\n')
-    {
-        end = last + 1;
-    }
-    // A cut between CR and LF would split one line terminator across pages.
-    if end > 0 && prefix.get(end) == Some(&b'\n') && prefix[end - 1] == b'\r' {
-        end -= 1;
-    }
-    let kept = String::from_utf8_lossy(&prefix[..end]).into_owned();
-    if end >= text.bytes {
-        return (kept.into(), None);
-    }
-    let line = 1 + prefix[..end].iter().filter(|&&byte| byte == b'\n').count();
-    let offset =
-        (prefix[..end].iter().rposition(|&byte| byte == b'\n')).map_or(end, |last| end - last - 1);
-    let record = OutputTruncation::Text {
-        field: field.clone(),
-        total_lines: text.newlines + usize::from(text.bytes > 0 && !text.ends_line),
-        next_start: line,
-        next_offset: (offset != 0).then_some(offset),
-    };
-    (kept.into(), Some(record))
 }
 
 /// At most `LISTED_CUTS` records: beyond them, one summary at the remaining cuts'

@@ -16,7 +16,7 @@ use tokio::{
 };
 
 use crate::tool::StreamEnd;
-use crate::tool::output::{FinishedOutput, TextCaptureField};
+use crate::tool::output::{FinishedOutput, TextCaptureField, ends};
 use crate::tool::{
     PathArgument, PathKind, RegistryError,
     policy::{Capability, PathAccess},
@@ -373,9 +373,9 @@ struct ProcessOutput {
     exit_code: Option<i32>,
     #[schemars(with = "i32")]
     signal: Option<i32>,
-    #[schemars(with = "crate::tool::output::JsonText")]
+    #[schemars(with = "crate::tool::output::JsonText", transform = ends)]
     stdout: Option<String>,
-    #[schemars(with = "String")]
+    #[schemars(with = "String", transform = ends)]
     stderr: Option<String>,
 }
 
@@ -518,6 +518,17 @@ mod tests {
                 .unwrap()
                 .contains('\u{fffd}')
         );
+
+        // The model's view of a long stream keeps its first and last lines.
+        let count = "i=0; while [ $i -lt 1000 ]; do i=$((i+1)); echo $i; done";
+        let command = json!({"command":format!("{count}; ({count}) >&2")});
+        let view = executor.run_model(agent, "exec", command).await.unwrap();
+        for stream in ["stdout", "stderr"] {
+            let text = view.output.value["result"][stream].as_str().unwrap();
+            assert!(text.starts_with("1\n2\n"), "{stream}: {text}");
+            assert!(text.contains("\n60\n… lines 61–860 omitted …\n861\n"));
+            assert!(text.ends_with("\n1000\n"));
+        }
 
         // The deadline elapses once the tool has captured the partial output.
         let command = json!({"command":"printf partial; exec sleep 3600", "timeout":3600});

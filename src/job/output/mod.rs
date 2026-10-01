@@ -25,7 +25,7 @@ pub use products::{
     Continuation, ElementPage, LinePage, Match, MatchPage, MemberPage, NumberedLine, OutputFields,
     OutputPreview, OutputSelection, OutputTruncation, PageLines, PresentedOutput,
 };
-pub(crate) use projection::complete_fields;
+pub(crate) use projection::{Presented, presented_fields};
 use reader::Source;
 pub(super) use saved::blocking;
 pub use saved::diagnostic_slot;
@@ -79,22 +79,21 @@ pub(crate) enum OutputOptions {
 }
 
 impl JobManager {
-    /// Record the fields of a script's saved return value its presentation never shortens.
-    pub(crate) async fn save_complete_fields(
+    /// Record the declared presentations of fields in a script's saved return value.
+    pub(crate) async fn save_presented_fields(
         &self,
         job: JobId,
-        complete: BTreeSet<FieldPointer>,
+        presented: Presented,
     ) -> Result<(), ToolError> {
-        if complete.is_empty() {
+        if presented.is_empty() {
             return Ok(());
         }
         let output = self.output(job);
         let job = output.job.get();
-        let fields: Vec<_> = complete.into_iter().collect();
         blocking(move || {
             output
                 .db
-                .save_complete_fields(job, &fields)
+                .save_presented_fields(job, &presented)
                 .map_err(database)
         })
         .await
@@ -180,9 +179,10 @@ impl JobManager {
     }
 
     /// Host inspection with automatic pages for captures absent from the whole
-    /// presentation. Any explicit selection (including `context: 0`) suppresses
-    /// hydration, and a present JSON null is not an absent capture. A page
-    /// failure is embedded as `{error}` in that capture's `output`.
+    /// presentation: a running job's from their last page, so that repeated
+    /// inspection follows them. Any explicit selection (including `context: 0`)
+    /// suppresses hydration, and a present JSON null is not an absent capture. A
+    /// page failure is embedded as `{error}` in that capture's `output`.
     pub async fn inspect_output_with_captures(
         &self,
         args: OutputArgs,
@@ -199,16 +199,28 @@ impl JobManager {
                 OutputOptions::Host,
             )
             .await?;
+        let live = !output.state.is_terminal();
         let mut pages = stream::iter(std::mem::take(&mut output.capture_targets))
-            .map(|(index, field)| {
+            .map(|target| {
                 let mut query = OutputArgs::new(args.job);
-                query.field = Some(field);
+                query.field = Some(target.field);
                 let cancellation = cancellation.clone();
+                let db = self.output(args.job).db;
                 async move {
-                    let page = self
-                        .present_output_with(query, cancellation, capabilities, OutputOptions::Host)
-                        .await;
-                    (index, page)
+                    let page = async {
+                        if live {
+                            let start = move || reader::last_page_start(&db, target.capture);
+                            query.start = Some(blocking(start).await?);
+                        }
+                        self.present_output_with(
+                            query,
+                            cancellation,
+                            capabilities,
+                            OutputOptions::Host,
+                        )
+                        .await
+                    };
+                    (target.index, page.await)
                 }
             })
             .buffer_unordered(HYDRATED_PAGES);
@@ -358,7 +370,13 @@ impl JobManager {
                 output_selection == OutputSelection::WholeWithImages
                     && !shows(result.as_ref(), &capture.field)
             })
-            .map(|(index, capture)| (index, capture.field.clone()))
+            .filter_map(|(index, capture)| {
+                Some(products::HydrationTarget {
+                    index,
+                    field: capture.field.clone(),
+                    capture: saved.captures.get(&capture.field)?.id,
+                })
+            })
             .collect();
         annotations.captures = (!captures.is_empty()).then_some(captures);
         Ok(PresentedOutput {
@@ -1087,14 +1105,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn automatic_hydration_retains_nested_page_continuations() {
+    async fn automatic_hydration_follows_a_live_captures_last_page() {
         let (_root, manager, job) = fixture(None).await;
         capture(
             &manager,
             job,
             "/result/log",
             CaptureKind::Text,
-            "line\n".repeat(150).as_bytes(),
+            (1..=150)
+                .map(|line| format!("line {line}\n"))
+                .collect::<String>()
+                .as_bytes(),
         );
         let (_, view) = hydrated(&manager, job).await;
         // The live whole-result page is empty but retains its polling position;
@@ -1105,9 +1126,37 @@ mod tests {
         );
         let preview = &view["presentation"]["captures"][0]["output"]["presentation"]["preview"];
         assert_eq!(preview["field"], "/result/log");
-        assert_eq!(preview["lines"].as_array().unwrap().len(), 100);
-        assert_eq!(preview["next_start"], 101);
+        let last: Vec<_> = (51..=150).map(|line| format!("line {line}")).collect();
+        assert_eq!(preview["lines"], json!(last));
+        assert_eq!(preview["next_start"], 151);
         assert_eq!(preview.get("next_offset"), None);
+        // Lines over a page's bytes leave fewer of them on the last page.
+        let wide = format!("{}\n", "w".repeat(CONTENT_BYTES / 4));
+        capture(
+            &manager,
+            job,
+            "/result/wide",
+            CaptureKind::Text,
+            wide.repeat(10).as_bytes(),
+        );
+        let (_, view) = hydrated(&manager, job).await;
+        let preview = &view["presentation"]["captures"][1]["output"]["presentation"]["preview"];
+        assert_eq!(preview["lines"].as_array().unwrap().len(), 3);
+        assert_eq!(preview["next_start"], 11);
+        // The last page is measured as pages are, in JSON-encoded line content.
+        let quoted = format!("{}\n", "\"".repeat(CONTENT_BYTES / 8));
+        capture(
+            &manager,
+            job,
+            "/result/quoted",
+            CaptureKind::Text,
+            quoted.repeat(10).as_bytes(),
+        );
+        let (_, view) = hydrated(&manager, job).await;
+        let preview = &view["presentation"]["captures"][1]["output"]["presentation"]["preview"];
+        assert_eq!(preview["field"], "/result/quoted");
+        assert_eq!(preview["lines"].as_array().unwrap().len(), 3);
+        assert_eq!(preview["next_start"], 11);
     }
 
     #[tokio::test]

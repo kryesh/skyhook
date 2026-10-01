@@ -1,9 +1,53 @@
 //! Automatic presentation of finished results, and the schema annotations it
-//! reads: `x-skyhook-complete` fields are never shortened, and JSON-declared text
-//! is classified when saved.
+//! reads: `x-skyhook-preview` declares fields never shortened or text keeping
+//! both ends, and JSON-declared text is classified when saved.
 use super::*;
 use crate::json_schema::{Node, Resolver, accepts, declared_types};
-use crate::tool::output::COMPLETE;
+use crate::tool::output::{FieldPresentation, PREVIEW};
+
+/// Fields of a result whose presentation is declared.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Presented {
+    /// Fields never shortened.
+    pub(crate) complete: BTreeSet<FieldPointer>,
+    /// Text fields keeping their first and last lines.
+    pub(crate) ends: BTreeSet<FieldPointer>,
+}
+
+impl Presented {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.complete.is_empty() && self.ends.is_empty()
+    }
+
+    pub(crate) fn insert(&mut self, field: FieldPointer, presentation: FieldPresentation) {
+        match presentation {
+            FieldPresentation::Complete => self.complete.insert(field),
+            FieldPresentation::Ends => self.ends.insert(field),
+        };
+    }
+
+    pub(crate) fn fields(&self) -> impl Iterator<Item = (&FieldPointer, FieldPresentation)> {
+        let of = |presentation| move |field| (field, presentation);
+        (self.complete.iter().map(of(FieldPresentation::Complete)))
+            .chain(self.ends.iter().map(of(FieldPresentation::Ends)))
+    }
+}
+
+impl Extend<(FieldPointer, FieldPresentation)> for Presented {
+    fn extend<I: IntoIterator<Item = (FieldPointer, FieldPresentation)>>(&mut self, fields: I) {
+        for (field, presentation) in fields {
+            self.insert(field, presentation);
+        }
+    }
+}
+
+impl FromIterator<(FieldPointer, FieldPresentation)> for Presented {
+    fn from_iter<I: IntoIterator<Item = (FieldPointer, FieldPresentation)>>(fields: I) -> Self {
+        let mut presented = Self::default();
+        presented.extend(fields);
+        presented
+    }
+}
 
 /// Typed presentation assembled before the JobView is serialized.
 pub(super) struct Projected {
@@ -26,21 +70,21 @@ pub(super) fn project(
     let notice = (!product.captures_complete).then_some(views::Notice::OutputIncomplete);
     let document = product.document();
     let root = FieldPointer::result();
-    let mut complete = saved.complete.clone();
-    complete.extend(saved.diagnostic_fields.iter().cloned());
+    let mut presented = saved.presented.clone();
+    (presented.complete).extend(saved.diagnostic_fields.iter().cloned());
     let (result, shape, truncated) = match &product.result {
         None => (None, None, Vec::new()),
-        Some(_) if complete.contains(&root) => {
+        Some(_) if presented.complete.contains(&root) => {
             let mut document = hydrate(saved, document)?;
             (Some(document["result"].take()), None, Vec::new())
         }
         Some(_) => {
             let reading = render::Reading::Sampled {
-                complete: &complete,
+                presented: &presented,
             };
             let mut input = render::json_text(saved, &root, &document["result"], reading)?;
             let clipped = input.take_clipped();
-            let preview = preview::preview(input, &root, &complete, &clipped, cancellation)?;
+            let preview = preview::preview(input, &root, &presented, &clipped, cancellation)?;
             (Some(preview.value), preview.shape, preview.truncated)
         }
     };
@@ -52,15 +96,20 @@ pub(super) fn project(
     })
 }
 
-/// Fields of `value` at `field` the schema declares complete, descendants
-/// included, since scripts can extract them.
-pub(crate) fn complete_fields(
+/// Fields of `value` at `field` whose presentation the schema declares, those
+/// inside a complete field included, since scripts can extract them.
+pub(crate) fn presented_fields(
     value: &Value,
     field: &FieldPointer,
     schema: &Value,
-) -> BTreeSet<FieldPointer> {
-    schema_fields(value, field, schema, |applicable, _| {
-        applicable.is_complete()
+) -> BTreeMap<FieldPointer, FieldPresentation> {
+    schema_fields(value, field, schema, |applicable, value| {
+        applicable
+            .presentation()
+            .filter(|presentation| match presentation {
+                FieldPresentation::Complete => true,
+                FieldPresentation::Ends => value.is_string(),
+            })
     })
 }
 
@@ -71,27 +120,29 @@ pub(crate) fn json_text_fields(
     schema: &Value,
 ) -> BTreeSet<FieldPointer> {
     schema_fields(value, field, schema, |applicable, value| {
-        value.is_string() && applicable.declares_json()
+        (value.is_string() && applicable.declares_json()).then_some(())
     })
+    .into_keys()
+    .collect()
 }
 
-fn schema_fields(
+fn schema_fields<T>(
     value: &Value,
     field: &FieldPointer,
     schema: &Value,
-    selects: impl Fn(&ApplicableSchemas<'_>, &Value) -> bool + Copy,
-) -> BTreeSet<FieldPointer> {
-    fn visit(
+    selects: impl Fn(&ApplicableSchemas<'_>, &Value) -> Option<T> + Copy,
+) -> BTreeMap<FieldPointer, T> {
+    fn visit<T>(
         value: &Value,
         field: &FieldPointer,
         schemas: &[Node<'_>],
         root: &Value,
-        selects: impl Fn(&ApplicableSchemas<'_>, &Value) -> bool + Copy,
-        fields: &mut BTreeSet<FieldPointer>,
+        selects: impl Fn(&ApplicableSchemas<'_>, &Value) -> Option<T> + Copy,
+        fields: &mut BTreeMap<FieldPointer, T>,
     ) {
         let applicable = ApplicableSchemas::new(schemas, root, value);
-        if selects(&applicable, value) {
-            fields.insert(field.clone());
+        if let Some(selected) = selects(&applicable, value) {
+            fields.insert(field.clone(), selected);
         }
         match value {
             Value::Object(map) => {
@@ -109,7 +160,7 @@ fn schema_fields(
             _ => {}
         }
     }
-    let mut fields = BTreeSet::new();
+    let mut fields = BTreeMap::new();
     visit(
         value,
         field,
@@ -134,8 +185,15 @@ impl<'a> ApplicableSchemas<'a> {
         Self(applicable)
     }
 
-    fn is_complete(&self) -> bool {
-        self.0.iter().any(|node| node.schema[COMPLETE] == true)
+    /// The presentation these schemas declare: complete when any does.
+    fn presentation(&self) -> Option<FieldPresentation> {
+        let declared = (self.0.iter()).filter_map(|node| {
+            node.schema[PREVIEW]
+                .as_str()?
+                .parse::<FieldPresentation>()
+                .ok()
+        });
+        declared.min_by_key(|presentation| *presentation != FieldPresentation::Complete)
     }
 
     fn declares_json(&self) -> bool {
@@ -307,10 +365,10 @@ mod tests {
     /// replay unchanged after resume.
     #[tokio::test]
     async fn text_fields_keep_their_limits_and_views_survive_resume() {
-        let value = json!({"content":"line\n".repeat(150), "stdout":"é\\\"".repeat(TEXT_BYTES),
+        let value = json!({"content":"line\n".repeat(250), "stdout":"é\\\"".repeat(TEXT_BYTES),
             "stderr":"e".repeat(2 * TEXT_BYTES), "extra":["z".repeat(10000)],
             "instructions":"i".repeat(2 * TEXT_BYTES), "exit_code":7});
-        let schema = json!({"type":"object","properties":{"instructions":{COMPLETE:true}}});
+        let schema = json!({"type":"object","properties":{"instructions":{PREVIEW:"complete"}}});
         let error = "failure details ".repeat(2000);
         let (root, manager, id) = fixture(value.clone(), schema, Some(error.clone())).await;
         let view = manager
@@ -318,7 +376,7 @@ mod tests {
             .await
             .unwrap();
         let result = &view["result"];
-        assert_eq!(result["content"], "line\n".repeat(100));
+        assert_eq!(result["content"], "line\n".repeat(200));
         for field in ["stdout", "stderr"] {
             assert_eq!(result[field].as_str().unwrap().len(), TEXT_BYTES);
         }
@@ -367,7 +425,7 @@ mod tests {
             view
         );
         for (field, expected, line, offset) in [
-            ("/result/content", "line", 101, 0),
+            ("/result/content", "line", 201, 0),
             ("/result/stderr", "e", 1, TEXT_BYTES),
             ("/result/extra/0", "z", 1, SAMPLE_TEXT_BYTES[0]),
         ] {
@@ -387,11 +445,56 @@ mod tests {
         }
     }
 
+    /// A stream its schema declares to keep both ends reads its last lines from
+    /// storage; the record continues at the gap, and the view replays after resume.
+    #[tokio::test]
+    async fn declared_streams_keep_their_last_lines_from_storage() {
+        let line = |line: usize| format!("line {line}\n");
+        let stdout: String = (1..=20_000).map(line).collect();
+        let value = json!({"stdout": stdout, "stderr": "warning\n", "exit_code": 1});
+        let ends = json!({"type":"string", PREVIEW:"ends"});
+        let schema = json!({"type":"object","properties":{"stdout":ends,"stderr":ends}});
+        let (root, manager, id) = fixture(value.clone(), schema, None).await;
+        let view = manager
+            .present_output(OutputArgs::new(id), &Default::default())
+            .await
+            .unwrap();
+        let head: String = (1..=60).map(line).collect();
+        let tail: String = (19_861..=20_000).map(line).collect();
+        assert_eq!(
+            view["result"]["stdout"],
+            format!("{head}… lines 61–19860 omitted …\n{tail}")
+        );
+        assert_eq!(view["result"]["stderr"], value["stderr"]);
+        assert_eq!(
+            view["presentation"]["truncated"],
+            json!([{"field":"/result/stdout","total_lines":20_000,"next_start":61,"tail_start":19_861}])
+        );
+        let gap = marker(&view, "/result/stdout");
+        let page = manager
+            .present_output(continuation(id, gap), &Default::default())
+            .await
+            .unwrap();
+        assert_eq!(page["presentation"]["preview"]["lines"][0], "line 61");
+        let session = manager.store().id();
+        manager.drain_supervisors().await;
+        drop(manager);
+        let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
+        let restored = JobManager::restore(store, &records).await.unwrap();
+        assert_eq!(
+            restored
+                .present_output(OutputArgs::new(id), &Default::default())
+                .await
+                .unwrap(),
+            view
+        );
+    }
+
     #[tokio::test]
     async fn initial_positions_read_remaining_service_and_container_lines_without_gaps() {
         let schema = json!(true);
         for (width, count) in [
-            (94, 150),
+            (40, 300),
             (223, 150),
             (TEXT_BYTES / 2 + 1, 3),
             (TEXT_BYTES - 1, 2),

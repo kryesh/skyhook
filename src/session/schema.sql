@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 19). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 20). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 --
@@ -702,12 +702,15 @@ CREATE TABLE job_output_field (
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX job_output_field_capture ON job_output_field(capture);
 
--- Fields of a saved result that presentation never shortens: those its schema
--- declares and those a script's returned tool results carry.
-CREATE TABLE job_complete_field (
+CREATE TABLE field_presentation (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
+
+-- Fields of a saved result whose presentation is declared: by its schema, or
+-- carried by a script's returned tool results.
+CREATE TABLE job_field_presentation (
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,
   pointer TEXT NOT NULL,
+  presentation TEXT NOT NULL REFERENCES field_presentation(name),
   PRIMARY KEY (job, generation, pointer),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
 ) STRICT, WITHOUT ROWID;

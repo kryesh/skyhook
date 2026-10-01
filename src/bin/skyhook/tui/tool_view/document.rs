@@ -209,6 +209,14 @@ impl Document {
                 self.error(hints, error, shown);
             }
             if let Some(preview) = preview {
+                // A running job's capture pages follow the end of its output.
+                if let OutputPreview::Lines(lines) = preview
+                    && !view.state().is_terminal()
+                    && let Some(total) = lines.total_lines()
+                    && total > lines.lines().len()
+                {
+                    self.line(format!("Latest of {total} lines"), Role::Muted);
+                }
                 self.preview(hints, preview);
             }
         }
@@ -794,8 +802,9 @@ mod tests {
             json!({"field": field, "complete": false, "output": {"state": "completed",
                 "error": error, "presentation": presentation}})
         };
-        let page =
-            json!({"field": "/result/custom", "lines": ["  live payload\t"], "next_start": 2});
+        // A running job's page is its capture's last one.
+        let page = json!({"field": "/result/custom", "lines": ["  live payload\t"],
+            "total_lines": 40, "next_start": 41});
         let captures = json!([
             capture(
                 "/result/custom",
@@ -817,6 +826,7 @@ mod tests {
                 "Output incomplete.",
                 "parent failure",
                 "field read failed",
+                "Latest of 40 lines",
                 "live payload",
             ] {
                 assert_eq!(text.matches(marker).count(), 1, "{text}");

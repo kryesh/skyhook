@@ -32,7 +32,7 @@ pub use state::{SessionSummary, SessionTitle};
 pub(super) use state::{stopped_turn, summary, title};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 19;
+pub(super) const USER_VERSION: i64 = 20;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
@@ -44,7 +44,7 @@ const MUTABLE_TABLES: [&str; 6] = [
     "job_capture",
     "job_capture_chunk",
     "job_output_field",
-    "job_complete_field",
+    "job_field_presentation",
 ];
 
 #[derive(Debug, thiserror::Error)]
@@ -366,6 +366,10 @@ impl Dictionaries<'_> {
         self.names("job_role", &JobRole::ALL)?;
         self.names("capture_kind", &CaptureKind::ALL)?;
         self.names("capture_detection", &crate::job::output::Detection::ALL)?;
+        self.names(
+            "field_presentation",
+            &crate::tool::output::FieldPresentation::ALL,
+        )?;
         self.names("diagnostic_slot", &diagnostic::Slot::ALL)?;
         self.names("diagnostic_operation", &Operation::ALL)?;
         self.flagged(

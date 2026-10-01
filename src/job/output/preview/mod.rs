@@ -4,11 +4,13 @@
 //!
 //! Strings reached only through record members keep the per-field text limit
 //! outside the budget, until together they use up the text allowance, and complete
-//! fields are shown whole outside it. Arrays and collection objects share one
-//! sample count; strings inside samples are clipped.
+//! fields are shown whole outside it. Over its limit, a text field keeps its
+//! first lines, or both ends where its schema declares that. Arrays and
+//! collection objects share one sample count; strings inside samples are clipped.
 mod fit;
 mod pool;
 mod present;
+mod text;
 
 use std::{collections::BTreeSet, io::Read};
 
@@ -17,21 +19,26 @@ use serde_json::Value;
 use pool::Node;
 pub(super) use pool::pool;
 use present::Fit;
+pub(super) use text::trailing_lines;
 
 use super::{
-    CONTENT_BYTES, FieldPointer, OutputTruncation, ToolError, json, render::Clipped, shape::Shape,
+    CONTENT_BYTES, FieldPointer, OutputTruncation, ToolError, json, projection::Presented,
+    render::Clipped, shape::Shape,
 };
 
 /// Budget for a preview's sampled content, its shape and its truncation records.
 const PREVIEW_BUDGET: usize = 8 * 1024;
 /// Budget for everything one page shows.
 const PAGE_BUDGET: usize = CONTENT_BYTES;
-/// A text field keeps at most this many bytes, as much as the budget, and lines.
-pub(super) const TEXT_BYTES: usize = PREVIEW_BUDGET;
-pub(super) const TEXT_LINES: usize = 100;
+/// A text field keeps at most this many bytes and lines.
+pub(super) const TEXT_BYTES: usize = 16 * 1024;
+pub(super) const TEXT_LINES: usize = 200;
+/// The fraction of those limits a text field keeping both ends gives its first
+/// lines; its last lines take what that leaves.
+const HEAD_SHARE: (usize, usize) = (3, 10);
 /// Text fields together keep at most this many bytes outside the budget; later
 /// strings are shortened within it.
-const TEXT_ALLOWANCE: usize = PAGE_BUDGET;
+const TEXT_ALLOWANCE: usize = 64 * 1024;
 /// No fit shows more of one string than a page holds.
 pub(super) const STRING_BYTES: usize = PAGE_BUDGET;
 /// A string inside a sample keeps at most this many bytes, then less if needed.
@@ -79,7 +86,7 @@ impl Accounting {
 pub(super) fn preview(
     mut input: impl Read,
     field: &FieldPointer,
-    complete: &BTreeSet<FieldPointer>,
+    presented: &Presented,
     clipped: &Clipped,
     cancellation: &crate::job::CancellationToken,
 ) -> Result<Preview, ToolError> {
@@ -92,7 +99,7 @@ pub(super) fn preview(
         let shape = Shape::of(&value);
         Pooled::new(
             shape,
-            Node::of(value, field, complete, Accounting::Preview),
+            Node::of(value, field, presented, Accounting::Preview),
             true,
             Accounting::Preview,
         )
@@ -101,13 +108,13 @@ pub(super) fn preview(
         pool(
             &mut reader,
             field,
-            complete,
+            presented,
             clipped,
             cancellation,
             Accounting::Preview,
         )?
     };
-    Ok(pooled.fitted(field, complete, PREVIEW_BUDGET))
+    Ok(pooled.fitted(field, &presented.complete, PREVIEW_BUDGET))
 }
 
 /// A value's exhaustive shape and pooled samples, ready to fit a budget.
@@ -127,7 +134,7 @@ impl Pooled {
         let node = Node::of(
             value,
             &FieldPointer::root(),
-            &BTreeSet::new(),
+            &Presented::default(),
             Accounting::Page,
         );
         Self::new(shape, node, true, Accounting::Page)
@@ -215,17 +222,22 @@ mod tests {
     use serde_json::json;
 
     fn run(value: &Value, complete: &[&str]) -> Preview {
-        let complete = complete
-            .iter()
-            .map(|field| field.parse().unwrap())
-            .collect();
+        presented(value, complete, &[])
+    }
+
+    fn presented(value: &Value, complete: &[&str], ends: &[&str]) -> Preview {
+        let fields = |fields: &[&str]| fields.iter().map(|field| field.parse().unwrap()).collect();
+        let presented = Presented {
+            complete: fields(complete),
+            ends: fields(ends),
+        };
         let bytes = serde_json::to_vec(value).unwrap();
         let cancellation = crate::job::CancellationToken::new();
         let clipped = Clipped::new();
         preview(
             bytes.as_slice(),
             &FieldPointer::result(),
-            &complete,
+            &presented,
             &clipped,
             &cancellation,
         )
@@ -262,12 +274,94 @@ mod tests {
             cut(&preview, "/result/log"),
             OutputTruncation::Text {
                 total_lines: 10_000,
-                next_start: 101,
+                next_start: 201,
                 next_offset: None,
                 ..
             }
         ));
         assert_eq!(preview.truncated.len(), 1);
+    }
+
+    /// A field declared to keep both ends shows its first and last whole lines
+    /// around a marker, within the limits a field cut at its end has.
+    #[test]
+    fn declared_fields_keep_both_ends_around_a_marker() {
+        let run = |text: &str| presented(&json!({"stdout": text}), &[], &["/result/stdout"]);
+        let short = "x\n".repeat(300);
+        let numbered: String = (1..=5000).map(|line| format!("line {line}\n")).collect();
+        let wide: String = (1..=1000).map(|line| format!("{line:0200}\n")).collect();
+        let head_bytes = TEXT_BYTES * HEAD_SHARE.0 / HEAD_SHARE.1;
+        let wide_head = head_bytes / 201;
+        for (text, head, tail) in [
+            // Held whole in memory, and streamed.
+            (short.clone(), 60, 140),
+            (numbered.clone(), 60, 140),
+            // One line over the limit leaves out one line.
+            ("x\n".repeat(TEXT_LINES + 1), 60, 140),
+            // The head keeps its share of the bytes, the tail what that leaves.
+            (wide, wide_head, (TEXT_BYTES - wide_head * 201) / 201),
+            // A final line without a terminator is a line.
+            (format!("{short}end"), 60, 140),
+            // A first line over the head's bytes leaves the head empty.
+            (format!("{}\n{short}", "y".repeat(head_bytes)), 0, 140),
+        ] {
+            let lines: Vec<_> = text.split_inclusive('\n').collect();
+            let (next_start, tail_start) = (head + 1, lines.len() - tail + 1);
+            let preview = run(&text);
+            assert_eq!(
+                preview.value["stdout"],
+                format!(
+                    "{}… lines {next_start}–{} omitted …\n{}",
+                    lines[..head].concat(),
+                    tail_start - 1,
+                    lines[tail_start - 1..].concat()
+                )
+            );
+            assert_eq!(
+                preview.truncated,
+                [OutputTruncation::TextGap {
+                    field: "/result/stdout".parse().unwrap(),
+                    total_lines: lines.len(),
+                    next_start,
+                    tail_start,
+                }]
+            );
+            assert!(preview.shape.is_none());
+        }
+
+        // Within the limits nothing is cut, and a last line over the tail's bytes
+        // leaves a cut at the end, which a position inside a line can continue.
+        let whole = "x\n".repeat(TEXT_LINES);
+        let preview = run(&whole);
+        assert_eq!(preview.value["stdout"], whole);
+        assert!(preview.truncated.is_empty());
+        let preview = run(&format!("{short}{}", "y".repeat(2 * TEXT_BYTES)));
+        assert_eq!(preview.value["stdout"], "x\n".repeat(TEXT_LINES));
+        assert!(matches!(
+            cut(&preview, "/result/stdout"),
+            OutputTruncation::Text {
+                total_lines: 301,
+                next_start: 201,
+                next_offset: None,
+                ..
+            }
+        ));
+        // Undeclared, the same text keeps only its first lines.
+        let preview = presented(&json!({"stdout": short}), &[], &[]);
+        assert_eq!(preview.value["stdout"], "x\n".repeat(TEXT_LINES));
+        // Declared text that is not a text field, as under an array, is a sample
+        // like any other, cut at its end.
+        let field = "/result/runs/0/stdout";
+        let preview = presented(&json!({"runs": [{"stdout": numbered}]}), &[], &[field]);
+        let shown = preview.value["runs"][0]["stdout"].as_str().unwrap();
+        assert!(numbered.starts_with(shown) && shown.len() <= SAMPLE_TEXT_BYTES[0]);
+        assert!(matches!(
+            cut(&preview, field),
+            OutputTruncation::Text {
+                total_lines: 5000,
+                ..
+            }
+        ));
     }
 
     #[test]

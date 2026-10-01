@@ -8,7 +8,7 @@
 //! crowds out a later container's first ones. Candidates beyond the samples are
 //! pooled only while a fit showing everything could still be within the budget.
 //! Records keep every member: past the pool, a container member is emptied.
-use std::{collections::BTreeSet, io::Read};
+use std::io::Read;
 
 use serde_json::Value;
 use struson::{
@@ -23,6 +23,7 @@ use super::{
 use crate::job::output::{
     CONTENT_BYTES, FieldPointer, ToolError,
     json::saved_json,
+    projection::Presented,
     render::Clipped,
     shape::{COLLECTION_MEMBERS, ObjectBuilder, Scalar, Shape},
 };
@@ -34,14 +35,14 @@ const POOL_BYTES: usize = 4 * CONTENT_BYTES;
 pub(in crate::job::output) fn pool<R: Read>(
     reader: &mut JsonStreamReader<R>,
     field: &FieldPointer,
-    complete: &BTreeSet<FieldPointer>,
+    presented: &Presented,
     clipped: &Clipped,
     cancellation: &crate::job::CancellationToken,
     accounting: Accounting,
 ) -> Result<Pooled, ToolError> {
     let mut walker = Walker {
         reader,
-        complete,
+        presented,
         clipped,
         cancellation,
         accounting,
@@ -72,27 +73,27 @@ pub(super) enum Node {
 }
 
 impl Node {
-    /// A whole in-memory value at `field` for `accounting`, its complete fields
+    /// A whole in-memory value at `field` for `accounting`, its presented fields
     /// marked.
     pub(super) fn of(
         value: Value,
         field: &FieldPointer,
-        complete: &BTreeSet<FieldPointer>,
+        presented: &Presented,
         accounting: Accounting,
     ) -> Self {
         let mut marker = Marker {
-            complete,
+            presented,
             accounting,
             text_bytes: 0,
         };
-        // Pointers are only needed to find complete fields.
-        marker.mark(value, (!complete.is_empty()).then(|| field.clone()), true)
+        // Pointers are only needed to find presented fields.
+        marker.mark(value, (!presented.is_empty()).then(|| field.clone()), true)
     }
 }
 
 /// How an in-memory value's nodes are classified, as a streamed one's are.
 struct Marker<'a> {
-    complete: &'a BTreeSet<FieldPointer>,
+    presented: &'a Presented,
     accounting: Accounting,
     /// Bytes of text fields so far, within `TEXT_ALLOWANCE`.
     text_bytes: usize,
@@ -102,22 +103,27 @@ impl Marker<'_> {
     fn mark(&mut self, value: Value, field: Option<FieldPointer>, record: bool) -> Node {
         if field
             .as_ref()
-            .is_some_and(|field| self.complete.contains(field))
+            .is_some_and(|field| self.presented.complete.contains(field))
         {
             return Node::Complete(value);
         }
         let child = |make: &dyn Fn(&FieldPointer) -> FieldPointer| field.as_ref().map(make);
         match value {
             Value::String(text) => {
+                let keep = keep(self.presented, field.as_ref());
                 let mut text = Text {
                     limit: text.len(),
                     bytes: text.len(),
                     newlines: text.bytes().filter(|&byte| byte == b'\n').count(),
                     ends_line: text.ends_with('\n'),
+                    end: Vec::new(),
                     prefix: text.into_bytes(),
                     role: TextRole::Sample,
                 };
-                text.role = role(&mut self.text_bytes, self.accounting, record, &text);
+                text.role = role(&mut self.text_bytes, self.accounting, record, keep, &text);
+                if text.role == TextRole::Field(Keep::Ends) {
+                    text.end = text.prefix[text.bytes.saturating_sub(TEXT_BYTES)..].to_vec();
+                }
                 Node::Text(text)
             }
             Value::Array(items) => Node::Array {
@@ -149,13 +155,28 @@ impl Marker<'_> {
 /// Whether a string, reached only through record members when `record`, is a
 /// text field: previews give those their own limits outside the budget until
 /// they have used `TEXT_ALLOWANCE`, charging each its most shown bytes.
-fn role(text_bytes: &mut usize, accounting: Accounting, record: bool, text: &Text) -> TextRole {
+fn role(
+    text_bytes: &mut usize,
+    accounting: Accounting,
+    record: bool,
+    keep: Keep,
+    text: &Text,
+) -> TextRole {
     let charged = text.prefix.len().min(TEXT_BYTES);
     if record && accounting == Accounting::Preview && *text_bytes + charged <= TEXT_ALLOWANCE {
         *text_bytes += charged;
-        TextRole::Field
+        TextRole::Field(keep)
     } else {
         TextRole::Sample
+    }
+}
+
+/// Which lines the string at `field` keeps as a text field.
+fn keep(presented: &Presented, field: Option<&FieldPointer>) -> Keep {
+    if field.is_some_and(|field| presented.ends.contains(field)) {
+        Keep::Ends
+    } else {
+        Keep::Head
     }
 }
 
@@ -163,9 +184,18 @@ fn role(text_bytes: &mut usize, accounting: Accounting, record: bool, text: &Tex
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum TextRole {
     /// A text field: its own line and byte limits, outside the budget.
-    Field,
+    Field(Keep),
     /// Within a sample, clipped as the fit allows and counted in the budget.
     Sample,
+}
+
+/// The lines a text field over its limits keeps.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Keep {
+    /// Its first lines.
+    Head,
+    /// Its first and last lines, around a gap.
+    Ends,
 }
 
 /// A string's leading bytes and the extent of the whole string.
@@ -174,6 +204,9 @@ pub(super) struct Text {
     /// Up to `limit` bytes, and one more when the string goes on, so that a cut
     /// sees what follows it.
     pub(super) prefix: Vec<u8>,
+    /// The string's last bytes, up to `TEXT_BYTES`, when it is a text field
+    /// keeping both ends.
+    pub(super) end: Vec<u8>,
     /// The most bytes a fit keeping all that was pooled shows.
     pub(super) limit: usize,
     pub(super) bytes: usize,
@@ -280,7 +313,7 @@ struct Walker<'a, R: Read> {
     /// Stored strings read only as a prefix, whose whole extents these are.
     clipped: &'a Clipped,
     accounting: Accounting,
-    complete: &'a BTreeSet<FieldPointer>,
+    presented: &'a Presented,
     cancellation: &'a crate::job::CancellationToken,
     /// Compact JSON bytes of the pooled budgeted values with strings clipped to
     /// a sample, by where fits show them: no fit showing them is smaller.
@@ -305,7 +338,7 @@ impl<R: Read> Walker<'_, R> {
         if self.cancellation.is_cancelled() {
             return Err(ToolError::cancelled());
         }
-        if self.complete.contains(field) {
+        if self.presented.complete.contains(field) {
             let mut bytes = Vec::new();
             let mut writer = JsonStreamWriter::new(&mut bytes);
             self.reader.transfer_to(&mut writer).map_err(saved_json)?;
@@ -322,7 +355,8 @@ impl<R: Read> Walker<'_, R> {
                 while self.reader.has_next().map_err(saved_json)? {
                     let child_place = place.child(total);
                     let pooled = self.pools(child_place);
-                    let child = (pooled || !self.complete.is_empty()).then(|| field.index(total));
+                    let child =
+                        (pooled || !self.presented.complete.is_empty()).then(|| field.index(total));
                     match child {
                         Some(child) if pooled || self.protects(&child) => {
                             self.count(usize::from(total > 0), child_place);
@@ -345,16 +379,20 @@ impl<R: Read> Walker<'_, R> {
                 let text_field = record
                     && self.accounting == Accounting::Preview
                     && self.text_bytes < TEXT_ALLOWANCE;
-                let mut text = self.text(if text_field { TEXT_BYTES } else { sample })?;
-                if let Some(extent) = self.clipped.get(field) {
+                let keep = keep(self.presented, Some(field));
+                let limit = if text_field { TEXT_BYTES } else { sample };
+                let mut text = self.text(limit, text_field && keep == Keep::Ends)?;
+                if let Some(clipped) = self.clipped.get(field) {
                     let size = |count: u64| usize::try_from(count).unwrap_or(usize::MAX);
-                    text.bytes = size(extent.bytes);
-                    text.newlines = size(extent.newlines);
-                    text.ends_line = extent.ends_line;
+                    text.bytes = size(clipped.extent.bytes);
+                    text.newlines = size(clipped.extent.newlines);
+                    text.ends_line = clipped.extent.ends_line;
+                    text.end.clone_from(&clipped.end);
                 }
-                text.role = role(&mut self.text_bytes, self.accounting, record, &text);
+                text.role = role(&mut self.text_bytes, self.accounting, record, keep, &text);
                 if text.role == TextRole::Sample {
                     text.prefix.truncate(sample + 1);
+                    text.end = Vec::new();
                     text.limit = text.limit.min(sample);
                     self.count_text(&text, place);
                 }
@@ -414,8 +452,8 @@ impl<R: Read> Walker<'_, R> {
                 (false, place.child(total))
             };
             let pooled = self.pools(member_place);
-            let child =
-                (pooled || leading || !self.complete.is_empty()).then(|| field.property(&key));
+            let child = (pooled || leading || !self.presented.complete.is_empty())
+                .then(|| field.property(&key));
             let before = self.tally.clone();
             let member = match child {
                 Some(child) if pooled || leading || self.protects(&child) => {
@@ -477,11 +515,12 @@ impl<R: Read> Walker<'_, R> {
     /// a record's, samples at `place`, returning their allowance.
     fn demote(&mut self, node: &mut Node, place: Place) {
         match node {
-            Node::Text(text) if text.role == TextRole::Field => {
+            Node::Text(text) if matches!(text.role, TextRole::Field(_)) => {
                 self.text_bytes -= text.prefix.len().min(TEXT_BYTES);
                 let sample = self.sample();
                 text.role = TextRole::Sample;
                 text.prefix.truncate(sample + 1);
+                text.end = Vec::new();
                 text.limit = text.limit.min(sample);
                 self.count_text(text, place);
             }
@@ -581,14 +620,16 @@ impl<R: Read> Walker<'_, R> {
     }
 
     fn protects(&self, field: &FieldPointer) -> bool {
-        protects(self.complete, field)
+        protects(&self.presented.complete, field)
     }
 
-    fn text(&mut self, limit: usize) -> Result<Text, ToolError> {
+    /// The next string's prefix and extent, with its last bytes when `end`.
+    fn text(&mut self, limit: usize, end: bool) -> Result<Text, ToolError> {
         let mut input = self.reader.next_string_reader().map_err(saved_json)?;
         let mut text = Text {
             role: TextRole::Sample,
             prefix: Vec::new(),
+            end: Vec::new(),
             limit,
             bytes: 0,
             newlines: 0,
@@ -606,6 +647,11 @@ impl<R: Read> Walker<'_, R> {
             let chunk = &buffer[..count];
             let room = (limit + 1).saturating_sub(text.prefix.len()).min(count);
             text.prefix.extend_from_slice(&chunk[..room]);
+            if end {
+                text.end.extend_from_slice(chunk);
+                let excess = text.end.len().saturating_sub(TEXT_BYTES);
+                text.end.drain(..excess);
+            }
             text.bytes += count;
             text.newlines += chunk.iter().filter(|&&byte| byte == b'\n').count();
             text.ends_line = *last == b'\n';

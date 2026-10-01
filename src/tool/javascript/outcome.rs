@@ -3,17 +3,18 @@
 use serde::Deserialize;
 use serde_json::Value;
 
-use std::collections::BTreeSet;
+use std::collections::BTreeMap;
 
-use crate::job::FieldPointer;
+use crate::{job::FieldPointer, tool::output::FieldPresentation};
 
 #[derive(Deserialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
 pub(super) enum Envelope {
     Ok {
         value: Value,
-        /// Complete fields of the returned value, rooted at `/result/value`.
-        complete: BTreeSet<FieldPointer>,
+        /// Declared presentations of the returned value's fields, rooted at
+        /// `/result/value`.
+        presented: BTreeMap<FieldPointer, FieldPresentation>,
     },
     /// What the script threw, as `__describeError` spells it: any JSON value.
     Failed { error: Value },

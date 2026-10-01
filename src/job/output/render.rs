@@ -10,25 +10,30 @@ pub(super) enum Reading<'a> {
     /// Every byte, for values read whole.
     Whole,
     /// Enough of each stored string to show or sample it: its prefix, with its
-    /// whole extent from storage rather than from scanning the rest. Strings in
-    /// `complete` fields are read whole.
-    Sampled {
-        complete: &'a BTreeSet<FieldPointer>,
-    },
+    /// whole extent from storage rather than from scanning the rest, and its
+    /// last bytes too where its field keeps both ends. Strings in complete
+    /// fields are read whole.
+    Sampled { presented: &'a Presented },
 }
 
-impl Reading<'_> {
-    /// Sampling what no complete field protects.
+impl<'a> Reading<'a> {
+    /// Sampling what no declared presentation covers.
     pub(super) const SAMPLED: Reading<'static> = Reading::Sampled {
-        complete: &BTreeSet::new(),
+        presented: &Presented {
+            complete: BTreeSet::new(),
+            ends: BTreeSet::new(),
+        },
     };
 
-    fn clips(self, field: &FieldPointer) -> bool {
+    /// What a stored string at `field` is clipped for; none when it is read whole.
+    fn clips(self, field: &FieldPointer) -> Option<&'a Presented> {
         match self {
-            Self::Whole => false,
-            Self::Sampled { complete } => !complete
-                .iter()
-                .any(|complete| complete == field || complete.contains(field)),
+            Self::Whole => None,
+            Self::Sampled { presented } => {
+                let complete = (presented.complete.iter())
+                    .any(|complete| complete == field || complete.contains(field));
+                (!complete).then_some(presented)
+            }
         }
     }
 }
@@ -51,8 +56,15 @@ pub(super) fn json_text(
     Ok(spliced)
 }
 
-/// Extents of stored strings a sampled reading spliced as a prefix.
-pub(super) type Clipped = BTreeMap<FieldPointer, crate::session::CaptureExtent>;
+/// Stored strings a sampled reading spliced as a prefix.
+pub(super) type Clipped = BTreeMap<FieldPointer, ClippedText>;
+
+/// What a sampled reading knows of a stored string beyond its prefix.
+pub(super) struct ClippedText {
+    pub(super) extent: crate::session::CaptureExtent,
+    /// The string's last bytes, up to `TEXT_BYTES`, when its field keeps both ends.
+    pub(super) end: Vec<u8>,
+}
 
 pub(super) struct Spliced {
     parts: VecDeque<Part>,
@@ -81,16 +93,25 @@ impl Spliced {
     ) -> Result<(), ToolError> {
         if let Some(source) = saved.stored(field) {
             self.flush();
-            let part = match (value.is_string(), reading.clips(field)) {
-                (false, _) => Part::Json(source),
-                (true, false) => Part::Text(EscapedText::new(source)),
-                (true, true) => {
+            let clips = reading.clips(field).filter(|_| value.is_string());
+            let part = match clips {
+                None if value.is_string() => Part::Text(EscapedText::new(source)),
+                None => Part::Json(source),
+                Some(presented) => {
                     let capture = saved
                         .captures
                         .get(field)
                         .ok_or_else(|| ToolError::failed("saved output field is missing"))?;
-                    let extent = (saved.output.db.capture_extent(capture.id)).map_err(database)?;
-                    self.clipped.insert(field.clone(), extent);
+                    let db = &saved.output.db;
+                    let extent = db.capture_extent(capture.id).map_err(database)?;
+                    let end = if presented.ends.contains(field) {
+                        reader::CaptureReader::new(db.clone(), capture.id)
+                            .end(extent.bytes, preview::TEXT_BYTES)?
+                    } else {
+                        Vec::new()
+                    };
+                    self.clipped
+                        .insert(field.clone(), ClippedText { extent, end });
                     let mut prefix = Vec::new();
                     // One byte more, so that a cut sees what follows it.
                     let limit = preview::STRING_BYTES as u64 + 1;

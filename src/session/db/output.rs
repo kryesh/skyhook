@@ -6,7 +6,10 @@ use super::{
     u64_of as integer,
 };
 use crate::{
-    job::{CaptureKind, output::Detection},
+    job::{
+        CaptureKind,
+        output::{Detection, Presented},
+    },
     tool::output::FieldPointer,
 };
 
@@ -266,7 +269,7 @@ impl SharedDb {
         result: Option<&str>,
         captures_complete: bool,
         referenced: &[i64],
-        complete: &[FieldPointer],
+        presented: &Presented,
     ) -> Result<(), DbError> {
         let db = self.lock();
         db.atomic(|| {
@@ -288,11 +291,11 @@ impl SharedDb {
                     params![job, generation, *capture],
                 )?;
             }
-            for pointer in complete {
+            for (pointer, presentation) in presented.fields() {
                 db.execute(
-                    "INSERT INTO job_complete_field (job, generation, pointer) \
-                     VALUES (?1, ?2, ?3) ON CONFLICT DO NOTHING",
-                    params![job, generation, pointer],
+                    "INSERT INTO job_field_presentation (job, generation, pointer, presentation) \
+                     VALUES (?1, ?2, ?3, ?4) ON CONFLICT DO NOTHING",
+                    params![job, generation, pointer, presentation],
                 )?;
             }
             Ok(())
@@ -358,38 +361,39 @@ impl SharedDb {
         }))
     }
 
-    pub(crate) fn save_complete_fields(
+    pub(crate) fn save_presented_fields(
         &self,
         job: u64,
-        fields: &[FieldPointer],
+        presented: &Presented,
     ) -> Result<(), DbError> {
         let db = self.lock();
         db.atomic(|| {
             let generation = generation(&db, job)?;
             db.execute(
-                "DELETE FROM job_complete_field WHERE job = ?1 AND generation = ?2",
+                "DELETE FROM job_field_presentation WHERE job = ?1 AND generation = ?2",
                 params![job, generation],
             )?;
-            for pointer in fields {
+            for (pointer, presentation) in presented.fields() {
                 db.execute(
-                    "INSERT INTO job_complete_field (job, generation, pointer) \
-                     VALUES (?1, ?2, ?3)",
-                    params![job, generation, pointer],
+                    "INSERT INTO job_field_presentation (job, generation, pointer, presentation) \
+                     VALUES (?1, ?2, ?3, ?4)",
+                    params![job, generation, pointer, presentation],
                 )?;
             }
             Ok(())
         })
     }
 
-    pub(crate) fn complete_fields(&self, job: u64) -> Result<Vec<FieldPointer>, DbError> {
-        self.lock().query(
+    pub(crate) fn presented_fields(&self, job: u64) -> Result<Presented, DbError> {
+        let fields = self.lock().query(
             &format!(
-                "SELECT p.pointer FROM job_complete_field p \
-                 WHERE p.job = ?1 AND p.generation = ({CURRENT_GENERATION}) ORDER BY p.pointer"
+                "SELECT p.pointer, p.presentation FROM job_field_presentation p \
+                 WHERE p.job = ?1 AND p.generation = ({CURRENT_GENERATION})"
             ),
             params![job],
-            |row| pointer(row, 0),
-        )
+            |row| Ok((pointer(row, 0)?, enum_column(row, 1)?)),
+        )?;
+        Ok(fields.into_iter().collect())
     }
 
     #[cfg(test)]
@@ -406,6 +410,7 @@ mod tests {
         identity::JobId,
         job::{JobEnd, JobRole, JobTransition},
         session::{SessionError, SessionEvent, SessionStore, tests::on_disk},
+        tool::output::FieldPresentation,
     };
 
     /// Saved fields reference the saved run's own captures. A capture of another job
@@ -438,7 +443,15 @@ mod tests {
             let capture = db.create_capture(job.get(), &field(name), CaptureKind::Text);
             capture.unwrap().unwrap()
         };
-        let save = |captures: &[i64]| db.save_output(first.get(), Some("{}"), true, captures, &[]);
+        let save = |captures: &[i64]| {
+            db.save_output(
+                first.get(),
+                Some("{}"),
+                true,
+                captures,
+                &Presented::default(),
+            )
+        };
         let saved = |name| {
             let output = db.output(first.get()).unwrap().unwrap();
             assert_eq!(output.result.as_deref(), Some("{}"));
@@ -535,7 +548,13 @@ mod tests {
         current.finish_capture(capture).unwrap();
         let document = r#"{"text":""}"#;
         current
-            .save_output(job.get(), Some(document), false, &[capture], &[])
+            .save_output(
+                job.get(),
+                Some(document),
+                false,
+                &[capture],
+                &Presented::default(),
+            )
             .unwrap();
 
         let extra = FieldPointer::result().property("late");
@@ -559,9 +578,15 @@ mod tests {
             ("finish", old.finish_capture(previous)),
             (
                 "document",
-                old.save_output(job.get(), Some("null"), true, &[], &[]),
+                old.save_output(job.get(), Some("null"), true, &[], &Presented::default()),
             ),
-            ("complete", old.save_complete_fields(job.get(), &[extra])),
+            (
+                "presented",
+                old.save_presented_fields(
+                    job.get(),
+                    &[(extra, FieldPresentation::Complete)].into_iter().collect(),
+                ),
+            ),
             ("size", old.set_presented_bytes(job.get(), 42)),
         ] {
             assert!(result.is_err(), "closed handle wrote {operation}");
@@ -572,7 +597,7 @@ mod tests {
         assert_eq!(saved.result.as_deref(), Some(document));
         assert!(!saved.captures_complete);
         assert_eq!(saved.fields.as_slice(), std::slice::from_ref(&field));
-        assert!(old.complete_fields(job.get()).unwrap().is_empty());
+        assert!(old.presented_fields(job.get()).unwrap().is_empty());
         assert_eq!(old.presented_bytes(job.get()).unwrap(), None);
         let captures = old.captures(job.get()).unwrap();
         assert_eq!(captures.len(), 1);

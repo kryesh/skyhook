@@ -195,7 +195,7 @@ async fn evaluate_inner(
     let images = Arc::new(Mutex::new(Vec::<ImageRef>::new()));
     let returned_images = images.clone();
     let cancelled = context.clone();
-    let complete_jobs = executor.jobs().clone();
+    let presented_jobs = executor.jobs().clone();
     let script_job = context.job();
     let execution = js_context.async_with(async move |js| {
         let sleep_context = context.clone();
@@ -271,31 +271,29 @@ async fn evaluate_inner(
                                 }
                                 Err(error) => failed(error),
                             };
-                            let complete_fields = crate::job::output::complete_fields;
-                            let mut complete = std::collections::BTreeSet::new();
+                            let presented_fields = crate::job::output::presented_fields;
+                            let mut presented = std::collections::BTreeMap::new();
                             match policy {
                                 // The response keeps its error and questions whole,
                                 // and its result what the tool's schema declares.
                                 crate::tool::ToolResultPolicy::Value => {
                                     let root = crate::job::FieldPointer::root();
                                     let response = &crate::job::views::JOB_VIEW_SCHEMAS.response;
-                                    complete.extend(complete_fields(&output.value, &root, response));
+                                    presented.extend(presented_fields(&output.value, &root, response));
                                     let result = surface.get(&name).and_then(|tool| tool.result_schema.as_ref());
                                     if let (Some(result), Some(value)) = (result, output.value.get("result")) {
                                         let field = crate::job::FieldPointer::result();
-                                        complete.extend(complete_fields(value, &field, result.schema()));
+                                        presented.extend(presented_fields(value, &field, result.schema()));
                                     }
                                 }
                                 // Job views and bare envelopes are presentations already.
                                 crate::tool::ToolResultPolicy::JobView | crate::tool::ToolResultPolicy::Nothing => {
-                                    complete.insert(crate::job::FieldPointer::root());
+                                    presented.insert(crate::job::FieldPointer::root(), crate::tool::output::FieldPresentation::Complete);
                                 }
                             }
-                            let complete: std::collections::BTreeSet<String> =
-                                complete.into_iter().map(String::from).collect();
-                            let complete = (!complete.is_empty()).then_some(complete);
+                            let presented = (!presented.is_empty()).then_some(presented);
                             host_images.lock().await.extend(output.images);
-                            HostResponse::Success { value: output.value, complete }
+                            HostResponse::Success { value: output.value, presented }
                         }
                         HostRequest::Receive => {
                             drop(issuing);
@@ -305,7 +303,7 @@ async fn evaluate_inner(
                                 Err(error) => Err(error.to_string()),
                             };
                             match result {
-                                Ok(value) => HostResponse::Success { value, complete: None },
+                                Ok(value) => HostResponse::Success { value, presented: None },
                                 Err(message) => HostResponse::Failure(message),
                             }
                         }
@@ -342,8 +340,8 @@ async fn evaluate_inner(
     })?;
     let envelope: super::outcome::Envelope = serde_json::from_str(&encoded)
         .map_err(|error| javascript_error(JsError::InvalidOutput(error.to_string())))?;
-    let (value, complete) = match envelope {
-        super::outcome::Envelope::Ok { value, complete } => (value, complete),
+    let (value, presented) = match envelope {
+        super::outcome::Envelope::Ok { value, presented } => (value, presented),
         super::outcome::Envelope::Failed { error: mut details } => {
             map_failure_stack_lines(&mut details, user_start_line, user_line_count);
             let (message, details) = failure_parts(details);
@@ -356,14 +354,14 @@ async fn evaluate_inner(
     let mut images = std::mem::take(&mut *returned_images.lock().await);
     images.sort();
     images.dedup();
-    complete_jobs
-        .save_complete_fields(script_job, complete)
+    presented_jobs
+        .save_presented_fields(script_job, presented.into_iter().collect())
         .await
         .map_err(|error| {
             error
                 .operation(
                     Operation::Save,
-                    Subject::Label("script complete fields".into()),
+                    Subject::Label("script presented fields".into()),
                 )
                 .effects(Effects::OutputIncomplete)
                 .with_result(
@@ -452,9 +450,9 @@ pub(super) fn wrapper_script(source: &str, builders: &str) -> String {
          const value = await (async () => {{\n\
          {USER_SOURCE_MARKER}{source}\n\
          }})();\n\
-         const complete = [];\n\
-         const resolved = await __resolve(value, \"$\", new Set(), \"/result/value\", complete);\n\
-         return __stringify({{outcome:\"ok\", value:resolved, complete}});\n\
+         const presented = {{}};\n\
+         const resolved = await __resolve(value, \"$\", new Set(), \"/result/value\", presented);\n\
+         return __stringify({{outcome:\"ok\", value:resolved, presented}});\n\
          }} catch (error) {{ return __stringify({{outcome:\"failed\", error:__describeError(error)}}); }}\n\
          }})()\n"
     )
@@ -615,6 +613,46 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
+    /// A returned response, or the result taken from one, keeps the presentations
+    /// its tool's result schema declares.
+    #[tokio::test]
+    async fn returned_tool_results_keep_their_declared_presentations() {
+        #[derive(serde::Serialize, JsonSchema)]
+        struct Streams {
+            #[schemars(transform = crate::tool::output::ends)]
+            stdout: String,
+        }
+        let mut builder = ToolRegistryBuilder::default();
+        builder
+            .register::<Echo, Streams, _, _>(
+                "streams",
+                "streams",
+                ToolOptions::default(),
+                |_, input| async move {
+                    Ok(Streams {
+                        stdout: input.value,
+                    })
+                },
+            )
+            .unwrap();
+        let (_scope, executor, context) = test_runtime(builder).await;
+        let source = "const full = await tool.streams({value:'x'});
+const extracted = (await tool.streams({value:'y'})).result;
+return {full, extracted};";
+        evaluate(source, executor.clone(), context.clone())
+            .await
+            .unwrap();
+        let output_rows = executor.jobs().output(context.job());
+        let presented = crate::job::output::Saved::load(&output_rows)
+            .unwrap()
+            .presented;
+        let fields = [
+            "/result/value/extracted/stdout",
+            "/result/value/full/result/stdout",
+        ];
+        assert!(presented.ends.iter().map(|field| field.as_str()).eq(fields));
+    }
+
     /// The script tool is hidden and rejected inside scripts, and denied
     /// operations keep their metadata in exceptions and uncaught details.
     #[tokio::test]
@@ -674,6 +712,7 @@ return {visible: typeof tool.script, direct, deniedResponse, denied};
         let output_rows = executor.jobs().output(context.job());
         let complete = crate::job::output::Saved::load(&output_rows)
             .unwrap()
+            .presented
             .complete;
         let error: crate::job::FieldPointer = "/result/value/deniedResponse/error".parse().unwrap();
         assert!(complete.contains(&error));
@@ -951,9 +990,11 @@ function __skyhookHostCall(encoded) {
   if (request.type === "receive") {
     return JSON.stringify({ok: true, value: {id: 99, state: "completed"}});
   }
+  const presented = {"/result/value": "complete"};
+  if (Array.isArray(request.arguments.value)) presented["/result/value/0"] = "ends";
   return JSON.stringify({ok: true, value: {
     id: __testCalls.length, state: "completed", result: request.arguments,
-  }, complete: ["/result/value"]});
+  }, presented});
 }
 function __skyhookConsoleLog(message) {
   throw new Error(`unexpected console output: ${message}`);
@@ -990,7 +1031,7 @@ function __skyhookConsoleLog(message) {
     }
 
     #[test]
-    fn complete_fields_follow_full_envelopes_and_extracted_native_payloads() {
+    fn presented_fields_follow_full_envelopes_and_extracted_native_payloads() {
         let result = evaluate_wrapper_envelope(
             r#"
 const full = await tool.echo({value:["full"]});
@@ -998,9 +1039,15 @@ const extracted = (await tool.echo({value:["extracted"]})).result.value;
 return {full, extracted};
 "#,
         );
-        let fields = result["complete"].as_array().unwrap();
-        assert!(fields.contains(&json!("/result/value/full/result/value")));
-        assert!(fields.contains(&json!("/result/value/extracted")));
+        assert_eq!(
+            result["presented"],
+            json!({
+                "/result/value/full/result/value": "complete",
+                "/result/value/full/result/value/0": "ends",
+                "/result/value/extracted": "complete",
+                "/result/value/extracted/0": "ends",
+            })
+        );
     }
 
     #[test]

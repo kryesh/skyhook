@@ -62,8 +62,8 @@ pub(crate) struct Saved {
     pub(super) captures: BTreeMap<FieldPointer, CaptureRow>,
     /// Slots holding a diagnostic rendered for the viewer, shown whole.
     pub(super) diagnostic_fields: BTreeSet<FieldPointer>,
-    /// Fields presentation never shortens, as saved with the result.
-    pub(crate) complete: BTreeSet<FieldPointer>,
+    /// Fields with a declared presentation, as saved with the result.
+    pub(crate) presented: Presented,
 }
 
 impl Saved {
@@ -71,7 +71,7 @@ impl Saved {
         let job = output.job.get();
         let saved = output.db.output(job).map_err(database)?;
         let captures = output.db.captures(job).map_err(database)?;
-        let complete = output.db.complete_fields(job).map_err(database)?;
+        let presented = output.db.presented_fields(job).map_err(database)?;
         let (product, fields) = match saved {
             Some(saved) => {
                 let result = saved.result.as_deref().map(serde_json::from_str);
@@ -88,7 +88,7 @@ impl Saved {
             product,
             fields,
             diagnostic_fields: BTreeSet::new(),
-            complete: complete.into_iter().collect(),
+            presented,
             captures: captures
                 .into_iter()
                 .map(|capture| (capture.pointer.clone(), capture))
@@ -165,8 +165,9 @@ pub(super) struct Stored<'a> {
     pub(super) referenced: &'a BTreeSet<FieldPointer>,
     /// Strings the schema declares as possibly JSON, classified here, once.
     pub(super) candidates: &'a BTreeSet<FieldPointer>,
-    /// Fields the schema declares complete, whose paths stay in the document.
-    pub(super) complete: &'a BTreeSet<FieldPointer>,
+    /// Fields whose presentation the schema declares; the paths of complete
+    /// ones stay in the document.
+    pub(super) presented: &'a Presented,
 }
 
 /// Persist a compact product, so loading it never parses a large value. Captures
@@ -193,7 +194,6 @@ pub(super) fn save_document(
     let result = has_result
         .then(|| serde_json::to_string(&document["result"]))
         .transpose()?;
-    let complete: Vec<_> = stored.complete.iter().cloned().collect();
     let job = output.job.get();
     (output.db)
         .save_output(
@@ -201,7 +201,7 @@ pub(super) fn save_document(
             result.as_deref(),
             captures_complete,
             &offload.fields,
-            &complete,
+            stored.presented,
         )
         .map_err(database)?;
     // Measured once, so batching notifications need not preview it again.
@@ -296,7 +296,7 @@ impl Offload<'_> {
             && serialized_bytes(value, OFFLOAD_BYTES).is_err()
             && !(self.registered.keys())
                 .chain(self.stored.candidates)
-                .chain(self.stored.complete)
+                .chain(&self.stored.presented.complete)
                 .any(|inner| field.contains(inner))
             && !text_field(value)
     }
@@ -597,7 +597,7 @@ mod tests {
     #[tokio::test]
     async fn containers_of_complete_fields_stay_in_the_document() {
         let schema = json!({"type":"object","properties":{
-            "details":{"type":"object","properties":{"instructions":{"x-skyhook-complete":true}}}
+            "details":{"type":"object","properties":{"instructions":{"x-skyhook-preview":"complete"}}}
         }});
         let assets: Vec<_> = (0..400).map(|index| format!("asset-{index}")).collect();
         let instructions = "step\n".repeat(150);
@@ -619,7 +619,7 @@ mod tests {
         let (_root, manager, agent) = runtime().await;
         let text = "\u{1}".repeat(3 * CONTENT_BYTES);
         let items: Vec<_> = (0..2000).map(|id| json!({"id": id})).collect();
-        let complete = json!({"properties":{"text":{"x-skyhook-complete":true}}});
+        let complete = json!({"properties":{"text":{"x-skyhook-preview":"complete"}}});
         for schema in [json!(true), complete] {
             let mut spec = JobSpec::test(agent.clone(), "sized");
             spec.output_schema = Some(schema.clone());

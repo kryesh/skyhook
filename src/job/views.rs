@@ -920,6 +920,12 @@ mod tests {
                     next_start: 4,
                     next_offset: Some(7),
                 },
+                output::OutputTruncation::TextGap {
+                    field: field("/result/stderr"),
+                    total_lines: 9,
+                    next_start: 3,
+                    tail_start: 8,
+                },
             ]),
             captures: Some(vec![
                 capture("/result/end", None),
@@ -949,6 +955,12 @@ mod tests {
         assert_eq!(
             next(&presentation),
             Some(("/result/stdout".into(), 4, Some(7)))
+        );
+        presentation.truncated.as_mut().unwrap().remove(0);
+        // A gap continues at its first line left out.
+        assert_eq!(
+            next(&presentation),
+            Some(("/result/stderr".into(), 3, None))
         );
         presentation.truncated = None;
         assert_eq!(

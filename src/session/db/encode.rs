@@ -639,12 +639,26 @@ mod tests {
                         },
                     )),
                     shape: Some(json!({"items": [3, "integer"]})),
-                    truncated: Some(vec![crate::job::output::OutputTruncation::Elements {
-                        field: "/result/items".parse().unwrap(),
-                        shown: 1,
-                        total_elements: 3,
-                        kept: None,
-                    }]),
+                    truncated: Some(vec![
+                        crate::job::output::OutputTruncation::Elements {
+                            field: "/result/items".parse().unwrap(),
+                            shown: 1,
+                            total_elements: 3,
+                            kept: None,
+                        },
+                        crate::job::output::OutputTruncation::Text {
+                            field: "/result/content".parse().unwrap(),
+                            total_lines: 9,
+                            next_start: 4,
+                            next_offset: None,
+                        },
+                        crate::job::output::OutputTruncation::TextGap {
+                            field: "/result/stdout".parse().unwrap(),
+                            total_lines: 9,
+                            next_start: 4,
+                            tail_start: 8,
+                        },
+                    ]),
                     captures: Some(vec![crate::job::output::CaptureDescriptor {
                         field: "/result/stdout".parse().unwrap(),
                         complete: true,
