@@ -117,11 +117,13 @@ impl Read for CaptureReader {
     }
 }
 
-/// The first line of a capture's last page: its trailing whole lines that a
-/// default page holds, or its last line when that alone is over one.
+/// The first line of a capture's last page of up to `limit` lines: its trailing
+/// whole lines that such a page holds, or its last line when that alone is
+/// over one.
 pub(super) fn last_page_start(
     db: &crate::session::SharedDb,
     capture: i64,
+    limit: usize,
 ) -> Result<usize, ToolError> {
     let reader = CaptureReader::new(db.clone(), capture);
     let index = reader.index()?;
@@ -129,7 +131,7 @@ pub(super) fn last_page_start(
     let end = reader.end(index.bytes, CONTENT_BYTES)?;
     let whole = end.len() as u64 == index.bytes;
     let size = |line: &[u8]| line_size(without_terminator(&String::from_utf8_lossy(line)));
-    let (_, lines) = preview::trailing_lines(&end, whole, DEFAULT_LIMIT, CONTENT_BYTES, size);
+    let (_, lines) = preview::trailing_lines(&end, whole, limit, CONTENT_BYTES, size);
     Ok(index.total_lines.saturating_sub(lines.max(1)) + 1)
 }
 

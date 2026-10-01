@@ -220,9 +220,6 @@ impl Document {
                 self.preview(hints, preview);
             }
         }
-        if let Some(envelope) = view.envelope() {
-            self.code(&pretty(&envelope), "", 2, None, Role::Muted);
-        }
     }
     /// A waiting child's question batch stands in for its result.
     fn questions(&mut self, questions: &[Question]) {
@@ -766,9 +763,6 @@ mod tests {
             "  • First",
             "    First step",
             "    Second step",
-            "  {",
-            "    \"state\": \"waiting_input\"",
-            "  }",
         ];
         assert_eq!(rows(&rendered("agent", &Value::Null, output)), expected);
     }
@@ -796,7 +790,7 @@ mod tests {
     }
 
     #[test]
-    fn live_captures_keep_unique_read_errors_without_duplicate_envelopes_or_empty_panes() {
+    fn live_captures_keep_unique_read_errors_without_envelopes_or_empty_panes() {
         let incomplete = |preview: Value, captures: Value| json!({"notice": "Output incomplete.", "preview": preview, "captures": captures});
         let capture = |field: &str, error: &str, presentation: Value| {
             json!({"field": field, "complete": false, "output": {"state": "completed",
@@ -836,6 +830,7 @@ mod tests {
                 "End of available output",
                 "\"output\"",
                 "\"preview\"",
+                "\"state\"",
             ] {
                 assert!(!text.contains(absent), "{text}");
             }

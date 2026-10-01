@@ -55,6 +55,8 @@ pub(crate) const PAGE_BYTES: usize = CONTENT_BYTES + 2048;
 const IO_BUFFER_BYTES: usize = 64 * 1024;
 /// Capture pages host inspection reads at once while hydrating a presentation.
 const HYDRATED_PAGES: usize = 4;
+/// The most lines host inspection shows of a running job's capture: its latest.
+const LIVE_LINES: usize = 20;
 
 /// Omit null-valued object fields from human-only UI display copies.
 /// Never use for model, history, saved output, or JavaScript response data.
@@ -209,8 +211,10 @@ impl JobManager {
                 async move {
                     let page = async {
                         if live {
-                            let start = move || reader::last_page_start(&db, target.capture);
+                            let start =
+                                move || reader::last_page_start(&db, target.capture, LIVE_LINES);
                             query.start = Some(blocking(start).await?);
+                            query.limit = Some(LIVE_LINES);
                         }
                         self.present_output_with(
                             query,
@@ -1126,7 +1130,7 @@ mod tests {
         );
         let preview = &view["presentation"]["captures"][0]["output"]["presentation"]["preview"];
         assert_eq!(preview["field"], "/result/log");
-        let last: Vec<_> = (51..=150).map(|line| format!("line {line}")).collect();
+        let last: Vec<_> = (131..=150).map(|line| format!("line {line}")).collect();
         assert_eq!(preview["lines"], json!(last));
         assert_eq!(preview["next_start"], 151);
         assert_eq!(preview.get("next_offset"), None);

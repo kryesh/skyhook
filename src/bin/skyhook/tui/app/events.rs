@@ -781,12 +781,7 @@ mod tests {
         toggle(&mut app);
         let cards = tool_cards(&app);
         assert_eq!((cards.len(), cards[0].key()), (1, &key));
-        for part in [
-            "Arguments",
-            "Output",
-            "Permission was denied",
-            "\"permission_denied\"",
-        ] {
+        for part in ["Arguments", "Output", "Permission was denied"] {
             assert!(cards[0].text().contains(part));
         }
         assert!(cards[0].document().is_some());

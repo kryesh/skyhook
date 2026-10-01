@@ -250,7 +250,7 @@ reconnecting to the remote machine.
 
 The TUI's automatic output view shows the structured result and previews any available captures
 not represented there. This exposes both process streams while live and preserves stderr and exit
-status on completion. While a job runs, each capture shows its latest lines, up to 100 within a
+status on completion. While a job runs, each capture shows its latest lines, up to 20 within a
 page's bytes, and follows them as output arrives. Explicit field, page, and search selections
 remain selected; choose **automatic output** in the Saved output menu to return to automatic
 viewing. The menu lists up to 100 fields one level below the one shown, from the page of it shown,
