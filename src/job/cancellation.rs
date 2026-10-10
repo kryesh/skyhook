@@ -17,7 +17,7 @@ pub(crate) enum CancelScope {
 }
 
 impl CancelScope {
-    fn covers(self, entry: &JobEntry) -> bool {
+    fn covers(self, entry: &JobFacts) -> bool {
         match self {
             Self::Outcome => entry.cancellable(),
             Self::Running => entry.end().is_none(),
@@ -28,104 +28,150 @@ impl CancelScope {
 impl JobManager {
     /// Request cancellation of this job and its descendants. The returned
     /// metadata is a snapshot, not proof that cancellation has completed; a
-    /// previously published terminal result is preserved.
+    /// previously published terminal result is preserved. A turn an interrupt
+    /// left held on the job runs on with its result.
     pub async fn cancel(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        let mut jobs = self.inner.jobs.lock().await;
-        if !jobs.contains_key(&id) {
-            return Err(JobError::Unknown(id));
-        }
-        self.cancel_trees(&mut jobs, vec![id], CancelScope::Outcome);
-        Ok(jobs[&id].metadata(id))
+        let manager = self.clone();
+        let cancel = move |state: &mut CoreState| {
+            let jobs = &state.jobs.entries;
+            let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
+            let metadata = entry.metadata(id);
+            let held =
+                entry.child().is_some() && entry.live() && !views::effectively_background(jobs, id);
+            let holder = held.then(|| entry.agent.clone());
+            manager.cancel_trees(state, vec![id], CancelScope::Outcome);
+            if let Some(holder) = holder {
+                state.agents.run_on(&holder);
+            }
+            Ok(metadata)
+        };
+        self.inner.store.live(cancel).await
     }
 
-    /// Cancel `roots` and all their descendants, starting the forced-abort
-    /// watchdog of each `scope` covers. The watchdog settles whatever outcome its
-    /// cancellation still changes, an interruption the cancellation caused too.
-    fn cancel_trees(
+    /// Cancel `roots` and all their descendants, arming the forced-abort watchdog
+    /// of the invocation each `scope` covers runs. The watchdog settles whatever
+    /// outcome its cancellation still changes, an interruption the cancellation
+    /// caused too. Tokens are cancelled once the change applies, in order.
+    pub(crate) fn cancel_trees(
         &self,
-        jobs: &mut HashMap<JobId, JobEntry>,
+        state: &mut CoreState,
         mut worklist: Vec<JobId>,
         scope: CancelScope,
     ) {
+        let jobs = &mut state.jobs.entries;
         let mut children = HashMap::<JobId, Vec<JobId>>::new();
         for (&id, entry) in jobs.iter() {
             if let Some(parent) = entry.parent {
                 children.entry(parent).or_default().push(id);
             }
         }
+        let (mut tokens, mut watched) = (Vec::new(), Vec::new());
         while let Some(job) = worklist.pop() {
             worklist.extend(children.remove(&job).into_iter().flatten());
             let Some(entry) = jobs.get_mut(&job) else {
                 continue;
             };
-            entry.cancellation.cancel();
-            if scope.covers(entry) && !entry.cancellation_watchdog_started {
-                entry.cancellation_watchdog_started = true;
-                let jobs = self.clone();
+            let watch = scope.covers(entry) && !entry.cancelling();
+            let armed = match entry.cancel {
+                CancelState::Requested { watched } if !watch => watched,
+                _ => watch.then_some(entry.invocation),
+            };
+            entry.cancel = CancelState::Requested { watched: armed };
+            tokens.push(self.handles(job, |handles| handles.cancellation.clone()));
+            // It cancels the invocation running now, not one a later input starts.
+            watched.extend(watch.then_some(Run(job, entry.invocation)));
+        }
+        let manager = self.clone();
+        state.defer(move || {
+            tokens.iter().for_each(CancellationToken::cancel);
+            for run in watched {
+                let jobs = manager.clone();
                 // Scheduling the watchdog must not extend the admitted grace period.
-                let grace = tokio::time::sleep(CANCELLATION_GRACE);
-                tokio::spawn(async move {
-                    grace.await;
-                    jobs.force_cancel(job).await;
+                let grace = tokio::time::Instant::now() + CANCELLATION_GRACE;
+                // It ends with the cancellation it watches, so a drain does not
+                // outwait its grace.
+                let settled = move |state: &mut CoreState| {
+                    let entry = state.jobs.entries.get(&run.0);
+                    (!entry.is_some_and(JobFacts::cancelling)).then_some(())
+                };
+                manager.inner.supervisor.spawn(async move {
+                    let settled = jobs.inner.store.until(settled);
+                    if tokio::time::timeout_at(grace, settled).await.is_err() {
+                        jobs.force_cancel(run).await;
+                    }
                 });
             }
-        }
+        });
     }
 
+    #[cfg(test)]
     pub(crate) async fn cancel_all(&self, owner: &AgentId, scope: CancelScope) -> usize {
-        let mut jobs = self.inner.jobs.lock().await;
-        let ids = jobs
-            .iter()
-            .filter_map(|(id, entry)| (&entry.agent == owner && scope.covers(entry)).then_some(*id))
+        let (manager, owner) = (self.clone(), owner.clone());
+        let cancel = move |state: &mut CoreState| manager.cancel_owned(state, &[owner], scope);
+        self.inner.store.live(cancel).await
+    }
+
+    /// Cancel the jobs of `owners` that `scope` covers, with their descendants.
+    pub(crate) fn cancel_owned(
+        &self,
+        state: &mut CoreState,
+        owners: &[AgentId],
+        scope: CancelScope,
+    ) -> usize {
+        let ids = (state.jobs.entries.iter())
+            .filter(|(_, entry)| owners.contains(&entry.agent) && scope.covers(entry))
+            .map(|(id, _)| *id)
             .collect::<Vec<_>>();
         let count = ids.len();
-        self.cancel_trees(&mut jobs, ids, scope);
+        self.cancel_trees(state, ids, scope);
         count
     }
 
-    /// Cancel every job still running and await its persisted terminal outcome,
+    /// Cancel every job still running but child invocations, which closing leaves
+    /// resumable, with its descendants: what a script launched ends with it.
+    pub(crate) fn cancel_running(&self, state: &mut CoreState) {
+        let running = (state.jobs.entries.iter())
+            .filter(|(_, entry)| entry.child().is_none() && CancelScope::Running.covers(entry))
+            .map(|(id, _)| *id)
+            .collect();
+        self.cancel_trees(state, running, CancelScope::Running);
+    }
+
+    /// Cancel what `cancel_running` does and await its persisted terminal outcome,
     /// and that of every cancellation already in flight. Unlike an ordinary
-    /// wait, a pending question is not a completion. Repeat the snapshot to
-    /// include descendants created while cancellation propagates.
+    /// wait, a pending question is not a completion. Repeat to include
+    /// descendants created while cancellation propagates.
     pub(crate) async fn cancel_and_drain(&self) -> Result<(), JobError> {
         loop {
-            let pending = {
-                let mut jobs = self.inner.jobs.lock().await;
-                let running = jobs
-                    .iter()
-                    .filter_map(|(id, entry)| CancelScope::Running.covers(entry).then_some(*id))
-                    .collect();
-                self.cancel_trees(&mut jobs, running, CancelScope::Running);
-                jobs.iter()
-                    .filter_map(|(id, entry)| entry.cancelling().then_some(*id))
-                    .collect::<Vec<_>>()
-            };
-            if pending.is_empty() {
+            let manager = self.clone();
+            let cancelling = self.inner.store.live(move |state| {
+                manager.cancel_running(state);
+                state.jobs.entries.values().any(JobFacts::cancelling)
+            });
+            if !cancelling.await {
                 // Terminal publication may precede supervisor cleanup.
-                self.drain_supervisors().await;
+                self.inner.supervisor.drain().await;
                 return Ok(());
             }
-            for id in pending {
-                self.wait_inner(id, None, WaitMode::Final).await?;
-            }
+            let settled = |state: &mut CoreState| {
+                let entries = state.jobs.entries.values();
+                (!entries.clone().any(JobFacts::cancelling)).then_some(())
+            };
+            self.inner.store.until(settled).await?;
         }
     }
 
-    pub(super) async fn force_cancel(&self, id: JobId) {
-        let task_abort = {
-            let jobs = self.inner.jobs.lock().await;
-            let Some(entry) = jobs.get(&id) else {
-                return;
-            };
-            if !entry.cancellable() {
-                return;
-            }
-            entry.task_abort.clone()
-        };
-        if let Some(task_abort) = task_abort {
+    /// Abort `run`'s worker and settle its cancellation, if that changes its outcome.
+    pub(super) async fn force_cancel(&self, run: Run) {
+        let Run(job, invocation) = run;
+        let worker = self.handles(job, |handles| handles.task_abort.clone());
+        if let Some((running, task_abort)) = worker
+            && running == invocation
+        {
             task_abort.abort();
         }
-        self.settle(id, ToolError::cancelled().into()).await;
+        let cancelled = async { ToolError::cancelled().into() };
+        let _ = super::supervisor::spawn_completion(self.clone(), run, cancelled).await;
     }
 }
 
@@ -138,6 +184,8 @@ mod tests {
         policy::{AuthorizationRequest, Capability, Policy, PolicyFuture},
     };
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use tokio::sync::Notify;
 
     #[derive(Deserialize, JsonSchema)]
     struct NoArgs {}
@@ -227,7 +275,7 @@ mod tests {
                 None => JobOutcome::Completed(output),
             };
             jobs.finish(id, outcome).await.unwrap();
-            let mut expected = jobs.snapshot(id).await.unwrap();
+            let mut expected = jobs.snapshot(id).unwrap();
             let document = saved.test_document();
             let fields = saved.test_fields();
             let view = jobs
@@ -243,10 +291,16 @@ mod tests {
                 expected.diagnostic.as_mut().unwrap().cause = Cause::Cancelled;
             }
             // Even a late watchdog must not overwrite output or denial metadata.
-            jobs.force_cancel(id).await;
-            for manager in [jobs.clone(), jobs.test_replay().await] {
-                assert_eq!(manager.snapshot(id).await.unwrap(), expected);
-                assert_eq!(manager.images(id).await.unwrap(), vec![image.clone()]);
+            jobs.force_cancel(jobs.run(id)).await;
+            // Replayed after the live reads, which can themselves journal.
+            for replay in [false, true] {
+                let manager = if replay {
+                    jobs.test_replay()
+                } else {
+                    jobs.clone()
+                };
+                assert_eq!(manager.snapshot(id).unwrap(), expected);
+                assert_eq!(manager.snapshot(id).unwrap().images, vec![image.clone()]);
                 let saved = manager.output(id);
                 assert_eq!(saved.test_document(), document);
                 assert_eq!(saved.test_fields(), fields);
@@ -289,22 +343,19 @@ mod tests {
         let prompt = crate::job::tests::question("pending");
         jobs.request_input(question.id(), prompt).await.unwrap();
         assert_eq!(
-            jobs.snapshot(question.id()).await.unwrap().state,
+            jobs.snapshot(question.id()).unwrap().state,
             JobState::WaitingInput
         );
         bounded(jobs.cancel_and_drain()).await.unwrap();
-        let records = jobs.store().records().await;
+        let records = jobs.store().records();
         let finished = |id| {
-            let finished = |record: &&EventRecord| matches!(&record.event, SessionEvent::JobFinished { job, .. } if *job == id);
+            let finished = |record: &&crate::session::EventRecord| matches!(&record.event, SessionEvent::JobFinished { job, .. } if *job == id);
             records.iter().filter(finished).count()
         };
-        assert_eq!(
-            jobs.snapshot(kept).await.unwrap().state,
-            JobState::Interrupted
-        );
+        assert_eq!(jobs.snapshot(kept).unwrap().state, JobState::Interrupted);
         assert_eq!(finished(kept), 1);
         for id in [parent.id(), question.id(), cancelling] {
-            assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Cancelled);
+            assert_eq!(jobs.snapshot(id).unwrap().state, JobState::Cancelled);
             let expected = if id == cancelling { 2 } else { 1 };
             // Journaled before shutdown returns.
             assert_eq!(finished(id), expected, "job {id:?}");
@@ -401,7 +452,7 @@ mod tests {
         });
         let awaiting = bounded(asked_about.recv()).await.unwrap();
         assert_eq!(
-            jobs.snapshot(awaiting).await.unwrap().state,
+            jobs.snapshot(awaiting).unwrap().state,
             JobState::AwaitingApproval
         );
         jobs.cancel(awaiting).await.unwrap();
@@ -410,9 +461,6 @@ mod tests {
             result.unwrap_err().diagnostic().cause,
             crate::tool::diagnostic::Cause::Cancelled,
         );
-        assert_eq!(
-            jobs.snapshot(awaiting).await.unwrap().state,
-            JobState::Cancelled
-        );
+        assert_eq!(jobs.snapshot(awaiting).unwrap().state, JobState::Cancelled);
     }
 }

@@ -13,8 +13,8 @@ code style while streaming.
 
 The agent tree appears above the composer while children are active or a child agent is being
 viewed. Click an agent to inspect its conversation without mixing its output with other agents.
-Each agent retains its reading position and expanded rows. Agents using the `wait` tool show
-**Waiting** rather than **Running tools**. Tree rows show `@target` for remote agents and their
+Each agent and tab retains its reading position and expanded rows. Agents using the `wait` tool
+show **Waiting** rather than **Running tools**. Tree rows show `@target` for remote agents and their
 own token totals, context usage and time: output · input (uncached) · context · time. The time is
 how long a busy agent's current turn has run; once it isn't busy, how long a child ran its job, or
 how long the root agent's last turn took.
@@ -31,6 +31,9 @@ composer; merely opening the queue or deleting an item does not pause it. Interr
 submission or delivery errors, and session-start failures also pause queue delivery. `/resume`
 clears that pause, as does normal composer Enter (even with an empty draft); slash commands
 do not automatically resume the queue.
+If Skyhook cannot write a session's journal, that session stops as if the process had crashed:
+its queued input is dropped and its conversation shows why. It stays open to read until you close
+it, and reopening it continues from what was saved.
 Queued input lives only in the running interface: it is not saved with the session. Each open
 session keeps its own queue, which keeps delivering while you look at another session and is
 discarded when its session is closed.
@@ -44,8 +47,8 @@ attempt starts; successful replies have no retry labels. Retries continue until 
 cancellation for [transient model failures](../configuration/providers-and-models.md#model-failure-recovery).
 
 The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
-tab, while reading positions and expanded rows remain separate for each agent. Requests include
-compaction requests, when each was sent, token summaries, and how long each took; transient
+tab, while reading positions and expanded rows remain separate for each agent and tab. Requests
+include compaction requests, when each was sent, token summaries, and how long each took; transient
 retries appear under the same request, which reads **Retrying** while the next attempt is pending.
 Full request bodies are available in the session log, not rendered in the UI. Status messages,
 such as interruptions and errors, appear in the conversation and are saved with the session, but

@@ -13,11 +13,12 @@ use crate::{
         protocol::{HistoryLifetime, ModelRequest, ResponseSchema, Usage},
     },
     session::{
-        AttemptRef, CompactionCheckpoint, Message, ModelCallOrigin, ModelPurpose, ProfileSnapshot,
-        RecordSeq, RequestSeq, SessionError, SessionEvent, project_history,
+        AttemptRef, CheckpointError, Command, CompactionCheckpoint, CoreState, Message,
+        ModelCallOrigin, ModelPurpose, Plan, ProfileSnapshot, RecordSeq, RequestSeq, SessionEvent,
+        project_history,
     },
 };
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 
 pub(super) struct CompactionInput<'a> {
     pub(super) meter: &'a mut TokenMeter,
@@ -44,12 +45,12 @@ impl SessionRuntime {
             model_attempt,
         } = source;
         let agent = turn.agent;
-        let records = self.store.records().await;
+        let records = self.store.records();
         let frontier = records
             .last()
             .map_or(RecordSeq::default(), |record| record.sequence);
         let projected = project_history(&records, agent);
-        for launch in self.jobs.active_launches(agent).await {
+        for launch in self.jobs.active_launches(agent) {
             if !launches.contains(&launch) {
                 launches.push(launch);
             }
@@ -58,12 +59,11 @@ impl SessionRuntime {
         // changes that invalidated an earlier attempt's snapshot.
         let runtime = state::runtime_state_content(
             &self.jobs,
-            &self.todos,
+            &self.store,
             agent,
             &turn.capabilities,
             turn.location,
-        )
-        .await;
+        );
         // A fresh snapshot replaces the input's state tail, when its state mode sends
         // one. The summary always gets it: it must return the reconciled todo list.
         let sends_state = !input.tail.is_empty();
@@ -144,21 +144,15 @@ impl SessionRuntime {
                 },
             )
             .await?;
-        let requested = self
-            .store
-            .append(
-                agent.clone(),
-                SessionEvent::ModelRequested {
-                    context: summary_context.sequence,
-                    checkpoint: projected.checkpoint,
-                    through: summary_through,
-                    tail: summary_tail,
-                    history_lifetime: summary_request.history_lifetime,
-                },
-            )
-            .await?;
+        let requested = SessionEvent::ModelRequested {
+            context: summary_context.sequence,
+            checkpoint: projected.checkpoint,
+            through: summary_through,
+            tail: summary_tail,
+            history_lifetime: summary_request.history_lifetime,
+        };
+        let requested = self.request(agent, requested).await?;
         *request_sequence = Some(requested.sequence.request());
-        self.activity(agent, crate::agent::runtime::AgentActivity::Compacting);
         let summary_estimate = compaction::estimate_request(&summary_request);
         self.store
             .load_blobs(&mut summary_request, &mut blobs)
@@ -175,7 +169,7 @@ impl SessionRuntime {
         meter.observe(summary_estimate, usage);
         let before_tokens = meter.scale(before_tokens);
         let mut message = continuation.message;
-        for launch in self.jobs.active_launches(agent).await {
+        for launch in self.jobs.active_launches(agent) {
             if !launches.contains(&launch) {
                 launches.push(launch);
             }
@@ -207,29 +201,16 @@ impl SessionRuntime {
             .iter()
             .filter_map(|(job, origin)| origin.is_none().then_some(*job))
             .collect();
-        let (mut created, facts) = self
-            .store
-            .visit_records_after(RecordSeq::default(), |records| {
-                let (mut created, mut facts) = (HashMap::new(), Vec::new());
-                for record in records {
-                    let SessionEvent::JobCreated { job, arguments, .. } = &record.event else {
-                        continue;
-                    };
-                    if selected.contains(job) {
-                        created.insert(*job, arguments.clone());
-                    }
-                    if &record.agent == agent && host_jobs.contains(job) {
-                        facts.push(serde_json::json!({"source_event": record.sequence, "launch": record.event}));
-                    }
-                }
-                (created, facts)
-            })
-            .await;
+        let facts = (host_jobs.iter())
+            .filter_map(|job| self.jobs.creation(*job))
+            .filter(|record| &record.agent == agent)
+            .map(|record| serde_json::json!({"source_event": record.sequence, "launch": record.event}))
+            .collect();
         let mut handover = Vec::new();
         for job in jobs {
-            let arguments = created
-                .remove(&job)
-                .ok_or(CompactionError::UnknownJob(job))?;
+            let created = self.jobs.snapshot(job);
+            let created = created.map_err(|_| CompactionError::UnknownJob(job))?;
+            let arguments = (*created.arguments).clone();
             if included.contains(&job) {
                 continue;
             }
@@ -280,8 +261,7 @@ impl SessionRuntime {
                 &turn.capabilities,
                 continuation.todos.clone(),
                 turn.location,
-            )
-            .await;
+            );
             compacted.tail = vec![Message::User(vec![runtime]).render()];
         }
         let after_tokens = meter.estimate(&compacted);
@@ -304,18 +284,21 @@ impl SessionRuntime {
             before_tokens,
             after_tokens,
         };
-        // The journal refuses an invalid checkpoint, including one whose reconciled
-        // todos a change since the frontier made stale.
-        match self.todos.commit_compaction(agent, checkpoint).await {
-            Err(SessionError::InvalidCompaction { reason, .. }) => {
-                return Err(CompactionError::Checkpoint(reason).into());
+        // Todos changed since the frontier make those the summary reconciled stale,
+        // which a fresh summary can correct.
+        let owner = agent.clone();
+        let compaction = move |state: &CoreState| {
+            if crate::session::stale_todos(&state.records, &owner, checkpoint.frontier) {
+                return Err(CompactionError::Checkpoint(CheckpointError::StaleTodos).into());
             }
-            committed => committed?,
-        }
+            let compaction = SessionEvent::Compaction { checkpoint };
+            Ok::<_, HarnessError>(Plan::journal(vec![(owner, compaction)]))
+        };
+        self.store.commit(Command::Journal, compaction).await?;
         // A final response may return immediately after automatic compaction,
         // without another normal request to refresh the observed occupancy.
-        self.events
-            .send(crate::agent::runtime::RuntimeEvent::Context {
+        self.store
+            .post(crate::agent::runtime::RuntimeEvent::Context {
                 agent: agent.clone(),
                 usage: crate::agent::ContextUsage {
                     tokens: after_tokens,
@@ -369,7 +352,7 @@ mod tests {
         fixture.add_history(20_000).await;
         fixture.compact(&CancellationToken::new()).await.unwrap();
         fixture.add_history(20_000).await;
-        let prefix = project_history(&fixture.records().await, agent);
+        let prefix = project_history(&fixture.records(), agent);
         let replay = envelope(
             ReplayFormat::Messages,
             "test",
@@ -394,8 +377,8 @@ mod tests {
         let assistant = Message::Assistant(items);
         let origin = runtime.commit(agent, assistant.clone()).await.unwrap();
         fixture.compact(&CancellationToken::new()).await.unwrap();
-        fixture.assert_no_tool_execution().await;
-        let records = fixture.records().await;
+        fixture.assert_no_tool_execution();
+        let records = fixture.records();
         let checkpoints = events!(&records, SessionEvent::Compaction { checkpoint } => checkpoint);
         assert_eq!(checkpoints.len(), 2);
         let checkpoint = checkpoints[1];
@@ -438,7 +421,7 @@ mod tests {
                 .await
                 .unwrap();
         }
-        let projected = project_history(&fixture.records().await, agent);
+        let projected = project_history(&fixture.records(), agent);
         let history = render_history(projected.history());
         let Some(Sent::Tool(results)) = history.last() else {
             panic!("real results follow the retained assistant")
@@ -510,7 +493,7 @@ mod tests {
         fixture.session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn fresh_state_reflects_concurrent_todo_updates_without_claiming_job_notifications() {
         let updated = vec![todo("Verify the fresh finding", TodoStatus::InProgress)];
         let mut reconciled = summary_json();
@@ -541,8 +524,8 @@ mod tests {
             tokio::join!(fixture.compact(&cancellation), async {
                 fixture.script.request(1).await;
                 runtime
-                    .todos
-                    .replace(agent, updated.clone(), None)
+                    .store
+                    .replace_todos(agent, updated.clone(), None)
                     .await
                     .unwrap();
                 for job in [job, root_job] {
@@ -557,7 +540,7 @@ mod tests {
         })
         .await;
         result.unwrap();
-        let records = fixture.records().await;
+        let records = fixture.records();
         let host_launch = serde_json::to_string(&checkpoint(&records).message).unwrap();
         assert!(host_launch.contains("Previously started host work"));
         assert!(host_launch.contains("root-research"));
@@ -568,7 +551,7 @@ mod tests {
             let pending = runtime.jobs.pending_delivery(&owner).await.unwrap();
             assert!(pending.envelopes().iter().map(|job| job.id).eq([job]));
         }
-        runtime.jobs.claim(job).await.unwrap();
+        runtime.jobs.test_claim(job).await.unwrap();
         let next = fixture.session.prompt("Continue with the current state.");
         next.await.unwrap();
         let request = fixture.script.request(3).await;
@@ -580,7 +563,7 @@ mod tests {
         };
         assert!(text.contains("Verify the fresh finding") && text.contains("in_progress"));
         assert!(!text.contains("root-research"));
-        let found = runtime.todos.inspect(agent, None).await.unwrap();
+        let found = runtime.store.inspect_todos(agent, None).unwrap();
         assert_eq!(found, updated);
         let summaries = records
             .iter()
@@ -612,32 +595,36 @@ mod tests {
         let fixture = Fixture::new([Step::new(summary(continuation))]).await;
         let runtime = &fixture.session.runtime;
         let agent = &fixture.session.root;
-        runtime.todos.replace(agent, original, None).await.unwrap();
+        runtime
+            .store
+            .replace_todos(agent, original, None)
+            .await
+            .unwrap();
         let workspace = fixture.workspace.path();
         let store = &runtime.store;
         let child = crate::session::tests::start_child(store, agent, 1, None, workspace).await;
         let child_todos = vec![todo("Independent delegated work", TodoStatus::InProgress)];
-        let todos = &runtime.todos;
+        let todos = &runtime.store;
         todos
-            .replace(&child, child_todos.clone(), None)
+            .replace_todos(&child, child_todos.clone(), None)
             .await
             .unwrap();
-        let before_sequence = fixture.records().await.last().unwrap().sequence;
+        let before_sequence = fixture.records().last().unwrap().sequence;
         fixture.compact(&CancellationToken::new()).await.unwrap();
-        let records = fixture.records().await;
+        let records = fixture.records();
         let checkpoint = checkpoint(&records);
         assert!(checkpoint.after_tokens >= checkpoint.before_tokens);
         assert!(
             matches!(&checkpoint.message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserPart::Compaction { text } if text.contains(markdown) && !text.contains("Reasoning before the answer"))))
         );
         assert_eq!(checkpoint.todos, reconciled);
-        let found = runtime.todos.inspect(agent, None).await.unwrap();
+        let found = runtime.store.inspect_todos(agent, None).unwrap();
         assert_eq!(found, reconciled);
-        let found = runtime.todos.inspect(&child, None).await.unwrap();
+        let found = runtime.store.inspect_todos(&child, None).unwrap();
         assert_eq!(found, child_todos);
         let later = records.iter().filter(|r| r.sequence > before_sequence);
         assert_eq!(count!(later, SessionEvent::TodosReplaced { .. }), 0);
-        fixture.assert_no_tool_execution().await;
+        fixture.assert_no_tool_execution();
         fixture.session.shutdown().await.unwrap();
     }
 
@@ -656,15 +643,15 @@ mod tests {
         assert!(fixture.script.request(0).await.tail.is_empty());
         fixture.add_history(20_000).await;
         runtime
-            .todos
-            .replace(agent, current.clone(), None)
+            .store
+            .replace_todos(agent, current.clone(), None)
             .await
             .unwrap();
         fixture.compact(&CancellationToken::new()).await.unwrap();
         let request = fixture.script.request(1).await;
         let sent = crate::agent::runtime::tests::rendered(&request);
         assert!(sent.contains("Keep the stateless todo"));
-        let found = runtime.todos.inspect(agent, None).await.unwrap();
+        let found = runtime.store.inspect_todos(agent, None).unwrap();
         assert_eq!(found, current);
         fixture.session.shutdown().await.unwrap();
     }
@@ -699,7 +686,7 @@ mod tests {
         selected["jobs"] = json!([lease, lease]);
         fixture.script.respond(1, summary(selected));
         fixture.compact(&CancellationToken::new()).await.unwrap();
-        let records = fixture.records().await;
+        let records = fixture.records();
         let Message::User(blocks) = &checkpoint(&records).message else {
             panic!("continuation")
         };
@@ -717,7 +704,13 @@ mod tests {
         let view = &snapshot["jobs"][0];
         assert_eq!(view["arguments"], arguments);
         assert!(view["result"]["content"].as_str().unwrap().len() < output.len());
-        let saved = runtime.jobs.snapshot(lease).await.unwrap().output.unwrap();
+        let saved = runtime
+            .jobs
+            .test_snapshot(lease)
+            .await
+            .unwrap()
+            .output
+            .unwrap();
         assert_eq!(saved["content"], output);
         let pending = runtime.jobs.pending_delivery(&agent.child(99)).await;
         assert!(

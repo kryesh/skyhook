@@ -1,11 +1,10 @@
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex, PoisonError},
 };
 
 use futures_util::future::{BoxFuture, FutureExt as _, Shared};
-use tokio::sync::Mutex;
 
 use super::{
     artifact::EmbeddedShimCatalog,
@@ -17,7 +16,8 @@ use super::{
 use crate::{
     execution::ExecutionLocation,
     job::CancellationToken,
-    target::{ResolvedRoute, Route, RouteIdentity, TargetName},
+    target::{ResolvedRoute, Route, RouteIdentity, TargetDefinition},
+    tool::authorization::AuthorizationError,
     tool::{ToolContext, ToolOutput},
 };
 
@@ -36,6 +36,9 @@ struct RemoteInner {
 
 struct PooledSlot {
     connection: Shared<BoxFuture<'static, Result<Session, RemoteError>>>,
+    /// Stops the startup, and any prompt it shows, once a redefinition replaces
+    /// a target on its route.
+    startup: CancellationToken,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -79,20 +82,23 @@ impl PreparedConnection {
     /// Worker I/O failures do not imply that the pooled transport failed.
     async fn release(&self) {
         if self.connection.is_failed().await {
-            self.manager.discard(self).await;
+            self.manager.discard(self);
         }
     }
 }
 
 impl RemoteManager {
+    /// A manager whose startups and connections stop once `shutdown` is cancelled,
+    /// as the session's own token is when its journal fails.
     pub(crate) fn new(
         catalog: EmbeddedShimCatalog,
         prompts: Arc<dyn SensitivePromptHandler>,
+        shutdown: CancellationToken,
     ) -> Self {
         Self {
             inner: Arc::new(RemoteInner {
                 factory: Arc::new(super::ssh::Backend::new(catalog, prompts.clone())),
-                shutdown: CancellationToken::new(),
+                shutdown,
                 tasks: tokio_util::task::TaskTracker::new(),
                 pool: Mutex::new(HashMap::new()),
                 prompts,
@@ -106,10 +112,17 @@ impl RemoteManager {
         }
         self.inner.factory.environment().await
     }
+    fn pool(&self) -> std::sync::MutexGuard<'_, HashMap<ConnectionKey, Arc<PooledSlot>>> {
+        self.inner
+            .pool
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     pub(crate) async fn shutdown(&self) {
         self.inner.shutdown.cancel();
         {
-            let mut pool = self.inner.pool.lock().await;
+            let mut pool = self.pool();
             pool.clear();
             self.inner.tasks.close();
         }
@@ -127,11 +140,15 @@ impl RemoteManager {
         self
     }
 
+    /// Join or start the pooled connection along `route`, once `admitted`
+    /// allows it. It is asked under the pool's lock, which `invalidate` takes
+    /// too, so a startup it admits is one any later invalidation sees.
     pub(crate) fn connection<'a>(
         &'a self,
         route: ResolvedRoute,
         workspace: &'a Path,
         cancellation: &'a CancellationToken,
+        admitted: &'a (dyn Fn() -> Result<(), RemoteError> + Sync),
     ) -> BoxFuture<'a, Result<PreparedConnection, RemoteError>> {
         Box::pin(async move {
             let key = ConnectionKey {
@@ -139,27 +156,41 @@ impl RemoteManager {
                 workspace: workspace.to_path_buf(),
             };
             let slot = {
-                let mut pool = self.inner.pool.lock().await;
+                let mut pool = self.pool();
                 if self.inner.shutdown.is_cancelled() {
                     return Err(RemoteError::Cancelled);
                 }
+                admitted()?;
                 if let Some(existing) = pool.get(&key) {
                     existing.clone()
                 } else {
                     let manager = self.clone();
                     let workspace = workspace.to_path_buf();
-                    let startup = self.inner.tasks.spawn(async move {
-                        let connect = async { manager.connect(&route, &workspace).await };
-                        tokio::select! { result = connect => result, () = manager.inner.shutdown.cancelled() => Err(RemoteError::Cancelled) }
+                    let startup = self.inner.shutdown.child_token();
+                    let stopped = startup.clone();
+                    let started = self.inner.tasks.spawn(async move {
+                        let connect = async { manager.connect(&route, &workspace, &stopped).await };
+                        tokio::select! {
+                            biased;
+                            () = stopped.cancelled() => Err(if manager.inner.shutdown.is_cancelled() {
+                                RemoteError::Cancelled
+                            } else {
+                                AuthorizationError::TargetRedefined.into()
+                            }),
+                            result = connect => result,
+                        }
                     });
                     let connection = async move {
-                        startup.await.map_err(|error| {
+                        started.await.map_err(|error| {
                             RemoteError::task_failed("remote connection startup", error)
                         })?
                     }
                     .boxed()
                     .shared();
-                    let slot = Arc::new(PooledSlot { connection });
+                    let slot = Arc::new(PooledSlot {
+                        connection,
+                        startup,
+                    });
                     pool.insert(key.clone(), slot.clone());
                     slot
                 }
@@ -176,28 +207,23 @@ impl RemoteManager {
                     connection,
                 }),
                 Err(error) => {
-                    self.remove_slot(&key, &slot).await;
+                    self.remove_slot(&key, &slot);
                     Err(error)
                 }
             }
         })
     }
 
-    pub(crate) async fn is_current(&self, prepared: &PreparedConnection) -> bool {
-        self.inner
-            .pool
-            .lock()
-            .await
-            .get(&prepared.key)
-            .is_some_and(|slot| Arc::ptr_eq(slot, &prepared.slot))
+    pub(crate) fn is_current(&self, prepared: &PreparedConnection) -> bool {
+        (self.pool().get(&prepared.key)).is_some_and(|slot| Arc::ptr_eq(slot, &prepared.slot))
     }
 
-    pub(crate) async fn discard(&self, prepared: &PreparedConnection) {
-        self.remove_slot(&prepared.key, &prepared.slot).await;
+    pub(crate) fn discard(&self, prepared: &PreparedConnection) {
+        self.remove_slot(&prepared.key, &prepared.slot);
     }
 
-    async fn remove_slot(&self, key: &ConnectionKey, slot: &Arc<PooledSlot>) {
-        let mut pool = self.inner.pool.lock().await;
+    fn remove_slot(&self, key: &ConnectionKey, slot: &Arc<PooledSlot>) {
+        let mut pool = self.pool();
         if pool
             .get(key)
             .is_some_and(|current| Arc::ptr_eq(current, slot))
@@ -206,18 +232,24 @@ impl RemoteManager {
         }
     }
 
-    pub(crate) async fn invalidate(&self, names: &[TargetName]) {
-        self.inner
-            .pool
-            .lock()
-            .await
-            .retain(|key, _| !names.contains(key.route.destination()));
+    /// Stop pooling the connections whose route names a revision `redefined`
+    /// replaces, stopping those still starting. Connections already handed out
+    /// keep running.
+    pub(crate) fn invalidate(&self, redefined: &[TargetDefinition]) {
+        self.pool().retain(|key, slot| {
+            let replaced = crate::target::replaces(redefined, &key.route.revisions());
+            if replaced {
+                slot.startup.cancel();
+            }
+            !replaced
+        });
     }
 
     async fn connect(
         &self,
         resolved_route: &ResolvedRoute,
         workspace: &Path,
+        startup: &CancellationToken,
     ) -> Result<Session, RemoteError> {
         let Route { hops, destination } = resolved_route.route();
         let location = ExecutionLocation::named(destination.name.clone(), workspace.to_owned());
@@ -233,9 +265,16 @@ impl RemoteManager {
                     hops: hops[..index].to_vec(),
                     destination: hops[index].clone(),
                 });
+                // Once this startup stops, it starts no origin connection.
+                let redefined = || AuthorizationError::TargetRedefined.into();
+                let running = || {
+                    (!startup.is_cancelled())
+                        .then_some(())
+                        .ok_or_else(redefined)
+                };
                 let cancellation = CancellationToken::new();
                 let prepared = self
-                    .connection(prefix, &hops[index].workspace, &cancellation)
+                    .connection(prefix, &hops[index].workspace, &cancellation, &running)
                     .await?;
                 (Some(prepared.connection), &hops[index + 1..])
             }
@@ -260,6 +299,7 @@ impl RemoteManager {
             PooledConnection::from_transport(
                 transport,
                 location,
+                resolved_route.identity().revisions(),
                 self.inner.prompts.clone(),
                 &self.inner.tasks,
                 self.inner.shutdown.child_token(),
@@ -343,7 +383,8 @@ pub(crate) mod tests {
 
     fn manager(factory: Arc<dyn ConnectionFactory>) -> RemoteManager {
         let prompts = Arc::new(RejectSensitivePrompts);
-        RemoteManager::new(EmbeddedShimCatalog::default(), prompts).with_connection_factory(factory)
+        RemoteManager::new(EmbeddedShimCatalog::default(), prompts, Default::default())
+            .with_connection_factory(factory)
     }
 
     /// Counts transports it starts and holds each shim handshake until `ready` has a permit.
@@ -369,7 +410,7 @@ pub(crate) mod tests {
         }
 
         /// (transports started, transport owners dropped)
-        fn counts(&self) -> (usize, usize) {
+        pub fn counts(&self) -> (usize, usize) {
             let starts = self.starts.load(Ordering::SeqCst);
             (starts, self.dropped.load(Ordering::SeqCst))
         }
@@ -407,6 +448,10 @@ pub(crate) mod tests {
         ResolvedRoute::new(Route { hops, destination })
     }
 
+    fn admitted() -> Result<(), RemoteError> {
+        Ok(())
+    }
+
     fn build_route() -> ResolvedRoute {
         route(vec![TargetDefinition::test("build", "/build", None)])
     }
@@ -418,7 +463,7 @@ pub(crate) mod tests {
                 client::tests::{fixture_context, write_result},
                 protocol::{PayloadEvent, RequestId},
             },
-            session::{AppendBoundary, SessionEvent},
+            session::SessionEvent,
             tool::output::{CaptureEvent, CaptureId},
         };
 
@@ -453,8 +498,12 @@ pub(crate) mod tests {
                     },
                 )))));
                 let cancellation = CancellationToken::new();
-                let connecting =
-                    manager.connection(build_route(), Path::new("/build"), &cancellation);
+                let connecting = manager.connection(
+                    build_route(),
+                    Path::new("/build"),
+                    &cancellation,
+                    &admitted,
+                );
                 let handshake = async {
                     assert!(matches!(
                         read_frame::<_, Request>(&mut shim).await.unwrap(),
@@ -504,14 +553,13 @@ pub(crate) mod tests {
                     }
                 }
 
-                // Hold the shared database connection at an existing persistence gate.
-                // A's capture open blocks; both accepted data chunks remain queued.
-                let (reached, resume) = runtime.store.pause_append_at(AppendBoundary::Write).await;
-                let accepted = runtime
-                    .store
-                    .accept_append(runtime.agent.clone(), SessionEvent::AgentInterrupted)
-                    .await
-                    .unwrap();
+                // Hold the shared database connection: A's capture open blocks, and an
+                // append queued behind it; both accepted data chunks remain queued.
+                let (reached, resume) = runtime.store.hold_connection();
+                let accepted = tokio::spawn({
+                    let (store, agent) = (runtime.store.clone(), runtime.agent.clone());
+                    async move { store.append(agent, SessionEvent::AgentInterrupted).await }
+                });
                 reached.await.unwrap();
                 for event in [
                     CaptureEvent::Open {
@@ -571,7 +619,7 @@ pub(crate) mod tests {
                         crate::tool::diagnostic::Effects::NotStarted
                     );
                 }
-                assert!(!manager.is_current(&prepared).await);
+                assert!(!manager.is_current(&prepared));
                 let connection = Arc::downgrade(&prepared.connection);
                 drop(prepared);
                 assert!(
@@ -603,7 +651,8 @@ pub(crate) mod tests {
         factory.invalid.store(true, Ordering::SeqCst);
         let manager = manager(factory.clone());
         let cancellation = CancellationToken::new();
-        let connect = || manager.connection(build_route(), Path::new("/build"), &cancellation);
+        let connect =
+            || manager.connection(build_route(), Path::new("/build"), &cancellation, &admitted);
         let error = connect()
             .await
             .err()
@@ -626,7 +675,7 @@ pub(crate) mod tests {
             matches!(error.cause, crate::tool::diagnostic::Cause::Message(message) if message.contains("invalid shim handshake"))
         );
         assert_eq!(factory.rejected_owners.load(Ordering::SeqCst), 1);
-        assert!(manager.inner.pool.lock().await.is_empty());
+        assert!(manager.pool().is_empty());
         factory.invalid.store(false, Ordering::SeqCst);
         let first = connect().await.unwrap();
         let second = connect().await.unwrap();
@@ -640,8 +689,8 @@ pub(crate) mod tests {
         let factory = PendingHandshakeFactory::new();
         let manager = manager(factory.clone());
         let (cancelled, survivor) = (CancellationToken::new(), CancellationToken::new());
-        let first = manager.connection(build_route(), Path::new("/build"), &cancelled);
-        let joined = manager.connection(build_route(), Path::new("/build"), &survivor);
+        let first = manager.connection(build_route(), Path::new("/build"), &cancelled, &admitted);
+        let joined = manager.connection(build_route(), Path::new("/build"), &survivor, &admitted);
         tokio::pin!(first, joined);
         assert!(futures_util::poll!(&mut first).is_pending());
         factory.wait_for_hello().await;
@@ -652,7 +701,7 @@ pub(crate) mod tests {
         assert_eq!(factory.counts(), (1, 0));
 
         // A waiter arriving after the cancellation joins the same startup too.
-        let second = manager.connection(build_route(), Path::new("/build"), &survivor);
+        let second = manager.connection(build_route(), Path::new("/build"), &survivor, &admitted);
         tokio::pin!(second);
         assert!(futures_util::poll!(&mut second).is_pending());
         factory.ready.add_permits(1);
@@ -669,8 +718,10 @@ pub(crate) mod tests {
         let factory = PendingHandshakeFactory::new();
         let manager = manager(factory.clone());
         let cancellation = CancellationToken::new();
-        let first = manager.connection(build_route(), Path::new("/build"), &cancellation);
-        let second = manager.connection(build_route(), Path::new("/build"), &cancellation);
+        let first =
+            manager.connection(build_route(), Path::new("/build"), &cancellation, &admitted);
+        let second =
+            manager.connection(build_route(), Path::new("/build"), &cancellation, &admitted);
         tokio::pin!(first, second);
         assert!(futures_util::poll!(&mut first).is_pending());
         factory.wait_for_hello().await;
@@ -682,7 +733,7 @@ pub(crate) mod tests {
         assert!(matches!(first, Err(RemoteError::Cancelled)));
         assert!(matches!(second, Err(RemoteError::Cancelled)));
         assert_eq!(factory.counts(), (1, 1));
-        assert!(manager.inner.pool.lock().await.is_empty());
+        assert!(manager.pool().is_empty());
     }
 
     #[tokio::test]
@@ -700,7 +751,7 @@ pub(crate) mod tests {
         deep.origin = Some("build".parse().unwrap());
         let route = route(vec![origin, via, destination, deep]);
         let cancellation = CancellationToken::new();
-        let prepared = manager.connection(route, Path::new("/override"), &cancellation);
+        let prepared = manager.connection(route, Path::new("/override"), &cancellation, &admitted);
         let prepared = prepared.await.unwrap();
         let expected = [
             ("origin", vec!["origin"], false, "/origin"),
@@ -715,7 +766,9 @@ pub(crate) mod tests {
         });
         assert_eq!(*factory.requests.lock().unwrap(), expected);
         let origin = factory.origins.lock().unwrap()[0].clone();
-        manager.invalidate(&["origin".parse().unwrap()]).await;
+        let mut redefined = TargetDefinition::test("origin", "/origin", None);
+        redefined.revision = 2;
+        manager.invalidate(&[redefined]);
         assert!(
             origin.upgrade().is_some(),
             "child stream must retain its origin"

@@ -21,12 +21,14 @@ Assistant output, script console output/results, startup warnings, and execution
 in the session logs; they are not printed to stdout or stderr. The process exits successfully when
 the submitted operation and shutdown succeed. On failure or interruption it exits nonzero and
 prints the error to stderr; stdout still carries only the session ID. A failure before a session
-can be opened produces no session-ID line. Explicit `--help` and `--version`
+can be opened produces no session-ID line. If Skyhook cannot write the session journal, the session
+stops as if the process had crashed: the error says so, and no final status is recorded. Explicit `--help` and `--version`
 retain their normal output. Headless mode is not a line-oriented conversation over stdin.
 
 The submitted root turn or workflow defines completion. A workflow must explicitly await background
-work it needs completed; outstanding jobs are cancelled and drained during shutdown. Interrupt and
-termination signals also trigger cleanup and journaled status rather than a terminal prompt.
+work it needs completed; outstanding jobs are cancelled, and child agents interrupted, during
+shutdown. Interrupt and termination signals also trigger cleanup and journaled status rather than
+a terminal prompt.
 
 A batch job never has human interaction. Root `ask` is unavailable (also inside scripts and with `bg:true`). Child agents
 can still ask their owning parent agent. Operations requiring human approval fail immediately;

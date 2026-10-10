@@ -804,9 +804,10 @@ mod tests {
         chunks: &[&str],
     ) -> (tempfile::TempDir, crate::job::JobManager, SharedDb, i64) {
         let (root, manager, id) = super::super::tests::fixture(None).await;
-        let db = manager.output(id).db;
+        let output = manager.output(id);
+        let db = output.db.clone();
         let field = FieldPointer::result().property("stdout");
-        let capture = db.create_capture(id.get(), &field, CaptureKind::Text);
+        let capture = db.create_capture(output.run(), &field, CaptureKind::Text);
         let capture = capture.unwrap().unwrap();
         append(&db, capture, chunks);
         (root, manager, db, capture)

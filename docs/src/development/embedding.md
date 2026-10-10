@@ -59,13 +59,16 @@ its own workspace-local session root.
 
 ## Host observation API
 
-`SessionHandle::observe().await` returns a snapshot and receiver sharing an atomic revision
+`SessionHandle::observe()` returns a snapshot and receiver sharing an atomic revision
 boundary. Apply updates to the snapshot in revision order with `ObservationSnapshot::apply`.
 It contains:
 
 - Durable records keyed by their original journal sequence.
 - The request ledger: each logical request's lifecycle phase, outcome, and usage, folded from
   those records. Host statistics and displays read request state from it.
+- Every job as the session state holds it: its owner, call arguments, state, failure, current
+  invocation, and when that invocation ran. A job's update arrives just before the record that
+  moved it.
 - Request-scoped live responses keyed by agent and logical request: their streamed blocks in
   arrival order, then the authoritative blocks once the response has ended.
 - Current agent activity, with when its turn began (or, once it is no longer busy, when that
@@ -76,12 +79,12 @@ same logical request resets its live response without removing durable attempt r
 receiver lag, obtain a fresh observation and replace **both** the snapshot and receiver; continuing
 with only one can leave a gap or apply stale live state.
 
-`inspect_jobs`, `inspect_output`, `inspect_output_with_captures`, and `inspect_output_fields` are
-host inspection APIs. They do not claim jobs or consume agent notifications. `cancel_job` is the
-separate operation that requests cancellation. `startup_warnings`, `warnings`, and `mcp_servers`
-expose startup diagnostics and MCP discovery outcomes without inserting diagnostics into model
-context or writing directly to a terminal. `record_status` likewise records host-facing status,
-not a user message.
+`inspect_jobs` (a synchronous read of an agent's jobs), `inspect_output`,
+`inspect_output_with_captures`, and `inspect_output_fields` are host inspection APIs. They do not
+claim jobs or consume agent notifications. `cancel_job` is the separate operation that requests
+cancellation. `startup_warnings`, `warnings`, and `mcp_servers` expose startup diagnostics and MCP
+discovery outcomes without inserting diagnostics into model context or writing directly to a
+terminal. `record_status` likewise records host-facing status, not a user message.
 
 `TodoItem` and `TodoStatus` are exported by `skyhook::agent`. Hosts projecting
 checklists from observed records apply `SessionEvent::TodosReplaced` and the reconciled todos in
@@ -91,32 +94,59 @@ child-agent lists remain independent.
 ## Interruption, continuation, and shutdown
 
 `prompt` and `prompt_with_options` submit input and wait for its turn. `interrupt` stops active
-turns while retaining child jobs for continuation; explicit job cancellation is non-resumable.
+turns while retaining child jobs for continuation, and returns how many turns and unstarted child
+agents it stopped. If that is more than none, job deliveries start no turn until
+`continue_turn_with` or new input: they stay pending for that request. An interrupt also hands
+back input no agent has taken yet: a pending `prompt` returns `Interrupted`, and each
+`QueuedPromptReceipt` from `enqueue_prompts` resolves `Interrupted`. Explicit job cancellation is
+non-resumable.
 `continue_turn_with` continues failed or interrupted work without duplicating its input and can
 select a model or mode for the continued root turn. Its `ContinueOutcome` distinguishes a root
 answer from resumed children and reports whether the selection applied: restarting children does
 not imply that a waiting or live root also ran. `continue_turn` uses default options and returns
 the root answer, or an empty string when there is none.
 
-Use `Harness::resume_session` to reopen durable state. The runtime journals the reopen, then
-reconciles interrupted work before starting agents. Work the previous process left open is
+Use `Harness::resume_session` to reopen durable state. The session opens to view: it journals
+nothing, and its observation reads it stopped at its last activity, until the first call that
+changes it, such as a prompt, `continue_turn_with`, a script, a status, a title or a job
+cancellation. That call first prepares the root agent; if the root cannot run, for example because
+its model is no longer configured, the call fails and the session stays viewed. Otherwise the
+runtime reconciles interrupted work in one transaction before starting agents. Shutting down a
+viewed session stops nothing and journals nothing: it closes the session, releasing it for another
+open, and later calls that would change it are refused. Work the previous process left open is
 recorded as ending when that process last did something, so reopening a session is not activity;
 record times therefore need not increase with sequence. It opens fresh provider contexts and does
 not reuse old network resources.
-A root turn that failed or was interrupted before the session closed can still be continued.
+A root turn that failed or was interrupted before the session closed can still be continued. A root
+that closed idle with job deliveries pending resumes interrupted too, so `continue_turn_with` or new
+input delivers them.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases use format 19. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 21. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 
 Await `SessionHandle::shutdown()` before releasing the host's session owner. Shutdown stops runtime
-producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
-remains available so the host can append a final status after observing shutdown errors; await
-that append, then `SessionHandle::close()`, which releases the session so it can be opened again
-at once rather than once every handle has dropped. Closing also prevents retained output handles
-from writing to the session; already saved output remains readable.
+producers, drains accepted job and journal work, and closes MCP and remote resources. It interrupts
+the session as a crash would: child agents still running end interrupted and can be continued once
+the session is resumed, and other running jobs are cancelled. Once it has
+begun, new prompts, `continue`, host scripts, new jobs, and input that would restart a finished
+job are refused with `SessionError::Refused`; input to a running job and answers to its questions
+are still accepted. The
+journal remains available so the host can append a final status after observing shutdown errors;
+await that append, then `SessionHandle::close()`, which releases the session so it can be opened
+again at once rather than once every handle has dropped; closing a closed session does nothing. Closing also prevents retained output
+handles from writing to the session; already saved output remains readable. Dropping the last
+`SessionHandle` without shutting down closes the session as a crash would leave it and stops its
+agents and jobs; resuming it settles what was running. A session closed with nothing journaled, such as one
+whose `new_session` caller gave up, is removed.
+A write the session journal cannot take stops the session as a crash would: the call that met it,
+calls it cut short and every later call return `SessionError::JournalFailed` with the first
+cause; `shutdown` and `close` report it too and still release the session. Its observation reads
+the phase as failed. `SessionHandle::phase` tells whether the session still runs and journals.
+A session belongs to the Tokio runtime that created or resumed it: use it only from that runtime,
+and keep the runtime running until the session is closed.
 
 ## Embedded shim catalog
 
@@ -140,9 +170,9 @@ archive inspection neither takes ownership nor resumes unfinished work.
 It takes the session lock shared for an instant; an open racing it retries once before failing
 with `AlreadyOpen`. `SessionStore::summary(root, id).await` reads a session list row without
 decoding the session, including its title as `SessionHandle::title` reads it, in `last_millis` the
-time of its newest record that `SessionEvent::is_activity` (reopening a session and closing it are
-not), and, in `stopped`, the failed or interrupted turn that resuming the root agent would continue,
-if any.
+time of its newest record that `SessionEvent::is_activity` (closing a session is not), and, in
+`stopped`, the failed or interrupted turn that resuming the root agent would continue, if any. `stopped` reads only the root's journaled turns, so a session that closed idle with job
+deliveries pending has none, yet resumes interrupted.
 
 The SQLite layout is versioned by `session::SESSION_FORMAT_VERSION`. Opening a database validates
 its identity and version; there is no migration or compatibility layer for earlier layouts.

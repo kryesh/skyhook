@@ -440,7 +440,7 @@ mod tests {
     async fn live_stdout(runtime: &TestRuntime) -> Value {
         bounded(async {
             loop {
-                let jobs = runtime.jobs.list(&runtime.agent).await;
+                let jobs = runtime.jobs.list(&runtime.agent);
                 if let Some(job) = jobs.iter().find(|job| job.state == JobState::Running) {
                     let mut args = OutputArgs::new(job.id);
                     args.field = Some("/result/stdout".parse().unwrap());
@@ -541,7 +541,7 @@ mod tests {
         assert_eq!(diagnostic.context.subject, Subject::Process);
         assert_eq!(diagnostic.context.effects, Effects::Started);
         assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("3600")));
-        let failed = jobs.list(agent).await.last().unwrap().id;
+        let failed = jobs.list(agent).last().unwrap().id;
         let view = jobs
             .inspect_output(
                 OutputArgs::new(failed),
@@ -594,7 +594,7 @@ mod tests {
                 "timeout",
             ),
         ] {
-            let jobs = runtime.jobs.list(&runtime.agent).await.len();
+            let jobs = runtime.jobs.list(&runtime.agent).len();
             let error = executor
                 .run_host(&runtime.agent, "exec", arguments.clone())
                 .await
@@ -602,7 +602,7 @@ mod tests {
             let Diagnostic { cause, context } = error.diagnostic();
             // Argument validation fails at admission, before any job exists.
             if argument != "cwd" {
-                assert_eq!(runtime.jobs.list(&runtime.agent).await.len(), jobs);
+                assert_eq!(runtime.jobs.list(&runtime.agent).len(), jobs);
                 let Cause::InvalidArguments(message) = cause else {
                     panic!("{cause:?}")
                 };
@@ -789,7 +789,7 @@ mod tests {
         assert_eq!(interactive.state, JobState::Cancelled);
         // A timeout kills noninteractive descendants that hold the pipes open.
         assert_eq!(timed_out.state, JobState::Failed);
-        let diagnostic = timed_out.diagnostic.unwrap();
+        let diagnostic = timed_out.envelope.diagnostic.unwrap();
         assert!(matches!(&diagnostic.cause, Cause::Message(text) if text.contains("timed out")));
     }
 

@@ -142,10 +142,9 @@ where
     Ok(capabilities)
 }
 
-/// The wire format is `{namespace, segments}`; unknown namespaces and malformed
-/// shapes are rejected. Decoding never normalizes paths.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
-#[serde(try_from = "ResourceWire", into = "ResourceWire")]
+/// The wire format is `{namespace, segments}`.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Hash)]
+#[serde(into = "ResourceWire")]
 pub enum ResourceId {
     Workspace {
         target: TargetRef,
@@ -184,11 +183,7 @@ named_enum! {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
-#[error("unknown or malformed permission resource: {0}")]
-pub struct ResourceError(String);
-
-#[derive(Deserialize, Serialize)]
+#[derive(Serialize)]
 struct ResourceWire {
     namespace: ResourceKind,
     segments: Vec<String>,
@@ -299,16 +294,6 @@ impl ResourceId {
         matches!(self, Self::Path { .. } | Self::Network { .. })
     }
 
-    /// Only these three resource kinds are scoped to an execution target.
-    pub fn execution_target_mut(&mut self) -> Option<&mut TargetRef> {
-        match self {
-            Self::Workspace { target, .. }
-            | Self::Path { target, .. }
-            | Self::Network { target, .. } => Some(target),
-            _ => None,
-        }
-    }
-
     fn contains(&self, other: &Self) -> bool {
         match (self, other) {
             (
@@ -326,56 +311,6 @@ impl ResourceId {
                 },
             ) => destination == other_destination && other_hops.starts_with(hops),
             _ => self == other,
-        }
-    }
-}
-
-impl TryFrom<ResourceWire> for ResourceId {
-    type Error = ResourceError;
-
-    fn try_from(wire: ResourceWire) -> Result<Self, Self::Error> {
-        let ResourceWire {
-            namespace,
-            segments,
-        } = wire;
-        let target = |text: &String| {
-            TargetRef::try_from(text.clone()).map_err(|error| ResourceError(error.to_string()))
-        };
-        let name = |text: &String| {
-            TargetName::try_from(text.clone()).map_err(|error| ResourceError(error.to_string()))
-        };
-        // Arity and target names are validated here only. Empty strings, relative
-        // components and whole workspace paths retain their historical opaque spelling.
-        match (namespace, segments.as_slice()) {
-            (ResourceKind::Workspace, [workspace, path]) => Ok(Self::Workspace {
-                target: target(workspace)?,
-                path: path.clone(),
-            }),
-            (ResourceKind::Path, [path, components @ ..]) => Ok(Self::Path {
-                target: target(path)?,
-                components: components.to_vec(),
-            }),
-            (ResourceKind::Network, [network, origin]) => Ok(Self::Network {
-                target: target(network)?,
-                origin: origin.clone(),
-            }),
-            (ResourceKind::Session, [session]) => Ok(Self::session(session)),
-            (ResourceKind::Mcp, [server, tool]) => Ok(Self::mcp(server, tool)),
-            (ResourceKind::Route, [destination, hops @ ..]) if hops.len() % 2 == 0 => {
-                let hops = hops
-                    .as_chunks::<2>()
-                    .0
-                    .iter()
-                    .map(|[hop, revision]| {
-                        let revision = revision
-                            .parse::<u64>()
-                            .map_err(|_| ResourceError("route revision must be a u64".into()))?;
-                        Ok((name(hop)?, revision))
-                    })
-                    .collect::<Result<_, ResourceError>>()?;
-                Ok(Self::route(name(destination)?, hops))
-            }
-            _ => Err(ResourceError(namespace.to_string())),
         }
     }
 }
@@ -413,7 +348,7 @@ named_enum! {
     }
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq, Hash)]
 pub struct ApprovalGrant {
     pub capability: Capability,
     pub resource: ResourceId,
@@ -459,7 +394,7 @@ impl ApprovalGrant {
 /// A permission an invocation uses, and the coverage of the grant it proposes
 /// for it. The proposal is derived from this permission's own capability and
 /// resource, so it can never name a broader grant than the one shown.
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct PermissionUse {
     pub capability: Capability,
     pub resource: ResourceId,
@@ -565,34 +500,6 @@ impl Policy for AllowAll {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn resource_wire_admits_builtin_shapes_without_path_normalization() {
-        for (namespace, segments, admitted) in [
-            ("workspace", vec!["root", "relative//workspace/../"], true),
-            ("path", vec!["root", "/", "", "a/b", "..", "."], true),
-            ("network", vec!["root", "https://example.test:8443"], true),
-            ("route", vec!["build", "jump", "0", "build", "7"], true),
-            ("mcp", vec!["server", "native-tool"], true),
-            ("session", vec!["name"], true),
-            ("session", vec!["name", "extra"], false),
-            ("mcp", vec!["server"], false),
-            ("extension", vec!["root", "opaque"], false),
-            ("workspace", vec!["root"], false),
-            ("network", vec!["root", "origin", "extra"], false),
-            ("route", vec!["destination", "hop"], false),
-            ("route", vec!["destination", "hop", "-1"], false),
-            ("route", vec!["root", "root", "1"], false),
-            ("path", vec!["bad target", "/"], false),
-        ] {
-            let wire = serde_json::json!({"namespace": namespace, "segments": segments});
-            let resource = serde_json::from_value::<ResourceId>(wire.clone());
-            assert_eq!(resource.is_ok(), admitted, "{wire}");
-            if let Ok(resource) = resource {
-                assert_eq!(serde_json::to_value(resource).unwrap(), wire);
-            }
-        }
-    }
 
     #[test]
     fn descendant_matching_preserves_vector_boundaries_and_route_identity() {

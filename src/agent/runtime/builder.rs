@@ -12,6 +12,7 @@ pub struct HarnessBuilder {
     mcp: BTreeMap<String, McpServerConfig>,
     instructions: Vec<String>,
     max_child_depth: usize,
+    coalescing: wait::Coalescing,
     capabilities: CapabilitySet,
     targets: TargetsConfig,
     shim_catalog: EmbeddedShimCatalog,
@@ -139,6 +140,7 @@ impl HarnessBuilder {
             mcp: BTreeMap::new(),
             instructions: Vec::new(),
             max_child_depth: crate::config::DEFAULT_MAX_CHILD_DEPTH,
+            coalescing: wait::Coalescing::default(),
             capabilities: CapabilitySet::default(),
             targets: TargetsConfig::default(),
             shim_catalog: EmbeddedShimCatalog::default(),
@@ -220,6 +222,12 @@ impl HarnessBuilder {
     #[must_use]
     pub const fn max_child_depth(mut self, depth: usize) -> Self {
         self.max_child_depth = depth;
+        self
+    }
+
+    #[cfg(test)]
+    pub(super) fn coalescing(mut self, coalescing: wait::Coalescing) -> Self {
+        self.coalescing = coalescing;
         self
     }
 
@@ -312,6 +320,7 @@ impl HarnessBuilder {
                 skills,
                 warnings,
                 max_child_depth: self.max_child_depth,
+                coalescing: self.coalescing,
                 capabilities: self.capabilities,
                 modes: catalog.modes,
                 mode: catalog.mode,

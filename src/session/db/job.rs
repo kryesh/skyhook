@@ -134,9 +134,10 @@ impl Encoder {
                 }
                 Ok(())
             }
-            SessionEvent::JobClaimed { job } | SessionEvent::JobInjected { job } => {
-                delivery(db, entry, job.get(), None, None)
-            }
+            SessionEvent::JobClaimed { job }
+            | SessionEvent::JobReleased { job }
+            | SessionEvent::JobMessageReleased { job }
+            | SessionEvent::JobInjected { job } => delivery(db, entry, job.get(), None, None),
             SessionEvent::JobMessageDelivered {
                 job,
                 source,
@@ -239,6 +240,8 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
             };
             Ok(match enum_column(row, 1)? {
                 EntryKind::JobClaimed => SessionEvent::JobClaimed { job },
+                EntryKind::JobReleased => SessionEvent::JobReleased { job },
+                EntryKind::JobMessageReleased => SessionEvent::JobMessageReleased { job },
                 EntryKind::JobInjected => SessionEvent::JobInjected { job },
                 EntryKind::JobMessageDelivered => SessionEvent::JobMessageDelivered {
                     job,

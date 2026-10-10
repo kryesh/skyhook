@@ -2,7 +2,6 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    session::SessionStore,
     target::{
         SshAuth, SshOptions, TargetConfig, TargetDefinition, TargetRef, TargetRouter, TargetSource,
     },
@@ -143,7 +142,6 @@ enum TargetView {
 
 pub(super) fn register(
     builder: &mut ToolRegistryBuilder,
-    store: SessionStore,
     router: TargetRouter,
 ) -> Result<(), RegistryError> {
     let listed = router.clone();
@@ -154,7 +152,7 @@ pub(super) fn register(
         move |context, args| {
             let router = listed.clone();
             async move {
-                let targets = router.targets().list(context.capabilities()).await;
+                let targets = router.targets(|targets| targets.list(context.capabilities()));
                 let listed = std::iter::once(DetailedTarget::root())
                     .chain(targets.into_iter().map(DetailedTarget::from));
                 Ok(listed
@@ -192,14 +190,13 @@ ssh.options can run commands, so it also requires exec."#,
             .argument_permissions(|_, args: &TargetAddArgs| Ok(add_permissions(&args.config.ssh))),
         move |context, args| {
             let router = router.clone();
-            let store = store.clone();
             async move {
                 let definition = TargetDefinition::from_config(args.name, args.config)
                     .map_err(|error| {
                         ToolError::from(error.into_admission_error()).effects(Effects::Unchanged)
                     })?;
                 router
-                    .add(definition, context.invocation_subject()?, &store)
+                    .add(definition, context.invocation_subject()?)
                     .await
                     .map_err(|e| e.into_tool_error())?;
                 Ok(())
@@ -228,13 +225,9 @@ mod tests {
     #[tokio::test]
     async fn saved_target_failures_hide_submitted_aliases_from_reduced_capabilities() {
         use crate::{
-            remote::{
-                EmbeddedShimCatalog, PendingHandshakeFactory, RejectSensitivePrompts, RemoteManager,
-            },
-            target::TargetRegistry,
+            remote::PendingHandshakeFactory,
             tests::TestRuntime,
             tool::{
-                authorization::AuthorizationCoordinator,
                 diagnostic::{FailureSite, Subject},
                 policy::{AllowAll, CapabilitySet},
             },
@@ -242,16 +235,11 @@ mod tests {
         use std::sync::{Arc, atomic::Ordering};
 
         let runtime = TestRuntime::new().await;
-        let authorization = AuthorizationCoordinator::new(Arc::new(AllowAll));
         let factory = PendingHandshakeFactory::new();
-        let remote = RemoteManager::new(
-            EmbeddedShimCatalog::default(),
-            Arc::new(RejectSensitivePrompts),
-        )
-        .with_connection_factory(factory.clone());
-        let router = TargetRouter::new(TargetRegistry::default(), remote, authorization);
+        let router = TargetRouter::test(&runtime.store, [], Arc::new(AllowAll)).await;
+        let router = router.with_connection_factory(factory.clone());
         let mut builder = ToolRegistryBuilder::default();
-        register(&mut builder, runtime.store.clone(), router.clone()).unwrap();
+        register(&mut builder, router.clone()).unwrap();
         let mut privileged = CapabilitySet::default();
         privileged.insert(Capability::Targets);
         let executor = runtime
@@ -278,12 +266,12 @@ mod tests {
                 .await
                 .unwrap();
             assert!(result.is_error);
-            let envelope = runtime.jobs.snapshot(result.job).await.unwrap();
+            let envelope = runtime.jobs.snapshot(result.job).unwrap();
             let diagnostic = envelope.diagnostic.as_ref().unwrap();
             assert_eq!(diagnostic.context.subject, Subject::argument([field]));
             assert_eq!(diagnostic.context.site, FailureSite::Host);
             assert_eq!(diagnostic.context.effects, Effects::Unchanged);
-            let inspection = envelope.response_view(&reduced).into_value();
+            let inspection = envelope.response_view(&reduced, None).into_value();
             assert!(!inspection.to_string().contains("private"), "{inspection}");
         }
         assert_eq!(factory.starts.load(Ordering::SeqCst), 0);

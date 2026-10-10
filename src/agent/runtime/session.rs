@@ -7,21 +7,9 @@ impl Harness {
     pub async fn new_session(&self) -> Result<SessionHandle, HarnessError> {
         let store = SessionStore::create(&self.inner.session_root).await?;
         let jobs = JobManager::new(store.clone());
+        let open = Arc::new(Open(store.clone(), jobs.supervisor().clone()));
         let runtime = SessionRuntime::build(self.inner.clone(), store, jobs, &[]).await?;
-        runtime.start_root(runtime.new_root()?).await
-    }
-
-    pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
-        let (store, mut records) = SessionStore::open(&self.inner.session_root, id).await?;
-        // Settlement closes only what this already reads as stopped.
-        let stopped = store.stopped_turn().await?;
-        let reopened = SessionEvent::SessionReopened;
-        records.push(store.append(AgentId::root(id), reopened).await?);
-        let jobs = JobManager::restore(store.clone(), &records).await?;
-        let runtime = SessionRuntime::build(self.inner.clone(), store, jobs, &records).await?;
-        let resumed = stopped.map_or(Resumed::Idle, Resumed::Parked);
-        runtime.settle_interrupted_work(&records).await?;
-        runtime.start_root(AgentLaunch::Resume(resumed)).await
+        runtime.start_root(runtime.new_root()?, open).await
     }
 }
 impl SessionHandle {
@@ -30,21 +18,14 @@ impl SessionHandle {
         self.root.session()
     }
 
-    #[must_use]
-    /// The session's journal, for hosts that record their own events beside the
-    /// runtime's.
-    pub fn store(&self) -> &crate::session::SessionStore {
-        &self.runtime.store
-    }
-
     pub fn root_agent(&self) -> &AgentId {
         &self.root
     }
 
     /// Observe without a gap between the initial snapshot and subsequent updates.
-    pub async fn observe(&self) -> Observation {
-        self.runtime.catch_up_store_events().await;
-        self.runtime.events.observe()
+    #[must_use]
+    pub fn observe(&self) -> Observation {
+        self.runtime.store.observe()
     }
 
     /// Host-only startup diagnostics, never inserted into agent context.
@@ -65,7 +46,7 @@ impl SessionHandle {
 
     /// What sending the root agent into `mode` would grant it.
     pub fn mode_capabilities(&self, mode: &ModeName) -> Option<crate::tool::policy::CapabilitySet> {
-        let depth = self.runtime.available_depth(&self.root);
+        let depth = (self.runtime.delegation(&self.root)).map_or(0, |(_, depth)| depth);
         let granted = self.runtime.mode_capabilities(mode).ok()?;
         Some(granted.for_agent(depth))
     }
@@ -83,30 +64,21 @@ impl SessionHandle {
     /// Name the session after its first prompt; a session already titled keeps
     /// its title.
     pub async fn set_title(&self, title: String) -> Result<(), HarnessError> {
-        let titled = |records: &[EventRecord]| {
-            (records.iter()).any(|record| matches!(record.event, SessionEvent::TitleSet { .. }))
+        self.running().await?;
+        let root = self.root.clone();
+        let plan = move |state: &crate::session::CoreState| {
+            let source = TitleSource::Prompt;
+            let titled = (!state.titled).then(|| (root, SessionEvent::TitleSet { title, source }));
+            let entries = titled.into_iter().collect();
+            Ok::<_, SessionError>(Plan::journal(entries))
         };
-        let store = &self.runtime.store;
-        if !store
-            .visit_records_after(RecordSeq::default(), titled)
-            .await
-        {
-            store
-                .append(
-                    self.root.clone(),
-                    SessionEvent::TitleSet {
-                        title,
-                        source: TitleSource::Prompt,
-                    },
-                )
-                .await?;
-        }
-        Ok(())
+        Ok(self.runtime.store.commit(Command::Journal, plan).await?)
     }
 
     /// Give the session the user's title, or with `None` return it to its
     /// automatic title.
     pub async fn rename(&self, title: Option<String>) -> Result<(), HarnessError> {
+        self.running().await?;
         let event = match title {
             Some(title) => SessionEvent::TitleSet {
                 title,
@@ -125,6 +97,7 @@ impl SessionHandle {
 
     /// Persist a host-facing status without adding it to the agent's model context.
     pub async fn record_status(&self, agent: AgentId, message: String) -> Result<(), HarnessError> {
+        self.running().await?;
         self.runtime
             .store
             .append(agent, SessionEvent::Status { message })
@@ -132,8 +105,16 @@ impl SessionHandle {
         Ok(())
     }
 
-    pub async fn inspect_jobs(&self, agent: &AgentId) -> Vec<crate::job::JobEnvelope> {
-        self.runtime.jobs.list(agent).await
+    #[must_use]
+    /// `agent`'s jobs, read as the session's observation reads them.
+    pub fn inspect_jobs(&self, agent: &AgentId) -> Vec<crate::job::JobEnvelope> {
+        let mut jobs = self.runtime.jobs.list(agent);
+        let stopped = |state: &CoreState| state.phase.stopped_at(&state.records);
+        if let Some(at) = self.runtime.store.read(stopped) {
+            jobs.iter_mut()
+                .for_each(|job| crate::agent::observation::read_job(job, at));
+        }
+        jobs
     }
 
     /// Host inspection is not bound to any turn: interrupting the agent never
@@ -178,11 +159,9 @@ impl SessionHandle {
             .await
     }
 
-    pub async fn cancel_job(
-        &self,
-        job: JobId,
-    ) -> Result<crate::job::JobEnvelope, crate::job::JobError> {
-        self.runtime.jobs.cancel(job).await
+    pub async fn cancel_job(&self, job: JobId) -> Result<crate::job::JobEnvelope, HarnessError> {
+        self.running().await?;
+        Ok(self.runtime.jobs.cancel(job).await?)
     }
 
     #[must_use]
@@ -203,67 +182,68 @@ impl SessionHandle {
 
     /// Continue a failed or interrupted turn without duplicating its input,
     /// optionally on another model (a refusal is deterministic for a given
-    /// request). Retained interrupted children restart first; a root still waiting
-    /// on them is left alone and woken by their ordinary completion.
+    /// request). Retained interrupted children restart first, and those stopped
+    /// before they began begin; a root still waiting on them is left alone and
+    /// woken by their ordinary completion.
     pub async fn continue_turn_with(
         &self,
         options: Selection,
     ) -> Result<ContinueOutcome, HarnessError> {
+        self.outcome(self.continue_with(options).await)
+    }
+
+    async fn continue_with(&self, options: Selection) -> Result<ContinueOutcome, HarnessError> {
         self.admit_selection(&options)?;
+        self.running().await?;
         // An immediate resume must not miss children still journaling.
         self.runtime.settle_interrupts().await;
-        // Admitted before closing begins, or refused before anything changes.
-        // Closing waits for what this restarts to be running, so no longer.
-        let admitted = self.runtime.jobs.admit_resumption();
-        let admitted = admitted.ok_or(HarnessError::AgentStopped)?;
-        // A held wait resumes with its children. Mark it busy before they restart,
-        // while its turn cannot move on.
-        let agents: Vec<_> = (self.runtime.agents().iter())
-            .map(|(agent, live)| (agent.clone(), live.control.clone()))
-            .collect();
-        for (agent, control) in agents {
-            if control.turn_from(&[TurnState::Held], TurnState::Busy) {
-                let waiting = crate::agent::AgentActivity::WaitingChildren;
-                self.runtime.activity(&agent, waiting);
-            }
-        }
-        let jobs = &self.runtime.jobs;
-        let children_resumed = jobs.continue_resumable_children(&admitted).await?;
-        drop(admitted);
-        let root = self
-            .runtime
-            .agents()
-            .get(&self.root)
-            .map(|live| live.control.clone());
-        let parked = root.filter(|root| root.turn() == TurnState::Parked);
-        let holding = self.runtime.jobs.live_work(&self.root).await.holding;
-        if let Some(root) = &parked
-            && holding.is_some()
-        {
-            // A cancelled turn still waiting on restarted children ends with them.
-            root.set_turn(TurnState::Busy);
-            self.runtime
-                .activity(&self.root, crate::agent::AgentActivity::WaitingChildren);
-        }
-        if parked.is_some() && holding.is_none() {
-            // An independently failed root has no live wait to preserve; continue
-            // it after scheduling descendant recovery.
-            let selection_applied = options.model.is_some() || options.mode.is_some();
-            let answer = self.submit(Vec::new(), options).await?;
-            return Ok(ContinueOutcome {
-                answer: Some(answer),
-                children_resumed,
-                selection_applied,
-            });
-        }
+        let (runtime, root) = (self.runtime.clone(), self.root.clone());
+        let selection_applied = options.model.is_some() || options.mode.is_some();
+        let (done, answer) = oneshot::channel();
+        let restart = move |state: &CoreState| {
+            let (running, restart) = runtime.jobs.continue_resumable(state);
+            Ok::<_, HarnessError>(Plan::new(running, move |state, _| {
+                state.agents.flow = Flow::Open;
+                let resumed = restart(state);
+                // A held wait resumes with its children: busy as they restart.
+                let waiting = state.agents.turned(&Turn::Held);
+                for agent in &waiting {
+                    state
+                        .agents
+                        .get_mut(agent)
+                        .expect("listed agents run")
+                        .set_turn(Turn::Busy);
+                }
+                // A root that stopped short of its answer goes on from where it did.
+                let parked = (state.agents.get(&root))
+                    .is_some_and(|facts| matches!(facts.turn, Turn::Parked(_)));
+                let input = AgentCommand::Input {
+                    options,
+                    content: Vec::new(),
+                    done: Some(RequestCompletion::Root(done)),
+                };
+                let continued = (parked && state.agents.send(&root, input)).then_some(answer);
+                (resumed, continued)
+            }))
+        };
+        let continued = self.runtime.store.commit(Command::Continue, restart);
+        let (children_resumed, continued) = continued.await?;
         // Child-only recovery deliberately leaves a live/waiting root request
         // untouched. Its normal delivery path observes the replacement result.
         // A model or mode change cannot apply here: only a continued root turn adopts
         // one, so report it as unapplied rather than dropping it silently.
+        let Some(answer) = continued else {
+            return Ok(ContinueOutcome {
+                answer: None,
+                children_resumed,
+                selection_applied: false,
+            });
+        };
+        let answer = answer.await.map_err(|_| HarnessError::AgentStopped)??;
         Ok(ContinueOutcome {
-            answer: None,
+            answer: Some(answer),
             children_resumed,
-            selection_applied: false,
+            selection_applied,
         })
     }
 
@@ -272,26 +252,31 @@ impl SessionHandle {
         &self,
         source: impl Into<String>,
     ) -> Result<crate::tool::ToolOutput, HarnessError> {
-        // A host script is the root agent's work: it runs under the root's current mode.
-        let root = self
-            .runtime
-            .agents()
-            .get(&self.root)
-            .map(|root| root.capabilities.clone());
-        let capabilities = root.ok_or(HarnessError::AgentStopped)?;
-        let result = self
-            .runtime
-            .executor
-            .clone()
-            .with_capabilities(capabilities)
-            .execute(
-                self.root.clone(),
-                "script",
-                json!({"source": source.into()}),
-                None,
-            )
-            .await?;
-        Ok(result.output)
+        let source = source.into();
+        let run = async {
+            self.running().await?;
+            // A host script is the root agent's work: it runs under the root's current mode.
+            let root = (self.runtime).agents(|agents| {
+                agents.get(&self.root)?;
+                Some(
+                    self.runtime
+                        .resumed_contract(agents, &self.root)?
+                        .capabilities,
+                )
+            });
+            let capabilities = root.ok_or_else(|| {
+                (self.runtime.store).read(|state| super::refused_input(&state.phase))
+            })?;
+            let executor = self
+                .runtime
+                .executor
+                .clone()
+                .with_capabilities(capabilities);
+            let source = json!({"source": source});
+            let result = executor.execute(self.root.clone(), "script", source, None);
+            Ok(result.await?.output)
+        };
+        self.outcome(run.await)
     }
 
     /// Submit a user message and wait for the resulting turn to finish.
@@ -302,11 +287,31 @@ impl SessionHandle {
         attachments: &[crate::media::Attachment],
         options: Selection,
     ) -> Result<String, HarnessError> {
-        let content = self
-            .prepare_prompt(text.into(), attachments, &options)
-            .await?;
-        self.runtime.redirect(&self.root, true).await;
-        self.submit(content, options).await
+        let submitted = async {
+            let content = (self.prepare_prompt(text.into(), attachments, &options)).await?;
+            let (done, answer) = oneshot::channel();
+            let input = AgentCommand::Input {
+                options,
+                content,
+                done: Some(RequestCompletion::Root(done)),
+            };
+            self.runtime.redirect(&self.root, input).await?;
+            answer.await.map_err(|_| HarnessError::AgentStopped)?
+        };
+        self.outcome(submitted.await)
+    }
+
+    /// What a call the session's failure cut short returns: that failure,
+    /// however the call itself ended.
+    fn outcome<T>(&self, result: Result<T, HarnessError>) -> Result<T, HarnessError> {
+        let failed = || self.runtime.store.read(|state| state.phase.failed());
+        result.map_err(|error| failed().map_or_else(Into::into, |()| error))
+    }
+
+    /// Where the session is in its life.
+    #[must_use]
+    pub fn phase(&self) -> crate::session::SessionPhase {
+        self.runtime.store.phase()
     }
 
     pub(super) async fn prepare_prompt(
@@ -317,6 +322,8 @@ impl SessionHandle {
     ) -> Result<Vec<UserPart>, HarnessError> {
         use crate::media::Attachment;
         self.admit_selection(options)?;
+        self.running().await?;
+        self.runtime.store.admits(Command::Submit)?;
         // Check every limit before storing any blob.
         let mut images = 0;
         let mut total = 0_u64;
@@ -388,60 +395,54 @@ impl SessionHandle {
         Ok(())
     }
 
-    async fn submit(
-        &self,
-        content: Vec<UserPart>,
-        options: Selection,
-    ) -> Result<String, HarnessError> {
-        let (done_tx, done_rx) = oneshot::channel();
-        self.root_tx
-            .send(AgentCommand::Input {
-                options,
-                content,
-                done: Some(RequestCompletion::Root(done_tx)),
-            })
-            .await
-            .map_err(|_| HarnessError::AgentStopped)?;
-        done_rx.await.map_err(|_| HarnessError::AgentStopped)?
-    }
-
     /// Stop runtime producers and drain their accepted work. The journal stays
     /// open so a host can record its final status after observing shutdown errors,
     /// then [`close`](Self::close) it.
     pub async fn shutdown(&self) -> Result<(), HarnessError> {
-        // What resumed before this is running work; nothing resumes after it.
-        self.runtime.jobs.close_resumption().await;
-        self.runtime
-            .shutting_down
-            .store(true, std::sync::atomic::Ordering::Release);
-        // Interruptions stay resumable. One accepted just before closing may still
-        // be unwinding, and must not be taken for running work and cancelled.
-        self.runtime.conclude_interrupts().await;
-        self.runtime
-            .interrupt_tree(&self.root, CancelScope::Running)
-            .await;
-        // Completed children retain idle loops for resumption, and must also stop.
-        let agents = (self.runtime.agents().iter())
-            .map(|(id, agent)| (id.clone(), agent.sender.clone()))
-            .collect::<Vec<_>>();
-        for (agent, sender) in &agents {
-            // Interruptions stay resumable, so a turn held on one is released
-            // rather than cancelled.
-            self.runtime.jobs.release_held(agent).await;
-            let _ = sender.send(AgentCommand::Shutdown).await;
-        }
-        self.runtime.jobs.cancel_and_drain().await?;
-        for (_, sender) in agents {
-            sender.closed().await;
-        }
-        // Agent loops can finish scheduling cancellation-owned descendants while
-        // they unwind. Persist those outcomes before the host drops its runtime.
-        self.runtime.jobs.cancel_and_drain().await?;
+        // What started or resumed before this is running work; nothing does after
+        // it. Closing stops the session as a crash would, in one commit: every turn
+        // is interrupted, every child invocation still live ends interrupted and
+        // stays resumable, the waits held on them are released, and only other
+        // running work is cancelled.
+        let (runtime, root) = (self.runtime.clone(), self.root.clone());
+        let stop = move |state: &CoreState| {
+            // A viewed session runs nothing, so it stops nothing.
+            if !state.phase.runs() {
+                return Ok(Plan::new(Vec::new(), |_, _| true));
+            }
+            let agents = state.agents.within(&root);
+            let released = crate::job::release_records(&state.jobs.releases(&root, &agents));
+            Ok::<_, SessionError>(Plan::new(released, move |state, _| {
+                runtime.stop_turns(state, &root);
+                drop(runtime.jobs.conclude(state, crate::job::Concluding::Every));
+                runtime.jobs.cancel_running(state);
+                let supervisor = runtime.jobs.supervisor().clone();
+                state.defer(move || {
+                    agents
+                        .iter()
+                        .for_each(|agent| supervisor.cancel_turn(agent))
+                });
+                false
+            }))
+        };
+        let stopped = async {
+            let viewed = (self.runtime.store)
+                .commit(Command::BeginShutdown, stop)
+                .await?;
+            if viewed {
+                return Ok(());
+            }
+            // Each loop ends as it finds its turn refused, and each cancellation settles.
+            let quiescent = |state: &mut CoreState| state.agents.is_empty().then_some(());
+            self.runtime.store.until(quiescent).await?;
+            Ok::<_, HarnessError>(self.runtime.jobs.cancel_and_drain().await?)
+        };
+        // A failed session's work is already stopped; its connections still close.
+        let stopped = stopped.await;
         self.runtime.mcp.shutdown().await;
         self.runtime.router.shutdown().await;
-        self.runtime.jobs.drain_creations().await;
-        self.runtime.store.drain().await?;
-        Ok(())
+        stopped?;
+        Ok(self.runtime.store.drain().await?)
     }
 
     /// Close the journal of a session already shut down, so it can be opened
@@ -450,20 +451,25 @@ impl SessionHandle {
         Ok(self.runtime.store.close().await?)
     }
 
-    /// Interrupt active turns while retaining child jobs for retry. Explicit
-    /// `job_cancel` remains the non-resumable cancellation path.
+    /// Interrupt active turns while retaining child jobs for retry, and report
+    /// how many turns and unbegun child invocations that stopped. Having stopped
+    /// any, the session is paused: deliveries start no turn until `continue` or
+    /// new input. Explicit `job_cancel` remains the non-resumable cancellation path.
     pub async fn interrupt(&self) -> usize {
-        self.runtime.interrupt_turns(&self.root).await
+        let (runtime, root) = (self.runtime.clone(), self.root.clone());
+        let interrupt = move |state: &mut CoreState| runtime.stop_turns(state, &root);
+        self.runtime.store.live(interrupt).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::TodoStatus;
     use crate::agent::runtime::tests::*;
-    use crate::session::tests::{attempt, requested};
 
+    /// Once closing has begun, a host script is refused before its job exists,
+    /// and input the root holds, or never takes, as the session's refusal, not
+    /// as a stopped agent.
     #[tokio::test]
     async fn shutdown_drains_before_final_host_status_without_closing_journal() {
         let root = tempfile::tempdir().unwrap();
@@ -472,6 +478,15 @@ mod tests {
         let session = harness.new_session().await.unwrap();
         let result = session.run_script("console.log('completed'); return 42;");
         assert_eq!(result.await.unwrap().value["value"], 42);
+        let begin = Command::BeginShutdown;
+        (session.runtime.store).enter(begin).await.unwrap();
+        let closing = crate::session::SessionPhase::ShuttingDown;
+        let refused = |result: Result<_, HarnessError>| matches!(result, Err(HarnessError::Session(SessionError::Refused(phase))) if phase == closing);
+        assert!(refused(session.run_script("return 1;").await.map(drop)));
+        // Once held by the root's loop, then never taken once it ended.
+        for _ in 0..2 {
+            assert!(refused(bounded(session.prompt("")).await.map(drop)));
+        }
         session.shutdown().await.unwrap();
         // Hosts record final status after shutdown so drain errors are not hidden.
         let status = session.record_status(session.root.clone(), "Completed".into());
@@ -480,556 +495,122 @@ mod tests {
         let durable = durable.unwrap();
         assert!(matches!(&durable.last().unwrap().event,
             SessionEvent::Status { message } if message == "Completed"));
-        assert_eq!(session.runtime.store.records().await, durable);
+        assert_eq!(session.runtime.store.records(), durable);
     }
 
-    /// A crash can leave an attempt without an outcome and a committed call
-    /// without a result. Resume settles both once, before any agent runs.
+    /// A caller that gives up on a new session, at any of its awaits, leaves it
+    /// closed: a session that journaled nothing is removed, and one whose root
+    /// started stays, released for another open.
     #[tokio::test]
-    async fn resume_settles_interrupted_attempts_and_calls_exactly_once() {
+    async fn a_new_session_given_up_on_is_closed() {
+        use std::task::{Context, Poll, Wake, Waker};
+        struct Woken(tokio::sync::Notify);
+        impl Wake for Woken {
+            fn wake(self: Arc<Self>) {
+                self.0.notify_one();
+            }
+        }
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let provider = scripted_provider(&requests, [answer("first")]);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("hello").await.unwrap(), "first");
-        let records = session.runtime.store.records().await;
-        let context = events!(&records, SessionEvent::ModelContext { .. } => ());
-        assert_eq!(context.len(), 1);
-        let context = records
-            .iter()
-            .find(|record| matches!(record.event, SessionEvent::ModelContext { .. }))
-            .unwrap()
-            .sequence;
-        let (id, root_agent) = (session.id(), session.root.clone());
-        shutdown_session(session).await;
-        // What a process killed mid-turn leaves behind.
-        let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
-        let call = ToolCall::new("orphan", "read", json!({"path": "file"})).unwrap();
-        let assistant = Message::Assistant(vec![AssistantItem::tool_call("orphan", 0, call)]);
-        store
-            .append(
-                root_agent.clone(),
-                SessionEvent::MessageCommitted { message: assistant },
-            )
-            .await
-            .unwrap();
-        let request = store.append(root_agent.clone(), requested(context)).await;
-        let request = request.unwrap();
-        let attempt = attempt(request.sequence.request(), 1);
-        store.append(root_agent, attempt).await.unwrap();
-        drop(store);
-
-        for resume in 0..2 {
-            let resumed = harness.resume_session(id).await.unwrap();
-            let records = resumed.runtime.store.records().await;
-            let interrupted = events!(&records,
-                SessionEvent::ModelAttemptInterrupted(attempt) => (attempt.request, attempt.attempt));
-            assert_eq!(interrupted, [(request.sequence.request(), 1)]);
-            let results = events!(&records,
-                SessionEvent::MessageCommitted { message: Message::Tool(results) } => results.clone());
-            assert_eq!(results.len(), 1);
-            assert_eq!(
-                (results[0][0].call_id.as_str(), results[0][0].is_error),
-                ("orphan", true)
-            );
-            // The settled turn stays continuable on every resume, not only the
-            // one that settled it.
-            assert_eq!(turn(&resumed, &resumed.root), TurnState::Parked, "{resume}");
-            shutdown_session(resumed).await;
+        let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
+        let closed = async || loop {
+            let mut open = 0;
+            for entry in std::fs::read_dir(&sessions).into_iter().flatten() {
+                let name = entry.unwrap().file_name();
+                let id = name.to_str().unwrap().parse().unwrap();
+                let records = SessionStore::read_records(&sessions, id).await;
+                let journaled = records.is_ok_and(|records| !records.is_empty());
+                if !journaled || SessionStore::is_open(&sessions, id).await.unwrap() {
+                    open += 1;
+                }
+            }
+            if open == 0 {
+                return;
+            }
+            tokio::task::yield_now().await;
+        };
+        for awaits in 0.. {
+            let woken = Arc::new(Woken(tokio::sync::Notify::new()));
+            let waker = Waker::from(woken.clone());
+            let mut start = Box::pin(harness.new_session());
+            let mut started = None;
+            for _ in 0..awaits {
+                match start.as_mut().poll(&mut Context::from_waker(&waker)) {
+                    Poll::Ready(session) => {
+                        started = Some(session.unwrap());
+                        break;
+                    }
+                    Poll::Pending => bounded(woken.0.notified()).await,
+                }
+            }
+            drop(start);
+            let finished = started.is_some();
+            if let Some(session) = started {
+                shutdown_session(session).await;
+            }
+            bounded(closed()).await;
+            if finished {
+                return;
+            }
         }
     }
 
-    /// A crash during a retry backoff, or between a request and its first attempt,
-    /// leaves a request waiting for an attempt that never comes. Resume journals its
-    /// reopening, then settles the request as interrupted, once, like an open
-    /// attempt. What it closes, a running job too, is dated when the crashed process
-    /// last did something, so reopening leaves the session's last activity alone,
-    /// and so does closing it again with the job still interrupted.
+    /// A saved session's root grants a mode what its recorded depth allows within
+    /// the current limit, the same while viewed as once running.
     #[tokio::test]
-    async fn resume_settles_requests_left_waiting_for_an_attempt() {
-        use crate::session::{AttemptRef, EventRecord, RequestLedger, RequestPhase, RequestSeq};
+    async fn viewed_and_running_roots_grant_a_mode_the_same_delegation() {
+        use crate::tool::policy::{Capability, Mode};
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let provider = scripted_provider(&requests, [answer("first")]);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("hello").await.unwrap(), "first");
-        let records = session.runtime.store.records().await;
-        let context = records
-            .iter()
-            .find(|record| matches!(record.event, SessionEvent::ModelContext { .. }))
-            .unwrap()
-            .sequence;
-        let root_agent = session.root.clone();
-        let id = session.id();
-        shutdown_session(session).await;
-        let settled = |records: &[EventRecord], request: RequestSeq| {
-            let mut ledger = RequestLedger::default();
-            for record in records {
-                ledger.observe(record);
-            }
-            ledger.get(request).unwrap().phase.clone()
-        };
-        let interrupted = |records: &[EventRecord]| count!(records, SessionEvent::AgentInterrupted);
-        // The one reopening, on the root, is journaled ahead of what resume settles.
-        let reopened_after = |records: &[EventRecord], last: &EventRecord| {
-            let resumed =
-                &records[records.partition_point(|record| record.sequence <= last.sequence)..];
-            assert_eq!(count!(resumed, SessionEvent::SessionReopened), 1);
-            assert!(matches!(resumed[0].event, SessionEvent::SessionReopened));
-            assert_eq!(resumed[0].agent, root_agent);
-        };
-
-        // What a killed process leaves behind: a running job, and a request failed
-        // once, with the retry scheduled but never started.
-        let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
-        let job = crate::identity::JobId::new(1).unwrap();
-        use crate::job::JobTransition::{AwaitingApproval, Running};
-        let created = SessionEvent::JobCreated {
-            job,
-            parent: None,
-            origin: None,
-            tool: "exec".into(),
-            role: crate::job::JobRole::Tool,
-            name: None,
-            arguments: serde_json::json!({}),
-            output_schema: None,
-            accepts_input: false,
-            background: false,
-            location: crate::execution::ExecutionLocation::root(root.path().to_owned()),
-        };
-        let started =
-            [AwaitingApproval, Running].map(|state| SessionEvent::JobStateChanged { job, state });
-        let running = [created].into_iter().chain(started);
-        let running = running.map(|event| (root_agent.clone(), event)).collect();
-        store.append_all(running).await.unwrap();
-        let retrying = store
-            .append(root_agent.clone(), requested(context))
-            .await
-            .unwrap();
-        let attempt = AttemptRef {
-            request: retrying.sequence.request(),
-            attempt: 1,
-        };
-        let started = SessionEvent::ModelAttemptStarted(attempt);
-        store.append(root_agent.clone(), started).await.unwrap();
-        let lost = "connection lost".into();
-        let failed = SessionEvent::ModelFailed {
-            attempt,
-            failure: crate::agent::Failure::Provider(
-                lost,
-                crate::provider::ProviderErrorKind::Transport,
-            ),
-        };
-        let failed = store.append(root_agent.clone(), failed).await.unwrap();
-        let scheduled = SessionEvent::ModelRecoveryScheduled {
-            failure: failed.sequence,
-            delay_millis: 60_000,
-        };
-        let last = store.append(root_agent.clone(), scheduled).await.unwrap();
-        let before = interrupted(&store.records().await);
-        drop(store);
-        let last_activity = async || {
-            let summary = SessionStore::summary(&sessions, id).await.unwrap();
-            summary.last_millis
-        };
-        assert_eq!(last_activity().await, last.timestamp_millis);
-        // Reopen strictly later, so a repair dated now would show.
-        bounded(async {
-            while chrono::Utc::now().timestamp_millis() <= last.timestamp_millis {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
-        let resumed = harness.resume_session(id).await.unwrap();
-        let records = resumed.runtime.store.records().await;
-        let request = retrying.sequence.request();
-        let cut = |attempt| RequestPhase::Interrupted {
-            attempt,
-            at: last.timestamp_millis,
-        };
-        assert_eq!(settled(&records, request), cut(Some(1)));
-        assert_eq!(interrupted(&records), before + 1);
-        reopened_after(&records, &last);
-        let repairs = records.iter().filter(|record| {
-            record.sequence > last.sequence
-                && matches!(
-                    record.event,
-                    SessionEvent::JobFinished { .. } | SessionEvent::AgentInterrupted
-                )
-        });
-        let repaired = repairs
-            .map(|record| record.timestamp_millis)
-            .collect::<Vec<_>>();
-        assert_eq!(repaired, [last.timestamp_millis; 2]);
-        assert_eq!(last_activity().await, last.timestamp_millis);
-        shutdown_session(resumed).await;
-        assert_eq!(last_activity().await, last.timestamp_millis);
-
-        // Requested, and never attempted.
-        let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
-        let waiting = store
-            .append(root_agent.clone(), requested(context))
-            .await
-            .unwrap();
-        let before = interrupted(&store.records().await);
-        drop(store);
-        let resumed = harness.resume_session(id).await.unwrap();
-        let records = resumed.runtime.store.records().await;
-        let request = waiting.sequence.request();
-        let cut = RequestPhase::Interrupted {
-            attempt: None,
-            at: waiting.timestamp_millis,
-        };
-        assert_eq!(settled(&records, request), cut);
-        assert_eq!(interrupted(&records), before + 1);
-        reopened_after(&records, &waiting);
-        shutdown_session(resumed).await;
-
-        // Nothing left to settle: an attempt its agent's interruption closed without
-        // an outcome of its own is settled already, so a further resume settles
-        // nothing, yet the interrupted turn can still be continued.
-        let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
-        let closed = store
-            .append(root_agent.clone(), requested(context))
-            .await
-            .unwrap();
-        let attempt = AttemptRef {
-            request: closed.sequence.request(),
-            attempt: 1,
-        };
-        let started = SessionEvent::ModelAttemptStarted(attempt);
-        store.append(root_agent.clone(), started).await.unwrap();
-        let stopped = SessionEvent::AgentInterrupted;
-        store.append(root_agent.clone(), stopped).await.unwrap();
-        let before = interrupted(&store.records().await);
-        drop(store);
-        let resumed = harness.resume_session(id).await.unwrap();
-        assert_eq!(interrupted(&resumed.runtime.store.records().await), before);
-        assert_eq!(turn(&resumed, &resumed.root), TurnState::Parked);
-        shutdown_session(resumed).await;
-    }
-
-    /// A session whose root is held on a child it interrupted mid-response. The
-    /// child's retry answers next, then the root's continuation.
-    async fn held_on_interrupted_child(
-        root: &Path,
-    ) -> (
-        Harness,
-        SessionHandle,
-        Requests,
-        tokio::task::JoinHandle<Result<String, HarnessError>>,
-        JobId,
-    ) {
-        let child = json!({"prompt": "child task", "depth": 0});
-        let steps = [
-            Step::new(response(vec![tool_call(0, "agent-0", "agent", child)])),
-            Step::new(Vec::new()).midstream(),
-            Step::new(answer("child recovered")),
-            Step::new(answer("root continued")),
-        ];
-        let requests = Requests::default();
-        let provider = Script::new(steps, &requests);
-        let harness = test_harness(root, &root.join("sessions"), provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        let parent = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("delegate").await }
-        });
-        provider.request(1).await;
-        root_waiting(&session).await;
-        assert_eq!(session.interrupt().await, 2);
-        assert_eq!(turn(&session, &session.root), TurnState::Held);
-        let job = session.inspect_jobs(&session.root).await[0].id;
-        (harness, session, requests, parent, job)
-    }
-
-    /// Closing ends running work, not an interruption, even one closing follows
-    /// at once: a turn held on an interrupted child is released, and when the
-    /// session reopens the child resumes and its result reaches the parent.
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_leaves_interrupted_children_resumable() {
-        use crate::job::JobState;
-        let root = tempfile::tempdir().unwrap();
-        let (harness, session, requests, parent, job) =
-            held_on_interrupted_child(root.path()).await;
-        let id = session.id();
-        shutdown_session(session).await;
-        assert!(bounded(parent).await.unwrap().is_err());
-
-        let resumed = harness.resume_session(id).await.unwrap();
-        let state = resumed.runtime.jobs.snapshot(job).await.unwrap().state;
-        assert_eq!(state, JobState::Interrupted);
-        resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
-        until(&resumed, job, |job| job.state == JobState::Completed).await;
-        assert_eq!(resumed.continue_turn().await.unwrap(), "root continued");
-        let last = requests.lock().unwrap().last().unwrap().request.clone();
-        assert!(format!("{last:?}").contains("child recovered"));
-        shutdown_session(resumed).await;
-    }
-
-    /// Closing a session whose interruption has settled, with nothing left
-    /// running, leaves its last activity where it was.
-    #[tokio::test(start_paused = true)]
-    async fn closing_a_settled_interruption_is_not_activity() {
-        use crate::job::JobState;
-        let root = tempfile::tempdir().unwrap();
-        let (_harness, session, _requests, parent, job) =
-            held_on_interrupted_child(root.path()).await;
-        until(&session, job, |job| job.state == JobState::Interrupted).await;
-        let sessions = root.path().join("sessions");
-        let id = session.id();
-        let last_activity = async || {
-            SessionStore::summary(&sessions, id)
+        let mode = mode_name("delegate");
+        let harness = async |depth| {
+            let delegate = Mode {
+                capabilities: vec![Capability::Read, Capability::Agents],
+                instructions: None,
+                hint: None,
+            };
+            let provider = scripted_provider(&Requests::default(), []);
+            (test_builder(root.path(), &sessions, provider, false))
+                .max_child_depth(depth)
+                .modes([(mode.clone(), delegate)].into_iter().collect())
+                .build()
                 .await
                 .unwrap()
-                .last_millis
         };
-        let before = last_activity().await;
-        // Close strictly later, so an entry dated now would show.
-        bounded(async {
-            while chrono::Utc::now().timestamp_millis() <= before {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await;
+        let session = harness(2).await.new_session().await.unwrap();
+        let id = session.id();
         shutdown_session(session).await;
-        assert!(bounded(parent).await.unwrap().is_err());
-        assert_eq!(last_activity().await, before);
+        for depth in [2, 0] {
+            let reopened = harness(depth).await.resume_session(id).await.unwrap();
+            let viewed = reopened.mode_capabilities(&mode).unwrap();
+            assert_eq!(viewed.contains(Capability::Agents), depth > 0);
+            assert_eq!(reopened.phase(), crate::session::SessionPhase::Viewing);
+            reopened.running().await.unwrap();
+            assert_eq!(reopened.mode_capabilities(&mode).unwrap(), viewed);
+            shutdown_session(reopened).await;
+        }
     }
 
-    /// Closing stops agents in no particular order. A child stopping before the
-    /// turn held on it is released leaves that turn releasable.
-    #[tokio::test(start_paused = true)]
-    async fn shutdown_releases_a_turn_whose_interrupted_child_stopped_first() {
-        use crate::job::JobState;
-        let root = tempfile::tempdir().unwrap();
-        let (_harness, session, _requests, parent, job) =
-            held_on_interrupted_child(root.path()).await;
-        until(&session, job, |job| job.state == JobState::Interrupted).await;
-        let child = session.root.child(1);
-        let sender = session.runtime.agent_sender(&child).unwrap();
-        (session.runtime.shutting_down).store(true, std::sync::atomic::Ordering::Release);
-        sender.send(AgentCommand::Shutdown).await.unwrap();
-        bounded(sender.closed()).await;
-        shutdown_session(session).await;
-        assert!(bounded(parent).await.unwrap().is_err());
-    }
-
-    /// A continue waiting for an interruption to publish while closing publishes
-    /// it finds the session closed: it journals nothing, and the interruption
-    /// resumes when the session reopens.
-    #[tokio::test(start_paused = true)]
-    async fn a_continue_pending_across_shutdown_leaves_the_interruption_resumable() {
-        use crate::job::JobState;
-        let child_task = json!({"prompt": "child task", "depth": 0});
-        let delegate = Step::new(response(vec![tool_call(0, "agent-0", "agent", child_task)]));
-        let recovered = (0..4).map(|_| Step::new(answer("recovered")));
-        let steps = [delegate, Step::new(Vec::new()).midstream()];
-        let provider = Script::new(steps.into_iter().chain(recovered), &Requests::default());
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        let parent = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("delegate").await }
-        });
-        provider.request(1).await;
-        root_waiting(&session).await;
-        let job = session.inspect_jobs(&session.root).await[0].id;
-        // The child's interruption publishes only once its turn completes.
-        let child = session.root.child(1);
-        let gate = session.runtime.agents()[&child].control.invocation.clone();
-        let completing = gate.lock().await;
-        assert_eq!(session.interrupt().await, 2);
-        let mut continued = Box::pin(session.continue_turn());
-        assert!(futures_util::poll!(continued.as_mut()).is_pending());
-        let shutdown = tokio::spawn({
-            let session = session.clone();
-            async move { session.shutdown().await }
-        });
-        until(&session, job, |job| job.state == JobState::Interrupted).await;
-        drop(completing);
-        bounded(shutdown).await.unwrap().unwrap();
-        assert!(bounded(parent).await.unwrap().is_err());
-        let closed = session.runtime.store.records().await;
-        let refused = bounded(continued).await;
-        assert!(
-            matches!(refused, Err(HarnessError::AgentStopped)),
-            "{refused:?}"
-        );
-        assert_eq!(session.runtime.store.records().await, closed);
-        session.close().await.unwrap();
-
-        let resumed = harness.resume_session(session.id()).await.unwrap();
-        let state = resumed.runtime.jobs.snapshot(job).await.unwrap().state;
-        assert_eq!(state, JobState::Interrupted);
-        bounded(resumed.continue_turn()).await.unwrap();
-        assert_eq!(terminal(&resumed, job).await.state, JobState::Completed);
-        shutdown_session(resumed).await;
-    }
-
-    /// Closing frees the session for another open while its handle lives on, and
-    /// work still winding down behind it can no longer write.
+    /// Dropping the last handle stops the session's work where it stands, as a
+    /// crash would, a worker that ignores its cancellation included.
     #[tokio::test]
-    async fn a_closed_session_reopens_while_its_handle_lives() {
+    async fn dropping_the_last_handle_stops_a_worker_that_ignores_cancellation() {
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, Arc::new(HangingProvider)).await;
         let session = harness.new_session().await.unwrap();
-        session.shutdown().await.unwrap();
-        session.close().await.unwrap();
-        let resumed = harness.resume_session(session.id()).await.unwrap();
-        let late = session.record_status(session.root.clone(), "late".into());
-        assert!(late.await.is_err());
-        shutdown_session(resumed).await;
-    }
-
-    /// A turn that failed or was interrupted before the session closed reopens
-    /// stopped for that reason and is continued; a finished one leaves nothing to
-    /// continue.
-    #[tokio::test(start_paused = true)]
-    async fn reopened_failed_or_interrupted_turn_continues() {
-        use crate::agent::{AgentActivity, Failure, TurnFailure};
-        let stopped = async |session: &SessionHandle| {
-            let activity = session.observe().await.snapshot.activity;
-            match &activity[&session.root].state {
-                AgentActivity::Stopped(failure) => Some(failure.clone()),
-                _ => None,
-            }
-        };
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let failure = crate::provider::ProviderErrorKind::Protocol.error("not retried");
-        let steps = [
-            Step::fail(failure),
-            Step::new(answer("recovered")),
-            Step::new(answer("never released")).midstream(),
-            Step::new(answer("continued")),
-        ];
-        let script = Script::new(steps, &requests);
-        let harness = test_harness(root.path(), &sessions, script.clone()).await;
-        let session = harness.new_session().await.unwrap();
-        let id = session.id();
-        session.prompt("fails").await.unwrap_err();
-        shutdown_session(session).await;
-
-        let resumed = harness.resume_session(id).await.unwrap();
-        let failed = stopped(&resumed).await;
-        assert!(matches!(
-            failed,
-            Some(TurnFailure::Failed(Failure::Provider(..)))
-        ));
-        assert_eq!(resumed.continue_turn().await.unwrap(), "recovered");
-        let interrupted = resumed.prompt("interrupted");
-        let interrupt = async {
-            script.held(2).await;
-            resumed.interrupt().await;
-        };
-        let (result, _) = tokio::join!(interrupted, interrupt);
-        result.unwrap_err();
-        shutdown_session(resumed).await;
-
-        let resumed = harness.resume_session(id).await.unwrap();
-        assert_eq!(stopped(&resumed).await, Some(TurnFailure::Interrupted));
-        assert_eq!(resumed.continue_turn().await.unwrap(), "continued");
-        shutdown_session(resumed).await;
-
-        let resumed = harness.resume_session(id).await.unwrap();
-        assert_eq!(stopped(&resumed).await, None);
-        assert_eq!(resumed.continue_turn().await.unwrap(), "");
-        assert_eq!(requests.lock().unwrap().len(), 4);
-        shutdown_session(resumed).await;
-    }
-
-    /// A selection proves membership in the runtime instance that issued it; the
-    /// same session resumed is another instance with its own catalog.
-    #[tokio::test]
-    async fn selections_do_not_survive_a_resume() {
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let provider = scripted_provider(&requests, [answer("first"), answer("second")]);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let session = harness.new_session().await.unwrap();
-        let model = session.runtime.harness.default_model.clone();
-        let stale = session.selection(Some(&model), None).unwrap();
-        let id = session.id();
-        shutdown_session(session).await;
-        let resumed = harness.resume_session(id).await.unwrap();
-        let rejected = resumed.prompt_with_options("hello", &[], stale).await;
-        assert!(matches!(rejected, Err(HarnessError::UnknownModel(name)) if name == model));
-        let fresh = resumed.selection(Some(&model), None).unwrap();
-        let answered = resumed.prompt_with_options("hello", &[], fresh).await;
-        assert_eq!(answered.unwrap(), "first");
-        shutdown_session(resumed).await;
-    }
-
-    /// A resumed agent keeps its journaled prompt, tools and capabilities. Live
-    /// configuration narrows them: a pinned tool it no longer allows is shown but
-    /// never executed, a newly allowed capability is not granted, and a lower
-    /// depth limit applies.
-    #[tokio::test]
-    async fn resumed_agents_keep_their_journaled_contract_and_config_only_narrows_it() {
-        use crate::tool::policy::{Capability, CapabilitySet};
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let provider = scripted_provider(&requests, [answer("first")]);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let session = harness.new_session().await.unwrap();
-        session.prompt("hello").await.unwrap();
-        let id = session.id();
-        shutdown_session(session).await;
-        let original = requests.lock().unwrap()[0].clone();
-
-        let mut narrowed = CapabilitySet::default();
-        narrowed.remove(Capability::Write);
-        narrowed.insert(Capability::Targets);
-        let write = json!({"path": "must-not-exist", "content": "unsafe"});
-        let responses = [
-            response(vec![tool_call(0, "write", "write", write)]),
-            answer("done"),
-        ];
-        let provider = scripted_provider(&requests, responses);
-        let resumed = test_builder(root.path(), &sessions, provider, false)
-            .capabilities(narrowed)
-            // A lowered depth limit narrows the resumed root instead of refusing it.
-            .max_child_depth(0)
-            .build()
-            .await
-            .unwrap()
-            .resume_session(id)
-            .await
-            .unwrap();
-        assert_eq!(resumed.prompt("write it").await.unwrap(), "done");
-        let captured = requests.lock().unwrap().clone();
-        assert_eq!(captured[1].tools, original.tools);
-        assert_eq!(captured[1].system, original.system);
-        let Some(Sent::Tool(results)) = captured[2].history.last() else {
-            panic!("expected the write result");
-        };
-        assert!(results[0].is_error);
-        assert!(
-            results[0]
-                .result
-                .to_string()
-                .contains("unavailable in this session")
-        );
-        assert!(!root.path().join("must-not-exist").exists());
-        let records = resumed.runtime.store.records().await;
-        assert_eq!(count!(&records, SessionEvent::ModelChanged { .. }), 0);
-        shutdown_session(resumed).await;
+        let jobs = session.runtime.jobs.clone();
+        let spec = crate::job::JobSpec::test(session.root.clone(), "stubborn");
+        let (_input, worker) = jobs.test_running(spec).await.split();
+        let ignores = std::future::pending::<crate::job::JobOutcome>();
+        worker.start_supervised(ignores).unwrap();
+        drop(session);
+        bounded(jobs.supervisor().drain()).await;
     }
 
     /// A mode decides the root agent's capabilities, tools and instructions from the
     /// input that selects it. A child gets what its parent holds when it starts.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn modes_switch_the_root_contract_and_survive_resume() {
         use crate::tool::policy::{Capability, CapabilitySet, Mode};
         let root = tempfile::tempdir().unwrap();
@@ -1124,7 +705,7 @@ mod tests {
         };
         assert!(!replays(working) && !replays(&captured[4]));
 
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let changes = events!(&records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
         let granted = [
             Capability::Read,
@@ -1170,7 +751,7 @@ mod tests {
             (&last.system, &last.tools),
             (&working.system, &working.tools)
         );
-        let records = resumed.runtime.store.records().await;
+        let records = resumed.runtime.store.records();
         assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 1);
 
         // Continuing a failed turn can change the mode it continues in.
@@ -1181,14 +762,14 @@ mod tests {
         assert!(outcome.selection_applied);
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured.last().unwrap().system, looking.system);
-        let records = resumed.runtime.store.records().await;
+        let records = resumed.runtime.store.records();
         assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 2);
         shutdown_session(resumed).await;
     }
 
     /// A mode consumed at a request boundary narrows the root's next tool call and its
     /// host scripts, while a child it already started keeps what it was given.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_mid_turn_mode_switch_narrows_the_root_but_not_its_running_child() {
         use crate::tool::policy::{Capability, Mode};
         let call = |id: &str, name: &str, arguments: serde_json::Value| {
@@ -1246,10 +827,7 @@ mod tests {
             .await
             .unwrap();
         let session = Arc::new(harness.new_session().await.unwrap());
-        let turn = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("delegate, then write").await }
-        });
+        let turn = spawn_prompt(&session, "delegate, then write");
         tracking.request(0).await;
         // Queued while the root's first request is in flight; consumed at its next one.
         let queued = QueuedPrompt {
@@ -1259,7 +837,7 @@ mod tests {
             cancellation: Default::default(),
         };
         let mut receipt = Box::pin(enqueue_prompts(&session, vec![queued]));
-        let sent = async || session.root_tx.capacity() < AGENT_CHANNEL_CAPACITY;
+        let sent = async || inbox(&session, &session.root) > 0;
         pending_until(&mut receipt, sent).await;
         tracking.release(0);
         tracking.request(1).await;
@@ -1282,7 +860,7 @@ mod tests {
         // The child started under `work` and still writes. Its reply and completion
         // are both pending before the root's answer, so they reach it together.
         tracking.release(1);
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let child = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
             [0];
         terminal(&session, child).await;
@@ -1293,280 +871,9 @@ mod tests {
             "return (await tool.write({path: 'script.txt', content: 'written'})).unwrap();";
         assert!(session.run_script(script).await.is_err());
         assert!(!root.path().join("script.txt").exists());
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 1);
         session.shutdown().await.unwrap();
-    }
-
-    /// A session never outgrows the ceiling it started with. A mode it has used keeps
-    /// the definition it was used under; a mode new to it is pinned on first use.
-    #[tokio::test(start_paused = true)]
-    async fn resume_keeps_the_session_ceiling_and_its_pinned_modes() {
-        use crate::tool::policy::{Capability, CapabilitySet, Mode};
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let mode = |capabilities: &[Capability], instructions: &str| Mode {
-            capabilities: capabilities.to_vec(),
-            instructions: Some(instructions.parse().unwrap()),
-            hint: None,
-        };
-        let build = |ceiling: CapabilitySet, modes: &[(&str, Mode)], reply: &str| {
-            let provider = scripted_provider(&requests, [answer(reply)]);
-            let modes = modes.iter().cloned();
-            test_builder(root.path(), &sessions, provider, false)
-                .capabilities(ceiling)
-                .modes(
-                    modes
-                        .map(|(name, mode)| (name.parse().unwrap(), mode))
-                        .collect(),
-                )
-                .build()
-        };
-        let look = ("look", mode(&[Capability::Read], "Look."));
-        let work = (
-            "work",
-            mode(&[Capability::Read, Capability::Write], "Work."),
-        );
-        let narrow: CapabilitySet = [Capability::Read].into_iter().collect();
-        let harness = build(narrow, &[look.clone(), work.clone()], "one").await;
-        let session = harness.unwrap().new_session().await.unwrap();
-        session.prompt("start").await.unwrap();
-        let id = session.id();
-        shutdown_session(session).await;
-
-        let in_mode = |session: &SessionHandle, mode: &str| {
-            session.selection(None, Some(&mode_name(mode))).unwrap()
-        };
-        let changes = |records: &[EventRecord]| events!(records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
-        // A wider live ceiling does not widen the session: `work` grants no write here.
-        let wide = CapabilitySet::default;
-        let harness = build(wide(), &[look.clone(), work.clone()], "two")
-            .await
-            .unwrap();
-        let resumed = harness.resume_session(id).await.unwrap();
-        let prompt = resumed.prompt_with_options("widen", &[], in_mode(&resumed, "work"));
-        assert_eq!(prompt.await.unwrap(), "two");
-        let first = crate::session::ModeSelection {
-            name: "work".parse().unwrap(),
-            definition: Some(work.1.clone()),
-        };
-        let records = resumed.runtime.store.records().await;
-        assert_eq!(changes(&records), [(first.clone(), vec![Capability::Read])]);
-        shutdown_session(resumed).await;
-
-        // The configuration now redefines both modes and adds one. The session keeps
-        // its own `look`, pins the new `extra` when a message first uses it, and keeps
-        // that after it leaves the configuration again.
-        let relook = ("look", mode(&[], "Changed."));
-        let extra = ("extra", mode(&[Capability::Read], "Extra."));
-        for (configured, selected, reply) in [
-            (vec![relook.clone(), extra.clone()], "extra", "three"),
-            (vec![relook.clone()], "look", "four"),
-            (vec![relook], "extra", "five"),
-        ] {
-            let harness = build(wide(), &configured, reply).await.unwrap();
-            let resumed = harness.resume_session(id).await.unwrap();
-            let prompt = resumed.prompt_with_options("next", &[], in_mode(&resumed, selected));
-            assert_eq!(prompt.await.unwrap(), reply);
-            shutdown_session(resumed).await;
-        }
-        let (_store, records) = SessionStore::open(&sessions, id).await.unwrap();
-        let named = |name: &str, definition: Option<&Mode>| crate::session::ModeSelection {
-            name: mode_name(name),
-            definition: definition.cloned(),
-        };
-        let read = vec![Capability::Read];
-        let expected = [
-            (first, read.clone()),
-            (named("extra", Some(&extra.1)), read.clone()),
-            (named("look", None), read.clone()),
-            (named("extra", None), read),
-        ];
-        assert_eq!(changes(&records), expected);
-        let captured = requests.lock().unwrap().clone();
-        let prompt = |index: usize| captured[index].system[0].text.clone();
-        assert!(prompt(3).contains("Look.") && !prompt(3).contains("Changed."));
-        assert!(prompt(4).contains("Extra."));
-    }
-
-    /// A retained child accepts owner input after a restart: its loop starts again
-    /// under its journaled contract and continues its own history.
-    #[tokio::test(start_paused = true)]
-    async fn retained_children_resume_after_the_session_restarts() {
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let delegate = tool_call(0, "delegate", "agent", json!({"prompt": "work"}));
-        let responses = [
-            response(vec![delegate]),
-            answer("child done"),
-            answer("root done"),
-        ];
-        let provider = scripted_provider(&requests, responses);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
-        let records = session.runtime.store.records().await;
-        let job = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
-            [0];
-        let id = session.id();
-        shutdown_session(session).await;
-
-        let responses = [answer("child resumed"), answer("root again")];
-        let provider = scripted_provider(&requests, responses);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let resumed = harness.resume_session(id).await.unwrap();
-        resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
-        let finished = terminal(&resumed, job).await;
-        assert_eq!(finished.state, crate::job::JobState::Completed);
-        let captured = requests.lock().unwrap().clone();
-        let child = captured
-            .iter()
-            .rev()
-            .find(|request| request.context != ContextId::from(&resumed.root))
-            .expect("the child made a request after the restart");
-        let history = serde_json::to_string(&child.history).unwrap();
-        assert!(history.contains("work") && history.contains("child done"));
-        assert!(history.contains("Owner input"));
-        shutdown_session(resumed).await;
-    }
-
-    /// A process killed while a foreground child works leaves the root's call
-    /// open. Resume settles it with an error result, so nothing waits on the child
-    /// any more; retry restarts the child and its answer reaches the root as an event.
-    #[tokio::test(start_paused = true)]
-    async fn retry_after_a_crash_delivers_a_retained_foreground_childs_answer() {
-        for answered in [false, true] {
-            crash_then_retry(answered).await;
-        }
-    }
-
-    async fn crash_then_retry(answered: bool) {
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let requests = Requests::default();
-        let provider = scripted_provider(&requests, [answer("first")]);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let session = harness.new_session().await.unwrap();
-        assert_eq!(session.prompt("hello").await.unwrap(), "first");
-        // What a process killed while its foreground child worked leaves behind.
-        let store = &session.runtime.store;
-        let root_agent = session.root.clone();
-        let call = ToolCall::new("delegate", "agent", json!({"prompt": "work"})).unwrap();
-        let assistant = Message::Assistant(vec![AssistantItem::tool_call("delegate", 0, call)]);
-        let launch = store
-            .append(
-                root_agent.clone(),
-                SessionEvent::MessageCommitted { message: assistant },
-            )
-            .await
-            .unwrap();
-        let job = crate::identity::JobId::new(1).unwrap();
-        let location = crate::execution::ExecutionLocation::root(root.path().to_owned());
-        let events = vec![
-            (
-                root_agent.clone(),
-                SessionEvent::JobCreated {
-                    job,
-                    parent: None,
-                    origin: Some(crate::session::ModelCallOrigin {
-                        message: launch.sequence.message(),
-                        call_id: "delegate".into(),
-                    }),
-                    tool: "agent".into(),
-                    role: crate::job::JobRole::Agent,
-                    name: None,
-                    arguments: json!({"prompt": "work"}),
-                    output_schema: None,
-                    accepts_input: true,
-                    background: false,
-                    location: location.clone(),
-                },
-            ),
-            (
-                root_agent.clone(),
-                SessionEvent::JobStateChanged {
-                    job,
-                    state: crate::job::JobTransition::AwaitingApproval,
-                },
-            ),
-            (
-                root_agent.clone(),
-                SessionEvent::JobStateChanged {
-                    job,
-                    state: crate::job::JobTransition::Running,
-                },
-            ),
-        ];
-        store.append_all(events).await.unwrap();
-        let started = crate::session::tests::child_started(Some(job), location);
-        store.append(root_agent.child(1), started).await.unwrap();
-        if answered {
-            // A second crash: the first resume answered the call and retry restarted
-            // the child, which was working again when the process died.
-            let result = crate::provider::protocol::ToolResult {
-                call_id: "delegate".into(),
-                name: "agent".into(),
-                result: json!({"error": "interrupted while the session was not running"}),
-                images: Vec::new(),
-                is_error: true,
-            };
-            let events = vec![
-                (
-                    root_agent.clone(),
-                    SessionEvent::JobFinished {
-                        job,
-                        state: crate::job::JobEnd::Interrupted,
-                        diagnostic: Some(crate::tool::ToolError::interrupted().diagnostic()),
-                        output_diagnostic: None,
-                        images: Vec::new(),
-                    },
-                ),
-                (
-                    root_agent.clone(),
-                    SessionEvent::MessageCommitted {
-                        message: Message::Tool(vec![result]),
-                    },
-                ),
-                (
-                    root_agent.clone(),
-                    SessionEvent::JobStateChanged {
-                        job,
-                        state: crate::job::JobTransition::Running,
-                    },
-                ),
-            ];
-            store.append_all(events).await.unwrap();
-        }
-        let id = session.id();
-        shutdown_session(session).await;
-
-        // Steps serve requests in arrival order; the root's continuation and the
-        // restarted child race, so every answer reads the same.
-        let steps = [(); 3].map(|()| Step::new(answer("recovered")));
-        let provider = Script::new(steps, &requests);
-        let harness = test_harness(root.path(), &sessions, provider).await;
-        let resumed = harness.resume_session(id).await.unwrap();
-        assert!(resumed.runtime.jobs.is_background(job).await.unwrap());
-        bounded(resumed.continue_turn()).await.unwrap();
-        // The child's answer reaches the root as a job event.
-        bounded(async {
-            loop {
-                let delivered = requests.lock().unwrap().iter().any(|request| {
-                    let history = rendered(request);
-                    history.contains("job_events") && history.contains("recovered")
-                });
-                if delivered {
-                    break;
-                }
-                poll().await;
-            }
-        })
-        .await;
-        let records = resumed.runtime.store.records().await;
-        assert_eq!(count!(&records, SessionEvent::AgentStarted { .. }), 2);
-        shutdown_session(resumed).await;
     }
 
     #[tokio::test]
@@ -1595,7 +902,7 @@ mod tests {
             summary.title.map(|title| title.text).as_deref(),
             Some("first title")
         );
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         assert_eq!(summary.entries, records.len() as u64);
         assert_eq!(
             summary.last_millis,
@@ -1605,94 +912,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compaction_resume_restores_todos_and_the_first_provider_request() {
-        let root = tempfile::tempdir().unwrap();
-        let requests = Requests::default();
-        let reconciled = vec![
-            todo("Inspect queue", TodoStatus::Completed),
-            todo("Verify queue fix", TodoStatus::Pending),
-        ];
-        let mut summary = summary_json();
-        summary["todo_reconciliation"] = json!(["Inspection finished"]);
-        summary["todos"] = json!(reconciled);
-        let mut completed = answer("checkpoint installed");
-        let usage = usage(48_000, 2_000, 3_914);
-        completed.insert(completed.len() - 1, ResponseEvent::Usage(usage));
-        let responses = [completed, answer(summary.to_string()), answer("resumed")];
-        let provider = scripted_provider(&requests, responses);
-        let profile = ModelProfile {
-            max_context: crate::tests::limit(64_000),
-            ..crate::tests::profile("test", false)
-        };
-        let harness = serving(root.path(), provider, [("test", profile)])
-            .build()
-            .await
-            .unwrap();
-        let session = harness.new_session().await.unwrap();
-        let todos = &session.runtime.todos;
-        let root_todos = vec![todo("Inspect queue", TodoStatus::InProgress)];
-        todos
-            .replace(&session.root, root_todos, None)
-            .await
-            .unwrap();
-        let child = start_child(&session, 1, None).await;
-        let child_todos = vec![todo("Independent child work", TodoStatus::InProgress)];
-        todos
-            .replace(&child, child_todos.clone(), None)
-            .await
-            .unwrap();
-        // Exceed the retention tail; only the high-usage response triggers the checkpoint.
-        let history = AssistantItem::text("history", 0, "research ".repeat(40_000));
-        let history = Message::Assistant(vec![history]);
-        session
-            .runtime
-            .commit(&session.root, history)
-            .await
-            .unwrap();
-        let answer = session.prompt("Compact this investigation.").await.unwrap();
-        assert_eq!(answer, "checkpoint installed");
-        let records = session.runtime.store.records().await;
-        let checkpoints =
-            events!(records, SessionEvent::Compaction { checkpoint } => checkpoint.clone());
-        let checkpoint = checkpoints.into_iter().next().unwrap();
-        assert_eq!(checkpoint.todos, reconciled);
-        let prior_request = {
-            let captured = requests.lock().unwrap();
-            assert_eq!(captured.len(), 2);
-            assert!(captured[0].response_schema.is_none());
-            assert!(captured[1].response_schema.is_some());
-            assert!(captured[1].messages().any(|message| matches!(message,
-                Sent::Assistant(items) if items == &vec![AssistantItem::text("answer", 0, "checkpoint installed")])));
-            captured[0].clone()
-        };
-        let id = session.id();
-        shutdown_session(session).await;
-
-        let resumed = harness.resume_session(id).await.unwrap();
-        let todos = &resumed.runtime.todos;
-        let found = todos.inspect(&resumed.root, None).await.unwrap();
-        assert_eq!(found, reconciled);
-        let found = todos.inspect(&child, None).await.unwrap();
-        assert_eq!(found, child_todos);
-        assert_eq!(resumed.prompt("Continue.").await.unwrap(), "resumed");
-        {
-            let captured = requests.lock().unwrap();
-            assert_eq!(captured.len(), 3, "exactly one resumed provider invocation");
-            let first = &captured[2];
-            assert_eq!(first.history.first(), Some(&checkpoint.message.render()));
-            assert_eq!(first.system, prior_request.system);
-            assert_eq!(first.tools, prior_request.tools);
-            assert_eq!(first.model, prior_request.model);
-            // do not leak the summary schema
-            assert!(first.response_schema.is_none());
-            let runtime = request_runtime_state(first);
-            assert!(runtime.contains("Inspect queue") && runtime.contains("completed"));
-            assert!(runtime.contains("Verify queue fix") && runtime.contains("pending"));
-        }
-        shutdown_session(resumed).await;
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn switching_models_preserves_image_history_and_reports_unsupported_images() {
         let root = tempfile::tempdir().unwrap();
         let image = crate::media::Attachment::Image {
@@ -1713,7 +932,7 @@ mod tests {
                 .selection(Some(&name.parse().unwrap()), None)
                 .unwrap()
         };
-        let before = session.runtime.store.records().await.len();
+        let before = session.runtime.store.records().len();
         let oversized = crate::media::Attachment::Image {
             file: None,
             image: crate::tests::png(&vec![0; MAX_IMAGE_BYTES as usize]),
@@ -1722,7 +941,7 @@ mod tests {
         let rejected =
             session.prompt_with_options("Oversized image", &oversized, model("test/vision"));
         assert!(matches!(rejected.await, Err(HarnessError::ImageLimit)));
-        assert_eq!(session.runtime.store.records().await.len(), before);
+        assert_eq!(session.runtime.store.records().len(), before);
         let images = [image];
         let direct = session.prompt_with_options("Look", &images, Selection::default());
         let error = direct.await.unwrap_err();
@@ -1730,7 +949,7 @@ mod tests {
             matches!(error, HarnessError::ImagesUnsupported(_)),
             "{error}"
         );
-        assert_eq!(session.runtime.store.records().await.len(), before);
+        assert_eq!(session.runtime.store.records().len(), before);
         let with_image = session.prompt_with_options("Look at this", &images, model("test/vision"));
         with_image.await.unwrap();
         let error = session.prompt_with_options("Go on", &[], model("test/test"));
@@ -1768,11 +987,8 @@ mod tests {
         let harness =
             test_harness(root.path(), &root.path().join("sessions"), provider.clone()).await;
         let session = harness.new_session().await.unwrap();
-        let task = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("retained input").await }
-        });
-        let mut events = session.runtime.events.observe().updates;
+        let task = spawn_prompt(&session, "retained input");
+        let mut events = session.runtime.store.observe().updates;
         provider.request(0).await;
         bounded(async {
             while !matches!(
@@ -1784,7 +1000,7 @@ mod tests {
         session.interrupt().await;
         assert!(task.await.unwrap().is_err());
         // The interrupted stream journals its usage and attempt, and commits nothing.
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let recorded = events!(&records, SessionEvent::Usage { usage, .. } => *usage);
         assert_eq!(recorded, [spent]);
         let interrupted = count!(
@@ -1795,7 +1011,7 @@ mod tests {
         let status = session.record_status(session.root.clone(), "Interrupted".into());
         status.await.unwrap();
         assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let retained = count!(&records, SessionEvent::MessageCommitted { message: Message::User(blocks) }
             if blocks.iter().any(|block| matches!(block, UserPart::Text { text } if text == "retained input")));
         let interrupted =
@@ -1810,7 +1026,7 @@ mod tests {
 
     /// Continue resumes every holder's wait, not only the root's: a nested holder's
     /// resumed turn is busy again, so a second interrupt stops it.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn continue_resumes_nested_holders_so_a_second_interrupt_stops_them() {
         let delegate = |id: &str, depth: u32| {
             let arguments = json!({"prompt": format!("{id} task"), "depth": depth});
@@ -1831,21 +1047,18 @@ mod tests {
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
         let session = harness.new_session().await.unwrap();
-        let parent = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("delegate").await }
-        });
+        let parent = spawn_prompt(&session, "delegate");
         provider.request(2).await;
         // The grandchild is interrupted; the child and the root holding it keep waiting.
         assert_eq!(session.interrupt().await, 3);
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
         provider.request(4).await;
         let child = session.root.child(1);
-        assert_eq!(turn(&session, &child), TurnState::Busy);
+        assert_eq!(turn(&session, &child), Turn::Busy);
         // The child's resumed turn is in a model request, so it is interrupted; the
         // root holding it shows interrupted again.
         assert_eq!(session.interrupt().await, 2);
-        assert_eq!(turn(&session, &child), TurnState::Parked);
+        assert_eq!(turn(&session, &child), INTERRUPTED);
         assert_eq!(bounded(session.continue_turn()).await.unwrap(), "");
         assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
         session.shutdown().await.unwrap();
@@ -1863,10 +1076,7 @@ mod tests {
         let sessions = root.path().join("sessions");
         let harness = test_harness(root.path(), &sessions, provider.clone()).await;
         let session = harness.new_session().await.unwrap();
-        let task = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("start").await }
-        });
+        let task = spawn_prompt(&session, "start");
         provider.request(0).await;
         session.interrupt().await;
         assert!(task.await.unwrap().is_err());
@@ -1878,10 +1088,8 @@ mod tests {
         bounded(session.runtime.jobs.wait_settled(job))
             .await
             .unwrap();
-        // Queue the completion's wake ahead of the continue: had it woken the
-        // interrupted root, that turn would spend the scripted answer.
-        session.root_tx.send(AgentCommand::JobsReady).await.unwrap();
-        // The completion reaches the model with the next request instead.
+        // The completion does not wake the interrupted root, whose turn would spend
+        // the scripted answer: it reaches the model with the next request instead.
         assert_eq!(session.continue_turn().await.unwrap(), "jobs handled");
         let captured = requests.lock().unwrap().clone();
         let delivered = captured[1].messages().any(|message| {

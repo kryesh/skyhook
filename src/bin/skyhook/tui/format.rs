@@ -147,6 +147,17 @@ impl Timing {
     }
 }
 
+impl From<skyhook::job::RunTiming> for Timing {
+    fn from(timing: skyhook::job::RunTiming) -> Self {
+        use skyhook::job::RunTiming;
+        match timing {
+            RunTiming::Unstarted => Self::Untimed,
+            RunTiming::Since(since) => Self::Since(since),
+            RunTiming::Took { since, until } => Self::Took { since, until },
+        }
+    }
+}
+
 /// How long from `since` to `until` (epoch milliseconds).
 pub fn span(since: i64, until: i64) -> String {
     duration(TimeDelta::milliseconds(until.saturating_sub(since)))

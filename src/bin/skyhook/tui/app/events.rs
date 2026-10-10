@@ -1,6 +1,6 @@
 use super::*;
 use crate::launch::LaunchError;
-use skyhook::job::PresentedOutput;
+use skyhook::job::{Invocation, PresentedOutput};
 
 // Query presence, capture selection and preview metadata belong to core.
 async fn load_output(session: &SessionHandle, query: JobOutputQuery) -> LoadedOutput {
@@ -33,7 +33,8 @@ pub enum Work {
     },
     Output {
         attempt: OutputAttempt,
-        finished: bool,
+        /// The run the job had finished when the load began, whose output is final.
+        finished: Option<Invocation>,
         result: Box<LoadedOutput>,
     },
     MenuLoaded(menus::MenuLoaded),
@@ -51,8 +52,8 @@ pub enum Work {
         agent: AgentId,
         message: String,
     },
-    /// A notice the session could not journal.
-    StatusFailed {
+    /// A notice the session did not journal: it could not, or it no longer runs.
+    Unsaved {
         session: SessionId,
         agent: AgentId,
         message: String,
@@ -112,7 +113,7 @@ impl App {
                 self.operation = false;
                 self.initial_input = None;
                 if let Err(error) = result {
-                    self.root_notifier().send(error.to_string());
+                    self.report(&error);
                     self.pause_queue();
                 }
             }
@@ -121,7 +122,7 @@ impl App {
                 result,
             } => {
                 if let Err(error) = result {
-                    self.root_notifier().send(error.to_string());
+                    self.report(&error);
                 }
             }
             Work::Output {
@@ -169,7 +170,7 @@ impl App {
                 }
                 self.push_local(self.root_agent().clone(), message);
             }
-            Work::StatusFailed {
+            Work::Unsaved {
                 session,
                 agent,
                 message,
@@ -194,6 +195,13 @@ impl App {
         }
         self.dirty = true;
     }
+    /// Report an operation's failure, except a failed journal: the session it
+    /// stopped shows that.
+    fn report(&self, error: &crate::launch::OperationError) {
+        if !error.journal_failed() {
+            self.root_notifier().send(error.to_string());
+        }
+    }
     pub fn tick(&mut self) {
         self.tick_count = self.tick_count.wrapping_add(1);
         let clock = model::Clock::now();
@@ -214,15 +222,12 @@ impl App {
         self.deliver_queue();
         if self.last_output.elapsed() >= OUTPUT_POLL {
             self.last_output = Instant::now();
-            let view = self.views.entry(self.selected.clone()).or_default();
-            let jobs: Vec<_> = self
-                .projection
-                .jobs()
-                .values()
+            let view = self.views.get_mut(&self.selected, self.tab);
+            let jobs: Vec<_> = (self.snapshot.jobs.values())
                 .filter(|j| {
                     j.agent == self.selected
                         && view.is_expanded(&model::EntryKey::Job(j.id), self.details)
-                        && (!j.state.is_terminal() || !self.outputs.is_final(j.id))
+                        && (!j.state.is_terminal() || !self.outputs.is_final(j.id, j.invocation))
                 })
                 .map(|j| j.id)
                 .collect();
@@ -246,11 +251,9 @@ impl App {
         let Some((attempt, query)) = self.outputs.begin(job) else {
             return;
         };
-        let finished = self
-            .projection
-            .jobs()
-            .get(&job)
-            .is_some_and(|job| job.state.is_terminal());
+        let finished = (self.snapshot.jobs.get(&job))
+            .filter(|job| job.state.is_terminal())
+            .map(|job| job.invocation);
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = load_output(&session, query).await;
@@ -507,10 +510,54 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::super::played::*;
     use super::super::tests::*;
     use super::*;
     use skyhook::job::{Continuation, OutputPreview};
-    use skyhook::session::Message;
+
+    /// A viewed session's notices are shown for the agent they concern, a saved
+    /// child included, and never journaled.
+    #[tokio::test]
+    async fn viewed_child_notices_are_shown_not_journaled() {
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let (children, _turns) = spawn_children(&mut app, &mut model, 1).await;
+        let child = children[0].clone();
+        bounded(session.shutdown()).await.unwrap();
+        session.close().await.unwrap();
+
+        let viewed = app.launch.create(Some(session.id())).await.unwrap();
+        let before = viewed.observe().snapshot.records;
+        let prepared = PreparedObservation::subscribe(viewed.clone());
+        let (tx, mut work) = mpsc::unbounded_channel();
+        app = app.sibling(Some(prepared), app.launch.clone(), tx);
+        app.select(child.clone());
+        app.rebuild_content();
+        app.view().query = "text the saved child never saw".into();
+        app.find(false);
+        app.command(Command::Export);
+        let label = crate::tui::format::agent_label(&child).replace(':', "-");
+        let exported = viewed.directory().join(format!("conversation-{label}.md"));
+        let exported = format!("Exported {}", exported.display());
+        let notices = |app: &App| -> Vec<String> {
+            let notices = app.unsaved_status.iter();
+            let notices = notices.filter(|(agent, _)| agent == &child);
+            notices.map(|(_, message)| message.clone()).collect()
+        };
+        bounded(async {
+            while notices(&app).len() < 2 {
+                app.work(work.recv().await.expect("work channel is open"));
+            }
+        })
+        .await;
+        let after = viewed.observe().snapshot.records;
+        bounded(viewed.shutdown()).await.unwrap();
+        viewed.close().await.unwrap();
+        assert_eq!(notices(&app), ["No matches".to_owned(), exported]);
+        assert_eq!(
+            before, after,
+            "a viewed session's notices are never journaled"
+        );
+    }
 
     fn capture_text(output: &skyhook::job::JobView, field: &str) -> String {
         let captures = output.presentation().map_or(&[][..], |p| p.captures());
@@ -540,7 +587,7 @@ mod tests {
         config.approve_all = true;
         app.launch.model = config.into_runtime().unwrap().default_model();
         let session = app.launch.create(None).await.unwrap();
-        attach(&mut app, session.clone()).await;
+        attach(&mut app, session.clone());
         let launched = session.run_script(format!("return await tool.exec({});", json!({
             "command": "printf 'live stdout\\n'; printf 'live stderr\\n' >&2; while [ ! -e release ]; do sleep 0.01; done; exit 1",
             "timeout": 10,
@@ -561,10 +608,11 @@ mod tests {
             }
         })
         .await;
-        app.snapshot = session.observe().await.snapshot;
+        app.snapshot = session.observe().snapshot;
         app.refresh();
         assert!(live(&fetch_output(&mut app, job).await));
-        assert!(app.outputs.query(job).is_none() && !app.outputs.is_final(job));
+        let run = app.snapshot.jobs[&job].invocation;
+        assert!(app.outputs.query(job).is_none() && !app.outputs.is_final(job, run));
         app.command(Command::Details);
         draw(&mut app);
         let text = job_text(&app, job);
@@ -575,22 +623,15 @@ mod tests {
 
         std::fs::write(app.launch.workspace.join("release"), "").unwrap();
         bounded(async {
-            // The live job settles just after its journal commit.
-            while !app.projection.jobs()[&job].state.is_terminal()
-                || !session
-                    .inspect_jobs(session.root_agent())
-                    .await
-                    .iter()
-                    .any(|envelope| envelope.id == job && envelope.state.is_terminal())
-            {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                app.snapshot = session.observe().await.snapshot;
-                app.refresh();
+            while !app.snapshot.jobs[&job].state.is_terminal() {
+                let event = app.recv_observation().await.unwrap();
+                app.observe(event);
             }
         })
         .await;
+        app.refresh();
         let complete = fetch_output(&mut app, job).await;
-        assert!(app.outputs.query(job).is_none() && app.outputs.is_final(job));
+        assert!(app.outputs.query(job).is_none() && app.outputs.is_final(job, run));
         let complete = complete.result().unwrap();
         let result = json!({"exit_code": 1, "stdout": "live stdout\n", "stderr": "live stderr\n"});
         for field in ["exit_code", "stdout", "stderr"] {
@@ -676,17 +717,18 @@ mod tests {
 
     #[tokio::test]
     async fn message_drag_selects_only_the_requested_text_including_unicode() {
-        use skyhook::{provider::protocol::AssistantItem, session::UserPart};
+        use skyhook::provider::protocol::AssistantItem;
         for surface in [model::Surface::User, model::Surface::Agent] {
             for word in ["bravo", "e\u{301}界🙂"] {
-                let (_root, mut app) = fixture().await;
+                let (_root, mut app, mut model, _session) = played_fixture().await;
                 let text = format!("Alpha **{word}** omega");
-                let message = match surface {
-                    model::Surface::User => Message::User(vec![UserPart::Text { text }]),
-                    _ => Message::Assistant(vec![AssistantItem::text("drag", 0, &text)]),
-                };
-                push_record(&mut app, SessionEvent::MessageCommitted { message }).await;
-                app.refresh();
+                if surface == model::Surface::User {
+                    let _asked = ask(app.session().unwrap(), &text);
+                    observe_record(&mut app, committed(user)).await;
+                } else {
+                    let answer = vec![AssistantItem::text("drag", 0, &text)];
+                    exchange(&mut app, &mut model, "question", answer).await;
+                }
                 let buffer = draw_buffer(&mut app);
                 let (x, y) = (0..24)
                     .find_map(|y| {
@@ -722,7 +764,6 @@ mod tests {
                 assert_ne!(selected[(x + 5, y)].bg, color);
                 chord(&mut app, KeyCode::Char('y'));
                 assert_eq!(app.clipboard.as_deref(), Some(word));
-                app.session().unwrap().shutdown().await.unwrap();
             }
         }
     }
@@ -730,31 +771,19 @@ mod tests {
     #[tokio::test]
     async fn pre_job_failure_updates_the_existing_tool_card_and_expands_in_place() {
         use crate::tui::theme::THEME;
-        use skyhook::provider::protocol::{AssistantItem, ToolCall, ToolResult};
-        let (_root, mut app) = fixture().await;
-        async fn commit(app: &mut App, message: Message) {
-            push_record(app, SessionEvent::MessageCommitted { message }).await;
-            app.refresh();
-        }
+        let (_root, mut app, mut model, _session) = played_fixture().await;
         let tool_cards = |app: &App| {
             let entries = app.entries().iter();
             let cards = entries.filter(|entry| entry.surface == model::Surface::Tool);
             cards.cloned().collect::<Vec<_>>()
         };
-        let call = ToolCall::new("denied-call", "exec", json!({"command":["cargo", "test"]}));
-        let call = AssistantItem::tool_call("call-item", 0, call.unwrap());
-        commit(&mut app, Message::Assistant(vec![call])).await;
+        let _asked = ask(app.session().unwrap(), "test it");
+        model.turn().await.end(vec![failing_call("failing-call")]);
+        observe_record(&mut app, committed(assistant)).await;
         draw(&mut app);
         let key = tool_cards(&app)[0].key().clone();
-        let result = ToolResult {
-            call_id: "denied-call".into(),
-            name: "exec".into(),
-            result: json!({"state": "failed", "error": "Permission was denied",
-                "meta": {"code": "permission_denied"}}),
-            images: vec![],
-            is_error: true,
-        };
-        commit(&mut app, Message::Tool(vec![result])).await;
+        observe_record(&mut app, committed(results)).await;
+        let error = tool_error(&app.snapshot).to_owned();
         let records = serde_json::to_vec(&app.snapshot.records).unwrap();
         let buffer = draw_buffer(&mut app);
         let cards = tool_cards(&app);
@@ -763,11 +792,10 @@ mod tests {
             (1, &key, None)
         );
         assert!(cards[0].text().contains("Failed") && cards[0].expandable());
-        assert!(!cards[0].text().contains("Permission was denied"));
-        let error = THEME.error;
+        assert!(!cards[0].text().contains(&error));
         assert!(buffer.content.windows(6).any(|cells| {
             cells.iter().map(|cell| cell.symbol()).collect::<String>() == "Failed"
-                && cells.iter().all(|cell| cell.fg == error)
+                && cells.iter().all(|cell| cell.fg == THEME.error)
         }));
         let index = app.entries().iter().position(|entry| entry.key() == &key);
         let toggle = |app: &mut App| {
@@ -781,7 +809,7 @@ mod tests {
         toggle(&mut app);
         let cards = tool_cards(&app);
         assert_eq!((cards.len(), cards[0].key()), (1, &key));
-        for part in ["Arguments", "Output", "Permission was denied"] {
+        for part in ["Arguments", "Output", error.as_str()] {
             assert!(cards[0].text().contains(part));
         }
         assert!(cards[0].document().is_some());

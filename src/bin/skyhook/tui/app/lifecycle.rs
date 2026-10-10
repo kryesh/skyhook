@@ -57,7 +57,7 @@ impl App {
         let tx = self.tx.clone();
         tokio::spawn(async move {
             let result = match launch.create(None).await {
-                Ok(session) => Ok(PreparedObservation::subscribe(session).await),
+                Ok(session) => Ok(PreparedObservation::subscribe(session)),
                 Err(error) => Err(error),
             };
             if let Err(error) = tx.send(Work::Started { result })
@@ -86,9 +86,7 @@ impl App {
         };
         self.snapshot = *prepared.snapshot;
         self.selected = self.root_agent().clone();
-        if let Some(view) = self.views.remove(&draft) {
-            self.views.insert(self.selected.clone(), view);
-        }
+        self.views.transfer(&draft, self.selected.clone());
         for (agent, _) in &mut self.unsaved_status {
             if *agent == draft {
                 *agent = self.selected.clone();
@@ -201,6 +199,7 @@ impl App {
             status.flush().await;
             if let Some(session) = &session
                 && let Err(e) = session.shutdown().await
+                && !e.journal_failed()
             {
                 notices.send(e.to_string());
             }
@@ -305,7 +304,7 @@ mod tests {
         assert_eq!(pastes, ["unsent attachment"]);
         app.status.flush().await;
         let session = app.session().unwrap();
-        let snapshot = session.observe().await.snapshot;
+        let snapshot = session.observe().snapshot;
         assert!(!session.warnings().is_empty());
         for warning in session.warnings() {
             let status = format!("Startup warning: {warning}");
@@ -393,5 +392,45 @@ mod tests {
         fail_creation(&mut app, &mut rx).await;
         app.work(next_lifecycle(&mut rx).await);
         assert!(app.exit && app.launch.sessions.is_file());
+    }
+
+    /// A failed journal stops the session as a crash would: its queued rows go,
+    /// its conversation shows why once, and it stays open until it is closed.
+    #[tokio::test]
+    async fn a_failed_journal_stops_the_session_and_shows_why_in_its_conversation() {
+        use super::super::played::{observe_until, played_fixture};
+        use skyhook::identity::SessionId;
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let mut rx = capture_work(&mut app);
+        app.status = crate::tui::status::StatusLog::new(app.tx.clone());
+        app.submit("first".into());
+        let _turn = model.turn().await;
+        app.submit("queued".into());
+        assert_eq!(app.queue.len(), 1);
+        let foreign = AgentId::root(SessionId::generate().unwrap());
+        let refused = session.record_status(foreign, "elsewhere".into()).await;
+        assert!(refused.is_err());
+        observe_until(&mut app, |app| app.queue.is_empty()).await;
+        // The prompt the failure cut short reports it too.
+        loop {
+            let work = recv(&mut rx).await;
+            let done = matches!(work, Work::Done { .. });
+            app.work(work);
+            if done {
+                break;
+            }
+        }
+        app.status.flush().await;
+        while let Ok(work) = rx.try_recv() {
+            app.work(work);
+        }
+        assert!(!app.exit && app.queue.is_empty());
+        app.rebuild_content();
+        let shown = (app.entries().iter())
+            .filter(|entry| entry.text().contains("could not write the session journal"));
+        assert_eq!(shown.count(), 1);
+        app.command(Command::Close);
+        app.work(next_lifecycle(&mut rx).await);
+        assert!(app.exit);
     }
 }

@@ -2,13 +2,11 @@ use std::{
     borrow::Cow,
     collections::{BTreeMap, BTreeSet},
     path::PathBuf,
-    sync::Arc,
 };
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tokio::sync::RwLock;
 
 use super::{
     MAX_TARGET_NAME_BYTES, Route, SshOptions, TargetConfig, TargetName, TargetRef, Transport,
@@ -16,10 +14,11 @@ use super::{
 use crate::{
     named_enum::named_enum,
     remote::SshOption,
+    session::SessionEvent,
     tool::{
         AdmissionError,
         diagnostic::{Operation, Subject},
-        policy::{Capability, CapabilitySet},
+        policy::{Capability, CapabilitySet, ResourceId},
     },
 };
 
@@ -133,56 +132,57 @@ impl TargetDefinition {
     }
 }
 
+/// The session's targets as its journal defines them: those it started with
+/// and those it added since, each at its revision.
 #[derive(Clone, Default)]
-pub struct TargetRegistry {
-    entries: Arc<RwLock<BTreeMap<TargetName, TargetDefinition>>>,
-    /// Serializes updates from preparation through publication, so readers only
-    /// wait for the in-memory install, never for the journal append.
-    updates: Arc<tokio::sync::Mutex<()>>,
+pub(crate) struct TargetRegistry {
+    entries: BTreeMap<TargetName, TargetDefinition>,
 }
 
 impl TargetRegistry {
-    pub fn from_definitions(
+    pub(crate) fn from_definitions(
         definitions: impl IntoIterator<Item = TargetDefinition>,
     ) -> Result<Self, TargetError> {
-        let mut entries = BTreeMap::new();
-        for definition in definitions {
-            entries.insert(definition.name.clone(), definition);
-        }
+        let entries = (definitions.into_iter())
+            .map(|definition| (definition.name.clone(), definition))
+            .collect();
         validate_graph(&entries)?;
-        Ok(Self {
-            entries: Arc::new(RwLock::new(entries)),
-            updates: Arc::default(),
-        })
+        Ok(Self { entries })
+    }
+
+    /// Fold the definitions a journaled event records, as their revisions stand.
+    pub(crate) fn apply(&mut self, event: &SessionEvent) {
+        if let SessionEvent::SessionStarted { targets, .. }
+        | SessionEvent::TargetsUpserted { targets } = event
+        {
+            let named = targets
+                .iter()
+                .map(|target| (target.name.clone(), target.clone()));
+            self.entries.extend(named);
+        }
     }
 
     /// Named targets visible with `capabilities`.
-    pub async fn list(&self, capabilities: &CapabilitySet) -> Vec<TargetDefinition> {
-        let entries = self.entries.read().await;
+    pub(crate) fn list(&self, capabilities: &CapabilitySet) -> Vec<TargetDefinition> {
         let visible = |target: &&TargetDefinition| {
-            capabilities.contains(Capability::SshAgent) || !needs_ssh_agent(&entries, &target.name)
+            capabilities.contains(Capability::SshAgent)
+                || !needs_ssh_agent(&self.entries, &target.name)
         };
-        entries.values().filter(visible).cloned().collect()
+        self.entries.values().filter(visible).cloned().collect()
     }
 
     /// Whether reaching `name` forwards an agent Skyhook does not own. Such targets
     /// are invisible to callers without the ssh_agent capability.
-    pub async fn needs_ssh_agent(&self, name: &TargetName) -> bool {
-        needs_ssh_agent(&*self.entries.read().await, name)
+    pub(crate) fn needs_ssh_agent(&self, name: &TargetName) -> bool {
+        needs_ssh_agent(&self.entries, name)
     }
 
-    pub async fn get(&self, name: &TargetName) -> Result<TargetDefinition, TargetError> {
-        self.entries
-            .read()
-            .await
-            .get(name)
-            .cloned()
-            .ok_or_else(|| TargetError::Unknown(name.clone()))
+    pub(crate) fn get(&self, name: &TargetName) -> Result<TargetDefinition, TargetError> {
+        (self.entries.get(name).cloned()).ok_or_else(|| TargetError::Unknown(name.clone()))
     }
 
-    pub(crate) async fn route(&self, name: &TargetName) -> Result<Route, TargetError> {
-        let entries = self.entries.read().await;
-        let walked = walk_route(&entries, name)?;
+    pub(crate) fn route(&self, name: &TargetName) -> Result<Route, TargetError> {
+        let walked = walk_route(&self.entries, name)?;
         let Some((destination, hops)) = walked.split_first() else {
             return Err(TargetError::Unknown(name.clone()));
         };
@@ -192,30 +192,17 @@ impl TargetRegistry {
         })
     }
 
-    pub async fn definitions(&self) -> Vec<TargetDefinition> {
-        self.entries.read().await.values().cloned().collect()
-    }
-
-    pub async fn upsert_many(
+    /// `definitions` as the session would add them, each at its next revision.
+    pub(crate) fn upsert(
         &self,
         definitions: Vec<TargetDefinition>,
-    ) -> Result<(Vec<TargetDefinition>, Vec<TargetName>), TargetError> {
-        Ok(self.prepare_upsert_many(definitions).await?.publish().await)
-    }
-
-    /// Retain the update gate through durable acceptance so publication cannot
-    /// fail or allocate a second, different revision after the append.
-    pub(super) async fn prepare_upsert_many(
-        &self,
-        definitions: Vec<TargetDefinition>,
-    ) -> Result<PreparedTargetUpdate, TargetError> {
-        let update = self.updates.clone().lock_owned().await;
-        let mut next = self.entries.read().await.clone();
+    ) -> Result<Vec<TargetDefinition>, TargetError> {
+        let mut next = self.entries.clone();
         let mut saved = Vec::new();
         for mut definition in definitions {
             definition.source = TargetSource::Session;
-            // Allocate against the staged batch as well as the live registry:
-            // repeated names in one batch must not reuse a route revision.
+            // Allocate against the staged batch as well as the registry: repeated
+            // names in one batch must not reuse a route revision.
             definition.revision = next
                 .get(&definition.name)
                 .map_or(1, |old| old.revision.saturating_add(1));
@@ -223,60 +210,54 @@ impl TargetRegistry {
             saved.push(definition);
         }
         validate_graph(&next)?;
-        let invalidated = saved
-            .iter()
-            .flat_map(|d| dependants(&next, &d.name))
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect();
-        Ok(PreparedTargetUpdate {
-            _update: update,
-            entries: self.entries.clone(),
-            next,
-            saved,
-            invalidated,
+        Ok(saved)
+    }
+
+    /// The revision of every target `resource` depends on, as those targets now
+    /// stand: a named target and those it is routed through. None for a route
+    /// that names another revision, or a target the session does not have.
+    pub(crate) fn revisions(&self, resource: &ResourceId) -> Option<Revisions> {
+        let route = |name: &TargetName| {
+            let route = walk_route(&self.entries, name).ok()?;
+            Some(
+                route
+                    .iter()
+                    .rev()
+                    .map(|hop| (hop.name.clone(), hop.revision))
+                    .collect(),
+            )
+        };
+        match resource {
+            ResourceId::Workspace { target, .. }
+            | ResourceId::Path { target, .. }
+            | ResourceId::Network { target, .. } => target.name().map_or(Some(Vec::new()), route),
+            ResourceId::Route { destination, hops } => {
+                route(destination).filter(|current: &Revisions| current == hops)
+            }
+            ResourceId::Session { .. } | ResourceId::Mcp { .. } => Some(Vec::new()),
+        }
+    }
+
+    /// Whether every target in `revisions` is still at its revision.
+    pub(crate) fn current(&self, revisions: &[(TargetName, u64)]) -> bool {
+        (revisions.iter()).all(|(name, revision)| {
+            (self.entries.get(name)).is_some_and(|target| target.revision == *revision)
         })
     }
 }
 
-/// Prepared target definitions and the sole right to install them. Dropping an
-/// unaccepted update leaves the registry unchanged. An accepted append owner
-/// must retain this value until its corresponding live publication completes.
-pub(super) struct PreparedTargetUpdate {
-    _update: tokio::sync::OwnedMutexGuard<()>,
-    entries: Arc<RwLock<BTreeMap<TargetName, TargetDefinition>>>,
-    next: BTreeMap<TargetName, TargetDefinition>,
-    saved: Vec<TargetDefinition>,
-    invalidated: Vec<TargetName>,
-}
+/// The revision of each target something depends on, outermost first.
+pub(crate) type Revisions = Vec<(TargetName, u64)>;
 
-impl PreparedTargetUpdate {
-    pub(super) fn definitions(&self) -> &[TargetDefinition] {
-        &self.saved
-    }
-
-    pub(super) async fn publish(self) -> (Vec<TargetDefinition>, Vec<TargetName>) {
-        *self.entries.write().await = self.next;
-        (self.saved, self.invalidated)
-    }
+/// Whether `redefined`, as a redefinition saves them, replaces any of `revisions`.
+pub(crate) fn replaces(redefined: &[TargetDefinition], revisions: &[(TargetName, u64)]) -> bool {
+    (revisions.iter()).any(|(name, revision)| {
+        (redefined.iter()).any(|target| &target.name == name && *revision < target.revision)
+    })
 }
 
 fn needs_ssh_agent(entries: &BTreeMap<TargetName, TargetDefinition>, name: &TargetName) -> bool {
     walk_route(entries, name).is_ok_and(|route| route.iter().any(|hop| hop.ssh.external_agent))
-}
-
-fn dependants(
-    entries: &BTreeMap<TargetName, TargetDefinition>,
-    changed: &TargetName,
-) -> Vec<TargetName> {
-    entries
-        .keys()
-        .filter(|name| {
-            walk_route(entries, name)
-                .is_ok_and(|route| route.iter().any(|target| &target.name == changed))
-        })
-        .cloned()
-        .collect()
 }
 
 fn validate_graph(entries: &BTreeMap<TargetName, TargetDefinition>) -> Result<(), TargetError> {
@@ -538,31 +519,30 @@ mod tests {
         name.parse().unwrap()
     }
 
-    #[tokio::test]
-    async fn routes_are_outermost_first_and_cycles_are_rejected() {
+    #[test]
+    fn routes_are_outermost_first_and_cycles_are_rejected() {
         let registry = TargetRegistry::from_definitions([
             target("edge", None),
             target("bastion", Some("edge")),
             target("build", Some("bastion")),
         ])
         .unwrap();
-        let route = registry.route(&name("build")).await.unwrap();
+        let route = registry.route(&name("build")).unwrap();
         let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
         assert_eq!(names, ["edge", "bastion", "build"]);
         let mut changed = target("edge", Some("build"));
         changed.source = TargetSource::Session;
-        let result = registry.upsert_many(vec![changed]).await;
+        let result = registry.upsert(vec![changed]);
         assert!(matches!(result, Err(TargetError::Cycle(_))));
     }
 
-    #[tokio::test]
-    async fn repeated_names_in_a_batch_receive_distinct_revisions() {
+    #[test]
+    fn repeated_names_in_a_batch_receive_distinct_revisions() {
         let registry = TargetRegistry::default();
         let batch = vec![target("build", None), target("build", None)];
-        let (saved, _) = registry.upsert_many(batch).await.unwrap();
+        let saved = registry.upsert(batch).unwrap();
         let revisions: Vec<_> = saved.iter().map(|target| target.revision).collect();
         assert_eq!(revisions, [1, 2]);
-        assert_eq!(registry.get(&name("build")).await.unwrap().revision, 2);
     }
 
     #[test]
@@ -599,33 +579,29 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn missing_route_references_identify_the_edge_and_leave_batch_unchanged() {
+    #[test]
+    fn missing_route_references_identify_the_edge() {
         let registry = TargetRegistry::from_definitions([target("first", None)]).unwrap();
-        let before = registry.definitions().await;
         for edge in [TargetEdge::Via, TargetEdge::Origin] {
             let mut invalid = target("invalid", None);
             match edge {
                 TargetEdge::Via => invalid.via = Some(name("missing")),
                 TargetEdge::Origin => invalid.origin = Some(name("missing")),
             }
-            let result = registry
-                .upsert_many(vec![target("added", None), invalid])
-                .await;
+            let result = registry.upsert(vec![target("added", None), invalid]);
             assert!(matches!(result, Err(TargetError::UnknownReference {
                 target,
                 edge: actual,
                 reference,
             }) if target == name("invalid") && actual == edge && reference == name("missing")));
-            assert_eq!(registry.definitions().await, before);
         }
         assert!(
-            matches!(registry.route(&name("absent")).await, Err(TargetError::Unknown(unknown)) if unknown == name("absent"))
+            matches!(registry.route(&name("absent")), Err(TargetError::Unknown(unknown)) if unknown == name("absent"))
         );
     }
 
-    #[tokio::test]
-    async fn jumps_share_the_origin_that_starts_their_connection() {
+    #[test]
+    fn jumps_share_the_origin_that_starts_their_connection() {
         let shim = target("shim", None);
         let mut jump = target("jump", None);
         jump.origin = Some(name("shim"));
@@ -651,7 +627,7 @@ mod tests {
         let mut deep = target("deep", None);
         deep.origin = Some(name("destination"));
         let registry = TargetRegistry::from_definitions([shim, jump, destination, deep]).unwrap();
-        let route = registry.route(&name("deep")).await.unwrap();
+        let route = registry.route(&name("deep")).unwrap();
         let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
         assert_eq!(names, ["shim", "jump", "destination", "deep"]);
         let from_config = |config: serde_json::Value| {

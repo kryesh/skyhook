@@ -1,9 +1,7 @@
 //! Dispatch shim responses without blocking frame reads on host callbacks.
-use super::permissions::rebase_remote_permissions;
 use super::*;
 use crate::{
     remote::{PromptAnswer, flow::CHUNK_BYTES, protocol::ControlRequest},
-    target::TargetRef,
     tool::authorization::AuthorizationError,
 };
 use tokio::io::AsyncRead;
@@ -180,19 +178,18 @@ where
             } => {
                 // The worker names its own machine as the root; everything it asks
                 // for is bound to this connection's target.
-                let (mut permissions, origin) = request.into_parts(&TargetRef::Root);
-                rebase_remote_permissions(&location.target, &mut permissions)?;
-                let context = state
-                    .lock()
-                    .await
-                    .pending
-                    .get(&request_id)
-                    .filter(|pending| !pending.sender.is_closed())
-                    .map(|pending| pending.context.clone());
+                let (permissions, origin) = request.into_parts(&location.target);
+                let (context, admitted) = {
+                    let state = state.lock().await;
+                    let pending = state.pending.get(&request_id);
+                    let context = (pending.filter(|pending| !pending.sender.is_closed()))
+                        .map(|pending| pending.context.clone());
+                    (context, state.admitted.clone())
+                };
                 let writer = writer.clone();
                 callbacks.spawn(async move {
                     let decision = match context {
-                        Some(context) => context.authorize(permissions, origin).await,
+                        Some(context) => context.authorize(permissions, origin, &admitted).await,
                         None => Err(AuthorizationError::PolicyFailed),
                     };
                     write_frame(
@@ -233,6 +230,13 @@ mod tests {
 
     const PROMPT: PromptId = PromptId::new(9);
     const AUTHORIZATION: AuthorizationId = AuthorizationId::new(7);
+
+    /// What a worker forwards of `request`.
+    fn forwarded(request: Reauthorization) -> crate::remote::protocol::Forwarded {
+        crate::remote::protocol::Forwarded::of(request)
+            .unwrap()
+            .unwrap()
+    }
 
     async fn control(reader: &mut tokio::io::DuplexStream) -> Option<Request> {
         loop {
@@ -315,10 +319,10 @@ mod tests {
             let request = Response::Authorization {
                 request_id: RequestId::new(1),
                 authorization_id: AUTHORIZATION,
-                request: Reauthorization::Permissions(vec![PermissionUse::new(
+                request: forwarded(Reauthorization::Permissions(vec![PermissionUse::new(
                     Capability::Read,
                     outside,
-                )]),
+                )])),
             };
             write_frame(&mut requests, &request).await.unwrap();
             entered.notified().await;
@@ -377,7 +381,10 @@ mod tests {
                 "read".into(),
                 AuthorizationArguments::default(),
             );
-        assert_eq!(context.execution_location().target, TargetRef::Root);
+        assert_eq!(
+            context.execution_location().target,
+            crate::target::TargetRef::Root
+        );
         let connection = test_connection();
         let (mut requests, responses) = tokio::io::duplex(4096);
         let (input, mut replies) = tokio::io::duplex(4096);
@@ -401,7 +408,7 @@ mod tests {
         let request = Response::Authorization {
             request_id: RequestId::new(1),
             authorization_id: AUTHORIZATION,
-            request: Reauthorization::Network(origin.to_owned()),
+            request: forwarded(Reauthorization::Network(origin.to_owned())),
         };
         write_frame(&mut requests, &request).await.unwrap();
         assert!(matches!(

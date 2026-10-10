@@ -25,7 +25,6 @@ use crate::{
 
 pub(in crate::remote) type Session = Arc<PooledConnection>;
 
-mod permissions;
 mod results;
 mod routing;
 mod streams;
@@ -61,6 +60,9 @@ impl Drop for OwnedCredits {
 
 #[derive(Default)]
 struct ConnectionState {
+    /// The revision of each target on the route this connection was admitted
+    /// at: what its worker asks for counts only while they are current.
+    admitted: crate::target::Revisions,
     pending: HashMap<RequestId, PendingCall>,
     failure: Option<RemoteError>,
     streams: HashMap<RequestId, ClientStream>,
@@ -109,10 +111,12 @@ impl PooledConnection {
         Ok((request_id, result))
     }
 
-    /// Serve a shim's responses; the shim runs at `location`.
+    /// Serve a shim's responses; the shim runs at `location`, reached along a
+    /// route `admitted` at those target revisions.
     pub(in crate::remote) async fn from_transport(
         transport: Transport,
         location: ExecutionLocation,
+        admitted: crate::target::Revisions,
         prompts: Arc<dyn SensitivePromptHandler>,
         tasks: &tokio_util::task::TaskTracker,
         shutdown: CancellationToken,
@@ -138,7 +142,11 @@ impl PooledConnection {
                 Operation::Receive,
             )));
         }
-        let state = Arc::new(Mutex::new(ConnectionState::default()));
+        let state = ConnectionState {
+            admitted,
+            ..ConnectionState::default()
+        };
+        let state = Arc::new(Mutex::new(state));
         let writer = Arc::new(Mutex::new(input));
         let reader_state = state.clone();
         let reader_writer = writer.clone();

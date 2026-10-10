@@ -26,6 +26,8 @@ struct Facts<O> {
 struct LocalFacts {
     provenance: FailureProvenance,
     native_io: Option<io::Error>,
+    /// The phase of the session that refused the operation.
+    refused: Option<crate::session::SessionPhase>,
 }
 
 #[derive(Debug, Default)]
@@ -53,12 +55,12 @@ impl<O> From<crate::fs::RegularFileError> for OperationError<O> {
 }
 impl<O> From<crate::session::SessionError> for OperationError<O> {
     fn from(error: crate::session::SessionError) -> Self {
-        Self::from_facts(PartialDiagnostic::session(&error), None)
+        Self::session(&error)
     }
 }
 impl<O> From<std::sync::Arc<crate::session::SessionError>> for OperationError<O> {
     fn from(error: std::sync::Arc<crate::session::SessionError>) -> Self {
-        Self::from_facts(PartialDiagnostic::session(&error), None)
+        Self::session(&error)
     }
 }
 impl<O> From<serde_json::Error> for OperationError<O> {
@@ -130,6 +132,17 @@ impl<O> OperationError<O> {
         let mut this = Self::cause(Cause::io(&error));
         this.0.local.native_io = Some(error);
         this
+    }
+    fn session(error: &crate::session::SessionError) -> Self {
+        let mut this = Self::from_facts(PartialDiagnostic::session(error), None);
+        if let crate::session::SessionError::Refused(phase) = error {
+            this.0.local.refused = Some(phase.clone());
+        }
+        this
+    }
+    /// The phase of the session that refused this operation, when one did.
+    pub(crate) fn refused(&self) -> Option<crate::session::SessionPhase> {
+        self.0.local.refused.clone()
     }
     /// The native error this failure was classified from, when it arose locally.
     pub(crate) fn native_io(&self) -> Option<&io::Error> {

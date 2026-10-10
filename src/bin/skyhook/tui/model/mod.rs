@@ -13,7 +13,7 @@ pub use super::format::{Clean, Clock, Timing, clean, footer, number, pretty, spa
 pub use cache::ContentCache;
 pub use entries::entries;
 pub use jobs::{state_glyph, state_name, state_role, target_suffix};
-pub use projection::{AgentDisplayState, AgentInfo, JobInfo, Projection, WaitReason};
+pub use projection::{AgentDisplayState, AgentInfo, Projection, WaitReason, open_jobs};
 pub use requests::{RequestRow, RequestStatus};
 
 use super::tool_view::{Document, Role, Run};
@@ -22,7 +22,7 @@ use skyhook::provider::protocol::BlockRef;
 use skyhook::session::{MessageSeq, RecordSeq, RequestSeq};
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Tab {
     #[default]
     Conversation,
@@ -81,6 +81,8 @@ pub enum EntryKey {
     Job(JobId),
     Working(AgentId),
     UnsavedStatus(usize),
+    /// The failure that stopped the session.
+    JournalFailed,
 }
 
 #[derive(Default)]
@@ -100,8 +102,33 @@ impl View {
         self.overrides.insert(key, expanded);
     }
 
-    pub fn clear_collapsed(&mut self) {
+    fn clear_collapsed(&mut self) {
         self.overrides.retain(|_, expanded| *expanded);
+    }
+}
+/// Each agent's reading state, kept apart per inspector tab.
+#[derive(Default)]
+pub struct Views(HashMap<AgentId, HashMap<Tab, View>>);
+impl Views {
+    pub fn get(&self, agent: &AgentId, tab: Tab) -> Option<&View> {
+        self.0.get(agent)?.get(&tab)
+    }
+
+    pub fn get_mut(&mut self, agent: &AgentId, tab: Tab) -> &mut View {
+        let tabs = self.0.entry(agent.clone()).or_default();
+        tabs.entry(tab).or_default()
+    }
+
+    /// Every tab's view of `from` becomes `to`'s.
+    pub fn transfer(&mut self, from: &AgentId, to: AgentId) {
+        if let Some(tabs) = self.0.remove(from) {
+            self.0.insert(to, tabs);
+        }
+    }
+
+    pub fn clear_collapsed(&mut self) {
+        let views = self.0.values_mut().flat_map(HashMap::values_mut);
+        views.for_each(View::clear_collapsed);
     }
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -403,26 +430,16 @@ pub struct EntryView<'a> {
 mod tests {
     use super::super::tool_view::Run;
     use super::*;
-    use crate::tui::{
-        app::{
-            App, OutputStore,
-            tests::{model_context, requested},
-        },
-        tool_view::tests::view,
-    };
+    use crate::tui::{app::OutputStore, tool_view::tests::view};
     use skyhook::agent::{ObservationSnapshot, ObservedEvent, RuntimeEvent};
     use skyhook::identity::SessionId;
-    use skyhook::job::{JobRole, JobState};
-    use skyhook::provider::protocol::{
-        AssistantItem, Binding, BlockRef, ItemKind, Provenance, Replay, ReplayFormat,
-        ResponseEvent, Scope, ToolCall, ToolResult,
-    };
-    use skyhook::session::{Message, MessageSeq, RecordSeq, RequestSeq, SessionEvent, UserPart};
+    use skyhook::provider::protocol::{Binding, Provenance, Replay, ReplayFormat, Scope};
 
     /// Install a job view of `fields` as `job`'s output through the store's refresh path.
     pub(super) fn loaded(outputs: &mut OutputStore, job: JobId, fields: serde_json::Value) {
         let (attempt, _) = outputs.begin(job).unwrap();
-        outputs.complete(attempt, true, Ok(view(fields)));
+        let first = skyhook::job::Invocation::default();
+        outputs.complete(attempt, Some(first), Ok(view(fields)));
     }
 
     pub(super) fn header_text(runs: &[Run]) -> String {
@@ -441,157 +458,6 @@ mod tests {
         });
     }
 
-    /// A journal whose sequences a real session minted: the app fixture's session
-    /// appends every record, and the snapshot folds it as an observer would.
-    pub(super) struct Journal {
-        _root: tempfile::TempDir,
-        app: App,
-        pub(super) snapshot: ObservationSnapshot,
-    }
-
-    /// A journaled request and the model context it named.
-    #[derive(Clone, Copy)]
-    pub(super) struct Requested {
-        pub(super) request: RequestSeq,
-        pub(super) context: RecordSeq,
-    }
-
-    impl Journal {
-        pub(super) async fn new() -> Self {
-            let (root, app) = crate::tui::app::tests::fixture().await;
-            Self {
-                _root: root,
-                app,
-                snapshot: ObservationSnapshot::default(),
-            }
-        }
-
-        pub(super) fn agent(&self) -> AgentId {
-            self.app.session().unwrap().root_agent().clone()
-        }
-
-        /// The journal replayed with each record `sequence` seconds past the epoch.
-        pub(super) fn stamped(&self) -> ObservationSnapshot {
-            let mut snapshot = ObservationSnapshot::default();
-            for record in self.snapshot.records.values() {
-                let mut record = record.clone();
-                record.timestamp_millis = record.sequence.get() as i64 * 1000;
-                update(&mut snapshot, RuntimeEvent::Record(Box::new(record)));
-            }
-            snapshot
-        }
-
-        pub(super) async fn record(&mut self, agent: &AgentId, event: SessionEvent) -> RecordSeq {
-            let store = self.app.session().unwrap().store();
-            let record = store.append(agent.clone(), event).await.unwrap();
-            update(
-                &mut self.snapshot,
-                RuntimeEvent::Record(Box::new(record.clone())),
-            );
-            record.sequence
-        }
-
-        pub(super) fn response(
-            &mut self,
-            agent: &AgentId,
-            request: RequestSeq,
-            event: ResponseEvent,
-        ) {
-            let agent = agent.clone();
-            update(
-                &mut self.snapshot,
-                RuntimeEvent::ResponseEvent {
-                    agent,
-                    request,
-                    event,
-                },
-            );
-        }
-
-        /// Stream `text` into the `text` (or `reasoning`) item of a request.
-        pub(super) fn delta(
-            &mut self,
-            agent: &AgentId,
-            request: RequestSeq,
-            item: &str,
-            text: &str,
-        ) {
-            let kind = if item == "reasoning" {
-                ItemKind::Reasoning
-            } else {
-                ItemKind::Text
-            };
-            let event = ResponseEvent::Delta {
-                block: BlockRef::single(item),
-                kind,
-                text: text.into(),
-            };
-            self.response(agent, request, event);
-        }
-
-        pub(super) async fn call_record(&mut self, agent: &AgentId, id: &str) -> MessageSeq {
-            let args = serde_json::json!({"command":["echo", "  original\ttext\n"]});
-            let call = ToolCall::new(id, "exec", args).unwrap();
-            let message = Message::Assistant(vec![AssistantItem::tool_call("tool", 0, call)]);
-            self.record(agent, SessionEvent::MessageCommitted { message })
-                .await
-                .message()
-        }
-
-        pub(super) async fn result_record(&mut self, agent: &AgentId, id: &str, error: bool) {
-            let result = if error {
-                serde_json::json!({"state": "failed", "error": "Permission was denied"})
-            } else {
-                serde_json::json!({"state": "completed", "result": {"stdout": "  original\ttext\n"}})
-            };
-            let message = Message::Tool(vec![ToolResult {
-                call_id: id.into(),
-                name: "exec".into(),
-                result,
-                images: vec![],
-                is_error: error,
-            }]);
-            self.record(agent, SessionEvent::MessageCommitted { message })
-                .await;
-        }
-
-        /// Record a model request and its first attempt, creating a fresh model
-        /// context unless one is given.
-        pub(super) async fn request(
-            &mut self,
-            agent: &AgentId,
-            context: Option<RecordSeq>,
-        ) -> Requested {
-            let context = match context {
-                Some(context) => context,
-                None => {
-                    let profile = skyhook::session::ProfileSnapshot {
-                        name: "test/fixture".parse().unwrap(),
-                        profile: skyhook::provider::profile::ModelProfile::new(
-                            "fixture-model".parse().unwrap(),
-                            None,
-                            128_000.try_into().unwrap(),
-                            100.try_into().unwrap(),
-                            false,
-                        ),
-                    };
-                    self.record(agent, model_context(profile)).await
-                }
-            };
-            let text = "original request".into();
-            let message = Message::User(vec![UserPart::Text { text }]);
-            let request = self.record(agent, requested(context, vec![message]));
-            let request = request.await.request();
-            let attempt = skyhook::session::AttemptRef {
-                request,
-                attempt: 1,
-            };
-            self.record(agent, SessionEvent::ModelAttemptStarted(attempt))
-                .await;
-            Requested { request, context }
-        }
-    }
-
     pub(super) fn replay() -> Replay {
         Replay {
             provenance: Provenance {
@@ -601,48 +467,6 @@ mod tests {
             },
             payload: serde_json::json!({"signature": "opaque"}),
             binding: Binding::Free,
-        }
-    }
-
-    pub(super) fn created(id: u64, tool: &str, role: JobRole) -> SessionEvent {
-        SessionEvent::JobCreated {
-            job: JobId::new(id).unwrap(),
-            parent: None,
-            origin: None,
-            tool: tool.into(),
-            role,
-            name: None,
-            arguments: serde_json::json!({"command": ["true"]}),
-            output_schema: None,
-            accepts_input: role == JobRole::Agent,
-            background: false,
-            location: skyhook::execution::ExecutionLocation::root("/workspace".into()),
-        }
-    }
-
-    pub(super) fn finished(id: u64) -> SessionEvent {
-        SessionEvent::JobFinished {
-            job: JobId::new(id).unwrap(),
-            state: skyhook::job::JobEnd::Completed,
-            diagnostic: None,
-            output_diagnostic: None,
-            images: Vec::new(),
-        }
-    }
-
-    pub(super) fn job_info(agent: &AgentId, id: u64, role: JobRole, state: JobState) -> JobInfo {
-        JobInfo {
-            id: JobId::new(id).unwrap(),
-            agent: agent.clone(),
-            name: None,
-            tool: "exec".into(),
-            role,
-            args: serde_json::json!({"command":["echo"]}),
-            parent: None,
-            state,
-            location: skyhook::execution::ExecutionLocation::root("/workspace".into()),
-            error: None,
-            timing: Timing::Untimed,
         }
     }
 }

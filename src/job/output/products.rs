@@ -355,6 +355,8 @@ pub struct PresentedOutput {
     /// Captures absent from a whole presentation, in the descriptor's stable
     /// order. Hydration is opt-in through `inspect_output_with_captures`.
     pub(super) capture_targets: Vec<HydrationTarget>,
+    /// The pending delivery a model-facing read presented.
+    pub(crate) acknowledges: Option<crate::job::Delivery>,
 }
 
 /// A capture host inspection pages into its descriptor.

@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 20). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 21). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 --
@@ -46,7 +46,7 @@ CREATE TABLE agent (
 CREATE UNIQUE INDEX agent_single_root ON agent((parent IS NULL)) WHERE parent IS NULL;
 
 -- Subtype tables narrow kind to the kinds they hold. Activity kinds are the session's
--- activity; reopening and closing it are not.
+-- activity; closing it, which interrupts its agents, is not.
 CREATE TABLE entry_kind (
   name TEXT PRIMARY KEY,
   activity INTEGER NOT NULL CHECK (activity IN (0,1))
@@ -64,8 +64,8 @@ CREATE UNIQUE INDEX entry_one_agent_start ON entry(agent) WHERE kind = 'agent_st
 -- An agent's latest entry of a kind, for state read without decoding the journal.
 CREATE INDEX entry_agent_kind ON entry(agent, kind);
 
--- Status text. agent_completed / agent_interrupted / session_started / session_reopened /
--- title_cleared carry no subtype row.
+-- Status text. agent_completed / agent_interrupted / session_started / title_cleared carry
+-- no subtype row.
 CREATE TABLE entry_text (
   entry INTEGER PRIMARY KEY,
   kind TEXT GENERATED ALWAYS AS ('status') VIRTUAL,
@@ -494,19 +494,12 @@ CREATE TABLE failure (
   provider TEXT REFERENCES provider_error_kind(name),
   -- A model failure is its attempt's outcome; NULL leaves an agent failure unlinked.
   outcome TEXT GENERATED ALWAYS AS (CASE kind WHEN 'model_failed' THEN kind END) VIRTUAL,
+  -- The backoff before a retried model failure's next attempt; only a provider failure retries.
+  retry_millis INTEGER CHECK (retry_millis >= 0),
   CHECK ((failure = 'provider') = (provider IS NOT NULL)),
+  CHECK (retry_millis IS NULL OR (outcome IS NOT NULL AND provider IS NOT NULL)),
   FOREIGN KEY (failure, detailed) REFERENCES failure_kind(name, detailed),
   FOREIGN KEY (entry, outcome) REFERENCES attempt_outcome(entry, kind),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
-) STRICT;
-
-CREATE TABLE model_recovery (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('model_recovery_scheduled') VIRTUAL,
-  failure INTEGER NOT NULL UNIQUE,
-  failure_kind TEXT GENERATED ALWAYS AS ('model_failed') VIRTUAL,
-  delay_millis INTEGER NOT NULL CHECK (delay_millis >= 0),
-  FOREIGN KEY (failure, failure_kind) REFERENCES attempt_outcome(entry, kind),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
@@ -630,7 +623,8 @@ CREATE TABLE job_run (
   PRIMARY KEY (job, generation)
 ) STRICT, WITHOUT ROWID;
 
--- Output belongs to one run: a reset never presents an earlier run's output.
+-- Output belongs to one run, saved once with its finish: a reset never presents an
+-- earlier run's output.
 CREATE TABLE job_output (
   job INTEGER NOT NULL,
   generation INTEGER NOT NULL,
@@ -639,8 +633,6 @@ CREATE TABLE job_output (
   -- The tool's result, NULL when the run produced none ('null' is a literal null);
   -- referenced captures are emptied placeholders.
   result TEXT CHECK (result IS NULL OR json_valid(result)),
-  -- Bytes of the result's automatic presentation, measured once it is saved.
-  presented_bytes INTEGER CHECK (presented_bytes >= 0),
   PRIMARY KEY (job, generation),
   FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
 ) STRICT;
@@ -696,9 +688,8 @@ CREATE TABLE job_output_field (
   generation INTEGER NOT NULL,
   capture INTEGER NOT NULL,
   PRIMARY KEY (job, generation, capture),
-  FOREIGN KEY (job, generation) REFERENCES job_output(job, generation) ON DELETE CASCADE,
-  FOREIGN KEY (capture, job, generation)
-    REFERENCES job_capture(id, job, generation) ON DELETE CASCADE
+  FOREIGN KEY (job, generation) REFERENCES job_output(job, generation),
+  FOREIGN KEY (capture, job, generation) REFERENCES job_capture(id, job, generation)
 ) STRICT, WITHOUT ROWID;
 CREATE INDEX job_output_field_capture ON job_output_field(capture);
 
@@ -712,7 +703,7 @@ CREATE TABLE job_field_presentation (
   pointer TEXT NOT NULL,
   presentation TEXT NOT NULL REFERENCES field_presentation(name),
   PRIMARY KEY (job, generation, pointer),
-  FOREIGN KEY (job, generation) REFERENCES job_run(job, generation)
+  FOREIGN KEY (job, generation) REFERENCES job_output(job, generation)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_finish (
@@ -818,64 +809,5 @@ CREATE TABLE job_delivery (
   notification INTEGER REFERENCES message_commit(entry),
   CHECK ((kind = 'job_message_delivered') = (source IS NOT NULL)),
   CHECK ((kind = 'job_message_delivered') = (notification IS NOT NULL)),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
-) STRICT;
-
--- ───────────────────────── Approvals ─────────────────────────
-
-CREATE TABLE approval_coverage (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
-CREATE TABLE resource_kind (
-  name TEXT PRIMARY KEY,
-  target INTEGER NOT NULL CHECK (target IN (0,1)),
-  UNIQUE (name, target)
-) STRICT, WITHOUT ROWID;
-
--- One ResourceId per grant: target is the execution target of a workspace, path or
--- network resource and the destination of a route; path components and route hops
--- are the child tables.
-CREATE TABLE approval_grant (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('approval_granted') VIRTUAL,
-  capability TEXT NOT NULL REFERENCES capability(name),
-  resource_kind TEXT NOT NULL,
-  target INTEGER REFERENCES target(id),
-  path TEXT,
-  origin TEXT,
-  session_name TEXT,
-  mcp_server TEXT,
-  mcp_tool TEXT,
-  coverage TEXT NOT NULL REFERENCES approval_coverage(name),
-  has_target INTEGER GENERATED ALWAYS AS (target IS NOT NULL) VIRTUAL,
-  FOREIGN KEY (resource_kind, has_target) REFERENCES resource_kind(name, target),
-  CHECK ((resource_kind = 'workspace') = (path IS NOT NULL)),
-  CHECK ((resource_kind = 'network') = (origin IS NOT NULL)),
-  CHECK ((resource_kind = 'session') = (session_name IS NOT NULL)),
-  CHECK ((resource_kind = 'mcp') = (mcp_server IS NOT NULL)),
-  CHECK ((resource_kind = 'mcp') = (mcp_tool IS NOT NULL)),
-  FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
-) STRICT;
-
-CREATE TABLE approval_grant_path_component (
-  grant_entry INTEGER NOT NULL REFERENCES approval_grant(entry),
-  position INTEGER NOT NULL CHECK (position >= 0),
-  component TEXT NOT NULL,
-  PRIMARY KEY (grant_entry, position)
-) STRICT, WITHOUT ROWID;
-
--- Hops name journaled target revisions; root is never a hop.
-CREATE TABLE approval_grant_route_hop (
-  grant_entry INTEGER NOT NULL REFERENCES approval_grant(entry),
-  position INTEGER NOT NULL CHECK (position >= 0),
-  target INTEGER NOT NULL REFERENCES target(id),
-  revision INTEGER NOT NULL,
-  PRIMARY KEY (grant_entry, position),
-  FOREIGN KEY (target, revision) REFERENCES target_revision(target, revision)
-) STRICT, WITHOUT ROWID;
-
--- Revocations are written in the same transaction as the targets_upserted that causes them.
-CREATE TABLE approval_revocation (
-  entry INTEGER PRIMARY KEY,
-  kind TEXT GENERATED ALWAYS AS ('approval_revoked') VIRTUAL,
-  grant_entry INTEGER NOT NULL UNIQUE REFERENCES approval_grant(entry),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;

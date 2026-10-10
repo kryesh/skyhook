@@ -133,10 +133,11 @@ limit, so `output_limit: omitted` is refused there.
 Every model profile requires `max_context` and `max_output`. Both must be positive, and
 `max_output` must be smaller than `max_context`. Prompt/history, reasoning, and generated
 text share the context window. Automatic [compaction](../guide/sessions-and-context.md#conversation-compaction)
-runs directly after a response when its reported input, cached input, and output tokens reach
+is triggered by a response whose reported input, cached input, and output tokens reach
 90% of `max_context - max_output`; it does not estimate the next request. Compaction precedes
-tool execution. The summarizer sees the pending calls, and their results reach the first
-post-compaction request intact; a pending `todo` replacement is superseded by its reconciled list.
+tool execution, or, after a final answer, the agent's next request. The summarizer sees the
+pending calls, and their results reach the first post-compaction request intact; a pending `todo`
+replacement is superseded by its reconciled list.
 A `max_output` of at least 50% of `max_context` produces a startup warning for that model, whether
 or not it is selected: reserving that much output space leaves most of the window unused for
 input. The configuration remains valid.

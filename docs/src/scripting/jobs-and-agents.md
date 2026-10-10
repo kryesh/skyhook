@@ -34,8 +34,9 @@ make another model request until its foreground calls return.
 
 Child names are scoped to their caller: `A` and `B` may each create a child named `worker`, but
 all scripts owned by `A` share `A`'s child-name scope. A child retains its name even after
-termination; send follow-ups to its existing job instead of launching a duplicate. A failed
-launch that never created a child does not permanently reserve the name.
+termination; send follow-ups to its existing job instead of launching a duplicate. A launch
+that created no child holds no name: of two launches taking one name at once, the first to start
+its child keeps it.
 
 Each model-facing `ask` contains one `{id, prompt, options?}` question; independent concurrent calls are merged by the runtime. A child
 question batch changes its stable agent job to `waiting_input`; answer that job with
@@ -82,8 +83,9 @@ question has `state: "waiting_input"`; `jobs({job})` returns its stable question
 
 Jobs normally follow `queued → running → completed`, optionally cycling through
 `waiting_input → running`; `failed`, `cancelled`, and `interrupted` are terminal alternatives.
-A `jobs({job})` read acknowledges a pending question or terminal result and suppresses duplicate
-automatic notification. Explicit reads remain repeatable, and `jobs` itself never waits; see
+A `jobs({job})` read acknowledges the question or result it returned, suppressing duplicate
+automatic notification; an outcome that arrives after the read is still notified. Explicit reads
+remain repeatable, and `jobs` itself never waits; see
 [waiting for background work](#waiting-for-background-work).
 Unanswered questions do not expire. Send answers to the stable child-agent job ID.
 

@@ -1,17 +1,15 @@
 //! Host-only observation. A snapshot and its receiver share an atomic revision boundary.
 use super::{RuntimeEvent, TurnFailure};
 use crate::{
-    identity::AgentId,
+    identity::{AgentId, JobId},
+    job::{JobEnvelope, JobState},
     provider::protocol::{LiveBlock, LiveResponse, Step},
     session::{
-        EventRecord, MessageSeq, ModelPurpose, RecordSeq, RequestLedger, RequestPhase, RequestSeq,
-        SessionEvent,
+        EventRecord, MessageSeq, RecordSeq, RequestLedger, RequestPhase, RequestSeq, SessionEvent,
+        SessionPhase,
     },
 };
-use std::{
-    collections::{BTreeMap, HashMap},
-    sync::{Arc, Mutex},
-};
+use std::collections::{BTreeMap, HashMap};
 use tokio::sync::broadcast;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -131,14 +129,22 @@ impl ObservedResponse {
 
 #[derive(Clone, Debug, Default)]
 pub struct ObservationSnapshot {
+    /// Where the session is in its life. Once its work stops, as a crash stops
+    /// it, every turn, response and job it left going reads as interrupted at
+    /// its last activity, as reopening settles them.
+    pub phase: SessionPhase,
     pub revision: u64,
     pub records: BTreeMap<RecordSeq, EventRecord>,
     /// Every request's lifecycle, folded from `records`.
     pub ledger: RequestLedger,
+    /// Every job, as the session's state holds it.
+    pub jobs: BTreeMap<JobId, JobEnvelope>,
     pub responses: HashMap<(AgentId, RequestSeq), ObservedResponse>,
     pub activity: HashMap<AgentId, ObservedActivity>,
     pub context: HashMap<AgentId, ContextUsage>,
 }
+
+pub(crate) type Responses = HashMap<(AgentId, RequestSeq), ObservedResponse>;
 
 impl ObservationSnapshot {
     /// Idempotent journal projection; live deltas are applied once by revision.
@@ -147,172 +153,174 @@ impl ObservationSnapshot {
             return;
         }
         self.revision = update.revision;
-        self.reduce(update.event);
-    }
-
-    fn reduce(&mut self, event: RuntimeEvent) {
-        match event {
+        match update.event {
             RuntimeEvent::Record(record) => {
                 if self.records.contains_key(&record.sequence) {
                     return;
                 }
-                let changed = self.ledger.observe(&record).into_iter().next().is_some();
-                let agent = &record.agent;
-                match &record.event {
-                    SessionEvent::ModelAttemptStarted(attempt) => {
-                        // One logical request survives retries; native item/block
-                        // IDs may be reused. Clear only the displayed response,
-                        // never the journal's per-attempt audit records.
-                        let key = (agent.clone(), attempt.request);
-                        self.responses.insert(key, ObservedResponse::default());
-                    }
-                    SessionEvent::AgentCompleted => {
-                        self.end_turn(agent, AgentActivity::Idle, record.timestamp_millis);
-                    }
-                    SessionEvent::AgentInterrupted => {
-                        let stopped = AgentActivity::Stopped(TurnFailure::Interrupted);
-                        self.end_turn(agent, stopped, record.timestamp_millis);
-                    }
-                    SessionEvent::AgentFailed { failure } => {
-                        let stopped = AgentActivity::Stopped(failure.clone().into());
-                        self.end_turn(agent, stopped, record.timestamp_millis);
-                    }
-                    SessionEvent::ModelFailed { attempt, failure } => {
-                        // The runtime's own settlement is authoritative and may
-                        // arrive before or after this record. An abort commits its
-                        // partial message before journaling the failure: that
-                        // commit is the attempt's settlement, and a committed
-                        // response is retired, never revived as one that committed
-                        // nothing.
-                        let key = (agent.clone(), attempt.request);
-                        let committed = self.ledger.get(attempt.request).is_some_and(|request| {
-                            matches!(
-                                request.phase,
-                                RequestPhase::Failed {
-                                    message: Some(_),
-                                    ..
-                                }
-                            )
-                        });
-                        if committed {
-                            self.responses.remove(&key);
-                        } else {
-                            let response = self.responses.entry(key).or_default();
-                            if response.settlement().is_none() {
-                                response.settle(Settlement::Failed(failure.clone().into()));
-                            }
-                        }
-                    }
-                    SessionEvent::MessageCommitted { .. } => {
-                        self.responses.retain(|_, response| {
-                            !matches!(
-                                response.settlement(),
-                                Some(Settlement::Committed(message) | Settlement::Aborted(message))
-                                    if RecordSeq::from(*message) == record.sequence
-                            )
-                        });
-                    }
-                    _ => {}
-                }
-                if changed {
-                    self.follow_request(&record.agent, record.timestamp_millis);
-                }
+                let views = Views {
+                    ledger: &mut self.ledger,
+                    responses: &mut self.responses,
+                };
+                views.record(&record);
                 self.records.insert(record.sequence, *record);
             }
-            RuntimeEvent::ResponseEvent {
-                agent,
-                request,
-                event,
-            } => {
-                let response = self.responses.entry((agent, request)).or_default();
-                if let ObservedResponse::Streaming(live) = response {
-                    *response = match std::mem::take(live).push(event) {
-                        Step::Open(live) => ObservedResponse::Streaming(live),
-                        Step::Ended { blocks, .. } => ObservedResponse::Ended(blocks),
-                    };
-                }
+            RuntimeEvent::Job(job) => {
+                self.jobs.insert(job.id, *job);
             }
-            RuntimeEvent::ResponseSettled {
-                agent,
-                request,
-                settlement,
-            } => {
-                let key = (agent, request);
-                match settlement {
-                    Settlement::Committed(message) | Settlement::Aborted(message)
-                        if self.records.contains_key(&message.into()) =>
-                    {
-                        self.responses.remove(&key);
-                    }
-                    how => self.responses.entry(key).or_default().settle(how),
-                }
+            RuntimeEvent::Phase(phase) => self.phase = phase,
+            event => {
+                let records = &self.records;
+                let committed = |sequence: RecordSeq| records.contains_key(&sequence);
+                live(
+                    &mut self.responses,
+                    Some(&mut self.activity),
+                    &mut self.context,
+                    committed,
+                    event,
+                );
             }
-            RuntimeEvent::Activity {
-                agent,
-                activity,
-                at,
-            } => {
-                if let AgentActivity::Stopped(failure) = &activity {
-                    for ((owner, _), response) in &mut self.responses {
-                        if owner == &agent && response.settlement().is_none() {
-                            response.settle(Settlement::Failed(failure.clone()));
-                        }
-                    }
-                }
-                self.set_activity(&agent, activity, at);
-            }
-            RuntimeEvent::Context { agent, usage } => {
-                self.context.insert(agent, usage);
-            }
-            RuntimeEvent::TurnCompleted { .. } => {}
         }
+        self.read_phase();
     }
 
-    /// Before the runtime reports an agent, and while it reports it in a model
-    /// request, the agent's pending request gives its activity: a scheduled recovery
-    /// reconnects and a compaction compacts. Records never move a reported agent into
-    /// or out of a request, so one forwarded late cannot regress newer activity.
-    fn follow_request(&mut self, agent: &AgentId, at: i64) {
-        let in_request = self.activity.get(agent).is_none_or(|activity| {
-            matches!(
-                activity.state,
-                AgentActivity::Working
-                    | AgentActivity::Compacting
-                    | AgentActivity::Reconnecting { .. }
-            )
-        });
-        let open = self
-            .ledger
-            .open(agent)
-            .and_then(|request| self.ledger.get(request));
-        let (true, Some(request)) = (in_request, open) else {
+    /// Read what a session whose work stopped left going as interrupted at its
+    /// last activity.
+    pub(crate) fn read_phase(&mut self) {
+        let Some(at) = self.phase.stopped_at(self.records.values()) else {
             return;
         };
-        let activity = match (&request.phase, request.purpose) {
-            (RequestPhase::Retrying { attempt, .. }, _) => AgentActivity::Reconnecting {
-                attempt: attempt.saturating_add(1),
-            },
-            (_, ModelPurpose::Compaction) => AgentActivity::Compacting,
-            _ => AgentActivity::Working,
-        };
-        self.set_activity(agent, activity, at);
+        for response in self.responses.values_mut() {
+            if response.settlement().is_none() {
+                response.settle(Settlement::Failed(TurnFailure::Interrupted));
+            }
+        }
+        self.jobs.values_mut().for_each(|job| read_job(job, at));
     }
+}
 
-    /// A change within a turn keeps its start; entering or leaving one moves it.
-    fn set_activity(&mut self, agent: &AgentId, state: AgentActivity, at: i64) {
-        let since = match self.activity.get(agent) {
-            Some(current) if current.state.is_busy() == state.is_busy() => current.since,
-            _ => at,
-        };
-        self.activity
-            .insert(agent.clone(), ObservedActivity { state, since });
+/// Read a job a stopped session left going as interrupted at its last activity,
+/// `at`.
+pub(crate) fn read_job(job: &mut JobEnvelope, at: i64) {
+    if !job.state.is_terminal() {
+        job.state = JobState::Interrupted;
+        job.timing = job.timing.after(JobState::Interrupted, at);
     }
+}
 
-    /// A turn's end record ends it at its own time, whether or not this snapshot saw
-    /// the turn begin: replay never does once an earlier turn has ended.
-    fn end_turn(&mut self, agent: &AgentId, state: AgentActivity, at: i64) {
-        self.activity
-            .insert(agent.clone(), ObservedActivity { state, since: at });
+/// What observers fold from each committed record beside the record itself.
+pub(crate) struct Views<'a> {
+    pub(crate) ledger: &'a mut RequestLedger,
+    pub(crate) responses: &'a mut Responses,
+}
+
+impl Views<'_> {
+    pub(crate) fn record(self, record: &EventRecord) {
+        self.ledger.observe(record);
+        let agent = &record.agent;
+        match &record.event {
+            SessionEvent::ModelAttemptStarted(attempt) => {
+                // One logical request survives retries; native item/block
+                // IDs may be reused. Clear only the displayed response,
+                // never the journal's per-attempt audit records.
+                let key = (agent.clone(), attempt.request);
+                self.responses.insert(key, ObservedResponse::default());
+            }
+            SessionEvent::ModelFailed { attempt, failure } => {
+                // The runtime's own settlement is authoritative and may
+                // arrive before or after this record. An abort commits its
+                // partial message before journaling the failure: that
+                // commit is the attempt's settlement, and a committed
+                // response is retired, never revived as one that committed
+                // nothing.
+                let key = (agent.clone(), attempt.request);
+                let committed = self.ledger.get(attempt.request).is_some_and(|request| {
+                    matches!(
+                        request.phase,
+                        RequestPhase::Failed {
+                            message: Some(_),
+                            ..
+                        }
+                    )
+                });
+                if committed {
+                    self.responses.remove(&key);
+                } else {
+                    let response = self.responses.entry(key).or_default();
+                    if response.settlement().is_none() {
+                        response.settle(Settlement::Failed(failure.failure().into()));
+                    }
+                }
+            }
+            SessionEvent::MessageCommitted { .. } => {
+                self.responses.retain(|_, response| {
+                    !matches!(
+                        response.settlement(),
+                        Some(Settlement::Committed(message) | Settlement::Aborted(message))
+                            if RecordSeq::from(*message) == record.sequence
+                    )
+                });
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Fold a live update the journal does not carry; `committed` tells whether a
+/// record is in the journal yet.
+pub(crate) fn live(
+    responses: &mut Responses,
+    activities: Option<&mut HashMap<AgentId, ObservedActivity>>,
+    context: &mut HashMap<AgentId, ContextUsage>,
+    committed: impl Fn(RecordSeq) -> bool,
+    event: RuntimeEvent,
+) {
+    match event {
+        RuntimeEvent::Record(_)
+        | RuntimeEvent::Job(_)
+        | RuntimeEvent::TurnCompleted { .. }
+        | RuntimeEvent::Phase(_) => {}
+        RuntimeEvent::ResponseEvent {
+            agent,
+            request,
+            event,
+        } => {
+            let response = responses.entry((agent, request)).or_default();
+            if let ObservedResponse::Streaming(live) = response {
+                *response = match std::mem::take(live).push(event) {
+                    Step::Open(live) => ObservedResponse::Streaming(live),
+                    Step::Ended { blocks, .. } => ObservedResponse::Ended(blocks),
+                };
+            }
+        }
+        RuntimeEvent::ResponseSettled {
+            agent,
+            request,
+            settlement,
+        } => {
+            let key = (agent, request);
+            match settlement {
+                Settlement::Committed(message) | Settlement::Aborted(message)
+                    if committed(message.into()) =>
+                {
+                    responses.remove(&key);
+                }
+                how => responses.entry(key).or_default().settle(how),
+            }
+        }
+        RuntimeEvent::Activity { agent, activity } => {
+            if let AgentActivity::Stopped(failure) = &activity.state {
+                for ((owner, _), response) in responses.iter_mut() {
+                    if owner == &agent && response.settlement().is_none() {
+                        response.settle(Settlement::Failed(failure.clone()));
+                    }
+                }
+            }
+            activities.map(|activities| activities.insert(agent, activity));
+        }
+        RuntimeEvent::Context { agent, usage } => {
+            context.insert(agent, usage);
+        }
     }
 }
 
@@ -327,63 +335,12 @@ pub struct Observation {
     pub updates: broadcast::Receiver<ObservedEvent>,
 }
 
-/// Updates an observer may fall behind by before it lags.
-const OBSERVATION_CAPACITY: usize = 1024;
-
-#[derive(Clone)]
-pub(crate) struct RuntimeEvents {
-    inner: Arc<Mutex<ObservationSnapshot>>,
-    updates: broadcast::Sender<ObservedEvent>,
-}
-
-impl RuntimeEvents {
-    pub fn new(records: &[EventRecord]) -> Self {
-        let mut snapshot = ObservationSnapshot::default();
-        for record in records {
-            snapshot.reduce(RuntimeEvent::Record(Box::new(record.clone())));
-        }
-        snapshot.context = super::runtime::recorded_context(records, &snapshot.ledger);
-        Self {
-            inner: Arc::new(Mutex::new(snapshot)),
-            updates: broadcast::channel(OBSERVATION_CAPACITY).0,
-        }
-    }
-
-    pub fn observe(&self) -> Observation {
-        let state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        Observation {
-            snapshot: state.clone(),
-            updates: self.updates.subscribe(),
-        }
-    }
-
-    /// Read the ledger folded from every record observed so far.
-    pub fn ledger<R>(&self, read: impl FnOnce(&RequestLedger) -> R) -> R {
-        read(&self.inner.lock().unwrap_or_else(|e| e.into_inner()).ledger)
-    }
-
-    pub fn send(&self, event: RuntimeEvent) {
-        let mut state = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        if let RuntimeEvent::Record(record) = &event
-            && state.records.contains_key(&record.sequence)
-        {
-            return;
-        }
-        state.revision += 1;
-        state.reduce(event.clone());
-        let _ = self.updates.send(ObservedEvent {
-            revision: state.revision,
-            event,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::Failure;
     use crate::session::{
-        AttemptRef, Message, ModelContext,
+        AttemptFailure, AttemptRef, Message, ModelContext, ModelPurpose,
         tests::{self, attempt, requested},
     };
     use crate::{
@@ -391,24 +348,35 @@ mod tests {
         provider::protocol::{BlockRef, ItemKind, ResponseEvent},
     };
 
-    /// Journals `event` at `sequence` seconds past the epoch.
-    fn record(hub: &RuntimeEvents, agent: &AgentId, sequence: u64, event: SessionEvent) {
-        let mut record = tests::record(agent, sequence, event);
-        record.timestamp_millis = sequence as i64 * 1000;
-        hub.send(RuntimeEvent::Record(Box::new(record)));
+    /// An observer fed updates one at a time.
+    type Hub = std::cell::RefCell<ObservationSnapshot>;
+
+    /// Apply `event` to `hub` as its next update.
+    fn send(hub: &Hub, event: RuntimeEvent) -> ObservedEvent {
+        let revision = hub.borrow().revision + 1;
+        let update = ObservedEvent { revision, event };
+        hub.borrow_mut().apply(update.clone());
+        update
     }
 
-    fn activity(hub: &RuntimeEvents, agent: &AgentId, activity: AgentActivity, at: i64) {
-        let agent = agent.clone();
-        hub.send(RuntimeEvent::Activity {
-            agent,
-            activity,
-            at,
-        });
+    /// A fresh observer's fold of `records`.
+    fn replayed<'a>(records: impl IntoIterator<Item = &'a EventRecord>) -> ObservationSnapshot {
+        let hub = Hub::default();
+        for record in records {
+            send(&hub, RuntimeEvent::Record(Box::new(record.clone())));
+        }
+        hub.into_inner()
+    }
+
+    /// Journals `event` at `sequence` seconds past the epoch.
+    fn record(hub: &Hub, agent: &AgentId, sequence: u64, event: SessionEvent) -> ObservedEvent {
+        let mut record = tests::record(agent, sequence, event);
+        record.timestamp_millis = sequence as i64 * 1000;
+        send(hub, RuntimeEvent::Record(Box::new(record)))
     }
 
     /// Journals request `request` for `purpose`, its context just before it.
-    fn request(hub: &RuntimeEvents, agent: &AgentId, request: u64, purpose: ModelPurpose) {
+    fn request(hub: &Hub, agent: &AgentId, request: u64, purpose: ModelPurpose) {
         let context = ModelContext::test(purpose, tests::profile());
         record(
             hub,
@@ -420,7 +388,7 @@ mod tests {
     }
 
     /// Journals `request` and starts its first attempt just after it.
-    fn request_attempt(hub: &RuntimeEvents, agent: &AgentId, request: u64) {
+    fn request_attempt(hub: &Hub, agent: &AgentId, request: u64) {
         self::request(hub, agent, request, ModelPurpose::Agent);
         record(hub, agent, request + 1, attempt(request.into(), 1));
     }
@@ -431,14 +399,22 @@ mod tests {
                 request: request.into(),
                 attempt,
             },
-            failure: transport(error),
+            failure: AttemptFailure::Final(transport(error)),
         }
     }
 
-    fn scheduled(failure: u64) -> SessionEvent {
-        SessionEvent::ModelRecoveryScheduled {
-            failure: failure.into(),
-            delay_millis: 1000,
+    /// A failure the runtime retries a second later.
+    fn retried(request: u64, attempt: u64) -> SessionEvent {
+        SessionEvent::ModelFailed {
+            attempt: AttemptRef {
+                request: request.into(),
+                attempt,
+            },
+            failure: AttemptFailure::Retrying {
+                message: "connection lost".into(),
+                kind: crate::provider::ProviderErrorKind::Transport,
+                delay: std::time::Duration::from_secs(1).into(),
+            },
         }
     }
 
@@ -448,7 +424,7 @@ mod tests {
         }
     }
 
-    /// A retryable failure, as the runtime schedules recoveries for.
+    /// A retryable failure.
     fn transport(error: &str) -> Failure {
         Failure::Provider(error.into(), crate::provider::ProviderErrorKind::Transport)
     }
@@ -458,142 +434,69 @@ mod tests {
     }
 
     /// Streams `text` into `request`'s text block.
-    fn delta(hub: &RuntimeEvents, agent: &AgentId, request: u64, text: &str) {
+    fn delta(hub: &Hub, agent: &AgentId, request: u64, text: &str) -> ObservedEvent {
         let block = BlockRef::single("text");
         let (kind, text) = (ItemKind::Text, text.into());
-        hub.send(RuntimeEvent::ResponseEvent {
-            agent: agent.clone(),
-            request: request.into(),
-            event: ResponseEvent::Delta { block, kind, text },
-        });
-    }
-
-    #[test]
-    fn replay_shows_each_agents_last_journaled_outcome() {
-        let agent = AgentId::root(SessionId::from_bytes([3; 16]));
-        let refused = Failure::Refused("content filter".into());
-        let failure = SessionEvent::AgentFailed {
-            failure: refused.clone(),
-        };
-        let snapshot = RuntimeEvents::new(&[tests::record(&agent, 1, failure)])
-            .observe()
-            .snapshot;
-        assert_eq!(
-            snapshot.activity[&agent].state,
-            AgentActivity::Stopped(refused.into())
-        );
-    }
-
-    #[test]
-    fn records_refine_only_the_activity_of_a_model_request() {
-        let hub = RuntimeEvents::new(&[]);
-        let agent = AgentId::root(SessionId::from_bytes([4; 16]));
-        let current = || hub.observe().snapshot.activity[&agent].clone();
-        let observed = |state, since| ObservedActivity { state, since };
-        activity(&hub, &agent, AgentActivity::Working, 500);
-        request(&hub, &agent, 2, ModelPurpose::Agent);
-        activity(&hub, &agent, AgentActivity::Tools, 2500);
-        record(&hub, &agent, 3, attempt(2.into(), 1));
-        // Every busy state belongs to the turn that began at 500.
-        assert_eq!(current(), observed(AgentActivity::Tools, 500));
-        activity(&hub, &agent, AgentActivity::Working, 3500);
-        record(&hub, &agent, 4, failed(2, 1, "connection lost"));
-        assert_eq!(current(), observed(AgentActivity::Working, 500));
-        record(&hub, &agent, 5, scheduled(4));
-        assert_eq!(
-            current(),
-            observed(AgentActivity::Reconnecting { attempt: 2 }, 500)
-        );
-        record(&hub, &agent, 6, attempt(2.into(), 2));
-        assert_eq!(current(), observed(AgentActivity::Working, 500));
-        request(&hub, &agent, 8, ModelPurpose::Compaction);
-        assert_eq!(current(), observed(AgentActivity::Compacting, 500));
-        record(&hub, &agent, 9, attempt(8.into(), 1));
-        record(&hub, &agent, 10, failed(8, 1, "connection lost"));
-        record(&hub, &agent, 11, scheduled(10));
-        assert_eq!(current().state, AgentActivity::Reconnecting { attempt: 2 });
-        record(&hub, &agent, 12, SessionEvent::AgentInterrupted);
-        let stopped = observed(AgentActivity::Stopped(TurnFailure::Interrupted), 12_000);
-        assert_eq!(current(), stopped);
-        let records: Vec<_> = hub.observe().snapshot.records.into_values().collect();
-        let replayed = RuntimeEvents::new(&records).observe().snapshot;
-        assert_eq!(replayed.activity[&agent], stopped);
-        activity(&hub, &agent, AgentActivity::Working, 13_000);
-        assert_eq!(current(), observed(AgentActivity::Working, 13_000));
-        // A later turn ends at its end record's time, whether the runtime reports
-        // the end before or after it, and so does its replay.
-        request(&hub, &agent, 15, ModelPurpose::Agent);
-        record(&hub, &agent, 16, SessionEvent::AgentCompleted);
-        activity(&hub, &agent, AgentActivity::Idle, 16_500);
-        assert_eq!(current(), observed(AgentActivity::Idle, 16_000));
-        activity(&hub, &agent, AgentActivity::Working, 17_000);
-        activity(&hub, &agent, AgentActivity::Idle, 18_000);
-        record(&hub, &agent, 19, SessionEvent::AgentCompleted);
-        let idle = observed(AgentActivity::Idle, 19_000);
-        assert_eq!(current(), idle);
-        let records: Vec<_> = hub.observe().snapshot.records.into_values().collect();
-        let replayed = RuntimeEvents::new(&records).observe().snapshot;
-        assert_eq!(replayed.activity[&agent], idle);
+        send(
+            hub,
+            RuntimeEvent::ResponseEvent {
+                agent: agent.clone(),
+                request: request.into(),
+                event: ResponseEvent::Delta { block, kind, text },
+            },
+        )
     }
 
     #[test]
     fn snapshot_handoff_and_commit_do_not_duplicate_streams() {
-        let hub = RuntimeEvents::new(&[]);
+        let hub = Hub::default();
         let agent = AgentId::root(SessionId::from_bytes([1; 16]));
         let key = (agent.clone(), 7.into());
         delta(&hub, &agent, 7, "hello");
-        let mut observation = hub.observe();
+        let mut observer = hub.borrow().clone();
         let text =
             |snapshot: &ObservationSnapshot| snapshot.responses[&key].blocks()[0].text.clone();
-        assert_eq!(text(&observation.snapshot), "hello");
-        delta(&hub, &agent, 7, "!");
-        let update = observation.updates.try_recv().unwrap();
-        observation.snapshot.apply(update.clone());
-        observation.snapshot.apply(update);
-        assert_eq!(text(&observation.snapshot), "hello!");
-        hub.send(RuntimeEvent::ResponseSettled {
+        assert_eq!(text(&observer), "hello");
+        let settled = RuntimeEvent::ResponseSettled {
             agent: agent.clone(),
             request: 7.into(),
             settlement: Settlement::Committed(3.into()),
-        });
-        record(&hub, &agent, 3, committed());
-        while let Ok(update) = observation.updates.try_recv() {
-            observation.snapshot.apply(update.clone());
-            observation.snapshot.apply(update);
+        };
+        let updates = [
+            delta(&hub, &agent, 7, "!"),
+            send(&hub, settled),
+            record(&hub, &agent, 3, committed()),
+        ];
+        for (index, update) in updates.into_iter().enumerate() {
+            observer.apply(update.clone());
+            observer.apply(update);
+            if index == 0 {
+                assert_eq!(text(&observer), "hello!");
+            }
         }
-        assert!(observation.snapshot.responses.is_empty());
-        assert_eq!(observation.snapshot.records.len(), 1);
-        assert_eq!(observation.snapshot.revision, 4);
+        assert!(observer.responses.is_empty());
+        assert_eq!(observer.records.len(), 1);
+        assert_eq!(observer.revision, 4);
     }
 
     #[test]
     fn a_retry_keeps_the_failed_partial_output_until_its_next_attempt() {
-        let hub = RuntimeEvents::new(&[]);
+        let hub = Hub::default();
         let agent = AgentId::root(SessionId::from_bytes([2; 16]));
         let key = (agent.clone(), 7.into());
-        let replayed = |snapshot: &ObservationSnapshot| {
-            let records: Vec<_> = snapshot.records.values().cloned().collect();
-            RuntimeEvents::new(&records).observe().snapshot
-        };
-        activity(&hub, &agent, AgentActivity::Working, 0);
+        let replayed = |snapshot: &ObservationSnapshot| replayed(snapshot.records.values());
         request(&hub, &agent, 7, ModelPurpose::Agent);
         delta(&hub, &agent, 7, "partial answer");
-        record(&hub, &agent, 8, failed(7, 1, "connection lost"));
-        record(&hub, &agent, 9, scheduled(8));
-        let snapshot = hub.observe().snapshot;
-        let reconnecting = AgentActivity::Reconnecting { attempt: 2 };
-        assert_eq!(snapshot.activity[&agent].state, reconnecting);
-        // Replay has no runtime to report the agent, so the journal alone does.
-        assert_eq!(replayed(&snapshot).activity[&agent].state, reconnecting);
+        record(&hub, &agent, 8, retried(7, 1));
+        let snapshot = hub.borrow().clone();
         let response = &snapshot.responses[&key];
         assert_eq!(response.settlement(), Some(&lost()));
         assert_eq!(response.blocks()[0].text, "partial answer");
         record(&hub, &agent, 10, attempt(7.into(), 2));
-        // Duplicate journal delivery cannot roll a newer activity back.
-        let recovery = snapshot.records[&9.into()].clone();
-        hub.send(RuntimeEvent::Record(Box::new(recovery)));
-        let started = hub.observe().snapshot;
-        assert_eq!(started.activity[&agent].state, AgentActivity::Working);
+        // Duplicate journal delivery cannot roll a newer response back.
+        let recovery = snapshot.records[&8.into()].clone();
+        send(&hub, RuntimeEvent::Record(Box::new(recovery)));
+        let started = hub.borrow().clone();
         for response in [
             &started.responses[&key],
             &replayed(&started).responses[&key],
@@ -605,31 +508,27 @@ mod tests {
             serde_json::to_value(&snapshot.records[&8.into()]).unwrap()
         };
         assert_eq!(json(&started), json(&snapshot));
-        record(&hub, &agent, 11, SessionEvent::AgentCompleted);
-        let completed = hub.observe().snapshot;
-        assert_eq!(completed.activity[&agent].state, AgentActivity::Idle);
-        assert_eq!(
-            replayed(&completed).activity[&agent].state,
-            AgentActivity::Idle
-        );
     }
 
     /// The runtime's settlement is authoritative in either order against the
     /// journal's `ModelFailed`, and a stop settles only still-open responses.
     #[test]
     fn settlement_survives_its_failure_record_and_stops_settle_open_responses_only() {
-        let hub = RuntimeEvents::new(&[]);
+        let hub = Hub::default();
         let agent = AgentId::root(SessionId::from_bytes([5; 16]));
         let settle = |request: u64, settlement| {
-            hub.send(RuntimeEvent::ResponseSettled {
-                agent: agent.clone(),
-                request: request.into(),
-                settlement,
-            });
+            send(
+                &hub,
+                RuntimeEvent::ResponseSettled {
+                    agent: agent.clone(),
+                    request: request.into(),
+                    settlement,
+                },
+            );
         };
         let response = |request: u64| {
             let key = (agent.clone(), request.into());
-            hub.observe().snapshot.responses.get(&key).cloned()
+            hub.borrow().clone().responses.get(&key).cloned()
         };
         let settlement = |request| response(request).and_then(|r| r.settlement().cloned());
         // An abort commits its partial message and journals ModelFailed together.
@@ -645,8 +544,16 @@ mod tests {
         assert_eq!(settlement(8), Some(Settlement::Committed(6.into())));
         // A stop settles the open response but leaves settled ones alone.
         delta(&hub, &agent, 9, "open");
-        let stopped = AgentActivity::Stopped(TurnFailure::Interrupted);
-        activity(&hub, &agent, stopped, 0);
+        let state = AgentActivity::Stopped(TurnFailure::Interrupted);
+        let activity = ObservedActivity { state, since: 0 };
+        let agent_ = agent.clone();
+        send(
+            &hub,
+            RuntimeEvent::Activity {
+                agent: agent_,
+                activity,
+            },
+        );
         let interrupted = Settlement::Failed(TurnFailure::Interrupted);
         assert_eq!(settlement(9), Some(interrupted));
         assert_eq!(settlement(7), Some(Settlement::Aborted(3.into())));
@@ -667,8 +574,13 @@ mod tests {
             for step in order.split(' ') {
                 match step {
                     "settle" => settle(request, Settlement::Aborted(message.into())),
-                    "commit" => record(&hub, &agent, message, committed()),
-                    "fail" => record(&hub, &agent, request + 3, failed(request, 1, "aborted")),
+                    "commit" => drop(record(&hub, &agent, message, committed())),
+                    "fail" => drop(record(
+                        &hub,
+                        &agent,
+                        request + 3,
+                        failed(request, 1, "aborted"),
+                    )),
                     _ => unreachable!(),
                 }
             }

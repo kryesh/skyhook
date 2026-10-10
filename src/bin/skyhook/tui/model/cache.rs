@@ -2,7 +2,7 @@ use super::entries::{Dep, History, Inputs};
 use super::live::{live_tail, live_tail_responses};
 use super::{Entry, EntryKey, EntryView, Projection, Tab};
 use crate::tui::app::OutputStore;
-use skyhook::agent::ObservationSnapshot;
+use skyhook::agent::{ObservationSnapshot, RuntimeEvent};
 use skyhook::identity::{AgentId, JobId};
 use skyhook::session::RequestSeq;
 use std::collections::{HashMap, HashSet};
@@ -39,10 +39,18 @@ struct Identity {
 }
 
 impl ContentCache {
-    /// Response events can replace content, reorder blocks, or end a block
-    /// without changing its text. Never infer cache validity from string lengths.
-    /// `request` is the runtime event's request sequence.
-    pub fn observe_response(&mut self, agent: &AgentId, request: RequestSeq) {
+    /// Note the responses `event` changes: response events can replace content,
+    /// reorder blocks, or end a block without changing its text. Never infer
+    /// cache validity from string lengths.
+    pub fn observe(&mut self, event: &RuntimeEvent) {
+        if let RuntimeEvent::ResponseEvent { agent, request, .. }
+        | RuntimeEvent::ResponseSettled { agent, request, .. } = event
+        {
+            self.observe_response(agent, *request);
+        }
+    }
+
+    fn observe_response(&mut self, agent: &AgentId, request: RequestSeq) {
         self.dirty_responses
             .entry(agent.clone())
             .or_default()
@@ -185,48 +193,108 @@ fn changed_indices(old: &[Entry], new: &[Entry], offset: usize) -> Vec<usize> {
 #[cfg(test)]
 mod tests {
     use super::super::entries::entries as history_entries;
-    use super::super::tests::{Journal, created, finished, loaded, replay, root, update};
+    use super::super::tests::{loaded, replay, root, update};
     use super::super::{Clock, EntryKey, ResponseRef, Surface, Timing, Title, View};
     use super::*;
-    use skyhook::agent::{AgentActivity, RuntimeEvent};
-    use skyhook::job::JobRole;
-    use skyhook::provider::protocol::{
-        AssistantItem, BlockId, BlockRef, Completion, ItemId, ResponseEvent,
+    use crate::tests::bounded;
+    use crate::tui::app::{
+        App,
+        played::{
+            activity, ask, assistant, at, call, committed, completed, count, failing_call,
+            job_ended, job_events, job_of_call, latest_request, model_failed, observe_find,
+            observe_next, observe_record, observe_until, played_fixture, reached, recorded,
+            results, sleeping_script, status, stopped, streamed, tool_error,
+        },
+        tests::fixture,
     };
+    use serde_json::json;
+    use skyhook::agent::{AgentActivity, RuntimeEvent};
+    use skyhook::job::JobTransition;
+    use skyhook::provider::ProviderErrorKind;
+    use skyhook::provider::protocol::{
+        AssistantItem, BlockId, BlockRef, Completion, CutReason, ItemId, ItemKind,
+    };
+    use skyhook::session::AttemptFailure;
     use skyhook::session::SessionEvent;
-    use skyhook::session::{Message, UserPart};
 
-    fn show<'a>(agent: &'a AgentId, view: &'a View, all_details: bool) -> EntryView<'a> {
-        EntryView {
-            agent,
-            tab: Tab::Conversation,
-            view,
-            all_details,
-            today: Default::default(),
+    /// One agent's tab folded into a cache from successive snapshots.
+    struct Fold {
+        agent: AgentId,
+        tab: Tab,
+        today: chrono::NaiveDate,
+        all_details: bool,
+        view: View,
+        projection: Projection,
+        cache: ContentCache,
+        outputs: OutputStore,
+        /// UI-only entries shown after the history.
+        overlay: Vec<Entry>,
+        /// Job views as the fold last saw them.
+        jobs: std::collections::BTreeMap<JobId, skyhook::job::JobEnvelope>,
+    }
+
+    impl Fold {
+        fn new(agent: &AgentId, tab: Tab) -> Self {
+            Self {
+                agent: agent.clone(),
+                tab,
+                today: Default::default(),
+                all_details: false,
+                view: View::default(),
+                projection: Projection::default(),
+                cache: ContentCache::default(),
+                outputs: OutputStore::default(),
+                overlay: Vec::new(),
+                jobs: Default::default(),
+            }
+        }
+
+        /// Fold `snapshot` in and check the cache matches a fresh uncached build.
+        fn refresh(&mut self, snapshot: &ObservationSnapshot) -> Vec<usize> {
+            // A changed job view arrives as its own update, before its record.
+            for (id, job) in &snapshot.jobs {
+                if self.jobs.get(id) != Some(job) {
+                    self.projection.observe_job(job);
+                }
+            }
+            self.jobs.clone_from(&snapshot.jobs);
+            self.projection.rebuild(snapshot);
+            let presentation = EntryView {
+                agent: &self.agent,
+                tab: self.tab,
+                view: &self.view,
+                all_details: self.all_details,
+                today: self.today,
+            };
+            let (projection, outputs) = (&mut self.projection, &self.outputs);
+            let overlay = self.overlay.clone();
+            let dirty =
+                (self.cache).update(snapshot, projection, presentation, outputs, 0, overlay);
+            let entries = self.cache.entries();
+            assert!(
+                entries[..entries.len() - self.overlay.len()]
+                    == history_entries(snapshot, projection, presentation, outputs, true),
+                "the retained history differs from a fresh build"
+            );
+            dirty
         }
     }
 
-    /// Refresh the cache and check it matches a fresh uncached projection.
-    fn refresh(
-        cache: &mut ContentCache,
-        (snapshot, projection): (&ObservationSnapshot, &mut Projection),
-        presentation: EntryView,
-        outputs: &OutputStore,
-        revision: u64,
-    ) -> Vec<usize> {
-        let dirty = cache.update(
-            snapshot,
-            projection,
-            presentation,
-            outputs,
-            revision,
-            Vec::new(),
-        );
-        assert!(
-            cache.entries() == history_entries(snapshot, projection, presentation, outputs, true),
-            "the retained history differs from a fresh build"
-        );
-        dirty
+    /// The entries the model's responses produced: no user input or indicator.
+    fn replies(cache: &ContentCache) -> Vec<&Entry> {
+        let entries = cache.entries().iter();
+        let reply = |entry: &&Entry| {
+            !matches!(
+                entry.key(),
+                EntryKey::UserBlock { .. } | EntryKey::Working(_)
+            )
+        };
+        entries.filter(reply).collect()
+    }
+
+    /// Observe updates through the next response event.
+    async fn next_response(app: &mut App) {
+        while !matches!(observe_next(app).await, RuntimeEvent::ResponseEvent { .. }) {}
     }
 
     /// Entries carry live timings for the renderer to paint and settle to what
@@ -234,217 +302,177 @@ mod tests {
     /// times.
     #[tokio::test]
     async fn entries_carry_timings_and_only_a_new_day_rebuilds_them() {
-        use skyhook::job::JobTransition;
-        use skyhook::session::AttemptRef;
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let request = journal.request(&agent, None).await.request;
-        journal
-            .record(&agent, created(1, "exec", JobRole::Tool))
-            .await;
-        let running = SessionEvent::JobStateChanged {
-            job: JobId::new(1).unwrap(),
-            state: JobTransition::Running,
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let asked = ask(&session, "work");
+        let turn = model.turn().await;
+        let script = sleeping_script(&session);
+        // The turn's attempt started before the model saw its request, so it is
+        // journaled before the script's job runs.
+        let script_job = |app: &App| {
+            let mut jobs = app.snapshot.jobs.values();
+            jobs.find(|job| job.tool == "script").map(|job| job.id)
         };
-        journal.record(&agent, running).await;
-        let live = journal.stamped();
-        let attempt = AttemptRef {
-            request,
-            attempt: 1,
-        };
-        journal.record(&agent, finished(1)).await;
-        let interrupted = SessionEvent::ModelAttemptInterrupted(attempt);
-        journal.record(&agent, interrupted).await;
-        let mut settled = journal.stamped();
-        let idle = RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity: AgentActivity::Idle,
-            at: 0,
-        };
-        update(&mut settled, idle);
-        let turn = Timing::Since(live.activity[&agent].since);
-        let today = Clock::default().day();
+        let job = observe_find(&mut app, script_job).await;
+        reached(&mut app, job, JobTransition::Running).await;
+        let running = app.snapshot.clone();
+        session.cancel_job(job).await.unwrap();
+        let _ = bounded(script).await.unwrap();
+        turn.answer("done");
+        bounded(asked).await.unwrap().unwrap();
+        observe_until(&mut app, |app| {
+            activity(&app.snapshot, &agent) == Some(&AgentActivity::Idle)
+                && recorded(&app.snapshot, completed)
+        })
+        .await;
+        let settled = app.snapshot.clone();
+        let turn = Timing::Since(running.activity[&agent].since);
+        // The day the session ran, which dates nothing it shows.
+        let last = settled.records.values().next_back().unwrap();
+        let today = Clock::at(last.timestamp_millis).day();
         let later = today + chrono::Days::new(2);
         for tab in [Tab::Conversation, Tab::Requests, Tab::Jobs] {
-            let (mut cache, outputs, view) = Default::default();
-            let on = |today| EntryView {
-                tab,
-                today,
-                ..show(&agent, &view, false)
-            };
-            let mut projection = Projection::default();
-            projection.rebuild(&live);
-            refresh(&mut cache, (&live, &mut projection), on(today), &outputs, 0);
-            let counting = cache.entries().iter().filter(|entry| entry.timing.live());
+            let mut fold = Fold::new(&agent, tab);
+            fold.today = today;
+            fold.refresh(&running);
+            let counting = fold
+                .cache
+                .entries()
+                .iter()
+                .filter(|entry| entry.timing.live());
             let expected = if tab == Tab::Conversation { 2 } else { 1 };
             assert_eq!(counting.count(), expected, "{tab:?}");
-            let state = (&live, &mut projection);
-            assert!(refresh(&mut cache, state, on(today), &outputs, 0).is_empty());
+            assert!(fold.refresh(&running).is_empty());
             if tab == Tab::Conversation {
-                let working = cache.entries().last().unwrap();
+                let working = fold.cache.entries().last().unwrap();
                 assert_eq!((working.text(), working.timing), ("Working", turn));
             }
-            projection.rebuild(&settled);
-            refresh(
-                &mut cache,
-                (&settled, &mut projection),
-                on(today),
-                &outputs,
-                0,
-            );
-            let timings: Vec<_> = (cache.entries().iter())
+            fold.refresh(&settled);
+            let timings: Vec<_> = (fold.cache.entries().iter())
                 .map(|entry| entry.timing)
                 .filter(|timing| *timing != Timing::Untimed)
                 .collect();
             let took = |timing: &Timing| matches!(timing, Timing::Took { .. });
             assert!(!timings.is_empty() && timings.iter().all(took), "{tab:?}");
             // Days later, only request rows change: their send time gains its date.
-            let state = (&settled, &mut projection);
-            let dated = refresh(&mut cache, state, on(later), &outputs, 0);
+            fold.today = later;
+            let dated = fold.refresh(&settled);
             assert_eq!(dated.is_empty(), tab != Tab::Requests, "{tab:?}");
         }
     }
 
     #[tokio::test]
-    async fn synchronous_failure_refreshes_the_existing_call_after_interleaved_user_input() {
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        journal.call_record(&agent, "call").await;
-        let mut projection = Projection::default();
-        projection.rebuild(&journal.snapshot);
-        let (mut cache, outputs, mut view) = Default::default();
-        refresh(
-            &mut cache,
-            (&journal.snapshot, &mut projection),
-            show(&agent, &view, false),
-            &outputs,
-            0,
-        );
-        let key = cache.entries()[0].key().clone();
-        assert!(!cache.entries()[0].text().contains("Failed"));
-        let text = "Continue after permission".into();
-        let message = Message::User(vec![UserPart::Text { text }]);
-        journal
-            .record(&agent, SessionEvent::MessageCommitted { message })
-            .await;
-        journal.result_record(&agent, "call", true).await;
-        let records_before = serde_json::to_value(&journal.snapshot.records).unwrap();
-        projection.rebuild(&journal.snapshot);
-        let dirty = refresh(
-            &mut cache,
-            (&journal.snapshot, &mut projection),
-            show(&agent, &view, false),
-            &outputs,
-            0,
-        );
-        assert_eq!(dirty, [0, 1]);
-        let entry = &cache.entries()[0];
-        assert_eq!(cache.entries().len(), 2);
+    async fn synchronous_failure_refreshes_the_existing_call() {
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let _asked = ask(app.session().unwrap(), "test it");
+        model.turn().await.end(vec![failing_call("call")]);
+        observe_record(&mut app, committed(assistant)).await;
+        let mut fold = Fold::new(&agent, Tab::Conversation);
+        fold.refresh(&app.snapshot);
+        let tool = |entry: &Entry| entry.surface == Surface::Tool;
+        let card = fold.cache.entries().iter().position(tool).unwrap();
+        let key = fold.cache.entries()[card].key().clone();
+        assert!(!fold.cache.entries()[card].text().contains("Failed"));
+        observe_record(&mut app, committed(results)).await;
+        let records_before = serde_json::to_value(&app.snapshot.records).unwrap();
+        assert_eq!(fold.refresh(&app.snapshot), [card]);
+        let entry = &fold.cache.entries()[card];
         assert_eq!(
             (entry.key(), entry.surface, entry.job_id()),
             (&key, Surface::Tool, None)
         );
         assert_eq!(entry.text(), "▸ × exec · Failed");
         // Expanding rebuilds only the toggled entry's source.
-        view.set_expanded(key.clone(), true);
-        cache.invalidate_entry(key.clone());
-        let dirty = refresh(
-            &mut cache,
-            (&journal.snapshot, &mut projection),
-            show(&agent, &view, false),
-            &outputs,
-            0,
-        );
-        assert_eq!(dirty, [0]);
-        let text = cache.entries()[0].text();
-        assert_eq!(cache.entries()[0].key(), &key);
-        for part in ["Arguments", "Output\n  Permission was denied"] {
+        fold.view.set_expanded(key.clone(), true);
+        fold.cache.invalidate_entry(key.clone());
+        assert_eq!(fold.refresh(&app.snapshot), [card]);
+        let text = fold.cache.entries()[card].text();
+        assert_eq!(fold.cache.entries()[card].key(), &key);
+        for part in ["Arguments", "Output"] {
             assert!(text.contains(part), "{text}");
         }
-        assert_eq!(text.matches("Permission was denied").count(), 1);
+        let error = tool_error(&app.snapshot);
+        assert_eq!(text.matches(error).count(), 1, "{text}");
         assert_eq!(
             records_before,
-            serde_json::to_value(&journal.snapshot.records).unwrap()
+            serde_json::to_value(&app.snapshot.records).unwrap()
         );
     }
 
     #[tokio::test]
     async fn content_cache_refreshes_only_invalidated_tool_output() {
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        for id in 1..=2 {
-            journal
-                .record(&agent, created(id, "exec", JobRole::Tool))
-                .await;
-            journal.record(&agent, finished(id)).await;
-        }
-        let snapshot = journal.snapshot;
-        let mut projection = Projection::default();
-        projection.rebuild(&snapshot);
-        let view = View::default();
-        let presentation = EntryView {
-            tab: Tab::Jobs,
-            ..show(&agent, &view, true)
+        let (_root, mut app) = fixture().await;
+        let agent = app.root_agent().clone();
+        let script = "await tool.exec({command:['true']}); await tool.exec({command:['true']});";
+        app.session().unwrap().run_script(script).await.unwrap();
+        observe_until(&mut app, |app| count(&app.snapshot, job_ended) == 3).await;
+        let mut fold = Fold::new(&agent, Tab::Jobs);
+        fold.all_details = true;
+        fold.refresh(&app.snapshot);
+        assert_eq!(fold.cache.entries().len(), 3);
+        let exec = |entry: &Entry| {
+            let tool = |job| &app.snapshot.jobs[&job].tool;
+            entry.job_id().is_some_and(|job| tool(job) == "exec")
         };
-        let (mut outputs, mut cache) = (OutputStore::default(), ContentCache::default());
-        let state = (&snapshot, &mut projection);
-        refresh(&mut cache, state, presentation, &outputs, 0);
-        assert_eq!(cache.entries().len(), 2);
-        let unchanged = cache.entries()[1].clone();
-        let job = JobId::new(1).unwrap();
+        let index = fold.cache.entries().iter().position(exec).unwrap();
+        let job = fold.cache.entries()[index].job_id().unwrap();
+        let unchanged = fold.cache.entries().to_vec();
         let output = serde_json::json!({"result": {"stdout": "new output"}});
-        loaded(&mut outputs, job, output);
-        cache.invalidate_job(job);
-        let state = (&snapshot, &mut projection);
-        let dirty = refresh(&mut cache, state, presentation, &outputs, 0);
-        assert_eq!(dirty, [0]);
-        assert!(cache.entries()[0].text().contains("new output"));
-        assert!(cache.entries().iter().all(|entry| entry.compact_after));
-        assert!(cache.entries()[1] == unchanged);
+        loaded(&mut fold.outputs, job, output);
+        fold.cache.invalidate_job(job);
+        assert_eq!(fold.refresh(&app.snapshot), [index]);
+        assert!(fold.cache.entries()[index].text().contains("new output"));
+        let mut others = (fold.cache.entries().iter().zip(&unchanged).enumerate())
+            .filter(|(position, _)| *position != index);
+        assert!(others.all(|(_, (entry, before))| entry == before));
     }
 
     #[tokio::test]
     async fn content_cache_reasoning_matches_uncached_across_shape_changes() {
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let request = journal.request(&agent, None).await.request;
-        let mut projection = Projection::default();
-        projection.rebuild(&journal.snapshot);
-        let (view, outputs, mut cache) = Default::default();
-        let sync = |cache: &mut ContentCache, snapshot: &_, projection: &mut _| {
-            cache.observe_response(&agent, request);
-            refresh(
-                cache,
-                (snapshot, projection),
-                show(&agent, &view, false),
-                &outputs,
-                0,
-            );
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let _asked = ask(app.session().unwrap(), "think");
+        let turn = model.turn().await;
+        let request = observe_find(&mut app, |app| latest_request(&app.snapshot)).await;
+        let mut fold = Fold::new(&agent, Tab::Conversation);
+        let sync = |fold: &mut Fold, snapshot: &_| {
+            fold.cache.observe_response(&agent, request);
+            fold.refresh(snapshot);
         };
-        sync(&mut cache, &journal.snapshot, &mut projection);
+        sync(&mut fold, &app.snapshot);
         for text in ["\n", "first", "\n", "second", "\r\n", "third", "\n\n"] {
-            journal.delta(&agent, request, "reasoning", text);
-            sync(&mut cache, &journal.snapshot, &mut projection);
+            turn.delta("reasoning", ItemKind::Reasoning, text);
+            next_response(&mut app).await;
+            sync(&mut fold, &app.snapshot);
         }
-        journal.delta(&agent, request, "text", "answer");
-        sync(&mut cache, &journal.snapshot, &mut projection);
+        turn.delta("text", ItemKind::Text, "answer");
+        next_response(&mut app).await;
+        sync(&mut fold, &app.snapshot);
         // An equal-length authoritative replacement at the end must invalidate entries.
-        let provisional = journal.snapshot.responses[&(agent.clone(), request)].blocks()[0]
+        let provisional = app.snapshot.responses[&(agent.clone(), request)].blocks()[0]
             .text
             .clone();
         let replacement = provisional.replace("first", "FIRST");
         assert_eq!(replacement.len(), provisional.len());
         let (item, block) = (String::from("reasoning"), String::from("reasoning:0"));
-        let ended = Completion::answer(vec![
-            AssistantItem::reasoning("reasoning", 0, replacement.clone(), Some(replay())),
-            AssistantItem::text("text", 1, "answer"),
-        ])
-        .unwrap();
-        journal.response(&agent, request, ResponseEvent::End(ended));
-        sync(&mut cache, &journal.snapshot, &mut projection);
-        assert!(!cache.entries()[0].timing.live());
+        turn.complete(
+            Completion::answer(vec![
+                AssistantItem::reasoning("reasoning", 0, replacement, Some(replay())),
+                AssistantItem::text("text", 1, "answer"),
+            ])
+            .unwrap(),
+        );
+        next_response(&mut app).await;
+        sync(&mut fold, &app.snapshot);
+        let reasoning = (fold.cache)
+            .entries()
+            .iter()
+            .find(|entry| entry.surface == Surface::Reasoning);
+        let reasoning = reasoning.unwrap();
+        assert!(!reasoning.timing.live());
         assert_eq!(
-            cache.entries()[0].title(),
+            reasoning.title(),
             Some(&Title::disclosed("Reasoning", false))
         );
         let block_ref = |item: &str, block: &str| BlockRef {
@@ -463,159 +491,92 @@ mod tests {
                 block: block_ref("text", "text:0"),
             },
         ];
-        // The working indicator trails the response until activity settles.
         let cached = |cache: &ContentCache| {
-            let keys = cache.entries().iter().map(|entry| entry.key().clone());
-            keys.filter(|key| !matches!(key, EntryKey::Working(_)))
-                .collect::<Vec<_>>()
+            let replies = replies(cache).into_iter();
+            replies.map(|entry| entry.key().clone()).collect::<Vec<_>>()
         };
-        assert_eq!(cached(&cache), keys);
-        let message = Message::Assistant(vec![
-            AssistantItem::reasoning("reasoning", 0, replacement, Some(replay())),
-            AssistantItem::text("text", 1, "answer"),
-        ]);
-        journal
-            .record(&agent, SessionEvent::MessageCommitted { message })
-            .await;
-        projection.rebuild(&journal.snapshot);
-        sync(&mut cache, &journal.snapshot, &mut projection);
-        assert_eq!(cached(&cache), keys);
+        assert_eq!(cached(&fold.cache), keys);
+        observe_record(&mut app, committed(assistant)).await;
+        sync(&mut fold, &app.snapshot);
+        assert_eq!(cached(&fold.cache), keys);
     }
 
     #[test]
     fn cached_reconnecting_indicator_tracks_activity_changes() {
         let agent = root(1);
         let mut snapshot = ObservationSnapshot::default();
-        let (mut projection, view, outputs, mut cache) = Default::default();
+        let mut fold = Fold::new(&agent, Tab::Conversation);
         let reconnecting = |attempt| AgentActivity::Reconnecting { attempt };
-        for activity in [
+        for state in [
             AgentActivity::Working,
             reconnecting(2),
             reconnecting(3),
             AgentActivity::Stopped(skyhook::agent::TurnFailure::Interrupted),
         ] {
+            let activity = skyhook::agent::ObservedActivity { state, since: 0 };
             let event = RuntimeEvent::Activity {
                 agent: agent.clone(),
                 activity,
-                at: 0,
             };
             update(&mut snapshot, event);
-            refresh(
-                &mut cache,
-                (&snapshot, &mut projection),
-                show(&agent, &view, false),
-                &outputs,
-                0,
-            );
+            fold.refresh(&snapshot);
         }
-        assert!(cache.entries().is_empty());
+        assert!(fold.cache.entries().is_empty());
     }
 
     #[tokio::test]
     async fn retry_error_lifecycle_matches_fresh_rendering_and_replay() {
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let request = journal.request(&agent, None).await.request;
-        let (view, outputs, mut cache) = Default::default();
-        let mut projection = Projection::default();
-        let presentation = show(&agent, &view, false);
-        macro_rules! commit {
-            ($event:expr) => {{
-                journal.record(&agent, $event).await;
-                projection.rebuild(&journal.snapshot);
-                refresh(
-                    &mut cache,
-                    (&journal.snapshot, &mut projection),
-                    presentation,
-                    &outputs,
-                    0,
-                )
-            }};
-        }
-        let replayed = |snapshot: &ObservationSnapshot| {
-            let mut replay = ObservationSnapshot::default();
-            for event in snapshot.records.values() {
-                update(&mut replay, RuntimeEvent::Record(Box::new(event.clone())));
-            }
-            let mut projection = Projection::default();
-            projection.rebuild(&replay);
-            history_entries(&replay, &projection, presentation, &outputs, true)
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let asked = ask(&session, "question");
+        let mut fold = Fold::new(&agent, Tab::Conversation);
+        let delay = std::time::Duration::from_millis(10);
+        let request = observe_find(&mut app, |app| latest_request(&app.snapshot)).await;
+        let started = |event: &SessionEvent| matches!(event, SessionEvent::ModelAttemptStarted(_));
+        let scheduled = |event: &SessionEvent| {
+            matches!(
+                event,
+                SessionEvent::ModelFailed {
+                    failure: AttemptFailure::Retrying { .. },
+                    ..
+                }
+            )
         };
         for attempt in 1..=3 {
-            // The request fixture already started attempt 1.
-            if attempt == 1 {
-                projection.rebuild(&journal.snapshot);
-                refresh(
-                    &mut cache,
-                    (&journal.snapshot, &mut projection),
-                    presentation,
-                    &outputs,
-                    0,
-                );
-            } else {
-                let started = SessionEvent::ModelAttemptStarted(skyhook::session::AttemptRef {
-                    request,
-                    attempt,
-                });
-                commit!(started);
-            }
-            assert_eq!(cache.entries().len(), 1);
-            assert_ne!(cache.entries()[0].key(), &EntryKey::Retry(request));
-            let text = cache.entries()[0].text();
-            assert!(
-                ["attempt", "partial", "HTTP"]
-                    .iter()
-                    .all(|part| !text.contains(part))
-            );
+            let turn = model.turn().await;
+            observe_until(&mut app, |app| count(&app.snapshot, started) == attempt).await;
+            fold.refresh(&app.snapshot);
+            assert!(replies(&fold.cache).is_empty());
             for (index, suffix) in [format!("partial {attempt}"), " updated".into()]
                 .into_iter()
                 .enumerate()
             {
-                journal.delta(&agent, request, "text", &suffix);
-                cache.observe_response(&agent, request);
-                let dirty = refresh(
-                    &mut cache,
-                    (&journal.snapshot, &mut projection),
-                    presentation,
-                    &outputs,
-                    0,
-                );
-                // The first delta pushes the working indicator below the reply.
-                let expected = if index == 0 { vec![0, 1] } else { vec![0] };
-                assert_eq!(dirty, expected, "delta {index}");
-                assert!(
-                    cache
-                        .entries()
-                        .iter()
-                        .all(|entry| !entry.text().contains("attempt"))
-                );
+                turn.delta("text", ItemKind::Text, &suffix);
+                next_response(&mut app).await;
+                fold.cache.observe_response(&agent, request);
+                let dirty = fold.refresh(&app.snapshot);
+                let replies = replies(&fold.cache);
+                assert_eq!(replies.len(), 1, "delta {index}");
+                let reply = (fold.cache.entries().iter()).position(|entry| entry == replies[0]);
+                assert!(dirty.contains(&reply.unwrap()), "delta {index}");
+                assert!(!replies[0].text().contains("attempt"));
             }
             if attempt == 3 {
+                let answer = vec![AssistantItem::text("answer", 0, "final answer")];
+                turn.complete(Completion::cut(answer, CutReason::Aborted).unwrap());
                 break;
             }
-            let error = String::from("HTTP 503 [code=overloaded]");
-            let failed = SessionEvent::ModelFailed {
-                attempt: skyhook::session::AttemptRef { request, attempt },
-                failure: skyhook::agent::Failure::Provider(
-                    error.clone(),
-                    skyhook::provider::ProviderErrorKind::Unavailable,
-                ),
-            };
-            assert_eq!(commit!(failed), [0]);
-            assert_eq!(cache.entries().len(), 1);
-            assert_eq!(cache.entries()[0].key(), &EntryKey::Retry(request));
-            let failure = *journal.snapshot.records.keys().next_back().unwrap();
-            let scheduled = SessionEvent::ModelRecoveryScheduled {
-                failure,
-                delay_millis: 1000,
-            };
-            assert_eq!(commit!(scheduled), [0]);
-            assert_eq!(cache.entries().len(), 1);
+            let error = ProviderErrorKind::Unavailable.error("HTTP 503 [code=overloaded]");
+            turn.fail(error.with_retry_after(Some(delay)));
+            observe_until(&mut app, |app| count(&app.snapshot, scheduled) == attempt).await;
+            fold.refresh(&app.snapshot);
+            let replies = replies(&fold.cache);
+            assert_eq!(replies.len(), 1);
+            assert_eq!(replies[0].key(), &EntryKey::Retry(request));
             // The card counts down to the next attempt.
-            let scheduled_at = journal.snapshot.records.values().next_back().unwrap();
-            let due = Timing::Until(scheduled_at.timestamp_millis + 1000);
-            assert_eq!(cache.entries()[0].timing, due);
-            let text = cache.entries()[0].text();
+            let due = Timing::Until(at(&app.snapshot, scheduled, attempt - 1) + 10);
+            assert_eq!(replies[0].timing, due);
+            let text = replies[0].text();
             let attempt_part = format!(" · attempt {}\n", attempt + 1);
             assert!(text.starts_with("Retrying · "), "{text}");
             for part in [attempt_part.as_str(), "HTTP 503"] {
@@ -623,11 +584,13 @@ mod tests {
             }
             assert!(text.ends_with(&format!("partial {attempt} updated")));
         }
-        let message = Message::Assistant(vec![AssistantItem::text("answer", 0, "final answer")]);
-        let committed = SessionEvent::MessageCommitted { message };
-        commit!(committed);
-        assert_eq!(cache.entries().len(), 1);
-        let committed = cache.entries()[0].clone();
+        // An abort commits the visible text before its failure: the message stays
+        // intact beside the diagnostics, including on replay.
+        observe_record(&mut app, committed(assistant)).await;
+        fold.refresh(&app.snapshot);
+        let replies_now = replies(&fold.cache);
+        assert_eq!(replies_now.len(), 1);
+        let committed = replies_now[0].clone();
         let text = committed.text();
         assert!(
             text.ends_with("final answer")
@@ -635,297 +598,168 @@ mod tests {
                 && !text.contains("partial")
         );
         assert!(committed.footer.is_some());
-        assert!(cache.entries() == replayed(&journal.snapshot));
-
-        // A provider abort commits its visible text before publishing ModelFailed:
-        // the message stays intact beside the diagnostics, including on replay.
-        let error = "provider aborted response".into();
-        let failed = SessionEvent::ModelFailed {
-            attempt: skyhook::session::AttemptRef {
-                request,
-                attempt: 3,
-            },
-            failure: skyhook::agent::Failure::Other(error),
-        };
-        commit!(failed);
-        assert_eq!(cache.entries().len(), 2);
+        let _ = bounded(asked).await.unwrap();
+        observe_until(&mut app, |app| count(&app.snapshot, model_failed) == 3).await;
+        fold.refresh(&app.snapshot);
         // Only its footer changes, now that the request has settled.
         let intact =
             |entry: &Entry| entry.key() == committed.key() && entry.text() == committed.text();
-        assert!(cache.entries().iter().any(intact));
-        let failures: Vec<_> = cache
+        assert!(fold.cache.entries().iter().any(intact));
+        let failures: Vec<_> = (fold.cache)
             .entries()
             .iter()
             .filter(|card| card.key() == &EntryKey::Retry(request))
             .map(Entry::text)
             .collect();
-        assert_eq!(
-            failures,
-            ["Request failed · attempt 3\nprovider aborted response"]
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].starts_with("Request failed · attempt 3\n"),
+            "{failures:?}"
         );
-        assert!(cache.entries() == replayed(&journal.snapshot));
+        let mut replay = ObservationSnapshot::default();
+        for event in app.snapshot.records.values() {
+            update(&mut replay, RuntimeEvent::Record(Box::new(event.clone())));
+        }
+        replay.activity.clone_from(&app.snapshot.activity);
+        let mut replayed = Fold::new(&agent, Tab::Conversation);
+        replayed.refresh(&replay);
+        assert!(fold.cache.entries() == replayed.cache.entries());
     }
 
-    /// Every tab's retained history matches a fresh build after each record of a
-    /// mixed journal, and conversation updates never relay out its first entry.
+    /// Every tab's retained history matches a fresh build after each update of a
+    /// mixed session, and conversation updates never relay out its first entry.
     #[tokio::test]
-    async fn incremental_history_matches_a_fresh_build_record_by_record() {
-        use skyhook::job::{AgentMessage, JobEnd, JobTransition};
-        use skyhook::provider::protocol::{ToolCall, ToolResult};
-        use skyhook::session::{AttemptRef, CompletedOutcome, JobEvent, ModelCallOrigin};
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let (view, outputs) = (View::default(), OutputStore::default());
-        let mut tabs = [Tab::Conversation, Tab::Requests, Tab::Jobs]
-            .map(|tab| (tab, Projection::default(), ContentCache::default()));
-        // `streamed` requests had response events since the previous step.
-        let mut step = |journal: &Journal, label: &str, streamed: &[RequestSeq]| {
-            for (tab, projection, cache) in &mut tabs {
-                for request in streamed {
-                    cache.observe_response(&agent, *request);
-                }
-                projection.rebuild(&journal.snapshot);
-                let presentation = EntryView {
-                    tab: *tab,
-                    ..show(&agent, &view, false)
-                };
-                let first = cache.entries().first().cloned();
-                let state = (&journal.snapshot, &mut *projection);
-                let dirty = refresh(cache, state, presentation, &outputs, 0);
-                if *tab == Tab::Conversation && first.is_some() {
-                    assert!(!dirty.contains(&0), "{label}: {dirty:?}");
+    async fn incremental_history_matches_a_fresh_build_update_by_update() {
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let mut tabs =
+            [Tab::Conversation, Tab::Requests, Tab::Jobs].map(|tab| Fold::new(&agent, tab));
+        // Fold updates until `done`, checking every tab after each.
+        let mut advance = async |app: &mut App, done: &dyn Fn(&ObservationSnapshot) -> bool| {
+            while !done(&app.snapshot) {
+                let event = observe_next(app).await;
+                for fold in &mut tabs {
+                    fold.cache.observe(&event);
+                    let first = fold.cache.entries().first().cloned();
+                    let dirty = fold.refresh(&app.snapshot);
+                    let history = |entry: &Entry| !matches!(entry.key(), EntryKey::Working(_));
+                    if fold.tab == Tab::Conversation && first.as_ref().is_some_and(history) {
+                        assert!(!dirty.contains(&0), "{event:?}: {dirty:?}");
+                    }
                 }
             }
         };
-        let committed = |message| SessionEvent::MessageCommitted { message };
-        let user = |text: &str| Message::User(vec![UserPart::Text { text: text.into() }]);
-        journal.record(&agent, committed(user("question"))).await;
-        step(&journal, "user message", &[]);
-        let working = RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity: AgentActivity::Working,
-            at: 0,
+        let asked = ask(&session, "question");
+        let turn = model.turn().await;
+        turn.delta("text", ItemKind::Text, "partial");
+        let delay = Some(std::time::Duration::from_millis(10));
+        turn.fail(
+            ProviderErrorKind::Unavailable
+                .error("HTTP 503")
+                .with_retry_after(delay),
+        );
+        let turn = model.turn().await;
+        let script = |children: usize| {
+            let exec = "await tool.exec({command:['true']});";
+            json!({"source": exec.repeat(children)})
         };
-        update(&mut journal.snapshot, working);
-        step(&journal, "working", &[]);
-        let request = journal.request(&agent, None).await.request;
-        step(&journal, "requested", &[]);
-        journal.delta(&agent, request, "text", "partial");
-        step(&journal, "delta", &[request]);
-        let attempt = |attempt| AttemptRef { request, attempt };
-        let error = "HTTP 503".into();
-        let failure = SessionEvent::ModelFailed {
-            attempt: attempt(1),
-            failure: skyhook::agent::Failure::Provider(
-                error,
-                skyhook::provider::ProviderErrorKind::Unavailable,
-            ),
-        };
-        let failure = journal.record(&agent, failure).await;
-        step(&journal, "failed", &[]);
-        let recovery = SessionEvent::ModelRecoveryScheduled {
-            failure,
-            delay_millis: 10,
-        };
-        journal.record(&agent, recovery).await;
-        step(&journal, "retrying", &[]);
-        journal
-            .record(&agent, SessionEvent::ModelAttemptStarted(attempt(2)))
-            .await;
-        step(&journal, "second attempt", &[]);
-        let call = |id, tool, position: u32| {
-            let call = ToolCall::new(id, tool, serde_json::json!({"command": ["true"]})).unwrap();
-            AssistantItem::tool_call(id, position, call)
-        };
-        let reply = Message::Assistant(vec![
+        turn.end(vec![
             AssistantItem::text("text", 0, "working on it"),
-            call("admitted", "exec", 1),
-            call("script", "script", 2),
-            call("parallel", "script", 3),
-            call("plain", "exec", 4),
+            call("admitted", "exec", json!({"command": ["true"]}), 1),
+            call("script", "script", script(2), 2),
+            call("parallel", "script", script(1), 3),
+            call(
+                "plain",
+                "exec",
+                json!({"command": ["sleep", "60"], "bg": true}),
+                4,
+            ),
         ]);
-        let message = journal.record(&agent, committed(reply)).await.message();
-        step(&journal, "calls committed", &[]);
-        let completed = SessionEvent::ResponseCompleted {
-            attempt: attempt(2),
-            message,
-            outcome: CompletedOutcome::Answer,
-        };
-        journal.record(&agent, completed).await;
-        step(&journal, "response completed", &[]);
-        let job = |id: u64, tool: &str, role, parent: Option<u64>, origin: Option<&str>| {
-            let origin = origin.map(|call| ModelCallOrigin {
-                message,
-                call_id: call.into(),
-            });
-            SessionEvent::JobCreated {
-                job: JobId::new(id).unwrap(),
-                parent: parent.map(|parent| JobId::new(parent).unwrap()),
-                origin,
-                tool: tool.into(),
-                role,
-                name: None,
-                arguments: serde_json::json!({"command": ["true"]}),
-                output_schema: None,
-                accepts_input: false,
-                background: false,
-                location: skyhook::execution::ExecutionLocation::root("/workspace".into()),
-            }
-        };
-        // Parallel scripts' children interleave in the journal.
-        let created = [
-            job(1, "exec", JobRole::Tool, None, Some("admitted")),
-            job(2, "script", JobRole::Script, None, Some("script")),
-            job(4, "script", JobRole::Script, None, Some("parallel")),
-            job(3, "exec", JobRole::Tool, Some(2), None),
-            job(5, "exec", JobRole::Tool, Some(4), None),
-            job(6, "exec", JobRole::Tool, Some(2), None),
-        ];
-        for (index, created) in created.into_iter().enumerate() {
-            journal.record(&agent, created).await;
-            step(&journal, &format!("job {index} created"), &[]);
-        }
-        let running = SessionEvent::JobStateChanged {
-            job: JobId::new(1).unwrap(),
-            state: JobTransition::Running,
-        };
-        journal.record(&agent, running).await;
-        step(&journal, "job running", &[]);
-        for id in [3, 5, 6, 1, 2, 4] {
-            let finished = SessionEvent::JobFinished {
-                job: JobId::new(id).unwrap(),
-                state: JobEnd::Completed,
-                diagnostic: None,
-                output_diagnostic: None,
-                images: vec![],
-            };
-            journal.record(&agent, finished).await;
-            step(&journal, &format!("job {id} finished"), &[]);
-        }
-        let result = |id: &str, name: &str| ToolResult {
-            call_id: id.into(),
-            name: name.into(),
-            result: serde_json::json!({"stdout": "done"}),
-            images: vec![],
-            is_error: false,
-        };
-        for (id, name) in [
-            ("admitted", "exec"),
-            ("script", "script"),
-            ("parallel", "script"),
-            ("plain", "exec"),
-        ] {
-            let results = Message::Tool(vec![result(id, name)]);
-            journal.record(&agent, committed(results)).await;
-            step(&journal, id, &[]);
-        }
-        let notice = JobEvent::Message(AgentMessage {
-            id: JobId::new(2).unwrap(),
-            name: None,
-            message,
-            text: "script says hi".into(),
-        });
-        let events = Message::User(vec![UserPart::JobEvents {
-            events: vec![notice],
-        }]);
-        journal.record(&agent, committed(events)).await;
-        step(&journal, "job events", &[]);
-        let next = journal.request(&agent, None).await.request;
-        journal.delta(&agent, next, "text", "cut short");
-        step(&journal, "second request streaming", &[next]);
-        let interrupted = SessionEvent::ModelAttemptInterrupted(AttemptRef {
-            request: next,
-            attempt: 1,
-        });
-        journal.record(&agent, interrupted).await;
-        step(&journal, "interrupted", &[]);
-        let stopped = RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity: AgentActivity::Stopped(skyhook::agent::TurnFailure::Interrupted),
-            at: 0,
-        };
-        update(&mut journal.snapshot, stopped);
-        // Stopping settles the interrupted response, moving it to its journal position.
-        step(&journal, "stopped", &[next]);
-        let status = SessionEvent::Status {
-            message: "done".into(),
-        };
-        journal.record(&agent, status).await;
-        step(&journal, "status", &[]);
+        // The background call ends only once the next request has gone out, so the
+        // wait wakes on it and its event commits as a notification.
+        model
+            .turn()
+            .await
+            .end(vec![call("wait", "wait", json!({}), 0)]);
+        let plain = job_of_call(&session.observe().snapshot, "plain").unwrap();
+        session.cancel_job(plain).await.unwrap();
+        let turn = model.turn().await;
+        let notified = |snapshot: &ObservationSnapshot| recorded(snapshot, committed(job_events));
+        advance(&mut app, &notified).await;
+        turn.delta("text", ItemKind::Text, "cut short");
+        advance(&mut app, &|snapshot| streamed(snapshot, "cut short")).await;
+        session.interrupt().await;
+        let _ = bounded(asked).await.unwrap();
+        advance(&mut app, &|snapshot| stopped(snapshot, &agent)).await;
+        session
+            .record_status(agent.clone(), "done".into())
+            .await
+            .unwrap();
+        advance(&mut app, &|snapshot| recorded(snapshot, status)).await;
 
-        // Each script's children sit directly under it, indented, on both tabs,
-        // and the response's tool cards stay one tight block.
-        let tree = [(1, 0), (2, 0), (3, 2), (6, 2), (4, 0), (5, 2)]
-            .map(|(id, indent)| (JobId::new(id).unwrap(), indent));
+        // The scripts run in parallel, so their children may interleave in the
+        // journal. Whatever order they landed in, each script's children sit
+        // directly under it, indented, on both tabs, and the response's tool cards
+        // stay one tight block.
+        let mut tree = Vec::new();
+        for id in ["admitted", "script", "parallel", "plain"] {
+            let job = job_of_call(&app.snapshot, id).unwrap();
+            tree.push((job, 0));
+            let records = app.snapshot.records.values();
+            tree.extend(records.filter_map(|record| match &record.event {
+                SessionEvent::JobCreated {
+                    job: child,
+                    parent: Some(parent),
+                    ..
+                } if *parent == job => Some((*child, 2)),
+                _ => None,
+            }));
+        }
+        assert_eq!(tree.len(), 7);
         let cards = |entries: &[Entry]| -> Vec<_> {
             let cards = entries.iter().filter_map(|e| Some((e.job_id()?, e.indent)));
             cards.collect()
         };
-        let entries = tabs[0].2.entries();
+        let entries = tabs[0].cache.entries();
         let first = entries.iter().position(|entry| entry.job_id().is_some());
-        let block = &entries[first.unwrap()..][..6];
+        let block = &entries[first.unwrap()..][..7];
         assert_eq!(cards(block), tree);
-        assert!(block[..5].iter().all(|entry| entry.compact_after));
-        assert_eq!(cards(tabs[2].2.entries()), tree);
+        assert!(block[..6].iter().all(|entry| entry.compact_after));
+        assert_eq!(cards(tabs[2].cache.entries())[..7], tree);
     }
 
     #[tokio::test]
     async fn retained_owner_separates_overlay_and_keeps_replacement_indices_valid() {
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let (mut projection, view, outputs, mut cache) = Default::default();
-        let presentation = show(&agent, &view, false);
-        let sync =
-            |cache: &mut ContentCache, snapshot: &_, projection: &mut _, text: Option<&str>| {
-                let overlay = text.map(|text| {
-                    Entry::new(EntryKey::UnsavedStatus(0), text.into(), Surface::Status)
-                });
-                let overlay = overlay.into_iter().collect();
-                cache.update(snapshot, projection, presentation, &outputs, 0, overlay)
-            };
-        assert_eq!(
-            sync(
-                &mut cache,
-                &journal.snapshot,
-                &mut projection,
-                Some("first")
-            ),
-            [0]
-        );
-        assert_eq!(cache.entries().len(), 1);
-        let dirty = sync(
-            &mut cache,
-            &journal.snapshot,
-            &mut projection,
-            Some("other"),
-        );
-        assert_eq!(dirty, [0]);
-        assert_eq!(cache.entries()[0].text(), "other");
-        journal.call_record(&agent, "call").await;
-        projection.rebuild(&journal.snapshot);
-        sync(
-            &mut cache,
-            &journal.snapshot,
-            &mut projection,
-            Some("other"),
-        );
-        assert_eq!(cache.entries().len(), 2);
-        assert_eq!(cache.entries()[1].key(), &EntryKey::UnsavedStatus(0));
-        sync(&mut cache, &journal.snapshot, &mut projection, None);
-        assert_eq!(cache.entries().len(), 1);
-        // Switching to an empty tab invalidates retained history and old overlay.
-        let presentation = EntryView {
-            tab: Tab::Requests,
-            ..show(&agent, &view, false)
+        let (_root, mut app) = fixture().await;
+        let agent = app.root_agent().clone();
+        let mut fold = Fold::new(&agent, Tab::Conversation);
+        let unsaved = |text: &str| {
+            vec![Entry::new(
+                EntryKey::UnsavedStatus(0),
+                text.into(),
+                Surface::Status,
+            )]
         };
-        cache.update(
-            &journal.snapshot,
-            &mut projection,
-            presentation,
-            &outputs,
-            1,
-            Vec::new(),
-        );
-        assert!(cache.entries().is_empty());
+        fold.overlay = unsaved("first");
+        assert_eq!(fold.refresh(&app.snapshot), [0]);
+        assert_eq!(fold.cache.entries().len(), 1);
+        fold.overlay = unsaved("other");
+        assert_eq!(fold.refresh(&app.snapshot), [0]);
+        assert_eq!(fold.cache.entries()[0].text(), "other");
+        (app.session().unwrap())
+            .record_status(agent.clone(), "saved".into())
+            .await
+            .unwrap();
+        observe_record(&mut app, status).await;
+        fold.refresh(&app.snapshot);
+        assert_eq!(fold.cache.entries().len(), 2);
+        assert_eq!(fold.cache.entries()[1].key(), &EntryKey::UnsavedStatus(0));
+        fold.overlay.clear();
+        fold.refresh(&app.snapshot);
+        assert_eq!(fold.cache.entries().len(), 1);
+        // Switching to an empty tab invalidates retained history and old overlay.
+        fold.tab = Tab::Requests;
+        fold.refresh(&app.snapshot);
+        assert!(fold.cache.entries().is_empty());
     }
 }

@@ -23,7 +23,8 @@ pub struct SessionSummary {
     pub model: Option<ModelRef>,
     /// The root agent's applied mode.
     pub mode: Option<crate::tool::policy::ModeName>,
-    /// How the root agent would resume: the turn it would continue, if any.
+    /// The root agent's stopped turn, which resuming continues, if any. A root
+    /// that closed idle with deliveries pending has none, yet resumes interrupted.
     pub stopped: Option<TurnFailure>,
 }
 
@@ -119,7 +120,7 @@ fn title_at(row: &Row, at: i32) -> DbResult<Option<SessionTitle>> {
 /// to continue: its turn failed, or it was cut short while its conversation still
 /// awaited the model or its latest request of any purpose had not completed.
 /// `None` resumes idle. Each step is one indexed lookup, however long the journal.
-pub(in crate::session) fn stopped_turn(db: &Db) -> DbResult<Option<TurnFailure>> {
+fn stopped_turn(db: &Db) -> DbResult<Option<TurnFailure>> {
     let latest = |kind: EntryKind| {
         let latest = db.query_row(
             "SELECT max(seq) FROM entry \

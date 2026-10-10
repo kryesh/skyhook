@@ -4,7 +4,7 @@ mod error;
 mod interaction;
 mod observation;
 mod runtime;
-mod todo;
+pub(crate) mod todo;
 
 pub use error::{CompactionError, CompactionFault, Failure, HarnessError, TurnFailure};
 pub(crate) use error::{FailureKind, FaultKind};
@@ -24,4 +24,7 @@ pub(crate) use todo::ReplaceError;
 pub use todo::{TodoItem, TodoStatus};
 
 pub(crate) use interaction::QuestionOutput;
-pub(crate) use runtime::{Catalog, ModelEntry};
+pub(crate) use observation::{Responses, Views, live};
+#[cfg(test)]
+pub(crate) use runtime::stopped_turn;
+pub(crate) use runtime::{Agents, Catalog, ModelEntry, activities, recorded_context};

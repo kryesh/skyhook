@@ -100,10 +100,7 @@ pub async fn run(
         Some(id) => Some(launch.create(Some(id)).await?),
         None => None,
     };
-    let observation = match session {
-        Some(session) => Some(PreparedObservation::subscribe(session).await),
-        None => None,
-    };
+    let observation = session.map(PreparedObservation::subscribe);
     let (tx, rx) = mpsc::unbounded_channel();
     let mut app = App::new(observation, launch, &mode, saved, tx);
     // An explicit mode outranks the one a resumed session was last in, if it has it.

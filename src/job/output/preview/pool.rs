@@ -103,7 +103,7 @@ impl Marker<'_> {
     fn mark(&mut self, value: Value, field: Option<FieldPointer>, record: bool) -> Node {
         if field
             .as_ref()
-            .is_some_and(|field| self.presented.complete.contains(field))
+            .is_some_and(|field| self.presented.complete().contains(field))
         {
             return Node::Complete(value);
         }
@@ -173,7 +173,7 @@ fn role(
 
 /// Which lines the string at `field` keeps as a text field.
 fn keep(presented: &Presented, field: Option<&FieldPointer>) -> Keep {
-    if field.is_some_and(|field| presented.ends.contains(field)) {
+    if field.is_some_and(|field| presented.ends().contains(field)) {
         Keep::Ends
     } else {
         Keep::Head
@@ -338,7 +338,7 @@ impl<R: Read> Walker<'_, R> {
         if self.cancellation.is_cancelled() {
             return Err(ToolError::cancelled());
         }
-        if self.presented.complete.contains(field) {
+        if self.presented.complete().contains(field) {
             let mut bytes = Vec::new();
             let mut writer = JsonStreamWriter::new(&mut bytes);
             self.reader.transfer_to(&mut writer).map_err(saved_json)?;
@@ -355,8 +355,8 @@ impl<R: Read> Walker<'_, R> {
                 while self.reader.has_next().map_err(saved_json)? {
                     let child_place = place.child(total);
                     let pooled = self.pools(child_place);
-                    let child =
-                        (pooled || !self.presented.complete.is_empty()).then(|| field.index(total));
+                    let child = (pooled || !self.presented.complete().is_empty())
+                        .then(|| field.index(total));
                     match child {
                         Some(child) if pooled || self.protects(&child) => {
                             self.count(usize::from(total > 0), child_place);
@@ -452,7 +452,7 @@ impl<R: Read> Walker<'_, R> {
                 (false, place.child(total))
             };
             let pooled = self.pools(member_place);
-            let child = (pooled || leading || !self.presented.complete.is_empty())
+            let child = (pooled || leading || !self.presented.complete().is_empty())
                 .then(|| field.property(&key));
             let before = self.tally.clone();
             let member = match child {
@@ -620,7 +620,7 @@ impl<R: Read> Walker<'_, R> {
     }
 
     fn protects(&self, field: &FieldPointer) -> bool {
-        protects(&self.presented.complete, field)
+        protects(self.presented.complete(), field)
     }
 
     /// The next string's prefix and extent, with its last bytes when `end`.

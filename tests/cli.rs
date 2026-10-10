@@ -90,8 +90,8 @@ impl Fixture {
         block_on(async {
             let opened = skyhook::session::SessionStore::open(&sessions, id);
             let (store, records) = opened.await.unwrap();
-            let jobs = skyhook::job::JobManager::restore(store, &records).await;
-            let (jobs, mut text, all) = (jobs.unwrap(), String::new(), <_>::default());
+            let jobs = skyhook::job::JobManager::new(store);
+            let (mut text, all) = (String::new(), <_>::default());
             for record in &records {
                 if let JobCreated { job, .. } = record.event {
                     let (query, token) = (Query::new(job), <_>::default());
@@ -751,6 +751,14 @@ mod headless {
             assert!(!out.status.success());
             assert!(f.journal(&out).contains("Failed:"));
         }
+        // A resumed session that never ran journals nothing, its final status
+        // included, and reports why it did not run.
+        let id = session_id(&out).to_string();
+        let resumed = output(f.batch().args(["-s", "missing.js", "--resume", &id]));
+        assert!(!resumed.status.success());
+        let stderr = String::from_utf8_lossy(&resumed.stderr);
+        assert!(stderr.contains("No such file"), "{stderr}");
+        assert_eq!(f.journal(&resumed), log);
     }
 
     #[test]

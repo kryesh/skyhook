@@ -309,7 +309,7 @@ pub(crate) mod tests {
         ResourceId::mcp(target, "item")
     }
 
-    fn attended(interactive: bool, ui: UiInteraction) -> HostApprovalPolicy {
+    pub(crate) fn attended(interactive: bool, ui: UiInteraction) -> HostApprovalPolicy {
         let mut capabilities = CapabilitySet::default();
         if interactive {
             capabilities.insert(Capability::Interactive);

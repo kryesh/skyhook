@@ -19,7 +19,7 @@ pub(crate) use captures::{
     CaptureCollector, CaptureWriter, CompletedCapture, HostOutput, PendingCapture, TextCaptureField,
 };
 pub use captures::{CaptureDescriptor, CaptureKind};
-pub(crate) use finalization::save_completed;
+pub(crate) use finalization::prepare_completed;
 pub(crate) use json::{Detection, parse_text as parse_json_text};
 pub use products::{
     Continuation, ElementPage, LinePage, Match, MatchPage, MemberPage, NumberedLine, OutputFields,
@@ -30,13 +30,13 @@ use reader::Source;
 pub(super) use saved::blocking;
 pub use saved::diagnostic_slot;
 pub(crate) use saved::{DiagnosticSlot, Output, Saved, diagnostic_slot_in, presented_size};
-use saved::{Stored, database, hydrate, save_document};
+use saved::{Stored, database, hydrate, prepare_document};
 
 use super::{JobError, JobManager, JobState, OutputPresentation, views};
 pub use crate::tool::output::FieldPointer;
 use crate::{
     identity::JobId,
-    session::{CaptureRow, SharedDb},
+    session::{CaptureRow, OffloadedCapture, OutputRows, SharedDb},
     tool::{ToolError, diagnostic::DiagnosticViewer, policy::CapabilitySet},
 };
 use base64::Engine as _;
@@ -72,8 +72,9 @@ pub fn omit_null_fields(value: &mut Value) {
     }
 }
 
-/// Who reads a presentation. Model-facing reads acknowledge the job's pending
-/// notification; host inspection never does and always shows details.
+/// Who reads a presentation. A model-facing read presents the job's pending
+/// notification, for its reader to acknowledge; host inspection never does and
+/// always shows details.
 #[derive(Clone, Copy)]
 pub(crate) enum OutputOptions {
     Host,
@@ -81,31 +82,9 @@ pub(crate) enum OutputOptions {
 }
 
 impl JobManager {
-    /// Record the declared presentations of fields in a script's saved return value.
-    pub(crate) async fn save_presented_fields(
-        &self,
-        job: JobId,
-        presented: Presented,
-    ) -> Result<(), ToolError> {
-        if presented.is_empty() {
-            return Ok(());
-        }
-        let output = self.output(job);
-        let job = output.job.get();
-        blocking(move || {
-            output
-                .db
-                .save_presented_fields(job, &presented)
-                .map_err(database)
-        })
-        .await
-    }
-
+    /// The output rows of job `id`'s current run.
     pub(crate) fn output(&self, id: JobId) -> Output {
-        Output {
-            db: self.inner.store.outputs(),
-            job: id,
-        }
+        Output::current(&self.inner.store, id)
     }
 
     #[cfg(test)]
@@ -114,16 +93,17 @@ impl JobManager {
         args: OutputArgs,
         capabilities: &CapabilitySet,
     ) -> Result<Value, ToolError> {
-        self.present_output_with(
+        let presented = self.present_output_with(
             args,
             super::CancellationToken::new(),
             capabilities,
             OutputOptions::Model {
                 presentation: crate::job::OutputPresentation::Full,
             },
-        )
-        .await
-        .map(PresentedOutput::into_view)
+        );
+        let presented = presented.await?;
+        self.acknowledge(presented.acknowledges).await?;
+        Ok(presented.into_view())
     }
 
     /// Host inspection never acknowledges an agent's pending notification.
@@ -149,8 +129,9 @@ impl JobManager {
         parent: FieldPointer,
         index: usize,
     ) -> Result<OutputFields, ToolError> {
-        let terminal = self.metadata(job).await?.state.is_terminal();
-        let output = self.output(job);
+        let metadata = self.metadata(job)?;
+        let terminal = metadata.state.is_terminal();
+        let output = Output::of(self.store(), job, metadata.invocation);
         blocking(move || {
             let saved = Saved::load(&output)?;
             let cancellation = super::CancellationToken::new();
@@ -244,16 +225,14 @@ impl JobManager {
         options: OutputOptions,
     ) -> Result<PresentedOutput, ToolError> {
         let viewer = viewer.into();
-        let (acknowledge, presentation) = match options {
+        let (model, presentation) = match options {
             OutputOptions::Host => (false, OutputPresentation::Full),
             OutputOptions::Model { presentation } => (true, presentation),
         };
         let mut query = args.admit()?;
         let output_selection = args.selection();
         let explicit = output_selection == OutputSelection::Explicit;
-        let (mut envelope, images) = {
-            let jobs = self.inner.jobs.lock().await;
-            let entry = jobs.get(&args.job).ok_or(JobError::Unknown(args.job))?;
+        let (mut envelope, images, delivery) = self.entry(args.job, |entry| {
             (
                 entry.envelope(args.job),
                 match entry.finished() {
@@ -262,8 +241,9 @@ impl JobManager {
                     }
                     _ => Vec::new(),
                 },
+                entry.delivery(args.job),
             )
-        };
+        })?;
         let terminal = envelope.state.is_terminal();
         let question = envelope.state == JobState::WaitingInput;
         let live_question = envelope.question.take();
@@ -274,7 +254,8 @@ impl JobManager {
         };
         let mut result = None;
         let mut annotations = views::Presentation::default();
-        let output = self.output(args.job);
+        // The run the envelope shows: a later run's output never presents it.
+        let output = Output::of(self.store(), args.job, envelope.invocation);
         let mut saved = blocking(move || Saved::load(&output)).await?;
         saved.present_diagnostics(envelope.output_diagnostic.as_ref(), viewer)?;
         let saved = std::sync::Arc::new(saved);
@@ -359,10 +340,9 @@ impl JobManager {
         if incomplete_capture {
             annotations.notice = Some(views::Notice::OutputIncomplete);
         }
-        if acknowledge && ((terminal && !questions().contains(&query.field)) || presented_question)
-        {
-            self.claim(args.job).await?;
-        }
+        let acknowledges = delivery.filter(|_| {
+            model && ((terminal && !questions().contains(&query.field)) || presented_question)
+        });
         // A complete capture is simply a field of the result, read by pointer.
         captures.retain(|capture| !capture.complete);
         // Hydration targets come from discovered records, never decoded wire
@@ -388,17 +368,19 @@ impl JobManager {
             view: envelope.view(viewer, kind, result, annotations),
             images,
             capture_targets,
+            acknowledges,
         })
     }
 
-    pub(crate) async fn hydrate_envelope(
+    /// The result `envelope`'s run saved, once it finished.
+    pub(crate) async fn saved_result(
         &self,
-        envelope: &mut super::JobEnvelope,
-    ) -> Result<(), JobError> {
+        envelope: &super::JobEnvelope,
+    ) -> Result<Option<Value>, JobError> {
         if !envelope.state.is_terminal() {
-            return Ok(());
+            return Ok(None);
         }
-        let output = self.output(envelope.id);
+        let output = Output::of(self.store(), envelope.id, envelope.invocation);
         let product = blocking(move || {
             let saved = Saved::load(&output)?;
             (saved.product.as_ref())
@@ -410,10 +392,7 @@ impl JobManager {
         })
         .await
         .map_err(|error| JobError::Output(Box::new(error)))?;
-        if let Some(result) = product {
-            envelope.output = result;
-        }
-        Ok(())
+        Ok(product.flatten())
     }
 }
 
@@ -521,6 +500,22 @@ mod tests {
         (root, manager, id)
     }
 
+    /// A read presents the run its envelope shows, however the job has run since.
+    #[tokio::test]
+    async fn a_read_presents_the_run_its_envelope_shows() {
+        let (_root, manager, agent) = runtime().await;
+        let id = manager
+            .test_resumable(agent, "rerun", json!("second"))
+            .await;
+        manager.test_finish(id, json!("first")).await;
+        let first = manager.snapshot(id).unwrap();
+        manager.send(id, json!("again")).await.unwrap();
+        let second = crate::tests::bounded(manager.wait(id, None, true)).await;
+        assert_eq!(second.unwrap().output, Some(json!("second")));
+        let shown = manager.saved_result(&first).await.unwrap();
+        assert_eq!(shown, Some(json!("first")));
+    }
+
     fn field_args(id: JobId, field: &str) -> OutputArgs {
         let mut args = OutputArgs::new(id);
         args.field = Some(field.parse().unwrap());
@@ -584,10 +579,7 @@ mod tests {
             })
             .to_vec();
         let output = ToolOutput::new(json!({"text": "first\nsecond"})).with_images(images.clone());
-        manager
-            .finish(id, JobOutcome::Completed(output))
-            .await
-            .unwrap();
+        manager.test_complete(id, output).await;
         manager
             .output(id)
             .test_capture("/result/raw", CaptureKind::Text, b"line");
@@ -647,7 +639,7 @@ mod tests {
             assert_eq!(captures.len(), 1);
             assert!(captures[0]["output"].is_null());
         }
-        assert_eq!(manager.images(id).await.unwrap(), images);
+        assert_eq!(manager.snapshot(id).unwrap().images, images);
     }
 
     #[tokio::test]
@@ -672,7 +664,6 @@ mod tests {
             assert_eq!(manager.output(id).test_document().unwrap()["result"], raw);
             let metadata = manager
                 .metadata(id)
-                .await
                 .unwrap()
                 .metadata_view(&Default::default())
                 .into_value();
@@ -748,12 +739,10 @@ mod tests {
             manager.finish(id, outcome).await.unwrap();
             let view = model(&manager, OutputArgs::new(id)).await;
             assert_eq!(view.get("result"), available.then_some(&Value::Null));
-            // Option<Value> in older journal decoding cannot retain Some(null).
-            // Hydration must recover availability from the saved presence bit.
-            let mut envelope = manager.snapshot(id).await.unwrap();
-            envelope.output = None;
-            manager.hydrate_envelope(&mut envelope).await.unwrap();
-            assert_eq!(envelope.output.is_some(), available);
+            // Hydration recovers availability from the saved presence bit.
+            let envelope = manager.snapshot(id).unwrap();
+            let result = manager.saved_result(&envelope).await.unwrap();
+            assert_eq!(result.is_some(), available);
         }
     }
 
@@ -800,10 +789,7 @@ mod tests {
             if !complete {
                 output.streams = crate::tool::StreamEnd::Cut;
             }
-            manager
-                .finish(job, JobOutcome::Completed(output))
-                .await
-                .unwrap();
+            manager.test_complete(job, output).await;
             for field in [None, Some("/result/stdout"), Some("")] {
                 let mut query = OutputArgs::new(job);
                 query.field = field.map(|field| field.parse().unwrap());
@@ -1245,13 +1231,13 @@ mod tests {
             let mut capabilities = CapabilitySet::default();
             capabilities.remove(Capability::Read);
             let denied = executor.clone().with_capabilities(capabilities);
-            let before = runtime.jobs.list(agent).await.len();
+            let before = runtime.jobs.list(agent).len();
             let arguments = json!({"path":"image.png"});
             // This is a pre-admission error: public dispatch converts it to an
             // id:null failure envelope, while the internal executor returns Err.
             assert!(denied.run_model(agent, "read", arguments).await.is_err());
-            for job in runtime.jobs.list(agent).await.into_iter().skip(before) {
-                assert!(runtime.jobs.images(job.id).await.unwrap().is_empty());
+            for job in runtime.jobs.list(agent).into_iter().skip(before) {
+                assert!(runtime.jobs.snapshot(job.id).unwrap().images.is_empty());
             }
         }
 
@@ -1276,8 +1262,8 @@ mod tests {
             let id = runtime.store.id();
             drop((runtime.jobs, runtime.store));
             let sessions = runtime.root.path().join("sessions");
-            let (store, records) = SessionStore::open(&sessions, id).await.unwrap();
-            let jobs = JobManager::restore(store.clone(), &records).await.unwrap();
+            let (store, _) = SessionStore::open(&sessions, id).await.unwrap();
+            let jobs = crate::job::tests::reopened(store.clone()).await;
             let agent = AgentId::root(id);
             let (executor, _slot) = tool_executor(jobs, runtime.root.path());
             let output = executor.run_model(&agent, "jobs", json!({"job":job}));

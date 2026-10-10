@@ -10,7 +10,6 @@ use super::live::{
     ReasoningStatus, block_key, live_tail, live_tail_responses, reasoning_entries, response_entries,
 };
 use super::notifications::job_event_entries;
-use super::projection::JobInfo;
 use super::requests::{request_entry, request_timing};
 use super::{
     Clean, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Timing, Title,
@@ -18,6 +17,7 @@ use super::{
 };
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
+use skyhook::job::JobEnvelope;
 use skyhook::provider::protocol::{AssistantItem, BlockRef, ToolResult};
 use skyhook::session::{
     EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestLedger, RequestSeq, SessionEvent,
@@ -244,7 +244,7 @@ impl History {
     pub fn build(inputs: Inputs<'_>) -> (Self, Vec<Entry>) {
         let mut history = Self::default();
         let mut entries = Vec::new();
-        let candidates = inputs.projection.jobs().keys().copied().collect();
+        let candidates = inputs.snapshot.jobs.keys().copied().collect();
         // Every record is folded before any segment is built: a call's segment
         // shows the result that arrives after it.
         let places = history.fold(inputs, candidates, &mut HashSet::new());
@@ -307,7 +307,7 @@ impl History {
             let mut jobs: Vec<_> = candidates
                 .into_iter()
                 .filter(|job| !self.index.contains_key(&Source::Job(*job)))
-                .filter_map(|job| projection.jobs().get(&job))
+                .filter_map(|job| snapshot.jobs.get(&job))
                 .filter(|job| &job.agent == agent)
                 .collect();
             // IDs follow creation, so a script is placed before its children.
@@ -341,7 +341,7 @@ impl History {
                 SessionEvent::JobCreated { job, origin, .. }
                     if presentation.tab == Tab::Conversation =>
                 {
-                    projection.jobs().get(job).map(|job| (job, origin))
+                    snapshot.jobs.get(job).map(|job| (job, origin))
                 }
                 _ => None,
             };
@@ -359,7 +359,12 @@ impl History {
     /// A child job follows its parent and shares its tool group, so children sit
     /// tight under their script and the script's block against its siblings.
     /// Other jobs group with the response that called them, if any.
-    fn place_job(&mut self, source: Source, job: &JobInfo, origin: Option<MessageSeq>) -> Place {
+    fn place_job(
+        &mut self,
+        source: Source,
+        job: &JobEnvelope,
+        origin: Option<MessageSeq>,
+    ) -> Place {
         let parent = job.parent.and_then(|parent| self.jobs.get(&parent));
         let group = parent.map_or_else(
             || origin.map_or(ToolGroup::Job(job.id), ToolGroup::Response),
@@ -489,7 +494,7 @@ impl History {
         built: &mut Built,
     ) -> Option<(Entry, ToolGroup)> {
         built.deps.push(Dep::Job(job));
-        let info = inputs.projection.jobs().get(&job)?;
+        let info = inputs.snapshot.jobs.get(&job)?;
         let placed = self.jobs.get(&job)?;
         let mut entry = job_entry(info, inputs.projection, inputs.outputs, inputs.presentation);
         entry.indent = (placed.place.depth().min(MAX_NESTING) * NEST_INDENT) as u16;
@@ -596,7 +601,7 @@ impl History {
                                     record.sequence,
                                     i,
                                     events,
-                                    projection,
+                                    snapshot,
                                     view,
                                     all_details,
                                 );
@@ -802,19 +807,23 @@ pub fn entries(
 #[cfg(test)]
 mod tests {
     use super::super::View;
-    use super::super::tests::{Journal, replay, update};
+    use super::super::tests::{replay, update};
     use super::*;
-    use skyhook::agent::{AgentActivity, RuntimeEvent};
+    use crate::tests::bounded;
+    use crate::tui::app::played::{
+        answered, ask, at, call, committed, count, exchange, failing_call, latest_request,
+        model_failed, observe_until, played_fixture, recorded, requested, results, stopped,
+        streamed,
+    };
+    use serde_json::json;
+    use skyhook::agent::RuntimeEvent;
     use skyhook::identity::AgentId;
-    use skyhook::provider::protocol::{AssistantItem, ToolCall};
+    use skyhook::provider::ProviderErrorKind;
+    use skyhook::provider::protocol::{AssistantItem, Completion, CutReason, ItemKind};
+    use skyhook::session::AttemptFailure;
 
     fn render(snapshot: &ObservationSnapshot, agent: &AgentId, details: bool) -> Vec<Entry> {
-        render_with(snapshot, agent, details)
-    }
-
-    fn render_with(snapshot: &ObservationSnapshot, agent: &AgentId, details: bool) -> Vec<Entry> {
-        let mut projection = Projection::default();
-        projection.rebuild(snapshot);
+        let projection = Projection::new(snapshot);
         let (view, outputs) = (View::default(), OutputStore::default());
         let view = EntryView {
             agent,
@@ -826,143 +835,115 @@ mod tests {
         entries(snapshot, &projection, view, &outputs, true)
     }
 
-    async fn commit(journal: &mut Journal, agent: &AgentId, message: Message) -> MessageSeq {
-        journal
-            .record(agent, SessionEvent::MessageCommitted { message })
-            .await
-            .message()
+    /// `snapshot` replayed with each record `sequence` seconds past the epoch.
+    fn stamped(snapshot: &ObservationSnapshot) -> ObservationSnapshot {
+        let mut stamped = ObservationSnapshot::default();
+        for record in snapshot.records.values() {
+            let mut record = record.clone();
+            record.timestamp_millis = record.sequence.get() as i64 * 1000;
+            update(&mut stamped, RuntimeEvent::Record(Box::new(record)));
+        }
+        stamped
     }
 
-    fn user(text: &str) -> Message {
-        Message::User(vec![UserPart::Text { text: text.into() }])
-    }
-
-    /// Records land a second apart. The first answer settles 3 s after its request
-    /// and 9 s after the request whose tool round began its turn; the second answer
-    /// is a turn of its own.
+    /// An answer's footer times its response, and the turn when a tool round began
+    /// it; an answer that is a turn of its own shows only its response.
     #[tokio::test]
     async fn answer_footers_time_their_response_and_a_longer_turn() {
-        use skyhook::session::{AttemptRef, CompletedOutcome};
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let completed = |request, message, outcome| SessionEvent::ResponseCompleted {
-            attempt: AttemptRef {
-                request,
-                attempt: 1,
-            },
-            message,
-            outcome,
-        };
-        let first = journal.request(&agent, None).await;
-        let call = journal.call_record(&agent, "call").await;
-        let used = completed(first.request, call, CompletedOutcome::ToolUse);
-        journal.record(&agent, used).await;
-        journal.result_record(&agent, "call", false).await;
-        // Input queued mid-turn does not start another.
-        commit(&mut journal, &agent, user("also this")).await;
-        for _ in 0..2 {
-            let request = journal.request(&agent, Some(first.context)).await.request;
-            let answer = Message::Assistant(vec![AssistantItem::text("text", 0, "done")]);
-            let message = commit(&mut journal, &agent, answer).await;
-            let answered = completed(request, message, CompletedOutcome::Answer);
-            journal.record(&agent, answered).await;
-        }
-        let footers: Vec<_> = render(&journal.stamped(), &agent, false)
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let first = ask(&session, "first");
+        let exec = call("call", "exec", json!({"command": ["true"]}), 0);
+        model.turn().await.end(vec![exec]);
+        model.turn().await.answer("done");
+        bounded(first).await.unwrap().unwrap();
+        let answer = vec![AssistantItem::text("text", 0, "done")];
+        exchange(&mut app, &mut model, "second", answer).await;
+        observe_until(&mut app, |app| count(&app.snapshot, answered) == 2).await;
+        let snapshot = stamped(&app.snapshot);
+        let seconds = |since: i64, until: i64| format!("{:.1}s", (until - since) as f64 / 1000.0);
+        let response = seconds(at(&snapshot, requested, 1), at(&snapshot, answered, 0));
+        let turn = seconds(at(&snapshot, requested, 0), at(&snapshot, answered, 0));
+        let alone = seconds(at(&snapshot, requested, 2), at(&snapshot, answered, 1));
+        let footers: Vec<_> = render(&snapshot, &agent, false)
             .into_iter()
             .filter_map(|entry| entry.footer.as_deref().map(str::to_owned))
             .collect();
         assert_eq!(
             footers,
-            ["fixture-model · 3.0s · turn 9.0s", "fixture-model · 3.0s"]
+            [
+                format!("fixture · {response} · turn {turn}"),
+                format!("fixture · {alone}")
+            ]
         );
     }
 
-    #[tokio::test]
-    async fn synchronous_results_are_turn_scoped() {
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        for error in [false, true] {
-            journal.call_record(&agent, "reused").await;
-            journal.result_record(&agent, "reused", error).await;
-        }
-        let cards = render(&journal.snapshot, &agent, true);
-        assert_eq!(cards.len(), 2);
-        assert!(cards[0].text().starts_with("▾ ✓ exec · Completed"));
-        assert!(cards[1].text().starts_with("▾ × exec · Failed"));
-        assert_ne!(cards[0].key(), cards[1].key());
-        assert!(cards[1].text().contains("Output\n  Permission was denied"));
-        assert!(cards.iter().all(|card| card.expandable()
-            && card.job_id().is_none()
-            && card.surface == Surface::Tool));
-
-        // A new assistant turn closes the old call scope even if its old call
-        // never produced a result: the late result stands alone.
-        journal.call_record(&agent, "pending").await;
-        journal.call_record(&agent, "new-turn").await;
-        journal.result_record(&agent, "pending", true).await;
-        let cards = render(&journal.snapshot, &agent, false);
-        let texts: Vec<_> = cards.iter().map(Entry::text).collect();
-        assert_eq!(texts[2..], ["▸ exec", "▸ exec", "▸ × exec · Failed"]);
-    }
-
+    /// A tool card follows its job by the job's exact call, so a call ID reused
+    /// by a later response that fails before any job starts gets a card of its
+    /// own, whether or not the first call's message is retained.
     #[tokio::test]
     async fn admitted_results_use_exact_job_provenance_even_without_retained_calls() {
-        use skyhook::{execution::ExecutionLocation, session::ModelCallOrigin};
         for retained in [false, true] {
-            let mut journal = Journal::new().await;
-            let agent = journal.agent();
-            let origin = journal.call_record(&agent, "reused").await;
-            let created = SessionEvent::JobCreated {
-                job: JobId::new(42).unwrap(),
-                parent: None,
-                origin: Some(ModelCallOrigin {
-                    message: origin,
-                    call_id: "reused".into(),
-                }),
-                tool: "exec".into(),
-                role: skyhook::job::JobRole::Tool,
-                name: None,
-                arguments: serde_json::json!({"command":["echo"]}),
-                output_schema: None,
-                accepts_input: false,
-                background: false,
-                location: ExecutionLocation::root("/workspace".into()),
-            };
-            journal.record(&agent, created).await;
-            journal.result_record(&agent, "reused", false).await;
+            let (_root, mut app, mut model, _session) = played_fixture().await;
+            let agent = app.root_agent().clone();
+            let asked = ask(app.session().unwrap(), "run");
+            let admitted = call("reused", "exec", json!({"command": ["true"]}), 0);
+            model.turn().await.end(vec![admitted]);
+            model.turn().await.end(vec![failing_call("reused")]);
+            model.turn().await.answer("done");
+            bounded(asked).await.unwrap().unwrap();
+            observe_until(&mut app, |app| {
+                count(&app.snapshot, committed(results)) == 2
+            })
+            .await;
+            let mut records = app.snapshot.records.values();
+            let (origin, job) = records
+                .find_map(|record| match &record.event {
+                    SessionEvent::JobCreated {
+                        job,
+                        origin: Some(origin),
+                        ..
+                    } => Some((origin.message, *job)),
+                    _ => None,
+                })
+                .unwrap();
             if !retained {
-                journal.snapshot.records.remove(&origin.into());
+                app.snapshot.records.remove(&origin.into());
             }
-            // A later call reuses the ID but fails before creating a job.
-            journal.call_record(&agent, "reused").await;
-            journal.result_record(&agent, "reused", true).await;
-
-            let cards = render(&journal.snapshot, &agent, false);
+            let cards: Vec<_> = render(&app.snapshot, &agent, false)
+                .into_iter()
+                .filter(|card| card.surface == Surface::Tool)
+                .collect();
             assert_eq!(cards.len(), 2);
-            assert_eq!(cards[0].job_id(), Some(JobId::new(42).unwrap()));
+            assert_eq!(cards[0].job_id(), Some(job));
             assert_eq!(
                 (cards[1].job_id(), cards[1].text()),
                 (None, "▸ × exec · Failed")
             );
+            assert_ne!(cards[0].key(), cards[1].key());
+            assert!(cards[1].expandable());
         }
     }
 
     #[tokio::test]
     async fn whitespace_only_turns_neither_create_agent_cards_nor_steal_the_answer_footer() {
-        let call = ToolCall::new("call_read", "read", serde_json::json!({"path":"."})).unwrap();
+        let read = call("call_read", "read", json!({"path": "."}), 2);
         for whitespace in ["\n\n", "\n\n\n", " \t\r\n", "\u{2003}"] {
-            let mut journal = Journal::new().await;
-            let agent = journal.agent();
-            journal.request(&agent, None).await;
+            let (_root, mut app, mut model, session) = played_fixture().await;
+            let agent = app.root_agent().clone();
+            let _asked = ask(&session, "look");
             let reasoning = "Inspect the repository.";
-            let message = Message::Assistant(vec![
+            model.turn().await.end(vec![
                 AssistantItem::reasoning("reasoning", 0, reasoning, Some(replay())),
                 AssistantItem::text("separator", 1, whitespace),
-                AssistantItem::tool_call("tool", 2, call.clone()),
+                read.clone(),
             ]);
-            commit(&mut journal, &agent, message).await;
+            observe_until(&mut app, |app| {
+                count(&app.snapshot, committed(results)) == 1
+            })
+            .await;
 
-            let cards = render(&journal.snapshot, &agent, true);
+            let cards = render(&app.snapshot, &agent, true);
             assert!(cards.iter().all(|card| card.surface != Surface::Agent));
             assert!(
                 cards
@@ -977,23 +958,23 @@ mod tests {
             );
         }
 
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        journal.request(&agent, None).await;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let agent = app.root_agent().clone();
         let answer = "  Actual answer with spacing.\n";
-        let message = Message::Assistant(vec![
+        let items = vec![
             AssistantItem::text("answer", 0, answer),
             AssistantItem::text("separator", 1, "\n\n"),
-        ]);
-        commit(&mut journal, &agent, message).await;
-        let cards = render(&journal.snapshot, &agent, false);
+        ];
+        exchange(&mut app, &mut model, "answer", items).await;
+        let cards = render(&app.snapshot, &agent, false);
         let answers: Vec<_> = cards
             .iter()
             .filter(|card| card.surface == Surface::Agent)
             .collect();
         assert_eq!(answers.len(), 1);
         assert!(answers[0].text().ends_with(answer));
-        assert_eq!(answers[0].footer.as_deref(), Some("fixture-model"));
+        let footer = answers[0].footer.as_deref().unwrap();
+        assert!(footer.starts_with("fixture · "), "{footer}");
     }
 
     #[tokio::test]
@@ -1001,19 +982,27 @@ mod tests {
         // Guards the journal-to-card wiring: rendering a refusal as an ordinary
         // failure would restore the silent-failure UX this classification exists
         // to prevent.
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let refused_request = journal.request(&agent, None).await.request;
-        let error = "content filter; the response contained no content".to_string();
-        let refused = SessionEvent::ModelFailed {
-            attempt: skyhook::session::AttemptRef {
-                request: refused_request,
-                attempt: 1,
-            },
-            failure: skyhook::agent::Failure::Refused(error.clone()),
-        };
-        journal.record(&agent, refused).await;
-        let entries = render(&journal.snapshot, &agent, false);
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let asked = ask(&session, "question");
+        let refusal = Completion::cut(Vec::new(), CutReason::Refusal).unwrap();
+        model.turn().await.complete(refusal);
+        let _ = bounded(asked).await.unwrap();
+        observe_until(&mut app, |app| count(&app.snapshot, model_failed) == 1).await;
+        let refused_request = latest_request(&app.snapshot).unwrap();
+        let detail = app
+            .snapshot
+            .records
+            .values()
+            .find_map(|record| match &record.event {
+                SessionEvent::ModelFailed {
+                    failure: AttemptFailure::Final(skyhook::agent::Failure::Refused(detail)),
+                    ..
+                } => Some(detail.clone()),
+                _ => None,
+            });
+        let detail = detail.expect("a refusal is journaled as one");
+        let entries = render(&app.snapshot, &agent, false);
         let card = entries
             .iter()
             .find(|entry| entry.key() == &EntryKey::Retry(refused_request))
@@ -1021,22 +1010,19 @@ mod tests {
         assert_eq!(card.surface, Surface::Error);
         let mut lines = card.text().lines();
         assert_eq!(lines.next(), Some("Model declined to respond · attempt 1"));
-        assert_eq!(lines.next(), Some(error.as_str()));
+        assert_eq!(lines.next(), Some(detail.as_str()));
         assert_eq!(lines.next(), Some(super::super::retry::REFUSAL_HINT));
         assert_eq!(lines.next(), None);
         // An ordinary failure keeps the muted presentation and gains no hint.
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let failed_request = journal.request(&agent, None).await.request;
-        let failed = SessionEvent::ModelFailed {
-            attempt: skyhook::session::AttemptRef {
-                request: failed_request,
-                attempt: 1,
-            },
-            failure: skyhook::agent::Failure::Other("Protocol: rejected".to_owned()),
-        };
-        journal.record(&agent, failed).await;
-        let entries = render(&journal.snapshot, &agent, false);
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let asked = ask(&session, "question");
+        let rejected = ProviderErrorKind::Protocol.error("rejected");
+        model.turn().await.fail(rejected);
+        let _ = bounded(asked).await.unwrap();
+        observe_until(&mut app, |app| count(&app.snapshot, model_failed) == 1).await;
+        let failed_request = latest_request(&app.snapshot).unwrap();
+        let entries = render(&app.snapshot, &agent, false);
         let card = entries
             .iter()
             .find(|entry| entry.key() == &EntryKey::Retry(failed_request))
@@ -1050,60 +1036,48 @@ mod tests {
 
     #[tokio::test]
     async fn partial_attempts_stay_before_retry_and_followup_while_current_stream_stays_last() {
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let failed = journal.request(&agent, None).await;
-        let context = Some(failed.context);
-        let failed = failed.request;
-        journal.delta(&agent, failed, "text", "failed partial");
-        let error = "stream lost".into();
-        let event = SessionEvent::ModelFailed {
-            attempt: skyhook::session::AttemptRef {
-                request: failed,
-                attempt: 1,
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let asked = ask(&session, "first");
+        let turn = model.turn().await;
+        turn.delta("text", ItemKind::Text, "failed partial");
+        observe_until(&mut app, |app| streamed(&app.snapshot, "failed partial")).await;
+        turn.fail(ProviderErrorKind::Protocol.error("stream lost"));
+        let _ = bounded(asked).await.unwrap();
+        let continued = tokio::spawn({
+            let session = session.clone();
+            async move { session.continue_turn().await }
+        });
+        model.turn().await.answer("successful retry");
+        bounded(continued).await.unwrap().unwrap();
+        let asked = ask(&session, "new followup");
+        let turn = model.turn().await;
+        turn.delta("reasoning", ItemKind::Reasoning, "interrupted thinking");
+        turn.delta("text", ItemKind::Text, "interrupted partial");
+        observe_until(&mut app, |app| {
+            streamed(&app.snapshot, "interrupted partial")
+        })
+        .await;
+        session.interrupt().await;
+        let _ = bounded(asked).await.unwrap();
+        observe_until(&mut app, |app| stopped(&app.snapshot, &agent)).await;
+        let _continued = tokio::spawn(async move { session.continue_turn().await });
+        let turn = model.turn().await;
+        turn.delta("text", ItemKind::Text, "current stream");
+        observe_until(&mut app, |app| streamed(&app.snapshot, "current stream")).await;
+        // A child's stream on the same request never shows in its parent's conversation.
+        let child = RuntimeEvent::ResponseEvent {
+            agent: agent.child(1),
+            request: latest_request(&app.snapshot).unwrap(),
+            event: skyhook::provider::protocol::ResponseEvent::Delta {
+                block: skyhook::provider::protocol::BlockRef::single("text"),
+                kind: ItemKind::Text,
+                text: "child only".into(),
             },
-            failure: skyhook::agent::Failure::Other(error),
         };
-        journal.record(&agent, event).await;
-        let retry = journal.request(&agent, context).await.request;
-        let answer = AssistantItem::text("text", 1, "successful retry");
-        let message = commit(&mut journal, &agent, Message::Assistant(vec![answer])).await;
-        journal
-            .record(
-                &agent,
-                SessionEvent::ResponseCompleted {
-                    attempt: skyhook::session::AttemptRef {
-                        request: retry,
-                        attempt: 1,
-                    },
-                    message,
-                    outcome: skyhook::session::CompletedOutcome::Answer,
-                },
-            )
-            .await;
-        commit(&mut journal, &agent, user("new followup")).await;
-        let interrupted = journal.request(&agent, context).await.request;
-        journal.delta(&agent, interrupted, "reasoning", "interrupted thinking");
-        journal.delta(&agent, interrupted, "text", "interrupted partial");
-        let activity = AgentActivity::Stopped(skyhook::agent::TurnFailure::Interrupted);
-        let event = RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity,
-            at: 0,
-        };
-        update(&mut journal.snapshot, event);
-        let cut = skyhook::session::AttemptRef {
-            request: interrupted,
-            attempt: 1,
-        };
-        journal
-            .record(&agent, SessionEvent::ModelAttemptInterrupted(cut))
-            .await;
-        let current = journal.request(&agent, context).await.request;
-        journal.delta(&agent, current, "text", "current stream");
-        journal.delta(&agent.child(1), retry, "text", "child only");
+        update(&mut app.snapshot, child);
 
-        let entries = render(&journal.snapshot, &agent, false);
+        let entries = render(&app.snapshot, &agent, false);
         let text = entries
             .iter()
             .map(Entry::text)
@@ -1128,37 +1102,55 @@ mod tests {
         assert_eq!(text.matches("failed partial").count(), 1);
         assert_eq!(text.matches("interrupted partial").count(), 1);
         assert!(!text.contains("child only"));
-        assert!(entries.last().unwrap().text().contains("current stream"));
+        let last = entries
+            .iter()
+            .rev()
+            .find(|entry| !matches!(entry.key(), EntryKey::Working(_)));
+        assert!(last.unwrap().text().contains("current stream"));
     }
 
     #[tokio::test]
     async fn retry_card_is_one_compact_safe_entry_and_leaves_the_stored_error_intact() {
-        let mut journal = Journal::new().await;
-        let agent = journal.agent();
-        let request = journal.request(&agent, None).await.request;
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let _asked = ask(&session, "question");
         let error = format!("HTTP 503 overloaded\n\u{1b}[31m{}", "x".repeat(1000));
-        let failed = SessionEvent::ModelFailed {
-            attempt: skyhook::session::AttemptRef {
-                request,
-                attempt: 1,
-            },
-            failure: skyhook::agent::Failure::Provider(
-                error.clone(),
-                skyhook::provider::ProviderErrorKind::Unavailable,
-            ),
+        let overloaded = ProviderErrorKind::Unavailable.error(error.clone());
+        model.turn().await.fail(overloaded);
+        let scheduled = |event: &SessionEvent| {
+            matches!(
+                event,
+                SessionEvent::ModelFailed {
+                    failure: AttemptFailure::Retrying { .. },
+                    ..
+                }
+            )
         };
-        let failure = journal.record(&agent, failed).await;
-        let scheduled = SessionEvent::ModelRecoveryScheduled {
-            failure,
-            delay_millis: 1000,
-        };
-        journal.record(&agent, scheduled).await;
-        let cards = render(&journal.snapshot, &agent, false);
-        let text = cards[0].text();
-        assert_eq!((cards.len(), text.lines().count()), (1, 2));
+        observe_until(&mut app, |app| recorded(&app.snapshot, scheduled)).await;
+        let request = latest_request(&app.snapshot).unwrap();
+        let cards = render(&app.snapshot, &agent, false);
+        let mut retries = cards
+            .iter()
+            .filter(|card| card.key() == &EntryKey::Retry(request));
+        let text = retries.next().unwrap().text();
+        assert!(retries.next().is_none());
+        assert_eq!(text.lines().count(), 2);
         assert!(text.contains("attempt 2") && text.contains("HTTP 503 overloaded"));
         assert!(!text.contains('\u{1b}') && text.chars().count() < 320 && text.ends_with('…'));
-        assert!(journal.snapshot.records.values().any(|r| matches!(&r.event,
-            SessionEvent::ModelFailed { failure: skyhook::agent::Failure::Provider(stored, _), .. } if *stored == error)));
+        let stored = |event: &SessionEvent| {
+            matches!(event, SessionEvent::ModelFailed {
+                failure: AttemptFailure::Retrying { message, .. }, ..
+            } if *message == error)
+        };
+        assert!(recorded(&app.snapshot, stored));
+        // Interrupting the backoff ends the turn, and with it the retry's countdown.
+        session.interrupt().await;
+        let ended = |event: &SessionEvent| matches!(event, SessionEvent::AgentInterrupted);
+        observe_until(&mut app, |app| recorded(&app.snapshot, ended)).await;
+        let cards = render(&app.snapshot, &agent, false);
+        let card = cards
+            .iter()
+            .find(|card| card.key() == &EntryKey::Retry(request));
+        assert_eq!(card.unwrap().text(), "Interrupted · attempt 1");
     }
 }

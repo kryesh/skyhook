@@ -17,6 +17,8 @@ mod output;
 mod projection;
 pub use output::OutputStore;
 use output::{LoadedOutput, OutputAttempt};
+#[cfg(test)]
+pub(super) mod played;
 mod prompts;
 mod queue;
 mod session;
@@ -27,7 +29,7 @@ use super::{
     composer::{Composer, Submission},
     editor::{Editor, TextField},
     keys::{Command, KeyMap},
-    model::{self, Entry, Projection, Tab, View},
+    model::{self, Entry, Projection, Tab, View, Views},
 };
 use crate::interaction::{ApprovalReply, Prompt, PromptKind};
 use crate::{state, text::brief};
@@ -146,7 +148,7 @@ pub struct App {
     pub selected: AgentId,
     /// Shared across agents; reading and expansion state remain in `views`.
     pub tab: Tab,
-    pub views: HashMap<AgentId, View>,
+    pub views: Views,
     pub focus: Focus,
     pub tree_cursor: usize,
     pub tree_scroll: usize,
@@ -266,7 +268,7 @@ impl App {
             projection: Projection::default(),
             selected: selected.clone(),
             tab: Tab::default(),
-            views: HashMap::new(),
+            views: Views::default(),
             focus: Focus::Composer,
             tree_cursor: 0,
             tree_scroll: 0,
@@ -322,7 +324,7 @@ impl App {
             hover: None,
             render: super::render::RenderState::new(selected, tx),
         };
-        app.refresh();
+        app.reset_projection();
         app.select_mode(mode);
         let mut agents = app.projection.agents.iter();
         let root = agents.find(|agent| agent.id == app.selected);
@@ -348,40 +350,9 @@ pub(super) mod tests {
     pub(super) use serde_json::json;
     pub(super) use skyhook::agent::{Question, QuestionAnswer, QuestionOption, QuestionReply};
     use skyhook::remote::EmbeddedShimCatalog;
-    use skyhook::session::{
-        Message, ModelContext, ModelPurpose, ProfileSnapshot, RecordSeq, SessionEvent,
-    };
+    use skyhook::session::SessionEvent;
     use std::sync::Arc;
     pub(super) use tokio::sync::oneshot;
-
-    /// An agent model context for `profile`, with no system prompt or tools.
-    pub(in crate::tui) fn model_context(profile: ProfileSnapshot) -> SessionEvent {
-        let context = ModelContext {
-            purpose: ModelPurpose::Agent,
-            profile,
-            system: Vec::new(),
-            tools: Vec::new(),
-            response_schema: None,
-        };
-        SessionEvent::ModelContext { context }
-    }
-
-    /// The launch model's [`model_context`].
-    pub(in crate::tui) fn launch_context(app: &App) -> SessionEvent {
-        let name = app.launch.model.name();
-        let profile = app.launch.model.profile().clone();
-        model_context(ProfileSnapshot { name, profile })
-    }
-
-    pub(in crate::tui) fn requested(context: RecordSeq, tail: Vec<Message>) -> SessionEvent {
-        SessionEvent::ModelRequested {
-            context,
-            checkpoint: None,
-            through: None,
-            tail,
-            history_lifetime: Default::default(),
-        }
-    }
 
     pub(in super::super) async fn draft_fixture() -> (tempfile::TempDir, App) {
         let root = tempfile::tempdir().unwrap();
@@ -410,34 +381,8 @@ pub(super) mod tests {
     pub(in super::super) async fn fixture() -> (tempfile::TempDir, App) {
         let (root, mut app) = draft_fixture().await;
         let session = app.launch.create(None).await.unwrap();
-        attach(&mut app, session).await;
+        attach(&mut app, session);
         (root, app)
-    }
-    /// Journal `event` for the selected agent and mirror it into the snapshot.
-    pub(in crate::tui) async fn push_record(app: &mut App, event: SessionEvent) -> RecordSeq {
-        let store = app.session().unwrap().store();
-        let record = store.append(app.selected.clone(), event).await.unwrap();
-        let sequence = record.sequence;
-        app.snapshot.apply(ObservedEvent {
-            revision: app.snapshot.revision + 1,
-            event: RuntimeEvent::Record(Box::new(record)),
-        });
-        sequence
-    }
-    /// Journal a child of the root agent, started as the root was.
-    pub(in crate::tui) async fn push_child(app: &mut App, index: u32) -> AgentId {
-        let root = app.root_agent().clone();
-        let mut records = app.snapshot.records.values();
-        let started = records.find(|record| {
-            record.agent == root && matches!(record.event, SessionEvent::AgentStarted { .. })
-        });
-        let started = started.unwrap().event.clone();
-        let child = root.child(index);
-        let store = app.session().unwrap().store();
-        let record = store.append(child.clone(), started).await.unwrap();
-        app.snapshot.records.insert(record.sequence, record);
-        app.refresh();
-        child
     }
     /// Refresh `job`'s output as the UI does, returning what it shows.
     pub(in crate::tui) async fn fetch_output(app: &mut App, job: JobId) -> skyhook::job::JobView {
@@ -449,52 +394,9 @@ pub(super) mod tests {
         app.outputs.get(&job).unwrap().clone().unwrap()
     }
     /// Replace a draft fixture with one opened on `session`.
-    pub(super) async fn attach(app: &mut App, session: SessionHandle) {
-        let observation = PreparedObservation::subscribe(session).await;
+    pub(in crate::tui) fn attach(app: &mut App, session: SessionHandle) {
+        let observation = PreparedObservation::subscribe(session);
         *app = app.sibling(Some(observation), app.launch.clone(), app.tx.clone());
-    }
-    /// A deterministic terminal failure, unlike a refused connection, which is
-    /// transient and now retries until cancellation.
-    pub(super) async fn permanent_failure_fixture() -> (tempfile::TempDir, App) {
-        use skyhook::provider::protocol::{ContextId, ModelRequest};
-        use skyhook::provider::{
-            Provider, ProviderContext, ProviderError, ProviderErrorKind, ResponseStream,
-        };
-        struct Rejected;
-        impl Provider for Rejected {
-            fn open_context(
-                &self,
-                _: ContextId,
-            ) -> Result<Box<dyn ProviderContext>, ProviderError> {
-                Ok(Box::new(Self))
-            }
-        }
-        impl ProviderContext for Rejected {
-            fn invoke(&mut self, _: ModelRequest) -> ResponseStream {
-                Box::pin(futures_util::stream::once(async {
-                    Err(ProviderErrorKind::Authentication.error("fixture credentials rejected"))
-                }))
-            }
-        }
-        let (root, mut app) = draft_fixture().await;
-        let harness = app
-            .launch
-            .model
-            .harness_builder(&app.launch.workspace)
-            .unwrap()
-            .provider(
-                "test".parse().unwrap(),
-                Arc::new(Rejected),
-                [("first".parse().unwrap(), app.launch.model.profile().clone())],
-            )
-            .session_root(&app.launch.sessions)
-            .shim_catalog(app.launch.catalog.clone())
-            .build()
-            .await
-            .unwrap();
-        let session = harness.new_session().await.unwrap();
-        attach(&mut app, session).await;
-        (root, app)
     }
     /// An image attachment whose bytes are a minimal PNG signature.
     pub(super) fn png_attachment(name: &str) -> Attachment {
@@ -639,11 +541,11 @@ pub(super) mod tests {
     pub(in crate::tui) async fn run_script(app: &mut App, source: &str) {
         let session = app.session().unwrap().clone();
         session.run_script(source).await.unwrap();
-        app.snapshot = session.observe().await.snapshot;
+        app.snapshot = session.observe().snapshot;
         app.refresh();
     }
     pub(in crate::tui) fn job_named(app: &App, tool: &str) -> JobId {
-        let mut jobs = app.projection.jobs().values();
+        let mut jobs = app.snapshot.jobs.values();
         jobs.find(|job| job.tool == tool).unwrap().id
     }
     /// Select the content row that renders `job`.
@@ -674,7 +576,7 @@ pub(super) mod tests {
             }
         }
         app.status.flush().await;
-        let records = session.observe().await.snapshot.records;
+        let records = session.observe().snapshot.records;
         let records = serde_json::to_string(&records).unwrap();
         for warning in &warnings {
             let encoded = serde_json::to_string(warning).unwrap();
@@ -699,7 +601,7 @@ pub(super) mod tests {
         let session = draft.launch.create(None).await.unwrap();
         let id = session.id();
         let (tx, _) = mpsc::unbounded_channel();
-        let observation = PreparedObservation::subscribe(session.clone()).await;
+        let observation = PreparedObservation::subscribe(session.clone());
         let mut initial = App::new(
             Some(observation),
             draft.launch.clone(),
@@ -708,7 +610,7 @@ pub(super) mod tests {
             tx,
         );
         assert_startup_warnings_ui_only(&mut initial).await;
-        draft.session_started(PreparedObservation::subscribe(session.clone()).await);
+        draft.session_started(PreparedObservation::subscribe(session.clone()));
         assert_startup_warnings_ui_only(&mut draft).await;
         session.shutdown().await.unwrap();
         session.close().await.unwrap();
@@ -716,7 +618,7 @@ pub(super) mod tests {
         drop((initial, draft, session));
 
         let session = resumed.launch.create(Some(id)).await.unwrap();
-        attach(&mut resumed, session).await;
+        attach(&mut resumed, session);
         assert_startup_warnings_ui_only(&mut resumed).await;
         resumed.session().unwrap().shutdown().await.unwrap();
     }

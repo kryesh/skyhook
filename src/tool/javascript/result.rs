@@ -132,7 +132,7 @@ mod tests {
             };
             runtime.jobs.finish(job, outcome).await.unwrap();
             assert_eq!(
-                runtime.jobs.snapshot(job).await.unwrap().output,
+                runtime.jobs.test_snapshot(job).await.unwrap().output,
                 Some(expected)
             );
         }

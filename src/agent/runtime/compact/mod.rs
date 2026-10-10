@@ -27,6 +27,7 @@ pub(super) async fn retry_delay(
     attempt: u8,
 ) -> Result<(), HarnessError> {
     tokio::select! {
+        biased;
         () = cancellation.cancelled() => Err(HarnessError::Interrupted),
         () = tokio::time::sleep(RETRY_BACKOFF * u32::from(attempt)) => Ok(()),
     }
@@ -111,7 +112,7 @@ impl SessionRuntime {
         input: &ModelRequest,
         completed_usage: Option<Usage>,
     ) -> Result<(), HarnessError> {
-        let mut launches = self.jobs.active_launches(turn.agent).await;
+        let mut launches = self.jobs.active_launches(turn.agent);
         let mut model_attempt = 0;
         for attempt in 1..=MAX_COMPACTION_ATTEMPTS {
             let mut request_sequence = None;
@@ -145,17 +146,13 @@ impl SessionRuntime {
             match result {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    self.store
-                        .append(
-                            turn.agent.clone(),
-                            SessionEvent::CompactionFailed {
-                                failure,
-                                error: (&error).into(),
-                            },
-                        )
-                        .await?;
-                    let retryable =
-                        matches!(&error, HarnessError::Compaction(error) if error.retryable());
+                    let fault = crate::agent::CompactionFault::from(&error);
+                    let retryable = fault.retryable();
+                    let failed = SessionEvent::CompactionFailed {
+                        failure,
+                        error: fault,
+                    };
+                    self.store.append(turn.agent.clone(), failed).await?;
                     if !retryable || attempt == MAX_COMPACTION_ATTEMPTS {
                         return Err(error);
                     }
@@ -177,9 +174,12 @@ mod tests {
     use super::{TokenMeter, summary_max_output};
     pub(super) use crate::agent::runtime::tests::{
         Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta, events, models,
-        provider_name, recoverable, response, summary_json, test_builder, todo, usage,
+        provider_name, recoverable, response, set_root_turn, summary_json, test_builder, todo,
+        usage,
     };
-    use crate::agent::runtime::{HarnessError, SessionHandle, TurnContext, compaction, state};
+    use crate::agent::runtime::{
+        HarnessError, SessionHandle, Turn, TurnContext, compaction, state,
+    };
     use crate::provider::profile::StateMode;
     use crate::{
         agent::{CompactionFault, FaultKind, TodoStatus},
@@ -329,14 +329,14 @@ mod tests {
             runtime.commit(root, next).await.unwrap();
         }
 
-        pub(super) async fn assert_no_tool_execution(&self) {
-            let records = self.session.runtime.store.records().await;
+        pub(super) fn assert_no_tool_execution(&self) {
+            let records = self.session.runtime.store.records();
             assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
             assert!(!self.workspace.path().join("must-not-exist").exists());
         }
 
-        pub(super) async fn records(&self) -> Vec<crate::session::EventRecord> {
-            self.session.runtime.store.records().await
+        pub(super) fn records(&self) -> Vec<crate::session::EventRecord> {
+            self.session.runtime.store.records()
         }
 
         pub(super) async fn compact(
@@ -345,7 +345,7 @@ mod tests {
         ) -> Result<(), HarnessError> {
             let runtime = &self.session.runtime;
             let agent = &self.session.root;
-            let records = runtime.store.records().await;
+            let records = runtime.store.records();
             let profile = records.iter().find_map(|record| match &record.event {
                 SessionEvent::ModelContext { context } => Some(context.profile.clone()),
                 _ => None,
@@ -356,9 +356,8 @@ mod tests {
             input.history = crate::session::render_history(history.history());
             let capabilities = CapabilitySet::default();
             let location = ExecutionLocation::root(self.workspace.path().to_path_buf());
-            let (jobs, todos) = (&runtime.jobs, &runtime.todos);
-            let state =
-                state::runtime_state_content(jobs, todos, agent, &capabilities, &location).await;
+            let (jobs, todos) = (&runtime.jobs, &runtime.store);
+            let state = state::runtime_state_content(jobs, todos, agent, &capabilities, &location);
             // As the agent's context builds it: only a stateless mode sends no tail.
             if profile.profile.state_mode != StateMode::None {
                 input.tail = vec![crate::session::Message::User(vec![state]).render()];
@@ -372,13 +371,16 @@ mod tests {
             };
             let mut provider = self.script.open_context(ContextId::from(agent))?;
             let (provider, meter) = (provider.as_mut(), &mut Default::default());
-            runtime
-                .compact_history(&turn, provider, meter, &profile, &input, None)
-                .await
+            // Only a busy turn requests a summary.
+            set_root_turn(&self.session, Turn::Busy);
+            let compacted = runtime.compact_history(&turn, provider, meter, &profile, &input, None);
+            let compacted = compacted.await;
+            set_root_turn(&self.session, Turn::Idle);
+            compacted
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn stream_overflow_below_threshold_compacts_once() {
         let overflow = ProviderErrorKind::ContextWindowExceeded.error("prompt is too long");
         let steps = [
@@ -394,7 +396,7 @@ mod tests {
         let requests = fixture.requests();
         assert_eq!(requests.len(), 4); // initial response, rejected stream, summary, retry
         assert!(compaction::estimate_request(&requests[1]) < 128_000 * 4 / 5);
-        let records = fixture.records().await;
+        let records = fixture.records();
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
         fixture.session.shutdown().await.unwrap();
     }
@@ -407,11 +409,11 @@ mod tests {
         fixture.add_history(20_000).await;
         let todos = vec![todo("Keep on interruption", TodoStatus::InProgress)];
         runtime
-            .todos
-            .replace(agent, todos.clone(), None)
+            .store
+            .replace_todos(agent, todos.clone(), None)
             .await
             .unwrap();
-        let before = project_history(&fixture.records().await, agent);
+        let before = project_history(&fixture.records(), agent);
         let cancellation = CancellationToken::new();
         let (result, ()) = bounded(async {
             tokio::join!(fixture.compact(&cancellation), async {
@@ -421,15 +423,15 @@ mod tests {
         })
         .await;
         assert!(matches!(result, Err(HarnessError::Interrupted)));
-        let records = fixture.records().await;
+        let records = fixture.records();
         assert_eq!(project_history(&records, agent), before);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
-        let found = runtime.todos.inspect(agent, None).await.unwrap();
+        let found = runtime.store.inspect_todos(agent, None).unwrap();
         assert_eq!(found, todos);
         fixture.session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn exhausted_summary_failures_preserve_history_and_never_execute_tools() {
         // Parser field cases live in compaction.rs; this covers rollback and tool contracts.
         let arguments = json!({"path":"must-not-exist", "content":"side effect"});
@@ -448,17 +450,20 @@ mod tests {
         for (fault, events) in failures {
             let steps = (0..3).map(|_| Step::new(events.clone()));
             let fixture = Fixture::new(steps).await;
-            let (todos, agent) = (&fixture.session.runtime.todos, &fixture.session.root);
+            let (todos, agent) = (&fixture.session.runtime.store, &fixture.session.root);
             fixture.add_history(20_000).await;
             let old_todos = vec![todo("Preserve unfinished work", TodoStatus::InProgress)];
-            todos.replace(agent, old_todos.clone(), None).await.unwrap();
-            let before = project_history(&fixture.records().await, agent);
+            todos
+                .replace_todos(agent, old_todos.clone(), None)
+                .await
+                .unwrap();
+            let before = project_history(&fixture.records(), agent);
             let error = fixture
                 .compact(&CancellationToken::new())
                 .await
                 .unwrap_err();
             assert_eq!(CompactionFault::from(&error).kind(), fault);
-            let records = fixture.records().await;
+            let records = fixture.records();
             let faults = events!(&records, SessionEvent::CompactionFailed { failure, error }
                 if failure.request().is_some() => error.kind());
             assert!(
@@ -468,45 +473,26 @@ mod tests {
             let requests = fixture.requests().len();
             let unchanged = project_history(&records, agent) == before;
             let compactions = count!(&records, SessionEvent::Compaction { .. });
-            let kept_todos = todos.inspect(agent, None).await.unwrap() == old_todos;
+            let kept_todos = todos.inspect_todos(agent, None).unwrap() == old_todos;
             let outcome = (requests, unchanged, compactions, kept_todos);
             assert_eq!(outcome, (4, true, 0, true), "{fault}");
-            fixture.assert_no_tool_execution().await;
+            fixture.assert_no_tool_execution();
             fixture.session.shutdown().await.unwrap();
         }
     }
 
-    /// A summary selecting an unknown job, or one whose output cannot be
-    /// presented, may succeed on retry; a checkpoint the journal refuses, here
-    /// for an active job's non-trailing unanswered call, cannot.
-    #[tokio::test(start_paused = true)]
+    /// A summary selecting an unknown job may succeed on retry; a checkpoint the
+    /// journal refuses, here for an active job's non-trailing unanswered call,
+    /// stops the session.
+    #[tokio::test]
     async fn only_a_retryable_failure_retries_without_installing_compaction() {
-        for (journaled, invariant) in [(false, false), (true, false), (false, true)] {
+        for invariant in [false, true] {
             let mut selected = summary_json();
             if !invariant {
                 selected["jobs"] = json!([99999]);
             }
             let fixture = Fixture::new((0..3).map(|_| Step::new(summary(&selected)))).await;
             fixture.add_history(20_000).await;
-            if journaled {
-                // Journaled but unknown to the job manager, so its output cannot be presented.
-                let (runtime, root) = (&fixture.session.runtime, &fixture.session.root);
-                let spec = crate::job::JobSpec::test(root.clone(), "read");
-                let created = SessionEvent::JobCreated {
-                    job: crate::identity::JobId::new(99999).unwrap(),
-                    parent: None,
-                    origin: None,
-                    tool: spec.tool,
-                    role: spec.role,
-                    name: None,
-                    arguments: spec.arguments,
-                    output_schema: None,
-                    accepts_input: false,
-                    background: false,
-                    location: spec.location,
-                };
-                runtime.store.append(root.clone(), created).await.unwrap();
-            }
             if invariant {
                 let (runtime, root) = (&fixture.session.runtime, &fixture.session.root);
                 let call = ToolCall::new("unanswered", "read", json!({"path":"file"})).unwrap();
@@ -526,17 +512,24 @@ mod tests {
                     origin: Some(crate::session::ModelCallOrigin { message, call_id }),
                     ..crate::job::JobSpec::test(root.clone(), "read")
                 };
+                set_root_turn(&fixture.session, Turn::Busy);
                 runtime.jobs.create(spec).await.unwrap().into_test_id();
             }
             let error = fixture
                 .compact(&CancellationToken::new())
                 .await
                 .unwrap_err();
-            let records = fixture.records().await;
+            let failed = matches!(
+                error,
+                HarnessError::Session(crate::session::SessionError::JournalFailed(_))
+            );
+            assert_eq!(failed, invariant, "{error}");
+            let records = fixture.records();
             assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
             let failed = count!(&records, SessionEvent::CompactionFailed { .. });
-            assert_eq!(failed, if invariant { 1 } else { 3 }, "{error}");
-            fixture.session.shutdown().await.unwrap();
+            assert_eq!(failed, if invariant { 0 } else { 3 }, "{error}");
+            let shutdown = fixture.session.shutdown().await;
+            assert_eq!(shutdown.is_ok(), !invariant);
         }
     }
 }

@@ -23,7 +23,7 @@ pub enum SavedState {
     /// Held open when the list was read, by another Skyhook instance or by a
     /// session still closing here; only a hint, as opening decides.
     Locked,
-    /// Its root agent's state, as it would resume.
+    /// Its root agent's state, as its journaled turns leave it.
     Closed(AgentDisplayState),
     /// Its state could not be read; it draws no glyph.
     Unknown,
@@ -197,54 +197,35 @@ mod tests {
 
     #[tokio::test]
     async fn switch_menu_pins_working_sessions_then_orders_by_last_activity() {
-        use skyhook::execution::ExecutionLocation;
-        use skyhook::identity::AgentId;
+        use crate::tui::app::{
+            played::{ask, played},
+            tests::draft_fixture,
+        };
         use skyhook::job::JobState;
-        use skyhook::session::{Message, SessionEvent, UserPart};
-        let root = tempfile::tempdir().unwrap();
-        let started = [
-            SessionEvent::SessionStarted {
-                targets: Vec::new(),
-                capabilities: Vec::new(),
-            },
-            SessionEvent::AgentStarted {
-                owner_job: None,
-                profile: None,
-                available_depth: 0,
-                mode: None,
-                capabilities: Vec::new(),
-                location: ExecutionLocation::root(root.path().to_owned()),
-            },
-        ];
+        let (_root, app) = draft_fixture().await;
+        let root = app.launch.sessions.clone();
         let mut stores = vec![];
         for index in 0..6 {
-            let store = SessionStore::create(root.path()).await.unwrap();
-            let agent = AgentId::root(store.id());
-            let mut events = started.to_vec();
-            // A prompt no answer followed resumes interrupted.
-            if index == 3 {
-                let text = "unanswered".into();
-                let message = Message::User(vec![UserPart::Text { text }]);
-                events.push(SessionEvent::MessageCommitted { message });
-            }
-            let records = store
-                .append_all(
-                    events
-                        .into_iter()
-                        .map(|event| (agent.clone(), event))
-                        .collect(),
-                )
-                .await
-                .unwrap();
-            let committed = records.last().unwrap().timestamp_millis;
-            // Keep one store's original lock held through the scan.
+            let (session, mut model) = played(&app.launch).await;
+            // A prompt no answer followed resumes interrupted; its request, sent once
+            // the prompt commits, stays open.
+            let _unanswered = if index == 3 {
+                drop(ask(&session, "unanswered"));
+                Some(model.turn().await)
+            } else {
+                None
+            };
+            // Keep one session held open through the scan.
             if index != 4 {
-                store.close().await.unwrap();
+                session.shutdown().await.unwrap();
+                session.close().await.unwrap();
             }
-            stores.push((store, committed));
+            let records = session.observe().snapshot.records;
+            let last = skyhook::session::EventRecord::last_activity(records.values()).unwrap();
+            stores.push((session, last));
         }
-        let ids: Vec<_> = stores.iter().map(|(store, _)| store.id()).collect();
-        let mut saved = load_saved(root.path()).await.unwrap();
+        let ids: Vec<_> = stores.iter().map(|(session, _)| session.id()).collect();
+        let mut saved = load_saved(&root).await.unwrap();
         assert_eq!(saved.len(), 6);
         for row in &mut saved {
             let index = ids.iter().position(|id| *id == row.id).unwrap();
@@ -292,6 +273,7 @@ mod tests {
         assert_eq!(time(6), local_time(1, today, &Local, Precision::Minutes));
         assert_eq!(items[6].columns[0], ids[0].to_string());
         assert!(time(1) == "draft" && time(2) == "draft");
+        stores[4].0.shutdown().await.unwrap();
         stores[4].0.close().await.unwrap();
     }
 }

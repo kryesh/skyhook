@@ -5,25 +5,47 @@ use super::*;
 use crate::json_schema::{Node, Resolver, accepts, declared_types};
 use crate::tool::output::{FieldPresentation, PREVIEW};
 
-/// Fields of a result whose presentation is declared.
+/// Fields of a result whose presentation is declared, each presented one way.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct Presented {
-    /// Fields never shortened.
-    pub(crate) complete: BTreeSet<FieldPointer>,
-    /// Text fields keeping their first and last lines.
-    pub(crate) ends: BTreeSet<FieldPointer>,
+    complete: BTreeSet<FieldPointer>,
+    ends: BTreeSet<FieldPointer>,
 }
 
 impl Presented {
+    pub(crate) const fn new() -> Self {
+        Self {
+            complete: BTreeSet::new(),
+            ends: BTreeSet::new(),
+        }
+    }
+
     pub(crate) fn is_empty(&self) -> bool {
         self.complete.is_empty() && self.ends.is_empty()
     }
 
+    /// Fields never shortened.
+    pub(crate) const fn complete(&self) -> &BTreeSet<FieldPointer> {
+        &self.complete
+    }
+
+    /// Text fields keeping their first and last lines.
+    pub(crate) const fn ends(&self) -> &BTreeSet<FieldPointer> {
+        &self.ends
+    }
+
+    /// A field declared both ways is complete.
     pub(crate) fn insert(&mut self, field: FieldPointer, presentation: FieldPresentation) {
         match presentation {
-            FieldPresentation::Complete => self.complete.insert(field),
-            FieldPresentation::Ends => self.ends.insert(field),
-        };
+            FieldPresentation::Complete => {
+                self.ends.remove(&field);
+                self.complete.insert(field);
+            }
+            FieldPresentation::Ends if !self.complete.contains(&field) => {
+                self.ends.insert(field);
+            }
+            FieldPresentation::Ends => {}
+        }
     }
 
     pub(crate) fn fields(&self) -> impl Iterator<Item = (&FieldPointer, FieldPresentation)> {
@@ -71,10 +93,12 @@ pub(super) fn project(
     let document = product.document();
     let root = FieldPointer::result();
     let mut presented = saved.presented.clone();
-    (presented.complete).extend(saved.diagnostic_fields.iter().cloned());
+    presented.extend(
+        (saved.diagnostic_fields.iter()).map(|field| (field.clone(), FieldPresentation::Complete)),
+    );
     let (result, shape, truncated) = match &product.result {
         None => (None, None, Vec::new()),
-        Some(_) if presented.complete.contains(&root) => {
+        Some(_) if presented.complete().contains(&root) => {
             let mut document = hydrate(saved, document)?;
             (Some(document["result"].take()), None, Vec::new())
         }
@@ -411,12 +435,15 @@ mod tests {
                 "/result/extra/0"
             ]
         );
-        assert_eq!(manager.snapshot(id).await.unwrap().output.unwrap(), value);
+        assert_eq!(
+            manager.test_snapshot(id).await.unwrap().output.unwrap(),
+            value
+        );
         let session = manager.store().id();
-        manager.drain_supervisors().await;
+        manager.supervisor().drain().await;
         drop(manager);
-        let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
-        let restored = JobManager::restore(store, &records).await.unwrap();
+        let (store, _) = SessionStore::open(root.path(), session).await.unwrap();
+        let restored = crate::job::tests::reopened(store).await;
         assert_eq!(
             restored
                 .present_output(OutputArgs::new(id), &Default::default())
@@ -477,10 +504,10 @@ mod tests {
             .unwrap();
         assert_eq!(page["presentation"]["preview"]["lines"][0], "line 61");
         let session = manager.store().id();
-        manager.drain_supervisors().await;
+        manager.supervisor().drain().await;
         drop(manager);
-        let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
-        let restored = JobManager::restore(store, &records).await.unwrap();
+        let (store, _) = SessionStore::open(root.path(), session).await.unwrap();
+        let restored = crate::job::tests::reopened(store).await;
         assert_eq!(
             restored
                 .present_output(OutputArgs::new(id), &Default::default())

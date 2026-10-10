@@ -18,7 +18,7 @@ use crate::{
 };
 
 impl ToolExecutor {
-    async fn resolve_workspace_invocation(
+    fn resolve_workspace_invocation(
         &self,
         tool: &crate::tool::RegisteredTool,
         explicit: Option<TargetRef>,
@@ -29,13 +29,10 @@ impl ToolExecutor {
                 route: None,
             });
         }
-        self.select_location(explicit).await
+        self.select_location(explicit)
     }
 
-    async fn select_location(
-        &self,
-        explicit: Option<TargetRef>,
-    ) -> Result<SelectedLocation, ToolError> {
+    fn select_location(&self, explicit: Option<TargetRef>) -> Result<SelectedLocation, ToolError> {
         let router = self.shared.router.as_ref();
         let selected = crate::target::select_location(
             &self.caller_location,
@@ -43,8 +40,7 @@ impl ToolExecutor {
             explicit.as_ref(),
             &self.capabilities,
             router,
-        )
-        .await?;
+        )?;
         Ok(SelectedLocation {
             location: selected.location,
             // A route is only resolved through a router.
@@ -57,7 +53,7 @@ impl ToolExecutor {
 
     /// Select where a host tool's input places its job, before the job exists.
     async fn locate_job(&self, requested: JobLocation) -> Result<ExecutionLocation, ToolError> {
-        let mut location = (self.select_location(requested.target).await)
+        let mut location = (self.select_location(requested.target))
             .map_err(|error| {
                 error
                     .operation(Operation::Lookup, Subject::argument([TARGET]))
@@ -141,7 +137,6 @@ impl ToolExecutor {
         } = self.prepare_invocation(kind, &agent, name, arguments)?;
         let selected = self
             .resolve_workspace_invocation(&tool, target)
-            .await
             .map_err(|error| {
                 error.or(
                     PartialContext::new(Operation::Lookup, Subject::argument([TARGET]))
@@ -238,7 +233,7 @@ impl ToolExecutor {
                 .operation(Operation::Validate, Subject::argument([SOURCE_ARGUMENT]))
         })?;
         let SelectedLocation { location, route } =
-            self.select_location(source.target).await.map_err(|error| {
+            self.select_location(source.target).map_err(|error| {
                 error.or(PartialContext::new(
                     Operation::Lookup,
                     Subject::argument([SOURCE_ARGUMENT, TARGET]),
@@ -315,13 +310,13 @@ fn validate_invocation(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use schemars::JsonSchema;
     use serde::Deserialize;
 
     use super::*;
     use crate::{
-        target::{TargetDefinition, TargetRegistry},
+        target::TargetDefinition,
         tests::RecordingPolicy,
         tool::{
             PathArgument, ToolOptions, ToolRegistryBuilder,
@@ -357,6 +352,10 @@ mod tests {
     #[derive(Deserialize, JsonSchema)]
     struct PathArgs {
         path: String,
+    }
+
+    pub(in crate::tool::executor) fn build() -> [TargetDefinition; 1] {
+        [TargetDefinition::test("build", "/build", None)]
     }
 
     fn network_builder() -> ToolRegistryBuilder {
@@ -552,14 +551,12 @@ mod tests {
                 |_, _| async { Ok(ToolOutput::new(Value::Null)) },
             )
             .unwrap();
-        let targets =
-            TargetRegistry::from_definitions([TargetDefinition::test("build", "/build", None)])
-                .unwrap();
         let mut capabilities = CapabilitySet::default();
         capabilities.insert(Capability::Targets);
+        let router = TargetRouter::test(&runtime.store, build(), policy.clone()).await;
         let executor = runtime
             .executor_with_policy(builder, policy.clone())
-            .with_target_router(TargetRouter::test(targets, policy.clone()))
+            .with_target_router(router)
             .with_capabilities(capabilities);
         let arguments = serde_json::json!({"url":"https://initial.test", "target":"build"});
         let network = plan(&executor, &runtime.agent, "network_test", arguments).await;
@@ -587,12 +584,10 @@ mod tests {
         builder
             .register_local(crate::tool::builtins::register_local_tools)
             .unwrap();
-        let targets =
-            TargetRegistry::from_definitions([TargetDefinition::test("build", "/build", None)])
-                .unwrap();
+        let router = TargetRouter::test(&runtime.store, build(), policy.clone()).await;
         let executor = runtime
             .executor_with_policy(builder, policy.clone())
-            .with_target_router(TargetRouter::test(targets, policy.clone()));
+            .with_target_router(router);
         let mut capabilities = CapabilitySet::default();
         capabilities.insert(Capability::Targets);
         let targeted = executor.clone().with_capabilities(capabilities);
@@ -915,7 +910,7 @@ mod tests {
             "{error:?}"
         );
         assert!(policy.requests.lock().unwrap().is_empty());
-        assert!(runtime.jobs.list(&runtime.agent).await.is_empty());
+        assert!(runtime.jobs.list(&runtime.agent).is_empty());
     }
 
     /// Where a hosted local tool runs, the host's admission decides whether its
@@ -928,12 +923,10 @@ mod tests {
         builder
             .register_local(crate::tool::builtins::register_local_tools)
             .unwrap();
-        let targets =
-            TargetRegistry::from_definitions([TargetDefinition::test("build", "/build", None)])
-                .unwrap();
+        let router = TargetRouter::test(&runtime.store, build(), policy.clone()).await;
         let local = runtime
-            .executor_with_policy(builder, policy.clone())
-            .with_target_router(TargetRouter::test(targets, policy));
+            .executor_with_policy(builder, policy)
+            .with_target_router(router);
         let remote = local.clone().with_location(ExecutionLocation {
             target: "build".parse().unwrap(),
             workspace: "/build".into(),

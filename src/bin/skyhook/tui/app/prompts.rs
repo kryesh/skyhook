@@ -661,8 +661,10 @@ mod tests {
 
     #[tokio::test]
     async fn questions_open_and_accept_answers_while_inspecting_agents() {
-        let (_root, mut app) = fixture().await;
-        let child = push_child(&mut app, 1).await;
+        use super::super::played::{played_fixture, spawn_children};
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let (children, _turns) = spawn_children(&mut app, &mut model, 1).await;
+        let child = children[0].clone();
         app.select(child.clone());
         app.editor.set("preserved draft".into());
 

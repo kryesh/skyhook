@@ -443,7 +443,7 @@ mod tests {
                     (Some(b"changed".to_vec()), BlobError::HashMismatch),
                     (None, BlobError::Missing),
                 ] {
-                    store.corrupt_blob(image.blob.sha256, bytes).await;
+                    store.corrupt_blob(image.blob.sha256, bytes);
                     let mut uncached = LoadedBlobs::default();
                     let error = store.load_blobs(&mut request, &mut uncached).await;
                     assert!(matches!(

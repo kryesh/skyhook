@@ -1,19 +1,13 @@
 //! Shared session state and journal observation for provider-neutral agent runtimes.
 use std::{
-    collections::{BTreeMap, HashMap, VecDeque},
+    collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::{
-        Arc, Mutex as StdMutex, OnceLock, PoisonError, RwLock as StdRwLock, Weak,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, OnceLock, Weak, atomic::Ordering},
 };
 
 use futures_util::StreamExt as _;
 use serde_json::json;
-use tokio::{
-    fs,
-    sync::{Mutex, RwLock, broadcast, mpsc, oneshot},
-};
+use tokio::{fs, sync::oneshot};
 
 use crate::{
     identity::{AgentId, JobId, SessionId},
@@ -28,8 +22,8 @@ use crate::{
     provider::{Provider, ProviderError},
     remote::{EmbeddedShimCatalog, RejectSensitivePrompts, RemoteManager, SensitivePromptHandler},
     session::{
-        EventRecord, Message, MessageSeq, RecordSeq, RequestSeq, SessionError, SessionEvent,
-        SessionStore, UserPart,
+        Command, CoreState, EventRecord, Message, MessageSeq, Plan, RecordSeq, RequestSeq,
+        SessionError, SessionEvent, SessionStore, UserPart,
     },
     target::{TargetDefinition, TargetRegistry, TargetsConfig},
     tool::builtins::{HostSkills, install_script_tool, register_coding_tools},
@@ -38,32 +32,34 @@ use crate::{
     tool::{ToolRegistry, ToolRegistryBuilder, executor::ToolExecutor},
 };
 
+use super::TodoItem;
 pub use super::error::{Failure, HarnessError, TurnFailure};
 use super::interaction::{QuestionHandler, RuntimeEvent};
-use super::observation::RuntimeEvents;
-use super::{AgentActivity, ContextUsage, Observation, Settlement};
-use super::{TodoItem, todo::TodoStore};
+use super::{ContextUsage, Observation, Settlement};
 
+mod agents;
+#[cfg(test)]
+pub(crate) use agents::stopped_turn;
+use agents::{Activation, Flow, Invocation, RecordedContract, Turn};
+pub(crate) use agents::{Agents, activities};
 mod compact;
 mod compaction;
 mod context;
 use context::AgentContext;
-pub(super) use context::recorded_context;
+pub(crate) use context::recorded_context;
 mod prompt;
 mod questions;
 mod queue;
 pub use queue::{QueuedPrompt, QueuedPromptCancellation, QueuedPromptReceipt};
-mod tools;
-mod wait;
-use wait::AgentSender;
-
-const AGENT_CHANNEL_CAPACITY: usize = 64;
 mod builder;
 mod dispatch;
+mod tools;
+mod wait;
 use dispatch::CreatedCall;
 mod driver;
 mod lifecycle;
 mod recovery;
+mod reopen;
 mod session;
 mod state;
 mod turn;
@@ -90,6 +86,7 @@ struct HarnessInner {
     /// Model configuration, instruction, and skill diagnostics.
     warnings: Vec<String>,
     max_child_depth: usize,
+    coalescing: wait::Coalescing,
     /// The most a new session can hold.
     capabilities: CapabilitySet,
     modes: indexmap::IndexMap<ModeName, Mode>,
@@ -123,7 +120,18 @@ impl SessionRuntime {
 pub struct SessionHandle {
     runtime: Arc<SessionRuntime>,
     root: AgentId,
-    root_tx: AgentSender,
+    _open: Arc<Open>,
+}
+
+/// What every handle holds: once the last is gone, the session closes as a crash
+/// would leave it, and everything it runs stops.
+struct Open(SessionStore, crate::job::Supervisor);
+
+impl Drop for Open {
+    fn drop(&mut self) {
+        self.0.close_soon();
+        self.1.stop();
+    }
 }
 
 /// What a continue attempt actually did. A child-only continue leaves a live or
@@ -212,97 +220,13 @@ struct SessionRuntime {
     modes: indexmap::IndexMap<ModeName, Mode>,
     store: SessionStore,
     jobs: JobManager,
-    todos: TodoStore,
     executor: ToolExecutor,
     mcp: Arc<McpManager>,
     startup_warnings: Vec<String>,
     // Keeps the script tool's weak executor lookup alive without an executor/registry cycle.
     _executor_slot: Arc<OnceLock<ToolExecutor>>,
     router: crate::target::TargetRouter,
-    agents: StdRwLock<HashMap<AgentId, LiveAgent>>,
-    child_counters: RwLock<HashMap<AgentId, u32>>,
     questions: Arc<questions::QuestionCoordinator>,
-    events: RuntimeEvents,
-    // Fully replayed journal prefix, which live forwarding may already have passed.
-    caught_up_sequence: Mutex<RecordSeq>,
-    /// Pauses the store and job-completion forwarders.
-    #[cfg(test)]
-    forwarding_gate: Arc<Mutex<()>>,
-    shutting_down: std::sync::atomic::AtomicBool,
-}
-
-struct LiveAgent {
-    model: ModelRef,
-    capabilities: CapabilitySet,
-    sender: AgentSender,
-    cancellation: CancellationToken,
-    control: AgentControl,
-    available_depth: usize,
-}
-
-// Constructed before registration and handed directly to both the map entry
-// and the loop. Running a loop never rediscovers its own control authority by ID.
-#[derive(Clone)]
-struct AgentControl {
-    retryable_interrupt: Arc<AtomicBool>,
-    /// Held across a child's final mailbox check, serializing it with owner forwarding.
-    invocation: Arc<Mutex<Invocation>>,
-    turn: Arc<StdMutex<TurnState>>,
-}
-
-/// Where owner input to a child goes: into its open invocation, or, once that
-/// resolved, into a new one.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Invocation {
-    Open,
-    Resolved,
-}
-
-/// Where an agent's command loop is, as interrupt and continue read it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TurnState {
-    Idle,
-    Busy,
-    /// The last turn failed or was interrupted: only input resumes it, and
-    /// notifications wait for that input's request.
-    Parked,
-    /// An interrupted turn still waiting on the retained children it holds, which
-    /// `continue` restarts together with it.
-    Held,
-}
-
-impl AgentControl {
-    fn new(turn: TurnState) -> Self {
-        Self {
-            retryable_interrupt: Arc::new(AtomicBool::new(false)),
-            invocation: Arc::new(Mutex::new(Invocation::Open)),
-            turn: Arc::new(StdMutex::new(turn)),
-        }
-    }
-
-    fn turn(&self) -> TurnState {
-        *self.turn.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// An interrupt stopped the turn, which has not begun again since.
-    fn interrupted(&self) -> bool {
-        self.retryable_interrupt.load(Ordering::Acquire)
-    }
-
-    fn set_turn(&self, turn: TurnState) {
-        *self.turn.lock().unwrap_or_else(PoisonError::into_inner) = turn;
-    }
-
-    /// Move a turn in one of the states `from` to `to`; one that moved on meanwhile
-    /// keeps its state.
-    fn turn_from(&self, from: &[TurnState], to: TurnState) -> bool {
-        let mut turn = self.turn.lock().unwrap_or_else(PoisonError::into_inner);
-        let moved = from.contains(&turn);
-        if moved {
-            *turn = to;
-        }
-        moved
-    }
 }
 
 type ChildCompletion = oneshot::Sender<Result<String, TurnFailure>>;
@@ -330,10 +254,24 @@ enum AgentCommand {
         content: Vec<UserPart>,
         done: Option<RequestCompletion>,
     },
-    JobsReady,
-    Shutdown,
 }
 
+impl AgentCommand {
+    /// Settle whoever waits on this command with `error`.
+    fn refuse(self, error: impl Fn() -> HarnessError) {
+        match self {
+            Self::QueuedInputs(inputs) => {
+                inputs.into_iter().for_each(|input| input.reject(error()))
+            }
+            Self::Input {
+                done: Some(done), ..
+            } => done.settle(Err(error())),
+            Self::Input { done: None, .. } => {}
+        }
+    }
+}
+
+#[derive(Clone)]
 enum AgentLaunch {
     /// An agent journaled as it starts.
     New {
@@ -352,6 +290,7 @@ enum AgentLaunch {
 }
 
 /// The turn state an agent resumes in.
+#[derive(Clone)]
 enum Resumed {
     Idle,
     /// Its journaled turn stopped short of an answer, for this reason.
@@ -359,13 +298,11 @@ enum Resumed {
 }
 
 struct AgentLoop {
-    control: AgentControl,
     id: AgentId,
     owner_job: Option<JobId>,
     context: AgentContext,
     location: crate::execution::ExecutionLocation,
     settings: AgentSettings,
-    rx: mpsc::Receiver<AgentCommand>,
 }
 
 /// What an agent currently runs under; a consumed input may change any of it.
@@ -390,110 +327,40 @@ impl TurnContext<'_> {
     }
 }
 
-type LiveAgents = HashMap<AgentId, LiveAgent>;
+/// Why the root takes no input: the session's refusal once its phase refuses
+/// input, which is what ends the root's loop, or else its agent stopped.
+fn refused_input(phase: &crate::session::SessionPhase) -> HarnessError {
+    let refused = phase.admits(Command::Submit);
+    refused.map_or_else(Into::into, |_| HarnessError::AgentStopped)
+}
+
+/// Why input whose reply was dropped was not taken.
+async fn dropped_input(store: &SessionStore) -> HarnessError {
+    store.behind(|state| refused_input(&state.phase)).await
+}
 
 impl SessionRuntime {
-    /// The live agents; a poisoned lock still holds a consistent map.
-    fn agents(&self) -> std::sync::RwLockReadGuard<'_, LiveAgents> {
-        let agents = self.agents.read();
-        agents.unwrap_or_else(std::sync::PoisonError::into_inner)
+    /// Read the running agents as the core last left them.
+    fn agents<T>(&self, read: impl FnOnce(&Agents) -> T) -> T {
+        self.store.read(|state| read(&state.agents))
     }
 
-    fn agents_mut(&self) -> std::sync::RwLockWriteGuard<'_, LiveAgents> {
-        let agents = self.agents.write();
-        agents.unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-
-    pub(super) fn activity(&self, agent: &AgentId, activity: AgentActivity) {
-        self.events.send(RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity,
-            at: chrono::Utc::now().timestamp_millis(),
-        });
-    }
-
-    pub(super) async fn catch_up_store_events(&self) {
-        // Serialize catchups so the cursor advances only after the entire prefix is
-        // published. The store broadcasts in sequence order and forwarding keeps it,
-        // so a catch-up only repeats records forwarding sent or will send: the
-        // deduplicated feed stays in order, as the ledger fold requires.
-        let mut sequence = self.caught_up_sequence.lock().await;
-        self.store
-            .visit_records_after(*sequence, |records| {
-                for record in records {
-                    self.events
-                        .send(RuntimeEvent::Record(Box::new(record.clone())));
-                    *sequence = record.sequence;
-                }
-            })
-            .await;
-    }
-
-    pub(super) fn forward_store_events(self: &Arc<Self>) {
-        let mut source = self.store.subscribe();
-        #[cfg(test)]
-        let forwarding_gate = self.forwarding_gate.clone();
-        let events = self.events.clone();
-        let runtime = Arc::downgrade(self);
-        tokio::spawn(async move {
-            loop {
-                let received = source.recv().await;
-                #[cfg(test)]
-                let _forwarding = forwarding_gate.lock().await;
-                match received {
-                    Ok(record) => {
-                        events.send(RuntimeEvent::Record(Box::new(record)));
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(runtime) = runtime.upgrade() else {
-                            break;
-                        };
-                        runtime.catch_up_store_events().await;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
+    /// Journal `event`, a model request of `agent`'s turn. Only a busy turn
+    /// requests: one an interrupt stopped or held is refused, and ends interrupted.
+    pub(super) async fn request(
+        &self,
+        agent: &AgentId,
+        event: SessionEvent,
+    ) -> Result<EventRecord, HarnessError> {
+        let agent = agent.clone();
+        let request = move |state: &CoreState| {
+            if !state.agents.busy(&agent) {
+                return Err(HarnessError::Interrupted);
             }
-        });
-    }
-
-    pub(super) fn forward_job_completions(self: &Arc<Self>) {
-        let mut completions = self.jobs.subscribe_completions();
-        #[cfg(test)]
-        let forwarding_gate = self.forwarding_gate.clone();
-        let runtime = Arc::downgrade(self);
-        tokio::spawn(async move {
-            loop {
-                let received = completions.recv().await;
-                #[cfg(test)]
-                let _forwarding = forwarding_gate.lock().await;
-                let completion = match received {
-                    Ok(completion) => completion,
-                    Err(broadcast::error::RecvError::Lagged(_)) => {
-                        let Some(runtime) = runtime.upgrade() else {
-                            break;
-                        };
-                        let agents = runtime
-                            .agents()
-                            .iter()
-                            .map(|(id, agent)| (id.clone(), agent.sender.clone()))
-                            .collect::<Vec<_>>();
-                        for (id, sender) in agents {
-                            if runtime.jobs.has_pending(&id).await {
-                                sender.jobs_ready();
-                            }
-                        }
-                        continue;
-                    }
-                    Err(broadcast::error::RecvError::Closed) => break,
-                };
-                let Some(runtime) = runtime.upgrade() else {
-                    break;
-                };
-                if let Some(sender) = runtime.agent_sender(&completion.agent) {
-                    sender.jobs_ready();
-                }
-            }
-        });
+            let requested = |_: &mut CoreState, records: &[EventRecord]| records[0].clone();
+            Ok(Plan::new(vec![(agent, event)], requested))
+        };
+        self.store.commit(Command::Request, request).await
     }
 
     pub(super) async fn commit(
@@ -501,17 +368,33 @@ impl SessionRuntime {
         agent: &AgentId,
         message: Message,
     ) -> Result<MessageSeq, SessionError> {
-        // Closing is not activity. What a closing session's turns still commit, such
-        // as the result of a call its release answered, takes the newest activity's
-        // time; work that closing ended has already dated its own outcome.
-        let dated = if self.shutting_down.load(Ordering::Acquire) {
-            crate::session::Dated::LastActivity
-        } else {
-            crate::session::Dated::Now
-        };
         let event = SessionEvent::MessageCommitted { message };
-        let records = self.store.append_dated(vec![(agent.clone(), event)], dated);
-        Ok(records.await?[0].sequence.message())
+        Ok(self
+            .store
+            .append(agent.clone(), event)
+            .await?
+            .sequence
+            .message())
+    }
+
+    /// Commit a call's result with the acknowledgement of the delivery it
+    /// reports, in one transaction: a result that never commits leaves it pending.
+    async fn commit_result(
+        &self,
+        agent: &AgentId,
+        result: crate::provider::protocol::ToolResult,
+        acknowledges: Option<crate::job::Delivery>,
+    ) -> Result<(), HarnessError> {
+        let message = Message::Tool(vec![result]);
+        let mut entries = vec![(agent.clone(), SessionEvent::MessageCommitted { message })];
+        let commit = move |state: &CoreState| {
+            let claim = acknowledges
+                .map(|delivery| delivery.claim(state))
+                .transpose()?;
+            entries.extend(claim.flatten());
+            Ok::<_, crate::job::JobError>(Plan::journal(entries))
+        };
+        Ok(self.store.commit(Command::Journal, commit).await?)
     }
 }
 
@@ -845,10 +728,11 @@ mod tests {
         let store = SessionStore::create_ephemeral(&harness.inner.session_root);
         let store = store.await.unwrap();
         let jobs = JobManager::new(store.clone());
+        let open = Arc::new(Open(store.clone(), jobs.supervisor().clone()));
         let runtime = SessionRuntime::build(harness.inner.clone(), store, jobs, &[]);
         let runtime = runtime.await.unwrap();
         runtime
-            .start_root(runtime.new_root().unwrap())
+            .start_root(runtime.new_root().unwrap(), open)
             .await
             .unwrap()
     }
@@ -939,7 +823,7 @@ mod tests {
 
     /// Every usage report the session journaled, as its requests' ledger folds it.
     pub(super) async fn journaled_usage(session: &SessionHandle) -> Usage {
-        let ledger = session.observe().await.snapshot.ledger;
+        let ledger = session.observe().snapshot.ledger;
         let mut usage = Usage::default();
         for (_, request) in ledger.iter() {
             usage.accumulate(request.usage);
@@ -947,8 +831,52 @@ mod tests {
         usage
     }
 
-    pub(super) fn turn(session: &SessionHandle, agent: &AgentId) -> TurnState {
-        session.runtime.agents()[agent].control.turn()
+    pub(super) fn turn(session: &SessionHandle, agent: &AgentId) -> Turn {
+        session
+            .runtime
+            .agents(|agents| agents.get(agent).unwrap().turn.clone())
+    }
+
+    pub(super) use super::agents::INTERRUPTED;
+
+    /// Queue `command` for `agent`, as an owner or the host would.
+    pub(super) async fn send(session: &SessionHandle, agent: &AgentId, command: AgentCommand) {
+        let agent = agent.clone();
+        let send = move |state: &mut CoreState| state.agents.send(&agent, command);
+        assert!(session.runtime.store.live(send).await, "the agent runs");
+    }
+
+    /// How many commands `agent` has yet to take.
+    pub(super) fn inbox(session: &SessionHandle, agent: &AgentId) -> usize {
+        session
+            .runtime
+            .agents(|agents| agents.get(agent).unwrap().inbox.len())
+    }
+
+    /// Whether `agent` has deliveries pending.
+    pub(super) fn pending(session: &SessionHandle, agent: &AgentId) -> bool {
+        session
+            .runtime
+            .store
+            .read(|state| state.jobs.has_pending(agent))
+    }
+
+    /// Wait until `agent` has deliveries pending.
+    pub(super) async fn until_pending(session: &SessionHandle, agent: &AgentId) {
+        let agent = agent.clone();
+        found(session, move |state| {
+            state.jobs.has_pending(&agent).then_some(())
+        })
+        .await;
+    }
+
+    /// Wait until input waits in `agent`'s inbox.
+    pub(super) async fn until_queued(session: &SessionHandle, agent: &AgentId) {
+        let agent = agent.clone();
+        found(session, move |state| {
+            (!state.agents.get(&agent)?.inbox.is_empty()).then_some(())
+        })
+        .await;
     }
 
     pub(super) fn assistant_commits(records: &[EventRecord]) -> usize {
@@ -990,6 +918,7 @@ mod tests {
         };
         HarnessBuilder::new(workspace)
             .session_root(sessions)
+            .coalescing(wait::Coalescing::NONE)
             .provider(provider_name("test"), provider, models([("test", profile)]))
             .default_model(model_ref("test"))
     }
@@ -1007,46 +936,122 @@ mod tests {
         )
     }
 
+    /// A session whose root is held on a child it interrupted mid-response, and
+    /// the root's prompt; `after` scripts the requests that follow.
+    pub(super) async fn held_on_interrupted_child(
+        root: &Path,
+        after: impl IntoIterator<Item = Step>,
+    ) -> (
+        Harness,
+        SessionHandle,
+        Arc<Script>,
+        Requests,
+        tokio::task::JoinHandle<Result<String, HarnessError>>,
+        JobId,
+    ) {
+        let child = json!({"prompt": "child task", "depth": 0});
+        let delegate = Step::new(response(vec![tool_call(0, "agent-0", "agent", child)]));
+        let steps = [delegate, Step::new(Vec::new()).midstream()];
+        let requests = Requests::default();
+        let provider = Script::new(steps.into_iter().chain(after), &requests);
+        let harness = test_harness(root, &root.join("sessions"), provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent = spawn_prompt(&session, "delegate");
+        provider.request(1).await;
+        root_waiting(&session).await;
+        assert_eq!(session.interrupt().await, 2);
+        assert_eq!(turn(&session, &session.root), Turn::Held);
+        let job = session.inspect_jobs(&session.root)[0].id;
+        (harness, session, provider, requests, parent, job)
+    }
+
+    /// Interrupt behind the append `resume` holds paused, then let the append go
+    /// on; how many the interrupt stopped.
+    pub(super) async fn interrupt_behind(
+        session: &SessionHandle,
+        resume: oneshot::Sender<()>,
+    ) -> usize {
+        let mut interrupt = Box::pin(session.interrupt());
+        assert!(futures_util::poll!(&mut interrupt).is_pending());
+        resume.send(()).unwrap();
+        bounded(interrupt).await
+    }
+
+    /// Prompt the root from a task.
+    pub(super) fn spawn_prompt(
+        session: &SessionHandle,
+        text: &'static str,
+    ) -> tokio::task::JoinHandle<Result<String, HarnessError>> {
+        let session = session.clone();
+        tokio::spawn(async move { session.prompt(text).await })
+    }
+
     /// One step of a polling loop. A timer rather than a yield, because paused
     /// time only advances while every task is idle.
     pub(super) async fn poll() {
         tokio::time::sleep(Duration::from_millis(1)).await;
     }
 
-    /// Wait until the root is seen running tools or waiting on children: observed
-    /// activity trails the journal.
-    pub(super) async fn root_waiting(session: &SessionHandle) {
-        use crate::agent::AgentActivity::{Tools, WaitingChildren};
-        bounded(async {
-            let activity = async || session.observe().await.snapshot.activity;
-            while !matches!(
-                activity().await.get(&session.root).map(|a| &a.state),
-                Some(Tools | WaitingChildren)
-            ) {
-                poll().await;
-            }
-        })
-        .await;
+    /// Wait until `find` finds what it looks for in the session's core state.
+    pub(super) async fn found<T: Send + 'static>(
+        session: &SessionHandle,
+        find: impl FnMut(&mut CoreState) -> Option<T> + Send + Sync + 'static,
+    ) -> T {
+        bounded(session.runtime.store.until(find)).await.unwrap()
     }
 
+    /// Wait until `agent`'s activity is one `wanted` accepts.
+    pub(super) async fn activity_is(
+        session: &SessionHandle,
+        agent: &AgentId,
+        wanted: fn(&crate::agent::AgentActivity) -> bool,
+    ) {
+        let agent = agent.clone();
+        let activity = move |state: &mut CoreState| {
+            let activity = crate::agent::activities(state).remove(&agent)?;
+            wanted(&activity.state).then_some(())
+        };
+        found(session, activity).await;
+    }
+
+    /// Wait until the root runs tools or waits on children.
+    pub(super) async fn root_waiting(session: &SessionHandle) {
+        use crate::agent::AgentActivity::{Tools, WaitingChildren};
+        let waiting = |state: &_| matches!(state, Tools | WaitingChildren);
+        activity_is(session, &session.root, waiting).await;
+    }
+
+    /// Job `job` once `predicate` accepts it.
     pub(super) async fn until(
         session: &SessionHandle,
         job: JobId,
-        predicate: impl Fn(&crate::job::JobEnvelope) -> bool,
+        predicate: impl Fn(&crate::job::JobEnvelope) -> bool + Send + Sync + 'static,
     ) -> crate::job::JobEnvelope {
-        bounded(async {
-            loop {
-                let snapshot = session.runtime.jobs.snapshot(job).await.unwrap();
-                if predicate(&snapshot) {
-                    return snapshot;
-                }
-                poll().await;
-            }
+        found(session, move |state| {
+            state.jobs.snapshot(job).filter(&predicate)
         })
         .await
     }
 
-    pub(super) async fn terminal(session: &SessionHandle, job: JobId) -> crate::job::JobEnvelope {
+    /// The first of `owner`'s jobs that `find` accepts, once there is one.
+    pub(super) async fn job_found(
+        session: &SessionHandle,
+        owner: &AgentId,
+        find: impl Fn(&crate::job::JobEnvelope) -> bool + Send + Sync + 'static,
+    ) -> JobId {
+        let owner = owner.clone();
+        let first = move |state: &mut CoreState| {
+            let mut jobs = state.jobs.views().into_values();
+            jobs.find(|job| job.agent == owner && find(job))
+                .map(|job| job.id)
+        };
+        found(session, first).await
+    }
+
+    pub(super) async fn terminal(
+        session: &SessionHandle,
+        job: JobId,
+    ) -> crate::job::tests::Hydrated {
         until(session, job, |job| job.state.is_terminal()).await;
         session.runtime.jobs.wait(job, None, true).await.unwrap()
     }
@@ -1074,27 +1079,30 @@ mod tests {
         jobs.test_running(spec).await.into_test_id()
     }
 
-    // A separate parent inbox keeps the idle root from consuming a child's responses.
-    pub(super) struct QuietRoot<'a> {
-        session: &'a SessionHandle,
-        _rx: mpsc::Receiver<AgentCommand>,
-    }
+    /// Parks the root, so while it lives the idle root leaves a child's responses
+    /// pending rather than consuming them.
+    pub(super) struct QuietRoot<'a>(&'a SessionHandle);
 
     impl Drop for QuietRoot<'_> {
         fn drop(&mut self) {
-            set_root_sender(self.session, self.session.root_tx.clone());
+            set_root_turn(self.0, Turn::Idle);
         }
     }
 
-    fn set_root_sender(session: &SessionHandle, sender: AgentSender) {
-        let mut agents = session.runtime.agents.write().unwrap();
-        agents.get_mut(&session.root).unwrap().sender = sender;
+    pub(super) fn set_root_turn(session: &SessionHandle, turn: Turn) {
+        let root = session.root.clone();
+        let set = move |state: &mut CoreState| {
+            // A failed session runs no agent.
+            if let Some(facts) = state.agents.get_mut(&root) {
+                facts.set_turn(turn);
+            }
+        };
+        session.runtime.store.enqueue(set);
     }
 
     pub(super) fn quiet_root(session: &SessionHandle) -> QuietRoot<'_> {
-        let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
-        set_root_sender(session, AgentSender::new(tx));
-        QuietRoot { session, _rx: rx }
+        set_root_turn(session, Turn::Parked(TurnFailure::Cancelled));
+        QuietRoot(session)
     }
 
     pub(super) async fn test_harness(
@@ -1156,7 +1164,13 @@ mod tests {
         bounded(async {
             loop {
                 if let RuntimeEvent::Record(record) = events.recv().await.unwrap().event
-                    && matches!(record.event, SessionEvent::ModelRecoveryScheduled { .. })
+                    && matches!(
+                        record.event,
+                        SessionEvent::ModelFailed {
+                            failure: crate::session::AttemptFailure::Retrying { .. },
+                            ..
+                        }
+                    )
                 {
                     return *record;
                 }
@@ -1199,13 +1213,44 @@ mod tests {
     ) -> Vec<Result<(), HarnessError>> {
         let mut results = Vec::new();
         for receipt in session.enqueue_prompts(prompts).await {
-            results.push(receipt.await.unwrap_or(Err(HarnessError::AgentStopped)));
+            results.push(receipt.await);
         }
         results
     }
 
     pub(super) fn recoverable() -> ProviderError {
         crate::provider::ProviderErrorKind::Transport.error("scripted connection lost")
+    }
+
+    /// Run `operation`, letting each retried failure's backoff elapse once it is
+    /// journaled: what a retry does is under test, not how long it waits.
+    pub(super) async fn retrying<T>(
+        session: &SessionHandle,
+        operation: impl Future<Output = T>,
+    ) -> T {
+        let mut updates = session.observe().updates;
+        let mut operation = std::pin::pin!(operation);
+        loop {
+            tokio::select! {
+                output = &mut operation => return output,
+                update = updates.recv() => {
+                    if let RuntimeEvent::Record(record) = update.expect("the observer keeps up").event {
+                        elapse_backoff(&record).await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Let the backoff a retried failure `record` waits out elapse.
+    pub(super) async fn elapse_backoff(record: &EventRecord) {
+        if let SessionEvent::ModelFailed {
+            failure: crate::session::AttemptFailure::Retrying { delay, .. },
+            ..
+        } = &record.event
+        {
+            crate::tests::elapse(Duration::from_millis(delay.millis())).await;
+        }
     }
 
     /// A valid, otherwise empty compaction continuation.
@@ -1217,73 +1262,5 @@ mod tests {
             "next_actions": [], "running_work": [], "recovery_details": [], "jobs": [],
             "additional_context": [], "todo_reconciliation": [], "todos": []
         })
-    }
-
-    async fn observation_session(root: &Path) -> SessionHandle {
-        let harness = test_harness(root, &root.join("sessions"), Arc::new(HangingProvider)).await;
-        ephemeral_session(&harness).await
-    }
-
-    #[tokio::test]
-    async fn observation_catchup_does_not_skip_gaps_before_live_records() {
-        let root = tempfile::tempdir().unwrap();
-        let session = observation_session(root.path()).await;
-        session.observe().await;
-        // Pause forwarding rather than relying on scheduler luck.
-        let forwarding = session.runtime.forwarding_gate.lock().await;
-        let store = &session.runtime.store;
-        let first = store.append(session.root.clone(), SessionEvent::AgentInterrupted);
-        let first = first.await.unwrap();
-        let second = store.append(session.root.clone(), SessionEvent::AgentCompleted);
-        let second = second.await.unwrap();
-        let events = &session.runtime.events;
-        events.send(RuntimeEvent::Record(Box::new(second.clone())));
-        let snapshot = session.runtime.events.observe().snapshot;
-        assert!(!snapshot.records.contains_key(&first.sequence));
-        assert_eq!(snapshot.records.get(&second.sequence), Some(&second));
-        drop(forwarding);
-        let (left, right) = tokio::join!(session.observe(), session.observe());
-        for snapshot in [&left.snapshot, &right.snapshot] {
-            assert_eq!(snapshot.records.get(&first.sequence), Some(&first));
-            assert_eq!(snapshot.records.get(&second.sequence), Some(&second));
-        }
-        assert_eq!(left.snapshot.revision, right.snapshot.revision);
-        let caught_up = *session.runtime.caught_up_sequence.lock().await;
-        assert_eq!(caught_up, second.sequence);
-        session.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
-    async fn observation_forwarder_catches_up_after_store_lag() {
-        let root = tempfile::tempdir().unwrap();
-        let session = observation_session(root.path()).await;
-        let mut observation = session.observe().await;
-        let initial_count = observation.snapshot.records.len();
-        // 600 gated appends overflow the 512-slot channel, forcing the Lagged catch-up.
-        let forwarding = session.runtime.forwarding_gate.lock().await;
-        let mut last = RecordSeq::default();
-        for _ in 0..600 {
-            let record = session
-                .runtime
-                .store
-                .append(session.root.clone(), SessionEvent::AgentInterrupted);
-            last = record.await.unwrap().sequence;
-        }
-        drop(forwarding);
-        bounded(async {
-            while observation.snapshot.records.len() < initial_count + 600 {
-                let update = observation.updates.recv().await.unwrap();
-                observation.snapshot.apply(update);
-            }
-        })
-        .await;
-        assert_eq!(*session.runtime.caught_up_sequence.lock().await, last);
-        let records = observation
-            .snapshot
-            .records
-            .into_values()
-            .collect::<Vec<_>>();
-        assert_eq!(records, session.runtime.store.records().await);
-        session.shutdown().await.unwrap();
     }
 }

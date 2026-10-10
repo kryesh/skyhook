@@ -137,10 +137,13 @@ or saved-output inspection failure is not necessarily a failure of the command o
 machine.
 
 Prefer these named targets to manually running `ssh`. A tool that needs an SSH route requests
-approval before any probe, authentication, or shim deployment. A saved
+approval before any probe, authentication, or shim deployment. A
 [route grant](permissions.md#approval-policy) applies across tools and workspaces, so
 reconnecting an unchanged route needs no new approval. Changing a target or any hop in its route
-invalidates the affected grant.
+invalidates every grant naming it, whatever the resource, and stops connections still starting
+over the old route; an operation waiting for approval or a connection is planned again and asks
+about the new definition. An operation already running over the old route finishes there, but any
+further approval it asks for is refused.
 
 JavaScript orchestration and the session log stay on the host; nested tool calls use the
 selected target and workspace. For remote execution internals and shim builds, see

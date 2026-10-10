@@ -293,7 +293,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
     }
     // A job card's glyph gives way to the spinner only while it runs; waiting
     // for input keeps its glyph beside the counter.
-    let jobs = app.projection.jobs();
+    let jobs = &app.snapshot.jobs;
     let running = |job| {
         jobs.get(&job)
             .is_none_or(|job| job.state == JobState::Running)
@@ -574,24 +574,27 @@ mod tests {
     use crate::tui::{
         app::{
             Work,
-            tests::{
-                fetch_output, fixture, job_named, launch_context, push_record, requested,
-                run_script,
+            played::{
+                Model, activity, ask, asking_child, call, committed, exchange, observe_find,
+                observe_record, observe_until, played_fixture, sleeping_script, spawn_children,
+                user,
             },
+            tests::{fetch_output, fixture, job_named, run_script},
         },
         keys::Command,
         theme::THEME,
     };
     use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
     use ratatui::{Terminal, backend::TestBackend};
+    use serde_json::json;
+    use skyhook::agent::AgentActivity;
     use skyhook::provider::protocol::AssistantItem;
-    use skyhook::session::{Message, SessionEvent};
+    use skyhook::session::SessionEvent;
     use std::time::Duration;
 
-    async fn commit_message(app: &mut App, text: &str) {
-        let message = Message::Assistant(vec![AssistantItem::text("frame-test", 0, text)]);
-        push_record(app, SessionEvent::MessageCommitted { message }).await;
-        app.refresh();
+    async fn reply(app: &mut App, model: &mut Model, text: &str) {
+        let answer = vec![AssistantItem::text("frame-test", 0, text)];
+        exchange(app, model, "question", answer).await;
     }
 
     /// A live job card paints its counter at its header row's right edge, so the
@@ -599,56 +602,50 @@ mod tests {
     /// its glyph; one waiting for input keeps its glyph.
     #[tokio::test]
     async fn live_job_cards_paint_counters_and_only_running_ones_spin() {
-        use skyhook::{identity::JobId, job::JobTransition};
-        let (_root, mut app) = fixture().await;
-        let job = JobId::new(1).unwrap();
-        let created = SessionEvent::JobCreated {
-            job,
-            parent: None,
-            origin: None,
-            tool: "exec".into(),
-            role: skyhook::job::JobRole::Tool,
-            name: None,
-            arguments: serde_json::json!({"command": ["true"]}),
-            output_schema: None,
-            accepts_input: true,
-            background: false,
-            location: skyhook::execution::ExecutionLocation::root("/workspace".into()),
-        };
-        push_record(&mut app, created).await;
-        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        use skyhook::job::JobState;
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let mut terminal = Terminal::new(TestBackend::new(80, 40)).unwrap();
         let mut screen = |app: &mut App| {
             terminal.draw(|frame| draw(frame, app)).unwrap();
             let buffer = terminal.backend().buffer();
             let row = |y| {
-                (0..60)
+                (0..80)
                     .map(|x| buffer[(x, y)].symbol().to_owned())
                     .collect()
             };
-            (0..12).map(row).collect::<Vec<Vec<_>>>()
+            (0..40).map(row).collect::<Vec<Vec<_>>>()
         };
-        for (state, header) in [
-            (
-                JobTransition::Running,
-                format!("{} exec true · Running · #1", spinner(0)),
-            ),
-            (
-                JobTransition::WaitingInput,
-                "? exec true · Waiting for input · #1".into(),
-            ),
+        let script = sleeping_script(&session);
+        for (state, name, glyph) in [
+            (JobState::Running, "Running", spinner(0)),
+            (JobState::WaitingInput, "Waiting for input", "?"),
         ] {
-            push_record(&mut app, SessionEvent::JobStateChanged { job, state }).await;
-            app.refresh();
+            if state == JobState::WaitingInput {
+                asking_child(&session, &mut model, json!({"prompt": "ask"})).await;
+            }
+            let live = |app: &App| {
+                let mut jobs = app.snapshot.jobs.values();
+                jobs.find(|job| job.state == state).map(|job| job.id)
+            };
+            let idle = |app: &App| {
+                let root = activity(&app.snapshot, app.root_agent());
+                !root.is_some_and(AgentActivity::is_busy)
+            };
+            let job = observe_find(&mut app, |app| live(app).filter(|_| idle(app))).await;
             app.tick_count = 0;
-            let model::Timing::Since(since) = app.projection.jobs()[&job].timing else {
+            let model::Timing::Since(since) = app.snapshot.jobs[&job].timing.into() else {
                 panic!("a live job counts from when it started");
             };
             app.clock = model::Clock::at(since + 12_400);
             let before = screen(&mut app);
+            let label = format!(" · {name} · #{job}");
             let y = (before.iter())
-                .position(|line| line.concat().contains(&header))
+                .position(|line| line.concat().contains(&label))
                 .unwrap();
-            let row = app.render.rows.get(0).unwrap();
+            assert!(before[y].concat().contains(&format!("{glyph} ")));
+            let row = (app.render.rows.iter())
+                .find(|row| row.text().contains(&label))
+                .unwrap();
             let right = usize::from(row.paragraph_x() + row.text_width);
             assert_eq!(before[y][right - 5..right].concat(), "12.4s");
             let entries = app.content_cache.entries().to_vec();
@@ -666,34 +663,18 @@ mod tests {
                     );
                 }
             }
+            session.cancel_job(job).await.unwrap();
+            observe_until(&mut app, |app| app.snapshot.jobs[&job].state.is_terminal()).await;
         }
+        let _ = crate::tests::bounded(script).await.unwrap();
     }
 
     #[tokio::test]
     async fn sidebar_narrows_only_the_transcript_and_persists_its_toggle() {
-        use skyhook::agent::{TodoItem, TodoStatus};
-        let (root, mut app) = fixture().await;
+        let (root, mut app, mut model, _session) = played_fixture().await;
         let text = "right-aligned user text ".repeat(12);
-        let message = Message::User(vec![skyhook::session::UserPart::Text { text }]);
-        push_record(&mut app, SessionEvent::MessageCommitted { message }).await;
-        let items = [
-            ("parse", TodoStatus::Completed),
-            (
-                "render the wrapped todo text wholeword",
-                TodoStatus::InProgress,
-            ),
-        ];
-        let items = items.map(|(text, status)| TodoItem {
-            text: text.parse().unwrap(),
-            status,
-        });
-        push_record(
-            &mut app,
-            SessionEvent::TodosReplaced {
-                items: items.into(),
-            },
-        )
-        .await;
+        let asked = ask(app.session().unwrap(), &text);
+        observe_record(&mut app, committed(user)).await;
         let screen = |app: &mut App, width| {
             let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
             terminal.draw(|frame| draw(frame, app)).unwrap();
@@ -705,6 +686,16 @@ mod tests {
         let bare = screen(&mut app, 120);
         assert!(bare.contains("Capabilities") && bare.contains("· Read files"));
         assert!(!bare.contains("MCP servers") && !bare.contains("Todos"));
+        let items = json!([
+            {"text": "parse", "status": "completed"},
+            {"text": "render the wrapped todo text wholeword", "status": "in_progress"},
+        ]);
+        let todo = call("todo", "todo", json!({"items": items}), 0);
+        model.turn().await.end(vec![todo]);
+        model.turn().await.answer("done");
+        crate::tests::bounded(asked).await.unwrap().unwrap();
+        let todos = |event: &SessionEvent| matches!(event, SessionEvent::TodosReplaced { .. });
+        observe_record(&mut app, todos).await;
         app.refresh();
         let wide = screen(&mut app, 120);
         for expected in [
@@ -766,11 +757,9 @@ mod tests {
 
     #[tokio::test]
     async fn request_headers_stay_outside_the_scrolling_rows() {
-        let (_root, mut app) = fixture().await;
-        let context = launch_context(&app);
-        let context = push_record(&mut app, context).await;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
         for _ in 0..30 {
-            push_record(&mut app, requested(context, Vec::new())).await;
+            reply(&mut app, &mut model, "done").await;
         }
         app.tab = Tab::Requests;
         app.refresh();
@@ -847,11 +836,12 @@ mod tests {
 
     #[tokio::test]
     async fn completed_highlights_repaint_retained_frames_after_reset_and_resize() {
-        let (_root, mut app) = fixture().await;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
         let (notify, mut ready) = tokio::sync::mpsc::unbounded_channel();
         app.render = RenderState::new(app.selected.clone(), notify);
-        commit_message(
+        reply(
             &mut app,
+            &mut model,
             "# Example\n\n```rust\nlet answer = 42;\n```\n\n**Done**",
         )
         .await;
@@ -896,21 +886,20 @@ mod tests {
 
     #[tokio::test]
     async fn highlighting_follows_the_viewport_through_a_transcript_beyond_the_cache() {
-        let (_root, mut app) = fixture().await;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
         let (notify, mut ready) = tokio::sync::mpsc::unbounded_channel();
         app.render = RenderState::new(app.selected.clone(), notify);
         // More distinct fenced sections than the highlight cache admits at once.
-        for index in 0..150 {
+        let sections = (0..150).map(|index| {
             let name = match index {
                 0 => "first".to_owned(),
                 149 => "last".to_owned(),
                 _ => format!("other{index}"),
             };
             let text = format!("```rust\nlet {name} = 42;\n```");
-            let message = Message::Assistant(vec![AssistantItem::text("m", 0, text)]);
-            push_record(&mut app, SessionEvent::MessageCommitted { message }).await;
-        }
-        app.refresh();
+            AssistantItem::text(format!("m{index}"), index, text)
+        });
+        exchange(&mut app, &mut model, "question", sections.collect()).await;
         let accent = THEME.accent;
         let mut terminal = Terminal::new(TestBackend::new(60, 20)).unwrap();
         for (scroll, source) in [(None, "let last = 42;"), (Some(0), "let first = 42;")] {
@@ -930,11 +919,8 @@ mod tests {
 
     #[tokio::test]
     async fn composer_grows_to_half_the_body_without_shaping_a_childs_tree() {
-        let (_root, mut app) = fixture().await;
-        let mut children = Vec::new();
-        for index in 1..=20 {
-            children.push(crate::tui::app::tests::push_child(&mut app, index).await);
-        }
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let (children, _turns) = spawn_children(&mut app, &mut model, 20).await;
         app.editor.set("line\n".repeat(40));
         let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -952,8 +938,8 @@ mod tests {
 
     #[tokio::test]
     async fn latest_activity_hit_restores_follow_tail_and_disappears() {
-        let (_root, mut app) = fixture().await;
-        commit_message(&mut app, &"ordinary prose\n".repeat(100)).await;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        reply(&mut app, &mut model, &"ordinary prose\n".repeat(100)).await;
         let latest = |app: &App| {
             let mut hits = app.hits.iter();
             hits.find_map(|(rect, hit)| matches!(hit, Hit::Latest).then_some(*rect))

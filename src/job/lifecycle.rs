@@ -2,325 +2,273 @@
 
 use super::*;
 
-impl JobManager {
-    /// After stopping creation producers, wait for admitted creation owners to
-    /// finish map publication and any abandoned-lease finalization.
-    pub(crate) async fn drain_creations(&self) {
-        let _operation = self.inner.creation_operation.write().await;
-        let operations = self
-            .inner
-            .jobs
-            .lock()
-            .await
-            .values()
-            .map(|entry| entry.operation.clone())
-            .collect::<Vec<_>>();
-        for operation in operations {
-            let _settled = operation.lock().await;
-        }
-        let _deliveries = self.inner.delivery_operation.lock().await;
-    }
+/// Proof of a claim on invocation `0`'s finish. Only an outcome applying ends
+/// it, never a drop, so its holder runs to the end as a completion owner does.
+/// Once a later invocation runs, nothing it holds applies to that one.
+pub(super) struct FinishClaim(Run);
 
-    pub async fn create(&self, spec: JobSpec) -> Result<JobLease, JobError> {
+pub(super) enum Unclaimed {
+    /// Another finish holds the claim; the phase it leaves may still admit this end.
+    InFlight,
+    /// No such job, a later invocation runs, or its phase admits no such end.
+    Ended,
+}
+
+impl JobManager {
+    pub async fn create(&self, mut spec: JobSpec) -> Result<JobLease, JobError> {
         if spec.agent.session() != self.inner.store.id() {
             return Err(SessionError::WrongSession.into());
         }
-        // Cancelling the caller before admission has no effect; after it, the
-        // detached owner still publishes, and the abandoned lease is cancelled.
-        let operation = self.inner.creation_operation.clone().read_owned().await;
-        self.spawn_owned(operation, "creation", move |manager| async move {
-            manager.create_owned(spec).await
-        })
-        .await
-    }
-
-    async fn create_owned(&self, mut spec: JobSpec) -> Result<JobLease, JobError> {
-        // Do not hold the map lock across append: cancellation must still be
-        // able to reach the parent token.
-        if let Some(parent) = spec.parent
-            && !self.inner.jobs.lock().await.contains_key(&parent)
-        {
-            return Err(JobError::Unknown(parent));
-        }
-        let raw = self.inner.next_id.fetch_add(1, Ordering::Relaxed);
-        let id = JobId::new(raw).map_err(|_| JobError::InvalidId)?;
-        let created = self
-            .inner
+        let manager = self.clone();
+        self.inner
             .store
-            .accept_append(
-                spec.agent.clone(),
-                SessionEvent::JobCreated {
-                    origin: spec.origin.clone(),
+            .commit::<_, JobError>(Command::CreateJob, move |state| {
+                if let Some(parent) = spec.parent
+                    && !state.jobs.entries.contains_key(&parent)
+                {
+                    return Err(JobError::Unknown(parent));
+                }
+                // Only a busy turn makes calls.
+                if spec.origin.is_some() && !state.agents.busy(&spec.agent) {
+                    return Err(JobError::Interrupted);
+                }
+                let id = state.jobs.next_id()?;
+                let created = SessionEvent::JobCreated {
+                    origin: spec.origin,
                     job: id,
                     parent: spec.parent,
-                    tool: spec.tool.clone(),
+                    tool: spec.tool,
                     role: spec.role,
-                    name: spec.name.clone(),
+                    name: spec.name,
                     arguments: std::mem::take(&mut spec.arguments),
-                    output_schema: spec.output_schema.clone(),
+                    output_schema: spec.output_schema,
                     accepts_input: spec.accepts_input,
                     background: spec.background,
-                    location: spec.location.clone(),
-                },
-            )
-            .await?
-            .committed()
-            .await?;
-        let (mut entry, input) = JobEntry::new(spec, created.timestamp_millis);
-        let cancellation = {
-            let mut jobs = self.inner.jobs.lock().await;
-            if let Some(parent) = entry.parent {
-                entry.cancellation = jobs
-                    .get(&parent)
-                    .ok_or(JobError::Unknown(parent))?
-                    .cancellation
-                    .child_token();
-            }
-            let cancellation = entry.cancellation.clone();
-            jobs.insert(id, entry);
-            cancellation
-        };
-        if cancellation.is_cancelled() {
-            self.cancel(id).await?;
+                    location: spec.location,
+                };
+                let parent = spec.parent;
+                // A caller that gives up drops the lease wherever it lands, which
+                // cancels the job.
+                Ok(Plan::new(vec![(spec.agent, created)], move |state, _| {
+                    let cancellation = manager.token_under(parent);
+                    let (handles, input) = JobHandles::new(cancellation.clone());
+                    manager
+                        .inner
+                        .handles
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(id, handles);
+                    // Created under a cancelled parent, it is cancelled with it.
+                    let jobs = &state.jobs.entries;
+                    let parent = parent.and_then(|parent| jobs.get(&parent));
+                    if parent.is_some_and(JobFacts::cancel_requested) {
+                        manager.cancel_trees(state, vec![id], CancelScope::Outcome);
+                    }
+                    let run = Run(id, Invocation::default());
+                    JobLease::new(manager, run, cancellation, input)
+                }))
+            })
+            .await
+    }
+
+    /// A new token under `parent`'s, or the session root's.
+    pub(super) fn token_under(&self, parent: Option<JobId>) -> CancellationToken {
+        match parent {
+            Some(parent) => self.handles(parent, |parent| parent.cancellation.child_token()),
+            None => self.inner.supervisor.token(),
         }
-        Ok(JobLease::new(self.clone(), id, cancellation, input))
     }
 
-    /// Run publication work on a detached owner holding `held` (its gates and
-    /// permits), so caller cancellation cannot abandon it.
-    pub(super) async fn spawn_owned<T, F, Fut>(
-        &self,
-        held: impl Send + 'static,
-        owner: &'static str,
-        work: F,
-    ) -> Result<T, JobError>
-    where
-        T: Send + 'static,
-        F: FnOnce(JobManager) -> Fut + Send + 'static,
-        Fut: std::future::Future<Output = Result<T, JobError>> + Send + 'static,
-    {
-        let manager = self.clone();
-        tokio::spawn(async move {
-            let result = work(manager).await;
-            drop(held);
-            result
-        })
-        .await
-        .map_err(|source| JobError::OwnerLost { owner, source })?
-    }
-
-    /// Journal one change to a job and apply it, in the order every change keeps
-    /// under the job's operation lock: refused before the append, as `refused`
-    /// reports it, when the phase does not admit its step; applied and announced
-    /// after. `settle` runs on the entry with the change applied.
-    pub(super) async fn journal_change<T>(
+    /// Journal one change to a job, refused, as `refused` reports it, when the
+    /// phase does not admit its step.
+    pub(super) async fn journal_change(
         &self,
         id: JobId,
         change: JobChange,
-        dated: Dated,
         refused: fn(Rejected, JobId) -> JobError,
-        settle: impl FnOnce(&mut JobEntry) -> T,
-    ) -> Result<T, JobError> {
-        let agent = {
-            let jobs = self.inner.jobs.lock().await;
-            let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
+    ) -> Result<(), JobError> {
+        // A question is delivered, so it wakes a background owner.
+        let wakes = matches!(change, JobChange::Ask(_));
+        let changed = move |state: &CoreState| {
+            let entry = state.jobs.entries.get(&id).ok_or(JobError::Unknown(id))?;
             entry
-                .admits(change.step())
+                .steps(change.step())
                 .map_err(|rejected| refused(rejected, id))?;
-            entry.agent.clone()
+            let journaled = vec![(entry.agent.clone(), change.event(id))];
+            Ok(Plan::new(journaled, move |state, _| {
+                let entry = state.jobs.entries.get_mut(&id).expect("jobs stay");
+                // The journal records only that it asked.
+                if let JobChange::Ask(question) = change {
+                    entry.phase = Phase::WaitingInput(question);
+                }
+                if wakes {
+                    woken(state, id);
+                }
+            }))
         };
-        let event = vec![(agent, change.event(id))];
-        self.inner.store.append_dated(event, dated).await?;
-        self.apply_change(id, change, settle).await
-    }
-
-    /// Apply a change live and announce it.
-    async fn apply_change<T>(
-        &self,
-        id: JobId,
-        change: JobChange,
-        settle: impl FnOnce(&mut JobEntry) -> T,
-    ) -> Result<T, JobError> {
-        // A question or an outcome is delivered, so it wakes a background owner.
-        let wakes = matches!(change, JobChange::Ask(_) | JobChange::Finish(_));
-        let (notify, woken, settled) = {
-            let mut jobs = self.inner.jobs.lock().await;
-            let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-            entry
-                .apply(change)
-                .map_err(|rejected| rejected.journaled(id))?;
-            let woken = (wakes && entry.background).then(|| entry.agent.clone());
-            (entry.notify.clone(), woken, settle(entry))
-        };
-        notify.notify_waiters();
-        if let Some(agent) = woken {
-            self.wake(agent, id);
-        }
-        Ok(settled)
+        self.inner.store.commit(Command::Journal, changed).await
     }
 
     /// A lease's startup transition. Its stage guarantees the order, so the only
     /// phase that refuses is a job finished underneath it.
     pub(super) async fn advance(&self, id: JobId, state: JobTransition) -> Result<(), JobError> {
-        let operation = self.operation(id).await?.lock_owned().await;
-        self.spawn_owned(
-            operation,
-            "transition publication",
-            move |manager| async move {
-                manager
-                    .journal_change(
-                        id,
-                        JobChange::Advance(state),
-                        Dated::Now,
-                        Rejected::lifecycle,
-                        |_| (),
-                    )
-                    .await
-            },
-        )
-        .await
+        let change = JobChange::Advance(state);
+        (self.journal_change(id, change, |_, job| JobError::AlreadyTerminal(job))).await
     }
 
-    /// Publish a worker's outcome. A job finished underneath it keeps its own;
-    /// one the journal cannot record still fails live.
-    pub(crate) async fn settle(&self, id: JobId, outcome: JobOutcome) {
-        match self.finish(id, outcome).await {
-            Ok(()) | Err(JobError::AlreadyTerminal(_)) => {}
-            Err(error) => self.fail_volatile(id, error).await,
+    /// Publish the outcome of invocation `run` as its completion owner, once no
+    /// other finish is in flight. A phase that then admits no such end, or a later
+    /// invocation, keeps its outcome. Nothing races the claim it takes: only a
+    /// closing session's abort abandons it.
+    pub(super) async fn settle(&self, run: Run, outcome: JobOutcome) {
+        let end = outcome.end();
+        let claimed = self
+            .inner
+            .store
+            .until(move |state| match claim(state, run, end) {
+                Ok(claim) => Some(Some(claim)),
+                Err(Unclaimed::Ended) => Some(None),
+                Err(Unclaimed::InFlight) => None,
+            });
+        if let Ok(Some(claim)) = claimed.await {
+            self.publish_claimed(claim, outcome).await;
         }
     }
 
-    pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
-        self.finish_dated(id, outcome, Dated::Now).await
-    }
-
-    /// Finish a job, its outcome's record dated `dated`.
-    pub(super) async fn finish_dated(
-        &self,
-        id: JobId,
-        outcome: JobOutcome,
-        dated: Dated,
-    ) -> Result<(), JobError> {
-        let operation = self.operation(id).await?.lock_owned().await;
-        self.spawn_owned(
-            operation,
-            "finalization publication",
-            move |manager| async move {
-                let _delivery = manager.inner.delivery_operation.lock().await;
-                let end = outcome.end();
-                let (output, mut diagnostic) = match outcome {
-                    JobOutcome::Completed(output) => (Some(output), None),
-                    JobOutcome::NoResult => (None, None),
-                    JobOutcome::Failed { diagnostic, output } => (output, Some(diagnostic)),
-                };
-                // A job that completes without a result left nothing unfinished.
-                let capture_complete = output.as_ref().map_or(end == JobEnd::Completed, |output| {
-                    output.streams == crate::tool::StreamEnd::Finished
-                });
-                let (mut output, images, captures, output_diagnostic) =
-                    output.map_or((None, Vec::new(), Vec::new(), None), |output| {
-                        (
-                            Some(output.value),
-                            output.images,
-                            output.captures,
-                            output.diagnostic,
-                        )
-                    });
-                // Diagnostic facts, not an early capability-specific rendering, are
-                // authoritative. Saved documents keep only the registered slot.
-                if output_diagnostic.is_some()
-                    && let Some(message) = output.as_mut().and_then(output::diagnostic_slot_in)
-                {
-                    *message = Value::Null;
+    /// Publish `outcome` as the finish `claim` holds. One the journal refuses
+    /// leaves the job as the journal does.
+    pub(super) async fn publish_claimed(&self, claim: FinishClaim, outcome: JobOutcome) {
+        let FinishClaim(Run(id, _)) = claim;
+        if self.publish(&claim, outcome).await.is_err() {
+            let released = move |state: &mut CoreState| {
+                if let Some(entry) = state.jobs.entries.get_mut(&id) {
+                    entry.finishing = false;
                 }
-                let mut finished = Box::new(Finished {
-                    end,
-                    images,
-                    diagnostic: None,
-                    output_diagnostic: output_diagnostic.map(PartialDiagnostic::resolve),
-                });
-                let (previous, schema) = {
-                    let jobs = manager.inner.jobs.lock().await;
-                    let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-                    entry
-                        .admits(JobStep::Finish(end))
-                        .map_err(|rejected| rejected.lifecycle(id))?;
-                    let schema = entry.output_schema.clone().unwrap_or(Value::Bool(true));
-                    (entry.finished().cloned(), schema)
-                };
-                if let Some(previous) = previous {
-                    // Cancelling an interruption ends resumability, not its published
-                    // output. Leave the saved document and capture references untouched;
-                    // hydrating and resaving them would lose completeness and may be huge.
-                    if let Some(interrupted) = previous.diagnostic {
-                        diagnostic = diagnostic.map(|d| d.or(interrupted.context.into()));
-                    }
-                    finished.images = previous.images;
-                    finished.output_diagnostic = previous.output_diagnostic;
-                } else {
-                    let saved = manager.output(id);
-                    // Captures have independent pointer/type metadata. A failed tool need not
-                    // produce a result, and unfinished JSON captures are not valid result trees.
-                    output::blocking(move || {
-                        output::save_completed(&saved, &schema, output, capture_complete, captures)
-                    })
-                    .await
-                    .map_err(|error| JobError::Output(Box::new(error)))?;
-                }
-                finished.diagnostic = diagnostic.map(PartialDiagnostic::resolve);
-                let finish = JobChange::Finish(finished);
-                (manager.journal_change(id, finish, dated, Rejected::lifecycle, |_| ())).await
-            },
-        )
-        .await
-    }
-
-    pub(crate) async fn operation(&self, id: JobId) -> Result<Arc<Mutex<()>>, JobError> {
-        self.entry(id, |entry| entry.operation.clone()).await
-    }
-
-    pub(crate) async fn attach_task(
-        &self,
-        id: JobId,
-        task_abort: AbortHandle,
-    ) -> Result<(), JobError> {
-        let mut jobs = self.inner.jobs.lock().await;
-        let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-        if entry.end().is_some() {
-            task_abort.abort();
-            return Err(JobError::AlreadyTerminal(id));
+            };
+            self.inner.store.live(released).await;
         }
-        entry.task_abort = Some(task_abort);
-        Ok(())
     }
 
-    /// Preserve a live, observable terminal result when durable finalization
-    /// failed with `error`. Ordered after any finalization in flight, so it never
-    /// ends a job the journal has just ended differently.
-    pub(super) async fn fail_volatile(&self, id: JobId, error: JobError) {
-        let Ok(operation) = self.operation(id).await else {
-            return;
+    /// Journal the finish `claim` holds with `outcome`'s output, and the
+    /// acknowledgement of what the job read, refused once a later invocation
+    /// runs. An output that cannot be prepared stops the session.
+    async fn publish(&self, claim: &FinishClaim, outcome: JobOutcome) -> Result<(), JobError> {
+        let FinishClaim(run @ Run(id, _)) = *claim;
+        let end = outcome.end();
+        let (finish, output) = self.finished(run, outcome).await?;
+        let finished = move |state: &CoreState| {
+            let entry = state.jobs.entries.get(&id).ok_or(JobError::Unknown(id))?;
+            (entry.ends(run, end).then_some(())).ok_or(JobError::AlreadyTerminal(id))?;
+            let mut journaled = vec![(entry.agent.clone(), finish.event(id))];
+            journaled.extend(Delivery::claims(entry.reads.clone(), state));
+            let acknowledged = Plan::new(journaled, move |state, _| {
+                if let Some(entry) = state.jobs.entries.get_mut(&id) {
+                    entry.reads.clear();
+                }
+                woken(state, id)
+            });
+            Ok(acknowledged.saving(output))
         };
-        let _operation = operation.lock_owned().await;
-        let _delivery = self.inner.delivery_operation.lock().await;
-        let failed = Box::new(Finished {
-            end: JobEnd::Failed,
-            images: Vec::new(),
-            diagnostic: Some(
-                ToolError::from(error)
-                    .operation(
-                        crate::tool::diagnostic::Operation::Save,
-                        crate::tool::diagnostic::Subject::Job(id),
-                    )
-                    .at(crate::tool::diagnostic::FailureSite::Host)
-                    .diagnostic(),
-            ),
-            output_diagnostic: None,
-        });
-        let _ = self
-            .apply_change(id, JobChange::Finish(failed), |_| ())
-            .await;
+        self.inner.store.commit(Command::Journal, finished).await
     }
+
+    /// The change that ends invocation `run` with `outcome`, with the output it
+    /// saves unless an earlier finish of the run saved one; refused unless that
+    /// invocation is current and its phase admits the end. The output is prepared
+    /// here, off the core.
+    pub(super) async fn finished(
+        &self,
+        run: Run,
+        outcome: JobOutcome,
+    ) -> Result<(JobChange, Option<Prepared>), JobError> {
+        let Run(id, invocation) = run;
+        let end = outcome.end();
+        let (output, mut diagnostic) = match outcome {
+            JobOutcome::Completed(output) => (Some(output), None),
+            JobOutcome::NoResult => (None, None),
+            JobOutcome::Failed { diagnostic, output } => (output, Some(diagnostic)),
+        };
+        // A job that completes without a result left nothing unfinished.
+        let capture_complete = output.as_ref().map_or(end == JobEnd::Completed, |output| {
+            output.streams == crate::tool::StreamEnd::Finished
+        });
+        let has_result = output.is_some();
+        let crate::tool::output::Output {
+            value,
+            images,
+            captures,
+            diagnostic: output_diagnostic,
+            presented,
+            ..
+        } = output.unwrap_or_default();
+        let mut output = has_result.then_some(value);
+        // Diagnostic facts, not an early capability-specific rendering, are
+        // authoritative. Saved documents keep only the registered slot.
+        if output_diagnostic.is_some()
+            && let Some(message) = output.as_mut().and_then(output::diagnostic_slot_in)
+        {
+            *message = Value::Null;
+        }
+        let mut finished = Box::new(Finished {
+            end,
+            images,
+            diagnostic: None,
+            output_diagnostic: output_diagnostic.map(PartialDiagnostic::resolve),
+        });
+        let (previous, schema) = self
+            .entry(id, |entry| {
+                let schema = entry.output_schema.clone().unwrap_or(Value::Bool(true));
+                (entry.ends(run, end)).then(|| (entry.finished().cloned(), schema))
+            })?
+            .ok_or(JobError::AlreadyTerminal(id))?;
+        let rows = if let Some(previous) = previous {
+            // Cancelling an interruption ends resumability, not its published
+            // output, which stays as it was saved.
+            if let Some(interrupted) = previous.diagnostic {
+                diagnostic = diagnostic.map(|d| d.or(interrupted.context.into()));
+            }
+            finished.images = previous.images;
+            finished.output_diagnostic = previous.output_diagnostic;
+            None
+        } else {
+            let saved = output::Output::of(self.store(), id, invocation);
+            // Captures have independent pointer/type metadata. A failed tool need not
+            // produce a result, and unfinished JSON captures are not valid result trees.
+            let product = (output, capture_complete);
+            let rows = tokio::task::spawn_blocking(move || {
+                output::prepare_completed(&saved, &schema, product, captures, presented)
+            });
+            Some(match rows.await {
+                Ok(rows) => rows.map_err(SessionError::Io),
+                Err(panicked) => Err(SessionError::Task(panicked)),
+            })
+        };
+        finished.diagnostic = diagnostic.map(PartialDiagnostic::resolve);
+        Ok((JobChange::Finish(finished), rows))
+    }
+}
+
+/// Wake job `id`'s owner if what changed it leaves it something to deliver:
+/// the one rule for every change that can make an outcome, a question or a
+/// reply pending. A wake only opens its owner's coalescing window.
+pub(crate) fn woken(state: &mut CoreState, id: JobId) {
+    let entry = &state.jobs.entries[&id];
+    if entry.has_pending() {
+        state.agents.wake(&entry.agent);
+    }
+}
+
+/// Claim the finish of `run` with `end` before any output is saved, unless
+/// another finish holds it.
+pub(super) fn claim(
+    state: &mut CoreState,
+    run: Run,
+    end: JobEnd,
+) -> Result<FinishClaim, Unclaimed> {
+    let entry = state.jobs.entries.get_mut(&run.0).ok_or(Unclaimed::Ended)?;
+    entry.ends(run, end).then_some(()).ok_or(Unclaimed::Ended)?;
+    let free = !std::mem::replace(&mut entry.finishing, true);
+    free.then_some(FinishClaim(run)).ok_or(Unclaimed::InFlight)
 }
 
 #[cfg(test)]
@@ -328,7 +276,32 @@ mod tests {
     use super::*;
     use crate::tests::TestRuntime;
     use crate::tool::{ToolOptions, ToolRegistryBuilder};
-    use tokio::sync::Semaphore;
+
+    impl JobManager {
+        /// Claim the finish of `run` with `end` before any output is saved.
+        pub(in crate::job) async fn claim(
+            &self,
+            run: Run,
+            end: JobEnd,
+        ) -> Result<FinishClaim, Unclaimed> {
+            self.inner
+                .store
+                .live(move |state| claim(state, run, end))
+                .await
+        }
+
+        /// Finish a job's current invocation, unless another finish holds its claim.
+        pub(crate) async fn finish(&self, id: JobId, outcome: JobOutcome) -> Result<(), JobError> {
+            let claim = self.claim(self.run(id), outcome.end()).await;
+            let claim = claim.map_err(|_| JobError::AlreadyTerminal(id))?;
+            self.publish(&claim, outcome).await
+        }
+
+        /// Job `id`'s current invocation.
+        pub(in crate::job) fn run(&self, id: JobId) -> Run {
+            Run(id, self.entry(id, |entry| entry.invocation).unwrap())
+        }
+    }
 
     #[derive(Deserialize, JsonSchema)]
     struct NoArgs {}
@@ -336,7 +309,7 @@ mod tests {
     #[tokio::test]
     async fn invalid_create_preflight_does_not_append_or_allocate() {
         let (_root, jobs, agent) = super::super::tests::runtime().await;
-        let before = jobs.store().records().await.len();
+        let before = jobs.store().records().len();
         let unknown = JobId::new(99).unwrap();
         let spec = JobSpec {
             parent: Some(unknown),
@@ -348,8 +321,8 @@ mod tests {
             jobs.create(JobSpec::test(other, "wrong-session")).await,
             Err(JobError::Session(SessionError::WrongSession))
         ));
-        assert_eq!(jobs.store().records().await.len(), before);
-        assert!(jobs.inner.jobs.lock().await.is_empty());
+        assert_eq!(jobs.store().records().len(), before);
+        assert!(jobs.facts(|jobs| jobs.entries.is_empty()));
         assert_eq!(
             jobs.test_create(JobSpec::test(agent, "valid")).await.get(),
             1
@@ -378,105 +351,183 @@ mod tests {
             }
             let product =
                 ToolOutput::new(serde_json::json!({"exit_code": 0})).with_captures(vec![capture]);
-            jobs.finish(id, JobOutcome::Completed(product))
-                .await
-                .unwrap();
-            assert_eq!(jobs.snapshot(id).await.unwrap().state, JobState::Completed);
-            let journaled = jobs.store().records().await.into_iter().any(|record| {
+            jobs.test_complete(id, product).await;
+            assert_eq!(jobs.snapshot(id).unwrap().state, JobState::Completed);
+            let journaled = jobs.store().records().into_iter().any(|record| {
                 matches!(
                     record.event,
                     SessionEvent::JobFinished { job, state: JobEnd::Completed, .. } if job == id
                 )
             });
             assert!(journaled, "unreadable: {unreadable}");
-            let replay = jobs.test_replay().await;
-            let replayed = replay.snapshot(id).await.unwrap();
+            let replay = jobs.test_replay();
+            let replayed = replay.test_snapshot(id).await.unwrap();
             assert_eq!(replayed.state, JobState::Completed);
             assert_eq!(replayed.output, Some(serde_json::json!({"exit_code": 0})));
         }
     }
 
-    /// Handler panics and finalization persistence failures both wake waiters
-    /// with failed jobs rather than leaving them running.
+    /// A handler panic wakes waiters with a failed job rather than leaving it
+    /// running.
     #[tokio::test]
-    async fn handler_panics_and_finalization_failures_are_supervised_as_failed_jobs() {
+    async fn handler_panics_are_supervised_as_failed_jobs() {
         let runtime = TestRuntime::new().await;
-        let release = Arc::new(Semaphore::new(0));
         let mut builder = ToolRegistryBuilder::default();
-        let options = || ToolOptions::new(Vec::new()).background();
+        let options = ToolOptions::new(Vec::new()).background();
         builder
-            .register::<NoArgs, String, _, _>("panic", "panic", options(), |_, _| async move {
+            .register::<NoArgs, String, _, _>("panic", "panic", options, |_, _| async move {
                 panic!("handler panic");
-            })
-            .unwrap()
-            .register::<NoArgs, String, _, _>("blocked", "wait before completing", options(), {
-                let release = release.clone();
-                move |_context, _input| {
-                    let release = release.clone();
-                    async move {
-                        release.acquire().await.unwrap().forget();
-                        Ok("done".to_owned())
-                    }
-                }
             })
             .unwrap();
         let (jobs, executor) = (runtime.jobs.clone(), runtime.executor(builder));
         let background = serde_json::json!({crate::tool::registry::BACKGROUND: true});
-        use crate::tool::diagnostic::Operation;
-        for (tool, operation) in [("panic", Operation::Execute), ("blocked", Operation::Save)] {
-            let running = executor
-                .run_host(&runtime.agent, tool, background.clone())
-                .await
-                .unwrap();
-            if tool == "blocked" {
-                jobs.store().outputs().test_batch(
-                    "CREATE TEMP TRIGGER reject_output BEFORE INSERT ON job_output \
-                     BEGIN SELECT RAISE(ABORT, 'injected output fault'); END;",
-                );
-                release.add_permits(1);
+        let running = executor
+            .run_host(&runtime.agent, "panic", background)
+            .await
+            .unwrap();
+        let failed = crate::tests::bounded(jobs.wait(running.job, None, true))
+            .await
+            .unwrap();
+        assert_eq!(failed.state, JobState::Failed);
+        let diagnostic = failed.envelope.diagnostic.unwrap();
+        assert_eq!(
+            diagnostic.context.operation,
+            crate::tool::diagnostic::Operation::Execute
+        );
+    }
+
+    /// Racing finishes publish one outcome with its own output: the finish
+    /// claim refuses the others before they save anything.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn racing_finishes_keep_the_output_of_the_outcome_that_commits() {
+        let (_root, jobs, agent) = super::super::tests::runtime().await;
+        for _ in 0..40 {
+            let lease = jobs
+                .test_running(JobSpec::test(agent.clone(), "raced"))
+                .await;
+            let (id, run) = (lease.id(), jobs.run(lease.id()));
+            let (_input, _worker) = lease.split();
+            let completed = JobOutcome::Completed(ToolOutput::new(serde_json::json!("A")));
+            let outcomes = [
+                completed,
+                ToolError::cancelled().into(),
+                ToolError::interrupted().into(),
+            ];
+            let finishes = outcomes.map(|outcome| {
+                super::super::supervisor::spawn_completion(jobs.clone(), run, async { outcome })
+            });
+            for finish in finishes {
+                bounded(finish).await.unwrap();
             }
-            let failed = crate::tests::bounded(jobs.wait(running.job, None, true))
-                .await
-                .unwrap();
-            assert_eq!(failed.state, JobState::Failed);
-            let diagnostic = failed.diagnostic.unwrap();
-            assert_eq!(diagnostic.context.operation, operation, "{tool}");
+            // Unrequested, the cancellation never supersedes an interruption.
+            let published = jobs.test_snapshot(id).await.unwrap();
+            let output = match published.state {
+                JobState::Completed => Some(serde_json::json!("A")),
+                JobState::Cancelled | JobState::Interrupted => None,
+                state => panic!("{state:?}"),
+            };
+            assert_eq!(published.output, output);
         }
+    }
+
+    /// A watchdog that fires while an interruption is still saving its output
+    /// settles its cancellation once that finish applies, so the drain ends.
+    #[tokio::test]
+    async fn a_cancellation_behind_an_in_flight_interruption_settles_after_it() {
+        let (_root, jobs, agent) = super::super::tests::runtime().await;
+        let lease = jobs.test_running(JobSpec::test(agent, "interrupted")).await;
+        let id = lease.id();
+        let (_input, _worker) = lease.split();
+        let claim = jobs.claim(jobs.run(id), JobEnd::Interrupted).await;
+        let claim = claim.unwrap_or_else(|_| panic!("a running job's finish is unclaimed"));
+        // The watchdog aborts this past the grace, then settles the cancellation.
+        let worker = tokio::spawn(std::future::pending::<()>());
+        jobs.handles(id, |handles| {
+            handles.task_abort = Some((jobs.run(id).1, worker.abort_handle()))
+        });
+        jobs.cancel(id).await.unwrap();
+        assert!(bounded(worker).await.unwrap_err().is_cancelled());
+        let interrupted = ToolError::interrupted().into();
+        jobs.publish(&claim, interrupted).await.unwrap();
+        bounded(jobs.cancel_and_drain()).await.unwrap();
+        assert_eq!(jobs.snapshot(id).unwrap().state, JobState::Cancelled);
+    }
+
+    /// A finish bound to an earlier invocation never ends a later one: neither a
+    /// settle that waited behind the interruption's claim nor the old worker's
+    /// late completion ends the invocation owner input resumed, and no
+    /// cancellation but a requested one ends the interruption before it.
+    #[tokio::test]
+    async fn finishes_of_an_earlier_invocation_leave_the_resumed_one_running() {
+        let (_root, jobs, agent) = super::super::tests::runtime().await;
+        let spec = JobSpec {
+            accepts_input: true,
+            role: JobRole::Agent,
+            ..JobSpec::test(agent, "resumed")
+        };
+        let lease = jobs.test_running(spec).await;
+        let (id, run) = (lease.id(), jobs.run(lease.id()));
+        let (_input, _worker) = lease.split();
+        let handler: ResumeHandler = Arc::new(|_, mut input| {
+            Box::pin(async move { Ok(ToolOutput::new(input.recv().await.unwrap())) })
+        });
+        jobs.set_resume_handler(id, handler).await.unwrap();
+        let stale = || JobOutcome::Completed(ToolOutput::new(serde_json::json!("stale")));
+        let (release, released) = tokio::sync::oneshot::channel();
+        let late = super::super::supervisor::spawn_completion(jobs.clone(), run, async move {
+            released.await.unwrap();
+            stale()
+        });
+        let claim = jobs.claim(run, JobEnd::Interrupted).await;
+        let claim = claim.unwrap_or_else(|_| panic!("a running job's finish is unclaimed"));
+        // Its first claim is queued before the interruption publishes: InFlight.
+        let waiting = jobs.settle(run, stale());
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(&mut waiting).is_pending());
+        let interrupted = ToolError::interrupted().into();
+        jobs.publish(&claim, interrupted).await.unwrap();
+        let unrequested = jobs.claim(run, JobEnd::Cancelled).await;
+        assert!(
+            unrequested.is_err(),
+            "a worker's cancellation ends its interruption"
+        );
+        jobs.send(id, serde_json::json!("resume")).await.unwrap();
+        bounded(waiting).await;
+        release.send(()).unwrap();
+        bounded(late).await.unwrap();
+        assert_eq!(jobs.metadata(id).unwrap().state, JobState::Running);
+        jobs.send(id, serde_json::json!("own")).await.unwrap();
+        let own = bounded(jobs.wait(id, None, true)).await.unwrap();
+        assert_eq!(own.state, JobState::Completed);
+        assert_eq!(own.output, Some(serde_json::json!("own")));
+        let cancelled = |event: &SessionEvent| {
+            matches!(
+                event,
+                SessionEvent::JobFinished {
+                    state: JobEnd::Cancelled,
+                    ..
+                }
+            )
+        };
+        assert_eq!(count(&jobs, cancelled), 0);
     }
 
     // Creation ownership and admission tests.
 
-    use crate::session::AppendBoundary;
     use crate::tests::bounded;
 
-    async fn count(jobs: &JobManager, matches: impl Fn(&SessionEvent) -> bool) -> usize {
-        let records = jobs.store().records().await;
+    fn count(jobs: &JobManager, matches: impl Fn(&SessionEvent) -> bool) -> usize {
+        let records = jobs.store().records();
         records
             .iter()
             .filter(|record| matches(&record.event))
             .count()
     }
 
-    async fn creation_count(jobs: &JobManager) -> usize {
+    fn creation_count(jobs: &JobManager) -> usize {
         count(jobs, |event| {
             matches!(event, SessionEvent::JobCreated { .. })
         })
-        .await
-    }
-
-    #[tokio::test]
-    async fn cancellation_before_creation_gate_has_no_admitted_work() {
-        let (_root, jobs, agent) = crate::job::tests::runtime().await;
-        let operation = jobs.inner.creation_operation.write().await;
-        let mut creating = Box::pin(jobs.create(JobSpec::test(agent.clone(), "not-admitted")));
-        assert!(futures_util::poll!(&mut creating).is_pending());
-        drop(creating);
-        drop(operation);
-        assert_eq!(creation_count(&jobs).await, 0);
-        assert_eq!(
-            jobs.test_create(JobSpec::test(agent, "first")).await.get(),
-            1
-        );
     }
 
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -544,7 +595,7 @@ mod tests {
                 let output = ToolOutput::new(serde_json::json!({"text":"done"}));
                 jobs.finish(id, JobOutcome::Completed(output)).await
             }
-            Op::Claim => jobs.claim(id).await,
+            Op::Claim => jobs.test_claim(id).await,
             Op::Send => jobs.send(id, serde_json::json!("resumed")).await,
             Op::RequestInput => {
                 let question = crate::job::tests::question("after");
@@ -554,8 +605,8 @@ mod tests {
         }
     }
 
-    /// Every accepted append keeps its ownership gate through a caller abort and
-    /// publishes both durably and live once the writer resumes.
+    /// An accepted append outlives a caller abort: it publishes both durably and
+    /// live once the writer resumes.
     #[tokio::test]
     async fn cancelled_callers_keep_accepted_publication_owned_at_append_boundaries() {
         use Op::*;
@@ -571,105 +622,106 @@ mod tests {
         for op in ops {
             let case = format!("{op:?}");
             let (_root, jobs, agent, id, _lease) = owned_job(op).await;
-            let state = async |jobs: &JobManager| jobs.metadata(id).await.ok().map(|m| m.state);
+            let state = |jobs: &JobManager| jobs.metadata(id).ok().map(|m| m.state);
             let acknowledged =
-                async |jobs: &JobManager| !jobs.inner.jobs.lock().await[&id].unacknowledged();
-            let before = state(&jobs).await;
+                |jobs: &JobManager| jobs.entry(id, |entry| !entry.unacknowledged()).unwrap();
+            let before = state(&jobs);
+            let mut updates = jobs.store().observe().updates;
             // Either boundary parks the owner on the same receipt; the session's own
             // tests cover what differs between them.
-            let (reached, resume) = jobs.store().pause_append_at(AppendBoundary::Write).await;
+            let (reached, resume) = jobs.store().pause_committed(|_| true).await;
             let caller = tokio::spawn(run(op, jobs.clone(), agent, id));
             reached.await.unwrap();
             caller.abort();
             assert!(caller.await.unwrap_err().is_cancelled());
-            // Nothing is published live before the durable append completes, and
-            // the cancelled caller must not release its publication gate.
-            assert_eq!(state(&jobs).await, before, "{case}");
-            let gate_held = match op {
-                Create => jobs.inner.creation_operation.try_write().is_err(),
-                Claim => {
-                    assert!(!acknowledged(&jobs).await);
-                    jobs.inner.delivery_operation.try_lock().is_err()
-                }
-                _ => jobs.operation(id).await.unwrap().try_lock().is_err(),
-            };
-            assert!(gate_held, "{case}");
-            let drain = async {
-                jobs.drain_creations().await;
-                jobs.drain_supervisors().await;
-            };
-            tokio::pin!(drain);
-            assert!(futures_util::poll!(&mut drain).is_pending(), "{case}");
+            // Nothing is published live before the durable append completes.
+            assert_eq!(state(&jobs), before, "{case}");
+            if op == Claim {
+                assert!(!acknowledged(&jobs));
+            }
             resume.send(()).unwrap();
-            bounded(drain).await;
             let expected = match op {
                 Create => JobState::Cancelled,
                 Transition | ResumeInput => JobState::Running,
                 Finish | Claim | Send => JobState::Completed,
                 RequestInput => JobState::WaitingInput,
             };
-            assert_eq!(state(&jobs).await, Some(expected), "{case}");
-            let replay = jobs.test_replay().await;
-            // Replay deliberately interrupts unfinished work; terminal results,
-            // delivery, and durable transition records still agree with the owner.
-            let durable = match op {
-            Create | Finish | Claim | Send => state(&replay).await == Some(expected),
-            Transition | RequestInput | ResumeInput => {
-                count(&jobs, |event| {
-                    matches!(event, SessionEvent::JobStateChanged { job, state } if *job == id && JobState::from(*state) == expected)
-                })
-                .await
-                    > 0
-            }
-        };
-            assert!(durable, "{case}");
+            // The record the abandoned operation journals last, and how many of
+            // its kind the job then has.
+            let last = |event: &SessionEvent| match event {
+                SessionEvent::JobFinished { .. } => matches!(op, Create | Finish | Send),
+                SessionEvent::JobClaimed { .. } => op == Claim,
+                SessionEvent::JobStateChanged { state, .. } => match state {
+                    JobTransition::Running => matches!(op, Transition | ResumeInput),
+                    JobTransition::WaitingInput => op == RequestInput,
+                    _ => false,
+                },
+                _ => false,
+            };
+            let total = if matches!(op, Send | ResumeInput) {
+                2
+            } else {
+                1
+            };
+            bounded(async {
+                while count(&jobs, last) < total {
+                    updates.recv().await.unwrap();
+                }
+            })
+            .await;
+            assert_eq!(state(&jobs), Some(expected), "{case}");
+            // Replay agrees with the owner on what was journaled.
+            let replay = jobs.test_replay();
+            assert_eq!(state(&replay), Some(expected), "{case}");
             if op == Claim {
-                assert!(acknowledged(&jobs).await);
-                assert!(acknowledged(&replay).await);
+                assert!(acknowledged(&jobs));
+                assert!(acknowledged(&replay));
             }
             if op == Create {
-                assert_eq!(creation_count(&jobs).await, 1);
+                assert_eq!(creation_count(&jobs), 1);
                 let finished = count(
                     &jobs,
                     |event| matches!(event, SessionEvent::JobFinished { job, .. } if *job == id),
                 );
-                assert_eq!(finished.await, 1);
+                assert_eq!(finished, 1);
             }
         }
     }
 
-    /// An indeterminate append publishes nothing live, and the poisoned writer
-    /// refuses the retry instead of appending again.
+    /// An indeterminate append publishes nothing live, and the retry is refused
+    /// instead of appending again: with the failure that stopped the journal, or
+    /// for a finish by the claim its first attempt still holds.
     #[tokio::test]
     async fn indeterminate_appends_do_not_publish_live_success_or_retry() {
         for op in [Op::Create, Op::Transition, Op::Finish, Op::Claim] {
             let (_root, jobs, agent, id, _lease) = owned_job(op).await;
-            let sequence = jobs.store().records().await.len() as u64 + 1;
-            jobs.store()
-                .fail_append_at(AppendBoundary::Publication)
-                .await;
+            jobs.store().fail_committed().await;
             let error = run(op, jobs.clone(), agent.clone(), id).await.unwrap_err();
-            let JobError::Session(SessionError::AppendIndeterminate { recovery, .. }) = error
-            else {
-                panic!("{op:?}: expected recovery-required failure: {error}");
+            let JobError::Session(SessionError::JournalFailed(failure)) = error else {
+                panic!("{op:?}: expected a journal failure: {error}");
             };
-            assert_eq!(
-                recovery.identity.sequence,
-                RecordSeq::from(sequence),
-                "{op:?}"
+            assert!(
+                matches!(failure.cause(), SessionError::Unconfirmed(_)),
+                "{op:?}: expected an unconfirmed append: {failure}"
             );
             let retried = run(op, jobs.clone(), agent, id).await;
             assert!(
-                matches!(retried, Err(JobError::Session(SessionError::AppendUnavailable(ref later))) if later == &recovery),
+                match retried {
+                    Err(JobError::AlreadyTerminal(_)) => op == Op::Finish,
+                    Err(JobError::Session(SessionError::JournalFailed(later))) => {
+                        op != Op::Finish && later == failure
+                    }
+                    _ => false,
+                },
                 "{op:?}"
             );
             match op {
                 Op::Create => {
-                    assert!(jobs.inner.jobs.lock().await.is_empty());
-                    assert_eq!(creation_count(&jobs).await, 0);
+                    assert!(jobs.facts(|jobs| jobs.entries.is_empty()));
+                    assert_eq!(creation_count(&jobs), 0);
                 }
                 Op::Claim => {
-                    assert!(jobs.inner.jobs.lock().await[&id].unacknowledged());
+                    assert!(jobs.entry(id, |entry| entry.unacknowledged()).unwrap());
                 }
                 _ => {
                     let expected = if op == Op::Transition {
@@ -677,8 +729,7 @@ mod tests {
                     } else {
                         JobState::Queued
                     };
-                    assert_eq!(jobs.metadata(id).await.unwrap().state, expected);
-                    assert!(jobs.operation(id).await.unwrap().try_lock().is_ok());
+                    assert_eq!(jobs.metadata(id).unwrap().state, expected);
                 }
             }
         }
@@ -691,10 +742,7 @@ mod tests {
             .test_create(JobSpec::test(agent.clone(), "parent"))
             .await;
         jobs.test_finish(parent, serde_json::json!("done")).await;
-        let (reached, resume) = jobs
-            .store()
-            .pause_append_at(AppendBoundary::Publication)
-            .await;
+        let (reached, resume) = jobs.store().pause_committed(|_| true).await;
         let creating = tokio::spawn({
             let jobs = jobs.clone();
             let spec = JobSpec {
@@ -704,13 +752,17 @@ mod tests {
             async move { jobs.create(spec).await }
         });
         bounded(reached).await.unwrap();
-        // Cancellation does not need the creation gate or the session writer lock.
-        bounded(jobs.cancel(parent)).await.unwrap();
+        // Cancellation is ordered behind the creation's commit, and reaches it.
+        let cancelling = tokio::spawn({
+            let jobs = jobs.clone();
+            async move { jobs.cancel(parent).await }
+        });
         resume.send(()).unwrap();
         let child = creating.await.unwrap().unwrap();
+        cancelling.await.unwrap().unwrap();
         assert!(child.cancellation_token().is_cancelled());
         let settled = bounded(jobs.wait(child.id(), None, false)).await;
         assert_eq!(settled.unwrap().state, JobState::Cancelled);
-        assert_eq!(creation_count(&jobs).await, 2);
+        assert_eq!(creation_count(&jobs), 2);
     }
 }

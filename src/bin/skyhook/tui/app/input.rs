@@ -12,10 +12,15 @@ pub enum InputTarget {
 impl App {
     /// Show an inspector tab at its latest activity.
     pub(super) fn set_tab(&mut self, tab: Tab) {
-        self.selection = None;
         self.tab = tab;
-        self.view().scroll = None;
+        self.follow_latest();
         self.invalidate_content();
+    }
+
+    /// Drop any text selection and follow the viewed tab's latest activity.
+    pub(super) fn follow_latest(&mut self) {
+        self.selection = None;
+        self.view().scroll = None;
     }
 
     /// View the agent above or below the viewed one in the tree, wrapping, at its
@@ -391,7 +396,7 @@ impl App {
     }
     /// The first transcript row in view: the pinned one, else the latest page.
     pub(super) fn scroll_offset(&self) -> usize {
-        let view = self.views.get(&self.selected).and_then(|view| view.scroll);
+        let view = self.viewed().and_then(|view| view.scroll);
         view.unwrap_or(self.latest_row())
     }
     pub(super) fn scroll(&mut self, delta: isize) {
@@ -415,9 +420,9 @@ impl App {
         {
             // Borrow only metadata; do not clone the trace/document to toggle.
             let key = entry.key().clone();
-            let job = entry.job_id();
+            let (job, open) = (entry.job_id(), entry.open());
             // An override from a toggle not yet rebuilt into the entries wins.
-            let closing = self.views[&self.selected].is_expanded(&key, entry.open());
+            let closing = self.view().is_expanded(&key, open);
             self.view().set_expanded(key.clone(), !closing);
             self.selection = None;
             self.content_cache.invalidate_entry(key);
@@ -534,8 +539,51 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::super::played::*;
     use super::super::tests::*;
     use super::*;
+
+    /// Each tab keeps its own reading state: a job opened in one tab stays closed
+    /// in the other, and closing it there leaves the first open; the row and
+    /// search query stay with their tab, while a switch returns to the latest
+    /// activity; and `/details` reopens what a hidden tab collapsed.
+    #[tokio::test]
+    async fn tabs_keep_reading_state_independently() {
+        let (_root, mut app) = fixture().await;
+        run_script(&mut app, "return await tool.exec({command:['true']});").await;
+        let key = model::EntryKey::Job(job_named(&app, "exec"));
+        let job_row = |app: &App| app.entries().iter().position(|entry| *entry.key() == key);
+        for (tab, open) in [
+            (Tab::Conversation, false),
+            (Tab::Jobs, false),
+            (Tab::Jobs, true),
+            (Tab::Conversation, true),
+        ] {
+            app.set_tab(tab);
+            app.rebuild_content();
+            let row = job_row(&app).unwrap();
+            assert_eq!(app.entries()[row].open(), open, "{tab:?}");
+            app.view().row = row;
+            app.toggle();
+        }
+        let row = app.view().row;
+        app.view().query = "exec".into();
+        app.view().scroll = Some(0);
+        app.set_tab(Tab::Jobs);
+        assert!(app.view().query.is_empty());
+        app.view().row = row + 1;
+        app.command(Command::Details);
+        app.set_tab(Tab::Conversation);
+        app.rebuild_content();
+        let view = app.view();
+        assert_eq!(
+            (view.row, view.query.as_str(), view.scroll),
+            (row, "exec", None)
+        );
+        assert!(app.entries()[job_row(&app).unwrap()].open());
+        app.set_tab(Tab::Jobs);
+        assert_eq!(app.view().row, row + 1);
+    }
 
     /// A draft taller than its box scrolls under the wheel without moving its cursor,
     /// pages its cursor with Page Up, and follows the cursor again once edited.
@@ -668,14 +716,16 @@ mod tests {
         let (_root, mut app) = draft_fixture().await;
         let mut config = app.launch.model.config().config().clone();
         config.modes = skyhook::config::Config::from_yaml(
-            "modes:\n  general:\n    capabilities: [read]\n  look:\n    capabilities: []\n  none:\n    capabilities: []",
+            "modes:\n  general:\n    capabilities: [read, agents]\n  look:\n    capabilities: []\n  none:\n    capabilities: []",
         )
         .unwrap()
         .modes;
         app.launch.model = config.into_runtime().unwrap().default_model();
         // A session offers the modes it was opened with.
-        let session = app.launch.create(None).await.unwrap();
-        attach(&mut app, session).await;
+        let (session, mut model) = played(&app.launch).await;
+        attach(&mut app, session);
+        let (children, _turns) = spawn_children(&mut app, &mut model, 1).await;
+        let child = children[0].clone();
         for index in 0..12 {
             app.local_notice(format!("Message {index}"));
         }
@@ -707,7 +757,7 @@ mod tests {
             [ratatui::style::Color::Rgb(255, 255, 255)]
         );
 
-        let (root, child) = (app.root_agent().clone(), push_child(&mut app, 1).await);
+        let root = app.root_agent().clone();
         draw(&mut app);
         // In the tree, a step views the next agent at its latest activity, wrapping.
         app.focus = Focus::Tree;

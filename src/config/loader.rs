@@ -793,7 +793,7 @@ mod tests {
         assert!(resolved.report.diagnostics.is_empty());
         let definitions = resolved.config.targets.definitions().unwrap();
         let registry = crate::target::TargetRegistry::from_definitions(definitions).unwrap();
-        let route = registry.route(&"a".parse().unwrap()).await.unwrap();
+        let route = registry.route(&"a".parse().unwrap()).unwrap();
         let names: Vec<_> = route.iter().map(|target| target.name.as_str()).collect();
         assert_eq!(names, ["c", "b", "a"]);
     }

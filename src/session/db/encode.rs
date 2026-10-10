@@ -146,7 +146,6 @@ impl Encoder {
             | E::ModelFailed { .. }
             | E::ModelAttemptInterrupted(_)
             | E::ResponseCompleted { .. }
-            | E::ModelRecoveryScheduled { .. }
             | E::Usage { .. }
             | E::Compaction { .. }
             | E::CompactionFailed { .. }
@@ -155,18 +154,11 @@ impl Encoder {
             | E::JobStateChanged { .. }
             | E::JobFinished { .. }
             | E::JobClaimed { .. }
+            | E::JobReleased { .. }
+            | E::JobMessageReleased { .. }
             | E::JobInjected { .. }
             | E::JobMessageDelivered { .. } => self.job(db, entry, event),
-            E::ApprovalGranted { grant } => self.grant(db, entry.seq, grant),
-            E::ApprovalRevoked { grant } => db
-                .execute(
-                    "INSERT INTO approval_revocation (entry, grant_entry) VALUES (?1, ?2)",
-                    params![entry.seq, *grant],
-                )
-                .map(drop),
-            E::SessionReopened | E::TitleCleared | E::AgentCompleted | E::AgentInterrupted => {
-                Ok(())
-            }
+            E::TitleCleared | E::AgentCompleted | E::AgentInterrupted => Ok(()),
         }
     }
 
@@ -240,7 +232,6 @@ mod tests {
         },
         target::TargetDefinition,
         target::TargetRef,
-        tool::policy::{ApprovalGrant, Capability, ResourceId},
     };
 
     #[test]
@@ -330,22 +321,19 @@ mod tests {
             attempt,
         };
         one!(SessionEvent::ModelAttemptStarted(attempt(1)));
-        let failed = one!(SessionEvent::ModelFailed {
+        one!(SessionEvent::ModelFailed {
             attempt: attempt(1),
-            failure: crate::agent::Failure::Provider(
-                "lost".into(),
-                crate::provider::ProviderErrorKind::Transport,
-            ),
+            failure: crate::session::AttemptFailure::Retrying {
+                message: "lost".into(),
+                kind: crate::provider::ProviderErrorKind::Transport,
+                delay: std::time::Duration::from_secs(1).into(),
+            },
         });
         // An attempt ends once.
         fixture.reject(
             root.clone(),
             SessionEvent::ModelAttemptInterrupted(attempt(1)),
         );
-        one!(SessionEvent::ModelRecoveryScheduled {
-            failure: failed,
-            delay_millis: 1000,
-        });
         one!(SessionEvent::ModelAttemptStarted(attempt(2)));
         let payload = json!({"encrypted": "opaque"});
         let replay = envelope(
@@ -421,47 +409,12 @@ mod tests {
             output_diagnostic: None,
             images: Vec::new(),
         });
-        // Every resource kind; a route names journaled target revisions.
         one!(SessionEvent::TargetsUpserted {
             targets: vec![TargetDefinition::test("build", "/srv", None)],
         });
-        let path = &crate::tool::policy::PathText::new("/srv/a b/../c").unwrap();
-        let build: crate::target::TargetName = "build".parse().unwrap();
-        for (capability, resource) in [
-            (Capability::Mcp, ResourceId::mcp("server", "tool")),
-            (Capability::Read, ResourceId::session("scratch")),
-            (
-                Capability::Write,
-                ResourceId::workspace(&"build".parse().unwrap(), path),
-            ),
-            (
-                Capability::Read,
-                ResourceId::path(&"build".parse().unwrap(), path),
-            ),
-            (
-                Capability::Network,
-                ResourceId::network(&crate::target::TargetRef::Root, "https://example.test"),
-            ),
-            (
-                Capability::Targets,
-                ResourceId::route(build.clone(), vec![(build.clone(), 1)]),
-            ),
-        ] {
-            let grant = one!(SessionEvent::ApprovalGranted {
-                grant: ApprovalGrant::descendants(capability, resource),
-            });
-            one!(SessionEvent::ApprovalRevoked { grant });
-        }
-        fixture.reject(
-            root.clone(),
-            SessionEvent::ApprovalGranted {
-                grant: ApprovalGrant::exact(
-                    Capability::Targets,
-                    ResourceId::route(build.clone(), vec![(build.clone(), 2)]),
-                ),
-            },
-        );
         one!(SessionEvent::JobClaimed { job });
+        one!(SessionEvent::JobReleased { job });
+        one!(SessionEvent::JobMessageReleased { job });
         one!(SessionEvent::JobInjected { job });
         one!(SessionEvent::JobMessageDelivered {
             job,
@@ -707,7 +660,6 @@ mod tests {
                 source: TitleSource::Generated,
             },
             SessionEvent::TitleCleared,
-            SessionEvent::SessionReopened,
             SessionEvent::AgentCompleted,
             SessionEvent::AgentInterrupted,
         ] {

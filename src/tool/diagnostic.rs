@@ -401,9 +401,6 @@ pub enum Cause {
     UnknownJob {
         job: JobId,
     },
-    JobNotTerminal {
-        job: JobId,
-    },
     JobAlreadyTerminal {
         job: JobId,
     },
@@ -464,13 +461,9 @@ impl PartialDiagnostic {
                 cause.redact_io_detail();
                 cause
             }
-            AppendIndeterminate { .. } => {
-                Message("session append completion is unknown; recovery is required".into())
-            }
-            AppendUnavailable(_) => {
-                Message("session append rejected; writer recovery is required".into())
-            }
-            Closed => Message("session writer is closed".into()),
+            Unconfirmed(_) => Message(crate::session::JOURNAL_FAILED.into()),
+            JournalFailed(failure) => return Self::session(failure.cause()),
+            Refused(phase) => Message(format!("the session is {phase}")),
             Database(_) => Message("session database operation failed".into()),
             TemplateHistory => {
                 Message("model request template must not contain conversation history".into())
@@ -490,6 +483,9 @@ impl PartialDiagnostic {
                 Message(format!("unsupported session version {version}"))
             }
             WrongSession => Message("event belongs to another session".into()),
+            IllegalTransition { sequence } => Message(format!(
+                "journal entry {sequence} changes a job's phase illegally"
+            )),
             Blob { reason, .. } => Message(format!("stored blob {reason}")),
         };
         Self::new(PartialContext::default().at(FailureSite::Host), cause)
@@ -605,9 +601,6 @@ impl Diagnostic {
                 "tool `{tool}` is not available in scripts"
             ))),
             Cause::UnknownJob { job } => text.push_str(&JobError::Unknown(*job).to_string()),
-            Cause::JobNotTerminal { job } => {
-                text.push_str(&JobError::NotTerminal(*job).to_string())
-            }
             Cause::JobAlreadyTerminal { job } => {
                 text.push_str(&JobError::AlreadyTerminal(*job).to_string())
             }
@@ -1198,40 +1191,25 @@ mod tests {
     #[test]
     fn session_normalization_preserves_classification_and_redacts_opaque_details() {
         use crate::{
-            identity::{EventId, SessionId},
             job::JobError,
-            session::{AppendIdentity, AppendRecovery, DbError, RecoveryReason, SessionError},
+            session::{DbError, SessionError},
             tool::{ToolError, ToolOutput},
         };
         use std::sync::Arc;
 
         const SECRET: &str = "private-session-payload";
-        fn recovery() -> AppendRecovery {
-            AppendRecovery {
-                identity: AppendIdentity {
-                    event: EventId::from_bytes([1; 16]),
-                    session: SessionId::from_bytes([2; 16]),
-                    sequence: 3.into(),
-                },
-                reason: RecoveryReason::Unpublished,
-            }
-        }
         for (error, message) in [
             (
                 SessionError::Database(DbError::Corrupt(SECRET.into())),
                 "database operation failed",
             ),
-            (SessionError::Closed, "writer is closed"),
             (
-                SessionError::AppendIndeterminate {
-                    recovery: recovery(),
-                    source: None,
-                },
-                "completion is unknown",
+                SessionError::Refused(crate::session::SessionPhase::Closed),
+                "session is closed",
             ),
             (
-                SessionError::AppendUnavailable(recovery()),
-                "append rejected",
+                SessionError::Unconfirmed(None),
+                crate::session::JOURNAL_FAILED,
             ),
         ] {
             let diagnostic = PartialDiagnostic::session(&error).resolve();

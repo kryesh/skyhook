@@ -23,9 +23,9 @@ pub enum HarnessError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
     #[error(transparent)]
-    Execution(#[from] ToolError),
+    Execution(ToolError),
     #[error(transparent)]
-    Job(#[from] JobError),
+    Job(JobError),
     #[error("a default model is required")]
     MissingDefaultModel,
     #[error("unknown model `{0}`")]
@@ -76,6 +76,38 @@ pub enum HarnessError {
     MissingSessionStart,
 }
 
+impl HarnessError {
+    /// Whether this is the failure of the session's journal, which stopped it.
+    #[must_use]
+    pub fn journal_failed(&self) -> bool {
+        matches!(
+            self,
+            Self::Session(crate::session::SessionError::JournalFailed(_))
+        )
+    }
+}
+
+/// A session's refusal reaches the host in one shape, whichever layer met it.
+impl From<ToolError> for HarnessError {
+    fn from(error: ToolError) -> Self {
+        match error.refused() {
+            Some(phase) => Self::Session(SessionError::Refused(phase)),
+            None => Self::Execution(error),
+        }
+    }
+}
+
+/// A session error reaches the host in one shape, whichever layer met it.
+impl From<JobError> for HarnessError {
+    fn from(error: JobError) -> Self {
+        match error {
+            JobError::Session(error) => Self::Session(error),
+            JobError::Interrupted => Self::Interrupted,
+            error => Self::Job(error),
+        }
+    }
+}
+
 /// Why a compaction attempt installed no checkpoint.
 #[derive(Debug, Error)]
 pub enum CompactionError {
@@ -95,16 +127,6 @@ pub enum CompactionError {
     },
     #[error(transparent)]
     Checkpoint(#[from] crate::session::CheckpointError),
-}
-
-impl CompactionError {
-    /// Whether a fresh summary can succeed: the model's answer was unusable, or the
-    /// todos it reconciled changed meanwhile. A broken invariant would fail again.
-    #[must_use]
-    pub fn retryable(&self) -> bool {
-        use crate::session::CheckpointError::StaleTodos;
-        !matches!(self, Self::Checkpoint(reason) if *reason != StaleTodos)
-    }
 }
 
 crate::named_enum::detailed_enum! {
@@ -133,6 +155,23 @@ crate::named_enum::detailed_enum! {
         /// A failure outside the summary's model attempts, such as journaling it.
         #[error("{0}")]
         Other(String) = "other",
+    }
+}
+
+impl CompactionFault {
+    /// Whether a fresh summary can succeed: the model's answer was unusable, or the
+    /// todos it reconciled changed meanwhile. A broken invariant would fail again.
+    #[must_use]
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::Truncated
+            | Self::ToolCall
+            | Self::Continuation(_)
+            | Self::UnknownJob
+            | Self::HandoverOutput => true,
+            Self::Checkpoint(reason) => *reason == crate::session::CheckpointError::StaleTodos,
+            Self::Interrupted | Self::Summary(_) | Self::Other(_) => false,
+        }
     }
 }
 

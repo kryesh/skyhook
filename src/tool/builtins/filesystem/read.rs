@@ -382,7 +382,7 @@ mod tests {
                 Subject::Argument(argument.into())
             );
         }
-        assert!(runtime.jobs.list(&runtime.agent).await.is_empty());
+        assert!(runtime.jobs.list(&runtime.agent).is_empty());
     }
 
     #[cfg(unix)]
@@ -522,7 +522,7 @@ mod tests {
         assert_eq!(value["error"]["code"], "not_found");
         assert!(!value["error"]["message"].as_str().unwrap().is_empty());
         assert_eq!(
-            runtime.jobs.snapshot(direct.job).await.unwrap().state,
+            runtime.jobs.snapshot(direct.job).unwrap().state,
             JobState::Completed
         );
 
@@ -540,7 +540,7 @@ mod tests {
         assert_eq!(script.output.value["value"]["error"]["code"], "not_found");
         assert!(script.output.value["failure"].is_null());
         assert_eq!(
-            runtime.jobs.snapshot(script.job).await.unwrap().state,
+            runtime.jobs.snapshot(script.job).unwrap().state,
             JobState::Completed
         );
     }

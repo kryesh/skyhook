@@ -7,8 +7,6 @@ pub enum InputUnavailableReason {
     State(JobState),
     CancellationRequested,
     ResumeUnavailable,
-    /// The session is closing, which restarts nothing.
-    Closing,
 }
 
 impl std::fmt::Display for InputUnavailableReason {
@@ -19,7 +17,6 @@ impl std::fmt::Display for InputUnavailableReason {
             Self::ResumeUnavailable => {
                 formatter.write_str("no retained resume handler is available")
             }
-            Self::Closing => formatter.write_str("the session is closing"),
         }
     }
 }
@@ -32,8 +29,8 @@ impl<O> From<JobError> for crate::tool::invocation::OperationError<O> {
             JobError::InputClosed(_) => Self::input_closed(),
             JobError::Output(error) => Self::from_facts(error.into_facts().0, None),
             JobError::Unknown(job) => Self::cause(Cause::UnknownJob { job }),
-            JobError::NotTerminal(job) => Self::cause(Cause::JobNotTerminal { job }),
             JobError::AlreadyTerminal(job) => Self::cause(Cause::JobAlreadyTerminal { job }),
+            JobError::Interrupted => Self::interrupted(),
             error => Self::failed(error),
         }
     }
@@ -47,8 +44,6 @@ pub enum JobError {
     Unknown(JobId),
     #[error("job {0} already has a terminal result")]
     AlreadyTerminal(JobId),
-    #[error("job {0} is not terminal")]
-    NotTerminal(JobId),
     #[error("job {job} input unavailable: {reason}")]
     InputUnavailable {
         job: JobId,
@@ -60,24 +55,21 @@ pub enum JobError {
     InputClosed(JobId),
     #[error("job identifier space is exhausted")]
     InvalidId,
-    /// The journaled change was admitted, but the live phase moved underneath it.
-    #[error("job {0} changed phase while its change was journaled")]
-    PhaseMoved(JobId),
-    #[error("journal entry {sequence} changes a job's phase illegally")]
-    IllegalTransition { sequence: u64 },
+    #[error("the calling turn was interrupted")]
+    Interrupted,
+    #[error(
+        "child `{name}` already exists as job {job}; message it with tool.job({job}).send({{value: ...}}), or pick another name"
+    )]
+    NameTaken { name: JobName, job: JobId },
     #[error("job {0} did not launch an agent")]
     NoChild(JobId),
     #[error("child agent does not belong to job {0}")]
     ChildOwnerMismatch(JobId),
     #[error("child message text does not match the committed assistant text")]
     ChildTextMismatch,
-    /// The detached task publishing `owner` stopped before reporting.
-    #[error("{owner} owner lost: {source}")]
-    OwnerLost {
-        owner: &'static str,
-        #[source]
-        source: tokio::task::JoinError,
-    },
+    /// A notification presented a delivery that is no longer pending as it read it.
+    #[error("a presented delivery changed before it was committed")]
+    Stale,
     /// Saving or reading the job's output failed; the facts name the stage.
     #[error(transparent)]
     Output(Box<crate::tool::ToolError>),

@@ -420,7 +420,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
         session,
         initial_prompt,
         started: time(records.first().map_or(0, |record| record.timestamp_millis)),
-        // Resuming dates what it closes before its own reopening.
+        // Activation and closing date what they settle at the last activity.
         finished: time(
             records
                 .iter()
@@ -557,7 +557,7 @@ mod tests {
         .message();
         let tool_use = completed(request, 1, message, CompletedOutcome::ToolUse);
         append(root, tool_use).await;
-        let mid_turn = session_stats(store.id(), &store.records().await);
+        let mid_turn = session_stats(store.id(), &store.records());
         append(
             root,
             SessionEvent::AgentFailed {
@@ -579,7 +579,7 @@ mod tests {
         for agent in [&first, &second, root] {
             append(agent, SessionEvent::AgentInterrupted).await;
         }
-        let stats = session_stats(store.id(), &store.records().await);
+        let stats = session_stats(store.id(), &store.records());
         let outcome = |index: usize| stats.agents[index].outcome.clone();
         let boom = Failure::Other("boom".into());
         assert!(matches!(outcome(0), AgentOutcome::Failed { failure, .. } if failure == boom));
@@ -624,7 +624,7 @@ mod tests {
                     request,
                     attempt: 1,
                 },
-                failure: Failure::Other("flaky".into()),
+                failure: crate::session::AttemptFailure::Final(Failure::Other("flaky".into())),
             },
         )
         .await;
@@ -699,13 +699,13 @@ mod tests {
         // change its outcome, but its next request makes it running again.
         append(&child, SessionEvent::AgentCompleted).await;
         append(&child, SessionEvent::AgentInterrupted).await;
-        let retained = session_stats(store.id(), &store.records().await);
+        let retained = session_stats(store.id(), &store.records());
         let completed_at = match retained.agents[1].outcome {
             AgentOutcome::Completed { at } => at,
             ref outcome => panic!("retained child reported {outcome:?}"),
         };
         append(&child, requested(child_context)).await;
-        let resumed = session_stats(store.id(), &store.records().await);
+        let resumed = session_stats(store.id(), &store.records());
         assert_eq!(resumed.agents[1].outcome, AgentOutcome::Running);
         append(&child, SessionEvent::AgentInterrupted).await;
         append(
@@ -727,7 +727,7 @@ mod tests {
         append(root, completed(ended, 1, message, CompletedOutcome::Answer)).await;
         append(root, SessionEvent::AgentInterrupted).await;
 
-        let records = store.records().await;
+        let records = store.records();
         let stats = session_stats(store.id(), &records);
         assert_eq!(stats.initial_prompt.as_deref(), Some("survey the\n  repo"));
         assert_eq!(stats.agents.len(), 2);

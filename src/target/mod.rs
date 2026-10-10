@@ -11,9 +11,8 @@ use serde::{Deserialize, Serialize};
 use crate::newtype::string_newtype;
 
 pub use config::{SshAuth, SshOptions, TargetAuth, TargetConfig, TargetsConfig, Transport};
-pub use registry::{
-    TargetDefinition, TargetEdge, TargetError, TargetField, TargetRegistry, TargetSource,
-};
+pub(crate) use registry::{Revisions, TargetRegistry, replaces};
+pub use registry::{TargetDefinition, TargetEdge, TargetError, TargetField, TargetSource};
 pub(crate) use router::{ResolvedRoute, Route, RouteIdentity, TargetRouter, select_location};
 
 pub(crate) const MAX_TARGET_NAME_BYTES: usize = 128;

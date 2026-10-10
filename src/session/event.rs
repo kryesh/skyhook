@@ -11,6 +11,7 @@ use crate::{
     media::ImageRef,
     named_enum::named_enum,
     provider::{
+        ProviderErrorKind,
         profile::{ModelProfile, ModelRef},
         protocol::{
             CutReason, HistoryLifetime, ModelRequest, Outcome, ResponseSchema, SystemSegment,
@@ -19,10 +20,7 @@ use crate::{
     },
     session::Message,
     target::TargetDefinition,
-    tool::{
-        policy::{ApprovalGrant, Capability},
-        registry::JobName,
-    },
+    tool::{policy::Capability, registry::JobName},
 };
 
 named_enum! {
@@ -188,6 +186,49 @@ pub struct AttemptRef {
     pub attempt: u64,
 }
 
+/// The backoff before a failed attempt's retry, kept to the millisecond.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct RetryDelay(u64);
+
+impl RetryDelay {
+    #[must_use]
+    pub fn millis(self) -> u64 {
+        self.0
+    }
+}
+
+impl From<std::time::Duration> for RetryDelay {
+    fn from(delay: std::time::Duration) -> Self {
+        Self(u64::try_from(delay.as_millis()).unwrap_or(u64::MAX))
+    }
+}
+
+/// How a failed attempt leaves its request: failed, or retrying a transient
+/// provider failure, the only kind that retries.
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptFailure {
+    Final(Failure),
+    /// The next attempt is due `delay` after the failure.
+    Retrying {
+        message: String,
+        kind: ProviderErrorKind,
+        delay: RetryDelay,
+    },
+}
+
+impl AttemptFailure {
+    /// Why the attempt failed, whether or not its request retries.
+    #[must_use]
+    pub fn failure(&self) -> Failure {
+        match self {
+            Self::Final(failure) => failure.clone(),
+            Self::Retrying { message, kind, .. } => Failure::Provider(message.clone(), *kind),
+        }
+    }
+}
+
 /// How far a failed compaction round got before it failed.
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -304,9 +345,6 @@ pub enum SessionEvent {
         targets: Vec<TargetDefinition>,
         capabilities: Vec<Capability>,
     },
-    /// A later process reopened the session, on its root agent. What it then closes
-    /// for the previous process is dated when that process last did something.
-    SessionReopened,
     TitleSet {
         title: String,
         source: TitleSource,
@@ -372,7 +410,7 @@ pub enum SessionEvent {
     /// request, so only a parent agent or a human may retry it.
     ModelFailed {
         attempt: AttemptRef,
-        failure: Failure,
+        failure: AttemptFailure,
     },
     /// An attempt ended without an outcome: cancelled, or open when the session stopped.
     ModelAttemptInterrupted(AttemptRef),
@@ -383,13 +421,6 @@ pub enum SessionEvent {
         /// The committed assistant message this response produced.
         message: MessageSeq,
         outcome: CompletedOutcome,
-    },
-    /// The `ModelFailed` at `failure` will be retried after a recovery delay.
-    /// This is host-facing status, not model-visible conversation history.
-    ModelRecoveryScheduled {
-        failure: RecordSeq,
-        /// Backoff scheduled before the next invocation.
-        delay_millis: u64,
     },
     CompactionFailed {
         failure: CompactionFailure,
@@ -413,14 +444,6 @@ pub enum SessionEvent {
         background: bool,
         location: ExecutionLocation,
     },
-    /// A policy approved this grant for the rest of the session.
-    ApprovalGranted {
-        grant: ApprovalGrant,
-    },
-    /// The grant journaled at sequence `grant` no longer applies.
-    ApprovalRevoked {
-        grant: RecordSeq,
-    },
     JobStateChanged {
         job: JobId,
         state: JobTransition,
@@ -435,6 +458,14 @@ pub enum SessionEvent {
         images: Vec<ImageRef>,
     },
     JobClaimed {
+        job: JobId,
+    },
+    /// The job's foreground holder let go of it; it goes on in the background.
+    JobReleased {
+        job: JobId,
+    },
+    /// The child's held answer went to its owner as a reply, its invocation going on.
+    JobMessageReleased {
         job: JobId,
     },
     /// The job's outcome was delivered to its owner.
@@ -462,7 +493,6 @@ named_enum! {
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub(crate) enum EntryKind {
         SessionStarted = "session_started",
-        SessionReopened = "session_reopened",
         TitleSet = "title_set",
         TitleCleared = "title_cleared",
         TargetsUpserted = "targets_upserted",
@@ -479,7 +509,6 @@ named_enum! {
         ModelRequested = "model_requested",
         ModelAttemptStarted = "model_attempt_started",
         ModelFailed = "model_failed",
-        ModelRecoveryScheduled = "model_recovery_scheduled",
         ModelAttemptInterrupted = "model_attempt_interrupted",
         ResponseCompleted = "response_completed",
         Usage = "usage",
@@ -489,22 +518,22 @@ named_enum! {
         JobStateChanged = "job_state_changed",
         JobFinished = "job_finished",
         JobClaimed = "job_claimed",
+        JobReleased = "job_released",
+        JobMessageReleased = "job_message_released",
         JobInjected = "job_injected",
         JobMessageDelivered = "job_message_delivered",
-        ApprovalGranted = "approval_granted",
-        ApprovalRevoked = "approval_revoked",
     }
 }
 
 impl EntryKind {
     pub(crate) fn is_activity(self) -> bool {
-        !matches!(self, Self::SessionReopened | Self::AgentInterrupted)
+        !matches!(self, Self::AgentInterrupted)
     }
 }
 
 impl SessionEvent {
     /// Whether this record is the session's activity, as the session list orders
-    /// by. Reopening a session is not, nor is closing it, which interrupts its agents.
+    /// by. Closing a session is not: it interrupts its agents.
     #[must_use]
     pub fn is_activity(&self) -> bool {
         self.kind().is_activity()
@@ -513,7 +542,6 @@ impl SessionEvent {
     pub(crate) fn kind(&self) -> EntryKind {
         match self {
             Self::SessionStarted { .. } => EntryKind::SessionStarted,
-            Self::SessionReopened => EntryKind::SessionReopened,
             Self::TitleSet { .. } => EntryKind::TitleSet,
             Self::TitleCleared => EntryKind::TitleCleared,
             Self::TargetsUpserted { .. } => EntryKind::TargetsUpserted,
@@ -530,15 +558,14 @@ impl SessionEvent {
             Self::ModelFailed { .. } => EntryKind::ModelFailed,
             Self::ModelAttemptInterrupted { .. } => EntryKind::ModelAttemptInterrupted,
             Self::ResponseCompleted { .. } => EntryKind::ResponseCompleted,
-            Self::ModelRecoveryScheduled { .. } => EntryKind::ModelRecoveryScheduled,
             Self::CompactionFailed { .. } => EntryKind::CompactionFailed,
             Self::Usage { .. } => EntryKind::Usage,
             Self::JobCreated { .. } => EntryKind::JobCreated,
-            Self::ApprovalGranted { .. } => EntryKind::ApprovalGranted,
-            Self::ApprovalRevoked { .. } => EntryKind::ApprovalRevoked,
             Self::JobStateChanged { .. } => EntryKind::JobStateChanged,
             Self::JobFinished { .. } => EntryKind::JobFinished,
             Self::JobClaimed { .. } => EntryKind::JobClaimed,
+            Self::JobReleased { .. } => EntryKind::JobReleased,
+            Self::JobMessageReleased { .. } => EntryKind::JobMessageReleased,
             Self::JobInjected { .. } => EntryKind::JobInjected,
             Self::JobMessageDelivered { .. } => EntryKind::JobMessageDelivered,
             Self::AgentCompleted => EntryKind::AgentCompleted,
@@ -558,11 +585,13 @@ pub struct EventRecord {
 }
 
 impl EventRecord {
-    pub(crate) fn append_identity(&self) -> super::AppendIdentity {
-        super::AppendIdentity {
-            event: self.id,
-            session: self.agent.session(),
-            sequence: self.sequence,
-        }
+    /// When a session whose journal is `records` last did something: its newest
+    /// activity record's time.
+    pub fn last_activity<'a>(
+        records: impl IntoIterator<Item = &'a Self, IntoIter: DoubleEndedIterator>,
+    ) -> Option<i64> {
+        let mut records = records.into_iter().rev();
+        let last = records.find(|record| record.event.is_activity());
+        last.map(|record| record.timestamp_millis)
     }
 }

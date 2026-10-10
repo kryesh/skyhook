@@ -373,7 +373,7 @@ impl crate::tool::invocation::LocalAuthorizer for HostAuthorizer {
     ) -> BoxFuture<'static, Result<(), AdmissionError>> {
         let context = self.0.clone();
         let (permissions, origin) = request.into_parts(&context.execution_location().target);
-        Box::pin(async move { Ok(context.authorize(permissions, origin).await?) })
+        Box::pin(async move { Ok(context.authorize(permissions, origin, &[]).await?) })
     }
 }
 

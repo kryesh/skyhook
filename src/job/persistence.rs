@@ -1,29 +1,80 @@
-use crate::session::{Dated, EventRecord, Message, SessionEvent, SessionStore};
+//! The jobs the journal records, as the core folds them, and what reopening settles.
+use super::*;
+use crate::session::EventRecord;
 
-use super::{Finished, JobChange, JobEntry, JobError, JobManager, JobSpec};
-use crate::tool::ToolError;
+/// Every job the journal records, with the live facts the core keeps beside them.
+#[derive(Default)]
+pub(crate) struct Jobs {
+    pub(super) entries: HashMap<JobId, JobFacts>,
+    /// The job each launched child agent answers through.
+    children: HashMap<AgentId, JobId>,
+    /// The highest id created so far.
+    last: u64,
+    pub(super) stamps: Stamps,
+    pub(super) progress: progress::Progress,
+    pub(super) calls: Calls,
+}
 
-pub(super) async fn restore(
-    store: SessionStore,
-    records: &[EventRecord],
-) -> Result<JobManager, JobError> {
-    let mut jobs = std::collections::HashMap::new();
-    let mut maximum = 0_u64;
-    let mut children = std::collections::HashMap::new();
-    // Calls already answered: a live job launched by one has no waiter left.
-    let mut answered = std::collections::HashSet::new();
-    let rejected = |record: &EventRecord| JobError::IllegalTransition {
-        sequence: record.sequence.get(),
-    };
-    for record in records {
-        if let SessionEvent::MessageCommitted {
-            message: Message::Tool(results),
-        } = &record.event
-        {
-            for result in results {
-                answered.insert((record.agent.clone(), result.call_id.clone()));
+/// Live only: model and script calls between their issue and their outcome, as
+/// a `wait` beside them needs to know them.
+#[derive(Default)]
+pub(super) struct Calls {
+    /// Per parent job, its issued calls whose jobs are not published yet.
+    issuing: HashMap<JobId, usize>,
+    /// Per agent, its latest response with a call that ended without a job: a
+    /// response's calls all end before the next one commits.
+    pub(super) jobless: HashMap<AgentId, MessageSeq>,
+}
+
+impl Calls {
+    pub(super) fn issue(&mut self, parent: JobId) {
+        *self.issuing.entry(parent).or_default() += 1;
+    }
+
+    pub(super) fn issued(&mut self, parent: JobId) {
+        if let Some(count) = self.issuing.get_mut(&parent) {
+            *count -= 1;
+            if *count == 0 {
+                self.issuing.remove(&parent);
             }
         }
+    }
+
+    pub(super) fn published(&self, parent: JobId) -> Option<()> {
+        (!self.issuing.contains_key(&parent)).then_some(())
+    }
+}
+
+impl Jobs {
+    /// The first record of `records` whose transition its job's phase, as the
+    /// records before it leave it, does not admit.
+    pub(crate) fn refused(&self, records: &[EventRecord]) -> Option<RecordSeq> {
+        let mut states = HashMap::new();
+        for record in records {
+            if let SessionEvent::JobCreated { job, .. } = &record.event {
+                states.insert(*job, JobState::Queued);
+            }
+            let Some((job, change)) = JobChange::of(&record.event) else {
+                continue;
+            };
+            let current = states.get(&job).copied();
+            let Some(state) = current.or_else(|| self.entries.get(&job).map(JobFacts::state))
+            else {
+                continue;
+            };
+            let step = change.step();
+            if !state.admits(step) {
+                return Some(record.sequence);
+            }
+            states.insert(job, JobState::after(step));
+        }
+        None
+    }
+
+    /// Fold one committed record: replay and live commits alike. Returns the job
+    /// whose lifecycle it moved.
+    pub(crate) fn apply(&mut self, record: &EventRecord) -> Option<JobId> {
+        self.progress.project(record);
         match &record.event {
             SessionEvent::JobCreated {
                 origin,
@@ -32,36 +83,47 @@ pub(super) async fn restore(
                 tool,
                 role,
                 name,
+                arguments,
                 accepts_input,
                 background,
                 location,
                 output_schema,
                 ..
             } => {
-                maximum = maximum.max(job.get());
-                let (entry, _receiver) = JobEntry::new(
-                    JobSpec {
-                        origin: origin.clone(),
-                        agent: record.agent.clone(),
-                        parent: *parent,
-                        tool: tool.clone(),
-                        role: *role,
-                        name: name.clone(),
-                        arguments: serde_json::Value::Null,
-                        output_schema: output_schema.clone(),
-                        accepts_input: *accepts_input,
-                        background: *background,
-                        location: location.clone(),
+                self.last = self.last.max(job.get());
+                let entry = JobFacts {
+                    origin: origin.clone(),
+                    output_schema: output_schema.clone(),
+                    agent: record.agent.clone(),
+                    parent: *parent,
+                    tool: tool.clone(),
+                    role: RoleState::new(*role),
+                    name: name.clone(),
+                    arguments: Arc::new(arguments.clone()),
+                    created_at_millis: record.timestamp_millis,
+                    created: record.sequence,
+                    phase: Phase::Queued,
+                    accepts_input: *accepts_input,
+                    delivery: DeliveryState::Pending {
+                        stamp: self.stamps.next(),
                     },
-                    record.timestamp_millis,
-                );
-                jobs.insert(*job, entry);
+                    background: *background,
+                    location: location.clone(),
+                    resume: None,
+                    finishing: false,
+                    reads: Vec::new(),
+                    invocation: Invocation::default(),
+                    timing: RunTiming::Unstarted,
+                    cancel: CancelState::Open,
+                };
+                self.entries.insert(*job, entry);
+                return Some(*job);
             }
             SessionEvent::AgentStarted {
                 owner_job: Some(job),
                 ..
             } => {
-                if let Some(entry) = jobs.get_mut(job) {
+                if let Some(entry) = self.entries.get_mut(job) {
                     let owner = entry.agent.clone();
                     if record.agent.parent().as_ref() == Some(&owner)
                         && let Some(launched) = entry.child_mut()
@@ -71,79 +133,120 @@ pub(super) async fn restore(
                             .is_none_or(|child| child == &record.agent)
                     {
                         launched.agent = Some(record.agent.clone());
-                        children.insert(record.agent.clone(), *job);
+                        self.children.insert(record.agent.clone(), *job);
                     }
-                }
-            }
-            SessionEvent::JobStateChanged { job, state } => {
-                if let Some(entry) = jobs.get_mut(job) {
-                    entry
-                        .apply(JobChange::Advance(*state))
-                        .map_err(|_| rejected(record))?;
                 }
             }
             SessionEvent::MessageCommitted { message } => {
-                if let Some(job) = children.get(&record.agent).copied()
-                    && let Some(reply) = super::messages::Reply::of(message)
+                if let Some(job) = self.children.get(&record.agent).copied()
+                    && let Some(reply) = messages::Reply::of(message)
                 {
-                    let publish = reply.publish(&jobs, job);
-                    if let Some(entry) = jobs.get_mut(&job) {
-                        entry.publish_message(job, record.sequence.message(), reply.text, publish);
+                    let publish = reply.publish(&self.entries, job);
+                    if let Some(entry) = self.entries.get_mut(&job) {
+                        let sequence = record.sequence.message();
+                        let stamps = &mut self.stamps;
+                        entry.publish_message(job, sequence, reply.text, publish, stamps);
                     }
                 }
             }
-            SessionEvent::JobFinished {
-                job,
-                state,
-                diagnostic,
-                output_diagnostic,
-                images,
-            } => {
-                if let Some(entry) = jobs.get_mut(job) {
-                    let finished = Box::new(Finished {
-                        end: *state,
-                        images: images.clone(),
-                        diagnostic: diagnostic.clone(),
-                        output_diagnostic: output_diagnostic.clone(),
-                    });
-                    entry
-                        .apply(JobChange::Finish(finished))
-                        .map_err(|_| rejected(record))?;
-                }
-            }
             SessionEvent::JobClaimed { job } | SessionEvent::JobInjected { job } => {
-                if let Some(entry) = jobs.get_mut(job) {
+                if let Some(entry) = self.entries.get_mut(job) {
                     entry.acknowledge();
                 }
             }
+            SessionEvent::JobReleased { job } => {
+                if let Some(entry) = self.entries.get_mut(job) {
+                    entry.background = true;
+                }
+            }
+            SessionEvent::JobMessageReleased { job } => {
+                if let Some(child) = self.entries.get_mut(job).and_then(JobFacts::child_mut) {
+                    child.release(&mut self.stamps);
+                }
+            }
             SessionEvent::JobMessageDelivered { job, source, .. } => {
-                if let Some(entry) = jobs.get_mut(job) {
+                if let Some(entry) = self.entries.get_mut(job) {
                     entry.deliver_message(*source);
                 }
             }
-            _ => {}
+            event => {
+                let (job, change) = JobChange::of(event)?;
+                let entry = self.entries.get_mut(&job)?;
+                entry.enter(change, &mut self.stamps);
+                entry.timing = entry.timing.after(entry.state(), record.timestamp_millis);
+                return Some(job);
+            }
         }
+        None
     }
-    // A retained child whose call was answered goes on in the background.
-    for entry in jobs.values_mut() {
-        if entry.cancellable()
-            && let Some(origin) = &entry.origin
-            && answered.contains(&(entry.agent.clone(), origin.call_id.clone()))
-        {
-            entry.background = true;
+
+    /// The job whose running invocation `child` answers through, while that
+    /// invocation has yet to begin and nothing is finishing it.
+    pub(crate) fn unbegun(&self, child: &AgentId) -> Option<JobId> {
+        let job = *self.children.get(child)?;
+        let entry = self.entries.get(&job)?;
+        let live = entry.end().is_none() && !entry.finishing;
+        (live && entry.child()?.start != Start::Begun).then_some(job)
+    }
+
+    /// Begin the invocation `child` answers through, as it takes the input that
+    /// begins it: whether an interrupt stopped that invocation first.
+    pub(crate) fn begin(&mut self, child: &AgentId) -> bool {
+        let job = self.unbegun(child);
+        let launched = job.and_then(|job| self.entries.get_mut(&job)?.child_mut());
+        launched.is_some_and(|child| {
+            std::mem::replace(&mut child.start, Start::Begun) == Start::Preempted
+        })
+    }
+
+    /// The id the next created job takes.
+    pub(super) fn next_id(&self) -> Result<JobId, JobError> {
+        JobId::new(self.last.saturating_add(1)).map_err(|_| JobError::InvalidId)
+    }
+
+    /// What reopening settles for the foreground jobs nothing holds any more,
+    /// once what was running has ended interrupted: a model call cut short is
+    /// read by the interrupted answer reopening gives it; every retained child,
+    /// suspended, and every other outcome nobody read, whoever called the job,
+    /// is released to report to its owner.
+    pub(crate) fn reopened(&self) -> Vec<(AgentId, SessionEvent)> {
+        let settled = |job: JobId, entry: &JobFacts| match entry.end() {
+            None if entry.resume.is_none() && entry.origin.is_some() => {
+                Some(SessionEvent::JobClaimed { job })
+            }
+            None => Some(SessionEvent::JobReleased { job }),
+            Some(_) if entry.unacknowledged() => Some(SessionEvent::JobReleased { job }),
+            Some(_) => None,
+        };
+        let mut jobs: Vec<_> = (self.entries.iter())
+            .filter(|(id, _)| !views::effectively_background(&self.entries, **id))
+            .collect();
+        jobs.sort_by_key(|(id, _)| **id);
+        let settled = jobs.into_iter().filter_map(|(id, entry)| {
+            settled(*id, entry).map(|event| (entry.agent.clone(), event))
+        });
+        settled.collect()
+    }
+}
+
+impl JobManager {
+    /// The records that end what a stopped process left running interrupted, and
+    /// the outputs they save.
+    pub(crate) async fn interrupt_running(
+        &self,
+    ) -> Result<(Vec<(AgentId, SessionEvent)>, Vec<Prepared>), JobError> {
+        let running = |(job, entry): (&JobId, &JobFacts)| {
+            (entry.end().is_none()).then(|| (Run(*job, entry.invocation), entry.agent.clone()))
+        };
+        let running: Vec<_> = self.facts(|jobs| jobs.entries.iter().filter_map(running).collect());
+        let (mut interrupted, mut outputs) = (Vec::new(), Vec::new());
+        for (run @ Run(job, _), agent) in running {
+            let (change, output) = self.finished(run, ToolError::interrupted().into()).await?;
+            interrupted.push((agent, change.event(job)));
+            outputs.extend(output);
         }
+        Ok((interrupted, outputs))
     }
-    let active = jobs
-        .iter()
-        .filter_map(|(job, entry)| entry.end().is_none().then_some(*job))
-        .collect::<Vec<_>>();
-    let manager = JobManager::with_jobs(store, jobs, maximum.saturating_add(1).max(1));
-    manager.inner.progress.lock().await.project(records);
-    for job in active {
-        let interrupted = ToolError::interrupted().into();
-        (manager.finish_dated(job, interrupted, Dated::LastActivity)).await?;
-    }
-    Ok(manager)
 }
 
 #[cfg(test)]
@@ -171,11 +274,10 @@ mod tests {
     /// Drain owners, drop the manager, and replay the durable journal.
     async fn reopen(jobs: JobManager, root: &std::path::Path) -> JobManager {
         let session = jobs.store().id();
-        jobs.drain_creations().await;
-        jobs.drain_supervisors().await;
+        jobs.supervisor().drain().await;
         drop(jobs);
-        let (store, records) = SessionStore::open(root, session).await.unwrap();
-        JobManager::restore(store, &records).await.unwrap()
+        let (store, _) = SessionStore::open(root, session).await.unwrap();
+        crate::job::tests::reopened(store).await
     }
 
     #[tokio::test]
@@ -236,9 +338,7 @@ mod tests {
         .await
         .unwrap();
         let opaque = jobs.test_create(JobSpec::test(agent, "read")).await;
-        jobs.finish(opaque, JobOutcome::Completed(ToolOutput::new(payload())))
-            .await
-            .unwrap();
+        jobs.test_finish(opaque, payload()).await;
 
         // Durable facts are authoritative; the saved result retains only its slot,
         // never a rendering selected by an earlier reader's capabilities.
@@ -303,49 +403,85 @@ mod tests {
     }
 
     /// A journal whose transitions are out of lifecycle order is corrupt, not
-    /// silently reinterpreted.
+    /// silently reinterpreted: one refused stops the session.
     #[tokio::test]
-    async fn restore_rejects_a_transition_the_phase_does_not_admit() {
-        let (root, jobs, agent) = runtime().await;
+    async fn the_journal_refuses_a_transition_the_phase_does_not_admit() {
+        let (_root, jobs, agent) = runtime().await;
         let lease = jobs
             .test_running(JobSpec::test(agent.clone(), "exec"))
             .await;
         let regressed = SessionEvent::JobStateChanged {
             job: lease.id(),
-            state: JobTransition::AwaitingApproval,
+            state: JobTransition::Running,
         };
-        jobs.test_append(agent, regressed).await;
-        let session = jobs.store().id();
-        abandon(lease);
-        drop(jobs);
-        let (store, records) = SessionStore::open(root.path(), session).await.unwrap();
-        let restored = JobManager::restore(store, &records).await;
-        assert!(matches!(restored, Err(JobError::IllegalTransition { .. })));
+        let before = jobs.store().records().len();
+        let refused = jobs.store().append(agent, regressed).await;
+        let sequence = RecordSeq::from(before as u64 + 1);
+        let Err(SessionError::JournalFailed(failure)) = refused else {
+            panic!("a refused transition stops the journal: {refused:?}");
+        };
+        assert!(matches!(failure.cause(),
+            SessionError::IllegalTransition { sequence: refused } if *refused == sequence));
+        assert_eq!(jobs.store().records().len(), before);
+        assert_eq!(jobs.metadata(lease.id()).unwrap().state, JobState::Running);
+    }
+
+    /// A job is timed from its first run to its end, through waits for input, and
+    /// anew from a later invocation; one that never ran stays unstarted.
+    #[test]
+    fn invocations_are_timed_from_their_first_run_to_their_end() {
+        use JobTransition::{AwaitingApproval, Running, WaitingInput};
+        use RunTiming::{Since, Took, Unstarted};
+        let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
+        let (mut jobs, mut at) = (Jobs::default(), 0);
+        let mut step = |jobs: &mut Jobs, job: u64, event: SessionEvent| {
+            at += 1;
+            let mut record = crate::session::tests::record(&agent, at, event);
+            record.timestamp_millis = at as i64;
+            let job = JobId::new(job).unwrap();
+            assert_eq!(jobs.apply(&record), Some(job));
+            let view = jobs.view(job).unwrap();
+            (view.invocation, view.timing)
+        };
+        let created =
+            |job| crate::session::tests::job_created(JobId::new(job).unwrap(), JobRole::Tool);
+        let changed = |state| SessionEvent::JobStateChanged {
+            job: JobId::new(1).unwrap(),
+            state,
+        };
+        let finished = |job, state| SessionEvent::JobFinished {
+            job: JobId::new(job).unwrap(),
+            state,
+            diagnostic: None,
+            output_diagnostic: None,
+            images: Vec::new(),
+        };
+        let (first, _) = step(&mut jobs, 1, created(1));
+        for (event, timing) in [
+            (changed(AwaitingApproval), Unstarted),
+            (changed(Running), Since(3)),
+            (changed(WaitingInput), Since(3)),
+            (changed(Running), Since(3)),
+            (finished(1, JobEnd::Completed), Took { since: 3, until: 6 }),
+        ] {
+            assert_eq!(step(&mut jobs, 1, event), (first, timing));
+        }
+        let (rerun, timing) = step(&mut jobs, 1, changed(Running));
+        assert!(rerun != first && timing == Since(7));
+        step(&mut jobs, 2, created(2));
+        let cancelled = step(&mut jobs, 2, finished(2, JobEnd::Cancelled));
+        assert_eq!(cancelled.1, Unstarted);
     }
 
     #[tokio::test]
     async fn replay_recovers_creation_committed_before_map_publication() {
         let (root, store, agent) = crate::session::tests::on_disk().await;
         let job = JobId::new(7).unwrap();
-        let created = SessionEvent::JobCreated {
-            origin: None,
-            job,
-            parent: None,
-            tool: "committed-without-map".into(),
-            role: JobRole::Tool,
-            name: None,
-            arguments: serde_json::json!({}),
-            output_schema: None,
-            accepts_input: false,
-            background: false,
-            location: ExecutionLocation::root(".".into()),
-        };
-        let accepted = store.accept_append(agent.clone(), created).await.unwrap();
-        accepted.committed().await.unwrap();
-        // Simulate the persisted prefix at a crash between commit and insertion:
-        // no JobManager has ever published this creation into its map.
+        let created = crate::session::tests::job_created(job, JobRole::Tool);
+        store.append(agent.clone(), created).await.unwrap();
+        // A creation no manager ever ran, as a crash leaves it.
         let jobs = reopen(JobManager::new(store), root.path()).await;
-        let interrupted = jobs.metadata(job).await.unwrap();
+        let interrupted = jobs.metadata(job).unwrap();
         assert_eq!(interrupted.state, JobState::Interrupted);
         assert!(
             interrupted
@@ -367,7 +503,7 @@ mod tests {
             .test_approving(JobSpec::test(agent, "exec"))
             .await
             .into_test_id();
-        let pending = jobs.snapshot(job).await.unwrap();
+        let pending = jobs.snapshot(job).unwrap();
         assert_eq!(
             pending.metadata_view(&capabilities).into_value()["state"],
             "queued"
@@ -389,7 +525,6 @@ mod tests {
         let restored = reopen(jobs, root.path()).await;
         let replayed = restored
             .snapshot(job)
-            .await
             .unwrap()
             .metadata_view(&capabilities)
             .into_value();
@@ -442,7 +577,7 @@ mod tests {
             assert_eq!(view.get("result"), None);
             let capture = serde_json::json!({"field":field,"complete":false});
             assert_eq!(view["presentation"]["captures"][0], capture);
-            let snapshot = restored.snapshot(id).await.unwrap();
+            let snapshot = restored.snapshot(id).unwrap();
             assert_eq!(
                 (snapshot.state, snapshot.location),
                 (JobState::Interrupted, location)
@@ -462,38 +597,30 @@ mod tests {
 
     const OUTCOME_IMAGE: &[u8] = b"historical image";
 
-    async fn stored_projection(jobs: &JobManager, id: JobId) -> serde_json::Value {
-        let entries = jobs.inner.jobs.lock().await;
-        let entry = entries.get(&id).unwrap();
-        let finished = entry.finished();
-        let diagnostic = finished.and_then(|finished| finished.diagnostic.as_ref());
-        serde_json::json!({
-            "state": entry.state(),
-            "images": finished.map_or(&[][..], |finished| finished.images.as_slice()),
-            "error": diagnostic.map(|diagnostic| diagnostic.render(&CapabilitySet::default())),
-            "denied": diagnostic.is_some_and(|diagnostic| diagnostic.is_denial()),
-            "pending": entry.unacknowledged(),
-            "resumable": entry.resume().is_some(),
+    fn stored_projection(jobs: &JobManager, id: JobId) -> serde_json::Value {
+        jobs.entry(id, |entry| {
+            let finished = entry.finished();
+            let diagnostic = finished.and_then(|finished| finished.diagnostic.as_ref());
+            serde_json::json!({
+                "state": entry.state(),
+                "images": finished.map_or(&[][..], |finished| finished.images.as_slice()),
+                "error": diagnostic.map(|diagnostic| diagnostic.render(&CapabilitySet::default())),
+                "denied": diagnostic.is_some_and(|diagnostic| diagnostic.is_denial()),
+                "pending": entry.unacknowledged(),
+                "resumable": entry.resume.is_some(),
+            })
         })
+        .unwrap()
     }
 
-    /// Case 7 is a volatile failure: persistence is unavailable, so the failure
-    /// is live only and not replayed.
     #[tokio::test]
     async fn outcome_application_live_replay_and_interrupted_cancellation_matrix() {
-        for case in 0..8 {
+        for case in 0..7 {
             let (root, jobs, agent) = runtime().await;
             jobs.store().store_blob(OUTCOME_IMAGE).await.unwrap();
-            let spec = JobSpec {
-                accepts_input: true,
-                role: JobRole::Agent,
-                ..JobSpec::test(agent, "outcome")
-            };
-            let id = jobs.test_running(spec).await.into_test_id();
-            let handler: super::super::ResumeHandler = std::sync::Arc::new(|_, _| {
-                Box::pin(async { Ok(ToolOutput::new(serde_json::Value::Null)) })
-            });
-            jobs.set_resume_handler(id, handler).await.unwrap();
+            let id = jobs
+                .test_resumable(agent, "outcome", serde_json::Value::Null)
+                .await;
             let question = crate::job::tests::question("partial");
             jobs.request_input(id, question).await.unwrap();
             let result = || {
@@ -508,29 +635,14 @@ mod tests {
                     .into(),
                 3 => ToolError::denied("denied").into(),
                 4 => ToolError::cancelled().with_result(result()).into(),
-                5 | 6 => ToolError::interrupted().into(),
-                _ => {
-                    let error = ToolError::failed("cannot persist");
-                    jobs.fail_volatile(id, JobError::Output(Box::new(error)))
-                        .await;
-                    let projection = stored_projection(&jobs, id).await;
-                    assert_eq!(projection["state"], "failed");
-                    assert!(
-                        projection["error"]
-                            .as_str()
-                            .unwrap()
-                            .contains("cannot persist")
-                    );
-                    continue;
-                }
+                _ => ToolError::interrupted().into(),
             };
             jobs.finish(id, outcome).await.unwrap();
             if case == 6 {
-                jobs.finish(id, ToolError::cancelled().into())
-                    .await
-                    .unwrap();
+                jobs.cancel(id).await.unwrap();
+                crate::tests::bounded(jobs.wait_settled(id)).await.unwrap();
             }
-            let projection = stored_projection(&jobs, id).await;
+            let projection = stored_projection(&jobs, id);
             assert_eq!(projection["resumable"], !matches!(case, 4 | 6));
             // The saved payload is never replaced by the in-memory question.
             if matches!(case, 0 | 2 | 4) {
@@ -539,11 +651,60 @@ mod tests {
             }
             let mut projection = projection;
             let replay = reopen(jobs, root.path()).await;
-            let mut replayed = stored_projection(&replay, id).await;
+            let mut replayed = stored_projection(&replay, id);
             // Resume handlers are live-only and never replayed.
             projection["resumable"] = false.into();
             replayed["resumable"] = false.into();
             assert_eq!(projection, replayed);
         }
+    }
+
+    /// A release lets go of a held child. A reply it made before is only recorded;
+    /// from the release on its replies are queued and its completion is delivered,
+    /// live and after reopening.
+    #[tokio::test]
+    async fn released_child_delivers_its_replies_and_completion_to_its_owner() {
+        use crate::job::tests::commit;
+        let (root, jobs, owner) = runtime().await;
+        let spec = JobSpec {
+            accepts_input: true,
+            role: JobRole::Agent,
+            ..JobSpec::test(owner.clone(), "agent")
+        };
+        let job = jobs.test_running(spec).await.into_test_id();
+        let child =
+            crate::session::tests::start_child(jobs.store(), &owner, 1, Some(job), root.path())
+                .await;
+        // A resumed child runs until its next input.
+        let handler: super::super::ResumeHandler = std::sync::Arc::new(|_, mut input| {
+            Box::pin(async move {
+                input.recv().await;
+                Ok(ToolOutput::new(serde_json::json!("done")))
+            })
+        });
+        jobs.set_resume_handler(job, handler).await.unwrap();
+        jobs.finish(job, ToolError::interrupted().into())
+            .await
+            .unwrap();
+        commit(&jobs, &child, job, "held").await;
+        assert!(!jobs.has_pending(&owner));
+        jobs.test_release(&owner).await;
+        jobs.send(job, serde_json::json!("resume")).await.unwrap();
+        let reply = commit(&jobs, &child, job, "released").await;
+        jobs.send(job, serde_json::json!("finish")).await.unwrap();
+        crate::tests::bounded(jobs.wait_settled(job)).await.unwrap();
+
+        let pending = async |jobs: &JobManager| {
+            let receipt = jobs.pending_delivery(&owner).await.unwrap();
+            let messages = receipt.messages().iter().map(|message| message.message);
+            let envelopes = (receipt.envelopes().iter())
+                .filter(|envelope| envelope.id == job)
+                .map(|envelope| envelope.state);
+            (messages.collect::<Vec<_>>(), envelopes.collect::<Vec<_>>())
+        };
+        let expected = (vec![reply], vec![JobState::Completed]);
+        assert_eq!(pending(&jobs).await, expected);
+        let reopened = reopen(jobs, root.path()).await;
+        assert_eq!(pending(&reopened).await, expected);
     }
 }

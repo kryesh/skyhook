@@ -189,7 +189,7 @@ impl Host {
                             match app.try_recv_observation() {
                                 Ok(event) => records |= app.observe(event),
                                 Err(TryRecvError::Lagged(_)) => {
-                                    app.resubscribe().await;
+                                    app.resubscribe();
                                     break;
                                 }
                                 Err(_) => break,
@@ -199,7 +199,7 @@ impl Host {
                             app.rebuild_projection();
                         }
                     }
-                    SlotEvent::Observation(Err(RecvError::Lagged(_))) => app.resubscribe().await,
+                    SlotEvent::Observation(Err(RecvError::Lagged(_))) => app.resubscribe(),
                     SlotEvent::Observation(Err(RecvError::Closed)) => app.close_observation(),
                     SlotEvent::Prompt(prompt) => app.prompt(prompt),
                     SlotEvent::Work(work) => app.work(work),
@@ -222,7 +222,7 @@ impl Host {
                 let _ = session.shutdown().await;
             }
             Ok(session) => {
-                let observation = PreparedObservation::subscribe(session).await;
+                let observation = PreparedObservation::subscribe(session);
                 let (tx, work) = mpsc::unbounded_channel();
                 let app = self.app().sibling(Some(observation), launch, tx);
                 let idle = self.key() == key && self.app().editor.revision() == revision;
@@ -413,8 +413,7 @@ mod tests {
     fn sessions(host: &Host) -> Vec<Option<SessionId>> {
         host.slots.iter().map(|s| s.app.session_id()).collect()
     }
-    /// Choose `id` from the session switcher, which shows it locked. Only the
-    /// active slot's work is handled, so a closing slot keeps its lock meanwhile.
+    /// Choose `id` from the session switcher, which must show it locked.
     async fn choose_locked(host: &mut Host, id: SessionId) {
         use crate::tui::app::{MenuKind, SavedState, SessionRef};
         use crossterm::event::{Event, KeyCode, KeyEvent, KeyModifiers};
@@ -495,6 +494,9 @@ mod tests {
         host.app().editor.set("unsent".into());
         open(&mut host, second).await;
         let closing = host.key();
+        // Held at its first step, the closing slot's shutdown keeps the lock.
+        let (status, release) = crate::tui::status::StatusLog::held();
+        host.app().status = status;
         host.app().host = Some(HostRequest::Open(first));
         host.settle();
         assert!(host.slots[1].app.stopping);
@@ -502,10 +504,11 @@ mod tests {
         host.app().host = Some(HostRequest::Activate(closing));
         host.settle();
         assert_eq!(host.app().session_id(), Some(first));
-        // Still holding its lock, it is listed as locked; choosing it waits.
+        // Still locked, it is listed as such; choosing it waits.
         choose_locked(&mut host, second).await;
         host.settle();
         assert_eq!(host.app().session_id(), Some(first));
+        release.send(()).unwrap();
 
         let reopened = |host: &Host| host.slots[host.active].app.session_id() == Some(second);
         assert!(drive(&mut host, reopened).await);

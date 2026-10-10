@@ -1,4 +1,4 @@
-//! Saved output documents and captures: loading, persisting and sizing them.
+//! Saved output documents and captures: loading, preparing and sizing them.
 use super::*;
 
 /// Strings longer than this are offloaded from a saved document into captures.
@@ -28,12 +28,42 @@ pub(super) fn database(error: crate::session::DbError) -> ToolError {
     ToolError::io(std::io::Error::other(error))
 }
 
-/// One job's output rows in the session database. Every operation locks the
+/// One run's output rows in the session database. Every operation locks the
 /// connection briefly, so call it off async worker threads for anything large.
 #[derive(Clone)]
 pub(crate) struct Output {
     pub(super) db: SharedDb,
     pub(super) job: JobId,
+    pub(super) invocation: crate::job::Invocation,
+}
+
+impl Output {
+    /// The rows of job `job`'s current run.
+    pub(crate) fn current(store: &crate::session::SessionStore, job: JobId) -> Self {
+        let entry = |state: &crate::session::CoreState| {
+            state.jobs.entries.get(&job).map(|entry| entry.invocation)
+        };
+        Self::of(store, job, store.read(entry).unwrap_or_default())
+    }
+
+    /// The rows of run `invocation` of job `job`.
+    pub(crate) fn of(
+        store: &crate::session::SessionStore,
+        job: JobId,
+        invocation: crate::job::Invocation,
+    ) -> Self {
+        let db = store.outputs();
+        Self {
+            db,
+            job,
+            invocation,
+        }
+    }
+
+    /// The rows' key: the job and its run.
+    pub(super) fn run(&self) -> crate::job::Run {
+        crate::job::Run(self.job, self.invocation)
+    }
 }
 
 /// One run's terminal product. `result` is `None` when the run produced none; a
@@ -68,10 +98,10 @@ pub(crate) struct Saved {
 
 impl Saved {
     pub(crate) fn load(output: &Output) -> Result<Self, ToolError> {
-        let job = output.job.get();
-        let saved = output.db.output(job).map_err(database)?;
-        let captures = output.db.captures(job).map_err(database)?;
-        let presented = output.db.presented_fields(job).map_err(database)?;
+        let run = output.run();
+        let saved = output.db.output(run).map_err(database)?;
+        let captures = output.db.captures(run).map_err(database)?;
+        let presented = output.db.presented_fields(run).map_err(database)?;
         let (product, fields) = match saved {
             Some(saved) => {
                 let result = saved.result.as_deref().map(serde_json::from_str);
@@ -165,72 +195,77 @@ pub(super) struct Stored<'a> {
     pub(super) referenced: &'a BTreeSet<FieldPointer>,
     /// Strings the schema declares as possibly JSON, classified here, once.
     pub(super) candidates: &'a BTreeSet<FieldPointer>,
-    /// Fields whose presentation the schema declares; the paths of complete
-    /// ones stay in the document.
-    pub(super) presented: &'a Presented,
+    /// Fields whose presentation is declared; the paths of complete ones stay in
+    /// the document.
+    pub(super) presented: Presented,
 }
 
-/// Persist a compact product, so loading it never parses a large value. Captures
+/// Prepare a compact product, so loading it never parses a large value. Captures
 /// hold the `referenced` fields, JSON or long candidate text, other strings over
 /// `OFFLOAD_BYTES`, and the outermost larger containers that enclose none of these,
 /// no complete field and no long string reached through object members alone.
-/// A pointer an unreferenced raw capture owns stays inline.
-pub(super) fn save_document(
+/// A pointer an unreferenced raw capture owns stays inline. Offloaded captures,
+/// like every other row, are saved with the finish.
+pub(super) fn prepare_document(
     output: &Output,
     registered: &BTreeMap<FieldPointer, CaptureRow>,
-    result: Option<Value>,
-    captures_complete: bool,
-    stored: &Stored<'_>,
-) -> Result<(), ToolError> {
+    (result, captures_complete): (Option<Value>, bool),
+    kinds: Vec<(i64, CaptureKind)>,
+    stored: Stored<'_>,
+) -> std::io::Result<OutputRows> {
     let has_result = result.is_some();
     let mut document = json!({"result": result});
     let mut offload = Offload {
         output,
         registered,
-        stored,
+        stored: &stored,
         fields: Vec::new(),
+        offloaded: Vec::new(),
     };
     offload.visit(&FieldPointer::root(), &mut document)?;
+    let Offload {
+        fields, offloaded, ..
+    } = offload;
     let result = has_result
         .then(|| serde_json::to_string(&document["result"]))
         .transpose()?;
-    let job = output.job.get();
-    (output.db)
-        .save_output(
-            job,
-            result.as_deref(),
-            captures_complete,
-            &offload.fields,
-            stored.presented,
-        )
-        .map_err(database)?;
-    // Measured once, so batching notifications need not preview it again.
-    measure_presentation(output);
-    Ok(())
+    Ok(OutputRows {
+        run: output.run(),
+        result,
+        captures_complete,
+        kinds,
+        fields,
+        offloaded,
+        presented: stored.presented,
+    })
 }
 
 struct Offload<'a> {
     output: &'a Output,
     registered: &'a BTreeMap<FieldPointer, CaptureRow>,
     stored: &'a Stored<'a>,
-    /// Captures the saved document references.
-    fields: Vec<i64>,
+    /// Registered captures the saved document references.
+    fields: Vec<(i64, Option<json::Detection>)>,
+    offloaded: Vec<OffloadedCapture>,
 }
 
 impl Offload<'_> {
-    fn visit(&mut self, field: &FieldPointer, value: &mut Value) -> Result<(), ToolError> {
+    fn visit(&mut self, field: &FieldPointer, value: &mut Value) -> std::io::Result<()> {
         if self.stored.referenced.contains(field)
             && let Some(capture) = self.registered.get(field)
         {
-            match value {
+            let detection = match value {
                 Value::String(_) if self.stored.candidates.contains(field) => {
                     let source = reader::CaptureReader::new(self.output.db.clone(), capture.id);
-                    self.classify(capture.id, json::detect(source)?, value)?;
+                    Some(classify(json::detect(source)?, value))
                 }
-                Value::String(_) | Value::Object(_) | Value::Array(_) => clear(value),
+                Value::String(_) | Value::Object(_) | Value::Array(_) => {
+                    clear(value);
+                    None
+                }
                 _ => return Ok(()),
-            }
-            self.fields.push(capture.id);
+            };
+            self.fields.push((capture.id, detection));
             return Ok(());
         }
         // Never overwrite or adopt an unreferenced raw capture merely because the
@@ -245,25 +280,25 @@ impl Offload<'_> {
                 if detection.placeholder().is_none() && text.len() <= OFFLOAD_BYTES {
                     return Ok(());
                 }
-                let text = std::mem::take(text);
-                let capture = self.store(field, CaptureKind::Text, text.as_bytes())?;
-                self.classify(capture, detection, value)
+                let text = std::mem::take(text).into_bytes();
+                let detection = classify(detection, value);
+                self.store(field, CaptureKind::Text, Some(detection), text);
             }
             Value::String(text) if text.len() > OFFLOAD_BYTES => {
-                let text = std::mem::take(text);
-                self.store(field, CaptureKind::Text, text.as_bytes())?;
-                Ok(())
+                let text = std::mem::take(text).into_bytes();
+                self.store(field, CaptureKind::Text, None, text);
             }
             Value::Object(_) | Value::Array(_) if self.offloadable(field, value) => {
-                self.store(field, CaptureKind::Json, &serde_json::to_vec(value)?)?;
+                let bytes = serde_json::to_vec(value)?;
+                self.store(field, CaptureKind::Json, None, bytes);
                 clear(value);
-                Ok(())
             }
-            _ => self.children(field, value),
+            _ => return self.children(field, value),
         }
+        Ok(())
     }
 
-    fn children(&mut self, field: &FieldPointer, value: &mut Value) -> Result<(), ToolError> {
+    fn children(&mut self, field: &FieldPointer, value: &mut Value) -> std::io::Result<()> {
         match value {
             Value::Object(map) => {
                 for (key, value) in map {
@@ -296,7 +331,7 @@ impl Offload<'_> {
             && serialized_bytes(value, OFFLOAD_BYTES).is_err()
             && !(self.registered.keys())
                 .chain(self.stored.candidates)
-                .chain(&self.stored.presented.complete)
+                .chain(self.stored.presented.complete())
                 .any(|inner| field.contains(inner))
             && !text_field(value)
     }
@@ -305,31 +340,24 @@ impl Offload<'_> {
         &mut self,
         field: &FieldPointer,
         kind: CaptureKind,
-        bytes: &[u8],
-    ) -> Result<i64, ToolError> {
-        let mut writer = PendingCapture::create(self.output, field, kind)?.open();
-        writer.write_all(bytes)?;
-        let capture = writer.finish()?.capture_id();
-        self.fields.push(capture);
-        Ok(capture)
+        detection: Option<json::Detection>,
+        data: Vec<u8>,
+    ) {
+        self.offloaded.push(OffloadedCapture {
+            pointer: field.clone(),
+            kind,
+            detection,
+            data,
+        });
     }
+}
 
-    /// Record what candidate text holds; a JSON field presents as its empty container.
-    fn classify(
-        &self,
-        capture: i64,
-        detection: json::Detection,
-        value: &mut Value,
-    ) -> Result<(), ToolError> {
-        self.output
-            .db
-            .set_detection(capture, detection)
-            .map_err(database)?;
-        *value = detection
-            .placeholder()
-            .unwrap_or_else(|| Value::String(String::new()));
-        Ok(())
-    }
+/// What candidate text holds; a JSON field presents as its empty container.
+fn classify(detection: json::Detection, value: &mut Value) -> json::Detection {
+    *value = detection
+        .placeholder()
+        .unwrap_or_else(|| Value::String(String::new()));
+    detection
 }
 
 /// A stored field's placeholder: the empty value of its type.
@@ -391,35 +419,20 @@ fn hydrate_field(saved: &Saved, value: &mut Value, field: &FieldPointer) -> Resu
     Ok(())
 }
 
-/// The bytes automatic presentation emits for this output: the previewed result,
-/// its shape and its truncation records. A rendered output diagnostic is not
-/// counted.
-fn presentation_size(output: &Output) -> Result<usize, ToolError> {
-    let saved = Saved::load(output)?;
-    let cancellation = crate::job::CancellationToken::new();
-    let projected = projection::project(&saved, &cancellation)?;
-    let truncated = (!projected.truncated.is_empty()).then_some(&projected.truncated);
-    Ok(preview::json_bytes(&projected.result)
-        + projected.shape.as_ref().map_or(0, preview::json_bytes)
-        + truncated.map_or(0, preview::json_bytes))
-}
-
-/// The size notification batching budgets for this output: measured when it was
-/// saved, or now when that did not finish.
+/// The bytes automatic presentation emits for this output, which notification
+/// batching budgets: the previewed result, its shape and its truncation records, or
+/// a page when it cannot be previewed. A rendered output diagnostic is not counted.
 pub(crate) fn presented_size(output: &Output) -> usize {
-    match output.db.presented_bytes(output.job.get()) {
-        Ok(Some(bytes)) => bytes,
-        _ => measure_presentation(output),
-    }
-}
-
-/// Measure and record the output's presentation size, a page when it cannot be
-/// previewed. The size only budgets notifications, so failing to record it fails
-/// nothing else.
-fn measure_presentation(output: &Output) -> usize {
-    let bytes = presentation_size(output).unwrap_or(PAGE_BYTES);
-    let _ = output.db.set_presented_bytes(output.job.get(), bytes);
-    bytes
+    let measure = || -> Result<usize, ToolError> {
+        let saved = Saved::load(output)?;
+        let cancellation = crate::job::CancellationToken::new();
+        let projected = projection::project(&saved, &cancellation)?;
+        let truncated = (!projected.truncated.is_empty()).then_some(&projected.truncated);
+        Ok(preview::json_bytes(&projected.result)
+            + projected.shape.as_ref().map_or(0, preview::json_bytes)
+            + truncated.map_or(0, preview::json_bytes))
+    };
+    measure().unwrap_or(PAGE_BYTES)
 }
 
 #[cfg(test)]
@@ -472,8 +485,10 @@ impl Output {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::job::{JobSpec, output::save_completed, tests::runtime};
+    use crate::job::{JobManager, JobSpec, tests::runtime};
+    use crate::tool::ToolOutput;
 
+    /// The result `output`'s saved document holds.
     fn value(output: &Output) -> Value {
         let saved = Saved::load(output).unwrap();
         hydrate(&saved, saved.product.as_ref().unwrap().document()).unwrap()["result"].take()
@@ -511,10 +526,9 @@ mod tests {
             // Short inline text that is not JSON stays inline, unclassified.
             ("42\n", false, None, json!("42\n")),
         ] {
-            let id = manager
-                .test_running(JobSpec::test(agent.clone(), "classified"))
-                .await
-                .into_test_id();
+            let mut spec = JobSpec::test(agent.clone(), "classified");
+            spec.output_schema = Some(schema.clone());
+            let id = manager.test_running(spec).await.into_test_id();
             let output = manager.output(id);
             // Candidate text is classified whether it streamed or returned inline;
             // other strings are never parsed.
@@ -529,7 +543,8 @@ mod tests {
             } else {
                 result["stdout"] = text.into();
             }
-            save_completed(&output, &schema, Some(result), true, receipts).unwrap();
+            let completed = ToolOutput::new(result).with_captures(receipts);
+            manager.test_complete(id, completed).await;
             let saved = Saved::load(&output).unwrap();
             let classified = saved
                 .captures
@@ -572,15 +587,17 @@ mod tests {
         schema: &Value,
         result: Value,
         captures_complete: bool,
-    ) -> (tempfile::TempDir, crate::job::JobManager, Saved) {
+    ) -> (tempfile::TempDir, JobManager, Saved) {
         let (root, manager, agent) = runtime().await;
-        let id = manager
-            .test_running(JobSpec::test(agent, "saved"))
-            .await
-            .into_test_id();
-        let output = manager.output(id);
-        save_completed(&output, schema, Some(result), captures_complete, Vec::new()).unwrap();
-        let saved = Saved::load(&output).unwrap();
+        let mut spec = JobSpec::test(agent, "saved");
+        spec.output_schema = Some(schema.clone());
+        let id = manager.test_running(spec).await.into_test_id();
+        let mut output = ToolOutput::new(result);
+        if !captures_complete {
+            output.streams = crate::tool::StreamEnd::Cut;
+        }
+        manager.test_complete(id, output).await;
+        let saved = Saved::load(&manager.output(id)).unwrap();
         (root, manager, saved)
     }
 
@@ -611,9 +628,8 @@ mod tests {
         assert_eq!(projected["details"]["instructions"], instructions);
     }
 
-    /// Notification sizing, measured when the result is saved, is exactly what
-    /// automatic presentation emits: the previewed result, its shape and its
-    /// records, escapes included.
+    /// Notification sizing is exactly what automatic presentation emits: the
+    /// previewed result, its shape and its records, escapes included.
     #[tokio::test]
     async fn presentation_size_is_what_automatic_presentation_emits() {
         let (_root, manager, agent) = runtime().await;
@@ -663,14 +679,9 @@ mod tests {
             // So does the container of the slot presentation renders a diagnostic into.
             "error": {"message": null, "paths": items},
         });
-        save_completed(
-            &output,
-            &json!(true),
-            Some(result.clone()),
-            true,
-            Vec::new(),
-        )
-        .unwrap();
+        manager
+            .test_complete(id, ToolOutput::new(result.clone()))
+            .await;
         let saved = Saved::load(&output).unwrap();
         let fields: Vec<_> = saved.fields.iter().map(FieldPointer::as_str).collect();
         assert_eq!(

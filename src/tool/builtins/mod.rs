@@ -38,8 +38,8 @@ pub(crate) fn register_coding_tools(
 ) -> Result<(), RegistryError> {
     builder.register_local(register_local_tools)?;
     jobs::register(builder, jobs)?;
-    skills::register(builder, skills, store.clone())?;
-    targets::register(builder, store, router)?;
+    skills::register(builder, skills, store)?;
+    targets::register(builder, router)?;
     Ok(())
 }
 

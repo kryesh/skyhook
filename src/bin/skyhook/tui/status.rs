@@ -31,15 +31,26 @@ impl StatusLog {
                         message,
                     } => {
                         if let Some(session) = session {
-                            if let Err(error) =
-                                session.record_status(agent.clone(), message.clone()).await
-                            {
-                                let _ = work.send(Work::StatusFailed {
-                                    session: session.id(),
-                                    agent,
-                                    message: format!(
+                            // A session that no longer runs journals nothing: its
+                            // notices are only shown, as is the one a failed
+                            // journal refuses, which the session shows already.
+                            let unsaved = if session.phase().runs() {
+                                match session.record_status(agent.clone(), message.clone()).await {
+                                    Ok(()) => None,
+                                    Err(error) if error.journal_failed() => Some(message),
+                                    Err(error) => Some(format!(
                                         "{message}\nCould not save this status: {error}"
-                                    ),
+                                    )),
+                                }
+                            } else {
+                                Some(message)
+                            };
+                            if let Some(message) = unsaved {
+                                let session = session.id();
+                                let _ = work.send(Work::Unsaved {
+                                    session,
+                                    agent,
+                                    message,
                                 });
                             }
                         } else {
@@ -78,6 +89,28 @@ impl StatusSender {
                 agent: self.agent.clone(),
                 message,
             });
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    impl StatusLog {
+        /// A log that answers nothing, flushes included, until `release` is sent.
+        pub(in crate::tui) fn held() -> (Self, oneshot::Sender<()>) {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let (release, released) = oneshot::channel();
+            tokio::spawn(async move {
+                let _ = released.await;
+                while let Some(request) = rx.recv().await {
+                    if let Request::Flush(done) = request {
+                        let _ = done.send(());
+                    }
+                }
+            });
+            (Self(tx), release)
         }
     }
 }

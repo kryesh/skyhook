@@ -18,64 +18,67 @@ pub(crate) struct LiveWork {
     pub(crate) holding: Option<JobId>,
 }
 
-/// What a `wait` needs to decide, resolved in one pass over the job map.
-pub(crate) struct WaitState {
-    pub(crate) holding: Option<JobId>,
-    /// Something is pending that this caller has not been shown yet.
-    pub(crate) unseen: bool,
-    pub(crate) caller: WaitCaller,
-    /// What to record as the caller's floor if it reports now.
-    pub(crate) stamp: u64,
+/// What a `wait` decides on, as its owner's jobs stand.
+pub(crate) enum Waiting {
+    /// Its caller was cancelled.
+    Cancelled,
+    /// Foreground work holds the agent, which cannot act until it returns.
+    Deferred,
+    Open {
+        /// Something is pending that the caller has not been shown yet.
+        unseen: bool,
+        /// The input revision a script caller was last shown; the model is shown
+        /// input at its request boundary instead.
+        seen_input: Option<u64>,
+        /// The newest pending stamp, which a script shown this decision has seen.
+        stamp: u64,
+    },
 }
 
-/// Who called `wait`: the model, whose request boundary consumes what it is
-/// shown, or a script, which is shown each event once.
-pub(crate) enum WaitCaller {
-    Model,
-    Script { floor: Option<WaitFloor> },
-}
-
-fn classify(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> LiveWork {
-    // A job parked in a `wait`, and the same agent's jobs hosting it, are waiting
-    // for events rather than doing work. Deferring to them would make concurrent
-    // waits each sleep until the other ended.
-    let mut parked = std::collections::HashSet::new();
-    for (id, _) in jobs.iter().filter(|(_, entry)| {
-        &entry.agent == owner
-            && matches!(entry.role, RoleState::Wait { parked: true })
-            && entry.live()
-    }) {
-        let mut next = Some(*id);
-        while let Some(job) = next.filter(|job| parked.insert(*job)) {
-            next = jobs
-                .get(&job)
-                .and_then(|entry| entry.parent)
-                .filter(|host| jobs.get(host).is_some_and(|host| &host.agent == owner));
+impl Jobs {
+    pub(crate) fn live_work(&self, owner: &AgentId) -> LiveWork {
+        let jobs = &self.entries;
+        // A job parked in a `wait`, and the same agent's jobs hosting it, are waiting
+        // for events rather than doing work. Deferring to them would make concurrent
+        // waits each sleep until the other ended.
+        let mut parked = std::collections::HashSet::new();
+        for (id, _) in jobs.iter().filter(|(_, entry)| {
+            &entry.agent == owner
+                && matches!(entry.role, RoleState::Wait { parked: true })
+                && entry.live()
+        }) {
+            let mut next = Some(*id);
+            while let Some(job) = next.filter(|job| parked.insert(*job)) {
+                next = jobs
+                    .get(&job)
+                    .and_then(|entry| entry.parent)
+                    .filter(|host| jobs.get(host).is_some_and(|host| &host.agent == owner));
+            }
         }
+        let mut work = LiveWork::default();
+        for (id, entry) in jobs
+            .iter()
+            .filter(|(_, entry)| &entry.agent == owner && entry.live())
+        {
+            if effectively_background(jobs, *id) {
+                continue;
+            }
+            match entry.child() {
+                Some(_) if !launched_by_blocking(jobs, entry) => work.children = true,
+                Some(_) => {}
+                None => work.blocking.push(*id),
+            }
+            if !parked.contains(id) && !entry.suspended() {
+                work.holding.get_or_insert(*id);
+            }
+        }
+        work
     }
-    let mut work = LiveWork::default();
-    for (id, entry) in jobs
-        .iter()
-        .filter(|(_, entry)| &entry.agent == owner && entry.live())
-    {
-        if effectively_background(jobs, *id) {
-            continue;
-        }
-        match entry.child() {
-            Some(_) if !launched_by_blocking(jobs, entry) => work.children = true,
-            Some(_) => {}
-            None => work.blocking.push(*id),
-        }
-        if !parked.contains(id) && !entry.suspended() {
-            work.holding.get_or_insert(*id);
-        }
-    }
-    work
 }
 
 /// Whether `entry` descends from blocking work: a live non-agent job of the same
 /// agent, foreground wherever `entry` is.
-fn launched_by_blocking(jobs: &HashMap<JobId, JobEntry>, entry: &JobEntry) -> bool {
+pub(super) fn launched_by_blocking(jobs: &HashMap<JobId, JobFacts>, entry: &JobFacts) -> bool {
     let mut next = entry.parent.and_then(|parent| jobs.get(&parent));
     while let Some(host) = next.filter(|host| host.agent == entry.agent) {
         if host.live() && host.child().is_none() {
@@ -86,10 +89,31 @@ fn launched_by_blocking(jobs: &HashMap<JobId, JobEntry>, entry: &JobEntry) -> bo
     false
 }
 
+/// The foreground child invocations `held` selects, with their owners.
+pub(super) fn held(
+    jobs: &HashMap<JobId, JobFacts>,
+    held: impl Fn(&JobFacts) -> bool,
+) -> Vec<(JobId, AgentId)> {
+    (jobs.iter())
+        .filter(|(id, entry)| {
+            entry.child().is_some() && held(entry) && !effectively_background(jobs, **id)
+        })
+        .map(|(id, entry)| (*id, entry.agent.clone()))
+        .collect()
+}
+
+/// What releasing `links` journals: they go on in the background, so waits on
+/// them return and their outcomes report through delivery.
+pub(crate) fn release_records(links: &[(JobId, AgentId)]) -> Vec<(AgentId, SessionEvent)> {
+    let released =
+        |(job, owner): &(JobId, AgentId)| (owner.clone(), SessionEvent::JobReleased { job: *job });
+    links.iter().map(released).collect()
+}
+
 /// Whether `id` or any ancestor launched by the same agent is background: a
 /// foreground call inside a background script does not hold the agent either.
 /// Stops at the agent boundary, whose launch mode belongs to the parent agent.
-pub(super) fn effectively_background(jobs: &HashMap<JobId, JobEntry>, id: JobId) -> bool {
+pub(super) fn effectively_background(jobs: &HashMap<JobId, JobFacts>, id: JobId) -> bool {
     let mut next = jobs.get(&id);
     while let Some(entry) = next {
         if entry.background {
@@ -103,55 +127,177 @@ pub(super) fn effectively_background(jobs: &HashMap<JobId, JobEntry>, id: JobId)
     false
 }
 
-fn pending(jobs: &HashMap<JobId, JobEntry>, owner: &AgentId) -> bool {
-    jobs.values()
-        .any(|entry| &entry.agent == owner && entry.has_pending())
-}
-
-/// The script hosting a `wait`: what persists across its successive waits.
+/// The script hosting a `wait`, with what it was last shown across its waits.
 fn script_host(
-    jobs: &mut HashMap<JobId, JobEntry>,
+    jobs: &HashMap<JobId, JobFacts>,
     caller: JobId,
-) -> Option<&mut Option<WaitFloor>> {
+) -> Option<(JobId, Option<WaitFloor>)> {
     let host = jobs.get(&caller)?.parent?;
-    match &mut jobs.get_mut(&host)?.role {
-        RoleState::Script { wait_floor } => Some(wait_floor),
+    match jobs.get(&host)?.role {
+        RoleState::Script { wait_floor } => Some((host, wait_floor)),
         _ => None,
     }
 }
 
-#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize, PartialEq)]
+impl Jobs {
+    /// What hosts are shown of `job`.
+    pub(crate) fn view(&self, job: JobId) -> Option<JobEnvelope> {
+        Some(self.entries.get(&job)?.metadata(job))
+    }
+
+    /// What a host inspecting job `job` is shown, its pending question included.
+    pub(crate) fn snapshot(&self, job: JobId) -> Option<JobEnvelope> {
+        Some(self.entries.get(&job)?.envelope(job))
+    }
+
+    /// Whether `job`, a `wait`, has parked: its deadline is set.
+    #[cfg(test)]
+    pub(crate) fn parked(&self, job: JobId) -> bool {
+        let parked = |entry: &JobFacts| matches!(entry.role, RoleState::Wait { parked: true });
+        self.entries.get(&job).is_some_and(parked)
+    }
+
+    /// What hosts are shown of every job.
+    pub(crate) fn views(&self) -> std::collections::BTreeMap<JobId, JobEnvelope> {
+        let jobs = self.entries.iter();
+        jobs.map(|(job, entry)| (*job, entry.metadata(*job)))
+            .collect()
+    }
+
+    /// The links new input breaks, with their owners: `root`'s suspended
+    /// foreground child invocations, and every live one of `holders`, whatever
+    /// its phase.
+    pub(crate) fn releases(&self, root: &AgentId, holders: &[AgentId]) -> Vec<(JobId, AgentId)> {
+        let released = |entry: &JobFacts| {
+            (holders.contains(&entry.agent) && entry.live())
+                || (&entry.agent == root && entry.suspended())
+        };
+        held(&self.entries, released)
+    }
+
+    /// Whether a child message or completion/question is ready, without reserving it.
+    pub(crate) fn has_pending(&self, owner: &AgentId) -> bool {
+        (self.entries.values()).any(|entry| &entry.agent == owner && entry.has_pending())
+    }
+
+    pub(crate) fn has_running(&self, owner: &AgentId) -> bool {
+        (self.entries.values()).any(|entry| &entry.agent == owner && entry.live())
+    }
+
+    /// Stop the invocations of `owner`'s child agents that have yet to take the
+    /// work that begins them, as an interrupt stops a running turn; returns how
+    /// many it stopped.
+    pub(crate) fn preempt(&mut self, owner: &AgentId) -> usize {
+        let unbegun = (self.entries.values_mut())
+            .filter(|entry| &entry.agent == owner && entry.end().is_none())
+            .filter_map(JobFacts::child_mut)
+            .filter(|child| child.start == Start::Pending);
+        unbegun.map(|child| child.start = Start::Preempted).count()
+    }
+
+    /// Let the invocations an interrupt stopped before they began begin; returns
+    /// how many.
+    pub(super) fn resume_preempted(&mut self) -> usize {
+        let preempted = (self.entries.values_mut())
+            .filter(|entry| entry.end().is_none())
+            .filter_map(JobFacts::child_mut)
+            .filter(|child| child.start == Start::Preempted);
+        preempted.map(|child| child.start = Start::Pending).count()
+    }
+
+    /// Mark `caller`, a `wait`, parked: concurrent waits do not defer to it.
+    pub(crate) fn park(&mut self, caller: JobId) {
+        if let Some(RoleState::Wait { parked }) =
+            (self.entries.get_mut(&caller)).map(|entry| &mut entry.role)
+        {
+            *parked = true;
+        }
+    }
+
+    /// How `owner`'s jobs decide a `wait` by `caller`: foreground work defers it;
+    /// a script is shown each event once; and the model is also woken by another
+    /// call of its own response that ended, with or without a job, whose outcome
+    /// then returns with this batch.
+    pub(crate) fn waiting(&self, owner: &AgentId, caller: JobId) -> Waiting {
+        let jobs = &self.entries;
+        let Some(entry) = jobs.get(&caller).filter(|entry| !entry.cancel_requested()) else {
+            return Waiting::Cancelled;
+        };
+        if self.live_work(owner).holding.is_some() {
+            return Waiting::Deferred;
+        }
+        let response = entry.origin.as_ref().map(|origin| origin.message);
+        let floor = script_host(jobs, caller).map(|(_, floor)| floor);
+        let answered = floor.is_none()
+            && response.is_some_and(|response| {
+                self.calls.jobless.get(owner) == Some(&response)
+                    || jobs.iter().any(|(&job, other)| {
+                        job != caller
+                            && !other.live()
+                            && other
+                                .origin
+                                .as_ref()
+                                .is_some_and(|origin| origin.message == response)
+                    })
+            });
+        let since = floor.flatten().map_or(0, |floor| floor.stamp);
+        let pending =
+            (jobs.values()).any(|entry| &entry.agent == owner && entry.pending_since(since));
+        Waiting::Open {
+            unseen: answered || pending,
+            seen_input: floor.flatten().map(|floor| floor.input),
+            stamp: self.stamps.current(),
+        }
+    }
+
+    /// Record what a script's `wait` by `caller` was shown, so it is not told twice.
+    pub(crate) fn shown(&mut self, caller: JobId, shown: WaitFloor) {
+        let host = script_host(&self.entries, caller).map(|(host, _)| host);
+        if let Some(RoleState::Script { wait_floor }) =
+            (host.and_then(|host| self.entries.get_mut(&host))).map(|host| &mut host.role)
+        {
+            *wait_floor = Some(shown);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq)]
 pub struct JobEnvelope {
     pub id: JobId,
+    /// The agent whose job it is.
+    #[serde(skip)]
+    pub agent: AgentId,
+    /// What it was called with.
+    #[serde(skip)]
+    pub arguments: std::sync::Arc<Value>,
+    #[serde(skip)]
+    pub invocation: Invocation,
+    #[serde(skip)]
+    pub timing: RunTiming,
     pub parent: Option<JobId>,
     pub tool: String,
-    #[serde(default)]
     pub role: JobRole,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[schemars(with = "Option<String>")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<JobName>,
     pub state: JobState,
-    pub output: Option<Value>,
+    /// The images its finished run returned.
+    #[serde(skip)]
+    pub(crate) images: Vec<ImageRef>,
     /// The model call that launched the job; its parent is then the calling
     /// agent's own.
     #[serde(skip)]
-    #[schemars(skip)]
     pub(crate) origin: Option<crate::session::ModelCallOrigin>,
     /// The question a waiting job asks, until its owner has seen it.
     #[serde(skip)]
-    #[schemars(skip)]
     pub(crate) question: Option<QuestionOutput>,
     /// Failure facts; every viewer renders them under its own capabilities.
     #[serde(skip)]
-    #[schemars(skip)]
     pub(crate) diagnostic: Option<Diagnostic>,
     #[serde(skip)]
-    #[schemars(skip)]
     pub(crate) output_diagnostic: Option<Diagnostic>,
     pub location: ExecutionLocation,
     /// Input would resume it after it ends.
     #[serde(skip)]
-    #[schemars(skip)]
     pub(crate) resumable: bool,
 }
 
@@ -381,11 +527,25 @@ impl JobView {
 }
 
 impl JobEnvelope {
-    /// Render the output diagnostic into its slot for `viewer`.
-    pub(crate) fn render_output_diagnostic<'a>(&mut self, viewer: impl Into<DiagnosticViewer<'a>>) {
-        if let (Some(output), Some(diagnostic)) = (&mut self.output, &self.output_diagnostic) {
-            render_output_diagnostic(output, diagnostic, viewer.into());
+    /// Why it failed, for each viewer to render under its own capabilities.
+    #[must_use]
+    pub fn diagnostic(&self) -> Option<&Diagnostic> {
+        self.diagnostic.as_ref()
+    }
+
+    /// Its saved `result`, with the output diagnostic rendered into its slot for
+    /// `viewer`.
+    pub(crate) fn presented<'a>(
+        &self,
+        mut result: Option<Value>,
+        viewer: impl Into<DiagnosticViewer<'a>>,
+    ) -> Option<Value> {
+        if let (Some(result), Some(diagnostic)) = (&mut result, &self.output_diagnostic)
+            && let Some(message) = output::diagnostic_slot_in(result)
+        {
+            *message = Value::String(diagnostic.render_for(viewer.into()));
         }
+        result
     }
 
     pub(crate) fn rendered_error<'a>(
@@ -398,32 +558,25 @@ impl JobEnvelope {
             .map(|diagnostic| diagnostic.render_for(viewer))
     }
 
-    /// The viewer's own foreground call: launch metadata only on failure.
-    pub(crate) fn response_view<'a>(&self, viewer: impl Into<DiagnosticViewer<'a>>) -> JobView {
-        let viewer = viewer.into();
-        let result = self.presented_result(viewer);
-        self.view(viewer, ViewKind::Response, result, Presentation::default())
-    }
-
-    /// Background handles, listings and inspection always retain launch metadata.
-    pub(crate) fn metadata_view<'a>(&self, viewer: impl Into<DiagnosticViewer<'a>>) -> JobView {
-        let viewer = viewer.into();
-        let result = self.presented_result(viewer);
+    /// The viewer's own foreground call, with its [`presented`](Self::presented)
+    /// `result`: launch metadata only on failure.
+    pub(crate) fn response_view<'a>(
+        &self,
+        viewer: impl Into<DiagnosticViewer<'a>>,
+        result: Option<Value>,
+    ) -> JobView {
         self.view(
-            viewer,
-            ViewKind::Inspection,
+            viewer.into(),
+            ViewKind::Response,
             result,
             Presentation::default(),
         )
     }
 
-    fn presented_result(&self, viewer: DiagnosticViewer<'_>) -> Option<Value> {
-        self.output.clone().map(|mut result| {
-            if let Some(diagnostic) = &self.output_diagnostic {
-                render_output_diagnostic(&mut result, diagnostic, viewer);
-            }
-            result
-        })
+    /// Background handles, listings and inspection always retain launch metadata.
+    pub(crate) fn metadata_view<'a>(&self, viewer: impl Into<DiagnosticViewer<'a>>) -> JobView {
+        let viewer = viewer.into();
+        self.view(viewer, ViewKind::Inspection, None, Presentation::default())
     }
 
     pub(super) fn view(
@@ -473,16 +626,6 @@ impl JobEnvelope {
     }
 }
 
-fn render_output_diagnostic(
-    result: &mut Value,
-    diagnostic: &Diagnostic,
-    viewer: DiagnosticViewer<'_>,
-) {
-    if let Some(message) = output::diagnostic_slot_in(result) {
-        *message = Value::String(diagnostic.render_for(viewer));
-    }
-}
-
 /// The schemas of one job view and of a list of them, as results declare them.
 /// A job view is itself a presentation; presenting it again never shortens it.
 pub(crate) struct JobViewSchemas {
@@ -503,231 +646,119 @@ pub(crate) static JOB_VIEW_SCHEMAS: std::sync::LazyLock<JobViewSchemas> =
     });
 
 impl JobManager {
+    /// The record that created job `id`: journal sequences start at one, without gaps.
+    pub(crate) fn creation(&self, id: JobId) -> Option<crate::session::EventRecord> {
+        self.inner.store.read(|state| {
+            let created = state.jobs.entries.get(&id)?.created.get();
+            state
+                .records
+                .get(usize::try_from(created).ok()? - 1)
+                .cloned()
+        })
+    }
+
     /// Inspect launch provenance without claiming output or changing delivery state.
-    pub(crate) async fn active_launches(
+    pub(crate) fn active_launches(
         &self,
         agent: &AgentId,
     ) -> Vec<(JobId, Option<crate::session::ModelCallOrigin>)> {
-        let jobs = self.inner.jobs.lock().await;
-        let mut launches = Vec::new();
-        for (id, entry) in jobs
-            .iter()
-            .filter(|(_, entry)| &entry.agent == agent && entry.end().is_none())
-        {
-            let mut current = entry;
-            let origin = loop {
-                if &current.agent != agent {
-                    break None;
-                }
-                if let Some(origin) = &current.origin {
-                    break Some(origin.clone());
-                }
-                let Some(parent) = current.parent.and_then(|id| jobs.get(&id)) else {
-                    break None;
+        let mut launches = self.facts(|jobs| {
+            let jobs = &jobs.entries;
+            let mut launches = Vec::new();
+            for (id, entry) in jobs
+                .iter()
+                .filter(|(_, entry)| &entry.agent == agent && entry.end().is_none())
+            {
+                let mut current = entry;
+                let origin = loop {
+                    if &current.agent != agent {
+                        break None;
+                    }
+                    if let Some(origin) = &current.origin {
+                        break Some(origin.clone());
+                    }
+                    let Some(parent) = current.parent.and_then(|id| jobs.get(&id)) else {
+                        break None;
+                    };
+                    current = parent;
                 };
-                current = parent;
-            };
-            launches.push((*id, origin));
-        }
+                launches.push((*id, origin));
+            }
+            launches
+        });
         launches.sort_by_key(|(id, _)| *id);
         launches
     }
 
     /// The committed response whose call launched job `id` directly.
-    pub(crate) async fn call_origin(&self, id: JobId) -> Option<crate::session::MessageSeq> {
-        let jobs = self.inner.jobs.lock().await;
-        Some(jobs.get(&id)?.origin.as_ref()?.message)
+    pub(crate) fn call_origin(&self, id: JobId) -> Option<crate::session::MessageSeq> {
+        let origin = self.entry(id, |entry| Some(entry.origin.as_ref()?.message));
+        origin.ok().flatten()
     }
 
-    /// Read from job `id`'s entry under the jobs lock.
-    pub(super) async fn entry<T>(
-        &self,
-        id: JobId,
-        read: impl FnOnce(&JobEntry) -> T,
-    ) -> Result<T, JobError> {
-        let jobs = self.inner.jobs.lock().await;
-        jobs.get(&id).map(read).ok_or(JobError::Unknown(id))
+    pub(crate) fn metadata(&self, id: JobId) -> Result<JobEnvelope, JobError> {
+        self.entry(id, |entry| entry.metadata(id))
     }
 
-    pub(crate) async fn metadata(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        self.entry(id, |entry| entry.metadata(id)).await
+    pub fn snapshot(&self, id: JobId) -> Result<JobEnvelope, JobError> {
+        self.facts(|jobs| jobs.snapshot(id))
+            .ok_or(JobError::Unknown(id))
     }
 
-    pub async fn snapshot(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        let mut envelope = self.entry(id, |entry| entry.envelope(id)).await?;
-        self.hydrate_envelope(&mut envelope).await?;
-        envelope.render_output_diagnostic(&CapabilitySet::default());
-        Ok(envelope)
+    pub(crate) fn cancellation_token(&self, id: JobId) -> Result<CancellationToken, JobError> {
+        self.entry(id, |_| ())?;
+        Ok(self.handles(id, |handles| handles.cancellation.clone()))
     }
 
-    pub(crate) async fn cancellation_token(
-        &self,
-        id: JobId,
-    ) -> Result<CancellationToken, JobError> {
-        self.entry(id, |entry| entry.cancellation.clone()).await
-    }
-
-    pub async fn list(&self, owner: &AgentId) -> Vec<JobEnvelope> {
-        let jobs = self.inner.jobs.lock().await;
-        let mut output = jobs
-            .iter()
-            .filter(|(_, entry)| &entry.agent == owner)
-            .map(|(id, entry)| entry.metadata(*id))
-            .collect::<Vec<_>>();
+    #[must_use]
+    pub fn list(&self, owner: &AgentId) -> Vec<JobEnvelope> {
+        let mut output = self.facts(|jobs| {
+            (jobs.entries.iter())
+                .filter(|(_, entry)| &entry.agent == owner)
+                .map(|(id, entry)| entry.metadata(*id))
+                .collect::<Vec<_>>()
+        });
         output.sort_by_key(|job| job.id);
         output
     }
 
-    /// Current request-time state; progress consumes each committed journal event once.
-    pub(crate) async fn active_states(
+    /// Current request-time state.
+    pub(crate) fn active_states(
         &self,
         owner: &AgentId,
         capabilities: &CapabilitySet,
         now_millis: i64,
     ) -> Vec<StateJob> {
-        let mut progress = self.inner.progress.lock().await;
-        self.inner
-            .store
-            .visit_records_after(progress.sequence, |records| progress.project(records))
-            .await;
-        let jobs = self.inner.jobs.lock().await;
-        let mut states = jobs
-            .iter()
-            .filter(|(_, entry)| &entry.agent == owner && entry.end().is_none())
-            .map(|(id, _)| {
-                progress::active_job(
-                    *id,
-                    &jobs,
-                    &progress,
-                    capabilities,
-                    now_millis,
-                    &mut std::collections::HashSet::new(),
-                )
-            })
-            .collect::<Vec<_>>();
+        let mut states = self.facts(|jobs| {
+            (jobs.entries.iter())
+                .filter(|(_, entry)| &entry.agent == owner && entry.end().is_none())
+                .map(|(id, _)| {
+                    progress::active_job(
+                        *id,
+                        &jobs.entries,
+                        &jobs.progress,
+                        capabilities,
+                        now_millis,
+                        &mut std::collections::HashSet::new(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
         states.sort_by_key(|job| job.job);
         states
     }
 
-    /// Whether a child message or completion/question is ready, without reserving it.
-    pub(crate) async fn has_pending(&self, owner: &AgentId) -> bool {
-        pending(&*self.inner.jobs.lock().await, owner)
-    }
-
-    pub async fn has_running(&self, owner: &AgentId) -> bool {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .values()
-            .any(|entry| &entry.agent == owner && entry.live())
-    }
-
-    pub(crate) async fn live_work(&self, owner: &AgentId) -> LiveWork {
-        classify(&*self.inner.jobs.lock().await, owner)
-    }
-
-    /// Release `owner`'s suspended foreground jobs: they go on in the background,
-    /// so waits on them return and their restarts report through delivery.
-    pub(crate) async fn release_held(&self, owner: &AgentId) -> Vec<JobId> {
-        let mut jobs = self.inner.jobs.lock().await;
-        let held: Vec<_> = jobs
-            .iter()
-            .filter(|(id, entry)| {
-                &entry.agent == owner && entry.suspended() && !effectively_background(&jobs, **id)
-            })
-            .map(|(id, _)| *id)
-            .collect();
-        for id in &held {
-            let entry = jobs.get_mut(id).expect("selected above");
-            entry.background = true;
-            entry.notify.notify_waiters();
-        }
-        held
-    }
-
-    /// Whether `owner` has a suspended foreground job to release.
-    pub(crate) async fn has_suspended(&self, owner: &AgentId) -> bool {
-        let jobs = self.inner.jobs.lock().await;
-        jobs.iter().any(|(id, entry)| {
-            &entry.agent == owner && entry.suspended() && !effectively_background(&jobs, *id)
+    pub(crate) fn is_effectively_background(&self, id: JobId) -> Result<bool, JobError> {
+        self.facts(|jobs| {
+            if !jobs.entries.contains_key(&id) {
+                return Err(JobError::Unknown(id));
+            }
+            Ok(effectively_background(&jobs.entries, id))
         })
     }
 
-    /// Whether the job ended, other than by a retained interruption.
-    pub(crate) async fn settled(&self, id: JobId) -> bool {
-        self.entry(id, JobEntry::settled).await.unwrap_or(true)
-    }
-
-    /// Mark `caller` parked and resolve its decision under one lock, so concurrent
-    /// waits classify each other consistently.
-    pub(crate) async fn wait_state(&self, owner: &AgentId, caller: JobId) -> WaitState {
-        let mut jobs = self.inner.jobs.lock().await;
-        if let Some(RoleState::Wait { parked }) = jobs.get_mut(&caller).map(|entry| &mut entry.role)
-            && !std::mem::replace(parked, true)
-        {
-            self.parked_signal(owner).notify_waiters();
-        }
-        let caller = match script_host(&mut jobs, caller) {
-            Some(floor) => WaitCaller::Script { floor: *floor },
-            None => WaitCaller::Model,
-        };
-        let since = match caller {
-            WaitCaller::Script { floor } => floor.map_or(0, |floor| floor.stamp),
-            WaitCaller::Model => 0,
-        };
-        WaitState {
-            holding: classify(&jobs, owner).holding,
-            unseen: jobs
-                .values()
-                .any(|entry| &entry.agent == owner && entry.pending_since(since)),
-            caller,
-            stamp: current_pending_stamp(),
-        }
-    }
-
-    /// Resolves once one of `owner`'s jobs next parks in a `wait`. Take it before
-    /// `wait_state` so a park in between is not missed.
-    pub(crate) fn parked(&self, owner: &AgentId) -> tokio::sync::futures::OwnedNotified {
-        self.parked_signal(owner).notified_owned()
-    }
-
-    fn parked_signal(&self, owner: &AgentId) -> Arc<Notify> {
-        self.inner
-            .parked
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .entry(owner.clone())
-            .or_default()
-            .clone()
-    }
-
-    pub(crate) async fn set_wait_floor(&self, caller: JobId, floor: WaitFloor) {
-        let mut jobs = self.inner.jobs.lock().await;
-        if let Some(host) = script_host(&mut jobs, caller) {
-            *host = Some(floor);
-        }
-    }
-
-    pub(crate) async fn is_effectively_background(&self, id: JobId) -> Result<bool, JobError> {
-        let jobs = self.inner.jobs.lock().await;
-        if !jobs.contains_key(&id) {
-            return Err(JobError::Unknown(id));
-        }
-        Ok(effectively_background(&jobs, id))
-    }
-
-    pub async fn is_background(&self, id: JobId) -> Result<bool, JobError> {
-        self.entry(id, |entry| entry.background).await
-    }
-
-    pub async fn images(&self, id: JobId) -> Result<Vec<ImageRef>, JobError> {
-        self.entry(id, |entry| {
-            entry
-                .finished()
-                .map_or_else(Vec::new, |finished| finished.images.clone())
-        })
-        .await
+    pub fn is_background(&self, id: JobId) -> Result<bool, JobError> {
+        self.entry(id, |entry| entry.background)
     }
 }
 
@@ -735,15 +766,19 @@ impl JobManager {
 mod tests {
     use super::*;
 
-    fn envelope(output: Option<Value>) -> JobEnvelope {
+    fn envelope() -> JobEnvelope {
         JobEnvelope {
             id: JobId::new(1).unwrap(),
+            agent: AgentId::root(crate::identity::SessionId::from_bytes([1; 16])),
+            arguments: Default::default(),
+            invocation: Invocation::default(),
+            timing: RunTiming::Unstarted,
             parent: None,
             tool: "fixture".into(),
             role: JobRole::Tool,
             name: None,
             state: JobState::Completed,
-            output,
+            images: Vec::new(),
             origin: None,
             question: None,
             diagnostic: None,
@@ -755,10 +790,10 @@ mod tests {
 
     #[test]
     fn plain_process_response_keeps_model_text_under_two_hundred_bytes() {
-        let job = envelope(Some(serde_json::json!({
+        let result = serde_json::json!({
             "exit_code":0, "stdout":"", "stderr":"", "timed_out":false
-        })));
-        let view = job.response_view(&CapabilitySet::default()).into_value();
+        });
+        let view = (envelope().response_view(&CapabilitySet::default(), Some(result))).into_value();
         let wire =
             serde_json::to_vec(&serde_json::json!({"result":view,"is_error":false})).unwrap();
         assert!(
@@ -772,7 +807,7 @@ mod tests {
     #[test]
     fn display_metadata_with_non_utf8_workspace_is_json_serializable() {
         use std::os::unix::ffi::OsStringExt as _;
-        let mut job = envelope(None);
+        let mut job = envelope();
         job.location.workspace = std::ffi::OsString::from_vec(b"/work/\xff".to_vec()).into();
         let view = job.metadata_view(&CapabilitySet::default()).into_value();
         assert_eq!(view["meta"]["workspace"], "/work/\u{fffd}");
@@ -784,16 +819,18 @@ mod tests {
         let validator = jsonschema::validator_for(&JOB_VIEW_SCHEMAS.one).unwrap();
         let payload =
             serde_json::json!({"nested": null, "array": [null], "presentation": {"preview": null}});
-        let job = envelope(Some(payload.clone()));
-        let view = job.response_view(&capabilities).into_value();
+        let job = envelope();
+        let view = job
+            .response_view(&capabilities, Some(payload.clone()))
+            .into_value();
         assert_eq!(view, serde_json::json!({"result":payload}));
         let full = job.metadata_view(&capabilities).into_value();
         assert_eq!(
             full["meta"],
             serde_json::json!({"tool":"fixture", "workspace":"/work"})
         );
-        let null = envelope(Some(Value::Null)).response_view(&capabilities);
-        let missing = envelope(None).metadata_view(&capabilities);
+        let null = envelope().response_view(&capabilities, Some(Value::Null));
+        let missing = envelope().metadata_view(&capabilities);
         let noticed = JobView {
             presentation: Some(Presentation {
                 notice: Some(Notice::OutputIncomplete),
@@ -821,7 +858,7 @@ mod tests {
         let capabilities = CapabilitySet::default();
         let own = ExecutionLocation::root(std::path::PathBuf::from("/work"));
         let viewer = DiagnosticViewer::new(&capabilities, &own);
-        let mut job = envelope(Some(Value::Null));
+        let mut job = envelope();
         job.parent = JobId::new(9).ok();
         job.name = Some("reader".parse().unwrap());
         job.origin = Some(crate::session::ModelCallOrigin {
@@ -846,7 +883,7 @@ mod tests {
         job.state = JobState::Failed;
         job.diagnostic = Some(crate::tool::ToolError::denied("no").diagnostic());
         assert_eq!(
-            job.response_view(viewer).meta,
+            job.response_view(viewer, Some(Value::Null)).meta,
             Some(JobMetadata {
                 workspace: Some("/elsewhere".into()),
                 code: Some(crate::tool::DenialCode::PermissionDenied),
@@ -859,18 +896,11 @@ mod tests {
     #[tokio::test]
     async fn a_resumable_completed_response_keeps_its_handle() {
         let (_root, jobs, agent) = super::super::tests::runtime().await;
-        let spec = JobSpec {
-            accepts_input: true,
-            role: JobRole::Agent,
-            ..JobSpec::test(agent, "agent")
-        };
-        let id = jobs.test_running(spec).await.into_test_id();
-        let handler: ResumeHandler = Arc::new(|_, _| Box::pin(async { Ok(ToolOutput::default()) }));
-        jobs.set_resume_handler(id, handler).await.unwrap();
+        let id = jobs.test_resumable(agent, "agent", Value::Null).await;
         jobs.test_finish(id, Value::Null).await;
         let view = async || {
-            let envelope = jobs.snapshot(id).await.unwrap();
-            envelope.response_view(&CapabilitySet::default())
+            let envelope = jobs.snapshot(id).unwrap();
+            envelope.response_view(&CapabilitySet::default(), None)
         };
         let resumable = view().await;
         assert_eq!(
@@ -973,10 +1003,10 @@ mod tests {
 
     #[test]
     fn failures_include_metadata_with_or_without_admission() {
-        let mut job = envelope(Some(Value::Null));
+        let mut job = envelope();
         job.state = JobState::Failed;
         job.diagnostic = Some(crate::tool::ToolError::denied("failed").diagnostic());
-        let view = job.response_view(&CapabilitySet::default()).into_value();
+        let view = (job.response_view(&CapabilitySet::default(), Some(Value::Null))).into_value();
         assert_eq!(view["meta"]["code"], "permission_denied");
         let failure = JobView::failure("denied".into(), Some(Value::Null), true).into_value();
         assert_eq!(failure.get("id"), None);
@@ -995,7 +1025,7 @@ mod tests {
                     .get("questions")
                     .is_some()
             );
-            let mut job = envelope(None);
+            let mut job = envelope();
             job.state = JobState::WaitingInput;
             job.question = Some(crate::job::tests::question("choice"));
             let job = job.metadata_view(&CapabilitySet::default()).into_value();
@@ -1042,10 +1072,7 @@ mod tests {
         let host = jobs
             .test_lease(spec(&child_agent, "host-started", Some(owner.id()), None))
             .await;
-        assert_eq!(
-            jobs.active_launches(&child_agent).await,
-            vec![(host.id(), None)]
-        );
+        assert_eq!(jobs.active_launches(&child_agent), vec![(host.id(), None)]);
         let script = spec(
             &child_agent,
             "script",
@@ -1057,11 +1084,11 @@ mod tests {
             .test_lease(spec(&child_agent, "exec", Some(child.id()), None))
             .await;
         assert_eq!(
-            jobs.active_launches(&agent).await,
+            jobs.active_launches(&agent),
             vec![(owner.id(), Some(root_origin))]
         );
         assert_eq!(
-            jobs.active_launches(&child_agent).await,
+            jobs.active_launches(&child_agent),
             vec![
                 (host.id(), None),
                 (child.id(), Some(child_origin.clone())),

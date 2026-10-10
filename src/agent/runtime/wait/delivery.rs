@@ -1,28 +1,35 @@
 //! Snapshot and present durable child messages and job notifications.
 use super::SessionRuntime;
 use crate::{
-    job::{JobView, PendingDelivery},
-    session::{JobEvent, UserPart},
+    job::{JobError, JobView, Notification},
+    session::{JobEvent, Message, MessageSeq, UserPart},
     tool::diagnostic::DiagnosticViewer,
 };
 
 impl SessionRuntime {
-    /// The owner's pending events, with the receipt whose commit delivers them.
-    /// None when nothing is pending, so no empty receipt holds the delivery gate
-    /// across a model request.
-    pub(in crate::agent::runtime) async fn pending_event_content<'a>(
+    /// Commit the owner's pending events as its next message. When another read
+    /// acknowledged part of what one presented first, present what is pending now
+    /// instead; None once nothing is.
+    pub(in crate::agent::runtime) async fn deliver_events<'a>(
         &self,
         agent: &crate::identity::AgentId,
-        viewer: impl Into<DiagnosticViewer<'a>>,
-    ) -> Result<Option<(UserPart, PendingDelivery)>, crate::agent::runtime::HarnessError> {
-        let pending = self.jobs.pending_delivery(agent).await?;
-        let content = self.job_event_content(&pending, viewer.into()).await;
-        Ok(content.map(|content| (content, pending)))
+        viewer: impl Into<DiagnosticViewer<'a>> + Copy,
+    ) -> Result<Option<MessageSeq>, crate::agent::runtime::HarnessError> {
+        loop {
+            let pending = self.jobs.pending_delivery(agent).await?;
+            let Some(content) = self.job_event_content(&pending, viewer.into()).await else {
+                return Ok(None);
+            };
+            match pending.commit(Message::User(vec![content])).await {
+                Err(JobError::Stale) => {}
+                committed => return Ok(Some(committed?)),
+            }
+        }
     }
 
     async fn job_event_content(
         &self,
-        pending: &crate::job::PendingDelivery,
+        pending: &Notification,
         viewer: DiagnosticViewer<'_>,
     ) -> Option<UserPart> {
         let mut events: Vec<_> = pending
@@ -60,7 +67,7 @@ impl SessionRuntime {
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
-    use crate::agent::runtime::tests::count;
+    use crate::agent::runtime::tests::{count, found, pending, until_pending};
     use crate::agent::runtime::*;
     use crate::job::{JobSpec, JobState};
 
@@ -83,23 +90,9 @@ mod tests {
             .collect()
     }
 
-    /// Wakes broadcast for `job` so far. Counting wakes rather than observing their
-    /// arrival order keeps these assertions independent of any coalescing window:
-    /// a wake published before the caller's last observation is already buffered.
-    fn drain_wakes(
-        wakes: &mut broadcast::Receiver<crate::job::JobCompletion>,
-        job: JobId,
-    ) -> usize {
-        let mut count = 0;
-        while let Ok(wake) = wakes.try_recv() {
-            count += usize::from(wake.job == job);
-        }
-        count
-    }
-
     /// A reply released by shutdown's own cancellation must not start a new turn;
     /// it stays journaled for resume.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn shutdown_stops_before_a_pending_child_reply_starts_another_turn() {
         const REPLY: &str = "pending-child-reply";
         let launch = json!({"prompt":"child task", "model":"wait-test/child", "bg":true});
@@ -132,23 +125,18 @@ mod tests {
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
+        time_out(&session, &session.root, 1, 1).await;
         tracking.request(1).await;
         tracking.pass(2).await;
-        bounded(async {
-            while !session.runtime.jobs.has_pending(&session.root).await {
-                poll().await;
-            }
-        })
-        .await;
+        until_pending(&session, &session.root).await;
         bounded(session.shutdown()).await.unwrap();
-        bounded(session.root_tx.closed()).await;
         assert!(
             !tracking.requested_from(3),
             "stop must not start another turn for a pending reply"
         );
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let root_said = records.iter().any(|record| {
             record.agent == session.root
                 && matches!(&record.event, SessionEvent::MessageCommitted { message }
@@ -166,7 +154,7 @@ mod tests {
 
     /// A script's foreground `tool.agent(...)` returns the child's answer to the
     /// script alone: no reply is left pending for its waits or for the model.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn script_foreground_child_leaves_no_pending_reply() {
         const FINAL: &str = "readme-first-lines";
         let source = "const answer = await tool.agent({prompt:'read', model:'wait-test/child', name:'read-readme'}); \
@@ -182,10 +170,12 @@ mod tests {
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let script = running_job(&session, &session.root, "script").await;
         tracking.pass(1).await;
+        time_out(&session, &session.root, 1, 1).await;
+        time_out(&session, &session.root, 2, 1).await;
         let request = tracking.request(2).await;
         let output = session
             .runtime
@@ -209,7 +199,7 @@ mod tests {
 
     /// A `wait` beside a foreground child keeps waiting through the child's progress;
     /// the next request carries the answer in the child's result, not its progress.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn outstanding_foreground_work_defers_wait_resolution() {
         const PROGRESS: &str = "foreground-progress";
         const FINAL: &str = "foreground-final";
@@ -235,13 +225,14 @@ mod tests {
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let wait = running_job(&session, &session.root, "wait").await;
         tracking.pass(1).await;
         // A second after the progress, an undeferred wait would have resolved.
+        time_out(&session, &only_child(&session), 1, 1).await;
         tracking.request(2).await;
-        let state = session.runtime.jobs.snapshot(wait).await.unwrap().state;
+        let state = session.runtime.jobs.snapshot(wait).unwrap().state;
         assert_eq!(
             state,
             JobState::Running,
@@ -262,7 +253,7 @@ mod tests {
 
     /// A background child's final answer is its job's result: the completion is the
     /// only wake and the answer is not delivered as a separate reply.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn background_child_answer_arrives_as_its_completion_result() {
         const FINAL: &str = "merged-child-final-answer";
         let launch =
@@ -274,7 +265,7 @@ mod tests {
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         tracking.request(1).await;
         let job = running_job(&session, &session.root, "agent").await;
@@ -282,14 +273,11 @@ mod tests {
         // request, so request count is exactly the number of wakes it observed.
         tracking.pass(2).await;
         running_job(&session, &session.root, "wait").await;
-        let mut wakes = session.runtime.jobs.subscribe_completions();
         tracking.release(1);
         child_completed(&session, job).await;
         let woken = tracking.request(3).await;
+        // The answer is held, and the job completion is the event that carries it.
         assert_reason(&woken, "waiting", "event");
-        // Exactly one wake, independent of any coalescing window: the answer is
-        // held and the job completion is the wake that carries it.
-        assert_eq!(drain_wakes(&mut wakes, job), 1);
         let envelopes = envelopes(&woken);
         assert_eq!(envelopes.len(), 1);
         assert_eq!(envelopes[0].len(), 1, "no separate reply");
@@ -306,7 +294,7 @@ mod tests {
 
     /// A child that answers while its own work is still running has not resolved its
     /// invocation, so the driver wakes the owner for that answer immediately.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn answering_child_with_live_work_wakes_its_owner_before_completing() {
         const PROGRESS: &str = "child-answer-with-live-work";
         const FINAL: &str = "child-answer-after-live-work";
@@ -324,29 +312,26 @@ mod tests {
         ]);
         let (_root, session) = start(&tracking).await;
         let jobs = &session.runtime.jobs;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let job = running_job(&session, &session.root, "agent").await;
         // The child agent exists once it has requested a response.
         tracking.request(1).await;
-        let (child, _) = only_child(&session);
+        let child = only_child(&session);
         tracking.release(1);
         let work = running_job(&session, &child, "script").await;
         tracking.pass(3).await;
         running_job(&session, &session.root, "wait").await;
         // A text-only response, but the child's own background job keeps the
         // invocation open: the answer must not wait for that job to be delivered.
-        let mut wakes = session.runtime.jobs.subscribe_completions();
         tracking.release(2);
         let woken = tracking.request(4).await;
         assert_reason(&woken, "waiting", "event");
-        // The driver, not the commit, issued this single wake.
-        assert_eq!(drain_wakes(&mut wakes, job), 1);
         let replies = agent_messages(&woken);
         assert_eq!(replies.len(), 1);
         assert_eq!(replies[0]["text"], PROGRESS);
         assert!(events(&woken).is_empty(), "the child has not completed");
-        assert_eq!(jobs.snapshot(job).await.unwrap().state, JobState::Running);
+        assert_eq!(jobs.snapshot(job).unwrap().state, JobState::Running);
 
         // Releasing its work lets the child answer again and complete; that answer
         // is the completion's result.
@@ -356,10 +341,8 @@ mod tests {
         tracking.pass(5).await;
         child_completed(&session, job).await;
         let completed = tracking.request(6).await;
+        // The second answer completes the invocation, so its completion carries it.
         assert_reason(&completed, "again", "event");
-        // The second answer completes the invocation, so its completion is again the
-        // only wake.
-        assert_eq!(drain_wakes(&mut wakes, job), 1);
         let batch = envelopes(&completed).pop().unwrap();
         assert_eq!(batch.len(), 1);
         assert_child_completion(&batch[0], job, FINAL);
@@ -368,7 +351,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn no_tool_child_reports_survive_queued_input_and_pending_runtime_events() {
         // (parent already waiting, input is a pending runtime event rather than a send)
         for (waiting, runtime_event) in [(true, false), (false, false), (false, true)] {
@@ -392,27 +375,23 @@ mod tests {
         ]);
         let (_root, session) = start(&tracking).await;
         let runtime = &session.runtime;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         tracking.request(1).await;
         tracking.request(2).await;
         let job = running_job(&session, &session.root, "agent").await;
-        let (child, sender) = only_child(&session);
+        let child = only_child(&session);
         if pending_runtime_event {
             complete_background(&session, &child, "please add an addendum").await;
-            assert!(runtime.jobs.has_pending(&child).await);
+            assert!(pending(&session, &child));
         } else {
             let send =
                 format!("return await tool.job({job}).send({{value:'please add an addendum'}});");
             let sent = bounded(session.run_script(send)).await.unwrap();
             assert_eq!(sent.value["value"], json!({}));
-            // Occupancy proves forwarding to the child's queue while A's invoke is gated.
-            bounded(async {
-                while sender.capacity() != AGENT_CHANNEL_CAPACITY - 1 {
-                    poll().await;
-                }
-            })
-            .await;
+            // The input is queued for the child while A's invoke is gated.
+            let queued = || runtime.agents(|agents| agents.get(&child).unwrap().inbox.len());
+            assert_eq!(queued(), 1);
         }
         if parent_already_waiting {
             tracking.release(2);
@@ -435,11 +414,12 @@ mod tests {
         assert_eq!(messages[0]["text"], A);
         // A must not complete the still-working child
         assert!(events(&first).is_empty());
-        let state = runtime.jobs.snapshot(job).await.unwrap().state;
+        let state = runtime.jobs.snapshot(job).unwrap().state;
         assert_eq!(state, JobState::Running);
         // parent must not finish before addendum work
         assert!(!turn.is_finished());
         tracking.release(4);
+        time_out(&session, &session.root, 2, 1).await;
         let waiting = tracking.request(5).await;
         assert_reason(&waiting, "no-repeat", "timeout");
         assert_eq!(agent_messages(&waiting), messages);
@@ -460,7 +440,7 @@ mod tests {
         assert_eq!(history.matches(A).count(), 1);
         // B is the result alone
         assert_eq!(history.matches(B).count(), 1);
-        let output = runtime.jobs.snapshot(job).await.unwrap().output;
+        let output = runtime.jobs.test_snapshot(job).await.unwrap().output;
         assert_eq!(output, Some(json!(B)));
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
@@ -471,7 +451,7 @@ mod tests {
     /// turn answered nothing, so it must publish no reply, wake nobody and leave no
     /// delivery behind. Otherwise the owner collects one blank child message per
     /// child turn, which is what a raw `is_empty` projection check produced.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn blank_child_turn_publishes_no_reply_and_never_wakes_the_owner() {
         const FINAL: &str = "child-final-answer-after-blank";
         let child_tool = call_at(
@@ -496,30 +476,24 @@ mod tests {
         ]);
         let (_root, session) = start(&tracking).await;
         let runtime = &session.runtime;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         tracking.request(1).await;
         let job = running_job(&session, &session.root, "agent").await;
-        let (child, _) = only_child(&session);
+        let child = only_child(&session);
         // Park the owner in an indefinite wait: only a wake produces its next request.
         tracking.pass(2).await;
         running_job(&session, &session.root, "wait").await;
-        let mut wakes = runtime.jobs.subscribe_completions();
 
         // The blank turn lands, and the child's next request proves it moved on.
         tracking.release(1);
         tracking.request(3).await;
-        assert_eq!(
-            drain_wakes(&mut wakes, job),
-            0,
-            "a blank turn woke the owner"
-        );
-        assert!(!runtime.jobs.has_pending(&session.root).await);
+        assert!(!pending(&session, &session.root));
         assert!(
             !tracking.requested_from(4),
             "the owner left its wait for a blank turn"
         );
-        let records = runtime.store.records().await;
+        let records = runtime.store.records();
         // The child's turn commits whole: the separator is history, though not a reply.
         let committed = records
             .iter()
@@ -541,16 +515,15 @@ mod tests {
         child_completed(&session, job).await;
         let woken = tracking.request(4).await;
         assert_reason(&woken, "waiting", "event");
-        assert_eq!(drain_wakes(&mut wakes, job), 1);
         assert!(agent_messages(&woken).is_empty());
         assert_child_completion(&events(&woken)[0], job, FINAL);
         tracking.release(4);
         bounded(turn).await.unwrap().unwrap();
-        assert_eq!(delivered(&runtime.store.records().await), 0);
+        assert_eq!(delivered(&runtime.store.records()), 0);
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn intermediate_child_replies_wake_parent_or_reach_request_boundary_once() {
         for parent_already_waiting in [true, false] {
             intermediate_child_reply(parent_already_waiting).await;
@@ -583,13 +556,13 @@ mod tests {
         ]);
         let (_root, session) = start(&tracking).await;
         let runtime = &session.runtime;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         tracking.request(1).await;
         let in_flight = tracking.request(2).await;
         assert!(agent_messages(&in_flight).is_empty());
         let child_job = running_job(&session, &session.root, "agent").await;
-        let (child, _) = only_child(&session);
+        let child = only_child(&session);
         tracking.release(1);
         running_job(&session, &child, "wait").await;
         if parent_already_waiting {
@@ -608,7 +581,7 @@ mod tests {
         assert_eq!(messages.matches("parent-reply-request-marker").count(), 1);
         // The child committed text WITH a tool call and reached another, gated invoke.
         tracking.request(4).await;
-        let state = runtime.jobs.snapshot(child_job).await.unwrap().state;
+        let state = runtime.jobs.snapshot(child_job).unwrap().state;
         assert_eq!(state, JobState::Running);
         if !parent_already_waiting {
             // No new parent request may start while its current invoke is gated.
@@ -617,11 +590,11 @@ mod tests {
         }
         let next = tracking.request(5).await;
         assert_reason(&next, "waiting", "event");
-        let state = runtime.jobs.snapshot(child_job).await.unwrap().state;
+        let state = runtime.jobs.snapshot(child_job).unwrap().state;
         // the reply must not depend on child completion
         assert_eq!(state, JobState::Running);
         assert!(events(&next).is_empty(), "a reply is not a job completion");
-        let records = runtime.store.records().await;
+        let records = runtime.store.records();
         let child_records = records.iter().filter(|record| record.agent == child);
         let committed = child_records
             .filter(|record| {
@@ -643,6 +616,7 @@ mod tests {
         assert_eq!(copies, 1);
 
         tracking.release(5);
+        time_out(&session, &session.root, 2, 1).await;
         let again = tracking.request(6).await;
         assert_reason(&again, "again", "timeout");
         // do not inject another copy
@@ -657,6 +631,7 @@ mod tests {
         let notifications = events(&completed);
         assert_eq!(notifications.len(), 1);
         assert_child_completion(&notifications[0], child_job, FINAL);
+        time_out(&session, &session.root, 4, 1).await;
         let last = tracking.pass(8).await;
         assert_reason(&last, "after-final", "timeout");
         assert_eq!(agent_messages(&last), replies);
@@ -665,9 +640,9 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn intermediate_child_replies_outlive_a_full_parent_mailbox() {
-        let reply_count = AGENT_CHANNEL_CAPACITY + 1;
+    #[tokio::test]
+    async fn intermediate_child_replies_outlive_a_busy_parent_turn() {
+        let reply_count = 3;
         let launch = json!({"prompt":"child task", "model":"wait-test/child", "bg":true});
         let mut steps = vec![
             ("root", vec![call("child", "agent", launch)]),
@@ -691,32 +666,25 @@ mod tests {
         let tracking = tracking_all(steps);
         let (_root, session) = start(&tracking).await;
         let runtime = &session.runtime;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         tracking.request(1).await;
         let child_job = running_job(&session, &session.root, "agent").await;
-        // Fill the mailbox during invoke; durable messages stay pending without JobsReady.
-        while session.root_tx.capacity() > 0 {
-            let ready = session.root_tx.send(AgentCommand::JobsReady);
-            bounded(ready).await.unwrap();
-        }
         for step in 2..child_final {
             tracking.release(step);
         }
-        // Publishing more replies than the mailbox holds must not deadlock the child.
+        // Replies published while the parent's turn is busy stay pending for it.
         tracking.request(child_final).await;
-        let state = runtime.jobs.snapshot(child_job).await.unwrap().state;
+        let state = runtime.jobs.snapshot(child_job).unwrap().state;
         assert_eq!(state, JobState::Running);
         assert!(!tracking.requested_from(parent_reply));
-        assert_eq!(session.root_tx.capacity(), 0);
         tracking.release(1);
         let next = tracking.request(parent_reply).await;
-        let state = runtime.jobs.snapshot(child_job).await.unwrap().state;
+        let state = runtime.jobs.snapshot(child_job).unwrap().state;
         // a no-tool parent response must not strand replies until child completion
         assert_eq!(state, JobState::Running);
         assert!(events(&next).is_empty());
         let replies = agent_messages(&next);
-        // a full mailbox must not drop payloads
         assert_eq!(replies.len(), reply_count);
         for (index, reply) in replies.iter().enumerate() {
             assert_eq!(reply["text"], format!("mailbox-child-reply-{index}"));
@@ -733,15 +701,14 @@ mod tests {
         assert_child_completion(&notifications[0], child_job, "mailbox-child-final");
         bounded(turn).await.unwrap().unwrap();
         bounded(session.shutdown()).await.unwrap();
-        bounded(session.root_tx.closed()).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn progress_and_completion_cross_the_same_no_tool_boundary_once() {
         let tracking = tracking(vec![("root", answer()), ("root", answer())]);
         let (root, session) = start(&tracking).await;
         let runtime = &session.runtime;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.request(0).await;
         complete_background(&session, &session.root, "no-tool-completion").await;
         let (job, child) = fixture_child(&session, root.path()).await;
@@ -751,20 +718,20 @@ mod tests {
         assert_eq!(agent_messages(&next).len(), 1);
         assert_eq!(events(&next).len(), 1);
         // Both entries share one persisted runtime envelope, not separate transactions.
-        let records = runtime.store.records().await;
+        let records = runtime.store.records();
         let root_records = records.iter().filter(|record| record.agent == session.root);
         let envelopes = count!(root_records, SessionEvent::MessageCommitted { message: Message::User(content) } if content.len() == 1 && content.iter().all(|block| matches!(block, UserPart::JobEvents { .. })));
         assert_ne!(envelopes, 0);
         // the earlier answer must not finish the caller's turn
         assert!(!turn.is_finished());
-        assert!(!runtime.jobs.has_pending(session.root_agent()).await);
+        assert!(!pending(&session, session.root_agent()));
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
 
     /// Publish through the same durable source-history path as a real child, without
-    /// invoking another provider. The owner stays gated while a test prepares receipts.
+    /// invoking another provider. The owner stays gated while a test reads its notifications.
     async fn fixture_child(session: &SessionHandle, root: &Path) -> (JobId, AgentId) {
         let runtime = &session.runtime;
         let spec = JobSpec {
@@ -779,8 +746,6 @@ mod tests {
             crate::execution::ExecutionLocation::root(root.to_path_buf()),
         );
         runtime.store.append(child.clone(), started).await.unwrap();
-        let jobs = &runtime.jobs;
-        jobs.set_child_agent(id, child.clone()).await.unwrap();
         (id, child)
     }
 
@@ -801,33 +766,34 @@ mod tests {
         committed.await.unwrap()
     }
 
-    /// The owner's pending events and the receipt that delivers them.
-    async fn pending_content(session: &SessionHandle) -> (UserPart, crate::job::PendingDelivery) {
+    /// The owner's pending events and the notification that delivers them.
+    async fn pending_content(session: &SessionHandle) -> (UserPart, crate::job::Notification) {
         let runtime = &session.runtime;
-        let capabilities = &runtime.capabilities;
-        let pending = runtime.pending_event_content(session.root_agent(), capabilities);
-        pending.await.unwrap().expect("events are pending")
+        let pending = runtime.jobs.pending_delivery(session.root_agent()).await;
+        let pending = pending.unwrap();
+        let content = runtime.job_event_content(&pending, (&runtime.capabilities).into());
+        (content.await.expect("events are pending"), pending)
     }
 
     /// Snapshotting must not consume the only durable copy of a child's progress.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn child_progress_snapshot_survives_abandoned_parent_commits() {
         let tracking = tracking(vec![("root", answer()), ("root", answer())]);
         let (root, session) = start(&tracking).await;
         let runtime = &session.runtime;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.request(0).await;
         let (job, child) = fixture_child(&session, root.path()).await;
         let first = fixture_message(&session, job, &child, "retained-progress").await;
         let (content, batch) = pending_content(&session).await;
         drop(batch);
-        assert!(runtime.jobs.has_pending(session.root_agent()).await);
+        assert!(pending(&session, session.root_agent()));
 
         let (retry, batch) = pending_content(&session).await;
-        // abandoning a receipt must retain its source message
+        // abandoning a notification must retain its source message
         assert_eq!(retry, content);
         let sequence = batch.commit(Message::User(vec![retry])).await.unwrap();
-        let records = runtime.store.records().await;
+        let records = runtime.store.records();
         let committed = records
             .iter()
             .find(|record| record.sequence == RecordSeq::from(sequence));
@@ -835,7 +801,7 @@ mod tests {
         assert_eq!(&committed.agent, session.root_agent());
         assert!(matches!(&committed.event,
             SessionEvent::MessageCommitted { message: Message::User(saved) } if saved.as_slice() == std::slice::from_ref(&content)));
-        assert!(!runtime.jobs.has_pending(session.root_agent()).await);
+        assert!(!pending(&session, session.root_agent()));
         // Equal text is a new independent event when its source sequence differs.
         let second = fixture_message(&session, job, &child, "retained-progress").await;
         assert_ne!(first, second);
@@ -848,14 +814,90 @@ mod tests {
         let delivered = agent_messages(&next);
         assert_eq!(delivered.len(), 2);
         assert_eq!(delivered[0], delivered[1]);
-        assert!(!runtime.jobs.has_pending(session.root_agent()).await);
+        assert!(!pending(&session, session.root_agent()));
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn cancelling_a_started_commit_finishes_acknowledgments_and_serializes_the_next_snapshot()
-    {
+    /// A notification that loses to a competing commit is presented again from
+    /// what is pending then: a reply another notification delivered drops out,
+    /// and so does a released answer its job's completion withdrew, which the
+    /// completion delivers instead.
+    #[tokio::test]
+    async fn a_stale_notification_is_presented_again_from_what_is_pending_now() {
+        use crate::session::JobEvent;
+        for withdrawn in [false, true] {
+            let tracking = tracking(vec![("root", answer())]);
+            let (root, session) = start(&tracking).await;
+            let (runtime, owner) = (&session.runtime, session.root_agent());
+            let turn = spawn_prompt(&session, "start");
+            tracking.request(0).await;
+            let (job, child) = fixture_child(&session, root.path()).await;
+            let jobs = runtime.jobs.clone();
+            let competing: futures_util::future::BoxFuture<()> = if withdrawn {
+                let text = "released-answer";
+                let answer = Message::Assistant(vec![AssistantItem::text("answer", 0, text)]);
+                let commit =
+                    jobs.commit_child_message(&child, job, answer, text.into(), |_| Vec::new());
+                commit.await.unwrap();
+                jobs.notify_owner(job).await.unwrap();
+                let result = crate::tool::ToolOutput::new(json!("result"));
+                let outcome = crate::job::JobOutcome::Completed(result);
+                Box::pin(async move { jobs.finish(job, outcome).await.unwrap() })
+            } else {
+                fixture_message(&session, job, &child, "first-reply").await;
+                let (content, read) = pending_content(&session).await;
+                fixture_message(&session, job, &child, "second-reply").await;
+                let message = Message::User(vec![content]);
+                Box::pin(async move { read.commit(message).await.map(drop).unwrap() })
+            };
+            let (reached, resume) = runtime.store.pause_committed(|_| true).await;
+            let competing = tokio::spawn(competing);
+            bounded(reached).await.unwrap();
+            // It reads before the competing commit applies; its own commit queues behind it.
+            let deliver = runtime.deliver_events(owner, &runtime.capabilities);
+            tokio::pin!(deliver);
+            assert!(futures_util::poll!(deliver.as_mut()).is_pending());
+            resume.send(()).unwrap();
+            let sequence = bounded(deliver)
+                .await
+                .unwrap()
+                .expect("events stay pending");
+            bounded(competing).await.unwrap();
+            let records = runtime.store.records();
+            let record = records
+                .iter()
+                .find(|record| record.sequence == RecordSeq::from(sequence));
+            let Some(SessionEvent::MessageCommitted {
+                message: Message::User(parts),
+            }) = record.map(|record| &record.event)
+            else {
+                panic!("the notification commits a user message");
+            };
+            let [UserPart::JobEvents { events }] = parts.as_slice() else {
+                panic!("the notification presents job events");
+            };
+            let presented: Vec<_> = (events.iter())
+                .map(|event| match event {
+                    JobEvent::Message(reply) => reply.text.clone(),
+                    JobEvent::Job(view) => format!("{:?}", (view.id, view.state)),
+                })
+                .collect();
+            let expected = if withdrawn {
+                format!("{:?}", (Some(job), Some(JobState::Completed)))
+            } else {
+                "second-reply".to_owned()
+            };
+            assert_eq!(presented, [expected], "withdrawn: {withdrawn}");
+            assert!(!pending(&session, owner));
+            tracking.release(0);
+            bounded(turn).await.unwrap().unwrap();
+            session.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_started_commit_finishes_acknowledgments_and_stales_a_competing_read() {
         for with_completion in [true, false] {
             cancelled_notification_commit(with_completion).await;
         }
@@ -865,7 +907,7 @@ mod tests {
         let tracking = tracking(vec![("root", answer()), ("root", answer())]);
         let (root, session) = start(&tracking).await;
         let runtime = &session.runtime;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.request(0).await;
         let completion = if with_completion {
             Some(complete_background(&session, &session.root, "committed-completion").await)
@@ -875,40 +917,37 @@ mod tests {
         let (job, child) = fixture_child(&session, root.path()).await;
         fixture_message(&session, job, &child, "committed-progress").await;
         let (content, batch) = pending_content(&session).await;
-        assert!(runtime.jobs.has_pending(session.root_agent()).await);
-        let mut records = runtime.store.subscribe();
+        let (_, competing) = pending_content(&session).await;
+        assert!(pending(&session, session.root_agent()));
+        let mut updates = runtime.store.observe().updates;
         {
-            let commit = batch.commit(Message::User(vec![content]));
+            let commit = batch.commit(Message::User(vec![content.clone()]));
             tokio::pin!(commit);
-            // Unpolled since scheduling: dropping the caller models an interrupt just
+            // Dropping the caller once its commit is queued models an interrupt just
             // after this transaction's ownership boundary.
-            assert!(futures_util::poll!(commit.as_mut()).is_pending());
+            let _ = futures_util::poll!(commit.as_mut());
         }
-        {
-            // An immediate resumed request cannot snapshot progress still owned by
-            // the interrupted caller's transaction, even without any terminal job.
-            let next_batch = pending_content(&session);
-            tokio::pin!(next_batch);
-            assert!(futures_util::poll!(next_batch.as_mut()).is_pending());
-        }
+        // A read of the same events, even without any terminal job, delivers
+        // nothing the interrupted caller's transaction delivered.
+        let stale = competing.commit(Message::User(vec![content])).await;
+        assert!(matches!(stale, Err(crate::job::JobError::Stale)));
         bounded(async {
             loop {
-                let record = records.recv().await.unwrap();
-                if matches!(&record.event, SessionEvent::MessageCommitted { message } if matches!(message, Message::User(_))) {
+                let update = updates.recv().await.unwrap();
+                if matches!(&update.event, RuntimeEvent::Record(record) if matches!(&record.event, SessionEvent::MessageCommitted { message: Message::User(_) })) {
                     break;
                 }
             }
-            while runtime.jobs.has_pending(session.root_agent()).await {
-                poll().await;
-            }
         })
         .await;
-        // Duplicate wake commands do not reconstruct already acknowledged output.
-        session.root_tx.jobs_ready();
-        session.root_tx.jobs_ready();
+        let root = session.root_agent().clone();
+        found(&session, move |state| {
+            (!state.jobs.has_pending(&root)).then_some(())
+        })
+        .await;
         tracking.release(0);
         bounded(turn).await.unwrap().unwrap();
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         let next = tracking.pass(1).await;
         assert_eq!(agent_messages(&next).len(), 1);
         let completions = events(&next)

@@ -13,8 +13,8 @@ use crate::{
     named_enum::named_enum,
     provider::protocol::Usage,
     session::{
-        AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome, EntryKind,
-        SessionEvent,
+        AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome,
+        EntryKind, SessionEvent,
     },
 };
 
@@ -63,9 +63,13 @@ impl Encoder {
                 .map(drop),
             SessionEvent::ModelFailed { attempt, failure } => {
                 outcome(db, entry, *attempt)?;
-                self::failure(db, entry, failure)
+                let retry = match failure {
+                    AttemptFailure::Final(_) => None,
+                    AttemptFailure::Retrying { delay, .. } => Some(delay.millis()),
+                };
+                self::failure(db, entry, &failure.failure(), retry)
             }
-            SessionEvent::AgentFailed { failure } => self::failure(db, entry, failure),
+            SessionEvent::AgentFailed { failure } => self::failure(db, entry, failure, None),
             SessionEvent::ModelAttemptInterrupted(attempt) => outcome(db, entry, *attempt),
             SessionEvent::ResponseCompleted {
                 attempt,
@@ -94,15 +98,6 @@ impl Encoder {
                 )
                 .map(drop)
             }
-            SessionEvent::ModelRecoveryScheduled {
-                failure,
-                delay_millis,
-            } => db
-                .execute(
-                    "INSERT INTO model_recovery (entry, failure, delay_millis) VALUES (?1, ?2, ?3)",
-                    params![seq, *failure, *delay_millis],
-                )
-                .map(drop),
             SessionEvent::CompactionFailed { failure, error } => {
                 compaction_failure(db, seq, failure, error)
             }
@@ -153,12 +148,12 @@ impl Encoder {
     }
 }
 
-fn failure(db: &Db, entry: Entry, failure: &Failure) -> DbResult<()> {
+fn failure(db: &Db, entry: Entry, failure: &Failure, retry_millis: Option<u64>) -> DbResult<()> {
     let (kind, (detail, class)) = (failure.kind(), failure.parts());
     db.execute(
-        "INSERT INTO failure (entry, kind, failure, detail, provider) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![entry.seq, entry.kind, kind, detail, class],
+        "INSERT INTO failure (entry, kind, failure, detail, provider, retry_millis) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![entry.seq, entry.kind, kind, detail, class, retry_millis],
     )
     .map(drop)
 }
@@ -286,14 +281,23 @@ pub(super) fn events(
         },
     )?;
     events.load_with(
-        "SELECT f.entry, a.request, a.attempt, f.failure, f.provider, f.detail FROM failure f \
-         JOIN attempt_outcome o ON o.entry = f.entry JOIN model_attempt a ON a.entry = o.attempt \
-         WHERE f.kind = ?1",
+        "SELECT f.entry, a.request, a.attempt, f.failure, f.provider, f.detail, f.retry_millis \
+         FROM failure f JOIN attempt_outcome o ON o.entry = f.entry \
+         JOIN model_attempt a ON a.entry = o.attempt WHERE f.kind = ?1",
         params![EntryKind::ModelFailed],
         |row| {
+            let failure = match (failure_at(row, 3)?, row.get::<Option<u64>>(6)?) {
+                (failure, None) => AttemptFailure::Final(failure),
+                (Failure::Provider(message, kind), Some(millis)) => AttemptFailure::Retrying {
+                    message,
+                    kind,
+                    delay: std::time::Duration::from_millis(millis).into(),
+                },
+                (_, Some(_)) => return Err(corrupt("only a provider failure retries")),
+            };
             Ok(SessionEvent::ModelFailed {
                 attempt: attempt(row, 1)?,
-                failure: failure_at(row, 3)?,
+                failure,
             })
         },
     )?;
@@ -318,15 +322,6 @@ pub(super) fn events(
                     (ResponseOutcome::Cut, Some(truncation)) => CompletedOutcome::Cut(truncation),
                     _ => return Err(corrupt("response outcome does not match its cut reason")),
                 },
-            })
-        },
-    )?;
-    events.load(
-        "SELECT entry, failure, delay_millis FROM model_recovery",
-        |row| {
-            Ok(SessionEvent::ModelRecoveryScheduled {
-                failure: sequence(row.get(1)?),
-                delay_millis: row.get(2)?,
             })
         },
     )?;

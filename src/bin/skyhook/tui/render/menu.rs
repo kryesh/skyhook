@@ -354,20 +354,19 @@ mod tests {
 
     #[tokio::test]
     async fn agents_palette_hides_columns_without_stacking_rows() {
-        use crate::tui::app::tests::{fixture, push_child};
-        let (_root, mut app) = fixture().await;
-        let session = app.session().unwrap().clone();
+        use crate::tui::app::played::{
+            count, job_ended, observe_until, played_fixture, spawn_children,
+        };
+        let (_root, mut app, mut model, _session) = played_fixture().await;
         app.command(crate::tui::keys::Command::Agents);
-        let mut children = Vec::new();
-        for index in 0..2 {
-            let child = push_child(&mut app, index).await;
-            let event = skyhook::session::SessionEvent::AgentCompleted;
-            let record = session.store().append(child.clone(), event).await;
-            let record = record.unwrap();
-            app.snapshot.records.insert(record.sequence, record);
-            children.push(format!("agent {}", crate::tui::format::agent_label(&child)));
+        let (agents, turns) = spawn_children(&mut app, &mut model, 2).await;
+        for turn in turns {
+            turn.answer("done");
         }
-        app.refresh();
+        observe_until(&mut app, |app| count(&app.snapshot, job_ended) == 2).await;
+        let children: Vec<_> = (agents.iter())
+            .map(|child| format!("agent {}", crate::tui::format::agent_label(child)))
+            .collect();
         // An open palette's rows follow agents and their live status, which is searchable.
         app.menu_mut().unwrap().input.set("completed".into());
         assert_eq!(app.menu().unwrap().filtered().len(), 2);

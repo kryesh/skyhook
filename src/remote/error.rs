@@ -1,7 +1,7 @@
 //! Remote transport and authorization errors, with tool-facing conversion.
 use crate::{
     remote::{ArtifactError, Platform, ShimProtocol},
-    target::{TargetError, TargetName, TargetRef},
+    target::{TargetError, TargetName},
     tool::{
         AdmissionError, ToolError, ToolOutput,
         authorization::AuthorizationError,
@@ -94,8 +94,8 @@ pub(crate) enum SshError {
 pub(crate) enum ProtocolError {
     #[error("{0}")]
     Violation(&'static str),
-    #[error("remote scoped permission used unexpected execution target `{0}`")]
-    UnexpectedPermissionTarget(TargetRef),
+    #[error("permission names another machine")]
+    ForeignPermission,
     #[error("remote result could not be decoded: {0}")]
     Decode(#[source] Arc<serde_json::Error>),
 }

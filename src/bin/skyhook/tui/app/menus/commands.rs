@@ -55,9 +55,7 @@ impl App {
             Command::Details => {
                 self.details = !self.details;
                 if self.details {
-                    for view in self.views.values_mut() {
-                        view.clear_collapsed();
-                    }
+                    self.views.clear_collapsed();
                 }
             }
             Command::Copy => self.copy(),
@@ -254,18 +252,28 @@ impl App {
 mod tests {
     use super::super::super::tests::*;
     use super::*;
+    use crate::tui::app::played::played_fixture;
     use crossterm::event::{KeyCode, KeyModifiers as M};
     use skyhook::agent::ObservationSnapshot;
     use skyhook::identity::JobId;
     use skyhook::session::{RecordSeq, SessionEvent};
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn retry_children_without_selection_preserves_the_waiting_root_operation() {
-        let (_root, mut app) = permanent_failure_fixture().await;
-        let session = app.session().cloned().unwrap();
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        // A terminal failure, unlike a refused connection, which retries.
+        let rejected = || {
+            let kind = skyhook::provider::ProviderErrorKind::Authentication;
+            kind.error("fixture credentials rejected")
+        };
         // A foreground child has settled once the script returns, so retry finds it failed.
         let script = "return await tool.agent({prompt:'Fail against the fixture provider'});";
-        let launched = session.run_script(script).await.unwrap();
+        let launched = tokio::spawn({
+            let session = session.clone();
+            async move { session.run_script(script).await }
+        });
+        model.turn().await.fail(rejected());
+        let launched = bounded(launched).await.unwrap().unwrap();
         let child: JobId = serde_json::from_value(launched.value["value"]["id"].clone()).unwrap();
         let failures = |snapshot: &ObservationSnapshot| {
             let records = snapshot.records.values();
@@ -276,7 +284,7 @@ mod tests {
             });
             failed.count()
         };
-        let observation = session.observe().await;
+        let observation = session.observe();
         let (mut snapshot, mut updates) = (observation.snapshot, observation.updates);
         assert_eq!(failures(&snapshot), 1);
         app.snapshot = snapshot.clone();
@@ -294,6 +302,7 @@ mod tests {
         assert!(app.busy());
 
         app.command(Command::Retry);
+        model.turn().await.fail(rejected());
         crate::tests::bounded(async {
             while failures(&snapshot) < 2 {
                 snapshot.apply(updates.recv().await.unwrap());

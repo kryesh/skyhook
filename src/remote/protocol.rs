@@ -8,15 +8,17 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWrite, AsyncWriteExt as _};
 
 use crate::{
-    target::Route,
+    target::{Route, TargetRef},
     tool::{
-        authorization::AuthorizationError,
+        authorization::{AuthorizationError, Reauthorization},
         diagnostic::{Diagnostic, PartialDiagnostic},
         output::{CaptureEvent, CaptureId, ProducedOutput},
-        policy::Capability,
+        policy::{ApprovalCoverage, Capability, PermissionUse, ResourceId},
     },
 };
 use serde_json::Value;
+
+use super::error::ProtocolError;
 
 pub(super) const MAX_FRAME_BYTES: usize = 16 * 1024 * 1024;
 
@@ -160,6 +162,8 @@ pub(crate) enum AuthorizationDecision {
     Unavailable(String),
     /// The host policy stopped before deciding.
     Failed,
+    /// A target the request names was redefined.
+    Redefined,
 }
 
 impl From<Result<(), AuthorizationError>> for AuthorizationDecision {
@@ -171,6 +175,7 @@ impl From<Result<(), AuthorizationError>> for AuthorizationDecision {
             Err(AuthorizationError::Cancelled) => Self::Cancelled,
             Err(AuthorizationError::Unavailable(tool)) => Self::Unavailable(tool),
             Err(AuthorizationError::PolicyFailed) => Self::Failed,
+            Err(AuthorizationError::TargetRedefined) => Self::Redefined,
         }
     }
 }
@@ -184,6 +189,7 @@ impl AuthorizationDecision {
             Self::Cancelled => Err(AuthorizationError::Cancelled),
             Self::Unavailable(tool) => Err(AuthorizationError::Unavailable(tool)),
             Self::Failed => Err(AuthorizationError::PolicyFailed),
+            Self::Redefined => Err(AuthorizationError::TargetRedefined),
         }
     }
 }
@@ -225,8 +231,83 @@ pub(crate) enum Response {
     Authorization {
         request_id: RequestId,
         authorization_id: AuthorizationId,
-        request: crate::tool::authorization::Reauthorization,
+        request: Forwarded,
     },
+}
+
+/// What a worker asks its host to authorize while it runs a call: permissions
+/// for its own paths and network origins, each with the grant it proposes, or
+/// the origin a request moved to there. A worker can name nothing else: the
+/// host binds what it asks to the connection's target.
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum Forwarded {
+    Permissions(Vec<(Capability, Own, Option<ApprovalCoverage>)>),
+    Network(String),
+}
+
+/// One of the worker's own paths or network origins.
+#[derive(Debug, Deserialize, Serialize)]
+pub(crate) enum Own {
+    Path(Vec<String>),
+    Network(String),
+}
+
+impl Forwarded {
+    /// What the worker forwards of `request`: what only its own machine, which
+    /// it names root, resolves; none if that is nothing. Refused for a path or
+    /// origin it names on another machine.
+    pub(crate) fn of(request: Reauthorization) -> Result<Option<Self>, ProtocolError> {
+        let permissions = match request {
+            Reauthorization::Network(origin) => return Ok(Some(Self::Network(origin))),
+            Reauthorization::Permissions(permissions) => permissions,
+        };
+        let mut own = Vec::new();
+        for permission in permissions {
+            let resource = match permission.resource {
+                ResourceId::Path {
+                    target: TargetRef::Root,
+                    components,
+                } => Own::Path(components),
+                ResourceId::Network {
+                    target: TargetRef::Root,
+                    origin,
+                } => Own::Network(origin),
+                ResourceId::Path { .. } | ResourceId::Network { .. } => {
+                    return Err(ProtocolError::ForeignPermission);
+                }
+                // The host admitted these before it forwarded the call.
+                _ => continue,
+            };
+            own.push((permission.capability, resource, permission.proposed));
+        }
+        Ok((!own.is_empty()).then_some(Self::Permissions(own)))
+    }
+
+    /// The permissions asked for on `target`, the machine the worker runs on,
+    /// and the origin a request moved to.
+    pub(crate) fn into_parts(self, target: &TargetRef) -> (Vec<PermissionUse>, Option<String>) {
+        let permissions = match self {
+            Self::Network(origin) => return Reauthorization::Network(origin).into_parts(target),
+            Self::Permissions(permissions) => permissions,
+        };
+        let bound = permissions
+            .into_iter()
+            .map(|(capability, resource, proposed)| {
+                let resource = match resource {
+                    Own::Path(components) => ResourceId::Path {
+                        target: target.clone(),
+                        components,
+                    },
+                    Own::Network(origin) => ResourceId::network(target, &origin),
+                };
+                PermissionUse {
+                    capability,
+                    resource,
+                    proposed,
+                }
+            });
+        (bound.collect(), None)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Deserialize, Serialize)]
@@ -371,7 +452,53 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tool::{AdmissionError, diagnostic::Cause};
+    use crate::tool::{AdmissionError, diagnostic::Cause, policy::PathText};
+
+    /// A worker forwards only its own paths and network origins, which the host
+    /// binds to the connection's target with the grants they propose; it refuses
+    /// another machine's, and the host refuses to decode a frame asking for
+    /// anything else.
+    #[test]
+    fn a_worker_forwards_only_its_own_paths_and_origins() {
+        let (root, build) = (TargetRef::Root, "build".parse::<TargetRef>().unwrap());
+        let path = PathText::new("/outside").unwrap();
+        let own = |target: &TargetRef| {
+            let path = ResourceId::path(target, &path);
+            let origin = ResourceId::network(target, "https://example.test:8443");
+            vec![
+                PermissionUse::descendants(Capability::Read, path),
+                PermissionUse::exact(Capability::Network, origin),
+            ]
+        };
+        let jump: crate::target::TargetName = "jump".parse().unwrap();
+        let admitted = [
+            ResourceId::workspace(&root, &path),
+            ResourceId::route(jump.clone(), vec![(jump, 1)]),
+            ResourceId::session("root"),
+            ResourceId::mcp("root", "tool"),
+        ];
+        let admitted = admitted.map(|resource| PermissionUse::new(Capability::Read, resource));
+        let asked = own(&root).into_iter().chain(admitted).collect();
+        let forwarded = Forwarded::of(Reauthorization::Permissions(asked)).unwrap();
+        assert_eq!(forwarded.unwrap().into_parts(&build), (own(&build), None));
+        let elsewhere = Reauthorization::Permissions(own(&build));
+        assert!(Forwarded::of(elsewhere).is_err());
+        let frame = |request| Response::Authorization {
+            request_id: RequestId::new(1),
+            authorization_id: AuthorizationId::new(1),
+            request,
+        };
+        let forwarded = Forwarded::of(Reauthorization::Permissions(own(&root)));
+        let mut frame = serde_json::to_value(frame(forwarded.unwrap().unwrap())).unwrap();
+        let decodes = |frame: &Value| {
+            let bytes = rmp_serde::to_vec_named(frame).unwrap();
+            rmp_serde::from_slice::<Response>(&bytes).is_ok()
+        };
+        assert!(decodes(&frame));
+        frame["authorization"]["request"]["Permissions"][0][1] =
+            serde_json::json!({"Session": "root"});
+        assert!(!decodes(&frame));
+    }
 
     /// Every path that reports an authorization failure to a tool reads it the
     /// same way, including after a wire round trip; a cancellation is never
@@ -397,6 +524,10 @@ mod tests {
             (
                 AuthorizationError::PolicyFailed,
                 Cause::Message("authorization could not be decided".into()),
+            ),
+            (
+                AuthorizationError::TargetRedefined,
+                Cause::Message("target was redefined".into()),
             ),
         ];
         for (error, cause) in cases {

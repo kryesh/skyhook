@@ -1,14 +1,14 @@
 //! Pending calls and admitted jobs rendered as structured tool cards.
 
 use super::super::tool_view::{Document, Hints, Role, Run, starts_child};
-use super::{Entry, EntryKey, EntryView, JobInfo, Projection};
+use super::{Entry, EntryKey, EntryView, Projection, Timing};
 use crate::text::brief;
 use crate::tui::app::OutputStore;
 use crate::tui::format::{Precision, local_time};
 use chrono::Local;
 use serde_json::Value;
 use skyhook::identity::AgentId;
-use skyhook::job::JobState;
+use skyhook::job::{JobEnvelope, JobState};
 use skyhook::provider::protocol::ToolResult;
 use skyhook::target::TargetRef;
 
@@ -115,7 +115,7 @@ pub(super) fn call_entry(
 }
 
 pub(super) fn job_entry(
-    job: &JobInfo,
+    job: &JobEnvelope,
     projection: &Projection,
     outputs: &OutputStore,
     presentation: EntryView<'_>,
@@ -127,7 +127,8 @@ pub(super) fn job_entry(
         ..
     } = presentation;
     let key = EntryKey::Job(job.id);
-    let hints = Hints::new(&job.tool, &job.args);
+    let timing = Timing::from(job.timing);
+    let hints = Hints::new(&job.tool, &job.arguments);
     let mut header = vec![
         Run::new(state_glyph(job.state), state_role(job.state)),
         Run::new(" ", Role::Plain),
@@ -140,31 +141,31 @@ pub(super) fn job_entry(
         Run::new(" · ", Role::Muted),
         Run::new(state_name(job.state), state_role(job.state)),
     ];
-    if let Some(took) = job.timing.took() {
+    if let Some(took) = timing.took() {
         header.push(Run::new(format!(" · {took}"), Role::Muted));
     }
     header.push(Run::new(format!(" · #{}", job.id), Role::Muted));
     let document = view.is_expanded(&key, all_details).then(|| {
         let mut body = Document::default();
-        let mut location = job.location_label();
-        if let Some(since) = job.timing.since() {
+        let mut location = format!(
+            "{} · {}",
+            job.location.target,
+            job.location.workspace.display()
+        );
+        if let Some(since) = timing.since() {
             let started = local_time(since, today, &Local, Precision::Seconds);
             location.push_str(&format!(" · started {started}"));
         }
         body.line(location, Role::Muted);
         body.arguments(hints);
         let output = outputs.get(&job.id);
-        if output.is_some() || job.error.is_some() {
+        let error = projection.job_error(job);
+        if output.is_some() || error.is_some() {
             let failure = output.and_then(|output| output.as_ref().err());
-            let summaries: Vec<&str> = job
-                .error
-                .iter()
-                .chain(failure)
-                .map(String::as_str)
-                .collect();
+            let summaries: Vec<&str> = error.iter().chain(failure).map(String::as_str).collect();
             let view = output.and_then(|output| output.as_ref().ok());
             body.output(hints, view, &summaries);
-        } else if job.remote() && !job.state.is_terminal() {
+        } else if !job.location.is_root() && !job.state.is_terminal() {
             body.line(
                 "Running remotely · output available after completion",
                 Role::Muted,
@@ -179,7 +180,7 @@ pub(super) fn job_entry(
         body
     });
     let mut entry = Entry::card(key, header, document);
-    entry.timing = job.timing;
+    entry.timing = timing;
     entry
 }
 
@@ -187,15 +188,26 @@ pub(super) fn job_entry(
 mod tests {
     use super::super::super::tool_view::Section;
     use super::super::clean;
-    use super::super::tests::{header_text, job_info, loaded, root};
+    use super::super::tests::{header_text, loaded, root};
     use super::super::{Tab, View};
     use super::*;
+    use crate::tui::app::{
+        App,
+        played::{observe_find, sleeping_script},
+        tests::{fixture, job_named, run_script},
+    };
     use crate::tui::format::Timing;
-    use skyhook::job::JobRole;
+    use skyhook::job::JobState;
     use skyhook::provider::protocol::ToolCall;
 
+    /// The job `app` shows once `ready` holds for it.
+    async fn job(app: &mut App, ready: impl Fn(&JobEnvelope) -> bool) -> JobEnvelope {
+        let found = |app: &App| app.snapshot.jobs.values().find(|job| ready(job)).cloned();
+        observe_find(app, found).await
+    }
+
     /// `job`'s card with every detail `open` or none.
-    fn card(job: &JobInfo, outputs: &OutputStore, open: bool) -> Entry {
+    fn card(job: &JobEnvelope, outputs: &OutputStore, open: bool) -> Entry {
         let (agent, view) = (root(1), View::default());
         let presentation = EntryView {
             agent: &agent,
@@ -207,34 +219,47 @@ mod tests {
         job_entry(job, &Projection::default(), outputs, presentation)
     }
 
-    #[test]
-    fn job_cards_time_their_run_and_show_when_it_started_once_expanded() {
+    #[tokio::test]
+    async fn job_cards_time_their_run_and_show_when_it_started_once_expanded() {
+        let (_root, mut app) = fixture().await;
         let outputs = OutputStore::default();
-        let started = local_time(1_000, Default::default(), &Local, Precision::Seconds);
+        let script = sleeping_script(app.session().unwrap());
         // A running job's counter is painted, never part of its header.
-        for (state, timing, time) in [
-            (JobState::Queued, Timing::Untimed, ""),
-            (JobState::Running, Timing::Since(1_000), ""),
-            (
-                JobState::Completed,
-                Timing::Took {
-                    since: 1_000,
-                    until: 4_200,
-                },
-                " · 3.2s",
-            ),
-        ] {
-            let job = JobInfo {
-                timing,
-                ..job_info(&root(5), 42, JobRole::Tool, state)
+        for step in 0..3 {
+            let job = match step {
+                0 => job(&mut app, |job| job.state == JobState::Queued).await,
+                1 => job(&mut app, |job| job.state == JobState::Running).await,
+                _ => {
+                    let id = app.snapshot.jobs.keys().next().copied().unwrap();
+                    app.session().unwrap().cancel_job(id).await.unwrap();
+                    job(&mut app, |job| job.state.is_terminal()).await
+                }
             };
+            let timing = Timing::from(job.timing);
             let entry = |open| card(&job, &outputs, open);
             let header = header_text(entry(false).header().unwrap());
-            assert!(header.ends_with(&format!("{}{time} · #42", state_name(state))));
-            let expanded = entry(true).text().contains(&format!("started {started}"));
-            assert_eq!(expanded, timing != Timing::Untimed, "{state:?}");
+            let took = timing
+                .took()
+                .map_or_else(String::new, |took| format!(" · {took}"));
+            let state = state_name(job.state);
+            assert!(
+                header.ends_with(&format!("{state}{took} · #{}", job.id)),
+                "{header}"
+            );
+            let started = timing.since().map(|since| {
+                let started = local_time(since, Default::default(), &Local, Precision::Seconds);
+                format!(" · started {started}")
+            });
+            let expanded = entry(true).text().to_owned();
+            assert_eq!(
+                expanded.contains(" · started "),
+                started.is_some(),
+                "{state}"
+            );
+            assert!(started.is_none_or(|started| expanded.contains(&started)));
             assert_eq!(entry(false).timing, timing);
         }
+        let _ = crate::tests::bounded(script).await.unwrap();
     }
 
     fn has_code(entry: &Entry, test: impl Fn(&str) -> bool) -> bool {
@@ -244,8 +269,8 @@ mod tests {
             .any(|section| matches!(section, Section::Code { source, .. } if test(source)))
     }
 
-    #[test]
-    fn expanded_jobs_and_historical_call_results_omit_null_object_fields() {
+    #[tokio::test]
+    async fn expanded_jobs_and_historical_call_results_omit_null_object_fields() {
         let agent = root(1);
         let value = serde_json::json!({
             "state": "completed", "result": {
@@ -260,7 +285,9 @@ mod tests {
             images: vec![],
             is_error: false,
         };
-        let job = job_info(&agent, 42, JobRole::Tool, JobState::Completed);
+        let (_root, mut app) = fixture().await;
+        run_script(&mut app, "return await tool.exec({command:['true']});").await;
+        let job = app.snapshot.jobs[&job_named(&app, "exec")].clone();
         let (projection, mut outputs) = (Projection::default(), OutputStore::default());
         loaded(&mut outputs, job.id, value.clone());
         let call = ("exec", None, Some(&result));
@@ -278,15 +305,22 @@ mod tests {
         assert_eq!(result.result, value);
     }
 
-    #[test]
-    fn failed_jobs_put_errors_in_expanded_output_and_keep_real_results() {
-        let job = JobInfo {
-            error: Some("failed exactly".into()),
-            ..job_info(&root(74), 42, JobRole::Tool, JobState::Failed)
-        };
+    #[tokio::test]
+    async fn failed_jobs_put_errors_in_expanded_output_and_keep_real_results() {
+        let (_root, mut app) = fixture().await;
+        let session = app.session().unwrap().clone();
+        // Its stack quotes its source line, which must not spell the message.
+        let source = "throw new Error(['failed', 'exactly'].join(' '));";
+        let failed = session.run_script(source).await;
+        assert!(failed.is_err());
+        app.snapshot = session.observe().snapshot;
+        let job = app.snapshot.jobs[&job_named(&app, "script")].clone();
+        assert_eq!(job.state, JobState::Failed);
+        let error = Projection::default().job_error(&job).unwrap();
+        let card = |outputs: &OutputStore, open| card(&job, outputs, open);
         for output in [
             None,
-            Some(serde_json::json!({"error": "failed exactly",
+            Some(serde_json::json!({"error": error,
                 "result": {"stdout": "  saved output\t\n"}})),
             Some(serde_json::json!({"result": {"stderr": "other details"}})),
         ] {
@@ -294,12 +328,12 @@ mod tests {
             if let Some(output) = output.clone() {
                 loaded(&mut outputs, job.id, output);
             }
-            let collapsed = card(&job, &outputs, false);
+            let collapsed = card(&outputs, false);
             assert_eq!(collapsed.text().lines().count(), 1);
             assert!(!collapsed.text().contains("failed exactly"));
             assert!(collapsed.document().is_none());
-            let expanded = card(&job, &outputs, true);
-            assert!(expanded.text().contains("Output\n  failed exactly"));
+            let expanded = card(&outputs, true);
+            assert!(expanded.text().contains(&format!("Output\n  {error}")));
             assert_eq!(expanded.text().matches("failed exactly").count(), 1);
             assert!(!expanded.text().contains("Loading output"));
             let result = output.as_ref().map(|output| &output["result"]);

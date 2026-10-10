@@ -8,7 +8,6 @@ use super::*;
 struct PreparedAgentLaunch {
     runtime: Arc<SessionRuntime>,
     agent_loop: AgentLoop,
-    sender: AgentSender,
     available_depth: usize,
     start: Start,
 }
@@ -18,6 +17,14 @@ enum Start {
     New(Option<Vec<TodoItem>>),
     /// Journaled before: resume under that contract without starting it again.
     Resume(Resumed),
+}
+
+/// The agent call a new child answers: its job, the prompt that begins the
+/// child's first invocation, and what restarts the call once it ends.
+pub(super) struct Call {
+    pub(super) job: JobId,
+    pub(super) prompt: String,
+    pub(super) handler: crate::job::ResumeHandler,
 }
 
 impl PreparedAgentLaunch {
@@ -31,7 +38,7 @@ impl PreparedAgentLaunch {
             return Err(HarnessError::ChildDepth);
         }
         let remaining_depth = runtime.harness.max_child_depth.saturating_sub(id.depth());
-        let (contract, meter, start, turn) = match launch {
+        let (contract, meter, start) = match launch {
             AgentLaunch::New {
                 model,
                 todos,
@@ -56,21 +63,15 @@ impl PreparedAgentLaunch {
                     tools: None,
                 };
                 let meter = super::compact::TokenMeter::default();
-                (contract, meter, Start::New(todos), TurnState::Idle)
+                (contract, meter, Start::New(todos))
             }
             AgentLaunch::Resume(resumed) => {
-                let (contract, meter) = (runtime.store)
-                    .visit_records_after(RecordSeq::default(), |records| {
-                        let meter = super::compact::TokenMeter::restore(records, &id);
-                        (runtime.resumed_contract(records, &id), meter)
-                    })
-                    .await;
+                let (contract, meter) = runtime.store.read(|state| {
+                    let meter = super::compact::TokenMeter::restore(&state.records, &id);
+                    (runtime.resumed_contract(&state.agents, &id), meter)
+                });
                 let contract = contract.ok_or_else(|| HarnessError::NoRecordedModel(id.clone()))?;
-                let turn = match resumed {
-                    Resumed::Idle => TurnState::Idle,
-                    Resumed::Parked(_) => TurnState::Parked,
-                };
-                (contract, meter, Start::Resume(resumed), turn)
+                (contract, meter, Start::Resume(resumed))
             }
         };
         let RecordedContract {
@@ -98,96 +99,125 @@ impl PreparedAgentLaunch {
                     .await?
             }
         };
-        let mut context = runtime
-            .open_agent_context(&id, profile, system, &capabilities, tools)
-            .await?;
+        let mut context = runtime.open_agent_context(&id, profile, system, &capabilities, tools)?;
         context.meter = meter;
-        let (tx, rx) = mpsc::channel(AGENT_CHANNEL_CAPACITY);
-        let sender = AgentSender::new(tx);
         Ok(Self {
             runtime,
             agent_loop: AgentLoop {
-                control: AgentControl::new(turn),
                 id,
                 owner_job,
                 context,
                 location,
                 settings: AgentSettings { mode, capabilities },
-                rx,
             },
-            sender,
             available_depth,
             start,
         })
     }
 
-    async fn install(self) -> Result<AgentSender, HarnessError> {
+    /// Resume as `resumed` instead.
+    fn resumed(self, resumed: Resumed) -> Self {
+        let start = Start::Resume(resumed);
+        Self { start, ..self }
+    }
+
+    /// Journal the agent's start, if new, and run its loop from the same commit.
+    /// For `call`, that commit accepts the call: unless its job ended or its name
+    /// belongs to another installed child of its owner, it installs the child
+    /// with its prompt and the call's resume handler, so the start record alone
+    /// marks a call that can run again. Returns where the child's answer arrives.
+    async fn install(self, call: Option<Call>) -> Result<Option<ChildAnswer>, HarnessError> {
+        let started = self.started(call.as_ref());
+        let store = self.runtime.store.clone();
+        let launch = move |state: &CoreState| {
+            if let Some(call) = &call {
+                state.jobs.accepts(call.job)?;
+            }
+            let run = move |state: &mut CoreState, _: &[EventRecord]| self.run(state, call);
+            Ok::<_, HarnessError>(Plan::new(started, run))
+        };
+        store.commit(Command::LaunchAgent, launch).await
+    }
+
+    /// What journals a new agent's start, with its seeded todos and the prompt
+    /// of its `call`; nothing for one that resumes.
+    fn started(&self, call: Option<&Call>) -> Vec<(AgentId, SessionEvent)> {
+        let Start::New(todos) = &self.start else {
+            return Vec::new();
+        };
+        let (runtime, agent_loop) = (&self.runtime, &self.agent_loop);
+        let started = SessionEvent::AgentStarted {
+            owner_job: agent_loop.owner_job,
+            profile: Some(agent_loop.context.profile.clone()),
+            available_depth: u32::try_from(self.available_depth).unwrap_or(u32::MAX),
+            mode: (agent_loop.settings.mode.as_ref()).map(|mode| runtime.mode_selection(mode)),
+            capabilities: agent_loop.settings.capabilities.iter().collect(),
+            location: agent_loop.location.clone(),
+        };
+        let id = &agent_loop.id;
+        // Every entry references an agent, so a new session starts with its
+        // root, the only agent that starts rather than resumes without an owner.
+        let session = id.parent().is_none().then(|| SessionEvent::SessionStarted {
+            targets: runtime.harness.target_definitions.clone(),
+            capabilities: runtime.capabilities.iter().collect(),
+        });
+        // The seed lands with the start, so the child never shows an empty list.
+        let seeded = (todos.clone()).map(|items| SessionEvent::TodosReplaced { items });
+        let prompted = call.map(|call| {
+            let text = call.prompt.clone();
+            let message = Message::User(vec![UserPart::Text { text }]);
+            SessionEvent::MessageCommitted { message }
+        });
+        let events = (session.into_iter().chain([started]).chain(seeded)).chain(prompted);
+        events.map(|event| (id.clone(), event)).collect()
+    }
+
+    /// Install the agent in `state`, begun on `call` if it answers one, and run
+    /// its loop once the change applies.
+    fn run(self, state: &mut CoreState, call: Option<Call>) -> Option<ChildAnswer> {
         let Self {
             runtime,
             agent_loop,
-            sender,
-            available_depth,
+            available_depth: _,
             start,
         } = self;
-        let activity = match &start {
-            Start::Resume(Resumed::Parked(failure)) => AgentActivity::Stopped(failure.clone()),
-            Start::New(_) | Start::Resume(Resumed::Idle) => AgentActivity::Idle,
+        let turn = match start {
+            Start::Resume(Resumed::Parked(failure)) => Turn::Parked(failure),
+            Start::New(_) | Start::Resume(Resumed::Idle) => Turn::Idle,
         };
-        let todos = match start {
-            Start::Resume(_) => None,
-            Start::New(todos) => {
-                let started = SessionEvent::AgentStarted {
-                    owner_job: agent_loop.owner_job,
-                    profile: Some(agent_loop.context.profile.clone()),
-                    available_depth: u32::try_from(available_depth).unwrap_or(u32::MAX),
-                    mode: (agent_loop.settings.mode.as_ref())
-                        .map(|mode| runtime.mode_selection(mode)),
-                    capabilities: agent_loop.settings.capabilities.iter().collect(),
-                    location: agent_loop.location.clone(),
-                };
-                // Every entry references an agent, so a new session starts with its
-                // root, the only agent that starts rather than resumes without an owner.
-                let id = &agent_loop.id;
-                let session = id.parent().is_none().then(|| SessionEvent::SessionStarted {
-                    targets: runtime.harness.target_definitions.clone(),
-                    capabilities: runtime.capabilities.iter().collect(),
-                });
-                let events = session.into_iter().chain([started]);
-                runtime
-                    .store
-                    .append_all(events.map(|event| (id.clone(), event)).collect())
-                    .await?;
-                todos
-            }
+        let id = agent_loop.id.clone();
+        let facts = agents::AgentFacts {
+            turn,
+            since: chrono::Utc::now().timestamp_millis(),
+            inbox: Default::default(),
+            window: Default::default(),
+            invocation: Invocation::Open,
         };
-        runtime
-            .todos
-            .register(agent_loop.id.clone(), agent_loop.owner_job, todos)
-            .await?;
-        {
-            let mut agents = runtime.agents_mut();
-            // Serialize this check with shutdown's agent snapshot. A child whose
-            // provider initialization raced shutdown must not leave an idle loop.
-            if runtime.shutting_down.load(Ordering::Acquire) {
-                return Err(HarnessError::Interrupted);
-            }
-            agents.insert(
-                agent_loop.id.clone(),
-                LiveAgent {
-                    model: agent_loop.context.profile.name.clone(),
-                    capabilities: agent_loop.settings.capabilities.clone(),
-                    sender: sender.clone(),
-                    cancellation: CancellationToken::new(),
-                    control: agent_loop.control.clone(),
-                    available_depth,
-                },
-            );
-        }
-        runtime.activity(&agent_loop.id, activity);
-        tokio::spawn(async move { runtime.run_agent(agent_loop).await });
-        Ok(sender)
+        state.agents.insert(id.clone(), facts);
+        // The prompt is committed: the input that begins the turn carries none.
+        let answer = call.map(|call| {
+            let _ = runtime.jobs.install(state, call.job, call.handler.into());
+            let (done, answer) = oneshot::channel();
+            let input = AgentCommand::Input {
+                options: Selection::default(),
+                content: Vec::new(),
+                done: Some(RequestCompletion::Child(done)),
+            };
+            state.agents.send(&id, input);
+            answer
+        });
+        state.defer(move || {
+            let supervisor = runtime.jobs.supervisor().clone();
+            let window = runtime.harness.coalescing.clone();
+            supervisor.spawn(wait::coalesce(runtime.store.clone(), id, window));
+            supervisor.spawn(async move { runtime.run_agent(agent_loop).await });
+        });
+        answer
     }
 }
+
+/// Where a child's answer to the invocation an input began arrives.
+pub(super) type ChildAnswer = oneshot::Receiver<Result<String, TurnFailure>>;
 
 impl SessionRuntime {
     pub(super) async fn spawn_agent(
@@ -195,11 +225,45 @@ impl SessionRuntime {
         id: AgentId,
         owner_job: Option<JobId>,
         launch: AgentLaunch,
-    ) -> Result<AgentSender, HarnessError> {
-        PreparedAgentLaunch::prepare(self.clone(), id, owner_job, launch)
-            .await?
-            .install()
-            .await
+    ) -> Result<(), HarnessError> {
+        let prepared = PreparedAgentLaunch::prepare(self.clone(), id, owner_job, launch);
+        prepared.await?.install(None).await.map(drop)
+    }
+
+    /// Activate the viewed session as its root resumes, then let a later first
+    /// call try again if it could not. The root is prepared first, so one that
+    /// cannot be journals nothing; then one commit settles what the process that
+    /// last ran the session left open and starts the root, parked as it read
+    /// stopped, or interrupted once the settlement leaves it deliveries.
+    pub(super) async fn activate_root(self: Arc<Self>) -> Result<(), HarnessError> {
+        // Settlement closes only what this already reads as stopped.
+        let root = AgentId::root(self.store.id());
+        let stopped = self.store.read(|state| agents::stopped_turn(state, &root));
+        let idle = AgentLaunch::Resume(Resumed::Idle);
+        let prepared = PreparedAgentLaunch::prepare(self.clone(), root, None, idle).await?;
+        let resume = move |state: &mut CoreState| {
+            let resumed = match stopped {
+                Some(failure) => Resumed::Parked(failure),
+                None if state.jobs.has_pending(&prepared.agent_loop.id) => {
+                    Resumed::Parked(TurnFailure::Interrupted)
+                }
+                None => Resumed::Idle,
+            };
+            prepared.resumed(resumed).run(state, None);
+        };
+        self.activate(resume).await
+    }
+
+    /// Start child `id` for `call`, accepting the call as its child is installed.
+    pub(super) async fn launch_child(
+        self: &Arc<Self>,
+        id: AgentId,
+        launch: AgentLaunch,
+        call: Call,
+    ) -> Result<ChildAnswer, HarnessError> {
+        let prepared = PreparedAgentLaunch::prepare(self.clone(), id, Some(call.job), launch);
+        let answer = prepared.await?.install(Some(call)).await?;
+        Ok(answer.expect("a call's child answers it"))
     }
 
     /// Plan a model call and publish its job. A response's calls are created in
@@ -255,19 +319,23 @@ pub(super) enum CreatedCall {
 }
 
 impl CreatedCall {
-    /// Tool dispatch owns its execution inputs. Erasing this future separates
-    /// the driver's Send proof from the nested supervised executor graph.
-    pub(super) fn run(self) -> futures_util::future::BoxFuture<'static, ToolResult> {
+    /// The call's result, with the delivery it reports for its commit to
+    /// acknowledge. Tool dispatch owns its execution inputs. Erasing this future
+    /// separates the driver's Send proof from the nested supervised executor graph.
+    pub(super) fn run(
+        self,
+    ) -> futures_util::future::BoxFuture<'static, (ToolResult, Option<crate::job::Delivery>)> {
         Box::pin(async move {
             let (executor, call, created) = match self {
-                Self::Settled(result) => return result,
+                Self::Settled(result) => return (result, None),
                 Self::Created {
                     executor,
                     call,
                     created,
                 } => (executor, call, created),
             };
-            match executor.run(*created).await {
+            let reported = executor.run_reported(*created).await;
+            let result = match reported.outcome {
                 Ok(result) => ToolResult {
                     call_id: call.id().to_owned(),
                     name: call.name().to_owned(),
@@ -276,7 +344,8 @@ impl CreatedCall {
                     is_error: result.is_error,
                 },
                 Err(error) => failed_result(&call, &executor, error),
-            }
+            };
+            (result, reported.acknowledges)
         })
     }
 }
@@ -343,7 +412,9 @@ impl SessionRuntime {
     ) -> Result<Vec<SystemSegment>, HarnessError> {
         let target = match &location.target {
             crate::target::TargetRef::Root => None,
-            crate::target::TargetRef::Named(name) => Some(self.router.targets().get(name).await?),
+            crate::target::TargetRef::Named(name) => {
+                Some(self.router.targets(|targets| targets.get(name))?)
+            }
         };
         let system = vec![prompt::system_segment(&prompt::PromptInputs {
             instructions: &self.harness.instructions,
@@ -361,7 +432,7 @@ impl SessionRuntime {
     /// live tool surface, or `pinned` tools journaled earlier. A pinned tool whose
     /// live definition differs or is gone stays visible to the model but is
     /// unavailable to call.
-    pub(super) async fn open_agent_context(
+    pub(super) fn open_agent_context(
         &self,
         agent: &AgentId,
         profile: crate::session::ProfileSnapshot,
@@ -406,50 +477,66 @@ impl SessionRuntime {
         let open = |records: &[EventRecord]| {
             AgentContext::open(agent, profile, template, provider, records)
         };
-        let mut context = self
-            .store
-            .visit_records_after(RecordSeq::default(), open)
-            .await;
+        let mut context = self.store.read(|state| open(&state.records));
         context.unavailable_tools = Arc::new(unavailable);
         Ok(context)
     }
 }
 
 impl SessionRuntime {
-    /// Give restored agent jobs a handler that resumes their child, starting it
-    /// again under its journaled contract when its loop is gone.
-    pub(super) async fn install_retained_children(self: &Arc<Self>, records: &[EventRecord]) {
-        for retained in self.jobs.retained_children().await {
+    /// Give each agent job in `retained` a handler under its owner's journaled
+    /// contract: one that resumes the child its call installed, or one that asks
+    /// again for a call stopped before it was accepted.
+    pub(super) fn install_retained(
+        self: &Arc<Self>,
+        state: &mut CoreState,
+        retained: Vec<crate::job::RetainedChild>,
+    ) {
+        for retained in retained {
             // The owner holds what it would if it resumed itself.
-            let Some(owner) = self.resumed_contract(records, &retained.owner) else {
+            let Some(owner) = self.resumed_contract(&state.agents, &retained.owner) else {
                 continue;
             };
-            let authorization = crate::tool::authorization::AuthorizationSubject {
-                agent: retained.owner,
-                job: retained.job,
-                parent: retained.parent,
-                capabilities: owner.capabilities,
-                cancellation: retained.cancellation,
+            let resume = match retained.restart {
+                crate::job::Restart::Child {
+                    parent,
+                    location,
+                    cancellation,
+                } => {
+                    let authorization = crate::tool::authorization::AuthorizationSubject {
+                        agent: retained.owner,
+                        job: retained.job,
+                        parent,
+                        capabilities: owner.capabilities,
+                        cancellation,
+                    };
+                    let handler = super::tools::child_resume_handler(
+                        Arc::downgrade(self),
+                        authorization,
+                        location,
+                        owner.location,
+                    );
+                    crate::job::Resume::Child(handler)
+                }
+                crate::job::Restart::Call => {
+                    let executor = (self.executor.clone())
+                        .with_location(owner.location)
+                        .with_capabilities(owner.capabilities);
+                    crate::job::Resume::Call(executor.relaunch())
+                }
             };
-            let handler = super::tools::child_resume_handler(
-                Arc::downgrade(self),
-                retained.child,
-                authorization,
-                retained.location,
-                owner.location,
-            );
-            let _ = self.jobs.set_resume_handler(retained.job, handler).await;
+            let _ = self.jobs.install(state, retained.job, resume);
         }
     }
 
     /// `agent`'s journaled contract under the live configuration, which may narrow
     /// it but never widen it: a lowered depth limit narrows rather than refuses it.
-    fn resumed_contract(
+    pub(super) fn resumed_contract(
         &self,
-        records: &[EventRecord],
+        agents: &Agents,
         agent: &AgentId,
     ) -> Option<RecordedContract> {
-        let mut contract = recorded_contract(records, agent)?;
+        let mut contract = agents.contract(agent)?.clone();
         let remaining = self.harness.max_child_depth.saturating_sub(agent.depth());
         contract.available_depth = contract.available_depth.min(remaining);
         let allowed = self.capabilities.for_agent(contract.available_depth);
@@ -458,100 +545,21 @@ impl SessionRuntime {
     }
 }
 
-/// The contract an agent runs under. A journaled one is its start, latest applied
-/// profile, and the prompt and tools of its latest agent model context.
-struct RecordedContract {
-    profile: crate::session::ProfileSnapshot,
-    available_depth: usize,
-    mode: Option<ModeName>,
-    capabilities: CapabilitySet,
-    location: crate::execution::ExecutionLocation,
-    system: Option<Vec<SystemSegment>>,
-    tools: Option<Vec<crate::provider::protocol::ToolDefinition>>,
-}
-
-fn recorded_contract(records: &[EventRecord], agent: &AgentId) -> Option<RecordedContract> {
-    let mut contract: Option<RecordedContract> = None;
-    for record in records.iter().filter(|record| &record.agent == agent) {
-        match &record.event {
-            SessionEvent::AgentStarted {
-                profile: Some(profile),
-                available_depth,
-                mode,
-                capabilities,
-                location,
-                ..
-            } => {
-                contract = Some(RecordedContract {
-                    profile: profile.clone(),
-                    available_depth: *available_depth as usize,
-                    mode: mode.as_ref().map(|mode| mode.name.clone()),
-                    capabilities: capabilities.iter().copied().collect(),
-                    location: location.clone(),
-                    system: None,
-                    tools: None,
-                });
-            }
-            SessionEvent::ModelChanged { profile } => {
-                if let Some(contract) = &mut contract {
-                    contract.profile = profile.clone();
-                }
-            }
-            SessionEvent::ModeChanged { mode, capabilities } => {
-                if let Some(contract) = &mut contract {
-                    contract.mode = Some(mode.name.clone());
-                    contract.capabilities = capabilities.iter().copied().collect();
-                    // The mode's prompt and tools are pinned by its next model context.
-                    (contract.system, contract.tools) = (None, None);
-                }
-            }
-            SessionEvent::ModelContext { context }
-                if context.purpose == crate::session::ModelPurpose::Agent =>
-            {
-                if let Some(contract) = &mut contract {
-                    contract.system = Some(context.system.clone());
-                    contract.tools = Some(context.tools.clone());
-                }
-            }
-            _ => {}
-        }
-    }
-    contract
-}
 impl SessionRuntime {
+    /// Reserve `parent`'s next child id, before the launch that journals it.
     pub(super) async fn next_child(&self, parent: &AgentId) -> AgentId {
-        let mut counters = self.child_counters.write().await;
-        let counter = counters.entry(parent.clone()).or_insert(0);
-        *counter = counter.saturating_add(1);
-        parent.child(*counter)
+        let parent = parent.clone();
+        self.store
+            .live(move |state| state.agents.next_child(&parent))
+            .await
     }
 
-    pub(super) fn available_depth(&self, agent: &AgentId) -> usize {
-        self.agents()
-            .get(agent)
-            .map_or(0, |agent| agent.available_depth)
-    }
-
-    pub(super) fn agent_sender(&self, id: &AgentId) -> Option<AgentSender> {
-        self.agents().get(id).map(|agent| agent.sender.clone())
-    }
-
-    /// Register this agent's turn cancellation, or decline once stopping. Checked
-    /// under the `agents` write lock: a token minted before `interrupt_tree`'s
-    /// snapshot is cancelled by it, and none can be minted after.
-    pub(super) fn begin_turn(&self, id: &AgentId) -> Option<CancellationToken> {
-        let cancellation = CancellationToken::new();
-        let mut agents = self.agents_mut();
-        if self.shutting_down.load(Ordering::Acquire) {
-            return None;
-        }
-        let agent = agents.get_mut(id).expect("running agents are registered");
-        agent
-            .control
-            .retryable_interrupt
-            .store(false, Ordering::Release);
-        agent.cancellation = cancellation.clone();
-        Some(cancellation)
+    /// The model `agent` delegates with and how deep it may delegate, whether it
+    /// runs or not yet: a call relaunched after a reopen may run before its owner
+    /// resumes.
+    pub(super) fn delegation(&self, agent: &AgentId) -> Option<(ModelRef, usize)> {
+        let contract = self.agents(|agents| self.resumed_contract(agents, agent))?;
+        Some((contract.profile.name, contract.available_depth))
     }
 }
 
@@ -590,7 +598,7 @@ mod tests {
         let (_root, requests, session) =
             scripted_session([response(vec![call]), answer("done")]).await;
         assert_eq!(session.prompt("run").await.unwrap(), "done");
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let results = events!(&records, SessionEvent::MessageCommitted { message: Message::Tool(results) } => results);
         let value = &results[0][0].result["result"]["value"];
         assert_eq!(
@@ -686,50 +694,41 @@ mod tests {
         assert!(error.contains("unavailable"));
     }
 
+    /// A call's launch is one append: a fault leaves no child, seed, prompt or
+    /// resumable call, never part of them.
     #[tokio::test]
     async fn launch_faults_never_install_a_live_agent() {
-        use crate::session::AppendBoundary;
-        for seed_fault in [false, true] {
-            for boundary in AppendBoundary::ALL {
-                let (_root, _, session) = scripted_session([]).await;
-                let runtime = &session.runtime;
-                let todos = Some(vec![todo("seed", crate::agent::TodoStatus::Pending)]);
-                let id = runtime.next_child(&session.root).await;
-                let launch = child_launch(&session, todos);
-                let launch = PreparedAgentLaunch::prepare(runtime.clone(), id, None, launch)
-                    .await
-                    .unwrap();
-                let agent = launch.agent_loop.id.clone();
-                let sender = launch.sender.clone();
-                let worker = if seed_fault {
-                    let store = &runtime.store;
-                    let (reached, resume) =
-                        store.pause_append_at(AppendBoundary::Publication).await;
-                    let worker = tokio::spawn(launch.install());
-                    bounded(reached).await.unwrap();
-                    // Queue the next fault on the writer's FIFO mutex before letting
-                    // AgentStarted commit; TodosReplaced is the next launch append.
-                    let fault = runtime.store.fail_append_at(boundary);
-                    tokio::pin!(fault);
-                    assert!(futures_util::poll!(fault.as_mut()).is_pending());
-                    resume.send(()).unwrap();
-                    bounded(fault).await;
-                    worker
-                } else {
-                    runtime.store.fail_append_at(boundary).await;
-                    tokio::spawn(launch.install())
-                };
-                assert!(bounded(worker).await.unwrap().is_err());
-                bounded(sender.closed()).await;
-                assert!(!runtime.agents.read().unwrap().contains_key(&agent));
-                let seeded = runtime.todos.inspect(&agent, None).await.unwrap();
-                assert!(seeded.is_empty());
-                // A failed append may leave a replayable prefix, never a live agent.
-                let visible = runtime.store.records().await;
-                let prefix = visible.iter().filter(|r| r.agent == agent).count();
-                assert_eq!(prefix, usize::from(seed_fault));
-                let _ = bounded(session.shutdown()).await;
+        for committed in [false, true] {
+            let (_root, _, session) = scripted_session([]).await;
+            let runtime = &session.runtime;
+            let todos = Some(vec![todo("seed", crate::agent::TodoStatus::Pending)]);
+            let id = runtime.next_child(&session.root).await;
+            let job = owner(&session, false).await;
+            let launch = child_launch(&session, todos);
+            let launch = PreparedAgentLaunch::prepare(runtime.clone(), id, Some(job), launch)
+                .await
+                .unwrap();
+            let agent = launch.agent_loop.id.clone();
+            let call = Call {
+                job,
+                prompt: "child task".into(),
+                handler: Arc::new(|_, _| Box::pin(async { unreachable!("never resumed") })),
+            };
+            let refuse = |store| crate::session::tests::refuse(store, "BEFORE INSERT ON entry");
+            let refused = (!committed).then(|| refuse(&runtime.store));
+            if committed {
+                runtime.store.fail_committed().await;
             }
+            assert!(bounded(launch.install(Some(call))).await.is_err());
+            drop(refused);
+            assert!(runtime.agents(|agents| agents.get(&agent).is_none()));
+            let launched = runtime.jobs.metadata(job).unwrap();
+            assert!(!launched.resumable && runtime.jobs.child_agent(job).is_none());
+            let seeded = runtime.store.inspect_todos(&agent, None).unwrap();
+            assert!(seeded.is_empty());
+            let visible = runtime.store.records();
+            assert!(visible.iter().all(|record| record.agent != agent));
+            let _ = bounded(session.shutdown()).await;
         }
     }
 
@@ -766,7 +765,7 @@ mod tests {
             let session = ephemeral_session(&harness).await;
             let runtime = &session.runtime;
             let child = session.root.child(1);
-            let mut records = runtime.store.records().await;
+            let mut records = runtime.store.records();
             records.retain(|record| matches!(record.event, SessionEvent::AgentStarted { .. }));
             records[0].agent = child.clone();
             let SessionEvent::AgentStarted {
@@ -778,7 +777,9 @@ mod tests {
                 unreachable!("retained above");
             };
             (*recorded_depth, *recorded) = (depth, journaled.iter().collect());
-            let contract = runtime.resumed_contract(&records, &child).unwrap();
+            let mut agents = super::Agents::default();
+            agents.observe(&records[0]);
+            let contract = runtime.resumed_contract(&agents, &child).unwrap();
             assert_eq!(
                 (contract.capabilities, contract.available_depth),
                 (capabilities, available_depth),

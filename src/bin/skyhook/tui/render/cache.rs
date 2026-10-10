@@ -48,8 +48,7 @@ pub(super) fn prepare_rows(app: &mut App, width: u16) {
     let content_changed = app.content_dirty;
     let anchor =
         if app.render.agent == app.selected && (content_changed || app.render.width != width) {
-            app.views
-                .get(&app.selected)
+            app.viewed()
                 .and_then(|view| view.scroll)
                 .and_then(|scroll| {
                     let row = app.render.rows.get(scroll)?;
@@ -166,7 +165,7 @@ pub(super) fn prepare_rows(app: &mut App, width: u16) {
     let visible = visible_entries(app);
     if reset || content_changed || !dirty.is_empty() || app.render.prepared != visible {
         app.render.prepared = visible.clone();
-        let selected = app.views.get(&app.selected).map_or(0, |view| view.row);
+        let selected = app.viewed().map_or(0, |view| view.row);
         let order = visible.chain([selected]).chain(dirty.iter().rev().copied());
         let (entries, rows) = (app.content_cache.entries(), &app.render.rows);
         let documents = order.filter_map(|index| Some((entries.get(index)?, index)));
@@ -182,7 +181,7 @@ fn visible_entries(app: &App) -> std::ops::Range<usize> {
     let rows = &app.render.rows;
     let height = app.content_rect.height as usize;
     let max = rows.len().saturating_sub(height);
-    let scroll = app.views.get(&app.selected).and_then(|view| view.scroll);
+    let scroll = app.viewed().and_then(|view| view.scroll);
     let top = scroll.map_or(max, |scroll| scroll.min(max));
     let bottom = (top + height).min(rows.len()).saturating_sub(1);
     match (rows.get(top), rows.get(bottom)) {

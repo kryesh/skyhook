@@ -10,26 +10,24 @@ impl SessionRuntime {
         mut turn: TurnContext<'_>,
         agent_context: &mut AgentContext,
         settings: &mut AgentSettings,
-        rx: &mut mpsc::Receiver<AgentCommand>,
-        deferred: &mut VecDeque<AgentCommand>,
     ) -> Result<String, HarnessError> {
         let (agent, owner_job) = (turn.agent, turn.owner_job);
         let (cancellation, location) = (turn.cancellation, turn.location);
         let mut context_sequence = None;
         let mut final_text = String::new();
-        let mut force_compaction = false;
         let mut provider_attempt = 0u64;
         let mut context_failures = 0u8;
+        // The last request overflowed the context window.
+        let mut overflowed = false;
         'requests: loop {
-            if let Some(sender) = self.agent_sender(agent) {
-                sender.flush_events(cancellation).await?;
-                sender.begin_request();
-            }
-            if cancellation.is_cancelled() {
+            self.flush_events(agent, cancellation).await?;
+            // A held turn whose wait ended without `continue` ends here, its
+            // results committed.
+            if cancellation.is_cancelled() || !self.agents(|agents| agents.busy(agent)) {
                 return Err(HarnessError::Interrupted);
             }
             if self
-                .consume_queued_inputs(&mut turn, agent_context, settings, rx, deferred)
+                .consume_queued_inputs(&mut turn, agent_context, settings)
                 .await
             {
                 // A mode or model change can replace both the template and its token meter.
@@ -40,13 +38,9 @@ impl SessionRuntime {
             if cancellation.is_cancelled() {
                 return Err(HarnessError::Interrupted);
             }
-            if let Some((content, pending)) = self
-                .pending_event_content(agent, turn.diagnostic_viewer())
-                .await?
-            {
-                pending.commit(Message::User(vec![content])).await?;
-            }
-            agent_context.refresh(&self.store, agent).await?;
+            let viewer = turn.diagnostic_viewer();
+            self.deliver_events(agent, viewer).await?;
+            agent_context.refresh(&self.store, agent)?;
             let profile = agent_context.profile.profile.clone();
             if !profile.supports_images && agent_context.contains_images() {
                 return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
@@ -70,14 +64,15 @@ impl SessionRuntime {
                     record.sequence
                 }
             };
-            let tail = agent_context.tail(self.runtime_state(&turn)).await;
-            if force_compaction {
+            let tail = agent_context.tail(|| self.runtime_state(&turn));
+            let completed = agent_context.compaction_due();
+            if overflowed || completed.is_some() {
+                overflowed = false;
                 let request = agent_context.request(tail.as_ref());
                 let (provider, meter) = (agent_context.provider.as_mut(), &mut agent_context.meter);
                 let snapshot = &agent_context.profile;
-                self.compact_history(&turn, provider, meter, snapshot, &request, None)
+                self.compact_history(&turn, provider, meter, snapshot, &request, completed)
                     .await?;
-                force_compaction = false;
                 // Consume input received during compaction before starting the
                 // normal request, rather than delaying it by another request.
                 continue 'requests;
@@ -89,7 +84,7 @@ impl SessionRuntime {
                     if profile.state_mode == crate::provider::profile::StateMode::Persist =>
                 {
                     self.commit(agent, state).await?;
-                    agent_context.refresh(&self.store, agent).await?;
+                    agent_context.refresh(&self.store, agent)?;
                     None
                 }
                 tail => tail,
@@ -106,26 +101,20 @@ impl SessionRuntime {
             let messages = request.messages().map(estimate).sum::<u64>();
             let input_estimate = agent_context.template_tokens + messages;
             let context_tokens = agent_context.meter.scale(input_estimate);
-            let requested = self
-                .store
-                .append(
-                    agent.clone(),
-                    SessionEvent::ModelRequested {
-                        context,
-                        checkpoint: agent_context.projected.checkpoint,
-                        through: agent_context.projected.through(),
-                        tail: tail.clone().into_iter().collect(),
-                        history_lifetime: request.history_lifetime,
-                    },
-                )
-                .await?;
+            let requested = SessionEvent::ModelRequested {
+                context,
+                checkpoint: agent_context.projected.checkpoint,
+                through: agent_context.projected.through(),
+                tail: tail.clone().into_iter().collect(),
+                history_lifetime: request.history_lifetime,
+            };
+            let requested = self.request(agent, requested).await?;
             let mut transient_attempt = 0u64;
             let (requested, response) = 'attempts: loop {
                 if cancellation.is_cancelled() {
                     return Err(HarnessError::Interrupted);
                 }
-                self.activity(agent, AgentActivity::Working);
-                self.events.send(RuntimeEvent::Context {
+                self.store.post(RuntimeEvent::Context {
                     agent: agent.clone(),
                     usage: ContextUsage {
                         tokens: context_tokens,
@@ -144,7 +133,7 @@ impl SessionRuntime {
                 // any recovery wait.
                 let stream = agent_context.provider.invoke(request.clone());
                 let streamed = self.consume_stream(&turn, attempt, stream, |event| {
-                    self.events.send(RuntimeEvent::ResponseEvent {
+                    self.store.post(RuntimeEvent::ResponseEvent {
                         agent: agent.clone(),
                         request: requested.sequence.request(),
                         event: event.clone(),
@@ -168,7 +157,7 @@ impl SessionRuntime {
                         {
                             context_failures += 1;
                             if context_failures < compact::MAX_COMPACTION_ATTEMPTS {
-                                force_compaction = true;
+                                overflowed = true;
                                 continue 'requests;
                             }
                         }
@@ -211,13 +200,14 @@ impl SessionRuntime {
                 Some(HarnessError::EmptyResponse)
             };
             if let Some(error) = unusable {
-                let failure = TurnFailure::from(&error);
-                self.record_attempt(agent, attempt, usage, failure.clone())
-                    .await?;
-                self.events.send(RuntimeEvent::ResponseSettled {
+                let failure = Failure::from(&error);
+                let failed = crate::session::AttemptFailure::Final(failure.clone());
+                let failed = recovery::AttemptEnd::Failed(failed);
+                self.record_attempt(agent, attempt, usage, failed).await?;
+                self.store.post(RuntimeEvent::ResponseSettled {
                     agent: agent.clone(),
                     request: requested.sequence.request(),
-                    settlement: Settlement::Failed(failure),
+                    settlement: Settlement::Failed(failure.into()),
                 });
                 return Err(error);
             }
@@ -240,7 +230,7 @@ impl SessionRuntime {
                         },
                         Err(_) => SessionEvent::ModelFailed {
                             attempt,
-                            failure: Failure::Aborted,
+                            failure: crate::session::AttemptFailure::Final(Failure::Aborted),
                         },
                     });
                     events
@@ -249,25 +239,47 @@ impl SessionRuntime {
                         .collect()
                 }
             };
-            let origin = if let Some(job) = owner_job {
-                self.jobs
-                    .commit_child_message(agent, job, assistant, text.clone(), outcome)
-                    .await?
-            } else {
-                self.store
-                    .append_then(
-                        agent.clone(),
-                        SessionEvent::MessageCommitted { message: assistant },
-                        outcome,
-                    )
-                    .await?[0]
-                    .sequence
-                    .message()
+            let ends = calls.is_empty();
+            let (author, published) = (agent.clone(), text.clone());
+            let commit = move |state: &CoreState| {
+                // A response whose stream outlived an interrupt is discarded.
+                if !state.agents.busy(&author) {
+                    return Err(HarnessError::Interrupted);
+                }
+                let turn = author.clone();
+                let plan = match owner_job {
+                    Some(job) => {
+                        let (child, text) = (author, &published);
+                        crate::job::Jobs::child_message(
+                            state, child, job, assistant, text, outcome,
+                        )?
+                    }
+                    None => {
+                        let message = SessionEvent::MessageCommitted { message: assistant };
+                        let mut entries = vec![(author, message)];
+                        entries.extend(outcome(state.next_sequence()));
+                        Plan::new(entries, |_, records| records[0].sequence.message())
+                    }
+                };
+                Ok(plan.then(move |state| {
+                    if ends {
+                        state.agents.answered(&turn);
+                    }
+                }))
+            };
+            let origin = match self.store.commit(Command::Journal, commit).await {
+                Err(HarnessError::Interrupted) => {
+                    let interrupted = recovery::AttemptEnd::Interrupted;
+                    self.record_attempt(agent, attempt, usage, interrupted)
+                        .await?;
+                    return Err(HarnessError::Interrupted);
+                }
+                committed => committed?,
             };
             if aborted {
                 // Preserve completed visible/replay content, but never turn a
                 // provider abort into a successful agent turn.
-                self.events.send(RuntimeEvent::ResponseSettled {
+                self.store.post(RuntimeEvent::ResponseSettled {
                     agent: agent.clone(),
                     request: requested.sequence.request(),
                     settlement: Settlement::Aborted(origin),
@@ -279,50 +291,54 @@ impl SessionRuntime {
             if owner_job.is_none() || calls.is_empty() {
                 final_text.push_str(&text);
             }
-            self.events.send(RuntimeEvent::ResponseSettled {
+            self.store.post(RuntimeEvent::ResponseSettled {
                 agent: agent.clone(),
                 request: requested.sequence.request(),
                 settlement: Settlement::Committed(origin),
             });
             agent_context.meter.observe(input_estimate, usage);
-            // Decide once from the successful completed response, never from an
-            // estimate that includes newly produced tool results or queued input.
-            let compact_completed_response = agent_context.needs_compaction(usage);
-            let next_tail = agent_context.tail(self.runtime_state(&turn)).await;
+            let next_tail = agent_context.tail(|| self.runtime_state(&turn));
             // The next request is this one with the response in its history and a new tail.
             let tail_tokens = next_tail
                 .as_ref()
                 .map_or(0, |tail| estimate(&tail.render()));
             let previous_tail = request.tail.iter().map(estimate).sum::<u64>();
             let next = input_estimate + response_tokens + tail_tokens - previous_tail;
-            self.events.send(RuntimeEvent::Context {
+            self.store.post(RuntimeEvent::Context {
                 agent: agent.clone(),
                 usage: ContextUsage {
                     tokens: agent_context.meter.scale(next),
                     capacity: profile.max_context.get(),
                 },
             });
-            if compact_completed_response {
-                agent_context.refresh(&self.store, agent).await?;
+            // Decided from the committed response's reported occupancy, never from an
+            // estimate that includes newly produced tool results or queued input. An
+            // answer ends the turn's model work: what it would compact waits for the
+            // next request boundary.
+            agent_context.refresh(&self.store, agent)?;
+            if !ends && let Some(completed) = agent_context.compaction_due() {
                 let current = agent_context.request(next_tail.as_ref());
                 let compacted = async {
                     let (provider, meter) =
                         (agent_context.provider.as_mut(), &mut agent_context.meter);
                     let snapshot = &agent_context.profile;
-                    self.compact_history(&turn, provider, meter, snapshot, &current, Some(usage))
-                        .await?;
-                    agent_context.refresh(&self.store, agent).await?;
-                    // Persistence can finish after interruption, before any call has
-                    // a job for the interrupt path to cancel.
+                    self.compact_history(
+                        &turn,
+                        provider,
+                        meter,
+                        snapshot,
+                        &current,
+                        Some(completed),
+                    )
+                    .await?;
+                    agent_context.refresh(&self.store, agent)?;
                     if cancellation.is_cancelled() {
                         return Err(HarnessError::Interrupted);
                     }
                     Ok(())
                 }
                 .await;
-                if let Err(error) = &compacted
-                    && !calls.is_empty()
-                {
+                if let Err(error) = &compacted {
                     // The response is durable, but none of its calls ran. Close the
                     // exchange so a later request never sends unanswered calls.
                     let error = format!("not executed: the turn ended during compaction: {error}");
@@ -339,7 +355,6 @@ impl SessionRuntime {
                 context_sequence = None;
             }
             if !calls.is_empty() {
-                self.activity(agent, AgentActivity::Tools);
                 // Every call's job exists, in call order, before any runs: a `wait`
                 // in this response must see its sibling calls as outstanding work.
                 let mut created = Vec::with_capacity(calls.len());
@@ -362,6 +377,13 @@ impl SessionRuntime {
                         .await
                     });
                 }
+                // A call that ended without a job ends it for a `wait` beside it.
+                if created
+                    .iter()
+                    .any(|call| matches!(call, CreatedCall::Settled(_)))
+                {
+                    self.jobs.settled_jobless(agent, origin);
+                }
                 // Each result commits as its call finishes, so a crash keeps every
                 // completed result; history merges them back into call order.
                 let mut calls: futures_util::stream::FuturesUnordered<_> =
@@ -369,46 +391,39 @@ impl SessionRuntime {
                 // Drain every call even after a failed commit; results that could not
                 // commit are settled as interrupted when the session resumes.
                 let mut committed = Ok(());
-                while let Some(result) = futures_util::StreamExt::next(&mut calls).await {
+                while let Some((result, acknowledges)) =
+                    futures_util::StreamExt::next(&mut calls).await
+                {
                     if committed.is_ok() {
-                        committed = self
-                            .commit(agent, Message::Tool(vec![result]))
-                            .await
-                            .map(drop);
+                        committed = self.commit_result(agent, result, acknowledges).await;
                     }
                 }
                 committed?;
             }
             provider_attempt = 0;
             context_failures = 0;
-            if calls.is_empty() {
+            // A response without tools is a request boundary too: what waits for
+            // the turn then precedes a stale answer.
+            if calls.is_empty() && self.rejoin(agent).await {
                 // Events that arrived during the request precede the answer.
-                if let Some((content, pending)) = self
-                    .pending_event_content(agent, turn.diagnostic_viewer())
-                    .await?
-                {
-                    pending.commit(Message::User(vec![content])).await?;
-                    final_text.clear();
-                    // The invocation continues, so the silent answer needs its wake now.
-                    if let Some(job) = owner_job {
-                        self.jobs.notify_owner(job).await;
-                    }
-                    continue 'requests;
-                }
-                // A response without tools is a request boundary too: consume prompts
-                // received in flight before returning a stale answer.
-                if self
-                    .consume_queued_inputs(&mut turn, agent_context, settings, rx, deferred)
-                    .await
+                let viewer = turn.diagnostic_viewer();
+                let delivered = self.deliver_events(agent, viewer).await?.is_some();
+                if delivered
+                    || self
+                        .consume_queued_inputs(&mut turn, agent_context, settings)
+                        .await
                 {
                     context_sequence = None;
                     final_text.clear();
+                    // The invocation continues, so the silent answer needs its wake now.
                     if let Some(job) = owner_job {
-                        self.jobs.notify_owner(job).await;
+                        self.jobs.notify_owner(job).await?;
                     }
                     continue 'requests;
                 }
-                self.events.send(RuntimeEvent::TurnCompleted {
+            }
+            if calls.is_empty() {
+                self.store.post(RuntimeEvent::TurnCompleted {
                     agent: agent.clone(),
                 });
                 return Ok(final_text);
@@ -422,10 +437,9 @@ pub(super) type Streamed =
     Result<(crate::provider::protocol::Completion, Usage), (ProviderError, Usage)>;
 
 impl SessionRuntime {
-    async fn runtime_state(&self, turn: &TurnContext<'_>) -> UserPart {
+    fn runtime_state(&self, turn: &TurnContext<'_>) -> UserPart {
         let (agent, capabilities) = (turn.agent, &turn.capabilities);
-        state::runtime_state_content(&self.jobs, &self.todos, agent, capabilities, turn.location)
-            .await
+        state::runtime_state_content(&self.jobs, &self.store, agent, capabilities, turn.location)
     }
 
     /// Stream one attempt to its end, handing each event to `observe`. Cancellation
@@ -441,12 +455,14 @@ impl SessionRuntime {
     ) -> Result<Streamed, HarnessError> {
         let mut live = LiveResponse::default();
         loop {
+            // An interrupt that lands before a poll wins even over a ready stream.
             let event = tokio::select! {
-                event = stream.next() => event,
+                biased;
                 () = turn.cancellation.cancelled() => {
-                    self.record_attempt(turn.agent, attempt, live.usage(), TurnFailure::Interrupted).await?;
+                    self.record_attempt(turn.agent, attempt, live.usage(), recovery::AttemptEnd::Interrupted).await?;
                     return Err(HarnessError::Interrupted);
                 },
+                event = stream.next() => event,
             };
             let checked = |event: ResponseEvent| event.checked().map_err(ProviderError::from);
             let event = match event.map(|event| event.and_then(checked)) {
@@ -493,13 +509,14 @@ pub(super) fn refusal_detail(text: &str) -> String {
 mod tests {
     use super::*;
     use crate::agent::runtime::tests::*;
+    use crate::session::AttemptFailure;
 
     /// A decoded response that ends in a refusal, as a content filter produces.
     fn refusal(items: Vec<AssistantItem>) -> Vec<ResponseEvent> {
         cut(items, CutReason::Refusal)
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn unusable_responses_fail_the_turn_without_committing_or_retrying() {
         // A stream that closes before its authoritative end.
         let incomplete = vec![delta("answer", ItemKind::Text, "must not persist")];
@@ -552,12 +569,13 @@ mod tests {
             let failure = session.prompt("hello").await.unwrap_err().to_string();
             assert!(failure.contains(expected), "unexpected failure: {failure}");
             assert_eq!(requests.lock().unwrap().len(), 1, "{expected}: retried");
-            let records = session.runtime.store.records().await;
+            let records = session.runtime.store.records();
             // An error state, never conversation history or an executed tool.
             assert_eq!(assistant_commits(&records), 0);
             assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
-            let failed =
-                events!(&records, SessionEvent::ModelFailed { failure, .. } => failure.clone());
+            let failed = events!(&records, SessionEvent::ModelFailed {
+                failure: AttemptFailure::Final(failure), ..
+            } => failure.clone());
             assert_eq!(failed.len(), 1);
             assert_eq!(matches!(failed[0], Failure::Refused(_)), refused);
             assert!(failed[0].to_string().contains(expected), "{failed:?}");
@@ -566,10 +584,6 @@ mod tests {
             assert_eq!(
                 count!(&records, SessionEvent::ModelAttemptStarted { .. }),
                 1
-            );
-            assert_eq!(
-                count!(&records, SessionEvent::ModelRecoveryScheduled { .. }),
-                0
             );
             let id = session.id();
             shutdown_session(session).await;
@@ -594,7 +608,7 @@ mod tests {
             session.prompt("delegate").await.unwrap(),
             "child could not proceed"
         );
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         // The parent sees a failed agent carrying the refusal message.
         let results = events!(
             &records,
@@ -625,8 +639,13 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(
-            count!(&child_records, SessionEvent::ModelFailed { failure, .. }
-                if matches!(failure, Failure::Refused(_))),
+            count!(
+                &child_records,
+                SessionEvent::ModelFailed {
+                    failure: AttemptFailure::Final(Failure::Refused(_)),
+                    ..
+                }
+            ),
             1
         );
         assert_eq!(count!(&child_records, SessionEvent::AgentFailed { .. }), 1);
@@ -643,7 +662,7 @@ mod tests {
         let (_root, requests, session) =
             scripted_session([response(items.clone()), answer("done")]).await;
         assert_eq!(session.prompt("hello").await.unwrap(), "alpha beta");
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let committed = events!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(content) } => content.clone());
         assert_eq!(committed, vec![items.clone()]);
         assert_eq!(session.prompt("again").await.unwrap(), "done");
@@ -667,7 +686,7 @@ mod tests {
     async fn successful_responses_journal_their_outcome() {
         let (_root, _requests, session) = scripted_session([answer("done")]).await;
         assert_eq!(session.prompt("hello").await.unwrap(), "done");
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let outcomes = events!(
             &records,
             SessionEvent::ResponseCompleted { outcome, .. } => *outcome
@@ -687,21 +706,27 @@ mod tests {
         let mut events = vec![ResponseEvent::Usage(observed)];
         events.extend(cut(retained.clone(), CutReason::Aborted));
         let (_root, requests, session) = scripted_session([events]).await;
-        let mut events = session.runtime.events.observe().updates;
+        let mut events = session.runtime.store.observe().updates;
         let error = session.prompt("Abort this turn.").await.unwrap_err();
         assert!(matches!(error, HarnessError::ProviderAborted));
         assert_eq!(
-            session.runtime.events.observe().snapshot.activity[&session.root].state,
-            AgentActivity::Stopped(Failure::Aborted.into())
+            session.runtime.store.observe().snapshot.activity[&session.root].state,
+            crate::agent::AgentActivity::Stopped(Failure::Aborted.into())
         );
         assert_eq!(requests.lock().unwrap().len(), 1);
         assert_eq!(journaled_usage(&session).await, observed);
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let assistants = events!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(items) } => items.clone());
         assert_eq!(assistants, vec![retained]);
         assert_eq!(count!(&records, SessionEvent::Usage { .. }), 1);
         assert_eq!(
-            count!(&records, SessionEvent::ModelFailed { failure, .. } if *failure == Failure::Aborted),
+            count!(
+                &records,
+                SessionEvent::ModelFailed {
+                    failure: AttemptFailure::Final(Failure::Aborted),
+                    ..
+                }
+            ),
             1
         );
         assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
@@ -800,7 +825,7 @@ mod tests {
         let (found, ()) = bounded(async {
             tokio::join!(session.prompt("Run the tool."), async {
                 script.request(1).await;
-                let records = session.runtime.store.records().await;
+                let records = session.runtime.store.records();
                 assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
                 assert_eq!(
                     count!(
@@ -821,7 +846,7 @@ mod tests {
         let executions = fs::read_to_string(root.path().join("executions")).await;
         // compaction must not re-execute the tool
         assert_eq!(executions.unwrap(), "executed\n");
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         use ModelPurpose::{Agent, Compaction};
         assert_eq!(purposes(&records), vec![Agent, Compaction, Agent]);
         let position = |matches: &dyn Fn(&SessionEvent) -> bool| {
@@ -933,7 +958,7 @@ mod tests {
         .await;
         seed_history(&session, 6_000).await;
         assert_eq!(session.prompt("Continue the task.").await.unwrap(), "done");
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
         assert_eq!(
             events!(&records, SessionEvent::TodosReplaced { items } => items.clone()),
@@ -992,8 +1017,6 @@ mod tests {
 
     #[tokio::test]
     async fn interruption_during_compaction_persistence_settles_unexecuted_calls() {
-        use crate::session::AppendBoundary;
-
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
         let script = Script::new(
@@ -1012,24 +1035,109 @@ mod tests {
             tokio::join!(session.prompt("Run the tool."), async {
                 script.request(1).await;
                 let store = &session.runtime.store;
-                let (usage, resume_usage) = store.pause_append_at(AppendBoundary::Write).await;
+                let (usage, resume_usage) = store.pause_committed(|_| true).await;
                 script.release(1);
                 usage.await.unwrap();
                 // Queue the next gate before releasing usage persistence: it must
                 // catch the checkpoint, after the summary has completed.
-                let persistence = store.pause_append_at(AppendBoundary::Write);
+                let persistence = store.pause_committed(|_| true);
                 tokio::pin!(persistence);
                 assert!(futures_util::poll!(&mut persistence).is_pending());
                 resume_usage.send(()).unwrap();
                 let (persisting, resume) = persistence.await;
                 persisting.await.unwrap();
-                assert_eq!(session.interrupt().await, 1);
-                resume.send(()).unwrap();
+                // Queued behind the checkpoint's commit.
+                assert_eq!(interrupt_behind(&session, resume).await, 1);
             })
         })
         .await;
         assert!(matches!(result, Err(HarnessError::Interrupted)));
         assert_calls_settled_unexecuted(root.path(), &requests, session, 1).await;
+    }
+
+    /// A turn interrupted once its response commits makes none of its calls.
+    #[tokio::test]
+    async fn interruption_after_a_response_commits_settles_unexecuted_calls() {
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let steps = [
+            Step::new(shell_response()).gated(),
+            Step::new(answer("retry done")),
+        ];
+        let script = Script::new(steps, &requests);
+        let harness =
+            test_harness(root.path(), &root.path().join("sessions"), script.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let (result, ()) = bounded(async {
+            tokio::join!(session.prompt("Run the tool."), async {
+                script.request(0).await;
+                let store = &session.runtime.store;
+                let (committing, resume) = store.pause_committed(|_| true).await;
+                script.release(0);
+                committing.await.unwrap();
+                // Queued behind the response's commit, ahead of its calls.
+                assert_eq!(interrupt_behind(&session, resume).await, 1);
+            })
+        })
+        .await;
+        assert!(matches!(result, Err(HarnessError::Interrupted)));
+        assert_calls_settled_unexecuted(root.path(), &requests, session, 0).await;
+    }
+
+    /// An interrupt takes effect at the response's commit. A turn it held while
+    /// its response still streamed has that response discarded, however the
+    /// stream ends, and its attempt journaled interrupted. Applied behind the
+    /// answer's commit, it finds nothing to stop, and the answer stands.
+    #[tokio::test]
+    async fn an_interrupt_stops_a_turn_until_its_answer_commits() {
+        let steps = [
+            Step::new(answer("answer")).midstream(),
+            Step::new(Vec::new()).midstream(),
+        ];
+        let provider = Script::new(steps, &Requests::default());
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let prompt = spawn_prompt(&session, "task");
+        provider.held(0).await;
+        // A host call's child holds the streaming root.
+        let (executor, owner) = (session.runtime.executor.clone(), session.root.clone());
+        let arguments = json!({"prompt": "child task"});
+        let host =
+            tokio::spawn(async move { executor.execute(owner, "agent", arguments, None).await });
+        provider.held(1).await;
+        assert_eq!(session.interrupt().await, 2);
+        assert_eq!(turn(&session, &session.root), Turn::Held);
+        provider.release(0);
+        let result = bounded(prompt).await.unwrap();
+        assert!(
+            matches!(result, Err(HarnessError::Interrupted)),
+            "{result:?}"
+        );
+        let records = session.runtime.store.records();
+        let root_records = records.iter().filter(|record| record.agent == session.root);
+        let interrupted = count!(root_records, SessionEvent::ModelAttemptInterrupted(_));
+        assert_eq!((assistant_commits(&records), interrupted), (0, 1));
+        session.shutdown().await.unwrap();
+        assert!(bounded(host).await.unwrap().is_err());
+
+        let (_root, _requests, session) = scripted_session([answer("answer")]).await;
+        let store = session.runtime.store.clone();
+        let answered: fn(&SessionEvent) -> bool = |event| {
+            matches!(
+                event,
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(_)
+                }
+            )
+        };
+        let (reached, resume) = store.pause_committed(answered).await;
+        let prompt = spawn_prompt(&session, "task");
+        bounded(reached).await.unwrap();
+        assert_eq!(interrupt_behind(&session, resume).await, 0);
+        assert_eq!(bounded(prompt).await.unwrap().unwrap(), "answer");
+        session.shutdown().await.unwrap();
     }
 
     /// The response's call never ran, its exchange is closed with an error result, and
@@ -1041,7 +1149,7 @@ mod tests {
         compactions: usize,
     ) {
         assert!(!root.join("executions").exists());
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         assert_eq!(
             count!(&records, SessionEvent::Compaction { .. }),
             compactions
@@ -1057,14 +1165,14 @@ mod tests {
         assert_eq!(session.prompt("Continue.").await.unwrap(), "retry done");
         let expected = Message::Tool(results.clone()).render();
         assert!(
-            requests.lock().unwrap()[2]
+            (requests.lock().unwrap().last().unwrap())
                 .messages()
                 .any(|message| message == &expected)
         );
         shutdown_session(session).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn state_mode_persists_or_omits_runtime_state() {
         use crate::provider::profile::StateMode;
         let state = |message: &&Sent| {
@@ -1111,6 +1219,120 @@ mod tests {
         }
     }
 
+    /// An answered turn goes on only for work the session lets it take: one that
+    /// runs on in a session an interrupt paused leaves what became pending
+    /// during its answer for the next request.
+    #[tokio::test]
+    async fn a_turn_running_on_while_paused_leaves_deliveries_at_its_answer() {
+        let child = json!({"prompt": "child task", "depth": 0});
+        let steps = [
+            Step::new(response(vec![tool_call(0, "agent-0", "agent", child)])),
+            Step::new(Vec::new()).midstream(),
+            Step::new(answer("done")).gated(),
+            Step::new(answer("again")),
+        ];
+        let provider = Script::new(steps, &Requests::default());
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let parent = spawn_prompt(&session, "delegate");
+        provider.request(1).await;
+        root_waiting(&session).await;
+        assert_eq!(session.interrupt().await, 2);
+        // Cancelling the held child lets the root run on, the session still paused.
+        let job = session.runtime.jobs.list(&session.root)[0].id;
+        session.runtime.jobs.cancel(job).await.unwrap();
+        provider.request(2).await;
+        let arguments = json!({"source": "return 1", "bg": true});
+        let executor = &session.runtime.executor;
+        let script = executor.execute(session.root.clone(), "script", arguments, None);
+        let script = script.await.unwrap().job;
+        bounded(session.runtime.jobs.wait_settled(script))
+            .await
+            .unwrap();
+        provider.release(2);
+        assert_eq!(bounded(parent).await.unwrap().unwrap(), "done");
+        assert!(pending(&session, &session.root));
+        assert!(!provider.requested_from(3));
+        session.shutdown().await.unwrap();
+    }
+
+    /// A call's result commits with the acknowledgement of the outcome it
+    /// reports. One that never commits, as when the process dies between them,
+    /// leaves the outcome for delivery once the session reopens; one that
+    /// commits is not reported again.
+    #[tokio::test]
+    async fn a_result_acknowledges_the_outcome_it_reports_as_it_commits() {
+        for commits in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let sessions = root.path().join("sessions");
+            let requests = Requests::default();
+            let shell = tool_call(0, "shell", "exec", json!({"command": "true"}));
+            let steps = [response(vec![shell]), answer("done")];
+            let provider = scripted_provider(&requests, steps);
+            let harness = test_harness(root.path(), &sessions, provider).await;
+            let session = harness.new_session().await.unwrap();
+            let store = &session.runtime.store;
+            let refused = (!commits)
+                .then(|| crate::session::tests::refuse(store, "BEFORE INSERT ON tool_result"));
+            assert_eq!(session.prompt("run").await.is_ok(), commits);
+            drop(refused);
+            let id = session.id();
+            // A refused result stops the session, which reports it.
+            assert_eq!(bounded(session.shutdown()).await.is_ok(), commits);
+            assert_eq!(session.close().await.is_ok(), commits);
+            let resumed = harness.resume_session(id).await.unwrap();
+            resumed.running().await.unwrap();
+            let receipt = resumed.runtime.jobs.pending_delivery(&resumed.root);
+            let receipt = receipt.await.unwrap();
+            let pending = (receipt.envelopes().iter()).map(|job| (job.tool.as_str(), job.state));
+            let expected = (!commits).then_some(("exec", crate::job::JobState::Completed));
+            assert_eq!(pending.collect::<Vec<_>>(), Vec::from_iter(expected));
+            drop(receipt);
+            shutdown_session(resumed).await;
+        }
+    }
+
+    /// A `jobs` read is acknowledged with its own finish. A crash before the
+    /// model's result commits leaves that finish unread, so reopening delivers
+    /// the read once, in its outcome, and never the outcome it read again.
+    #[tokio::test]
+    async fn a_read_cut_off_from_its_result_is_delivered_once_on_reopen() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let read = tool_call(0, "read", "jobs", json!({"job": 1}));
+        let provider = Script::new([Step::new(response(vec![read])).gated()], &requests);
+        let harness = test_harness(root.path(), &sessions, provider.clone()).await;
+        let session = harness.new_session().await.unwrap();
+        let prompt = spawn_prompt(&session, "read it");
+        provider.request(0).await;
+        let arguments = json!({"source": "return 1", "bg": true});
+        let executor = &session.runtime.executor;
+        let script = executor.execute(session.root.clone(), "script", arguments, None);
+        let script = script.await.unwrap().job;
+        bounded(session.runtime.jobs.wait_settled(script))
+            .await
+            .unwrap();
+        let store = &session.runtime.store;
+        let refused = crate::session::tests::refuse(store, "BEFORE INSERT ON tool_result");
+        provider.release(0);
+        assert!(bounded(prompt).await.unwrap().is_err());
+        drop(refused);
+        let id = session.id();
+        assert!(bounded(session.shutdown()).await.is_err());
+        assert!(session.close().await.is_err());
+        let resumed = harness.resume_session(id).await.unwrap();
+        resumed.running().await.unwrap();
+        let receipt = resumed.runtime.jobs.pending_delivery(&resumed.root);
+        let receipt = receipt.await.unwrap();
+        let pending = (receipt.envelopes().iter()).map(|job| job.tool.as_str());
+        assert_eq!(pending.collect::<Vec<_>>(), ["jobs"]);
+        drop(receipt);
+        shutdown_session(resumed).await;
+    }
+
     #[tokio::test]
     async fn only_compaction_summaries_end_their_history() {
         use crate::provider::protocol::HistoryLifetime::*;
@@ -1124,7 +1346,7 @@ mod tests {
         .await;
         seed_history(&session, 6_000).await;
         assert_eq!(session.prompt("Run both tools.").await.unwrap(), "done");
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let requests: Vec<_> = records
             .iter()
             .filter_map(|record| match &record.event {
@@ -1153,33 +1375,66 @@ mod tests {
         shutdown_session(session).await;
     }
 
-    #[tokio::test(start_paused = true)]
-    async fn high_usage_final_response_compacts_before_returning_original_text() {
+    /// A final answer over the threshold leaves busy in its own commit, so an
+    /// interrupt behind it finds nothing to stop. The compaction it triggers is due
+    /// from the journal: after a reopen, the next turn compacts before its first
+    /// request, and an interrupt during that compaction leaves it due for `continue`.
+    #[tokio::test]
+    async fn high_usage_final_answer_stands_and_the_next_turn_compacts_first() {
         let final_answer = with_usage(answer("original final"), &[threshold_usage()]);
         let summary = answer(summary_json().to_string());
         let summary = with_usage(summary, &[usage(1_000_000, 0, 1)]);
-        let (_root, requests, session) = scripted_session([final_answer, summary]).await;
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let provider = scripted_provider(&requests, [final_answer, summary, answer("next")]);
+        let harness = test_harness(root.path(), &root.path().join("sessions"), provider).await;
+        let session = harness.new_session().await.unwrap();
         seed_history(&session, 6_000).await;
-        assert_eq!(session.prompt("Finish.").await.unwrap(), "original final");
-        // Live state must already show the reduced context, without further catch-up.
-        let observation = session.runtime.events.observe().snapshot;
-        let records = session.runtime.store.records().await;
+        let answered: fn(&SessionEvent) -> bool = |event| {
+            matches!(
+                event,
+                SessionEvent::MessageCommitted {
+                    message: Message::Assistant(_)
+                }
+            )
+        };
+        let (reached, resume) = session.runtime.store.pause_committed(answered).await;
+        let prompt = spawn_prompt(&session, "Finish.");
+        bounded(reached).await.unwrap();
+        assert_eq!(interrupt_behind(&session, resume).await, 0);
+        assert_eq!(bounded(prompt).await.unwrap().unwrap(), "original final");
+        let records = session.runtime.store.records();
+        assert_eq!(purposes(&records), vec![ModelPurpose::Agent]);
+
+        let id = session.id();
+        shutdown_session(session).await;
+        let session = harness.resume_session(id).await.unwrap();
+        let compacting: fn(&SessionEvent) -> bool = |event| {
+            matches!(event, SessionEvent::ModelContext { context }
+                if context.purpose == ModelPurpose::Compaction)
+        };
+        let (reached, resume) = session.runtime.store.pause_committed(compacting).await;
+        let prompt = spawn_prompt(&session, "Next.");
+        bounded(reached).await.unwrap();
+        assert_eq!(interrupt_behind(&session, resume).await, 1);
+        let interrupted = bounded(prompt).await.unwrap();
+        assert!(matches!(interrupted, Err(HarnessError::Interrupted)));
+        let records = session.runtime.store.records();
+        assert_eq!(purposes(&records), vec![ModelPurpose::Agent]);
+
+        assert_eq!(bounded(session.continue_turn()).await.unwrap(), "next");
+        let records = session.runtime.store.records();
         let found = purposes(&records);
-        assert_eq!(found, vec![ModelPurpose::Agent, ModelPurpose::Compaction]);
+        let expected = [
+            ModelPurpose::Agent,
+            ModelPurpose::Compaction,
+            ModelPurpose::Agent,
+        ];
+        assert_eq!(found, expected);
         let checkpoint = events!(&records, SessionEvent::Compaction { checkpoint } => checkpoint);
-        let checkpoint = checkpoint[0];
-        let context = observation.context.get(&session.root).unwrap();
-        assert!(checkpoint.after_tokens < checkpoint.before_tokens);
-        // final-response compaction must refresh live occupancy before returning
-        assert_eq!(context.tokens, checkpoint.after_tokens);
-        assert_eq!(context.capacity, 128_000);
+        assert!(checkpoint[0].after_tokens < checkpoint[0].before_tokens);
         {
             let captured = requests.lock().unwrap();
-            assert_eq!(captured.len(), 2);
-            // The summary's reported prompt size calibrates both sides of the checkpoint.
-            let estimate = super::super::compaction::estimate_request;
-            let scaled = estimate(&captured[0]) * 1_000_000 / estimate(&captured[1]);
-            assert!(checkpoint.before_tokens >= scaled);
             assert!(captured[0].response_schema.is_none());
             assert!(captured[1].response_schema.is_some());
             assert!(captured[1].messages().any(|message| matches!(message,
@@ -1188,7 +1443,7 @@ mod tests {
         shutdown_session(session).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn oversized_history_or_tool_result_with_low_completed_usage_does_not_compact() {
         for tool_result in [false, true] {
             let low = with_usage(answer("done"), &[usage(10, 5, 1)]);
@@ -1216,7 +1471,7 @@ mod tests {
                 seed_history(&session, 100_000).await;
             }
             assert_eq!(session.prompt("Use the result.").await.unwrap(), "done");
-            let records = session.runtime.store.records().await;
+            let records = session.runtime.store.records();
             assert_eq!(purposes(&records), vec![ModelPurpose::Agent]);
             assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
             let estimate = super::super::compaction::estimate_request(&requests.lock().unwrap()[0]);
@@ -1225,7 +1480,7 @@ mod tests {
         }
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn usage_with_cache_writes_above_input_fails_the_response_with_the_last_valid_usage() {
         // Cache writes may equal input, never exceed it.
         let valid = Usage {
@@ -1239,7 +1494,8 @@ mod tests {
         let rejected = |events| with_usage(events, &[valid, invalid]);
         for compaction in [false, true] {
             let responses = if compaction {
-                // The answer commits; the summary its usage asks for is rejected.
+                // The answer stands; the summary its usage asks for, before the
+                // next turn's request, is rejected.
                 let summary = rejected(answer(summary_json().to_string()));
                 vec![with_usage(answer("final"), &[threshold_usage()]), summary]
             } else {
@@ -1248,8 +1504,9 @@ mod tests {
             let (root, requests, session) = scripted_session(responses).await;
             if compaction {
                 seed_history(&session, 6_000).await;
+                assert_eq!(session.prompt("Answer.").await.unwrap(), "final");
             }
-            let mut observed = session.runtime.events.observe().updates;
+            let mut observed = session.runtime.store.observe().updates;
             let error = session.prompt("Finish.").await.unwrap_err();
             let protocol = crate::provider::ProviderErrorKind::Protocol;
             assert!(
@@ -1257,7 +1514,7 @@ mod tests {
                 "{error:?}"
             );
             assert_eq!(requests.lock().unwrap().len(), 1 + usize::from(compaction));
-            let records = session.runtime.store.records().await;
+            let records = session.runtime.store.records();
             let expected = if compaction {
                 vec![ModelPurpose::Agent, ModelPurpose::Compaction]
             } else {
@@ -1300,7 +1557,7 @@ mod tests {
         let (_root, _, session) = scripted_session(responses).await;
         seed_history(&session, 6_000).await;
         assert_eq!(session.prompt("Run then finish.").await.unwrap(), "done");
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let found = purposes(&records);
         assert_eq!(found, vec![ModelPurpose::Agent, ModelPurpose::Agent]);
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);

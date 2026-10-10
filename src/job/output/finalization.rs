@@ -2,26 +2,29 @@
 //! IO completion is not JSON validity or terminal publication. Validate first,
 //! then install the existing compact document/fields references in one owner.
 use super::*;
+use crate::tool::output::FieldPresentation;
 use std::io;
 
 fn invalid(message: impl Into<String>) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.into())
 }
 
-/// Persist a terminal product, referencing only its explicitly completed captures.
+/// Prepare a terminal product, referencing only its explicitly completed captures.
 /// JSON containers are referenced; JSON scalars are decoded inline. Existing
 /// null/bool/number fields remain authoritative. Known kinds can install a missing
 /// field; Unknown kinds reference only an existing string or container shape.
 ///
 /// A receipt that fails validation never fails the terminal product: its capture
-/// stays unreferenced and is reported incomplete. Only persistence failures are errors.
-pub(crate) fn save_completed(
+/// stays unreferenced and is reported incomplete. Only reading a capture it
+/// references can fail, a storage failure. The fields the schema declares join
+/// the `presented` the producer reported.
+pub(crate) fn prepare_completed(
     output: &Output,
     schema: &Value,
-    result: Option<Value>,
-    captures_complete: bool,
+    (result, captures_complete): (Option<Value>, bool),
     completed: Vec<CompletedCapture>,
-) -> Result<(), ToolError> {
+    mut presented: Presented,
+) -> io::Result<OutputRows> {
     // An unreadable inventory leaves every receipt unbound (and so incomplete).
     let saved = Saved::load(output).ok();
     let empty = BTreeMap::new();
@@ -67,11 +70,8 @@ pub(crate) fn save_completed(
         if kind == CaptureKind::Text || value.is_array() || value.is_object() {
             references.insert(field.clone());
         }
+        // Unknown registrations resolve only for admitted receipts.
         kinds.push((id, kind));
-    }
-    // Unknown registrations resolve only for admitted receipts.
-    for (id, kind) in kinds {
-        output.db.resolve_capture_kind(id, kind).map_err(database)?;
     }
     let root = FieldPointer::result();
     // Cut-off output is never taken as JSON, however it happens to end.
@@ -79,24 +79,27 @@ pub(crate) fn save_completed(
         true => projection::json_text_fields(&document["result"], &root, schema),
         false => BTreeSet::new(),
     };
-    let mut presented: Presented =
-        (projection::presented_fields(&document["result"], &root, schema).into_iter()).collect();
+    presented.extend(projection::presented_fields(
+        &document["result"],
+        &root,
+        schema,
+    ));
     // A result with an output diagnostic saves its slot as null; presentation
     // renders each viewer's diagnostic into it, whole.
     let slot = diagnostic_slot();
     if document.pointer(slot.as_str()) == Some(&Value::Null) {
-        presented.complete.insert(slot);
+        presented.insert(slot, FieldPresentation::Complete);
     }
     let result = has_result.then(|| document["result"].take());
-    save_document(
+    prepare_document(
         output,
         registered,
-        result,
-        captures_complete,
-        &Stored {
+        (result, captures_complete),
+        kinds,
+        Stored {
             referenced: &references,
             candidates: &candidates,
-            presented: &presented,
+            presented,
         },
     )
 }
@@ -258,6 +261,7 @@ fn slot<'a>(cursor: &'a mut Value, key: &str) -> &'a mut Value {
 mod tests {
     use super::*;
     use crate::job::{JobSpec, tests::runtime};
+    use crate::tool::ToolOutput;
 
     /// Two running jobs of one session: receipts are bound to exactly one of them.
     async fn outputs() -> (tempfile::TempDir, JobManager, Output, Output) {
@@ -288,6 +292,17 @@ mod tests {
         writer.finish().unwrap()
     }
 
+    /// Complete `output`'s job with `result` and the receipts `captures`.
+    async fn finish(
+        manager: &JobManager,
+        output: &Output,
+        result: Value,
+        captures: Vec<CompletedCapture>,
+    ) {
+        let completed = ToolOutput::new(result).with_captures(captures);
+        manager.test_complete(output.job, completed).await;
+    }
+
     fn pointer(field: &str) -> FieldPointer {
         field.parse().unwrap()
     }
@@ -302,21 +317,14 @@ mod tests {
 
     #[tokio::test]
     async fn completed_receipts_install_omitted_fields_and_preserve_existing_wire_references() {
-        let (_root, _manager, output, _) = outputs().await;
+        let (_root, manager, output, _) = outputs().await;
         let captures = [
             ("/result/text", CaptureKind::Text, "é\ntext".as_bytes()),
             ("/result/matches", CaptureKind::Json, br#"{"a":[1,true]}"#),
             ("/result/a~1b/~0key", CaptureKind::Json, br#"[null,"x"]"#),
         ]
         .map(|(field, kind, bytes)| completed(&output, field, kind, bytes));
-        save_completed(
-            &output,
-            &json!(true),
-            Some(json!({})),
-            true,
-            captures.into(),
-        )
-        .unwrap();
+        finish(&manager, &output, json!({}), captures.into()).await;
         let document = document(&output);
         assert_eq!(
             document["result"],
@@ -355,15 +363,7 @@ mod tests {
             ("utf8", &b"ok\xff"[..]),
             ("ancestor", &b"valid"[..]),
         ] {
-            let (_root, _manager, output, other) = outputs().await;
-            save_completed(
-                &output,
-                &json!(true),
-                Some(json!({"prior":true})),
-                false,
-                Vec::new(),
-            )
-            .unwrap();
+            let (_root, manager, output, other) = outputs().await;
             let kind = if failure == "json" {
                 CaptureKind::Json
             } else {
@@ -400,8 +400,7 @@ mod tests {
                 _ => {}
             }
             let target = if failure == "job" { &other } else { &output };
-            let product = Some(json!({"scalar":"text"}));
-            save_completed(target, &json!(true), product, true, proofs).expect(failure);
+            finish(&manager, target, json!({"scalar":"text"}), proofs).await;
             let document = document(target);
             assert_eq!(document["result"]["scalar"], "text", "{failure}");
             assert!(document.pointer(field).is_none(), "{failure}");
@@ -463,7 +462,7 @@ mod tests {
     #[tokio::test]
     async fn unknown_uses_existing_shape_only_and_preserves_scalar_or_absent_inventory() {
         for kind in [CaptureKind::Unknown, CaptureKind::Text, CaptureKind::Json] {
-            let (_root, _manager, output, _) = outputs().await;
+            let (_root, manager, output, _) = outputs().await;
             let unknown = kind == CaptureKind::Unknown;
             let initial =
                 json!({"text":"", "object":{}, "array":[], "null":null, "bool":true,"number":4});
@@ -485,7 +484,7 @@ mod tests {
                 .chain(scalars)
                 .map(|(field, bytes)| completed(&output, &format!("/result/{field}"), kind, bytes))
                 .collect();
-            save_completed(&output, &json!(true), Some(initial.clone()), true, captures).unwrap();
+            finish(&manager, &output, initial.clone(), captures).await;
             let hydrated = hydrate(&saved(&output), document(&output)).unwrap();
             if unknown {
                 assert_eq!(hydrated["result"]["text"], r#"{"looks":"json"}"#);
@@ -511,7 +510,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_capture_is_neither_adopted_nor_overwritten_by_ordinary_results() {
-        let (_root, _manager, output, _) = outputs().await;
+        let (_root, manager, output, _) = outputs().await;
         let _unreferenced = completed(
             &output,
             "/result/raw",
@@ -519,7 +518,7 @@ mod tests {
             b"abandoned raw bytes",
         );
         let result = json!({"raw":"ordinary value".repeat(1000)});
-        save_completed(&output, &json!(true), Some(result.clone()), true, vec![]).unwrap();
+        finish(&manager, &output, result.clone(), vec![]).await;
         assert_eq!(document(&output)["result"], result);
         assert!(output.test_fields().is_empty());
         assert_eq!(

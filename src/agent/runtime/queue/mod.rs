@@ -90,15 +90,36 @@ pub(super) struct QueuedInput {
 }
 
 impl QueuedInput {
-    fn reject(self, error: HarnessError) {
+    pub(super) fn reject(self, error: HarnessError) {
         let _ = self.cancellation.cancel();
         let _ = self.committed.send(Err(error));
     }
 }
 
 /// Resolves once the input's user message is committed to history, not when
-/// the model turn ends. A closed receipt means the runtime stopped first.
-pub type QueuedPromptReceipt = oneshot::Receiver<Result<(), HarnessError>>;
+/// the model turn ends, or with why it never will be: an input the session
+/// dropped unclaimed reports the session's refusal, or the root agent stopped.
+pub struct QueuedPromptReceipt {
+    committed: oneshot::Receiver<Result<(), HarnessError>>,
+    store: crate::session::WeakStore,
+}
+
+impl std::future::IntoFuture for QueuedPromptReceipt {
+    type Output = Result<(), HarnessError>;
+    type IntoFuture = futures_util::future::BoxFuture<'static, Self::Output>;
+
+    fn into_future(self) -> Self::IntoFuture {
+        Box::pin(async move {
+            let Ok(committed) = self.committed.await else {
+                return Err(match self.store.upgrade() {
+                    Some(store) => super::dropped_input(&store).await,
+                    None => SessionError::Refused(crate::session::SessionPhase::Closed).into(),
+                });
+            };
+            committed
+        })
+    }
+}
 
 impl SessionHandle {
     /// Publish the prompts as one FIFO request-boundary batch, returning one
@@ -109,10 +130,12 @@ impl SessionHandle {
         let mut receipts = Vec::new();
         for prompt in prompts {
             let (committed, receipt) = oneshot::channel();
-            receipts.push(receipt);
-            let prepared = if self.runtime.shutting_down.load(Ordering::Acquire) {
-                Err(HarnessError::AgentStopped)
-            } else if receipts.len() > batch.len() + 1 {
+            let store = self.runtime.store.downgrade();
+            receipts.push(QueuedPromptReceipt {
+                committed: receipt,
+                store,
+            });
+            let prepared = if receipts.len() > batch.len() + 1 {
                 // Dispatching past a rejected prompt would reorder the submissions.
                 Err(HarnessError::Interrupted)
             } else {
@@ -130,34 +153,13 @@ impl SessionHandle {
             }
         }
         if !batch.is_empty() {
-            self.runtime.redirect(&self.root, false).await;
-            let _ = self.root_tx.send(AgentCommand::QueuedInputs(batch)).await;
+            // Queued with the releases, so the turn the root's held wait returns to
+            // finds the batch at its next request boundary.
+            let queued = AgentCommand::QueuedInputs(batch);
+            let _ = self.runtime.redirect(&self.root, queued).await;
         }
         receipts
     }
-}
-
-/// Reject unclaimed inputs on interrupt without discarding ordinary commands or
-/// job notifications. The caller receives an error and retains the editable row.
-pub(super) fn reject_pending(
-    rx: &mut mpsc::Receiver<AgentCommand>,
-    deferred: &mut VecDeque<AgentCommand>,
-) {
-    let count = rx.len();
-    for _ in 0..count {
-        let Ok(command) = rx.try_recv() else { break };
-        deferred.push_back(command);
-    }
-    deferred.retain_mut(|command| {
-        if let AgentCommand::QueuedInputs(inputs) = command {
-            for input in inputs.drain(..) {
-                input.reject(HarnessError::Interrupted);
-            }
-            false
-        } else {
-            true
-        }
-    });
 }
 
 impl SessionRuntime {
@@ -188,37 +190,43 @@ impl SessionRuntime {
         outcome
     }
 
-    /// Drain a bounded snapshot of the mailbox, preserving all non-queue commands
-    /// for the outer loop (notably JobsReady and ordinary prompt completion).
+    /// Consume the input batches queued now, leaving every other command for the
+    /// agent's loop.
     pub(super) async fn consume_queued_inputs(
         &self,
         turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
         settings: &mut AgentSettings,
-        rx: &mut mpsc::Receiver<AgentCommand>,
-        deferred: &mut VecDeque<AgentCommand>,
     ) -> bool {
+        let agent = turn.agent.clone();
+        let queued = self
+            .store
+            .live(move |state| state.agents.take_queued(&agent));
+        let mut queued = queued.await.into_iter();
         let mut consumed = false;
-        let count = rx.len();
-        for _ in 0..count {
-            if turn.cancellation.is_cancelled() {
-                break;
-            }
-            let Ok(command) = rx.try_recv() else { break };
-            match command {
-                AgentCommand::QueuedInputs(inputs) => {
-                    let batch = self
-                        .consume_queued_batch(turn, context, settings, inputs)
-                        .await;
-                    consumed |= batch.consumed;
-                    if batch.failed {
-                        reject_pending(rx, deferred);
-                    }
-                }
-                command => deferred.push_back(command),
+        while let Some(inputs) = queued.next() {
+            let batch = self
+                .consume_queued_batch(turn, context, settings, inputs)
+                .await;
+            consumed |= batch.consumed;
+            if batch.failed {
+                let rest = queued.by_ref().flatten();
+                rest.for_each(|input| input.reject(HarnessError::Interrupted));
+                self.reject_queued(turn.agent).await;
             }
         }
         consumed
+    }
+
+    /// Reject `agent`'s unclaimed queued input without discarding its other
+    /// commands. Each submitter receives an error and retains its editable row.
+    pub(super) async fn reject_queued(&self, agent: &AgentId) {
+        let agent = agent.clone();
+        let rejected = self
+            .store
+            .live(move |state| state.agents.take_queued(&agent));
+        let rejected = rejected.await.into_iter().flatten();
+        rejected.for_each(|input| input.reject(HarnessError::Interrupted));
     }
 }
 
@@ -229,7 +237,7 @@ mod tests {
     use super::super::*;
     pub(super) use crate::agent::runtime::tests::{
         AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, events, models,
-        provider_name, quiet_root, response,
+        provider_name, quiet_root, response, spawn_prompt,
     };
     pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
 
@@ -286,13 +294,6 @@ mod tests {
         (root, tracking, session)
     }
 
-    pub(super) fn prompt(
-        session: &Arc<SessionHandle>,
-        text: &'static str,
-    ) -> tokio::task::JoinHandle<Result<String, HarnessError>> {
-        let session = session.clone();
-        tokio::spawn(async move { session.prompt(text).await })
-    }
     pub(super) type Receipt = tokio::task::JoinHandle<Result<(), HarnessError>>;
 
     /// Enqueues from a task; returns its receipt and the submission's cancellation handle.
@@ -330,7 +331,7 @@ mod tests {
     // asynchronous image loading/import, which merely polling once would not do.
     pub(super) async fn buffered(session: &SessionHandle, count: usize) {
         bounded(async {
-            while session.root_tx.capacity() != AGENT_CHANNEL_CAPACITY - count {
+            while super::super::tests::inbox(session, &session.root) != count {
                 tokio::task::yield_now().await;
             }
         })
@@ -359,19 +360,18 @@ mod tests {
     }
 
     /// Committed history as a provider would receive it.
-    pub(super) async fn committed(session: &SessionHandle) -> Vec<Sent> {
-        let records = session.runtime.store.records().await;
+    pub(super) fn committed(session: &SessionHandle) -> Vec<Sent> {
+        let records = session.runtime.store.records();
         events!(records, SessionEvent::MessageCommitted { message } => message.render())
     }
 
-    pub(super) async fn model_changes(session: &SessionHandle) -> Vec<String> {
-        let records = session.runtime.store.records().await;
+    pub(super) fn model_changes(session: &SessionHandle) -> Vec<String> {
+        let records = session.runtime.store.records();
         events!(records, SessionEvent::ModelChanged { profile } => profile.name.to_string())
     }
 
     pub(super) async fn stop(session: &SessionHandle) {
         bounded(session.shutdown()).await.unwrap();
-        bounded(session.root_tx.closed()).await;
     }
 
     /// Parent input reaches the model as user text; the fixture's own prompts are
@@ -430,7 +430,7 @@ mod tests {
                         && request.blobs.get(&image.blob).ok() == Some(png.bytes()))))));
         tracking.release(0);
         // A normal prompt is a mailbox barrier after the batch's completed turn.
-        let barrier = prompt(&session, "test:barrier");
+        let barrier = spawn_prompt(&session, "test:barrier");
         let next = tracking.request(1).await;
         let found = texts(next.messages());
         assert_eq!(found, [&expected[..], &["test:barrier"]].concat());
@@ -444,7 +444,7 @@ mod tests {
     async fn active_batch_skips_canceled_items_and_holds_back_everything_behind_a_rejection() {
         use HarnessError::{ImageLimit, Interrupted};
         let (_root, tracking, session) = start(true).await;
-        let turn = prompt(&session, "test:initial");
+        let turn = spawn_prompt(&session, "test:initial");
         tracking.request(0).await;
         let canceled = QueuedPromptCancellation::default();
         let oversized = crate::media::Attachment::Image {
@@ -495,7 +495,7 @@ mod tests {
     async fn interrupt_and_shutdown_resolve_every_buffered_batch_receipt() {
         for shutdown in [false, true] {
             let (_root, tracking, session) = start(false).await;
-            let turn = prompt(&session, "test:initial");
+            let turn = spawn_prompt(&session, "test:initial");
             tracking.request(0).await;
             let inputs = vec![
                 queued(&session, "test:one", vec![], None),
@@ -514,7 +514,7 @@ mod tests {
                 || matches!(result, Err(HarnessError::Interrupted))));
             let _ = bounded(turn).await.unwrap();
             stop(&session).await;
-            assert_eq!(texts(&committed(&session).await), ["test:initial"]);
+            assert_eq!(texts(&committed(&session)), ["test:initial"]);
             assert_eq!(count(&tracking), 1);
         }
     }
@@ -533,8 +533,8 @@ mod tests {
         assert!(matches!(results[..], [Err(HarnessError::Interrupted)]));
         stop(&session).await;
         assert_eq!(count(&tracking), 0);
-        assert!(committed(&session).await.is_empty());
-        assert!(model_changes(&session).await.is_empty());
+        assert!(committed(&session).is_empty());
+        assert!(model_changes(&session).is_empty());
     }
 
     #[tokio::test]
@@ -561,13 +561,13 @@ mod tests {
         ));
         stop(&session).await;
         assert_eq!(count(&tracking), 0);
-        assert!(committed(&session).await.is_empty());
+        assert!(committed(&session).is_empty());
     }
 
     #[tokio::test]
     async fn claimed_failure_rejects_the_batches_queued_behind_it() {
         let (_root, tracking, session) = start(false).await;
-        let turn = prompt(&session, "test:initial");
+        let turn = spawn_prompt(&session, "test:initial");
         tracking.request(0).await;
         let image = crate::media::Attachment::Image {
             file: None,
@@ -604,7 +604,7 @@ mod tests {
     #[tokio::test]
     async fn dropped_receipt_still_commits_the_input_exactly_once() {
         let (_root, tracking, session) = start(false).await;
-        let turn = prompt(&session, "test:initial");
+        let turn = spawn_prompt(&session, "test:initial");
         tracking.request(0).await;
         let (waiter, _) = enqueue(&session, "test:dropped", vec![], Some("queue-test/second"));
         buffered(&session, 1).await;
@@ -618,14 +618,14 @@ mod tests {
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         stop(&session).await;
-        assert_eq!(texts(&committed(&session).await), expected);
+        assert_eq!(texts(&committed(&session)), expected);
     }
 
     #[tokio::test]
     async fn interrupt_and_shutdown_racing_a_claim_commit_exactly_the_ok_receipts() {
         for shutdown in [false, true] {
             let (_root, tracking, session) = start(false).await;
-            let turn = prompt(&session, "test:initial");
+            let turn = spawn_prompt(&session, "test:initial");
             tracking.request(0).await;
             let inputs = vec![
                 queued(&session, "test:one", vec![], Some("queue-test/second")),
@@ -651,7 +651,7 @@ mod tests {
             let _ = bounded(turn).await.unwrap();
             stop(&session).await;
             let accepted = results.iter().filter(|result| result.is_ok()).count();
-            let found = texts(&committed(&session).await);
+            let found = texts(&committed(&session));
             assert_eq!(found[1..], ["test:one", "test:two"][..accepted]);
         }
     }
@@ -667,5 +667,24 @@ mod tests {
         let copy = claimed.clone();
         assert!(claimed.try_claim());
         assert!(copy.is_claimed() && !copy.cancel() && !copy.try_claim());
+    }
+
+    /// A receipt whose input was dropped unclaimed reports why: the agent stopped
+    /// in a session that still takes input, and closed once nothing holds it.
+    #[tokio::test]
+    async fn a_dropped_receipt_reports_why_its_input_was_not_taken() {
+        let (_root, _requests, session) = crate::agent::runtime::tests::scripted_session([]).await;
+        let receipt = |store| super::QueuedPromptReceipt {
+            committed: tokio::sync::oneshot::channel().1,
+            store,
+        };
+        let running = receipt(session.runtime.store.downgrade());
+        assert!(matches!(running.await, Err(HarnessError::AgentStopped)));
+        let dropped = receipt(session.runtime.store.downgrade());
+        session.shutdown().await.unwrap();
+        drop(session);
+        let closed = crate::session::SessionPhase::Closed;
+        assert!(matches!(dropped.await,
+            Err(HarnessError::Session(SessionError::Refused(phase))) if phase == closed));
     }
 }

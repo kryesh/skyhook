@@ -41,7 +41,7 @@ impl SessionRuntime {
                 return Err(HarnessError::ModeChangeUnsupported(name));
             }
             Some(name) => {
-                let depth = self.available_depth(agent);
+                let depth = self.delegation(agent).map_or(0, |(_, depth)| depth);
                 let capabilities = self.granted_by(&self.modes[&name]).for_agent(depth);
                 Some((name, depth, capabilities))
             }
@@ -54,7 +54,7 @@ impl SessionRuntime {
             let opening =
                 self.open_agent_context(agent, snapshot.clone(), system, capabilities, None);
             // Projected before its `ModeChanged` is journaled, which later projections see.
-            let mut replacement = opening.await?;
+            let mut replacement = opening?;
             replacement.strip_bound_reasoning();
             Some(replacement)
         } else if model.is_some() {
@@ -64,7 +64,7 @@ impl SessionRuntime {
             let capabilities = &settings.capabilities;
             let opening =
                 self.open_agent_context(agent, snapshot.clone(), system, capabilities, tools);
-            Some(opening.await?)
+            Some(opening?)
         } else {
             None
         };
@@ -99,10 +99,6 @@ impl SessionRuntime {
             turn.capabilities.clone_from(&capabilities);
             (settings.mode, settings.capabilities) = (Some(name), capabilities);
         }
-        if let Some(live) = self.agents_mut().get_mut(agent) {
-            live.model.clone_from(&context.profile.name);
-            live.capabilities.clone_from(&settings.capabilities);
-        }
         Ok(())
     }
 
@@ -114,8 +110,8 @@ impl SessionRuntime {
         input: QueuedInput,
     ) -> bool {
         let agent = turn.agent;
-        if self.shutting_down.load(Ordering::Acquire) {
-            input.reject(HarnessError::AgentStopped);
+        if let Err(refused) = self.store.admits(Command::Submit) {
+            input.reject(refused.into());
             return false;
         }
         if !input.cancellation.try_claim() {
@@ -138,14 +134,6 @@ impl SessionRuntime {
         }
         .await;
         let consumed = result.is_ok();
-        if consumed {
-            // Receipt readers must already observe a busy agent when this input
-            // starts a fresh turn; publishing afterward races the UI's idle check.
-            if let Some(live) = self.agents().get(agent) {
-                live.control.set_turn(TurnState::Busy);
-            }
-            self.activity(agent, AgentActivity::Working);
-        }
         let _ = committed.send(result);
         consumed
     }
@@ -155,9 +143,9 @@ impl SessionRuntime {
 mod tests {
     use super::super::tests::*;
     use super::*;
-    use crate::agent::runtime::tests::{answer, model_ref, scripted_provider};
+    use crate::agent::runtime::tests::{answer, inbox, model_ref, scripted_provider};
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn running_child_parent_inputs_are_fifo_once_after_tool_or_final_responses() {
         for first_calls_tool in [true, false] {
             running_child_receives_parent_inputs(first_calls_tool).await;
@@ -178,17 +166,17 @@ mod tests {
         assert!(error.contains(&format!("tool.job({job}).send")), "{error}");
         assert_eq!(texts(initial.messages()), ["test:child-initial"]);
         assert!(parent_inputs(initial.messages()).is_empty());
-        let sender = {
-            let agents = runtime.agents.read().unwrap();
-            let mut children = agents.iter().filter(|(id, _)| *id != &session.root);
-            let (_, child) = children.next().unwrap();
+        let child = {
+            let agents = runtime.agents(|agents| agents.within(&session.root));
+            let mut children = agents.into_iter().filter(|id| id != &session.root);
+            let child = children.next().unwrap();
             assert!(children.next().is_none());
-            child.sender.clone()
+            child
         };
-        // A send acknowledgement alone does not prove forwarding: observe the child's mailbox.
+        // A send acknowledgement alone does not prove forwarding: observe the child's inbox.
         let forwarded = async |count| {
             bounded(async {
-                while sender.capacity() != AGENT_CHANNEL_CAPACITY - count {
+                while inbox(&session, &child) != count {
                     tokio::task::yield_now().await;
                 }
             })
@@ -224,7 +212,7 @@ mod tests {
             assert!(next.messages().any(|message| matches!(message,
                 Sent::Assistant(items) if items == &vec![AssistantItem::text("text/0", 0, "answer-0")])));
         }
-        let state = runtime.jobs.snapshot(job).await.unwrap().state;
+        let state = runtime.jobs.snapshot(job).unwrap().state;
         // The child must answer the parent updates first.
         assert!(!state.is_terminal());
 
@@ -237,7 +225,7 @@ mod tests {
         assert_eq!(count(&tracking), 2);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn child_names_are_owner_scoped_and_survive_completion_but_not_failed_launches() {
         let (_root, tracking, session) = start(false).await;
         let runtime = &session.runtime;
@@ -280,7 +268,7 @@ mod tests {
         .await;
         assert_eq!(invalid["state"], "failed");
         assert!(invalid["error"].as_str().unwrap().contains("depth"));
-        assert!(runtime.jobs.snapshot(id(&invalid)).await.is_ok());
+        assert!(runtime.jobs.snapshot(id(&invalid)).is_ok());
         let first = call(&session.root, &launch("worker")).await;
         assert_ne!(first["state"], "failed", "{first}");
         let first = id(&first);
@@ -296,7 +284,7 @@ mod tests {
         )
         .await);
         tracking.request(1).await;
-        let records = runtime.store.records().await;
+        let records = runtime.store.records();
         let manager = records
             .iter()
             .find_map(|record| match &record.event {
@@ -349,7 +337,7 @@ mod tests {
             file: Some(root.path().join(name)),
             image: image.clone(),
         };
-        let turn = prompt(&session, "test:initial");
+        let turn = spawn_prompt(&session, "test:initial");
         let in_flight = tracking.request(0).await;
         assert_eq!(in_flight.model.as_str(), "first-model");
 
@@ -371,7 +359,7 @@ mod tests {
         buffered(&session, 2).await;
         assert!(!first.is_finished() && !second.is_finished());
         assert!(!first_cancel.is_claimed() && !second_cancel.is_claimed());
-        assert_eq!(texts(&committed(&session).await), ["test:initial"]);
+        assert_eq!(texts(&committed(&session)), ["test:initial"]);
         assert_eq!(count(&tracking), 1);
 
         tracking.release(0);
@@ -402,7 +390,7 @@ mod tests {
         assert!(next.messages().any(todo_finished));
         // Do not collapse intermediate captured model changes.
         assert_eq!(
-            model_changes(&session).await,
+            model_changes(&session),
             ["queue-test/second", "queue-test/third"]
         );
         tracking.release(1);
@@ -410,7 +398,7 @@ mod tests {
         stop(&session).await;
         // Queued inputs must not become additional turns.
         assert_eq!(count(&tracking), 2);
-        assert_eq!(texts(&committed(&session).await), expected);
+        assert_eq!(texts(&committed(&session)), expected);
     }
 
     #[tokio::test]
@@ -448,7 +436,7 @@ mod tests {
     #[tokio::test]
     async fn queued_input_is_not_lost_at_a_final_response_boundary() {
         let (_root, tracking, session) = start(false).await;
-        let turn = prompt(&session, "test:initial");
+        let turn = spawn_prompt(&session, "test:initial");
         tracking.request(0).await;
         let (receipt, token_cancel) = enqueue(&session, "test:follow-up", vec![], None);
         buffered(&session, 1).await;
@@ -468,7 +456,7 @@ mod tests {
     #[tokio::test]
     async fn canceled_buffered_submission_never_commits_text_or_model() {
         let (_root, tracking, session) = start(true).await;
-        let turn = prompt(&session, "test:initial");
+        let turn = spawn_prompt(&session, "test:initial");
         tracking.request(0).await;
         let (receipt, token_cancel) =
             enqueue(&session, "test:canceled", vec![], Some("queue-test/second"));
@@ -482,20 +470,20 @@ mod tests {
         assert!(!token_cancel.is_claimed());
         assert_eq!(next.model.as_str(), "first-model");
         assert_eq!(texts(next.messages()), ["test:initial"]);
-        assert!(model_changes(&session).await.is_empty());
+        assert!(model_changes(&session).is_empty());
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         stop(&session).await;
-        assert_eq!(texts(&committed(&session).await), ["test:initial"]);
+        assert_eq!(texts(&committed(&session)), ["test:initial"]);
         assert_eq!(count(&tracking), 2);
     }
 
     #[tokio::test]
     async fn ordinary_prompt_still_waits_for_its_own_turn() {
         let (_root, tracking, session) = start(true).await;
-        let turn = prompt(&session, "test:initial");
+        let turn = spawn_prompt(&session, "test:initial");
         tracking.request(0).await;
-        let ordinary = prompt(&session, "test:ordinary");
+        let ordinary = spawn_prompt(&session, "test:ordinary");
         buffered(&session, 1).await;
         tracking.release(0);
         let next = tracking.request(1).await;
@@ -523,7 +511,7 @@ mod tests {
             image: crate::tests::png(bytes),
         };
         let (oversized, small) = (image(&vec![0; MAX_IMAGE_BYTES as usize - 7]), image(b""));
-        let before = runtime.store.records().await.len();
+        let before = runtime.store.records().len();
         let cases = [
             (vec![oversized], "size"),
             (vec![small; MAX_IMAGES_PER_SUBMISSION + 1], "count"),
@@ -541,7 +529,7 @@ mod tests {
             assert!(matches!(error, HarnessError::ImageLimit), "{case}");
             assert!(!token_cancel.is_claimed(), "{case}");
             assert!(token_cancel.cancel(), "{case}");
-            assert_eq!(runtime.store.records().await.len(), before, "{case}");
+            assert_eq!(runtime.store.records().len(), before, "{case}");
         }
         assert_eq!(count(&tracking), 0);
         stop(&session).await;

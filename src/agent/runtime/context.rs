@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use super::{HarnessError, compact::TokenMeter};
 use crate::{
-    agent::ContextUsage,
+    agent::{CompactionFault, ContextUsage},
     identity::AgentId,
     provider::{
         ProviderContext,
@@ -13,7 +13,7 @@ use crate::{
     },
     session::{
         AttemptRef, EventRecord, Message, ModelPurpose, ModelRequestTemplate, ProfileSnapshot,
-        Projection, RecordSeq, RequestLedger, SessionEvent, UserPart, project_history,
+        Projection, RecordSeq, RequestLedger, RequestSeq, SessionEvent, UserPart, project_history,
         render_history,
     },
 };
@@ -31,10 +31,46 @@ pub(super) struct AgentContext {
     pub blobs: crate::media::LoadedBlobs,
     /// Pinned tools the live registry no longer provides as journaled.
     pub unavailable_tools: std::sync::Arc<std::collections::HashSet<String>>,
+    /// What the journal leaves for the next request to compact for.
+    reported: Reported,
     /// The last journal sequence reflected in `projected`.
     through: RecordSeq,
     /// Checkpoint and retained messages, which precede later commits in `projected`.
     prefix: usize,
+}
+
+/// The occupancy the agent's last committed response reported, while no compaction
+/// has answered it and its model and mode are unchanged since: a fold of its journal,
+/// so a reopened context decides as the live one would.
+#[derive(Clone, Copy, Default)]
+struct Reported {
+    /// The latest usage record, which a committed response's outcome follows.
+    usage: Option<(RequestSeq, Usage)>,
+    pending: Option<Usage>,
+}
+
+impl Reported {
+    fn fold(&mut self, event: &SessionEvent) {
+        match event {
+            SessionEvent::Usage { request, usage } => self.usage = Some((*request, *usage)),
+            SessionEvent::ResponseCompleted { attempt, .. } => {
+                if let Some((request, usage)) = self.usage
+                    && request == attempt.request
+                {
+                    self.pending = Some(usage);
+                }
+            }
+            // A round cut short, or whose summary a fresh one could replace, leaves
+            // the need; one that would fail again consumes it.
+            SessionEvent::CompactionFailed { error, .. }
+                if error.retryable() || *error == CompactionFault::Interrupted => {}
+            SessionEvent::Compaction { .. }
+            | SessionEvent::CompactionFailed { .. }
+            | SessionEvent::ModelChanged { .. }
+            | SessionEvent::ModeChanged { .. } => self.pending = None,
+            _ => {}
+        }
+    }
 }
 
 impl AgentContext {
@@ -46,6 +82,10 @@ impl AgentContext {
         records: &[EventRecord],
     ) -> Self {
         let projected = project_history(records, agent);
+        let mut reported = Reported::default();
+        for record in records.iter().filter(|record| &record.agent == agent) {
+            reported.fold(&record.event);
+        }
         Self {
             profile,
             template_tokens: super::compaction::estimate_request(&template.to_request()),
@@ -56,6 +96,7 @@ impl AgentContext {
             provider,
             blobs: Default::default(),
             unavailable_tools: Default::default(),
+            reported,
             through: records
                 .last()
                 .map_or(RecordSeq::default(), |record| record.sequence),
@@ -64,35 +105,35 @@ impl AgentContext {
 
     /// Project what the journal committed since the last refresh, from any producer.
     /// A compaction among it replaces this agent's history, so all is re-projected.
-    pub async fn refresh(
+    pub fn refresh(
         &mut self,
         store: &crate::session::SessionStore,
         agent: &AgentId,
     ) -> Result<(), HarnessError> {
         let (mut compacted, mut through, mut committed) = (false, self.through, Vec::new());
-        store
-            .visit_records_after(self.through, |records| {
-                for record in records.iter().filter(|record| &record.agent == agent) {
-                    match &record.event {
-                        SessionEvent::Compaction { .. } => compacted = true,
-                        SessionEvent::MessageCommitted { message } => {
-                            committed.push((record.sequence, message.clone()));
-                        }
-                        _ => {}
+        let mut reported = self.reported;
+        store.read(|state| {
+            let records = state.records_after(self.through);
+            for record in records.iter().filter(|record| &record.agent == agent) {
+                reported.fold(&record.event);
+                match &record.event {
+                    SessionEvent::Compaction { .. } => compacted = true,
+                    SessionEvent::MessageCommitted { message } => {
+                        committed.push((record.sequence, message.clone()));
                     }
+                    _ => {}
                 }
-                through = records.last().map_or(through, |record| record.sequence);
-            })
-            .await;
+            }
+            through = records.last().map_or(through, |record| record.sequence);
+        });
+        self.reported = reported;
         if compacted {
-            let reproject = |records: &[EventRecord]| {
+            store.read(|state| {
+                let records = &state.records;
                 self.projected = project_history(records, agent);
                 self.prefix = history_prefix(&self.projected.messages, records, agent);
                 self.through = records.last().map_or(through, |record| record.sequence);
-            };
-            store
-                .visit_records_after(RecordSeq::default(), reproject)
-                .await;
+            });
             return Ok(());
         }
         self.through = through;
@@ -102,17 +143,10 @@ impl AgentContext {
 
     /// Build the runtime-state tail only when the profile sends it. A persisting
     /// profile commits it to history instead, before the request.
-    pub fn tail<F>(&self, runtime: F) -> impl Future<Output = Option<Message>> + use<F>
-    where
-        F: Future<Output = UserPart>,
-    {
-        // The future must not borrow the provider context, which need not be Sync.
-        let mode = self.profile.profile.state_mode;
-        async move {
-            match mode {
-                StateMode::None => None,
-                StateMode::Dynamic | StateMode::Persist => Some(Message::User(vec![runtime.await])),
-            }
+    pub fn tail(&self, runtime: impl FnOnce() -> UserPart) -> Option<Message> {
+        match self.profile.profile.state_mode {
+            StateMode::None => None,
+            StateMode::Dynamic | StateMode::Persist => Some(Message::User(vec![runtime()])),
         }
     }
 
@@ -125,7 +159,12 @@ impl AgentContext {
         }
     }
 
-    pub fn needs_compaction(&self, usage: Usage) -> bool {
+    /// The reported occupancy the next request compacts for first, if over the threshold.
+    pub fn compaction_due(&self) -> Option<Usage> {
+        (self.reported.pending).filter(|usage| self.needs_compaction(*usage))
+    }
+
+    fn needs_compaction(&self, usage: Usage) -> bool {
         // Only the completed response's reported occupancy, including cached input
         // and generated output; estimates never trigger it.
         let tokens = occupancy(usage);
@@ -191,7 +230,7 @@ fn history_prefix(
 /// later checkpoint's estimate, at the capacity of its latest request. Output of an
 /// attempt that committed nothing never joined the context. A zero report is a
 /// backend reporting nothing, as the meter treats it too.
-pub(in crate::agent) fn recorded_context(
+pub(crate) fn recorded_context(
     records: &[EventRecord],
     ledger: &RequestLedger,
 ) -> HashMap<AgentId, ContextUsage> {
@@ -241,7 +280,7 @@ mod tests {
     use super::super::*;
     use crate::agent::runtime::tests::{
         Requests, Script, Step, answer, child_launch, ephemeral_session, model_ref, recoverable,
-        scripted_session, shutdown_session, test_harness,
+        scripted_session, send, shutdown_session, test_harness,
     };
     use crate::provider::{
         ProviderErrorKind,
@@ -272,6 +311,7 @@ mod tests {
             provider,
             blobs: Default::default(),
             unavailable_tools: Default::default(),
+            reported: Default::default(),
             through: RecordSeq::default(),
             prefix: 0,
         }
@@ -342,15 +382,15 @@ mod tests {
     async fn resumed_context_skips_unreported_usage() {
         let (_root, _, session) = scripted_session([answer("done")]).await;
         session.prompt("work").await.unwrap();
-        let records = session.runtime.store.records().await;
-        let resumed = crate::agent::observation::RuntimeEvents::new(&records).observe();
-        assert!(!resumed.snapshot.context.contains_key(&session.root));
+        let resumed =
+            (session.runtime.store).read(|state| recorded_context(&state.records, &state.ledger));
+        assert!(!resumed.contains_key(&session.root));
         shutdown_session(session).await;
     }
 
     /// Only a committed response's report restores occupancy: output streamed by an
     /// attempt that failed, was interrupted or was retried never joined the context.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn resumed_context_counts_only_committed_attempts() {
         let reported = |input, output| Ok(ResponseEvent::Usage(tests::usage(input, 0, output)));
         let committed = |events: Vec<ResponseEvent>, input, output| {
@@ -373,9 +413,9 @@ mod tests {
         let harness = test_harness(root.path(), &sessions, script.clone()).await;
         let session = ephemeral_session(&harness).await;
         let resumed = async || {
-            let records = session.runtime.store.records().await;
-            let observation = crate::agent::observation::RuntimeEvents::new(&records).observe();
-            observation.snapshot.context[&session.root].tokens
+            let store = &session.runtime.store;
+            store.read(|state| recorded_context(&state.records, &state.ledger))[&session.root]
+                .tokens
         };
         session.prompt("committed").await.unwrap();
         assert_eq!(resumed().await, 1_010);
@@ -389,12 +429,15 @@ mod tests {
         let (result, ()) = tokio::join!(interrupted, interrupt);
         result.unwrap_err();
         assert_eq!(resumed().await, 1_010);
-        session.prompt("retried").await.unwrap();
+        let retried = session.prompt("retried");
+        crate::agent::runtime::tests::retrying(&session, retried)
+            .await
+            .unwrap();
         assert_eq!(resumed().await, 1_010);
         shutdown_session(session).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn cancelled_children_release_but_failed_children_retain_their_context() {
         let root = tempfile::tempdir().unwrap();
         let steps = [
@@ -420,7 +463,7 @@ mod tests {
             let spawned = session
                 .runtime
                 .spawn_agent(child.clone(), Some(owner_job), launch);
-            let sender = spawned.await.unwrap();
+            spawned.await.unwrap();
             let (done, received) = oneshot::channel();
             let input = AgentCommand::Input {
                 options: Default::default(),
@@ -429,13 +472,10 @@ mod tests {
                 }],
                 done: Some(RequestCompletion::Child(done)),
             };
-            sender.send(input).await.unwrap();
+            send(&session, &child, input).await;
             if !fail {
                 script.request(0).await;
-                session
-                    .runtime
-                    .interrupt_tree(&child, CancelScope::Outcome)
-                    .await;
+                session.runtime.interrupt_tree(&child).await;
             }
             assert!(received.await.unwrap().is_err());
             let context = ContextId::from(&child);

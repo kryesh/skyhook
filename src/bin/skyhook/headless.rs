@@ -19,6 +19,9 @@ pub enum BatchError {
     Failed(#[from] Failure),
     #[error("could not record the final status: {0}")]
     Status(#[from] HarnessError),
+    /// The job failed, and recording why failed too.
+    #[error("{0}; could not record the final status: {1}")]
+    Unrecorded(Box<Failure>, HarnessError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -107,15 +110,25 @@ pub async fn run(request: BatchRequest, input: InitialInput) -> Result<(), Batch
     let outcome = match (outcome, session.shutdown().await) {
         (result, Ok(())) => result,
         (Ok(()), Err(error)) => Err(OperationError::from(error).into()),
+        // Shutdown reports again the failed journal that stopped the operation.
+        (Err(Failure::Operation(error)), Err(_)) if error.journal_failed() => Err(error.into()),
         (Err(error), Err(cleanup)) => Err(Failure::Shutdown(Box::new(error), cleanup)),
     };
-    let status = match &outcome {
-        Ok(()) => "Completed".to_owned(),
-        Err(error) => format!("Failed: {error}"),
-    };
-    session
-        .record_status(session.root_agent().clone(), status)
-        .await?;
+    // A session only viewed, or whose journal failed, records nothing, its final
+    // status included.
+    if session.phase().runs() {
+        let status = match &outcome {
+            Ok(()) => "Completed".to_owned(),
+            Err(error) => format!("Failed: {error}"),
+        };
+        let recorded = session.record_status(session.root_agent().clone(), status);
+        if let Err(status) = recorded.await {
+            return Err(match outcome {
+                Ok(()) => status.into(),
+                Err(failure) => BatchError::Unrecorded(Box::new(failure), status),
+            });
+        }
+    }
     Ok(outcome?)
 }
 

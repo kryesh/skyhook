@@ -34,16 +34,18 @@ pub(crate) fn register(
                 }
                 JobsRequest::Output(args) => Invocation::job_view(move |context| async move {
                     let job = args.job;
-                    jobs.present_output_with(
+                    let read = PartialContext::new(Operation::Read, Subject::Job(job));
+                    let presented = jobs.present_output_with(
                         args,
                         context.cancellation_token(),
                         context.diagnostic_viewer(),
                         OutputOptions::Model {
                             presentation: OutputPresentation::Full,
                         },
-                    )
-                    .await
-                    .map_err(|error| error.or(PartialContext::new(Operation::Read, Subject::Job(job))))
+                    );
+                    let presented = presented.await.map_err(|error| error.or(read))?;
+                    context.read(presented.acknowledges).await;
+                    Ok(presented)
                 }),
             }
         },
@@ -104,11 +106,11 @@ fn job_failure(error: JobError, operation: Operation, job: JobId) -> ToolError {
 }
 
 async fn list(jobs: JobManager, context: ToolContext, all: bool) -> Result<ToolOutput, ToolError> {
-    let current = jobs.metadata(context.job()).await.map_err(|error| {
+    let current = jobs.metadata(context.job()).map_err(|error| {
         job_failure(error, Operation::Inspect, context.job()).effects(Effects::Unchanged)
     })?;
     let containing_script = if let Some(parent) = current.parent {
-        let parent = jobs.metadata(parent).await.map_err(|error| {
+        let parent = jobs.metadata(parent).map_err(|error| {
             job_failure(error, Operation::Inspect, parent).effects(Effects::Unchanged)
         })?;
         (parent.role == crate::job::JobRole::Script).then_some(parent.id)
@@ -117,7 +119,6 @@ async fn list(jobs: JobManager, context: ToolContext, all: bool) -> Result<ToolO
     };
     let listing = jobs
         .list(context.agent())
-        .await
         .into_iter()
         .filter(|job| job.id != context.job() && Some(job.id) != containing_script)
         .filter(|job| all || !job.state.is_terminal())
@@ -409,5 +410,32 @@ mod tests {
         let listed = ids(&all.output.value);
         assert!(listed.contains(&json!(pending)) && listed.contains(&json!(completed)));
         assert!(!listed.contains(&json!(all.job)));
+    }
+
+    /// An output read acknowledges the outcome it presents with its own finish:
+    /// one the journal refuses leaves that outcome pending for its owner.
+    #[tokio::test]
+    async fn an_output_read_acknowledges_what_it_presents_with_its_finish() {
+        let runtime = TestRuntime::new().await;
+        let (agent, jobs) = (&runtime.agent, &runtime.jobs);
+        let spec = JobSpec {
+            background: true,
+            ..JobSpec::test(agent.clone(), "done")
+        };
+        let done = jobs.test_create(spec).await;
+        let finished = JobOutcome::Completed(ToolOutput::new(json!("result")));
+        jobs.finish(done, finished).await.unwrap();
+        let mut builder = ToolRegistryBuilder::default();
+        register(&mut builder, jobs.clone()).unwrap();
+        let executor = runtime.executor(builder);
+        let read = done.get() + 1;
+        let rule = format!("BEFORE INSERT ON job_finish WHEN NEW.job = {read}");
+        let refused = crate::session::tests::refuse(&runtime.store, &rule);
+        let failed = executor
+            .run_model(agent, "jobs", json!({"job": done}))
+            .await;
+        drop(refused);
+        assert!(failed.is_err());
+        assert!(jobs.has_pending(agent));
     }
 }

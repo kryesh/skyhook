@@ -4,15 +4,13 @@ use std::collections::BTreeMap;
 
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use tokio::sync::Mutex;
 
 use crate::{
     Prose,
     identity::{AgentId, JobId},
     named_enum::named_enum,
     session::{
-        CompactionCheckpoint, EventRecord, MessageSeq, RecordSeq, SessionError, SessionEvent,
-        SessionStore,
+        Command, EventRecord, MessageSeq, Plan, RecordSeq, SessionError, SessionEvent, SessionStore,
     },
     tool::{
         ToolError,
@@ -38,12 +36,32 @@ pub struct TodoItem<Text = Prose> {
     pub status: TodoStatus,
 }
 
+/// One agent's list as the core folds it.
 #[derive(Default)]
-struct AgentTodos {
+pub(crate) struct AgentTodos {
     owner_job: Option<JobId>,
     items: Vec<TodoItem>,
     /// The latest checkpoint's frontier: its summary reconciled every response up to it.
     reconciled: RecordSeq,
+}
+
+/// Fold one committed record into every agent's list.
+pub(crate) fn apply(agents: &mut BTreeMap<AgentId, AgentTodos>, record: &EventRecord) {
+    let agent = record.agent.clone();
+    match &record.event {
+        SessionEvent::AgentStarted { owner_job, .. } => {
+            agents.entry(agent).or_default().owner_job = *owner_job;
+        }
+        SessionEvent::TodosReplaced { items } => {
+            agents.entry(agent).or_default().items.clone_from(items);
+        }
+        SessionEvent::Compaction { checkpoint } => {
+            let state = agents.entry(agent).or_default();
+            state.items.clone_from(&checkpoint.todos);
+            state.reconciled = checkpoint.frontier;
+        }
+        _ => {}
+    }
 }
 
 /// Why a replacement was not applied.
@@ -59,129 +77,62 @@ pub(crate) enum ReplaceError {
     Session(#[from] SessionError),
 }
 
-pub(super) struct TodoStore {
-    store: SessionStore,
-    agents: Mutex<BTreeMap<AgentId, AgentTodos>>,
-}
-
-impl TodoStore {
-    pub fn restore(store: SessionStore, records: &[EventRecord]) -> Self {
-        let mut agents = BTreeMap::<AgentId, AgentTodos>::new();
-        for record in records {
-            let items = match &record.event {
-                SessionEvent::AgentStarted { owner_job, .. } => {
-                    agents.entry(record.agent.clone()).or_default().owner_job = *owner_job;
-                    continue;
-                }
-                SessionEvent::TodosReplaced { items } => items,
-                SessionEvent::Compaction { checkpoint } => {
-                    agents.entry(record.agent.clone()).or_default().reconciled =
-                        checkpoint.frontier;
-                    &checkpoint.todos
-                }
-                _ => continue,
-            };
-            let state = agents.entry(record.agent.clone()).or_default();
-            state.items.clone_from(items);
-        }
-        Self {
-            store,
-            agents: Mutex::new(agents),
-        }
-    }
-
-    pub async fn register(
-        &self,
-        agent: AgentId,
-        owner_job: Option<JobId>,
-        seed: Option<Vec<TodoItem>>,
-    ) -> Result<(), SessionError> {
-        // Publish the job association and seed together so inspection cannot see an
-        // empty list between registering the child and persisting its initial instructions.
-        let mut agents = self.agents.lock().await;
-        if let Some(items) = &seed {
-            let seeded = SessionEvent::TodosReplaced {
-                items: items.clone(),
-            };
-            self.store.append(agent.clone(), seeded).await?;
-        }
-        let state = agents.entry(agent).or_default();
-        state.owner_job = owner_job;
-        if let Some(items) = seed {
-            state.items = items;
-        }
-        Ok(())
-    }
-
+impl SessionStore {
     /// Replace `agent`'s list on behalf of the response `issued_by`, if a model call
     /// issued it. A checkpoint that reconciled that response supersedes it.
-    pub async fn replace(
+    pub(crate) async fn replace_todos(
         &self,
         agent: &AgentId,
         items: Vec<TodoItem>,
         issued_by: Option<MessageSeq>,
     ) -> Result<(), ReplaceError> {
-        // Hold the lock across persistence so published snapshots and replay agree on order.
-        let mut agents = self.agents.lock().await;
-        let state = agents.entry(agent.clone()).or_default();
-        if issued_by.is_some_and(|message| RecordSeq::from(message) <= state.reconciled) {
-            return Err(ReplaceError::Superseded);
-        }
-        let replaced = SessionEvent::TodosReplaced {
-            items: items.clone(),
-        };
-        self.store.append(agent.clone(), replaced).await?;
-        state.items = items;
-        Ok(())
-    }
-
-    /// Journal and publish history and todos together. The journal refuses a
-    /// checkpoint that a newer todo mutation made stale; a fresh attempt reconciles it.
-    pub(crate) async fn commit_compaction(
-        &self,
-        agent: &AgentId,
-        checkpoint: CompactionCheckpoint,
-    ) -> Result<(), SessionError> {
-        let mut agents = self.agents.lock().await;
-        let (items, reconciled) = (checkpoint.todos.clone(), checkpoint.frontier);
-        self.store
-            .append(agent.clone(), SessionEvent::Compaction { checkpoint })
-            .await?;
-        let state = agents.entry(agent.clone()).or_default();
-        (state.items, state.reconciled) = (items, reconciled);
-        Ok(())
+        let agent = agent.clone();
+        self.commit(Command::Journal, move |state| {
+            let reconciled = state.todos.get(&agent).map(|state| state.reconciled);
+            let reconciled = reconciled.unwrap_or_default();
+            if issued_by.is_some_and(|message| RecordSeq::from(message) <= reconciled) {
+                return Err(ReplaceError::Superseded);
+            }
+            let replaced = SessionEvent::TodosReplaced { items };
+            Ok(Plan::journal(vec![(agent, replaced)]))
+        })
+        .await
     }
 
     /// The caller's own list, or with `job` the list of the descendant it launched.
-    pub async fn inspect(
+    pub(crate) fn inspect_todos(
         &self,
         caller: &AgentId,
         job: Option<JobId>,
     ) -> Result<Vec<TodoItem>, ToolError> {
-        let agents = self.agents.lock().await;
-        let agent = if let Some(job) = job {
-            let agent = agents
-                .iter()
-                .find_map(|(agent, state)| (state.owner_job == Some(job)).then_some(agent))
-                .ok_or_else(|| {
-                    ToolError::invalid_arguments("job does not identify an initialized child agent")
+        self.read(|state| {
+            let agents = &state.todos;
+            let agent = if let Some(job) = job {
+                let agent = agents
+                    .iter()
+                    .find_map(|(agent, state)| (state.owner_job == Some(job)).then_some(agent))
+                    .ok_or_else(|| {
+                        ToolError::invalid_arguments(
+                            "job does not identify an initialized child agent",
+                        )
                         .operation(Operation::Lookup, Subject::Job(job))
                         .effects(Effects::Unchanged)
-                })?;
-            if agent == caller || !agent.is_within(caller) {
-                return Err(ToolError::invalid_arguments(
-                    "todo inspection is limited to descendants",
-                )
-                .operation(Operation::Inspect, Subject::Job(job))
-                .effects(Effects::Unchanged));
-            }
-            agent
-        } else {
-            caller
-        };
-        Ok(agents
-            .get(agent)
-            .map_or_else(Vec::new, |state| state.items.clone()))
+                    })?;
+                if agent == caller || !agent.is_within(caller) {
+                    return Err(ToolError::invalid_arguments(
+                        "todo inspection is limited to descendants",
+                    )
+                    .operation(Operation::Inspect, Subject::Job(job))
+                    .effects(Effects::Unchanged));
+                }
+                agent
+            } else {
+                caller
+            };
+            Ok(agents
+                .get(agent)
+                .map_or_else(Vec::new, |state| state.items.clone()))
+        })
     }
 }
 
@@ -189,52 +140,17 @@ impl TodoStore {
 mod tests {
     use super::*;
 
-    /// A restored store still knows which responses its latest checkpoint reconciled.
-    #[tokio::test]
-    async fn replacements_from_reconciled_responses_are_superseded() {
-        let fixture = crate::session::tests::MemorySession::new().await;
-        let checkpoint = CompactionCheckpoint {
-            frontier: RecordSeq::from(5),
-            message: crate::session::Message::User(Vec::new()),
-            todos: Vec::new(),
-            retained: Vec::new(),
-            attempt: crate::session::AttemptRef {
-                request: RecordSeq::from(4).request(),
-                attempt: 1,
-            },
-            before_tokens: 2,
-            after_tokens: 1,
-        };
-        let compaction = SessionEvent::Compaction { checkpoint };
-        let records = [crate::session::tests::record(&fixture.agent, 6, compaction)];
-        let todos = TodoStore::restore(fixture.store, &records);
-        let replace = |issued_by: Option<u64>| {
-            let items = vec![TodoItem {
-                text: "Next".parse().unwrap(),
-                status: TodoStatus::Pending,
-            }];
-            todos.replace(&fixture.agent, items, issued_by.map(MessageSeq::from))
-        };
-        assert!(matches!(
-            replace(Some(5)).await,
-            Err(ReplaceError::Superseded)
-        ));
-        replace(Some(6)).await.unwrap();
-        replace(None).await.unwrap();
-    }
-
     #[tokio::test]
     async fn rejections_identify_the_rejected_job() {
         let fixture = crate::session::tests::MemorySession::new().await;
-        let todos = TodoStore::restore(fixture.store, &[]);
-        let job = JobId::new(17).unwrap();
-        let missing = todos.inspect(&fixture.agent, Some(job)).await.unwrap_err();
-        todos
-            .register(fixture.agent.child(1), Some(job), None)
-            .await
-            .unwrap();
+        let todos = &fixture.store;
+        let jobs = crate::job::JobManager::new(fixture.store.clone());
+        let spec = crate::job::JobSpec::test(fixture.agent.clone(), "agent");
+        let job = jobs.create(spec).await.unwrap().into_test_id();
+        let missing = todos.inspect_todos(&fixture.agent, Some(job)).unwrap_err();
+        fixture.start_child(&fixture.agent, 1, Some(job)).await;
         let sibling = fixture.agent.child(2);
-        let forbidden = todos.inspect(&sibling, Some(job)).await.unwrap_err();
+        let forbidden = todos.inspect_todos(&sibling, Some(job)).unwrap_err();
         for (error, operation) in [
             (missing, Operation::Lookup),
             (forbidden, Operation::Inspect),

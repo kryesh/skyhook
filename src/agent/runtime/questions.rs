@@ -200,7 +200,7 @@ impl QuestionCoordinator {
 
     async fn owning_agent_job(&self, mut job: JobId) -> Result<JobId, HarnessError> {
         loop {
-            let envelope = self.jobs.snapshot(job).await?;
+            let envelope = self.jobs.snapshot(job)?;
             if envelope.role == crate::job::JobRole::Agent {
                 return Ok(job);
             }
@@ -241,7 +241,7 @@ impl QuestionCoordinator {
             // A response's calls are all created before any runs, and a script's
             // issued calls are published above: a new batch waits for the issuer's
             // other live asks.
-            let jobs = self.jobs.list(&agent).await.into_iter();
+            let jobs = self.jobs.list(&agent).into_iter();
             jobs.filter(|sibling| {
                 sibling.parent == key.1
                     && sibling.role == crate::job::JobRole::Question
@@ -264,7 +264,7 @@ impl QuestionCoordinator {
         drop(open);
         for sibling in awaited {
             let (runtime, key) = (self.clone(), key.clone());
-            tokio::spawn(async move {
+            self.jobs.supervisor().spawn(async move {
                 let _ = runtime.jobs.wait_settled(sibling).await;
                 let mut open = runtime.batches.lock().await;
                 if open
@@ -294,7 +294,8 @@ impl QuestionCoordinator {
                 return;
             }
             let (runtime, agent) = (self.clone(), key.0.clone());
-            tokio::spawn(async move { runtime.present_question_batch(agent, batch).await });
+            let presented = async move { runtime.present_question_batch(agent, batch).await };
+            self.jobs.supervisor().spawn(presented);
         }
     }
 
@@ -319,7 +320,6 @@ impl QuestionCoordinator {
             if self
                 .jobs
                 .is_background(pending.context.job())
-                .await
                 .unwrap_or(false)
                 && let Err(error) = self
                     .jobs
@@ -352,7 +352,7 @@ impl QuestionCoordinator {
         let mut background = false;
         for ask in &batch {
             // A foreground ask inside a background script does not block the agent.
-            match self.jobs.is_effectively_background(ask.context.job()).await {
+            match self.jobs.is_effectively_background(ask.context.job()) {
                 Ok(true) => {
                     background = true;
                     break;
@@ -392,11 +392,7 @@ impl QuestionCoordinator {
         if self.handler.is_none() {
             for item in &mut pending {
                 if let Some(ask) = item.as_ref()
-                    && !self
-                        .jobs
-                        .is_background(ask.context.job())
-                        .await
-                        .unwrap_or(false)
+                    && !self.jobs.is_background(ask.context.job()).unwrap_or(false)
                 {
                     item.take().unwrap().finish(
                         Err(ToolError::failed(QuestionError::Unavailable.to_string())
@@ -749,7 +745,7 @@ mod tests {
         (harness.new_session().await.unwrap(), batches, backgrounds)
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn concurrent_root_questions_are_merged_and_answers_are_split() {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
@@ -823,7 +819,7 @@ mod tests {
     /// A sibling ask holds its batch open until it joins or, like one rejected
     /// before it runs, ends. A later ask from another issuer does not close it, and
     /// one dropped after joining leaves neither its question nor its join behind.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn sibling_asks_hold_the_batch_until_they_join_or_end() {
         let root = tempfile::tempdir().unwrap();
         let provider = Arc::new(HangingProvider);
@@ -910,17 +906,17 @@ mod tests {
             let output = terminal(&session, asks[index]).await.output;
             assert_eq!(output, Some(json!(value)));
             if index == 0 {
-                let remaining = jobs.snapshot(owner).await.unwrap();
+                let remaining = jobs.snapshot(owner).unwrap();
                 assert_eq!(remaining.state, JobState::WaitingInput);
                 assert_eq!(remaining.question.unwrap().questions[0].id, "second");
             }
         }
-        assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
+        assert_eq!(jobs.snapshot(owner).unwrap().state, JobState::Running);
         jobs.cancel(owner).await.unwrap();
         shutdown_session(session).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn stable_agent_job_routes_answers_and_duplicate_bursts_do_not_block_cancellation() {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
@@ -940,7 +936,7 @@ mod tests {
         let pending = pending_questions(&[("first", asks[0].id()), ("second", asks[1].id())]);
         let opened = coordinator.open_child_questions(pending).await.unwrap();
         assert_eq!(opened, owner);
-        let state = jobs.snapshot(owner).await.unwrap().state;
+        let state = jobs.snapshot(owner).unwrap().state;
         assert_eq!(state, JobState::WaitingInput);
         let answered = coordinator.answer_child_question(owner, json!({"first":"yes", "second":2}));
         assert!(answered.await.unwrap());
@@ -963,7 +959,7 @@ mod tests {
         assert_eq!(second_input.recv().await.unwrap(), json!(2));
         let resolve = coordinator.resolve_child_question(owner, &resolved);
         resolve.await.unwrap();
-        assert_eq!(jobs.snapshot(owner).await.unwrap().state, JobState::Running);
+        assert_eq!(jobs.snapshot(owner).unwrap().state, JobState::Running);
         let pending = pending_questions(&[("cancel", resolved[0])]);
         coordinator.open_child_questions(pending).await.unwrap();
         bounded(async {
@@ -982,7 +978,7 @@ mod tests {
         shutdown_session(session).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn cancelled_answer_under_backpressure_releases_claim_without_cleanup_task() {
         let root = tempfile::tempdir().unwrap();
         let session = hanging_session(&root).await;
@@ -1050,7 +1046,7 @@ mod tests {
         shutdown_session(session).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn noninteractive_children_receive_parent_answers_directly_and_through_scripts() {
         for scripted in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -1138,7 +1134,7 @@ mod tests {
                     error.diagnostic().cause,
                     crate::tool::diagnostic::Cause::Denied(_)
                 ));
-                let state = jobs.snapshot(job).await.unwrap().state;
+                let state = jobs.snapshot(job).unwrap().state;
                 assert_ne!(state, JobState::WaitingInput);
                 jobs.cancel(job).await.unwrap();
             }

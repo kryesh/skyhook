@@ -120,6 +120,7 @@ mod tests {
     use super::super::{Accounting, Pooled, pool::pool};
     use super::*;
     use crate::job::output::{FieldPointer, projection::Presented, render::Clipped, shape::Shape};
+    use crate::tool::output::FieldPresentation;
     use serde_json::{Value, json};
     use std::collections::BTreeSet;
 
@@ -155,13 +156,17 @@ mod tests {
         }
     }
 
+    fn complete_fields(complete: &BTreeSet<FieldPointer>) -> Presented {
+        let complete = complete.iter().cloned();
+        complete
+            .map(|field| (field, FieldPresentation::Complete))
+            .collect()
+    }
+
     fn both_paths(value: &Value, complete: &BTreeSet<FieldPointer>) {
         let field = FieldPointer::result();
         let bytes = serde_json::to_vec(value).unwrap();
-        let presented = Presented {
-            complete: complete.clone(),
-            ends: BTreeSet::new(),
-        };
+        let presented = complete_fields(complete);
         for accounting in [Accounting::Preview, Accounting::Page] {
             let memory = Pooled::new(
                 Shape::of(value),
@@ -234,10 +239,7 @@ mod tests {
                 .property("answer")]
             .into_iter()
             .collect();
-            let presented = Presented {
-                complete: complete.clone(),
-                ends: BTreeSet::new(),
-            };
+            let presented = complete_fields(&complete);
             let mut node = Node::of(
                 value.clone(),
                 &FieldPointer::result(),

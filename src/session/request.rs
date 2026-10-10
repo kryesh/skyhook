@@ -190,6 +190,23 @@ crate::named_enum::named_enum! {
     }
 }
 
+/// Whether `agent`'s todos changed after `frontier`, which makes the todos a
+/// summary up to it reconciled stale.
+pub(crate) fn stale_todos<'a>(
+    preceding: impl IntoIterator<Item = &'a EventRecord>,
+    agent: &AgentId,
+    frontier: RecordSeq,
+) -> bool {
+    preceding.into_iter().any(|source| {
+        &source.agent == agent
+            && source.sequence > frontier
+            && matches!(
+                source.event,
+                SessionEvent::TodosReplaced { .. } | SessionEvent::Compaction { .. }
+            )
+    })
+}
+
 /// Validate a request's or checkpoint's references against the records before it:
 /// `committed`, then `batch`.
 pub(super) fn validate(
@@ -215,15 +232,7 @@ pub(super) fn validate(
         reason,
     };
     let preceding = || committed.iter().chain(batch);
-    // Todos replaced after the frontier are newer than the summary reconciled.
-    if preceding().any(|source| {
-        source.agent == record.agent
-            && source.sequence > checkpoint.frontier
-            && matches!(
-                source.event,
-                SessionEvent::TodosReplaced { .. } | SessionEvent::Compaction { .. }
-            )
-    }) {
+    if stale_todos(preceding(), &record.agent, checkpoint.frontier) {
         return Err(invalid(CheckpointError::StaleTodos));
     }
     if !matches!(checkpoint.message, Message::User(_)) {
@@ -659,7 +668,7 @@ mod tests {
             (context.sequence, &[context.sequence], ReplayError::Through),
         ] {
             let request = requested(context, None, history, "state", history_lifetime);
-            let rejected = store.append(agent.clone(), request).await;
+            let rejected = refused(&store, &agent, request);
             assert!(
                 matches!(rejected, Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected),
                 "{expected}: {rejected:?}"
@@ -700,6 +709,18 @@ mod tests {
                 Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected
             ));
         }
+    }
+
+    /// Whether the journal takes `event` as `agent`'s next record.
+    fn refused(
+        store: &crate::session::SessionStore,
+        agent: &AgentId,
+        event: SessionEvent,
+    ) -> Result<(), SessionError> {
+        let committed = store.records();
+        let sequence = committed.len() as u64 + 1;
+        let record = crate::session::tests::record(agent, sequence, event);
+        validate(&committed, &[], &record)
     }
 
     fn context_event_changed() -> SessionEvent {
@@ -842,7 +863,7 @@ mod tests {
 
     /// Checkpoints are validated when appended, so a journal always projects.
     #[tokio::test]
-    async fn invalid_compactions_are_rejected_at_append() {
+    async fn invalid_compactions_are_refused() {
         let session = MemorySession::new().await;
         let (store, agent) = (&session.store, &session.agent);
         let append = async |event| store.append(agent.clone(), event).await.map(|r| r.sequence);
@@ -940,7 +961,7 @@ mod tests {
             ),
             (StaleTodos, checkpoint(research, vec![], summary)),
         ] {
-            let rejected = append(SessionEvent::Compaction { checkpoint }).await;
+            let rejected = refused(store, agent, SessionEvent::Compaction { checkpoint });
             assert!(
                 matches!(rejected, Err(SessionError::InvalidCompaction { reason, .. }) if reason == expected),
                 "{expected}: {rejected:?}"
@@ -948,7 +969,7 @@ mod tests {
         }
         // A loaded journal is admitted by the same rules, so a checkpoint append
         // would refuse never reaches projection.
-        let mut corrupt = store.records().await;
+        let mut corrupt = store.records();
         let mut record = corrupt.last().unwrap().clone();
         record.sequence = record.sequence.next();
         record.event = SessionEvent::Compaction {
@@ -968,7 +989,7 @@ mod tests {
             vec![(owner.clone(), attempt(request)), (owner, compaction)]
         });
         let installed = batch.await.unwrap().last().unwrap().sequence;
-        let records = admit_records(store.records().await).unwrap();
+        let records = admit_records(store.records()).unwrap();
         let projected = project_history(&records, agent);
         assert_eq!(projected.checkpoint, Some(installed));
         assert_eq!(

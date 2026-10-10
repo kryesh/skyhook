@@ -91,7 +91,9 @@ fn finish_evaluation(
             Effects::OutputIncomplete,
         )
         .with_result(
-            super::result::script_output(output.value, None, None).with_images(output.images),
+            super::result::script_output(output.value, None, None)
+                .with_images(output.images)
+                .with_presented(output.presented),
         )),
         (Err(error), Err(_)) => {
             // Keep the primary outcome and summary, recording the incomplete output.
@@ -195,8 +197,6 @@ async fn evaluate_inner(
     let images = Arc::new(Mutex::new(Vec::<ImageRef>::new()));
     let returned_images = images.clone();
     let cancelled = context.clone();
-    let presented_jobs = executor.jobs().clone();
-    let script_job = context.job();
     let execution = js_context.async_with(async move |js| {
         let sleep_context = context.clone();
         let sleep = Function::new(js.clone(), Async(move |milliseconds: f64| {
@@ -264,7 +264,9 @@ async fn evaluate_inner(
                             let output = match created {
                                 Ok(created) => {
                                     policy = created.result_policy();
-                                    match host_executor.run(created).await {
+                                    let reported = host_executor.run_reported(created).await;
+                                    host_context.read(reported.acknowledges).await;
+                                    match reported.outcome {
                                         Ok(result) => result.output,
                                         Err(error) => failed(error),
                                     }
@@ -297,7 +299,7 @@ async fn evaluate_inner(
                         }
                         HostRequest::Receive => {
                             drop(issuing);
-                            let result = match host_executor.jobs().is_background(host_context.job()).await {
+                            let result = match host_executor.jobs().is_background(host_context.job()) {
                                 Ok(true) => host_context.receive().await.map_err(|error| error.to_string()),
                                 Ok(false) => Err("receive() requires the script tool to be invoked with bg: true".to_owned()),
                                 Err(error) => Err(error.to_string()),
@@ -354,22 +356,9 @@ async fn evaluate_inner(
     let mut images = std::mem::take(&mut *returned_images.lock().await);
     images.sort();
     images.dedup();
-    presented_jobs
-        .save_presented_fields(script_job, presented.into_iter().collect())
-        .await
-        .map_err(|error| {
-            error
-                .operation(
-                    Operation::Save,
-                    Subject::Label("script presented fields".into()),
-                )
-                .effects(Effects::OutputIncomplete)
-                .with_result(
-                    super::result::script_output(value.clone(), None, None)
-                        .with_images(images.clone()),
-                )
-        })?;
-    Ok(ToolOutput::new(value).with_images(images))
+    Ok(ToolOutput::new(value)
+        .with_images(images)
+        .with_presented(presented.into_iter().collect()))
 }
 
 /// The error text, once: a thrown error's message and then its stack, or the
@@ -639,18 +628,18 @@ mod tests {
         let source = "const full = await tool.streams({value:'x'});
 const extracted = (await tool.streams({value:'y'})).result;
 return {full, extracted};";
-        evaluate(source, executor.clone(), context.clone())
-            .await
-            .unwrap();
-        let output_rows = executor.jobs().output(context.job());
-        let presented = crate::job::output::Saved::load(&output_rows)
-            .unwrap()
-            .presented;
+        let presented = evaluate(source, executor, context).await.unwrap().presented;
         let fields = [
             "/result/value/extracted/stdout",
             "/result/value/full/result/stdout",
         ];
-        assert!(presented.ends.iter().map(|field| field.as_str()).eq(fields));
+        assert!(
+            presented
+                .ends()
+                .iter()
+                .map(|field| field.as_str())
+                .eq(fields)
+        );
     }
 
     /// The script tool is hidden and rejected inside scripts, and denied
@@ -709,13 +698,8 @@ return {visible: typeof tool.script, direct, deniedResponse, denied};
         );
         assert_eq!(value["deniedResponse"]["state"], "failed");
         // A returned response keeps its error whole in the script's presentation.
-        let output_rows = executor.jobs().output(context.job());
-        let complete = crate::job::output::Saved::load(&output_rows)
-            .unwrap()
-            .presented
-            .complete;
         let error: crate::job::FieldPointer = "/result/value/deniedResponse/error".parse().unwrap();
-        assert!(complete.contains(&error));
+        assert!(output.presented.complete().contains(&error));
         let job = &value["deniedResponse"]["id"];
         assert_eq!(
             (&value["denied"]["code"], &value["denied"]["job"]),
@@ -1240,6 +1224,53 @@ return __testCalls;
         );
     }
 
+    /// What a script's calls report is acknowledged with the script's own
+    /// finish, however it ends: one the journal refuses leaves it unread, and
+    /// a cancelled one, which has no output, acknowledges it.
+    #[tokio::test]
+    async fn a_script_acknowledges_what_its_calls_report_with_its_finish() {
+        use crate::session::SessionEvent::{JobClaimed, JobCreated};
+        let (runtime, executor, _slot) = image_runtime().await;
+        let created = |records: &[crate::session::EventRecord], name| -> Vec<_> {
+            let jobs = records.iter().filter_map(|record| match &record.event {
+                JobCreated { job, tool, .. } if tool == name => Some(*job),
+                _ => None,
+            });
+            jobs.collect()
+        };
+        let claimed = |records: &[crate::session::EventRecord], read| {
+            (records.iter()).any(|record| matches!(record.event, JobClaimed { job } if job == read))
+        };
+        let source = "return (await tool.read({path: 'image.png'})).state;";
+        let arguments = json!({"source": source});
+        let refused = "BEFORE INSERT ON job_finish WHEN NEW.job = 1";
+        let refused = crate::session::tests::refuse(&runtime.store, refused);
+        let failed = executor.run_host(&runtime.agent, "script", arguments).await;
+        drop(refused);
+        assert!(failed.is_err());
+        let records = runtime.store.records();
+        assert!(!claimed(&records, created(&records, "read")[0]));
+
+        // A refused finish stops the session: the cancelled script runs in another.
+        let (runtime, executor, _slot) = image_runtime().await;
+        // The second read starts once the script took the first one's report.
+        let read = "await tool.read({path: 'image.png'});";
+        let source = format!("{read} {read} await sleep(3600000);");
+        let arguments = json!({"source": source});
+        let script = tokio::spawn({
+            let (executor, agent) = (executor.clone(), runtime.agent.clone());
+            async move { executor.run_host(&agent, "script", arguments).await }
+        });
+        let started = move |state: &mut crate::session::CoreState| {
+            let reads = created(&state.records, "read");
+            (reads.len() == 2).then(|| (created(&state.records, "script")[0], reads[0]))
+        };
+        let (script_job, read) = bounded(runtime.store.until(started)).await.unwrap();
+        runtime.jobs.cancel(script_job).await.unwrap();
+        assert!(bounded(script).await.unwrap().is_err());
+        assert!(claimed(&runtime.store.records(), read));
+    }
+
     #[tokio::test]
     async fn failed_script_discards_collected_images_but_retains_console_and_source() {
         let (runtime, executor, _slot) = image_runtime().await;
@@ -1260,14 +1291,14 @@ return __testCalls;
             "console survives the deliberate image-discard policy\n"
         );
         assert!(failed.output.images.is_empty());
-        assert!(runtime.jobs.images(failed.job).await.unwrap().is_empty());
-        let jobs = runtime.jobs.list(&runtime.agent).await;
+        assert!(runtime.jobs.snapshot(failed.job).unwrap().images.is_empty());
+        let jobs = runtime.jobs.list(&runtime.agent);
         let source = jobs.into_iter().find(|job| job.tool == "read");
         let source = source.expect("owning read result survives script failure");
         assert_eq!(source.state, JobState::Completed);
         assert_loaded(
             &runtime.store,
-            runtime.jobs.images(source.id).await.unwrap(),
+            runtime.jobs.snapshot(source.id).unwrap().images,
         )
         .await;
     }

@@ -14,8 +14,8 @@ pub struct PreparedObservation {
     pub(super) snapshot: Box<ObservationSnapshot>,
 }
 impl PreparedObservation {
-    pub async fn subscribe(session: SessionHandle) -> Self {
-        let observation = session.observe().await;
+    pub fn subscribe(session: SessionHandle) -> Self {
+        let observation = session.observe();
         Self {
             active: ActiveObservation {
                 session,
@@ -74,11 +74,11 @@ impl App {
         }
     }
 
-    pub async fn resubscribe(&mut self) {
+    pub fn resubscribe(&mut self) {
         let Phase::Open { observation, .. } = &mut self.phase else {
             return;
         };
-        let prepared = PreparedObservation::subscribe(observation.session.clone()).await;
+        let prepared = PreparedObservation::subscribe(observation.session.clone());
         *observation = prepared.active;
         self.snapshot = *prepared.snapshot;
         self.reset_projection();
@@ -88,6 +88,7 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::super::played::*;
     use super::super::tests::*;
     use super::*;
 
@@ -105,63 +106,24 @@ mod tests {
         )
     }
 
-    /// Deliver `event` as the host does: observe it, fold records, rebuild content.
-    fn deliver(app: &mut App, event: RuntimeEvent) {
-        let revision = app.snapshot.revision + 1;
-        app.observe(ObservedEvent { revision, event });
-        app.projection.rebuild(&app.snapshot);
-        app.rebuild_content();
-    }
-
-    async fn journal(app: &mut App, event: SessionEvent) -> RecordSeq {
-        let store = app.session().unwrap().store();
-        let record = store.append(app.selected.clone(), event).await.unwrap();
-        let sequence = record.sequence;
-        deliver(app, RuntimeEvent::Record(Box::new(record)));
-        sequence
-    }
-
     #[tokio::test]
     async fn stopping_keeps_an_interrupted_reply_at_its_journal_position() {
-        use skyhook::provider::protocol::{BlockRef, ItemKind, ResponseEvent};
-        use skyhook::session::AttemptRef;
-        let (_root, mut app) = fixture().await;
+        use skyhook::provider::protocol::ItemKind;
+        let (_root, mut app, mut model, session) = played_fixture().await;
         let agent = app.selected.clone();
-        let context = launch_context(&app);
-        let context = journal(&mut app, context).await;
-        let request = journal(&mut app, requested(context, Vec::new())).await;
-        let request = request.request();
-        let attempt = AttemptRef {
-            request,
-            attempt: 1,
-        };
-        journal(&mut app, SessionEvent::ModelAttemptStarted(attempt)).await;
-        let delta = ResponseEvent::Delta {
-            block: BlockRef::single("text"),
-            kind: ItemKind::Text,
-            text: "cut short".into(),
-        };
-        let event = RuntimeEvent::ResponseEvent {
-            agent: agent.clone(),
-            request,
-            event: delta,
-        };
-        deliver(&mut app, event);
+        let _asked = ask(&session, "question");
+        let turn = model.turn().await;
+        turn.delta("text", ItemKind::Text, "cut short");
         let shown = |app: &App| {
             app.entries()
                 .iter()
                 .any(|entry| entry.text().contains("cut short"))
         };
-        assert!(shown(&app), "streaming");
+        observe_until(&mut app, shown).await;
         // The interruption ends the live reply before stopping settles it.
-        journal(&mut app, SessionEvent::ModelAttemptInterrupted(attempt)).await;
-        let activity = AgentActivity::Stopped(TurnFailure::Interrupted);
-        let event = RuntimeEvent::Activity {
-            agent: agent.clone(),
-            activity,
-            at: 0,
-        };
-        deliver(&mut app, event);
+        session.interrupt().await;
+        observe_until(&mut app, |app| stopped(&app.snapshot, &app.selected)).await;
+        let request = latest_request(&app.snapshot).unwrap();
         assert!(
             app.snapshot.responses[&(agent, request)]
                 .settlement()
@@ -187,7 +149,7 @@ mod tests {
             .record_status(root.clone(), "while closed".into())
             .await
             .unwrap();
-        app.resubscribe().await;
+        app.resubscribe();
         assert!(has_status(&app, "while closed"));
         session
             .record_status(root, "after subscription".into())
@@ -206,7 +168,7 @@ mod tests {
             lagged,
             Err(broadcast::error::RecvError::Lagged(_))
         ));
-        app.resubscribe().await;
+        app.resubscribe();
         assert!(has_status(&app, "after subscription"));
         let empty = app.try_recv_observation();
         assert!(matches!(empty, Err(broadcast::error::TryRecvError::Empty)));

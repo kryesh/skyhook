@@ -126,36 +126,76 @@ lists the requests changed after a given record, so a host folding records incre
 just those. `session::Turns` is likewise the one journal fold of turns, shared by statistics and the
 terminal's reply footers: a turn runs from an agent's first agent-purpose (non-compaction) model
 request after the last one ended until a response ends it without calling tools or the agent stops.
-Whether resuming continues a stopped root turn is a store query that does not decode the session,
-shared by resume (`SessionStore::stopped_turn`) and the session summary the terminal's session list
-reads. The summary also holds the one rule choosing a session's title from its title records,
-reported with the winning title's source, which the terminal reads rather than folding them. Its
-last activity skips entry kinds that `EntryKind::is_activity` excludes, through a flag the
+Whether resuming continues a stopped turn is read from where the journal leaves each agent's last
+turn: the core keeps it with each agent's contract, and resume and every agent's observed activity
+read it; the session summary the terminal's session list reads applies the same rule to the
+database without decoding the session. Resume also parks an idle root interrupted when it has deliveries pending. Whether it has
+depends on live-only facts such as resume handlers, so the summary, which reads only the journal,
+does not show it, nor does a reopened session until it runs. The summary also holds the one rule choosing a session's title from its title
+records, reported with the winning title's source, which the terminal reads rather than folding
+them. Its last activity skips entry kinds that `EntryKind::is_activity` excludes, through a flag the
 `entry_kind` dictionary is seeded with, so the SQL and a host's live fold of
-`SessionEvent::is_activity` share one definition. Resume journals `SessionReopened`, then settles
-leftover work (interrupted jobs as it restores them, then open requests, calls, and turns) in
-appends dated at the journal's newest activity record (`Dated::LastActivity`), so every fold ends
-that work there and reopening changes no session's last activity; entry times need not increase with
-sequence. Shutdown first closes resumption: a `continue` admitted before it has restarted its jobs,
-which count as running, and one after it is refused before journaling a restart. Shutdown then
-publishes interruptions it finds still unwinding, held agents' included, cancels only jobs still
-running (`CancelScope::Running`), and releases turns held on interrupted ones; a stopping agent
-leaves its own interruption suspended. What released turns commit is dated the same way, so closing neither
-ends an interruption's resumability nor journals activity for it; explicit cancellation
-(`CancelScope::Outcome`) does both. Interrupt and continue read each agent loop's own turn state
-instead: idle, busy, parked after a failed or interrupted turn, when only new input resumes it and
-job notifications wait for that input's request, or held: interrupted while waiting on retained
-children, which `continue` restarts together with it. New input instead breaks every held link
-beneath the root: each held descendant's turn ends interrupted, deepest first, so its holder's wait
-releases it as a retained child in turn. The host's observation is a display, never an input to
-that decision.
+`SessionEvent::is_activity` share one definition. A reopened session is only viewed: it journals
+nothing and runs no agent until the first call that changes it activates it. That call starts the
+activation, which runs on even if the call gives up, and a call while it runs joins it. Activation
+first prepares the root, so a root that cannot run leaves the session viewed with nothing journaled,
+for the next call to try again; then
+one commit, which runs to the end once queued, starts the root and settles leftover work: jobs still running as interrupted, open requests, unanswered calls, every turn the
+journal leaves open (a request without an outcome, a call without a result, or input not yet
+answered), and the releases of the foreground jobs nothing holds across a
+restart (retained children, and every outcome nobody read, whoever called the job; a model call cut
+short is read by the interrupted answer reopening gives it). Until then a viewed session
+reads as that settlement would leave it: stopped at its last activity, its root as it would resume.
+The core admits every command by the session's `SessionPhase` (viewing, running, shutting down,
+failed, closed), in one match on phase and command that also gives the phase the command moves to;
+only a running session that goes on running dates its records now, so what activation settles and
+what a closing session journals take its last activity's time: every fold ends that work there,
+opening or closing changes no session's last activity, and entry times need not increase with
+sequence. Shutdown first moves
+the session to shutting down: from then on no agent launches, takes input, begins a turn or requests
+a model, and no
+`continue` or `send` restarts a job, while work already running may still record how it ends. A
+restart committed before that is running work. The same commit stops the session as a crash would:
+it interrupts every turn, ends every child invocation still running interrupted, releases the waits
+held on them, and cancels only the other running jobs. Closing neither ends an interruption's
+resumability nor journals activity for it; explicit cancellation (`CancelScope::Outcome`) does both.
+Shutting down a viewed session closes it instead: it never ran, so it stops nothing, journals
+nothing, is released for another open, and reads as it did while viewed. A closed session admits
+only shutting down and closing, which do nothing.
+
+Interrupt, continue and new input read three facts the core keeps, and nothing else. The session's
+flow is open or paused: an interrupt that stops anything pauses it, as does a resume, and until
+`continue` or new input opens it no agent takes deliveries, which stay pending for the next request.
+Each agent's turn is idle, busy, held, or parked after a failed or interrupted turn, when only input
+or `continue` resumes it and job notifications wait for that request. Only a busy turn requests,
+commits a response or makes calls. A response without calls leaves busy in its own commit, so an
+interrupt either stops a turn or finds it between turns; the turn goes on, busy again, only for
+input queued for it or for deliveries while the flow is open, as an agent between turns takes them.
+Each child invocation is unbegun until its child takes the input that begins it. An interrupt
+decides each agent from its own turn and jobs: a busy turn with a live foreground child invocation
+is held on it, any other busy turn is stopped, a stopped turn and an agent between turns give up
+input they had yet to take, and an invocation yet to begin is preempted: the input that begins it
+runs as an interrupted turn, unless `continue` comes first. A held turn keeps waiting: `continue`,
+or cancelling a job it holds, makes it busy again, and a wait that ends otherwise parks it
+interrupted. An agent call is accepted by the commit that installs its child, once the call still
+runs and its name is free among its owner's installed children. A call without that start record was
+never accepted: one a stopped process or new input left interrupted is stopped as a crash stops
+it, and is planned and asked for again when the session continues. Only a requested cancellation ends an interruption, and no startup step
+restarts a job finished underneath it. New input breaks every held link in one commit: it releases
+each held turn's live foreground child invocations, ends the held descendants' turns interrupted,
+ends each released invocation the interrupt stopped, held or yet to begin, interrupted, so its call
+reads so, opens the flow and queues the input. The host's observation is a display, never an input to that
+decision. A release is journaled; from it on, the released job reports to its owner through
+delivery, live and after reopening.
 
 Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized `ProviderErrorKind` values rather than error-message text: rate limits, timeouts,
 transport failures, and unavailable servers repeat the frozen logical request. Input
 and selection changes wait for the next request boundary. The failed stream is dropped before
 backoff; server retry hints take precedence over capped exponential delays. Recovery remains
-cancellable and continues until success or interruption.
+cancellable and continues until success or interruption. A failure is journaled with its retry
+and backoff, so a request never reads failed while it retries, and one a crash leaves retrying
+reopens interrupted.
 
 A retry starts a fresh live response while retaining the attempt audit records and any reported
 usage. A stream that fails or closes before its end never authorizes tool execution, and
@@ -176,7 +216,14 @@ Empty text is never committed, even beside a tool call.
 The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a successful response's reported occupancy (uncached input,
 cached input, and output), at 90% of `max_context - max_output`, not from a display estimate.
-It runs after committing that response and before creating or executing its tool calls.
+It runs after committing a response with tool calls, before creating or executing them. A final
+answer leaves busy in its own commit, so the compaction it triggers runs at the next request
+boundary, before the agent's next turn sends its first request. The need is folded from the
+agent's journal whenever its context opens or refreshes: the last committed response's occupancy,
+until a checkpoint installs, a round fails with a fault a fresh summary could not fix, or the
+agent's model or mode changes. An interrupted round and unusable summaries leave it, so a reopened
+or continued agent compacts first, as the live one would have. A context-window overflow compacts
+and retries within its turn only.
 
 Summarization is a separate recorded request with a structured response schema and no callable
 tools. Native history ends before any trailing unanswered tool-call message, keeping the summary
@@ -224,7 +271,12 @@ rather than denied.
 The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
 (queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
 are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
-its startup stage carries a job from creation to its running worker. A tool may declare a source argument, a
+its startup stage carries a job from creation to its running worker. A finish claims the job before
+it prepares any output, so of competing outcomes (completion, cancellation, interruption) only the one
+that publishes saves output, once, in the transaction that journals it; the others wait for it, then
+apply only where its outcome admits them,
+as a cancellation ends an interruption. Each finish is bound to the invocation it was issued for,
+so one from before a restart never ends the invocation the restart began. A tool may declare a source argument, a
 `TargetPath` on any target: the executor selects its location like a tool target, authorizes the
 read with the call, and opens it for the call's context. A host tool whose input places its job
 elsewhere, such as a child agent's target and workspace, has that location selected before the job
@@ -269,9 +321,8 @@ declares as `contentMediaType: application/json` is classified once at finalizat
 output was cut off, and when it is JSON is read as that value from its original bytes.
 Finalization also records the fields whose presentation the output schema declares with
 `x-skyhook-preview`, joining those a script's returned tool results carry: `complete` fields are
-never shortened, and `ends` text keeps its first and last lines. It then records the size of the
-result's automatic presentation, which notification batching budgets without previewing it again.
-Jobs persist their output schemas so resumed and remote results use the same rules.
+never shortened, and `ends` text keeps its first and last lines; a field declared both ways is
+complete. Jobs persist their output schemas so resumed and remote results use the same rules.
 
 All saved JSON is read through streaming readers built in `job::output::json`. Previews, pages,
 and navigation into stored containers hold a bounded pool of what they may show rather than the
@@ -284,10 +335,18 @@ metered on the bytes it reads. JavaScript receives complete results, while the j
 exact previews delivered to the model. See [saved job output](../reference/job-output.md) for the
 user-facing limits.
 
-Child messages and job notifications use a prepared delivery receipt: snapshot pending events,
-then commit them to the parent's history together with their acknowledgment. Abandoned preparation leaves the
-events pending; cancellation cannot split an accepted commit from its acknowledgment. Replay
-recovers pending child messages from durable history, independently of output inspection.
+Child messages and job notifications are read, presented, then committed to the parent's history
+together with their acknowledgment. The commit is refused when anything it presents is no longer
+pending as it was read, as when a claim acknowledged it meanwhile, and the parent presents what is
+pending now instead. Abandoned presentation leaves the events pending; cancellation cannot split
+an accepted commit from its acknowledgment. A model call's result likewise commits with the
+acknowledgment of the outcome it reports, so a result that never commits, as when the process
+dies first, leaves that outcome pending for delivery. A job's own reads, such as a `jobs` read or
+the calls a script collects, are acknowledged by its finish in the same way, however it ends:
+failed or cancelled, with or without output. The host journals no result, so its collection
+acknowledges as it reads. Replay recovers pending child messages from durable history,
+independently of output inspection. A child's text-only answer is held as its job's result;
+when its invocation goes on instead, the answer's release to the owner is journaled too.
 
 Process tools never connect stdin, and capture stdout/stderr. Without the `Interactive` capability,
 they also detach from the controlling terminal on Unix and replace inherited askpass settings with
@@ -305,19 +364,42 @@ normalized; blobs, job results, and line-addressable captures share the database
 separate transcript or output files. Only shapes that a model, a tool's own schema or a provider
 defines are stored as JSON text: tool-call arguments and results, job arguments and output
 schemas, tool and response schemas, reasoning replay payloads, saved job results and the
-results and pages a job event presented. Related state transitions are appended transactionally
-before their in-memory projections are published. Accepted writer work is owned independently
-of the caller, so dropping an await does not cancel a commit already in progress.
+results and pages a job event presented. Each open session has one core thread that owns the
+writer and the one in-memory fold of the journal: its records, request ledger, jobs, todos and
+targets, and beside them, never journaled, each running agent's turn and inbox and every
+registered wait. A wait, such as an agent's `wait`, a caller awaiting its foreground job, or an
+idle agent awaiting work, is a predicate the core decides when it is registered and after every
+change. Senders to an agent never wait: its inbox accumulates in order.
+Observation views the runtime updates without journaling, such as streaming deltas, sit beside
+that fold. A command plans against
+that state on the core thread, commits its entries in one transaction, and applies and publishes
+them before the next command runs, so no reader sees a record the state does not reflect.
+Reopening folds the journal with the same apply, refusing a job transition the job's phase does
+not admit. Dropping an await, or its runtime, does not cancel a command already queued.
+
+A write the journal cannot take stops the session as a crash does: a refused or failed
+transaction, a commit whose outcome is unknown, a failed blob insert, a finished job's output
+that cannot be prepared for its finish, or a panic on the core thread. In the same critical section the session moves to failed, its connection takes no more
+writes, everything it runs is cancelled, no agent runs, and every wait and reply resolves with the
+failure, which every later write reports too. Observers see the phase change, and read every
+turn, response and job the session left going as interrupted at its last activity, as reopening
+settles them. Rules a concurrent change can break, such as the stale-todos check on a compaction
+checkpoint, are decided by their command's plan against the state it commits to, so a refusal
+there is not a failure.
 
 A writer lock excludes competing session owners, not read-only snapshot inspection. Closing the
 store rolls back any abandoned transaction and makes its shared SQLite connection read-only before
 releasing that lock, so retained output handles cannot write into a reopened session. Saved output
-can still be read. If a write's outcome becomes uncertain, the writer requires recovery
-instead of allowing later appends to pretend the commit failed. On resume, the runtime reconciles unfinished model attempts and
+can still be read. Dropping the store's last handle closes it the same way, and so does dropping a
+session's last handle, which also stops its agent loops, job work, and the approval and question
+prompts they asked, where they stand: a session left that way reopens as a crash would leave it. A
+session closed with nothing journaled is removed, so a caller that gives up creating one leaves
+nothing behind. Closing a failed session releases it too, and reports the failure; reopening
+resolves what committed. Activating a reopened session reconciles unfinished model attempts and
 committed tool calls lacking results before any agent runs. Agents retain their journaled prompt,
-tools, and capability contract; current configuration can narrow that contract, not silently
-expand it. Observation is a host projection of durable records plus live state, not a second
-source of conversation history.
+tools, and capability contract; current configuration can narrow that contract, not silently expand
+it. Observation is a host view of durable records, the jobs the session state folds from them, and
+live state; it is not a second source of conversation history or job state.
 
 Source: [agent runtime](https://github.com/kryesh/skyhook/tree/main/src/agent/runtime),
 [providers](https://github.com/kryesh/skyhook/tree/main/src/provider),

@@ -1,6 +1,5 @@
 use super::*;
 use skyhook::agent::{HarnessError, QueuedPrompt, QueuedPromptCancellation};
-use skyhook::session::SessionError;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct QueuedInputId(u64);
@@ -10,9 +9,6 @@ pub(super) enum RowState {
     Waiting,
     /// Dispatched; the cancellation withdraws it while its commit is pending.
     InFlight(QueuedPromptCancellation),
-    /// The commit outcome is unknown: only the user may send this row again,
-    /// and nothing behind it is dispatched until they edit or remove it.
-    Unknown,
 }
 
 /// One composer submission waiting behind the current operation.
@@ -58,8 +54,8 @@ pub(super) async fn queue_dispatcher(
                     for ((id, generation), receipt) in ids.into_iter().zip(receipts) {
                         let session = session.clone();
                         pending.push(async move {
-                            let result = receipt.await.unwrap_or(Err(HarnessError::AgentStopped));
-                            let revision = session.observe().await.snapshot.revision;
+                            let result = receipt.await;
+                            let revision = session.observe().snapshot.revision;
                             Work::QueueCommitted { id, generation, revision, result }
                         });
                     }
@@ -78,6 +74,7 @@ impl App {
         if submission.is_empty() {
             return;
         }
+        self.follow_latest();
         self.reject_pending_questions();
         self.advance_draft();
         let queued = self.queued_input(submission);
@@ -169,6 +166,11 @@ impl App {
     }
 
     pub(super) fn deliver_queue(&mut self) {
+        // A session its failed journal stopped takes nothing more.
+        if self.snapshot.phase.failure().is_some() {
+            self.queue.clear();
+            return;
+        }
         // Lag recovery replaces the snapshot without replaying each event. Only
         // records after the gate can release it.
         if let Some(&(_, after)) = self.initial_input.as_ref() {
@@ -194,7 +196,7 @@ impl App {
         let mut deliveries = Vec::new();
         let mut rejected = None;
         let queue = self.queue.iter_mut();
-        for input in queue.take_while(|input| !matches!(input.state, RowState::Unknown)) {
+        for input in queue {
             if matches!(input.state, RowState::InFlight(_)) {
                 continue;
             }
@@ -262,25 +264,16 @@ impl App {
                 self.commit_row(&input);
             }
             Err(error) => {
-                let unknown = matches!(
-                    error,
-                    HarnessError::Session(SessionError::AppendIndeterminate { .. })
-                );
-                self.queue[index].state = if unknown {
-                    RowState::Unknown
-                } else {
-                    RowState::Waiting
-                };
+                self.queue[index].state = RowState::Waiting;
                 self.pause_queue();
-                // A held-back row is reported by whatever held it back.
-                if matches!(error, HarnessError::Interrupted) {
+                // A held-back row is reported by whatever held it back, and a
+                // failed journal by the session it stopped.
+                if matches!(error, HarnessError::Interrupted) || error.journal_failed() {
                     return self.refresh_menu();
                 }
-                self.notice(if unknown {
-                    format!("Queued message may or may not have been submitted: {error}. Check the transcript, then edit or remove it from the queue.")
-                } else {
-                    format!("Queued message was not submitted: {error}. Resume to retry.")
-                });
+                self.notice(format!(
+                    "Queued message was not submitted: {error}. Resume to retry."
+                ));
             }
         }
         self.refresh_menu();
@@ -305,9 +298,6 @@ impl App {
                     queued.id,
                     brief(&queued.submission.text, TITLE_CHARS),
                     match profile {
-                        _ if matches!(queued.state, RowState::Unknown) => {
-                            "outcome unknown".to_owned()
-                        }
                         Some(profile) => profile.model.to_string(),
                         None => queued.model.to_string(),
                     },
@@ -330,20 +320,26 @@ impl App {
 
 #[cfg(test)]
 mod tests {
+    use super::super::played::*;
     use super::super::tests::*;
     use super::*;
-    use skyhook::identity::EventId;
-    use skyhook::session::{RecordSeq, UserPart};
+    use skyhook::session::RecordSeq;
 
     type Deliveries = mpsc::UnboundedReceiver<Vec<QueueDelivery>>;
 
     /// A busy fixture whose dispatches the test receives instead of a runtime.
     async fn queue_fixture() -> (tempfile::TempDir, App, Deliveries) {
         let (root, mut app) = fixture().await;
+        let deliveries = busy(&mut app);
+        (root, app, deliveries)
+    }
+
+    /// Make `app` busy, its dispatches received by the test instead of a runtime.
+    fn busy(app: &mut App) -> Deliveries {
         let (tx, rx) = mpsc::unbounded_channel();
         app.queue_sender = Some(tx);
         app.operation = true;
-        (root, app, rx)
+        rx
     }
 
     /// Every notice so far: journaled with a session, otherwise sent back as work.
@@ -351,14 +347,14 @@ mod tests {
         app.status.flush().await;
         let mut notices = Vec::new();
         if let Some(session) = app.session() {
-            let records = session.observe().await.snapshot.records;
+            let records = session.observe().snapshot.records;
             notices.extend(records.values().filter_map(|record| match &record.event {
                 SessionEvent::Status { message } => Some(message.clone()),
                 _ => None,
             }));
         }
         while let Ok(work) = rx.try_recv() {
-            if let Work::StatusFailed { message, .. } = work {
+            if let Work::Unsaved { message, .. } = work {
                 notices.push(message);
             }
         }
@@ -384,6 +380,26 @@ mod tests {
             revision: app.snapshot.revision + 1,
             result,
         });
+    }
+
+    /// Submitting follows the latest activity, even from a view pinned by a text click.
+    #[tokio::test]
+    async fn submission_follows_latest_from_a_pinned_view() {
+        use skyhook::provider::protocol::AssistantItem;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let text = "ordinary prose\n".repeat(100);
+        let answer = vec![AssistantItem::text("pin", 0, &text)];
+        exchange(&mut app, &mut model, "question", answer).await;
+        let _deliveries = busy(&mut app);
+        app.refresh();
+        let screen = draw(&mut app);
+        let (x, y) = (screen.lines().enumerate())
+            .find_map(|(y, line)| Some((line[..line.find("ordinary")?].chars().count(), y)))
+            .unwrap();
+        click(&mut app, Rect::new(x as u16, y as u16, 1, 1));
+        assert!(app.view().scroll.is_some() && app.selection.is_some());
+        app.submit("next".into());
+        assert!(app.view().scroll.is_none() && app.selection.is_none());
     }
 
     #[tokio::test]
@@ -489,42 +505,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn indeterminate_receipt_is_never_redispatched_and_blocks_the_rows_behind_it() {
-        let (_root, mut app, mut deliveries) = queue_fixture().await;
-        let mut rx = capture_work(&mut app);
-        app.submit("unknown".into());
-        app.submit("behind".into());
-        let unknown = deliveries.try_recv().unwrap();
-        let error = SessionError::AppendIndeterminate {
-            recovery: skyhook::session::AppendRecovery {
-                identity: skyhook::session::AppendIdentity {
-                    event: EventId::generate().unwrap(),
-                    session: app.session_id().unwrap(),
-                    sequence: RecordSeq::default(),
-                },
-                reason: skyhook::session::RecoveryReason::ReceiptLost,
-            },
-            source: None,
-        };
-        receipt(&mut app, &unknown[0], Err(HarnessError::Session(error)));
-        deliveries.try_recv().unwrap();
-        app.command(Command::Resume);
-        app.tick();
-        assert!(deliveries.try_recv().is_err());
-        assert!(
-            notices(&app, &mut rx)
-                .await
-                .iter()
-                .any(|notice| notice.contains("Check the transcript"))
-        );
-        // Only the user resolves it: removing the row releases the rows behind it.
-        let id = app.queue[0].id;
-        assert_eq!(app.remove_queued(id).unwrap().submission.text, "unknown");
-        app.tick();
-        assert_eq!(texts(&deliveries.try_recv().unwrap()), ["behind"]);
-    }
-
-    #[tokio::test]
     async fn dead_dispatcher_returns_rows_to_waiting_and_resume_spawns_a_new_one() {
         let (_root, mut app, deliveries) = queue_fixture().await;
         let mut rx = capture_work(&mut app);
@@ -568,7 +548,7 @@ mod tests {
         let prompt = claimed.pop().unwrap().prompt;
         let session = app.session().unwrap().clone();
         for receipt in session.enqueue_prompts(vec![prompt]).await {
-            receipt.await.unwrap().unwrap();
+            receipt.await.unwrap();
         }
         app.command(Command::Queue);
         app.choose();
@@ -585,32 +565,38 @@ mod tests {
 
     #[tokio::test]
     async fn queue_waits_for_the_initial_input_to_commit() {
-        let (_root, mut app, mut deliveries) = queue_fixture().await;
+        let (_root, mut app, _model, _session) = played_fixture().await;
+        let _asked = ask(app.session().unwrap(), "initial");
+        // The root's input, committed while the played model holds its turn open.
+        let input = committed(user);
+        let first = |app: &App| {
+            let mut records = app.snapshot.records.values();
+            records.find(|record| input(&record.event)).cloned()
+        };
+        let committed = observe_find(&mut app, first).await;
+        let mut deliveries = busy(&mut app);
         let root = app.root_agent().clone();
-        app.initial_input = Some((root.clone(), RecordSeq::default()));
+        // Bound to the input just committed, which comes before what releases it.
+        app.initial_input = Some((root.clone(), committed.sequence));
         app.submit("followup".into());
         app.tick();
         assert!(deliveries.try_recv().is_err());
-        let text = "initial".into();
-        let message = skyhook::session::Message::User(vec![UserPart::Text { text }]);
-        let store = app.session().unwrap().store();
-        let committed = store
-            .append(root.clone(), SessionEvent::MessageCommitted { message })
-            .await
-            .unwrap();
         // Only a later user record from the bound root releases the gate.
-        let mut other = committed.clone();
-        other.agent = AgentId::root(SessionId::generate().unwrap());
-        let mut status = committed.clone();
-        status.event = SessionEvent::Status {
-            message: "status".into(),
+        assert!(!observe_initial_input(&mut app.initial_input, &committed));
+        app.initial_input = Some((root.clone(), RecordSeq::default()));
+        let child = EventRecord {
+            agent: root.child(1),
+            ..committed.clone()
         };
-        for ignored in [&other, &status] {
+        let status = EventRecord {
+            event: SessionEvent::Status {
+                message: "status".into(),
+            },
+            ..committed.clone()
+        };
+        for ignored in [&child, &status] {
             assert!(!observe_initial_input(&mut app.initial_input, ignored));
         }
-        app.initial_input = Some((root.clone(), committed.sequence));
-        assert!(!observe_initial_input(&mut app.initial_input, &committed));
-        app.initial_input = Some((root, RecordSeq::default()));
         app.observe(ObservedEvent {
             revision: app.snapshot.revision + 1,
             event: RuntimeEvent::Record(Box::new(committed)),

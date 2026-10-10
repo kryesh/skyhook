@@ -16,7 +16,10 @@ impl App {
         self.dirty = true;
     }
     pub fn view(&mut self) -> &mut View {
-        self.views.entry(self.selected.clone()).or_default()
+        self.views.get_mut(&self.selected, self.tab)
+    }
+    pub fn viewed(&self) -> Option<&View> {
+        self.views.get(&self.selected, self.tab)
     }
     pub fn observe(&mut self, event: ObservedEvent) -> bool {
         if let RuntimeEvent::Record(record) = &event.event {
@@ -30,28 +33,22 @@ impl App {
         }
         // Response updates replace the live response or a settled one at its
         // journal position; records reach history through the projection.
+        self.content_cache.observe(&event.event);
         let (records, repaint, content) = match &event.event {
             RuntimeEvent::Record(_) => (true, true, true),
-            RuntimeEvent::ResponseEvent { agent, request, .. }
-            | RuntimeEvent::ResponseSettled { agent, request, .. } => {
-                self.content_cache.observe_response(agent, *request);
+            // The record that follows redraws the job's entries.
+            RuntimeEvent::Job(job) => {
+                self.projection.observe_job(job);
+                (false, false, false)
+            }
+            RuntimeEvent::ResponseEvent { agent, .. }
+            | RuntimeEvent::ResponseSettled { agent, .. } => {
                 (false, agent == &self.selected, agent == &self.selected)
             }
-            RuntimeEvent::Activity {
-                agent, activity, ..
-            } => {
-                // Stopping settles the agent's unsettled responses.
-                if matches!(activity, AgentActivity::Stopped(_)) {
-                    for ((owner, request), response) in &self.snapshot.responses {
-                        if owner == agent && response.settlement().is_none() {
-                            self.content_cache.observe_response(agent, *request);
-                        }
-                    }
-                }
-                (false, true, agent == &self.selected)
-            }
+            RuntimeEvent::Activity { agent, .. } => (false, true, agent == &self.selected),
             RuntimeEvent::Context { agent, .. } => (false, agent == &self.selected, false),
             RuntimeEvent::TurnCompleted { .. } => (false, true, false),
+            RuntimeEvent::Phase(_) => (false, true, true),
         };
         self.snapshot.apply(event);
         self.refresh_menu();
@@ -75,25 +72,29 @@ impl App {
         self.invalidate_content();
     }
     pub fn reset_projection(&mut self) {
-        self.projection = Projection::default();
+        self.projection = Projection::new(&self.snapshot);
         self.refresh();
     }
     pub fn rebuild_content(&mut self) {
         if self.content_dirty {
-            let view = self.views.entry(self.selected.clone()).or_default();
-            let overlay = self
-                .unsaved_status
-                .iter()
-                .enumerate()
+            let status = |key, message: &dyn std::fmt::Display| {
+                Entry::new(key, format!("Status · {message}"), model::Surface::Status)
+            };
+            let unsaved = (self.unsaved_status.iter().enumerate())
                 .filter(|(_, (agent, _))| agent == &self.selected)
                 .map(|(index, (_, message))| {
-                    Entry::new(
-                        model::EntryKey::UnsavedStatus(index),
-                        format!("Status · {message}"),
-                        model::Surface::Status,
-                    )
-                })
-                .collect();
+                    status(model::EntryKey::UnsavedStatus(index), message)
+                });
+            // The session's conversation, and only it, shows what stopped it.
+            let root = self.root_agent() == &self.selected;
+            let failed = (self.snapshot.phase.failure())
+                .filter(|_| root)
+                .map(|failure| {
+                    let failed = skyhook::session::SessionError::JournalFailed(failure.clone());
+                    status(model::EntryKey::JournalFailed, &failed)
+                });
+            let overlay = unsaved.chain(failed).collect();
+            let view = self.views.get_mut(&self.selected, self.tab);
             let changes = self.content_cache.update(
                 &self.snapshot,
                 &mut self.projection,
@@ -133,7 +134,7 @@ impl App {
                 .is_some_and(|activity| activity.state.is_busy())
     }
     pub(super) fn active_work(&self) -> bool {
-        self.busy() || self.projection.has_open_jobs()
+        self.busy() || model::open_jobs(&self.snapshot)
     }
     pub fn agent_status(&self, agent: &model::AgentInfo) -> model::AgentDisplayState {
         let pending = self.prompts.iter().find(|prompt| match &prompt.kind {

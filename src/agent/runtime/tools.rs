@@ -11,9 +11,9 @@ use tokio::sync::oneshot;
 
 use crate::{
     agent::{ModelEntry, Question, ReplaceError, TodoItem},
-    job::CancelScope,
+    identity::{AgentId, JobId},
     provider::profile::ModelRef,
-    session::UserPart,
+    session::{Command, CoreState, Plan, UserPart},
     tool::{
         AdmissionError, RegistryError, TARGET, ToolError, ToolOptions, ToolRegistryBuilder,
         diagnostic::{Effects, FailureSite, Operation, Subject},
@@ -23,7 +23,8 @@ use crate::{
 };
 
 use super::{
-    AgentCommand, AgentLaunch, Invocation, Resumed, SessionRuntime, TurnFailure, queue::QueuedInput,
+    AgentCommand, AgentLaunch, HarnessError, Invocation, Resumed, SessionRuntime, TurnFailure,
+    dispatch::ChildAnswer, queue::QueuedInput,
 };
 
 /// Connect only root-eligible MCP servers; adapters enforce per-agent gates later.
@@ -158,16 +159,16 @@ fn register_todo(
                 TodoRequest::Replace(items) => registry::AdmittedInvocation::unit(move |context| async move {
                     let runtime = runtime.ok_or_else(runtime_unavailable)?;
                     let items = admit_todos("items", items)?;
-                    let issued_by = runtime.jobs.call_origin(context.job()).await;
+                    let issued_by = runtime.jobs.call_origin(context.job());
                     let subject = Subject::Label(format!("todos for agent {}", context.agent()));
-                    runtime.todos.replace(context.agent(), items, issued_by).await.map_err(|error| match error {
+                    runtime.store.replace_todos(context.agent(), items, issued_by).await.map_err(|error| match error {
                         ReplaceError::Superseded => ToolError::failed(error).operation(Operation::Save, subject).effects(Effects::Unchanged),
                         ReplaceError::Session(error) => harness_error(error.into()).operation(Operation::Save, subject).effects(Effects::Unknown),
                     })
                 }),
                 TodoRequest::Inspect(job) => registry::AdmittedInvocation::new(move |context| async move {
                     let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                    registry::serialized(TodoList { items: runtime.todos.inspect(context.agent(), job).await? })
+                    registry::serialized(TodoList { items: runtime.store.inspect_todos(context.agent(), job)? })
                 }),
             }
         },
@@ -258,131 +259,121 @@ fn register_child_agent(
             let runtime = runtime_slot.get().and_then(Weak::upgrade);
             async move {
                 let runtime = runtime.ok_or_else(runtime_unavailable)?;
-                let todos = input.todos.map(|items| admit_todos("todos", items)).transpose()?;
-                // Only hinted models were offered; anything else is unknown to the caller.
-                let model = match input.model {
-                    Some(name) => {
-                        let hinted = |model: &ModelRef| runtime.harness.models.get(model).is_some_and(|entry| entry.profile.hint.is_some());
-                        let model = name.parse::<ModelRef>().ok().filter(hinted);
-                        Some(model.ok_or_else(|| invalid_argument(["model"], format!("unknown model `{name}`")))?)
-                    }
-                    None => None,
-                };
-                let (mode, capabilities) = match &input.mode {
-                    None => (None, context.capabilities().clone()),
-                    Some(name) => {
-                        let offered = |(_, mode): &(&ModeName, &Mode)| offers_mode(mode, context.capabilities());
-                        let Some((name, mode)) = runtime.modes.get_key_value(name.as_str()).filter(offered) else {
-                            return Err(invalid_argument(["mode"], format!("unknown mode `{name}`")));
-                        };
-                        // Interaction follows the caller, as the root's follows the host.
-                        (Some(name.clone()), &runtime.granted_by(mode) & context.capabilities())
-                    }
-                };
-                let available_depth = runtime.available_depth(context.agent());
-                if input.depth >= available_depth {
-                    return Err(invalid_argument(["depth"], format!(
-                        "depth must be less than the caller's available depth of {available_depth}"
-                    )));
-                }
-                let launched = runtime.jobs.metadata(context.job()).await.map_err(|error| harness_error(error.into())
+                let owner = context.agent();
+                let (model, depth) = runtime.delegation(owner)
+                    .ok_or_else(|| ToolError::failed("parent agent never started")
+                        .operation(Operation::Lookup, Subject::Label(format!("parent agent {owner}"))).effects(Effects::NotStarted))?;
+                let launched = runtime.jobs.metadata(context.job()).map_err(|error| harness_error(error.into())
                     .operation(Operation::Inspect, Subject::Job(context.job())).effects(Effects::Unchanged))?;
-                // A reused name is a follow-up aimed at the wrong tool.
-                if let Some(name) = launched.name
-                    && let Some(id) = runtime.jobs.child_name_owner(context.agent(), &name, context.job()).await
-                {
-                    return Err(ToolError::invalid_arguments(format!(
-                        "child `{name}` already exists as job {id}; message it with tool.job({id}).send({{value: ...}}), or pick another name"
-                    )).operation(Operation::Validate, Subject::Job(id)).effects(Effects::NotStarted));
-                }
-                let child = runtime.next_child(context.agent()).await;
-                let model = model
-                    .or_else(|| runtime.agents()
-                        .get(context.agent()).map(|agent| agent.model.clone()))
-                    .ok_or_else(|| ToolError::failed("parent agent is no longer running")
-                        .operation(Operation::Lookup, Subject::Label(format!("parent agent {}", context.agent()))).effects(Effects::NotStarted))?;
-                let sender = runtime.spawn_agent(child.clone(), Some(context.job()), AgentLaunch::New {
-                    model,
-                    todos,
-                    available_depth: input.depth,
-                    location: launched.location,
-                    mode,
-                    capabilities,
-                }).await.map_err(|error| harness_error(error)
-                    .operation(Operation::Create, Subject::Label(format!("child agent {child}"))).effects(Effects::Unknown))?;
-                // Associate immediately so a failed first turn is selectable for retry
-                // even when it never emitted visible assistant text.
-                runtime.jobs.set_child_agent(context.job(), child.clone()).await.map_err(|error| harness_error(error.into())
-                    .operation(Operation::Save, Subject::Job(context.job())).effects(Effects::Started))?;
-                // Only this child session may opt its terminal job into resumption.
+                let caller = (context.capabilities(), model, depth);
+                let (launch, prompt) = child_launch(&runtime, input, caller, launched.location)?;
+                // Only this call may opt its job into resumption, as its child installs.
                 let handler = child_resume_handler(
                     Arc::downgrade(&runtime),
-                    child.clone(),
                     context.job_subject().clone(),
                     context.execution_location().clone(),
                     context.caller_location().clone(),
                 );
-                runtime.jobs.set_resume_handler(context.job(), handler).await.map_err(|error| harness_error(error.into())
-                    .operation(Operation::Prepare, Subject::Job(context.job())).effects(Effects::Started))?;
-                run_child_request(
-                    &runtime, &context, &child, &sender,
-                    vec![UserPart::Text { text: input.prompt }],
-                ).await
+                let (job, child) = (context.job(), runtime.next_child(owner).await);
+                let call = super::dispatch::Call { job, prompt, handler };
+                let launched = runtime.launch_child(child.clone(), launch, call);
+                let answer = launched.await.map_err(|error| launch_error(error, &child))?;
+                run_child_request(&runtime, &context, &child, answer).await
             }
         },
     )?;
     Ok(())
 }
 
-/// Resume a retained child with owner input. A child whose loop is gone, such as
-/// after a restart, is started again under its journaled contract. The runtime
-/// reference is weak: jobs must not retain their own manager.
+/// Why a child agent could not start, or start again.
+fn launch_error(error: HarnessError, child: &crate::identity::AgentId) -> ToolError {
+    let subject = Subject::Label(format!("child agent {child}"));
+    let error = match error {
+        // A session that no longer starts agents interrupted the call.
+        HarnessError::Session(crate::session::SessionError::Refused(_)) => {
+            (ToolError::interrupted().operation(Operation::Prepare, subject))
+                .effects(Effects::NotStarted)
+        }
+        // A reused name is a follow-up aimed at the wrong tool.
+        HarnessError::Job(error @ crate::job::JobError::NameTaken { job, .. }) => {
+            (ToolError::invalid_arguments(error).operation(Operation::Validate, Subject::Job(job)))
+                .effects(Effects::NotStarted)
+        }
+        error => {
+            (harness_error(error).operation(Operation::Create, subject)).effects(Effects::Unknown)
+        }
+    };
+    error.at(FailureSite::Host)
+}
+
+/// Check `input` as the launch its call makes, with the prompt that begins it,
+/// against what its caller now holds, which model it runs and how deep it may
+/// delegate.
+fn child_launch(
+    runtime: &SessionRuntime,
+    input: AgentArgs,
+    (caller, model, available_depth): (&CapabilitySet, ModelRef, usize),
+    location: crate::execution::ExecutionLocation,
+) -> Result<(AgentLaunch, String), ToolError> {
+    let todos = input.todos.map(|items| admit_todos("todos", items));
+    let todos = todos.transpose()?;
+    // Only hinted models were offered; anything else is unknown to the caller.
+    let model = match input.model {
+        Some(name) => {
+            let hinted = |model: &ModelRef| {
+                (runtime.harness.models.get(model))
+                    .is_some_and(|entry| entry.profile.hint.is_some())
+            };
+            let model = name.parse::<ModelRef>().ok().filter(hinted);
+            model.ok_or_else(|| invalid_argument(["model"], format!("unknown model `{name}`")))?
+        }
+        None => model,
+    };
+    let (mode, capabilities) = match &input.mode {
+        None => (None, caller.clone()),
+        Some(name) => {
+            let offered = |(_, mode): &(&ModeName, &Mode)| offers_mode(mode, caller);
+            let Some((name, mode)) = runtime.modes.get_key_value(name.as_str()).filter(offered)
+            else {
+                return Err(invalid_argument(["mode"], format!("unknown mode `{name}`")));
+            };
+            // Interaction follows the caller, as the root's follows the host.
+            (Some(name.clone()), &runtime.granted_by(mode) & caller)
+        }
+    };
+    if input.depth >= available_depth {
+        return Err(invalid_argument(
+            ["depth"],
+            format!("depth must be less than the caller's available depth of {available_depth}"),
+        ));
+    }
+    let launch = AgentLaunch::New {
+        model,
+        todos,
+        available_depth: input.depth,
+        location,
+        mode,
+        capabilities,
+    };
+    Ok((launch, input.prompt))
+}
+
+/// Run an agent call's installed child again with owner input, started again
+/// under its journaled contract if its loop is gone, such as after a restart.
+/// The runtime reference is weak: jobs must not retain their own manager.
 pub(super) fn child_resume_handler(
     runtime: Weak<SessionRuntime>,
-    child: crate::identity::AgentId,
     authorization: crate::tool::authorization::AuthorizationSubject,
     execution_location: crate::execution::ExecutionLocation,
     caller_location: crate::execution::ExecutionLocation,
 ) -> crate::job::ResumeHandler {
     Arc::new(move |value, input| {
         let runtime = runtime.upgrade();
-        let child = child.clone();
         let authorization = authorization.clone();
         let execution_location = execution_location.clone();
         let caller_location = caller_location.clone();
         Box::pin(async move {
             let runtime = runtime.ok_or_else(runtime_unavailable)?;
-            if runtime
-                .shutting_down
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err(ToolError::cancelled()
-                    .operation(
-                        Operation::Prepare,
-                        Subject::Label(format!("child agent {child}")),
-                    )
-                    .at(FailureSite::Host)
-                    .effects(Effects::NotStarted));
-            }
-            let sender = match runtime.agent_sender(&child) {
-                Some(sender) => sender,
-                None => runtime
-                    .spawn_agent(
-                        child.clone(),
-                        Some(authorization.job),
-                        AgentLaunch::Resume(Resumed::Idle),
-                    )
-                    .await
-                    .map_err(|error| {
-                        harness_error(error)
-                            .operation(
-                                Operation::Create,
-                                Subject::Label(format!("retained child agent {child}")),
-                            )
-                            .at(FailureSite::Host)
-                            .effects(Effects::Unknown)
-                    })?,
-            };
             let context = crate::tool::ToolContext::new(
                 authorization,
                 execution_location,
@@ -390,8 +381,23 @@ pub(super) fn child_resume_handler(
                 input,
                 runtime.jobs.clone(),
             );
+            let job = context.job();
+            let child = runtime.jobs.child_agent(job).ok_or_else(|| {
+                ToolError::failed("the call has no child to resume").at(FailureSite::Host)
+            })?;
+            if runtime.agents(|agents| agents.get(&child).is_none()) {
+                let resumed = AgentLaunch::Resume(Resumed::Idle);
+                let spawned = runtime.spawn_agent(child.clone(), Some(job), resumed);
+                spawned.await.map_err(|error| launch_error(error, &child))?;
+            }
             let content = value.iter().map(owner_input).collect();
-            let text = run_child_request(&runtime, &context, &child, &sender, content).await?;
+            let started = restart_child(&runtime, job, &child, content).await;
+            let answer = started.map_err(|error| {
+                (error.operation(Operation::Send, Subject::Job(job)))
+                    .at(FailureSite::Host)
+                    .effects(Effects::NotStarted)
+            })?;
+            let text = run_child_request(&runtime, &context, &child, answer).await?;
             Ok(crate::tool::ToolOutput::new(json!(text)))
         })
     })
@@ -402,28 +408,87 @@ fn owner_input(value: &serde_json::Value) -> UserPart {
     UserPart::ParentInput { text }
 }
 
-/// Start a child turn; the receiver resolves with its answer.
-async fn send_child_input(
-    sender: &super::AgentSender,
+/// Start child agent `child`'s next invocation with owner input `content`,
+/// releasing the answer the last one held as a reply. The receiver resolves with
+/// the new invocation's answer.
+async fn restart_child(
+    runtime: &SessionRuntime,
+    job: JobId,
+    child: &AgentId,
     content: Vec<UserPart>,
-) -> Result<oneshot::Receiver<Result<String, TurnFailure>>, ToolError> {
-    let (done, received) = oneshot::channel();
-    let input = AgentCommand::Input {
-        options: Default::default(),
-        content,
-        done: Some(super::RequestCompletion::Child(done)),
-    };
-    let sent = sender.send(input).await;
-    sent.map_err(|_| ToolError::failed("child agent stopped before accepting input"))?;
-    Ok(received)
+) -> Result<ChildAnswer, ToolError> {
+    let child = child.clone();
+    let restart = move |state: &CoreState| restart(state, job, child, content, |answer| answer);
+    let restarted = runtime.store.commit(Command::Journal, restart).await;
+    restarted.map_err(harness_error)
 }
 
+/// Give child agent `child` owner input: it joins the open invocation at its
+/// next request boundary, or, once that resolved, starts the next as
+/// [`restart_child`] does.
+async fn owner_update(
+    runtime: &SessionRuntime,
+    job: JobId,
+    child: &AgentId,
+    content: Vec<UserPart>,
+) -> Result<Option<ChildAnswer>, ToolError> {
+    let child = child.clone();
+    let input = move |state: &CoreState| {
+        let facts = state.agents.get(&child);
+        if facts.is_none_or(|facts| facts.invocation == Invocation::Resolved) {
+            return restart(state, job, child, content, Some);
+        }
+        let input = QueuedInput {
+            options: Default::default(),
+            content,
+            cancellation: Default::default(),
+            committed: oneshot::channel().0,
+        };
+        let queued = AgentCommand::QueuedInputs(vec![input]);
+        Ok(Plan::new(Vec::new(), move |state, _| {
+            state.agents.send(&child, queued);
+            None
+        }))
+    };
+    let updated = runtime.store.commit(Command::Journal, input).await;
+    updated.map_err(harness_error)
+}
+
+/// What [`restart_child`] commits, its answer's receiver passed `into` its result.
+fn restart<T: Send + 'static>(
+    state: &CoreState,
+    job: JobId,
+    child: AgentId,
+    content: Vec<UserPart>,
+    into: fn(ChildAnswer) -> T,
+) -> Result<Plan<T>, HarnessError> {
+    state.agents.get(&child).ok_or(HarnessError::AgentStopped)?;
+    let released = crate::job::Jobs::release_answer(state, job)?;
+    Ok(Plan::new(released, move |state, _| {
+        crate::job::woken(state, job);
+        let (done, received) = oneshot::channel();
+        let input = AgentCommand::Input {
+            options: Default::default(),
+            content,
+            done: Some(super::RequestCompletion::Child(done)),
+        };
+        let facts = state
+            .agents
+            .get_mut(&child)
+            .expect("checked before the commit");
+        facts.invocation = Invocation::Open;
+        state.agents.send(&child, input);
+        into(received)
+    }))
+}
+
+/// Wait for `child`'s answer to the invocation whose answer arrives on `done_rx`,
+/// passing on what its owner sends meanwhile.
 async fn run_child_request(
     runtime: &Arc<SessionRuntime>,
     context: &crate::tool::ToolContext,
     child: &crate::identity::AgentId,
-    sender: &super::AgentSender,
-    content: Vec<UserPart>,
+    mut done_rx: super::dispatch::ChildAnswer,
 ) -> Result<String, ToolError> {
     let job = context.job();
     // Resumption runs this outside dispatch, which would otherwise bind the host site.
@@ -435,21 +500,6 @@ async fn run_child_request(
                 .effects(effects)
         }
     };
-    let invocation = runtime
-        .agents()
-        .get(child)
-        .ok_or_else(|| {
-            failure(Operation::Lookup, Effects::NotStarted)(ToolError::failed(
-                "child agent stopped",
-            ))
-        })?
-        .control
-        .invocation
-        .clone();
-    *invocation.lock().await = Invocation::Open;
-    let mut done_rx = send_child_input(sender, content)
-        .await
-        .map_err(failure(Operation::Send, Effects::NotStarted))?;
     loop {
         tokio::select! {
             result = &mut done_rx => {
@@ -463,10 +513,8 @@ async fn run_child_request(
                 if inputs.is_empty() { return Ok(text); }
                 // Owner input continues this invocation instead of finishing the job, so
                 // the answer above, held for its result, is released as a reply.
-                runtime.jobs.notify_owner(context.job()).await;
-                *invocation.lock().await = Invocation::Open;
                 let content = inputs.iter().map(owner_input).collect();
-                done_rx = send_child_input(sender, content).await.map_err(|error| failure(Operation::Send, Effects::NotStarted)(error)
+                done_rx = restart_child(runtime, job, child, content).await.map_err(|error| failure(Operation::Send, Effects::NotStarted)(error)
                     .with_result(crate::tool::ToolOutput::new(json!(text))))?;
             }
             value = context.receive() => {
@@ -474,31 +522,19 @@ async fn run_child_request(
                     Ok(value) => value,
                     Err(error) => {
                         runtime.questions.cancel_child_question(context.job()).await;
-                        runtime.interrupt_tree(child, CancelScope::Outcome).await;
+                        runtime.interrupt_tree(child).await;
                         return Err(failure(Operation::Receive, Effects::Started)(error));
                     }
                 };
                 if !runtime.questions.answer_child_question(context.job(), value.clone()).await
                     .map_err(|error| failure(Operation::Send, Effects::Unknown)(harness_error(error)))?
                 {
-                    let mut active = invocation.lock().await;
-                    if *active == Invocation::Resolved {
-                        // The child already resolved this invocation; owner input restarts
-                        // it, so the held answer is released as a reply.
-                        runtime.jobs.notify_owner(context.job()).await;
-                        *active = Invocation::Open;
-                        done_rx = send_child_input(sender, vec![owner_input(&value)]).await.map_err(failure(Operation::Send, Effects::NotStarted))?;
-                        continue;
+                    // Owner updates join the open turn at its next request boundary, as
+                    // queued root prompts do; once it resolved, they restart it.
+                    let sent = owner_update(runtime, job, child, vec![owner_input(&value)]).await;
+                    if let Some(restarted) = sent.map_err(failure(Operation::Send, Effects::NotStarted))? {
+                        done_rx = restarted;
                     }
-                    // Owner updates use the same request-boundary mailbox as
-                    // queued root prompts, rather than waiting for a new turn.
-                    let (committed, _receipt) = oneshot::channel();
-                    sender.send(AgentCommand::QueuedInputs(vec![QueuedInput {
-                        options: Default::default(),
-                        content: vec![owner_input(&value)],
-                        cancellation: Default::default(),
-                        committed,
-                    }])).await.map_err(|_| failure(Operation::Send, Effects::NotStarted)(ToolError::failed("child agent stopped before accepting owner input")))?;
                 }
             }
         }
@@ -713,7 +749,7 @@ for line in sys.stdin:
 
     /// An agent may name only hinted models, and hinted modes within what it holds
     /// itself; with none to name, the input is absent. A chosen mode is the child's.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn children_take_only_hinted_models_and_modes_their_parent_could_hold() {
         use crate::tool::policy::Mode;
         let root = tempfile::tempdir().unwrap();
@@ -811,7 +847,7 @@ for line in sys.stdin:
                 .text
                 .contains("<mode name=\"scout\">\nHolds 2.")
         );
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let started = events!(&records, SessionEvent::AgentStarted { mode, capabilities, .. } => (mode.clone().map(|mode| mode.name), capabilities.clone()));
         // Interaction follows the parent; the mode grants the rest.
         let held = vec![read, agents, Capability::Interactive];
@@ -899,7 +935,7 @@ for line in sys.stdin:
 
     /// A child in a mode is held to it: depth still withholds `agents`, a mode it could
     /// not hold is unknown to it, and a restart returns it to the mode as pinned.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_child_keeps_its_mode_through_depth_delegation_and_restart() {
         use crate::tool::policy::Mode;
         let root = tempfile::tempdir().unwrap();
@@ -917,7 +953,9 @@ for line in sys.stdin:
                 ("work", mode(&[read, write, agents], "Work.")),
                 ("scout", scout),
             ];
+            // No turn is scripted for the completions: the held window keeps them.
             test_builder(root.path(), &sessions, provider, false)
+                .coalescing(wait::Coalescing::held().0)
                 .max_child_depth(2)
                 .modes(
                     modes
@@ -942,7 +980,7 @@ for line in sys.stdin:
             session.run_script(spawn(1)).await.unwrap().value["value"]["result"],
             "held"
         );
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let started = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), capabilities, .. } if mode.name.as_str() == "scout" => capabilities.clone());
         let interactive = Capability::Interactive;
         assert_eq!(
@@ -978,6 +1016,7 @@ for line in sys.stdin:
         let widened = mode(&[read, write, agents], "Changed.");
         let harness = build(widened, vec![answer("again")]).await.unwrap();
         let resumed = harness.resume_session(id).await.unwrap();
+        resumed.running().await.unwrap();
         resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
         assert_eq!(
             terminal(&resumed, job).await.state,
@@ -1036,7 +1075,7 @@ for line in sys.stdin:
         let script = "const all = [...Array(8)].map(() => tool.agent({prompt:'go', mode:'look'})); \
                       return (await Promise.all(all)).length;";
         assert_eq!(session.run_script(script).await.unwrap().value["value"], 8);
-        let records = session.runtime.store.records().await;
+        let records = session.runtime.store.records();
         let looks = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name.as_str() == "look" => mode.definition.is_some());
         assert_eq!(
             (looks.len(), looks.iter().filter(|pinned| **pinned).count()),
@@ -1114,7 +1153,7 @@ for line in sys.stdin:
         shutdown_session(session).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn root_interactive_gate_covers_dispatch_and_nested_scripts() {
         for enabled in [false, true] {
             let root = tempfile::tempdir().unwrap();
@@ -1129,7 +1168,9 @@ for line in sys.stdin:
                 answer: "host-answer".into(),
                 ..Default::default()
             };
+            // No turn is scripted for the completions: the held window keeps them.
             let harness = builder(root.path(), requests.clone())
+                .coalescing(wait::Coalescing::held().0)
                 .capabilities(capabilities.clone())
                 .question_handler(Arc::new(questions))
                 .build()
@@ -1186,7 +1227,7 @@ for line in sys.stdin:
             }
             assert_eq!(batches.lock().unwrap().len(), if enabled { 8 } else { 0 });
             if !enabled {
-                let jobs = session.inspect_jobs(&session.root).await;
+                let jobs = session.inspect_jobs(&session.root);
                 assert!(jobs.iter().all(|job| job.tool != "ask"));
             }
             shutdown_session(session).await;
@@ -1196,7 +1237,12 @@ for line in sys.stdin:
     /// A background handle reports where the child runs, not where the tool does.
     #[tokio::test]
     async fn background_child_handle_reports_the_childs_workspace() {
-        let (_root, _requests, session) = scripted_session([answer("child done")]).await;
+        let root = tempfile::tempdir().unwrap();
+        let provider = scripted_provider(&Requests::default(), [answer("child done")]);
+        // No turn is scripted for the completion: the held window keeps it.
+        let builder = test_builder(root.path(), &root.path().join("sessions"), provider, false);
+        let harness = builder.coalescing(wait::Coalescing::held().0).build();
+        let session = ephemeral_session(&harness.await.unwrap()).await;
         let workspace = session.runtime.harness.workspace.join("sub");
         std::fs::create_dir(&workspace).unwrap();
         let arguments = json!({"prompt":"work", "workspace":"sub", "bg":true});

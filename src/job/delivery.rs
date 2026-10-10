@@ -1,4 +1,4 @@
-//! Serialized lifecycle delivery, claims, and wait semantics.
+//! Lifecycle delivery, claims, and wait semantics.
 
 use super::*;
 use crate::session::Message;
@@ -14,17 +14,52 @@ pub(super) const LIFECYCLE_BATCH_BYTES: usize = 4 * output::PAGE_BYTES;
 /// What a notification adds around each envelope it presents.
 const ENVELOPE_OVERHEAD: usize = 128;
 
-/// A pending batch holding the delivery gate. Dropping it uncommitted leaves its
-/// messages and jobs pending; presentation must not claim jobs while it is held.
-pub(crate) struct PendingDelivery {
+/// The pending question or outcome one read presented, which only that read
+/// may acknowledge: a later delivery of the same job is not its to acknowledge.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Delivery {
+    pub(super) job: JobId,
+    pub(super) stamp: u64,
+}
+
+impl Delivery {
+    /// The claim acknowledging this delivery, unless its job has a newer one since.
+    pub(crate) fn claim(
+        self,
+        state: &CoreState,
+    ) -> Result<Option<(AgentId, SessionEvent)>, JobError> {
+        let Self { job, stamp } = self;
+        let entry = state.jobs.entries.get(&job).ok_or(JobError::Unknown(job))?;
+        let current = entry
+            .delivery(job)
+            .is_some_and(|delivery| delivery.stamp == stamp);
+        Ok(current.then(|| (entry.agent.clone(), SessionEvent::JobClaimed { job })))
+    }
+
+    /// The claims acknowledging `reads` that are still current: each job's
+    /// newest, once.
+    pub(crate) fn claims(
+        mut reads: Vec<Self>,
+        state: &CoreState,
+    ) -> impl Iterator<Item = (AgentId, SessionEvent)> {
+        reads.sort_by_key(|read| (read.job, std::cmp::Reverse(read.stamp)));
+        reads.dedup_by_key(|read| read.job);
+        (reads.into_iter()).filter_map(|read| read.claim(state).ok().flatten())
+    }
+}
+
+/// A pending batch as one read saw it. Committing it delivers exactly what it
+/// presents, or nothing once part of it is no longer pending as it was read.
+pub(crate) struct Notification {
     manager: JobManager,
     pub(super) owner: AgentId,
     envelopes: Vec<JobEnvelope>,
+    /// What each envelope presents.
+    deliveries: Vec<Delivery>,
     messages: Vec<AgentMessage>,
-    _delivery: OwnedMutexGuard<()>,
 }
 
-impl PendingDelivery {
+impl Notification {
     pub(crate) fn messages(&self) -> &[AgentMessage] {
         &self.messages
     }
@@ -33,225 +68,129 @@ impl PendingDelivery {
         &self.envelopes
     }
 
-    /// Commit the parent notification with an acknowledgement row for each delivered
-    /// job outcome and child reply, in one transaction, then acknowledge them live.
-    /// Shielded from caller cancellation once admitted.
+    /// Commit the owner's `message` presenting this batch, with an
+    /// acknowledgement row for each job outcome and child reply it delivers, in
+    /// one transaction. Refused [`JobError::Stale`] when any of them is no longer
+    /// pending as it was read, so the owner presents what is pending now instead.
     pub(crate) async fn commit(self, message: Message) -> Result<MessageSeq, JobError> {
         let Self {
             manager,
             owner,
-            envelopes,
+            deliveries,
             messages,
-            _delivery: gate,
+            ..
         } = self;
-        manager
-            .spawn_owned(
-                gate,
-                "notification publication",
-                move |manager| async move {
-                    // The gate serializes outcomes with delivery, so this selection holds.
-                    let delivered: Vec<_> = {
-                        let jobs = manager.inner.jobs.lock().await;
-                        envelopes
-                            .iter()
-                            .filter(|envelope| {
-                                jobs.get(&envelope.id).is_some_and(|entry| {
-                                    entry.agent == owner
-                                        && entry.state() == envelope.state
-                                        && entry.lifecycle_pending().is_some()
-                                })
-                            })
-                            .map(|envelope| envelope.id)
-                            .collect()
-                    };
-                    let (acknowledged, replies) = (delivered.clone(), messages.clone());
-                    let author = owner.clone();
-                    let records = manager
-                        .inner
-                        .store
-                        .append_then(
-                            owner.clone(),
-                            SessionEvent::MessageCommitted { message },
-                            move |notification: RecordSeq| {
-                                let notification = notification.message();
-                                let injected = acknowledged
-                                    .into_iter()
-                                    .map(|job| SessionEvent::JobInjected { job });
-                                let replies = replies.into_iter().map(|reply| {
-                                    SessionEvent::JobMessageDelivered {
-                                        job: reply.id,
-                                        source: reply.message,
-                                        notification,
-                                    }
-                                });
-                                injected
-                                    .chain(replies)
-                                    .map(|event| (author.clone(), event))
-                                    .collect()
-                            },
-                        )
-                        .await?;
-                    let record = &records[0];
-                    let mut jobs = manager.inner.jobs.lock().await;
-                    for reply in &messages {
-                        if let Some(entry) = jobs.get_mut(&reply.id) {
-                            entry.deliver_message(reply.message);
-                        }
-                    }
-                    for job in delivered {
-                        if let Some(entry) = jobs.get_mut(&job) {
-                            entry.acknowledge();
-                        }
-                    }
-                    // A bounded snapshot may leave more work: wake the owner for it.
-                    let more = jobs
-                        .iter()
-                        .find(|(_, entry)| entry.agent == owner && entry.has_pending());
-                    if let Some((&job, _)) = more {
-                        manager.wake(owner, job);
-                    }
-                    Ok(record.sequence.message())
-                },
-            )
-            .await
+        let store = manager.inner.store.clone();
+        let notify = move |state: &CoreState| {
+            let jobs = &state.jobs.entries;
+            let current = deliveries.iter().all(|Delivery { job, stamp }| {
+                jobs.get(job).is_some_and(|entry| {
+                    entry.agent == owner && entry.lifecycle_pending() == Some(*stamp)
+                })
+            });
+            let queued = messages.iter().all(|reply| {
+                let child = jobs.get(&reply.id).and_then(JobFacts::child);
+                child.is_some_and(|child| child.messages.iter().any(|m| m.message == reply.message))
+            });
+            if !(current && queued) {
+                return Err(JobError::Stale);
+            }
+            let notification = state.next_sequence().message();
+            let injected = (deliveries.into_iter())
+                .map(|Delivery { job, .. }| SessionEvent::JobInjected { job });
+            let replies = messages
+                .into_iter()
+                .map(|reply| SessionEvent::JobMessageDelivered {
+                    job: reply.id,
+                    source: reply.message,
+                    notification,
+                });
+            let events = std::iter::once(SessionEvent::MessageCommitted { message })
+                .chain(injected)
+                .chain(replies);
+            let entries = events.map(|event| (owner.clone(), event)).collect();
+            Ok(Plan::new(entries, |_, records| {
+                records[0].sequence.message()
+            }))
+        };
+        store.commit(Command::Journal, notify).await
     }
 }
 
 impl JobManager {
-    pub async fn wait(
+    /// The foreground result, with the delivery it presents for the caller to
+    /// acknowledge once it has read it; a question it presents is acknowledged now.
+    pub(crate) async fn wait_foreground(
         &self,
         id: JobId,
-        timeout: Option<Duration>,
-        claim: bool,
-    ) -> Result<JobEnvelope, JobError> {
-        let mut envelope = self
-            .wait_inner(id, timeout, WaitMode::Explicit { claim })
-            .await?;
-        self.hydrate_envelope(&mut envelope).await?;
-        envelope.render_output_diagnostic(&CapabilitySet::default());
-        Ok(envelope)
-    }
-
-    pub(crate) async fn wait_foreground(&self, id: JobId) -> Result<JobEnvelope, JobError> {
-        self.wait_inner(id, None, WaitMode::Foreground).await
+    ) -> Result<(JobEnvelope, Option<Delivery>), JobError> {
+        // A released job whose finish is claimed returns with that outcome.
+        let ready =
+            |entry: &JobFacts| entry.deliverable() || (entry.background && !entry.finishing);
+        let (envelope, presented) = self.until_job(id, ready).await?;
+        if envelope.question.is_some() {
+            self.acknowledge(presented).await?;
+        }
+        Ok((envelope, presented))
     }
 
     /// Block until `id` is no longer live, without claiming or hydrating output.
     pub(crate) async fn wait_settled(&self, id: JobId) -> Result<(), JobError> {
-        self.wait_inner(id, None, WaitMode::Terminal)
-            .await
-            .map(drop)
+        self.until_job(id, |entry| !entry.live()).await.map(drop)
     }
 
-    pub(super) async fn wait_inner(
+    /// Job `id`'s envelope and the delivery it presents, once `ready`.
+    pub(super) async fn until_job(
         &self,
         id: JobId,
-        timeout: Option<Duration>,
-        mode: WaitMode,
-    ) -> Result<JobEnvelope, JobError> {
-        let deadline = timeout.map(|duration| tokio::time::Instant::now() + duration);
-        loop {
-            let delivery = self.inner.delivery_operation.clone().lock_owned().await;
-            let (snapshot, notified, ready, claimed_agent) = {
-                let mut jobs = self.inner.jobs.lock().await;
-                let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-                let notified = entry.notify.clone().notified_owned();
-                let pending_question = entry.waiting() && entry.unacknowledged();
-                let (ready, claim) = match mode {
-                    WaitMode::Foreground => {
-                        (entry.deliverable() || entry.background, entry.waiting())
-                    }
-                    WaitMode::Explicit { claim } => (
-                        !entry.suspended() && (entry.end().is_some() || pending_question),
-                        claim,
-                    ),
-                    WaitMode::Terminal => (entry.settled(), false),
-                    WaitMode::Final => (!entry.cancellable(), false),
-                };
-                let claimed_agent =
-                    (ready && claim && entry.unacknowledged()).then(|| entry.agent.clone());
-                let mut snapshot = entry.envelope(id);
-                if !ready {
-                    snapshot.question = None;
-                }
-                (snapshot, notified, ready, claimed_agent)
-            };
-            if ready {
-                self.persist_claim(id, claimed_agent, delivery).await?;
-                return Ok(snapshot);
-            }
-            drop(delivery);
-            if let Some(deadline) = deadline {
-                if tokio::time::timeout_at(deadline, notified).await.is_err() {
-                    return Ok(snapshot);
-                }
-            } else {
-                notified.await;
-            }
-        }
+        ready: fn(&JobFacts) -> bool,
+    ) -> Result<(JobEnvelope, Option<Delivery>), JobError> {
+        let resolve = move |state: &mut CoreState| match state.jobs.entries.get(&id) {
+            None => Some(Err(JobError::Unknown(id))),
+            Some(entry) => ready(entry).then(|| Ok((entry.envelope(id), entry.delivery(id)))),
+        };
+        self.inner.store.until(resolve).await?
     }
 
-    /// Append the claim, then install it live; a no-op without `agent`.
-    async fn persist_claim(
-        &self,
-        id: JobId,
-        agent: Option<AgentId>,
-        gate: OwnedMutexGuard<()>,
-    ) -> Result<(), JobError> {
-        let Some(agent) = agent else {
+    /// Acknowledge what a read presented, unless the job has a newer delivery since.
+    pub(crate) async fn acknowledge(&self, delivery: Option<Delivery>) -> Result<(), JobError> {
+        let Some(delivery) = delivery else {
             return Ok(());
         };
-        self.spawn_owned(gate, "delivery publication", move |manager| async move {
-            let claimed = SessionEvent::JobClaimed { job: id };
-            manager.inner.store.append(agent, claimed).await?;
-            let mut jobs = manager.inner.jobs.lock().await;
-            jobs.get_mut(&id)
-                .ok_or(JobError::Unknown(id))?
-                .acknowledge();
-            Ok(())
-        })
-        .await
-    }
-
-    pub async fn claim(&self, id: JobId) -> Result<(), JobError> {
-        let delivery = self.inner.delivery_operation.clone().lock_owned().await;
-        let agent = {
-            let mut jobs = self.inner.jobs.lock().await;
-            let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-            // A suspended job's delivery waits for its restart; reading its state
-            // acknowledges nothing.
-            if entry.suspended() {
-                return Ok(());
-            }
-            if !entry.deliverable() {
-                return Err(JobError::NotTerminal(id));
-            }
-            entry.unacknowledged().then(|| entry.agent.clone())
+        let claim = move |state: &CoreState| {
+            Ok::<_, JobError>(Plan::journal(delivery.claim(state)?.into_iter().collect()))
         };
-        self.persist_claim(id, agent, delivery).await
+        self.inner.store.commit(Command::Journal, claim).await
     }
 
-    /// Snapshot a bounded pending batch without acknowledging it. The receipt
-    /// holds the delivery gate through presentation and parent history commit.
-    pub(crate) async fn pending_delivery(
-        &self,
-        owner: &AgentId,
-    ) -> Result<PendingDelivery, JobError> {
-        let delivery = self.inner.delivery_operation.clone().lock_owned().await;
-        let (messages, candidates) = {
-            let jobs = self.inner.jobs.lock().await;
-            let messages = messages::pending_messages(&jobs, owner);
-            let candidates = self.lifecycle_candidates(&jobs, owner, &messages);
+    /// Record that job `reader` presented `read`, for its finish to acknowledge.
+    pub(crate) async fn read(&self, reader: JobId, read: Option<Delivery>) {
+        let Some(read) = read else {
+            return;
+        };
+        let record = move |state: &mut CoreState| {
+            if let Some(entry) = state.jobs.entries.get_mut(&reader) {
+                entry.reads.push(read);
+            }
+        };
+        self.inner.store.live(record).await;
+    }
+
+    /// Read a bounded pending batch without acknowledging it.
+    pub(crate) async fn pending_delivery(&self, owner: &AgentId) -> Result<Notification, JobError> {
+        let (messages, candidates) = self.facts(|jobs| {
+            let messages = messages::pending_messages(&jobs.entries, owner);
+            let candidates = self.lifecycle_candidates(&jobs.entries, owner, &messages);
             (messages, candidates)
-        };
+        });
         let envelopes = if candidates.is_empty() {
             Vec::new()
         } else {
-            // Sized off the jobs lock; the held gate keeps the candidates pending.
+            // Sized off the core.
             output::blocking(move || {
                 let mut remaining = LIFECYCLE_BATCH_BYTES;
                 let mut pending = Vec::new();
-                for (envelope, output) in candidates {
+                for (envelope, delivery, output) in candidates {
                     if remaining == 0 {
                         break;
                     }
@@ -264,7 +203,7 @@ impl JobManager {
                         // A later completion may still fit; an oversized first one is admitted.
                         continue;
                     }
-                    pending.push(envelope);
+                    pending.push((envelope, delivery));
                     remaining = remaining.saturating_sub(cost);
                 }
                 Ok(pending)
@@ -272,12 +211,13 @@ impl JobManager {
             .await
             .map_err(|error| JobError::Output(Box::new(error)))?
         };
-        Ok(PendingDelivery {
+        let (envelopes, deliveries) = envelopes.into_iter().unzip();
+        Ok(Notification {
             manager: self.clone(),
             owner: owner.clone(),
             envelopes,
+            deliveries,
             messages,
-            _delivery: delivery,
         })
     }
 
@@ -286,10 +226,10 @@ impl JobManager {
     /// of its own job.
     fn lifecycle_candidates(
         &self,
-        jobs: &HashMap<JobId, JobEntry>,
+        jobs: &HashMap<JobId, JobFacts>,
         owner: &AgentId,
         messages: &[AgentMessage],
-    ) -> Vec<(JobEnvelope, output::Output)> {
+    ) -> Vec<(JobEnvelope, Delivery, output::Output)> {
         let messages_through = messages
             .last()
             .map_or(MessageSeq::default(), |message| message.message);
@@ -297,16 +237,22 @@ impl JobManager {
             .iter()
             .filter(|(_, entry)| {
                 &entry.agent == owner
-                    && entry.lifecycle_pending().is_some()
                     // Filter before budgeting: a blocked low-ID child must not
                     // consume the lifecycle budget of an unrelated completion.
                     && entry.child().is_none_or(|child| {
                         child.messages.iter().all(|message| message.message <= messages_through)
                     })
             })
-            .map(|(&id, entry)| (entry.envelope(id), self.output(id)))
+            .filter_map(|(&id, entry)| {
+                let stamp = entry.lifecycle_pending()?;
+                Some((
+                    entry.envelope(id),
+                    Delivery { job: id, stamp },
+                    output::Output::of(self.store(), id, entry.invocation),
+                ))
+            })
             .collect::<Vec<_>>();
-        candidates.sort_by_key(|(envelope, _)| envelope.id);
+        candidates.sort_by_key(|(envelope, ..)| envelope.id);
         candidates
     }
 }
@@ -314,7 +260,6 @@ impl JobManager {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::UserPart;
 
     async fn completed_job() -> (tempfile::TempDir, JobManager, AgentId, JobId) {
         let (root, manager, owner) = crate::job::tests::runtime().await;
@@ -348,58 +293,56 @@ mod tests {
     }
 
     /// Asserts the owner has (or has no) pending delivery both live and after replay.
-    async fn assert_pending(manager: &JobManager, owner: &AgentId, pending: bool, case: &str) {
-        assert_eq!(manager.has_pending(owner).await, pending, "live {case}");
+    fn assert_pending(manager: &JobManager, owner: &AgentId, pending: bool, case: &str) {
+        assert_eq!(manager.has_pending(owner), pending, "live {case}");
         assert_eq!(
-            manager.test_replay().await.has_pending(owner).await,
+            manager.test_replay().has_pending(owner),
             pending,
             "replay {case}"
         );
     }
 
-    /// An open receipt serializes an explicit claim; either the claim wins after
-    /// the receipt drops, or a commit wins without a duplicate acknowledgement.
+    /// A notification read beside an explicit claim delivers its job once: a
+    /// claim that lands first makes the notification stale, which commits
+    /// nothing, and a committed notification leaves the claim nothing to
+    /// acknowledge. A delivery of another job does not make it stale.
     #[tokio::test]
-    async fn delivery_receipt_serializes_explicit_claim_until_drop_or_commit() {
-        for commit in [false, true] {
+    async fn a_claim_landing_first_makes_the_notification_stale() {
+        for claim_first in [true, false] {
             let (_root, manager, owner, job) = completed_job().await;
-            let receipt = manager.pending_delivery(&owner).await.unwrap();
-            assert_eq!(receipt.envelopes()[0].id, job);
-            let claim = manager.claim(job);
-            tokio::pin!(claim);
-            assert!(futures_util::poll!(&mut claim).is_pending());
-            let sequence = if commit {
-                // Consuming commit owns the notification append and releases its gate
-                // only after publication; the competing claim can now complete.
-                Some(
-                    receipt
-                        .commit(notification(job, JobState::Completed))
-                        .await
-                        .unwrap(),
-                )
-            } else {
-                drop(receipt);
-                assert!(manager.has_pending(&owner).await);
-                None
+            let read = manager.pending_delivery(&owner).await.unwrap();
+            assert_eq!(read.envelopes()[0].id, job);
+            let spec = JobSpec {
+                background: true,
+                ..JobSpec::test(owner.clone(), "other")
             };
-            claim.await.unwrap();
-            assert_pending(&manager, &owner, false, "claimed").await;
-            let records = manager.store().records().await;
-            // Exactly one acknowledgement: the notification's, or the later claim.
+            let other = manager.test_create(spec).await;
+            manager.test_finish(other, serde_json::json!("other")).await;
+            let message = notification(job, JobState::Completed);
+            if claim_first {
+                manager.test_claim(job).await.unwrap();
+                let stale = read.commit(message).await;
+                assert!(matches!(stale, Err(JobError::Stale)), "{stale:?}");
+            } else {
+                read.commit(message).await.unwrap();
+                manager.test_claim(job).await.unwrap();
+            }
+            let records = manager.store().records();
+            // Exactly one acknowledgement: the notification's, or the claim's.
             let acks: Vec<_> = records
                 .iter()
                 .filter_map(|record| match record.event {
-                    SessionEvent::JobClaimed { .. } => Some(false),
-                    SessionEvent::JobInjected { .. } => Some(true),
+                    SessionEvent::JobClaimed { job: claimed } => Some((claimed, false)),
+                    SessionEvent::JobInjected { job: injected } => Some((injected, true)),
                     _ => None,
                 })
                 .collect();
-            assert_eq!(acks, [sequence.is_some()]);
+            assert_eq!(acks, [(job, !claim_first)]);
+            assert!(manager.has_pending(&owner), "the other job stays pending");
             // Claiming affects delivery, not later explicit output access.
             let output = manager
                 .test_replay()
-                .await
-                .snapshot(job)
+                .test_snapshot(job)
                 .await
                 .unwrap()
                 .output;
@@ -421,9 +364,7 @@ mod tests {
                 let event = SessionEvent::MessageCommitted { message };
                 manager.test_append(owner.clone(), event).await;
             }
-            assert_eq!(manager.has_pending(&owner).await, !receipt);
-            let restored = manager.test_replay().await;
-            assert_eq!(restored.has_pending(&owner).await, !receipt, "{receipt}");
+            assert_pending(&manager, &owner, !receipt, &receipt.to_string());
         }
     }
 
@@ -444,7 +385,7 @@ mod tests {
             images: Vec::new(),
         };
         manager.test_append(owner.clone(), finished).await;
-        assert!(manager.test_replay().await.has_pending(&owner).await);
+        assert!(manager.test_replay().has_pending(&owner));
     }
 
     /// A delivered question never suppresses the job's later terminal delivery.
@@ -462,8 +403,8 @@ mod tests {
                 manager.resume_input(job).await.unwrap();
                 manager.test_finish(job, serde_json::json!("done")).await;
             }
-            assert_pending(&manager, &owner, true, "terminal").await;
-            let restored = manager.test_replay().await;
+            assert_pending(&manager, &owner, true, "terminal");
+            let restored = manager.test_replay();
             let state = restored.pending_delivery(&owner).await.unwrap().envelopes()[0].state;
             let expected = if cancelled {
                 JobState::Cancelled
@@ -474,52 +415,38 @@ mod tests {
         }
     }
 
+    /// A read acknowledges only the delivery it showed: what replaced it is still
+    /// delivered, whether an outcome or another question, or a restart's
+    /// completion replacing the completion it read.
     #[tokio::test]
-    async fn empty_receipts_release_the_delivery_gate() {
-        let (_root, manager, owner, job) = completed_job().await;
-        manager.claim(job).await.unwrap();
-        let receipt = manager.pending_delivery(&owner).await.unwrap();
-        assert!(receipt.envelopes().is_empty());
-        receipt
-            .commit(Message::User(vec![UserPart::JobEvents { events: vec![] }]))
+    async fn stale_acknowledgement_leaves_the_later_delivery_pending() {
+        let presented = async |manager: &JobManager, job| {
+            manager.entry(job, |entry| entry.delivery(job)).unwrap()
+        };
+        for asks_again in [false, true] {
+            let (_root, manager, owner, job) = question_job().await;
+            let first = presented(&manager, job).await;
+            manager.resume_input(job).await.unwrap();
+            if asks_again {
+                let question = crate::job::tests::question("again");
+                manager.request_input(job, question).await.unwrap();
+            } else {
+                manager.test_finish(job, serde_json::json!("done")).await;
+            }
+            manager.acknowledge(first).await.unwrap();
+            assert_pending(&manager, &owner, true, "after a stale question");
+        }
+        let (_root, manager, owner) = crate::job::tests::runtime().await;
+        let again = serde_json::json!("again");
+        let job = manager.test_resumable(owner.clone(), "agent", again).await;
+        manager.test_finish(job, serde_json::json!("done")).await;
+        let first = presented(&manager, job).await;
+        manager.send(job, serde_json::json!("again")).await.unwrap();
+        crate::tests::bounded(manager.wait(job, None, false))
             .await
             .unwrap();
-        assert!(
-            manager
-                .pending_delivery(&owner)
-                .await
-                .unwrap()
-                .envelopes()
-                .is_empty()
-        );
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn wait_deadline_does_not_restart_on_notifications() {
-        let (_root, jobs, agent) = crate::job::tests::runtime().await;
-        let lease = jobs.test_lease(JobSpec::test(agent, "pending")).await;
-        let notify = jobs
-            .inner
-            .jobs
-            .lock()
-            .await
-            .get(&lease.id())
-            .unwrap()
-            .notify
-            .clone();
-        let mut waiter = Box::pin(jobs.wait(lease.id(), Some(Duration::from_secs(10)), true));
-        assert!(futures_util::poll!(&mut waiter).is_pending());
-        for _ in 0..4 {
-            tokio::time::advance(Duration::from_secs(2)).await;
-            notify.notify_waiters();
-            assert!(futures_util::poll!(&mut waiter).is_pending());
-        }
-        tokio::time::advance(Duration::from_secs(2)).await;
-        let std::task::Poll::Ready(view) = futures_util::poll!(&mut waiter) else {
-            panic!("the deadline passed");
-        };
-        assert_eq!(view.unwrap().state, JobState::Queued);
-        assert!(!lease.cancellation_token().is_cancelled());
+        manager.acknowledge(first).await.unwrap();
+        assert_pending(&manager, &owner, true, "after a stale completion");
     }
 
     #[tokio::test]
@@ -538,14 +465,14 @@ mod tests {
         let question_view = manager.wait(lease.id(), None, true).await.unwrap();
         assert_eq!(question_view.state, JobState::WaitingInput);
         assert_eq!(question_view.question, Some(question("q-2")));
-        assert!(!manager.has_pending(&agent).await);
+        assert!(!manager.has_pending(&agent));
         // Nothing changes, so this wait returns at its deadline.
         let repeated = manager
             .wait(lease.id(), Some(Duration::from_millis(1)), true)
             .await
             .unwrap();
         assert_eq!(
-            (repeated.state, repeated.question),
+            (repeated.state, repeated.envelope.question),
             (JobState::WaitingInput, None)
         );
         manager.resume_input(lease.id()).await.unwrap();
@@ -558,6 +485,6 @@ mod tests {
         assert_eq!(receipt.envelopes()[0].question, Some(question("q-3")));
         let message = notification(lease.id(), JobState::WaitingInput);
         receipt.commit(message).await.unwrap();
-        assert!(!manager.has_pending(&agent).await);
+        assert!(!manager.has_pending(&agent));
     }
 }

@@ -28,7 +28,8 @@ operations share validation and execution behavior.
 ## Connection and request lifecycle
 
 Connection startup is shared by callers using the same pool key. Cancelling one waiter stops its
-wait, not the shared startup. Startup failure removes the failed slot; transport I/O or protocol failure
+wait, not the shared startup; redefining a target on its route stops the startup, and its callers
+plan again. Startup failure removes the failed slot; transport I/O or protocol failure
 during execution discards the affected pooled connection so later work can establish a new one.
 It does not transparently replay the failed tool operation.
 

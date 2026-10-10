@@ -58,6 +58,12 @@ impl ToolContext {
         }
     }
 
+    /// Record that this invocation presented `read`, for its job's finish to
+    /// acknowledge: the record of a read is the outcome of the job that read it.
+    pub(crate) async fn read(&self, read: Option<crate::job::Delivery>) {
+        self.jobs.read(self.job(), read).await;
+    }
+
     #[must_use]
     pub(crate) fn with_source(mut self, source: Option<crate::tool::source::Source>) -> Self {
         self.source = source;
@@ -132,11 +138,13 @@ impl ToolContext {
     }
 
     /// Authorize further permissions under this invocation's capabilities and
-    /// authorization arguments, naming the origin a running request moved to.
+    /// authorization arguments, naming the origin a running request moved to,
+    /// for a connection `admitted` at those target revisions.
     pub(crate) async fn authorize(
         &self,
         permissions: Vec<super::policy::PermissionUse>,
         network_origin: Option<String>,
+        admitted: &[(crate::target::TargetName, u64)],
     ) -> Result<(), AuthorizationError> {
         let Authority::Invocation {
             coordinator,
@@ -147,7 +155,14 @@ impl ToolContext {
             return Err(unavailable());
         };
         let arguments = arguments.document(network_origin.as_deref());
-        (coordinator.authorize(&self.subject, tool.clone(), permissions, arguments)).await
+        (coordinator.authorize(
+            &self.subject,
+            tool.clone(),
+            permissions,
+            arguments,
+            admitted,
+        ))
+        .await
     }
 
     #[must_use]
@@ -160,27 +175,18 @@ impl ToolContext {
         self.subject.cancellation.cancelled().await;
     }
 
+    /// Take the accepted input, or close the mailbox when there is none: a core live
+    /// command, so no send is accepted part-way through it.
     pub(crate) async fn drain_input_or_close(&self) -> Vec<Value> {
-        let mut input = self.input.lock().await;
-        let operation = self
-            .jobs
-            .operation(self.job())
-            .await
-            .expect("live tool job");
-        let _operation = operation.lock().await;
-        let mut pending = Vec::new();
-        while let Ok(value) = input.try_recv() {
-            pending.push(value);
-        }
-        if pending.is_empty() {
-            input.close();
-            // A sender on another thread may enqueue between try_recv and
-            // close. Closing rejects future sends, but preserves accepted ones.
-            while let Ok(value) = input.try_recv() {
-                pending.push(value);
+        let mut input = self.input.clone().lock_owned().await;
+        let drain = move |_: &mut _| {
+            let pending: Vec<_> = std::iter::from_fn(|| input.try_recv().ok()).collect();
+            if pending.is_empty() {
+                input.close();
             }
-        }
-        pending
+            pending
+        };
+        self.store().live(drain).await
     }
 
     pub async fn receive(&self) -> Result<Value, ToolError> {

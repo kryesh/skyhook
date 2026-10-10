@@ -20,14 +20,16 @@ names a path or workspace that is not valid Unicode is refused rather than appro
 approximate name.
 
 Choose **Allow once** to approve only the current operation. When offered, **Allow proposed
-scope** saves the displayed grant for later operations in the same session, including after
-resume; inspect **Details** before granting it. Path grants apply only to the approved target
-and access mode. Directory grants cover descendants; read and write grants remain separate.
+scope** saves the displayed grant for later operations while the session stays open; reopening
+the session asks again. Inspect **Details** before granting it. Path grants apply only to the
+approved target and access mode. Directory grants cover descendants; read and write grants remain
+separate.
 Process execution remains subject to confirmation on each invocation. These defaults apply to
 the CLI; [library hosts](../development/embedding.md) can supply a different approval policy.
 
 Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
-queued job while authorization is pending. A denial preserves its reason and marks the rejected
+queued job while authorization is pending. A prompt is withdrawn once nothing waits for it, as
+when its operation is cancelled or its session stops. A denial preserves its reason and marks the rejected
 operation with `code: "permission_denied"`; it does not undo work that a
 containing script already performed.
 Agents must not circumvent a denial through another tool or route. For programmatic failure
@@ -90,7 +92,7 @@ with that message and forfeits the provider's prompt cache for the next request.
 parent chose for them, or otherwise the capabilities their parent holds and no mode instructions.
 Background jobs and scripts already running keep their capabilities too. A session can only hold capabilities
 that some configured mode grants, and MCP servers start under that union, so switching modes
-never starts or stops a server. Approvals granted earlier stay recorded but cannot be used while
+never starts or stops a server. Approvals granted earlier stay granted but cannot be used while
 the mode lacks their capability. A resumed session continues in the mode it was last in. A
 session records each mode's definition the first time it is used and keeps it: editing or
 removing that mode in the configuration does not change the session, while modes added later

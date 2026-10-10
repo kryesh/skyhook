@@ -458,8 +458,9 @@ impl FinishedOutput {
 }
 
 /// A handler's value and the evidence its producer owns: the captures `C` its
-/// fields stream into, its images, whether its streams ran to their end, and a
-/// completed read error's facts.
+/// fields stream into, its images, whether its streams ran to their end, a
+/// completed read error's facts, and the presentations its fields carry beyond
+/// those its schema declares.
 #[derive(Clone, Debug)]
 pub struct Output<C> {
     pub value: Value,
@@ -467,6 +468,7 @@ pub struct Output<C> {
     pub(crate) captures: Vec<C>,
     pub(crate) streams: StreamEnd,
     pub(crate) diagnostic: Option<crate::tool::diagnostic::PartialDiagnostic>,
+    pub(crate) presented: crate::job::output::Presented,
 }
 
 impl<C> Default for Output<C> {
@@ -487,6 +489,7 @@ impl<C> Output<C> {
             captures: Vec::new(),
             streams: StreamEnd::Finished,
             diagnostic: None,
+            presented: crate::job::output::Presented::new(),
         }
     }
 
@@ -509,6 +512,12 @@ impl<C> Output<C> {
     #[must_use]
     pub fn with_images(mut self, images: Vec<ImageRef>) -> Self {
         self.images = images;
+        self
+    }
+
+    #[must_use]
+    pub(crate) fn with_presented(mut self, presented: crate::job::output::Presented) -> Self {
+        self.presented = presented;
         self
     }
 }

@@ -337,7 +337,6 @@ impl FetchError {
             | Cause::ModelHidden { .. }
             | Cause::ScriptUnavailable { .. }
             | Cause::UnknownJob { .. }
-            | Cause::JobNotTerminal { .. }
             | Cause::JobAlreadyTerminal { .. } => {
                 Self::Passthrough(LocalError::from_facts(diagnostic, None))
             }

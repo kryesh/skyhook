@@ -1,10 +1,7 @@
 //! Supervised jobs and durable saved output.
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+    sync::{Arc, PoisonError},
     time::Duration,
 };
 
@@ -12,10 +9,7 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
-use tokio::{
-    sync::{Mutex, Notify, OwnedMutexGuard, broadcast, mpsc},
-    task::AbortHandle,
-};
+use tokio::{sync::mpsc, task::AbortHandle};
 pub(crate) use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -25,7 +19,8 @@ use crate::{
     media::ImageRef,
     named_enum::named_enum,
     session::{
-        Dated, EventRecord, MessageSeq, RecordSeq, SessionError, SessionEvent, SessionStore,
+        Command, CoreState, MessageSeq, Plan, Prepared, RecordSeq, SessionError, SessionEvent,
+        SessionStore,
     },
     tool::{
         ToolError, ToolOutput,
@@ -51,33 +46,30 @@ mod lifecycle;
 mod messages;
 pub(super) mod views;
 
-pub(crate) use delivery::PendingDelivery;
+pub(crate) use delivery::{Delivery, Notification};
+pub(crate) use entry::Run;
 pub(crate) use entry::WaitFloor;
-use entry::{Answer, Finished, JobChange, JobEntry, JobStep, Phase, Rejected, RoleState};
+use entry::{
+    Answer, CancelState, Child, DeliveryState, Finished, JobChange, JobFacts, JobHandles, Phase,
+    Rejected, RoleState, Stamps, Start,
+};
+pub use entry::{Invocation, RunTiming};
 pub use error::{InputUnavailableReason, JobError};
+pub(crate) use input::Concluding;
+pub(crate) use lifecycle::woken;
 pub(crate) use progress::AgentProgress;
-pub(crate) use views::{JOB_VIEW_SCHEMAS, WaitCaller};
+pub(crate) use views::{JOB_VIEW_SCHEMAS, Waiting, release_records};
 pub use views::{JobEnvelope, JobView, Notice, Presentation};
 mod persistence;
+pub(crate) use persistence::Jobs;
 mod progress;
 mod supervisor;
 #[cfg(test)]
 pub(crate) use supervisor::JobWorker;
+pub(crate) use supervisor::Supervisor;
 pub use supervisor::{JobLease, stage};
 
 const JOB_INPUT_CAPACITY: usize = 32;
-
-/// Orders what becomes pending for delivery. Taken under the jobs lock, so a wait
-/// floor snapshotted under that lock covers exactly what the wait could see.
-static PENDING_STAMP: AtomicU64 = AtomicU64::new(0);
-
-fn next_pending_stamp() -> u64 {
-    PENDING_STAMP.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-fn current_pending_stamp() -> u64 {
-    PENDING_STAMP.load(Ordering::Relaxed)
-}
 
 named_enum! {
     /// Semantic execution role, independent of extensible tool names.
@@ -226,23 +218,66 @@ impl From<Result<ToolOutput, crate::tool::ToolError>> for JobOutcome {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct JobCompletion {
-    pub agent: AgentId,
-    pub job: JobId,
-}
-
-/// A restored agent job: its owner, child and the authority its invocations ran under.
+/// A restored agent job that can run again: its owner, and what runs it.
 pub(crate) struct RetainedChild {
     pub job: JobId,
     pub owner: AgentId,
-    pub parent: Option<JobId>,
-    pub child: AgentId,
-    pub location: ExecutionLocation,
-    pub cancellation: CancellationToken,
+    pub restart: Restart,
 }
 
-/// Explicitly installed by live child agents; ordinary input-capable tools cannot restart.
+/// What runs a restored agent job again.
+pub(crate) enum Restart {
+    /// The child its call installed, under the authority its invocations ran under.
+    Child {
+        parent: Option<JobId>,
+        location: ExecutionLocation,
+        cancellation: CancellationToken,
+    },
+    /// The call itself, asked for again.
+    Call,
+}
+
+/// What runs a finished agent job again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Retained {
+    /// The child its call installed.
+    Child,
+    /// The call itself, which a stopped process interrupted before it was
+    /// accepted, asked for again.
+    Call,
+}
+
+/// What restarts a finished agent job; ordinary input-capable tools cannot restart.
+#[derive(Clone)]
+pub(crate) enum Resume {
+    /// Runs the installed child again, given its owner's input, if any.
+    Child(ResumeHandler),
+    /// Asks again for a call interrupted before it installed its child, then
+    /// runs it, from its approval on.
+    Call(Relaunch),
+}
+
+impl Resume {
+    fn retained(&self) -> Retained {
+        match self {
+            Self::Child(_) => Retained::Child,
+            Self::Call(_) => Retained::Call,
+        }
+    }
+}
+
+impl From<ResumeHandler> for Resume {
+    fn from(handler: ResumeHandler) -> Self {
+        Self::Child(handler)
+    }
+}
+
+/// Starts a call's restarted invocation, from the lease that runs it.
+pub(crate) type Relaunch = Arc<
+    dyn Fn(JobLease<stage::Running>) -> futures_util::future::BoxFuture<'static, ()> + Send + Sync,
+>;
+
+/// Runs an installed child's restarted invocation as its worker.
 pub(crate) type ResumeHandler = Arc<
     dyn Fn(
             Option<Value>,
@@ -253,67 +288,20 @@ pub(crate) type ResumeHandler = Arc<
         + Sync,
 >;
 
-#[derive(Clone, Copy)]
-enum WaitMode {
-    Foreground,
-    Explicit {
-        claim: bool,
-    },
-    Terminal,
-    /// Until nothing, a cancellation included, can change the outcome.
-    Final,
-}
-
 struct JobManagerInner {
     store: SessionStore,
-    jobs: Mutex<HashMap<JobId, JobEntry>>,
-    progress: Mutex<progress::Progress>,
-    supervision: Arc<supervisor::Supervision>,
-    delivery_operation: Arc<Mutex<()>>,
-    /// Shared by concurrent creations; exclusive for drain.
-    /// Never acquired while holding a jobs, delivery, or per-job operation lock.
-    creation_operation: Arc<tokio::sync::RwLock<()>>,
-    /// Shared by each admitted resumption until its job is running again;
-    /// exclusive for closing, after which none is admitted.
-    resumption: Arc<tokio::sync::RwLock<Resumption>>,
-    next_id: AtomicU64,
-    completions: broadcast::Sender<JobCompletion>,
-    /// Per agent, fires when one of its jobs newly parks in a `wait`, releasing
-    /// that agent's waits deferring to it.
-    parked: std::sync::Mutex<HashMap<AgentId, Arc<Notify>>>,
-    /// Per parent job, its issued calls whose jobs are not published yet.
-    issuing: std::sync::Mutex<HashMap<JobId, usize>>,
-    issued: Notify,
-}
-
-/// Whether interrupted jobs may still restart.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Resumption {
-    Open,
-    Closed,
-}
-
-/// Resumption admitted before closing, held until the jobs it restarts are
-/// running: closing then finds them running rather than restarting behind it.
-#[derive(Clone)]
-pub(crate) struct Admitted {
-    _open: Arc<tokio::sync::OwnedRwLockReadGuard<Resumption>>,
+    /// Taken after the core's state, never before it.
+    handles: std::sync::Mutex<HashMap<JobId, JobHandles>>,
+    supervisor: Supervisor,
 }
 
 /// A call from its issue until its job is published or refused.
-pub(crate) struct Issuing(JobManager, JobId);
+pub(crate) struct Issuing(SessionStore, JobId);
 
 impl Drop for Issuing {
     fn drop(&mut self) {
-        let inner = &self.0.inner;
-        let mut issuing = inner.issuing.lock().expect("issuing poisoned");
-        if let Some(count) = issuing.get_mut(&self.1) {
-            *count -= 1;
-            if *count == 0 {
-                issuing.remove(&self.1);
-            }
-        }
-        inner.issued.notify_waiters();
+        let parent = self.1;
+        self.0.enqueue(move |state| state.jobs.calls.issued(parent));
     }
 }
 
@@ -371,80 +359,89 @@ impl JobSpec {
 impl JobManager {
     #[must_use]
     pub fn new(store: SessionStore) -> Self {
-        Self::with_jobs(store, HashMap::new(), 1)
-    }
-
-    fn with_jobs(store: SessionStore, jobs: HashMap<JobId, JobEntry>, next_id: u64) -> Self {
-        let (completions, _) = broadcast::channel(256);
         Self {
             inner: Arc::new(JobManagerInner {
+                supervisor: Supervisor::new(store.root()),
                 store,
-                jobs: Mutex::new(jobs),
-                progress: Mutex::new(progress::Progress::default()),
-                supervision: Arc::new(supervisor::Supervision::default()),
-                delivery_operation: Arc::new(Mutex::new(())),
-                creation_operation: Arc::default(),
-                resumption: Arc::new(tokio::sync::RwLock::new(Resumption::Open)),
-                next_id: AtomicU64::new(next_id),
-                completions,
-                parked: std::sync::Mutex::default(),
-                issuing: std::sync::Mutex::default(),
-                issued: Notify::new(),
+                handles: std::sync::Mutex::default(),
             }),
         }
     }
 
-    /// Replay a journal's jobs. Those its process left running end interrupted,
-    /// when that process last did something.
-    pub async fn restore(store: SessionStore, records: &[EventRecord]) -> Result<Self, JobError> {
-        persistence::restore(store, records).await
+    /// Read the jobs as the core last applied them.
+    fn facts<T>(&self, read: impl FnOnce(&Jobs) -> T) -> T {
+        self.inner.store.read(|state| read(&state.jobs))
     }
 
-    /// Count a call `parent` issued, synchronously, until its job is published.
+    /// Read job `id`'s facts.
+    fn entry<T>(&self, id: JobId, read: impl FnOnce(&JobFacts) -> T) -> Result<T, JobError> {
+        self.facts(|jobs| jobs.entries.get(&id).map(read).ok_or(JobError::Unknown(id)))
+    }
+
+    /// Use job `id`'s handles. A job this manager did not create, as one
+    /// replayed from the journal, runs with fresh ones.
+    fn handles<T>(&self, id: JobId, use_: impl FnOnce(&mut JobHandles) -> T) -> T {
+        let mut handles = self
+            .inner
+            .handles
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        let fresh = || JobHandles::new(self.inner.supervisor.token()).0;
+        use_(handles.entry(id).or_insert_with(fresh))
+    }
+
+    /// Count a call `parent` issued, synchronously, until its job is published:
+    /// the count is queued ahead of every command its caller issues after it.
     pub(crate) fn issue(&self, parent: JobId) -> Issuing {
-        let mut issuing = self.inner.issuing.lock().expect("issuing poisoned");
-        *issuing.entry(parent).or_default() += 1;
-        Issuing(self.clone(), parent)
+        let store = self.inner.store.clone();
+        store.enqueue(move |state| state.jobs.calls.issue(parent));
+        Issuing(store, parent)
     }
 
     /// Wait until every call `parent` has issued so far has its job published.
     pub(crate) async fn issued(&self, parent: JobId) {
-        loop {
-            let published = self.inner.issued.notified();
-            let pending = (self.inner.issuing.lock())
-                .expect("issuing poisoned")
-                .contains_key(&parent);
-            if !pending {
-                return;
-            }
-            published.await;
-        }
+        let published = move |state: &mut CoreState| state.jobs.calls.published(parent);
+        let _ = self.inner.store.until(published).await;
     }
 
-    #[must_use]
-    pub fn subscribe_completions(&self) -> broadcast::Receiver<JobCompletion> {
-        self.inner.completions.subscribe()
+    /// Record that a call of `agent`'s response committed at `response` ended
+    /// without a job.
+    pub(crate) fn settled_jobless(&self, agent: &AgentId, response: MessageSeq) {
+        let agent = agent.clone();
+        let settled = move |state: &mut CoreState| {
+            state.jobs.calls.jobless.insert(agent, response);
+        };
+        self.inner.store.enqueue(settled);
+    }
+
+    pub(crate) fn supervisor(&self) -> &Supervisor {
+        &self.inner.supervisor
     }
 
     #[must_use]
     pub fn store(&self) -> &SessionStore {
         &self.inner.store
     }
-
-    /// Tell `agent` it has work from `job` to collect.
-    fn wake(&self, agent: AgentId, job: JobId) {
-        let _ = self.inner.completions.send(JobCompletion { agent, job });
-    }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::session::Message;
 
     pub(super) async fn runtime() -> (tempfile::TempDir, JobManager, AgentId) {
         let runtime = crate::tests::TestRuntime::new().await;
         (runtime.root, runtime.jobs, runtime.agent)
+    }
+
+    /// The jobs of a reopened session, what its last process left running settled.
+    pub(crate) async fn reopened(store: SessionStore) -> JobManager {
+        let jobs = JobManager::new(store.clone());
+        let (interrupted, outputs) = jobs.interrupt_running().await.unwrap();
+        let settle =
+            |_: &CoreState| Ok::<_, SessionError>(Plan::journal(interrupted).saving(outputs));
+        store.commit(Command::Activate, settle).await.unwrap();
+        jobs
     }
 
     /// A parent notification presenting `events`.
@@ -463,6 +460,29 @@ mod tests {
         }
     }
 
+    /// Progress: a turn with a tool call beside its text.
+    pub(super) fn progress(text: &str) -> Message {
+        use crate::provider::protocol::{AssistantItem, ToolCall};
+        let call = ToolCall::new("call", "todo", serde_json::json!({}));
+        Message::Assistant(vec![
+            AssistantItem::text("text", 0, text),
+            AssistantItem::tool_call("call", 1, call.unwrap()),
+        ])
+    }
+
+    /// Commit `child`'s progress reply for `job`.
+    pub(super) async fn commit(
+        manager: &JobManager,
+        child: &AgentId,
+        job: JobId,
+        text: &str,
+    ) -> MessageSeq {
+        manager
+            .commit_child_message(child, job, progress(text), text.into(), |_| Vec::new())
+            .await
+            .unwrap()
+    }
+
     /// A job's view as a notification presents it, with no result or metadata.
     pub(super) fn job_view(job: JobId, state: JobState) -> crate::session::JobEvent {
         crate::session::JobEvent::Job(Box::new(JobView {
@@ -475,10 +495,10 @@ mod tests {
         }))
     }
 
-    /// Every phase change `apply` admits or rejects, with the live effects a
-    /// legal one carries.
-    #[tokio::test]
-    async fn apply_admits_only_lifecycle_order_and_cancels_interruptions() {
+    /// Every phase change a job admits or rejects, with the effects the journaled
+    /// change carries when it is applied.
+    #[test]
+    fn changes_admit_only_lifecycle_order_and_cancel_interruptions() {
         use JobChange::{Advance, Answer, Ask, Finish};
         use JobTransition::{AwaitingApproval, Running, WaitingInput};
         let finished = |end| {
@@ -489,26 +509,24 @@ mod tests {
                 output_diagnostic: None,
             })
         };
-        let handler: ResumeHandler =
-            Arc::new(|_, _| Box::pin(async { Ok(ToolOutput::new(Value::Null)) }));
         let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
-        let spec = JobSpec {
-            role: JobRole::Agent,
-            ..JobSpec::test(agent.clone(), "phase")
+        let id = JobId::new(1).unwrap();
+        let created = crate::session::tests::job_created(id, JobRole::Agent);
+        // Applies a change as the journal does, when the phase admits it.
+        let apply = |entry: &mut JobFacts, stamps: &mut Stamps, change: &JobChange| {
+            entry.admits(change.step()).ok()?;
+            let (_, journaled) = JobChange::of(&change.event(id)).unwrap();
+            entry.enter(journaled, stamps);
+            Some(())
         };
-        let entry = || JobEntry::new(spec.clone(), 0).0;
         let at = |changes: &[JobChange]| {
-            let mut entry = entry();
+            let mut jobs = Jobs::default();
+            jobs.apply(&crate::session::tests::record(&agent, 1, created.clone()));
+            let mut entry = jobs.entries.remove(&id).unwrap();
             for change in changes {
-                let change = match change {
-                    Advance(transition) => Advance(*transition),
-                    Ask(question) => Ask(question.clone()),
-                    Answer => Answer,
-                    Finish(outcome) => Finish(outcome.clone()),
-                };
-                entry.apply(change).ok().expect("fixture prefix is legal");
+                apply(&mut entry, &mut jobs.stamps, change).expect("fixture prefix is legal");
             }
-            entry
+            (entry, jobs.stamps)
         };
         let running = [Advance(AwaitingApproval), Advance(Running)];
         let waiting = [
@@ -551,7 +569,7 @@ mod tests {
                 "running approval",
                 &running,
                 Advance(AwaitingApproval),
-                None,
+                Some(JobState::AwaitingApproval),
             ),
             (
                 "running question",
@@ -624,14 +642,14 @@ mod tests {
             ),
         ];
         for (case, prefix, change, expected) in cases {
-            let mut entry = at(prefix);
-            entry.child_mut().unwrap().resume = Some(handler.clone());
+            let (mut entry, mut stamps) = at(prefix);
+            entry.resume = Some(Retained::Child);
             let before = entry.state();
-            let applied = entry.apply(change);
-            assert_eq!(applied.is_ok(), expected.is_some(), "{case}");
+            let applied = apply(&mut entry, &mut stamps, &change);
+            assert_eq!(applied.is_some(), expected.is_some(), "{case}");
             assert_eq!(entry.state(), expected.unwrap_or(before), "{case}");
             assert_eq!(
-                entry.resume().is_none(),
+                entry.resume.is_none(),
                 expected == Some(JobState::Cancelled),
                 "{case}"
             );
@@ -643,12 +661,25 @@ mod tests {
             ("interrupted", &interrupted[..], Advance(Running), false),
             ("asked", &running[..], Ask(question("q")), true),
         ] {
-            let mut entry = at(prefix);
+            let (mut entry, mut stamps) = at(prefix);
             entry.background = false;
             entry.acknowledge();
-            entry.apply(change).ok().unwrap();
+            apply(&mut entry, &mut stamps, &change).unwrap();
             assert_eq!(entry.background, background, "{case}");
             assert!(entry.unacknowledged(), "{case}");
+        }
+    }
+
+    /// A job's envelope and the result its run saved.
+    pub(crate) struct Hydrated {
+        pub(crate) envelope: JobEnvelope,
+        pub(crate) output: Option<Value>,
+    }
+
+    impl std::ops::Deref for Hydrated {
+        type Target = JobEnvelope;
+        fn deref(&self) -> &JobEnvelope {
+            &self.envelope
         }
     }
 
@@ -672,8 +703,117 @@ mod tests {
             self.test_lease(spec).await.test_run().await
         }
 
+        /// The job's envelope once it ends, or asks while unacknowledged, or once
+        /// `timeout` passes; with `claim`, its delivery is acknowledged.
+        pub(crate) async fn wait(
+            &self,
+            id: JobId,
+            timeout: Option<Duration>,
+            claim: bool,
+        ) -> Result<Hydrated, JobError> {
+            let ready = |entry: &JobFacts| {
+                !entry.suspended()
+                    && (entry.end().is_some() || entry.waiting() && entry.unacknowledged())
+            };
+            let until = self.until_job(id, ready);
+            let (envelope, presented) = match timeout {
+                None => until.await?,
+                Some(timeout) => match tokio::time::timeout(timeout, until).await {
+                    Ok(ready) => ready?,
+                    Err(_) => {
+                        let pending = |entry: &JobFacts| JobEnvelope {
+                            question: None,
+                            ..entry.envelope(id)
+                        };
+                        (self.entry(id, pending)?, None)
+                    }
+                },
+            };
+            if claim {
+                self.acknowledge(presented).await?;
+            }
+            self.hydrated(envelope).await
+        }
+
+        /// `envelope` with the result its run saved, as the default viewer reads it.
+        pub(crate) async fn hydrated(&self, envelope: JobEnvelope) -> Result<Hydrated, JobError> {
+            let output = self.saved_result(&envelope).await?;
+            let output = envelope.presented(output, &CapabilitySet::default());
+            Ok(Hydrated { envelope, output })
+        }
+
+        /// Job `id`'s envelope, [`hydrated`](Self::hydrated).
+        pub(crate) async fn test_snapshot(&self, id: JobId) -> Result<Hydrated, JobError> {
+            self.hydrated(self.snapshot(id)?).await
+        }
+
+        /// Commit a child's assistant history and publish its visible text in one
+        /// step: see [`Jobs::child_message`].
+        pub(crate) async fn commit_child_message(
+            &self,
+            child: &AgentId,
+            job: JobId,
+            message: crate::session::Message,
+            text: String,
+            follow: impl FnOnce(RecordSeq) -> Vec<(AgentId, SessionEvent)> + Send + 'static,
+        ) -> Result<MessageSeq, JobError> {
+            let child = child.clone();
+            let commit = move |state: &CoreState| {
+                Jobs::child_message(state, child, job, message, &text, follow)
+            };
+            self.inner.store.commit(Command::Journal, commit).await
+        }
+
+        /// Release `owner`'s suspended foreground jobs, as a redirect does.
+        pub(crate) async fn test_release(&self, owner: &AgentId) {
+            let owner = owner.clone();
+            let release = move |state: &CoreState| {
+                let released = state.jobs.releases(&owner, &[]);
+                Ok::<_, SessionError>(Plan::journal(release_records(&released)))
+            };
+            self.store()
+                .commit(Command::Journal, release)
+                .await
+                .unwrap();
+        }
+
+        pub(crate) fn has_pending(&self, owner: &AgentId) -> bool {
+            self.facts(|jobs| jobs.has_pending(owner))
+        }
+
+        /// Acknowledge the job's current delivery, as a read presenting it does.
+        pub(crate) async fn test_claim(&self, job: JobId) -> Result<(), JobError> {
+            let delivery = self.entry(job, |entry| entry.delivery(job))?;
+            self.acknowledge(delivery).await
+        }
+
+        /// A running agent job, called `tool`, whose resume handler answers `answer`.
+        pub(super) async fn test_resumable(
+            &self,
+            agent: AgentId,
+            tool: &str,
+            answer: Value,
+        ) -> JobId {
+            let spec = JobSpec {
+                accepts_input: true,
+                role: JobRole::Agent,
+                ..JobSpec::test(agent, tool)
+            };
+            let id = self.test_running(spec).await.into_test_id();
+            let handler: ResumeHandler = Arc::new(move |_, _| {
+                let answer = answer.clone();
+                Box::pin(async move { Ok(ToolOutput::new(answer)) })
+            });
+            self.set_resume_handler(id, handler).await.unwrap();
+            id
+        }
+
         pub(super) async fn test_finish(&self, job: JobId, output: Value) {
-            self.finish(job, JobOutcome::Completed(ToolOutput::new(output)))
+            self.test_complete(job, ToolOutput::new(output)).await;
+        }
+
+        pub(super) async fn test_complete(&self, job: JobId, output: ToolOutput) {
+            self.finish(job, JobOutcome::Completed(output))
                 .await
                 .unwrap();
         }
@@ -682,10 +822,46 @@ mod tests {
             self.store().append(agent, event).await.unwrap().sequence
         }
 
-        pub(super) async fn test_replay(&self) -> Self {
-            Self::restore(self.store().clone(), &self.store().records().await)
-                .await
-                .unwrap()
+        /// The jobs as a reopen replays them, before it settles what was running.
+        /// Live commits and replay share one fold, so what the journal records of
+        /// every job, delivery stamps included, is the same both ways.
+        pub(crate) fn test_replay(&self) -> Self {
+            let replay = Self::new(self.store().replica());
+            let live = self.facts(journaled);
+            assert_eq!(live, replay.facts(journaled), "live and replay disagree");
+            replay
         }
+    }
+
+    /// What the journal records of each job.
+    fn journaled(jobs: &Jobs) -> Vec<String> {
+        let mut facts = (jobs.entries.iter())
+            .map(|(id, entry)| {
+                let child = entry.child().map(|child| {
+                    let answer = child.answer.as_ref().map(|answer| match answer {
+                        Answer::Held(message) => message.message,
+                        Answer::Released(message) => *message,
+                    });
+                    let messages = &child.messages;
+                    format!(
+                        "{:?} {messages:?} {} {answer:?}",
+                        child.agent, child.message_stamp
+                    )
+                });
+                let finished = entry
+                    .finished()
+                    .map(|finished| (finished.images.clone(), finished.diagnostic.clone()));
+                format!(
+                    "{id} {:?} {:?} {} {:?} {} {finished:?} {child:?}",
+                    entry.state(),
+                    entry.delivery,
+                    entry.background,
+                    entry.parent,
+                    entry.created_at_millis,
+                )
+            })
+            .collect::<Vec<_>>();
+        facts.sort();
+        facts
     }
 }

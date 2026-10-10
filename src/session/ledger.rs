@@ -8,8 +8,8 @@ use crate::{
     identity::AgentId,
     provider::{ProviderError, protocol::Usage},
     session::{
-        CompactionFailure, EventRecord, Message, MessageSeq, ModelPurpose, ProfileSnapshot,
-        RecordSeq, RequestSeq, SessionEvent,
+        AttemptFailure, CompactionFailure, EventRecord, Message, MessageSeq, ModelPurpose,
+        ProfileSnapshot, RecordSeq, RequestSeq, SessionEvent,
     },
 };
 
@@ -171,11 +171,15 @@ impl IntoIterator for RequestChanges {
 #[derive(Clone, Debug, Default)]
 pub struct RequestLedger {
     requests: BTreeMap<RequestSeq, RequestRecord>,
+    /// The tool names of calls without a result, by agent and call id, in
+    /// commit order.
+    unanswered: indexmap::IndexMap<(AgentId, String), String>,
+    /// Agents whose newest history is input their model has yet to answer: a
+    /// prompt, a notification or results, until a response or the turn's end.
+    awaiting: BTreeSet<AgentId>,
     /// Each agent's newest request, whatever its phase.
     latest: HashMap<AgentId, RequestSeq>,
     messages: HashMap<MessageSeq, RequestSeq>,
-    /// The request each `ModelFailed` record failed, for the recovery that cites it.
-    failures: HashMap<RecordSeq, RequestSeq>,
     contexts: HashMap<RecordSeq, (ModelPurpose, ProfileSnapshot)>,
     /// Each request under the record that last changed it.
     revisions: BTreeSet<(RecordSeq, RequestSeq)>,
@@ -226,8 +230,13 @@ impl RequestLedger {
                 }
             }
             SessionEvent::MessageCommitted {
-                message: Message::Assistant(_),
+                message: Message::Assistant(items),
             } => {
+                self.awaiting.remove(&record.agent);
+                for call in items.iter().filter_map(|item| item.call()) {
+                    let key = (record.agent.clone(), call.id().to_owned());
+                    self.unanswered.insert(key, call.name().to_owned());
+                }
                 let Some(&request) = self.latest.get(&record.agent) else {
                     return changes;
                 };
@@ -241,33 +250,23 @@ impl RequestLedger {
             }
             SessionEvent::ModelFailed { attempt, failure } => {
                 let (attempt, request) = (attempt.attempt, attempt.request);
-                self.failures.insert(record.sequence, request);
-                changes.named = self.settle(request, |phase| RequestPhase::Failed {
-                    attempt: Some(attempt),
-                    failure: failure.clone().into(),
-                    message: phase.committed(),
-                    at,
-                });
-            }
-            SessionEvent::ModelRecoveryScheduled {
-                failure,
-                delay_millis,
-            } => {
-                if let Some(&request) = self.failures.get(failure)
-                    && let Some(failed) = self.requests.get_mut(&request)
-                    && let RequestPhase::Failed {
+                changes.named = self.settle(request, |phase| match failure {
+                    AttemptFailure::Final(failure) => RequestPhase::Failed {
                         attempt: Some(attempt),
-                        failure: RequestFailure::Model(Failure::Provider(message, kind)),
-                        ..
-                    } = &failed.phase
-                {
-                    failed.phase = RequestPhase::Retrying {
-                        attempt: *attempt,
+                        failure: failure.clone().into(),
+                        message: phase.committed(),
+                        at,
+                    },
+                    AttemptFailure::Retrying {
+                        message,
+                        kind,
+                        delay,
+                    } => RequestPhase::Retrying {
+                        attempt,
                         failure: kind.error(message.clone()),
-                        due: at.saturating_add_unsigned(*delay_millis),
-                    };
-                    changes.named = Some(request);
-                }
+                        due: at.saturating_add_unsigned(delay.millis()),
+                    },
+                });
             }
             SessionEvent::ModelAttemptInterrupted(attempt) => {
                 changes.named = self.settle(attempt.request, |_| RequestPhase::Interrupted {
@@ -319,7 +318,25 @@ impl RequestLedger {
                     changes.named = Some(*request);
                 }
             }
+            SessionEvent::MessageCommitted {
+                message: Message::Tool(results),
+            } => {
+                for result in results {
+                    let key = (record.agent.clone(), result.call_id.clone());
+                    self.unanswered.shift_remove(&key);
+                }
+                self.awaiting.insert(record.agent.clone());
+            }
+            SessionEvent::MessageCommitted {
+                message: Message::User(_),
+            } => {
+                self.awaiting.insert(record.agent.clone());
+            }
+            SessionEvent::AgentFailed { .. } => {
+                self.awaiting.remove(&record.agent);
+            }
             SessionEvent::AgentInterrupted => {
+                self.awaiting.remove(&record.agent);
                 changes.interrupted = self.interrupt(&record.agent, at);
             }
             _ => {}
@@ -390,6 +407,21 @@ impl RequestLedger {
     #[must_use]
     pub fn request_of(&self, message: MessageSeq) -> Option<RequestSeq> {
         self.messages.get(&message).copied()
+    }
+
+    /// Calls committed responses made that no result answers yet, with their
+    /// tool names, in commit order.
+    pub(crate) fn unanswered(&self) -> impl Iterator<Item = (&AgentId, &str, &str)> {
+        let calls = self.unanswered.iter();
+        calls.map(|((agent, call), name)| (agent, call.as_str(), name.as_str()))
+    }
+
+    /// The agents whose turn the journal leaves open: a request without its
+    /// outcome, a call without its result, or input not yet answered.
+    pub(crate) fn open_turns(&self) -> BTreeSet<&AgentId> {
+        let requesting = (self.latest.keys()).filter(|agent| self.open(agent).is_some());
+        let calling = self.unanswered.keys().map(|(agent, _)| agent);
+        requesting.chain(calling).chain(&self.awaiting).collect()
     }
 }
 
@@ -467,14 +499,19 @@ mod tests {
         ) -> RecordSeq {
             self.record(SessionEvent::ModelFailed {
                 attempt: attempt_ref(request, attempt),
-                failure: failure("boom".into()),
+                failure: AttemptFailure::Final(failure("boom".into())),
             })
         }
 
-        fn recover(&mut self, failure: RecordSeq, delay_millis: u64) {
-            self.record(SessionEvent::ModelRecoveryScheduled {
-                failure,
-                delay_millis,
+        /// A transport failure of `attempt`, retried after `delay_millis`.
+        fn retried(&mut self, request: RequestSeq, attempt: u64, delay_millis: u64) {
+            self.record(SessionEvent::ModelFailed {
+                attempt: attempt_ref(request, attempt),
+                failure: AttemptFailure::Retrying {
+                    message: "boom".into(),
+                    kind: ProviderErrorKind::Transport,
+                    delay: std::time::Duration::from_millis(delay_millis).into(),
+                },
             });
         }
 
@@ -537,17 +574,7 @@ mod tests {
         assert_eq!(journal.record_of(request).requested_millis, at(request));
 
         journal.attempt(request, 1);
-        let transport = |message| Failure::Provider(message, ProviderErrorKind::Transport);
-        let failure = journal.failed(request, 1, transport);
-        let failed = RequestPhase::Failed {
-            attempt: Some(1),
-            failure: transport("boom".into()).into(),
-            message: None,
-            at: at(failure),
-        };
-        assert_eq!(journal.phase(request), &failed);
-        journal.recover(failure, 250);
-        // The recovery names only its failure; the ledger reports the request.
+        journal.retried(request, 1, 250);
         assert_eq!(journal.changed, [request]);
         let retrying = RequestPhase::Retrying {
             attempt: 1,
@@ -556,10 +583,6 @@ mod tests {
         };
         assert_eq!(journal.phase(request), &retrying);
         assert_eq!(journal.open(), Some(request));
-        // A schedule citing a failure the request has already left changes nothing.
-        journal.recover(failure, 1);
-        assert_eq!(journal.phase(request), &retrying);
-        assert_eq!(journal.changed, []);
 
         journal.attempt(request, 2);
         let open = |message| RequestPhase::Open {
@@ -645,9 +668,7 @@ mod tests {
             at: journal.now(),
         };
         let retrying = journal.attempted(ModelPurpose::Agent);
-        let transport = |message| Failure::Provider(message, ProviderErrorKind::Transport);
-        let failure = journal.failed(retrying, 1, transport);
-        journal.recover(failure, 5);
+        journal.retried(retrying, 1, 5);
         journal.record(SessionEvent::AgentInterrupted);
         assert_eq!(journal.phase(retrying), &after_attempt(&journal));
 

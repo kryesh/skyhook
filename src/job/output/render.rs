@@ -19,10 +19,7 @@ pub(super) enum Reading<'a> {
 impl<'a> Reading<'a> {
     /// Sampling what no declared presentation covers.
     pub(super) const SAMPLED: Reading<'static> = Reading::Sampled {
-        presented: &Presented {
-            complete: BTreeSet::new(),
-            ends: BTreeSet::new(),
-        },
+        presented: &Presented::new(),
     };
 
     /// What a stored string at `field` is clipped for; none when it is read whole.
@@ -30,7 +27,7 @@ impl<'a> Reading<'a> {
         match self {
             Self::Whole => None,
             Self::Sampled { presented } => {
-                let complete = (presented.complete.iter())
+                let complete = (presented.complete().iter())
                     .any(|complete| complete == field || complete.contains(field));
                 (!complete).then_some(presented)
             }
@@ -104,7 +101,7 @@ impl Spliced {
                         .ok_or_else(|| ToolError::failed("saved output field is missing"))?;
                     let db = &saved.output.db;
                     let extent = db.capture_extent(capture.id).map_err(database)?;
-                    let end = if presented.ends.contains(field) {
+                    let end = if presented.ends().contains(field) {
                         reader::CaptureReader::new(db.clone(), capture.id)
                             .end(extent.bytes, preview::TEXT_BYTES)?
                     } else {

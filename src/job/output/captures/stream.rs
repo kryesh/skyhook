@@ -34,16 +34,8 @@ impl CompletedCapture {
         self.job == job && self.capture == capture
     }
 
-    #[cfg(test)]
-    pub(crate) fn matches(&self, job: JobId, field: &str) -> bool {
-        self.job == job && self.field.as_str() == field
-    }
-
     pub(crate) fn field(&self) -> &FieldPointer {
         &self.field
-    }
-    pub(crate) fn capture_id(&self) -> i64 {
-        self.capture
     }
     pub(crate) fn kind(&self) -> CaptureKind {
         self.kind
@@ -57,19 +49,6 @@ fn database(error: crate::session::DbError) -> io::Error {
 pub(crate) type PendingCapture = PendingProducer<StoredCapture>;
 pub(crate) type CaptureWriter = Producer<StoredCapture>;
 
-impl PendingCapture {
-    pub(crate) fn create(
-        output: &Output,
-        field: &FieldPointer,
-        kind: CaptureKind,
-    ) -> io::Result<Self> {
-        Ok(Self::new(
-            StoredCapture::reserve(output, field, kind)?,
-            Abandon::Retain,
-        ))
-    }
-}
-
 pub(crate) struct StoredCapture {
     output: Output,
     completed: CompletedCapture,
@@ -80,7 +59,7 @@ impl StoredCapture {
     fn reserve(output: &Output, field: &FieldPointer, kind: CaptureKind) -> io::Result<Self> {
         let capture = output
             .db
-            .create_capture(output.job.get(), field, kind)
+            .create_capture(output.run(), field, kind)
             .map_err(database)?
             .ok_or_else(|| {
                 io::Error::new(io::ErrorKind::AlreadyExists, "capture field is reserved")
@@ -216,7 +195,8 @@ impl HostOutput {
             .select(output.captures.iter().map(|capture| capture.id()))?;
         let mut imported = ToolOutput::new(output.value)
             .with_captures(captures)
-            .with_images(output.images);
+            .with_images(output.images)
+            .with_presented(output.presented);
         imported.streams = output.streams;
         imported.diagnostic = output.diagnostic;
         Ok(imported)
@@ -226,10 +206,7 @@ impl HostOutput {
 impl CaptureCollector {
     pub(crate) fn new(store: SessionStore, job: JobId) -> Self {
         Self {
-            output: Output {
-                db: store.outputs(),
-                job,
-            },
+            output: Output::current(&store, job),
             store,
             runtime: tokio::runtime::Handle::current(),
             captures: Mutex::new(HashMap::new()),
@@ -305,6 +282,29 @@ mod tests {
         io::{Seek, Write},
         task::Poll,
     };
+
+    impl CompletedCapture {
+        pub(crate) fn matches(&self, job: JobId, field: &str) -> bool {
+            self.job == job && self.field.as_str() == field
+        }
+
+        pub(crate) fn capture_id(&self) -> i64 {
+            self.capture
+        }
+    }
+
+    impl PendingCapture {
+        pub(crate) fn create(
+            output: &Output,
+            field: &FieldPointer,
+            kind: CaptureKind,
+        ) -> io::Result<Self> {
+            Ok(Self::new(
+                StoredCapture::reserve(output, field, kind)?,
+                Abandon::Retain,
+            ))
+        }
+    }
 
     fn text(output: &Output, field: TextCaptureField) -> PendingCapture {
         PendingCapture::new(
@@ -447,15 +447,9 @@ mod tests {
         let descriptors = captures(&output, true);
         assert_eq!(descriptors.len(), 2);
         assert!(descriptors.iter().all(|capture| !capture.complete));
-        let result = Some(serde_json::json!({}));
-        crate::job::output::save_completed(
-            &output,
-            &serde_json::json!(true),
-            result,
-            true,
-            vec![completed, empty],
-        )
-        .unwrap();
+        let completed =
+            ToolOutput::new(serde_json::json!({})).with_captures(vec![completed, empty]);
+        manager.test_complete(job, completed).await;
         assert!(
             captures(&output, true)
                 .iter()

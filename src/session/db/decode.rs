@@ -155,7 +155,6 @@ pub(in crate::session) fn decode_records(
     messages.events(&mut events)?;
     request::events(&mut events, &messages, &todos)?;
     job::events(&mut events)?;
-    approval::events(&mut events)?;
     let targets = contract::targets(db)?;
     let agents = agent_paths(db, session)?;
     let session_capabilities = sorted(db.query(
@@ -189,7 +188,6 @@ pub(in crate::session) fn decode_records(
             EntryKind::TodosReplaced => SessionEvent::TodosReplaced {
                 items: todos.get(&seq).cloned().unwrap_or_default(),
             },
-            EntryKind::SessionReopened => SessionEvent::SessionReopened,
             EntryKind::AgentCompleted => SessionEvent::AgentCompleted,
             EntryKind::AgentInterrupted => SessionEvent::AgentInterrupted,
             EntryKind::TitleCleared => SessionEvent::TitleCleared,

@@ -114,7 +114,7 @@ pub(super) fn preview(
             Accounting::Preview,
         )?
     };
-    Ok(pooled.fitted(field, &presented.complete, PREVIEW_BUDGET))
+    Ok(pooled.fitted(field, presented.complete(), PREVIEW_BUDGET))
 }
 
 /// A value's exhaustive shape and pooled samples, ready to fit a budget.
@@ -219,6 +219,7 @@ pub(super) fn json_bytes(value: &impl serde::Serialize) -> usize {
 mod tests {
     use super::*;
     use crate::job::output::shape::COLLECTION_MEMBERS;
+    use crate::tool::output::FieldPresentation;
     use serde_json::json;
 
     fn run(value: &Value, complete: &[&str]) -> Preview {
@@ -226,11 +227,17 @@ mod tests {
     }
 
     fn presented(value: &Value, complete: &[&str], ends: &[&str]) -> Preview {
-        let fields = |fields: &[&str]| fields.iter().map(|field| field.parse().unwrap()).collect();
-        let presented = Presented {
-            complete: fields(complete),
-            ends: fields(ends),
+        let fields = |fields: &[&str], presentation| {
+            let fields = fields
+                .iter()
+                .map(|field| (field.parse().unwrap(), presentation));
+            fields.collect::<Vec<_>>()
         };
+        let presented = [
+            fields(complete, FieldPresentation::Complete),
+            fields(ends, FieldPresentation::Ends),
+        ];
+        let presented = presented.into_iter().flatten().collect();
         let bytes = serde_json::to_vec(value).unwrap();
         let cancellation = crate::job::CancellationToken::new();
         let clipped = Clipped::new();

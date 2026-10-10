@@ -73,6 +73,8 @@ pub enum QuestionError {
 #[derive(Clone, Debug)]
 pub enum RuntimeEvent {
     Record(Box<EventRecord>),
+    /// A job as the record that follows leaves it.
+    Job(Box<crate::job::JobEnvelope>),
     /// Provider-native item/block lifecycle, validated by the observation reducer.
     ResponseEvent {
         agent: AgentId,
@@ -84,11 +86,10 @@ pub enum RuntimeEvent {
         request: RequestSeq,
         settlement: super::Settlement,
     },
+    /// An agent's activity moved, as the session's state reads it.
     Activity {
         agent: AgentId,
-        activity: super::AgentActivity,
-        /// Epoch milliseconds, on the journal's clock.
-        at: i64,
+        activity: super::ObservedActivity,
     },
     Context {
         agent: AgentId,
@@ -97,4 +98,6 @@ pub enum RuntimeEvent {
     TurnCompleted {
         agent: AgentId,
     },
+    /// The phase the session moved to.
+    Phase(crate::session::SessionPhase),
 }

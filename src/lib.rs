@@ -62,6 +62,17 @@ mod tests {
         }
     }
 
+    /// Wait until the clock is strictly past `millis`, so a record dated now
+    /// would show as later.
+    pub(crate) async fn past(millis: i64) {
+        bounded(async {
+            while chrono::Utc::now().timestamp_millis() <= millis {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+    }
+
     /// Drive `operation` until `reached` completes, then fire every timer due
     /// within `limit` at once, so the deadline under test expires only after the
     /// state it guards is reached, never racing real work. No other guard may be
@@ -76,10 +87,15 @@ mod tests {
             _ = &mut operation => panic!("finished before its deadline expired"),
             reached = reached => reached,
         };
+        elapse(limit).await;
+        (bounded(operation).await, reached)
+    }
+
+    /// Fire every timer due within `limit` at once. Current-thread only.
+    pub(crate) async fn elapse(limit: std::time::Duration) {
         tokio::time::pause();
         tokio::time::advance(limit).await;
         tokio::time::resume();
-        (bounded(operation).await, reached)
     }
 
     pub(crate) fn limit(tokens: u64) -> std::num::NonZeroU64 {
@@ -148,6 +164,30 @@ mod tests {
             let decision = (self.decide)(&request);
             self.requests.lock().unwrap().push(request);
             Box::pin(async move { decision })
+        }
+    }
+
+    /// Asks for each request in turn, allowing what it proposes once answered.
+    /// Dropping a request's decision withdraws it, closing its reply.
+    pub(crate) struct PromptingPolicy(pub tokio::sync::mpsc::UnboundedSender<Prompt>);
+
+    pub(crate) type Prompt = (AuthorizationRequest, tokio::sync::oneshot::Sender<()>);
+
+    impl Policy for PromptingPolicy {
+        fn authorize(&self, request: AuthorizationRequest) -> PolicyFuture<'_> {
+            let grants = (request.permissions.iter())
+                .filter_map(crate::tool::policy::PermissionUse::proposed_grant)
+                .collect();
+            let (reply, replied) = tokio::sync::oneshot::channel();
+            self.0.send((request, reply)).unwrap();
+            Box::pin(async move {
+                match replied.await {
+                    Ok(()) => PolicyDecision::Allow { grants },
+                    Err(_) => PolicyDecision::Deny {
+                        reason: "unanswered".into(),
+                    },
+                }
+            })
         }
     }
 

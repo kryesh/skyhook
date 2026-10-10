@@ -1,10 +1,12 @@
 //! Agent-facing event waiting, separate from saved-output inspection.
 
-use super::{AgentCommand, SessionRuntime};
+use super::{HarnessError, SessionRuntime};
 
 mod delivery;
 use crate::{
-    job::{WaitCaller, WaitFloor},
+    identity::AgentId,
+    job::{CancellationToken, WaitFloor, Waiting},
+    session::{CoreState, SessionStore},
     tool::{
         ToolContext, ToolError,
         diagnostic::{Effects, Operation, Subject},
@@ -12,180 +14,136 @@ use crate::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::sync::{
-    Arc,
-    atomic::{AtomicU64, Ordering},
-};
 use std::time::Duration;
-use tokio::sync::{mpsc, watch};
 
-/// A batch releases this long after the *most recent* event of a burst, so
-/// events that trickle in (a child's progress reply, then its job completion a
-/// few milliseconds later) become one wake instead of two.
-const COALESCE_QUIET_WINDOW: Duration = Duration::from_millis(100);
-/// Ceiling on a single window, measured from the burst's first event: a steady
-/// stream of notifications would otherwise reset the quiet timer forever, and
-/// both an idle agent's wake and `flush_events` (which blocks a turn on the
-/// open window) must stay bounded regardless of activity.
-const COALESCE_MAX_WINDOW: Duration = Duration::from_millis(500);
-
-/// The receiving agent loop has exited; the command was not delivered.
-#[derive(Debug)]
-pub(super) struct AgentGone;
-
-/// Input and background notifications use the same per-agent delivery gate.
+/// How a burst of an agent's inputs and wakes is held to release as one batch.
 #[derive(Clone)]
-pub(super) struct AgentSender {
-    sender: mpsc::Sender<AgentCommand>,
-    wake: Arc<AgentWake>,
-}
-
-struct AgentWake {
-    revision: watch::Sender<u64>,
-    batch: std::sync::Mutex<EventBatch>,
-    ready_input_revision: AtomicU64,
-    observed_input: AtomicU64,
-}
-
-impl AgentWake {
-    /// The latest scheduled wake revision; differs from the released one while a
-    /// coalescing window is open.
-    fn scheduled(&self) -> u64 {
-        self.batch().revision
-    }
-
-    fn batch(&self) -> std::sync::MutexGuard<'_, EventBatch> {
-        let batch = self.batch.lock();
-        batch.unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-#[derive(Default)]
-struct EventBatch {
-    revision: u64,
-    input_revision: u64,
-    /// Present exactly while a window is open; signals the window task that
-    /// more events landed and its quiet timer must restart.
-    activity: Option<Arc<tokio::sync::Notify>>,
-}
-
-impl AgentSender {
-    pub(super) fn new(sender: mpsc::Sender<AgentCommand>) -> Self {
-        Self {
-            sender,
-            wake: Arc::new(AgentWake {
-                revision: watch::channel(0).0,
-                batch: std::sync::Mutex::new(EventBatch::default()),
-                ready_input_revision: AtomicU64::new(0),
-                observed_input: AtomicU64::new(0),
-            }),
-        }
-    }
-
-    /// Deliver a command; `Err` means the agent loop has exited.
-    pub(super) async fn send(&self, command: AgentCommand) -> Result<(), AgentGone> {
-        let notify = !matches!(command, AgentCommand::JobsReady);
-        let Ok(permit) = self.sender.reserve().await else {
-            return Err(AgentGone);
-        };
-        // Schedule before publication; no await separates these operations.
-        if notify {
-            self.schedule(true);
-        }
-        permit.send(command);
-        Ok(())
-    }
-
+pub(super) enum Coalescing {
+    /// A batch releases `quiet` after the *most recent* event of a burst, so
+    /// events that trickle in (a child's progress reply, then its job completion a
+    /// few milliseconds later) become one wake instead of two. `cap` bounds a
+    /// window from the burst's first event: a steady stream of notifications would
+    /// otherwise reset the quiet timer forever, and both an idle agent's wake and
+    /// `flush_events` (which blocks a turn on the open window) must stay bounded
+    /// regardless of activity.
+    Timed { quiet: Duration, cap: Duration },
+    /// Under test: a burst with an input releases at once, and one of wakes for
+    /// each permit the test adds.
     #[cfg(test)]
-    pub(super) fn capacity(&self) -> usize {
-        self.sender.capacity()
-    }
+    Held(std::sync::Arc<tokio::sync::Semaphore>),
+}
 
-    pub(super) async fn closed(&self) {
-        self.sender.closed().await
-    }
+#[cfg(test)]
+impl Coalescing {
+    /// Releases every event as it arrives.
+    pub(super) const NONE: Self = Self::Timed {
+        quiet: Duration::ZERO,
+        cap: Duration::ZERO,
+    };
 
-    pub(super) fn jobs_ready(&self) {
-        self.schedule(false);
-        // A full mailbox already guarantees another request boundary. Never
-        // stall notification of other agents behind this one's mailbox.
-        let _ = self.sender.try_send(AgentCommand::JobsReady);
+    /// A held window, and the gate the test adds permits to.
+    pub(super) fn held() -> (Self, std::sync::Arc<tokio::sync::Semaphore>) {
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
+        (Self::Held(gate.clone()), gate)
     }
+}
 
-    /// One bounded coalescing window per agent, shared by every delivery path.
-    /// The window is trailing: activity restarts the quiet timer instead of
-    /// being cut off into the next window, bounded by `COALESCE_MAX_WINDOW`.
-    /// Stays synchronous and non-blocking; `send` calls this between
-    /// `reserve` and `permit.send` with no await in between.
-    fn schedule(&self, input: bool) {
-        let mut batch = self.wake.batch();
-        batch.revision = batch.revision.wrapping_add(1);
-        if input {
-            batch.input_revision = batch.input_revision.wrapping_add(1);
+const QUIET: Duration = Duration::from_millis(100);
+const CAP: Duration = Duration::from_millis(500);
+
+impl Default for Coalescing {
+    fn default() -> Self {
+        Self::Timed {
+            quiet: QUIET,
+            cap: CAP,
         }
-        if let Some(activity) = &batch.activity {
-            // `notify_one` stores a permit, so a reset racing with the window
-            // task's select is observed rather than lost. A reset racing with
-            // release is harmless: this revision bump happened under the same
-            // lock the releasing task publishes from.
-            activity.notify_one();
+    }
+}
+
+/// The newest revision `agent` scheduled once its window passes `since`, if
+/// any; None once the agent is gone.
+fn scheduled(
+    agent: &AgentId,
+    since: Option<u64>,
+) -> impl Fn(&mut CoreState) -> Option<Option<u64>> + Send + Sync + 'static {
+    let agent = agent.clone();
+    move |state: &mut CoreState| match state.agents.get(&agent) {
+        None => Some(None),
+        Some(facts) => {
+            let window = &facts.window;
+            let since = since.unwrap_or(window.released);
+            (window.scheduled > since).then_some(Some(window.scheduled))
+        }
+    }
+}
+
+/// Release each burst of `agent`'s inputs and wakes as `window` decides: the
+/// window is trailing, so activity restarts the quiet timer instead of being cut
+/// off into the next window. Ends with the agent.
+pub(super) async fn coalesce(store: SessionStore, agent: AgentId, window: Coalescing) {
+    while let Ok(Some(opened)) = store.until(scheduled(&agent, None)).await {
+        if !window.wait_out(&store, &agent, opened).await {
             return;
         }
-        let activity = Arc::new(tokio::sync::Notify::new());
-        batch.activity = Some(activity.clone());
-        // `Weak`: a dropped agent must not be kept alive by its own window.
-        let wake = Arc::downgrade(&self.wake);
-        tokio::spawn(async move {
-            let quiet = tokio::time::sleep(COALESCE_QUIET_WINDOW);
-            let cap = tokio::time::sleep(COALESCE_MAX_WINDOW);
-            tokio::pin!(quiet, cap);
-            loop {
-                tokio::select! {
-                    () = &mut quiet => break,
-                    () = &mut cap => break,
-                    () = activity.notified() => quiet
-                        .as_mut()
-                        .reset(tokio::time::Instant::now() + COALESCE_QUIET_WINDOW),
-                }
-            }
-            let Some(wake) = wake.upgrade() else { return };
-            let mut batch = wake.batch();
-            wake.ready_input_revision
-                .store(batch.input_revision, Ordering::Release);
-            batch.activity = None;
-            // Publish under the lock before another window can begin.
-            wake.revision.send_replace(batch.revision);
-        });
+        let agent = agent.clone();
+        let release = move |state: &mut CoreState| {
+            (state.agents.get_mut(&agent)).map(|facts| facts.window.release())
+        };
+        store.live(release).await;
     }
+}
 
-    pub(super) async fn flush_events(
-        &self,
-        cancellation: &crate::job::CancellationToken,
-    ) -> Result<(), super::HarnessError> {
-        let mut revision = self.wake.revision.subscribe();
-        let requested = self.wake.scheduled();
-        loop {
-            if cancellation.is_cancelled() {
-                return Err(super::HarnessError::Interrupted);
+impl Coalescing {
+    /// Wait out `agent`'s burst that opened at revision `opened`; false once the
+    /// agent is gone.
+    async fn wait_out(&self, store: &SessionStore, agent: &AgentId, opened: u64) -> bool {
+        match self {
+            Self::Timed { quiet, cap } => {
+                let more = |since| {
+                    let (store, more) = (store.clone(), scheduled(agent, Some(since)));
+                    async move { store.until(more).await.ok().flatten() }
+                };
+                burst(*quiet, *cap, more, opened).await
             }
-            if *revision.borrow_and_update() >= requested {
-                return Ok(());
-            }
-            tokio::select! {
-                biased;
-                () = cancellation.cancelled() => return Err(super::HarnessError::Interrupted),
-                result = revision.changed() => {
-                    if result.is_err() { return Err(super::HarnessError::Interrupted); }
+            #[cfg(test)]
+            Self::Held(gate) => {
+                let agent = agent.clone();
+                let input = move |state: &mut CoreState| match state.agents.get(&agent) {
+                    None => Some(false),
+                    Some(facts) => facts.window.holds_input().then_some(true),
+                };
+                tokio::select! {
+                    permit = gate.acquire() => permit.map(tokio::sync::SemaphorePermit::forget).is_ok(),
+                    input = store.until(input) => input.unwrap_or(false),
                 }
             }
         }
     }
+}
 
-    pub(super) fn begin_request(&self) {
-        self.wake.observed_input.store(
-            self.wake.ready_input_revision.load(Ordering::Acquire),
-            Ordering::Release,
-        );
+/// Wait out the burst that opened at revision `seen`: until `more`, the next
+/// revision after the one given, stays quiet for `quiet`, or `cap` passes. False
+/// once `more` finds the agent gone.
+async fn burst<F>(
+    quiet: Duration,
+    cap: Duration,
+    mut more: impl FnMut(u64) -> F,
+    mut seen: u64,
+) -> bool
+where
+    F: Future<Output = Option<u64>>,
+{
+    let cap = tokio::time::sleep(cap);
+    tokio::pin!(cap);
+    loop {
+        tokio::select! {
+            () = &mut cap => return true,
+            next = tokio::time::timeout(quiet, more(seen)) => match next {
+                Ok(Some(next)) => seen = next,
+                Ok(None) => return false,
+                Err(_) => return true,
+            },
+        }
     }
 }
 
@@ -209,6 +167,31 @@ pub(super) struct WaitOutput {
 }
 
 impl SessionRuntime {
+    /// Wait for the window open now, if any, to release; the request it precedes
+    /// then counts the input it released as seen. A turn cancelled meanwhile may
+    /// abandon that count, but makes no request, and every later one flushes again.
+    pub(super) async fn flush_events(
+        &self,
+        agent: &AgentId,
+        cancellation: &CancellationToken,
+    ) -> Result<(), HarnessError> {
+        let agent = agent.clone();
+        let mut requested = None;
+        let released = move |state: &mut CoreState| {
+            let Some(facts) = state.agents.get_mut(&agent) else {
+                return Some(());
+            };
+            let window = &mut facts.window;
+            let requested = *requested.get_or_insert(window.scheduled);
+            (window.released >= requested).then(|| window.observed_inputs = window.ready_inputs)
+        };
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(HarnessError::Interrupted),
+            released = self.store.until(released) => Ok(released?),
+        }
+    }
+
     pub(super) async fn wait_for_event(
         &self,
         context: &ToolContext,
@@ -226,89 +209,67 @@ impl SessionRuntime {
                     })
             })
             .transpose()?;
-        let sender = self.agent_sender(context.agent()).ok_or_else(|| {
-            ToolError::failed("calling agent is not active")
+        let (agent, caller) = (context.agent().clone(), context.job());
+        if self.agents(|agents| agents.get(&agent).is_none()) {
+            return Err(ToolError::failed("calling agent is not active")
                 .operation(
                     Operation::Lookup,
-                    Subject::Label(format!("calling agent {}", context.agent())),
+                    Subject::Label(format!("calling agent {agent}")),
                 )
-                .effects(Effects::Unchanged)
-        })?;
-        let mut revision = sender.wake.revision.subscribe();
-        let timeout = async || match deadline {
-            Some(deadline) => tokio::time::sleep_until(deadline).await,
-            None => std::future::pending().await,
-        };
-        let cancelled = || {
-            ToolError::cancelled()
-                .operation(Operation::Wait, Subject::Job(context.job()))
-                .effects(Effects::Unchanged)
-        };
-        loop {
-            if context.is_cancelled() {
-                return Err(cancelled());
-            }
-            // The agent cannot act while its foreground work is outstanding, so that
-            // takes precedence; the next request carries every event together. Such
-            // work can park in a wait later, so each new event re-evaluates.
-            let parked = self.jobs.parked(context.agent());
-            let state = self.jobs.wait_state(context.agent(), context.job()).await;
-            if let Some(holding) = state.holding {
-                tokio::select! {
-                    biased;
-                    () = context.cancelled() => return Err(cancelled()),
-                    // Completed foreground work is something the agent acts on: its
-                    // result returns with this wait's. A script's wait cannot.
-                    _ = self.jobs.wait_settled(holding) => {
-                        if matches!(state.caller, WaitCaller::Model) && self.jobs.settled(holding).await {
-                            return Ok(WaitOutput { reason: WakeReason::Event });
-                        }
-                        continue;
-                    }
-                    () = parked => continue,
-                    changed = revision.changed() => {
-                        if changed.is_err() { return Err(cancelled()); }
-                        continue;
-                    }
-                    () = timeout() => return Ok(WaitOutput { reason: WakeReason::Timeout }),
-                }
-            }
-            // Level-triggered, so nothing that landed earlier is lost; a script's
-            // floor (what it was last shown) stops it being told twice. Waiting for
-            // any open batch to release first keeps a burst in one report.
-            let released = *revision.borrow_and_update();
-            let ready_input = sender.wake.ready_input_revision.load(Ordering::Acquire);
-            let seen_input = match state.caller {
-                WaitCaller::Script { floor } => floor.map(|floor| floor.input),
-                WaitCaller::Model => None,
+                .effects(Effects::Unchanged));
+        }
+        // The agent cannot act while its foreground work is outstanding, so that
+        // takes precedence; the next request carries every event together. Waiting
+        // for any open batch to release keeps a burst in one report.
+        let decided = move |state: &mut CoreState| {
+            let waiting = state.jobs.waiting(&agent, caller);
+            let Some(facts) = state.agents.get(&agent) else {
+                return Some(None);
             };
-            let input = ready_input != sender.wake.observed_input.load(Ordering::Acquire)
-                && seen_input != Some(ready_input);
-            let settled = released == sender.wake.scheduled();
-            if (state.unseen || input) && settled {
-                let floor = WaitFloor {
-                    stamp: state.stamp,
-                    input: ready_input,
-                };
-                self.jobs.set_wait_floor(context.job(), floor).await;
-                return Ok(WaitOutput {
-                    reason: WakeReason::Event,
-                });
+            let window = &facts.window;
+            let (unseen, seen_input, stamp) = match waiting {
+                Waiting::Cancelled => return Some(None),
+                Waiting::Deferred => return None,
+                Waiting::Open {
+                    unseen,
+                    seen_input,
+                    stamp,
+                } => (unseen, seen_input, stamp),
+            };
+            let input = window.ready_inputs;
+            let ready = input != window.observed_inputs && seen_input != Some(input);
+            ((unseen || ready) && window.settled()).then_some(Some(WaitFloor { stamp, input }))
+        };
+        let timeout = async {
+            match deadline {
+                Some(deadline) => tokio::time::sleep_until(deadline).await,
+                None => std::future::pending().await,
             }
-            tokio::select! {
-                biased;
-                () = context.cancelled() => return Err(cancelled()),
-                changed = revision.changed() => {
-                    if changed.is_err() { return Err(cancelled()); }
+        };
+        // Parked in the change that first decides, so a concurrent wait that
+        // defers to this one is released, and an event ready as it parks is
+        // decided before its timeout can pass. An event ready with the timeout is
+        // reported; one lost to it stays unseen.
+        let park = move |state: &mut CoreState| state.jobs.park(caller);
+        tokio::select! {
+            biased;
+            decided = self.store.until_after(park, decided) => match decided {
+                Ok(Some(floor)) => {
+                    self.store.live(move |state| state.jobs.shown(caller, floor)).await;
+                    Ok(WaitOutput { reason: WakeReason::Event })
                 }
-                () = timeout() => return Ok(WaitOutput { reason: WakeReason::Timeout }),
-            }
+                Ok(None) | Err(_) => Err(ToolError::cancelled()
+                    .operation(Operation::Wait, Subject::Job(caller))
+                    .effects(Effects::Unchanged)),
+            },
+            () = timeout => Ok(WaitOutput { reason: WakeReason::Timeout }),
         }
     }
 }
 
-// Most tests pause time: journal and job I/O runs in `spawn_blocking`, which holds
-// the paused clock still. A test that spawns a real process must use real time.
+// Tests run in real time: a paused clock would advance while the session core's
+// thread works. A timeout under test fires through `time_out` once nothing else
+// can end its wait.
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -316,14 +277,14 @@ mod tests {
     use serde_json::Value;
 
     use super::super::*;
-    use super::{COALESCE_MAX_WINDOW, COALESCE_QUIET_WINDOW};
+    use super::{CAP, Coalescing, QUIET, WaitFloor, Waiting, burst};
     pub(super) use crate::agent::runtime::tests::{
-        AssistantItem, Script, Step, bounded, enqueue_prompts, ephemeral_session, models, poll,
-        provider_name, rendered, response,
+        AssistantItem, Script, Step, activity_is, bounded, enqueue_prompts, ephemeral_session,
+        found, job_found, models, poll, provider_name, rendered, response, spawn_prompt, until,
     };
     pub(super) use crate::agent::runtime::tests::{Sent, SentPart};
     use crate::{
-        job::{JobOutcome, JobSpec, JobState},
+        job::{JobEnvelope, JobOutcome, JobSpec, JobState},
         tool::ToolOutput,
     };
 
@@ -353,6 +314,13 @@ mod tests {
 
     /// A session whose "root" and "child" profiles are answered by `tracking`.
     pub(super) async fn start(tracking: &Arc<Script>) -> (tempfile::TempDir, Arc<SessionHandle>) {
+        start_coalescing(tracking, Coalescing::NONE).await
+    }
+
+    pub(super) async fn start_coalescing(
+        tracking: &Arc<Script>,
+        window: Coalescing,
+    ) -> (tempfile::TempDir, Arc<SessionHandle>) {
         let root = tempfile::tempdir().unwrap();
         let profile = |model: &str| ModelProfile {
             hint: Some(model.parse().unwrap()),
@@ -360,6 +328,7 @@ mod tests {
         };
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
+            .coalescing(window)
             .provider(
                 provider_name("wait-test"),
                 tracking.clone(),
@@ -372,33 +341,43 @@ mod tests {
         (root, Arc::new(ephemeral_session(&harness).await))
     }
 
-    pub(super) fn prompt(
-        session: &Arc<SessionHandle>,
-    ) -> tokio::task::JoinHandle<Result<String, HarnessError>> {
-        let session = session.clone();
-        tokio::spawn(async move { session.prompt("start").await })
-    }
-
     pub(super) async fn running_job(session: &SessionHandle, owner: &AgentId, tool: &str) -> JobId {
-        bounded(async {
-            loop {
-                let mut jobs = session.runtime.jobs.list(owner).await.into_iter();
-                if let Some(job) =
-                    jobs.find(|job| job.tool == tool && job.state == JobState::Running)
-                {
-                    return job.id;
-                }
-                poll().await;
-            }
-        })
-        .await
+        let tool = tool.to_owned();
+        let running = move |job: &JobEnvelope| job.tool == tool && job.state == JobState::Running;
+        job_found(session, owner, running).await
     }
 
-    /// The only non-root agent and its command sender.
-    pub(super) fn only_child(session: &SessionHandle) -> (AgentId, AgentSender) {
-        let agents = session.runtime.agents.read().unwrap();
-        let (child, slot) = agents.iter().find(|(id, _)| **id != session.root).unwrap();
-        (child.clone(), slot.sender.clone())
+    /// Once `owner`'s `nth` `wait` has parked, let `seconds` pass: what it waits
+    /// for has happened, so only its timeout is left to end it. A wait that runs
+    /// but has yet to park has set no deadline, and would count from after the
+    /// time let pass here.
+    pub(super) async fn time_out(
+        session: &SessionHandle,
+        owner: &AgentId,
+        nth: usize,
+        seconds: u64,
+    ) {
+        let owner = owner.clone();
+        found(session, move |state| {
+            let mut waits = state.jobs.views().into_values();
+            let mut waits = waits
+                .by_ref()
+                .filter(|job| job.agent == owner && job.tool == "wait");
+            waits
+                .nth(nth - 1)
+                .filter(|job| state.jobs.parked(job.id))
+                .map(drop)
+        })
+        .await;
+        crate::tests::elapse(std::time::Duration::from_secs(seconds)).await;
+    }
+
+    /// The only non-root agent.
+    pub(super) fn only_child(session: &SessionHandle) -> AgentId {
+        let agents = session
+            .runtime
+            .agents(|agents| agents.within(&session.root));
+        agents.into_iter().find(|id| *id != session.root).unwrap()
     }
     pub(super) async fn complete_background(
         session: &SessionHandle,
@@ -486,64 +465,62 @@ mod tests {
         tokio::task::yield_now().await;
     }
 
+    /// A burst driven by `schedule`, as revisions sent on the returned sender,
+    /// and how long it lasted.
+    async fn timed_burst(
+        schedule: impl AsyncFnOnce(&tokio::sync::watch::Sender<u64>),
+    ) -> std::time::Duration {
+        let (revisions, receiver) = tokio::sync::watch::channel(1);
+        let more = move |since: u64| {
+            let mut receiver = receiver.clone();
+            async move {
+                let next = receiver.wait_for(|revision| *revision > since).await;
+                Some(*next.unwrap())
+            }
+        };
+        let burst = tokio::spawn(async move {
+            let start = tokio::time::Instant::now();
+            assert!(burst(QUIET, CAP, more, 1).await);
+            start.elapsed()
+        });
+        settle().await;
+        schedule(&revisions).await;
+        burst.await.unwrap()
+    }
+
     #[tokio::test(start_paused = true)]
     async fn trailing_window_coalesces_a_split_burst_into_one_batch() {
-        let sender = AgentSender::new(mpsc::channel(1).0);
-        let mut revision = sender.wake.revision.subscribe();
         // Each gap ends inside the open quiet period, so every event resets it.
-        let gap = COALESCE_QUIET_WINDOW - std::time::Duration::from_millis(20);
-        sender.schedule(true);
-        settle().await;
-        for _ in 0..3 {
-            tokio::time::advance(gap).await;
-            settle().await;
-            assert_eq!(
-                *revision.borrow_and_update(),
-                0,
-                "batch released before the quiet period elapsed"
-            );
-            sender.schedule(true);
-            settle().await;
-        }
-        tokio::time::advance(COALESCE_QUIET_WINDOW).await;
-        settle().await;
-        // Four notifications spread over 340ms, one wake carrying all of them.
-        assert_eq!(*revision.borrow_and_update(), 4);
-        assert_eq!(
-            sender.wake.ready_input_revision.load(Ordering::Acquire),
-            4,
-            "released batch must expose every accumulated input"
-        );
-        assert!(
-            !revision.has_changed().unwrap(),
-            "a trailing burst must not release a second batch"
-        );
+        let quiet = QUIET;
+        let gap = quiet - std::time::Duration::from_millis(20);
+        let lasted = timed_burst(async |revisions| {
+            for revision in 2..=4 {
+                tokio::time::advance(gap).await;
+                revisions.send_replace(revision);
+                settle().await;
+            }
+        })
+        .await;
+        // Four events spread over 240ms release once, a quiet period after the last.
+        assert_eq!(lasted, gap * 3 + quiet);
     }
 
     #[tokio::test(start_paused = true)]
     async fn continuous_activity_cannot_postpone_a_batch_past_the_cap() {
-        let sender = AgentSender::new(mpsc::channel(1).0);
-        let mut revision = sender.wake.revision.subscribe();
         let step = std::time::Duration::from_millis(10);
-        sender.schedule(false);
-        settle().await;
-        let mut elapsed = std::time::Duration::ZERO;
-        while *revision.borrow_and_update() == 0 {
-            assert!(
-                elapsed <= COALESCE_MAX_WINDOW,
-                "cap failed to release after {elapsed:?} of continuous activity"
-            );
-            tokio::time::advance(step).await;
-            settle().await;
-            elapsed += step;
+        let lasted = timed_burst(async |revisions| {
             // Activity never quiets down: only the cap can end this window.
-            sender.schedule(false);
-            settle().await;
-        }
-        assert_eq!(elapsed, COALESCE_MAX_WINDOW);
+            for revision in 2..=60 {
+                tokio::time::advance(step).await;
+                revisions.send_replace(revision);
+                settle().await;
+            }
+        })
+        .await;
+        assert_eq!(lasted, CAP);
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn positive_timeouts_do_not_wake_on_their_own_jobs() {
         let tracking = tracking(vec![
             ("root", call("first", "wait", json!({"timeout":1}))),
@@ -551,9 +528,11 @@ mod tests {
             ("root", answer()),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
+        time_out(&session, &session.root, 1, 1).await;
         assert_reason(&tracking.pass(1).await, "first", "timeout");
+        time_out(&session, &session.root, 2, 1).await;
         let request = tracking.pass(2).await;
         assert_reason(&request, "second", "timeout");
         let notifications = events(&request);
@@ -563,20 +542,22 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn clustered_background_completions_wake_and_inject_saved_output_once() {
         let tracking = tracking(vec![
             ("root", call("waiting", "wait", json!({}))),
             ("root", call("again", "wait", json!({"timeout":1}))),
             ("root", answer()),
         ]);
-        let (_root, session) = start(&tracking).await;
+        let (window, gate) = Coalescing::held();
+        let (_root, session) = start_coalescing(&tracking, window).await;
         let root = &session.root;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         running_job(&session, root, "wait").await;
         let first = complete_background(&session, root, "first-output").await;
         let second = complete_background(&session, root, "second-output").await;
+        gate.add_permits(1);
         let request = tracking.pass(1).await;
         assert_reason(&request, "waiting", "event");
         let notifications = events(&request);
@@ -584,6 +565,7 @@ mod tests {
             &notifications,
             &[(first, "first-output"), (second, "second-output")],
         );
+        time_out(&session, root, 2, 1).await;
         let next = tracking.pass(2).await;
         assert_reason(&next, "again", "timeout");
         // retained history must not get another copy
@@ -592,14 +574,14 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn completion_before_wait_registration_is_not_lost() {
         let tracking = tracking(vec![
-            ("root", call("waiting", "wait", json!({"timeout":1}))),
+            ("root", call("waiting", "wait", json!({}))),
             ("root", answer()),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.request(0).await;
         let job = complete_background(&session, &session.root, "already-ready").await;
         tracking.release(0);
@@ -610,7 +592,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn queued_user_input_wakes_wait_without_consuming_the_input() {
         let tracking = tracking(vec![
             ("root", call("waiting", "wait", json!({"timeout":null}))),
@@ -618,7 +600,7 @@ mod tests {
             ("root", answer()),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         running_job(&session, &session.root, "wait").await;
         let prompt = queued("queued-wake-marker");
@@ -632,6 +614,7 @@ mod tests {
         let messages = rendered(&request);
         assert!(messages.contains("queued-wake-marker"));
         tracking.release(1);
+        time_out(&session, &session.root, 2, 1).await;
         assert_reason(&tracking.pass(2).await, "again", "timeout");
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
@@ -655,7 +638,7 @@ mod tests {
             ("root", answer()),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let exec = running_job(&session, &session.root, "exec").await;
         tracking.pass(1).await;
@@ -672,7 +655,7 @@ mod tests {
         let request = tracking.request(2).await;
         bounded(queued).await.unwrap().unwrap();
         assert_reason(&request, "hold", "event");
-        let state = session.runtime.jobs.snapshot(exec).await.unwrap().state;
+        let state = session.runtime.jobs.snapshot(exec).unwrap().state;
         assert_eq!(state, JobState::Running);
         tracking.release(2);
         bounded(turn).await.unwrap().unwrap();
@@ -681,10 +664,10 @@ mod tests {
 
     /// A wait deferring to a script must wake when that script parks in its own
     /// wait, not sleep until the script ends.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_deferring_wait_wakes_when_its_holder_parks() {
         let first = json!({"source":"return (await tool.wait({timeout:30})).result;"});
-        // Holds the agent for a (virtual) second, then parks in a wait of its own.
+        // Holds the agent until a second elapses, then parks in a wait of its own.
         let second = json!({"source":"await sleep(1000); \
             await tool.wait({timeout:30}); return (await tool.wait({timeout:1})).result;"});
         let tracking = tracking_all(vec![
@@ -702,16 +685,16 @@ mod tests {
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let scripts = async || {
-            let jobs = session.runtime.jobs.list(&session.root).await;
+            let jobs = session.runtime.jobs.list(&session.root);
             jobs.into_iter()
                 .filter(|job| job.tool == "script")
                 .collect::<Vec<_>>()
         };
         let wait = running_job(&session, &session.root, "wait").await;
-        let deferring = session.runtime.jobs.snapshot(wait).await.unwrap().parent;
+        let deferring = session.runtime.jobs.snapshot(wait).unwrap().parent;
         let queued = tokio::spawn({
             let session = session.clone();
             async move {
@@ -721,25 +704,24 @@ mod tests {
                     .unwrap()
             }
         });
-        // Paused time passes the batch cap only once every task idles, so the
-        // input's batch has released and been handled, yet the wait defers.
-        tokio::time::sleep(COALESCE_MAX_WINDOW).await;
+        // The input's batch releases, yet the wait defers to the sleeping script.
+        let root = session.root.clone();
+        let released = move |state: &mut CoreState| {
+            let window = &state.agents.get(&root)?.window;
+            (window.ready_inputs != window.observed_inputs).then_some(())
+        };
+        bounded(session.runtime.store.until(released))
+            .await
+            .unwrap();
         assert!(
             scripts()
                 .await
                 .iter()
                 .all(|job| job.state == JobState::Running)
         );
-        let finished = bounded(async {
-            loop {
-                let mut scripts = scripts().await.into_iter();
-                if let Some(done) = scripts.find(|job| job.state.is_terminal()) {
-                    return done.id;
-                }
-                poll().await;
-            }
-        })
-        .await;
+        crate::tests::elapse(std::time::Duration::from_secs(1)).await;
+        let done = |job: &crate::job::JobEnvelope| job.tool == "script" && job.state.is_terminal();
+        let finished = job_found(&session, &session.root, done).await;
         assert_eq!(Some(finished), deferring);
         // The first to finish is the deferring script, told about the input while
         // the other is still parked in its second wait.
@@ -754,6 +736,7 @@ mod tests {
             .output;
         let value = output.as_ref().map(|output| &output["value"]);
         assert_eq!(value, Some(&json!({"reason":"event"})), "{output:?}");
+        time_out(&session, &session.root, 3, 1).await;
         tracking.request(1).await;
         bounded(queued).await.unwrap().unwrap();
         tracking.release(1);
@@ -764,40 +747,53 @@ mod tests {
     /// What a script was shown depends only on what was pending when it looked, not
     /// on when the wake revision catches up: a notification becomes pending before
     /// its wake is forwarded, and must not be reported to the same script twice.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn a_script_is_shown_each_pending_notification_once() {
-        let (_root, session) = start(&tracking(vec![])).await;
+        // No turn is scripted: the held window keeps the completions from the root.
+        let (_root, session) = start_coalescing(&tracking(vec![]), Coalescing::held().0).await;
         let (jobs, root) = (&session.runtime.jobs, &session.root);
         let script = JobSpec {
             role: crate::job::JobRole::Script,
             ..JobSpec::test(root.clone(), "script")
         };
         let script = jobs.test_create(script).await;
+        let wait = || JobSpec {
+            role: crate::job::JobRole::Wait,
+            ..JobSpec::test(root.clone(), "wait")
+        };
         let hosted = || JobSpec {
             parent: Some(script),
-            ..JobSpec::test(root.clone(), "wait")
+            ..wait()
+        };
+        let unseen = async |caller: JobId, shown: bool| {
+            let root = root.clone();
+            let decide = move |state: &mut CoreState| {
+                state.jobs.park(caller);
+                let Waiting::Open { unseen, stamp, .. } = state.jobs.waiting(&root, caller) else {
+                    return false;
+                };
+                if shown {
+                    state.jobs.shown(caller, WaitFloor { stamp, input: 0 });
+                }
+                unseen
+            };
+            session.runtime.store.live(decide).await
         };
         complete_background(&session, root, "first").await;
         let first = jobs.test_create(hosted()).await;
-        let state = jobs.wait_state(root, first).await;
-        assert!(state.unseen);
-        let floor = crate::job::WaitFloor {
-            stamp: state.stamp,
-            input: 0,
-        };
-        jobs.set_wait_floor(first, floor).await;
+        assert!(unseen(first, true).await);
         let second = jobs.test_create(hosted()).await;
-        assert!(!jobs.wait_state(root, second).await.unseen);
+        assert!(!unseen(second, false).await);
         complete_background(&session, root, "second").await;
-        assert!(jobs.wait_state(root, second).await.unseen);
+        assert!(unseen(second, false).await);
         // A model caller has no script floor: its request boundary consumes instead.
-        let model = jobs.test_create(JobSpec::test(root.clone(), "wait")).await;
-        assert!(jobs.wait_state(root, model).await.unseen);
+        let model = jobs.test_create(wait()).await;
+        assert!(unseen(model, false).await);
         session.shutdown().await.unwrap();
     }
 
     /// Waits must not defer to each other: both wake on the same event.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn concurrent_waits_do_not_defer_to_each_other() {
         let second = ToolCall::new("second", "wait", json!({"timeout":null})).unwrap();
         let tracking = tracking_all(vec![
@@ -811,21 +807,17 @@ mod tests {
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
-        bounded(async {
-            while session
-                .runtime
+        let root = session.root.clone();
+        found(&session, move |state| {
+            let waits = state
                 .jobs
-                .list(&session.root)
-                .await
-                .iter()
-                .filter(|job| job.tool == "wait" && job.state == JobState::Running)
-                .count()
-                < 2
-            {
-                poll().await;
-            }
+                .views()
+                .into_values()
+                .filter(|job| job.agent == root);
+            let running = waits.filter(|job| job.tool == "wait" && job.state == JobState::Running);
+            (running.count() >= 2).then_some(())
         })
         .await;
         let prompt = queued("concurrent-wake-marker");
@@ -844,7 +836,7 @@ mod tests {
 
     /// Queued input stays unconsumed while a script runs; it must still wake the
     /// script's waits only once.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn queued_input_does_not_respin_a_script_wait() {
         let source = "const first = (await tool.wait({timeout:60})).result; \
             const second = (await tool.wait({timeout:1})).result; return [first, second];";
@@ -853,7 +845,7 @@ mod tests {
             ("root", answer()),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let script = running_job(&session, &session.root, "script").await;
         running_job(&session, &session.root, "wait").await;
@@ -862,6 +854,7 @@ mod tests {
             let session = session.clone();
             async move { enqueue_prompts(&session, vec![prompt]).await.pop().unwrap() }
         });
+        time_out(&session, &session.root, 2, 1).await;
         let request = tracking.request(1).await;
         bounded(queued).await.unwrap().unwrap();
         let output = session
@@ -888,7 +881,93 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    /// An event ready together with a script `wait`'s timeout is reported, by that
+    /// wait or by the next: one that times out leaves it unseen.
+    #[tokio::test]
+    async fn an_event_ready_with_the_timeout_reaches_the_script() {
+        let source = "const first = (await tool.wait({timeout:1})).result; \
+            const second = (await tool.wait({timeout:1})).result; return [first, second];";
+        let tracking = tracking(vec![
+            ("root", call("run", "script", json!({"source": source}))),
+            ("root", answer()),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let (jobs, store, root) = (&session.runtime.jobs, &session.runtime.store, &session.root);
+        let turn = spawn_prompt(&session, "start");
+        tracking.pass(0).await;
+        let script = running_job(&session, root, "script").await;
+        let wait = running_job(&session, root, "wait").await;
+        // Parked, the wait has set its deadline.
+        let owner = root.clone();
+        let parked = move |state: &mut CoreState| {
+            let held = state.jobs.live_work(&owner).holding.is_some();
+            (state.jobs.parked(wait) && !held).then_some(())
+        };
+        bounded(store.until(parked)).await.unwrap();
+        // Input arrives in the timer pass that fires the wait's timeout, ahead of
+        // the wait, which then finds both ready.
+        tokio::time::pause();
+        let arrives = tokio::time::sleep(std::time::Duration::from_millis(500));
+        let (store, owner) = (store.clone(), root.clone());
+        let input = tokio::spawn(async move {
+            arrives.await;
+            let (applied, decided) = std::sync::mpsc::channel();
+            store.enqueue(move |state| {
+                let input = super::super::queue::QueuedInput {
+                    content: vec![UserPart::Text {
+                        text: "racing input".into(),
+                    }],
+                    options: Default::default(),
+                    cancellation: Default::default(),
+                    committed: tokio::sync::oneshot::channel().0,
+                };
+                state
+                    .agents
+                    .send(&owner, AgentCommand::QueuedInputs(vec![input]));
+                state.agents.get_mut(&owner).unwrap().window.release();
+                state.defer(move || applied.send(()).unwrap());
+            });
+            // Holding this runtime's only thread until the wait has decided.
+            decided.recv().unwrap();
+        });
+        tokio::time::advance(std::time::Duration::from_secs(1)).await;
+        tokio::time::resume();
+        bounded(input).await.unwrap();
+        // Whichever wait reported it, the other only times out.
+        bounded(async {
+            let mut elapsed = false;
+            while !jobs.metadata(script).unwrap().state.is_terminal() {
+                let mut waits = jobs.list(root).into_iter().filter(|job| job.tool == "wait");
+                // Parked, its deadline is set: time let pass sooner would not count.
+                let parked =
+                    |job: JobId| session.runtime.store.read(|state| state.jobs.parked(job));
+                if !elapsed && waits.nth(1).is_some_and(|job| parked(job.id)) {
+                    crate::tests::elapse(std::time::Duration::from_secs(1)).await;
+                    elapsed = true;
+                }
+                poll().await;
+            }
+        })
+        .await;
+        let output = jobs
+            .wait(script, None, false)
+            .await
+            .unwrap()
+            .output
+            .unwrap();
+        let event = json!({"reason":"event"});
+        let reasons = output["value"].as_array().unwrap();
+        assert_eq!(
+            reasons.iter().filter(|reason| **reason == event).count(),
+            1,
+            "{output}"
+        );
+        tracking.pass(1).await;
+        bounded(turn).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn parent_input_wakes_wait_and_is_in_the_next_model_request() {
         let launch = json!({"prompt":"child task", "model":"wait-test/child", "bg":true});
         let tracking = tracking(vec![
@@ -899,12 +978,12 @@ mod tests {
             ("root", answer()),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         tracking.request(1).await;
         tracking.request(2).await;
         let child_job = running_job(&session, &session.root, "agent").await;
-        let (child, _) = only_child(&session);
+        let child = only_child(&session);
         tracking.release(1);
         running_job(&session, &child, "wait").await;
         let jobs = &session.runtime.jobs;
@@ -922,7 +1001,7 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn wait_rejects_invalid_arguments_and_script_waits_do_not_self_wake() {
         let (_root, session) = start(&tracking(vec![])).await;
         let invalid = json!([{"timeout":0}, {"timeout":0.125}, {"timeout":-1}, {"timeout":1e300}, {"timeout":"1"}, {"timeout":true}, {"bg":true}, {"bg":false}, {"job":1}, {"wait":1}]);
@@ -932,53 +1011,47 @@ mod tests {
             assert!(bounded(result).await.is_err(), "accepted {invalid}");
         }
         let source = "const direct = (await tool.wait({timeout:1})).result; const builder = (await tool.wait().timeout(1)).result; return [direct, builder];";
-        let output = bounded(session.run_script(source)).await.unwrap();
+        let jobs = session.runtime.jobs.list(&session.root).into_iter();
+        let refused = jobs.filter(|job| job.tool == "wait").count();
+        let timeouts = async {
+            time_out(&session, &session.root, refused + 1, 1).await;
+            time_out(&session, &session.root, refused + 2, 1).await;
+        };
+        let (output, ()) = tokio::join!(bounded(session.run_script(source)), timeouts);
+        let output = output.unwrap();
         let timeouts = json!([{"reason":"timeout"}, {"reason":"timeout"}]);
         assert_eq!(output.value, json!({"value":timeouts}));
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn cancelling_an_indefinite_wait_unblocks_the_agent() {
         let tracking = tracking(vec![
             ("root", call("waiting", "wait", json!({}))),
             ("root", answer()),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let job = running_job(&session, &session.root, "wait").await;
         session.cancel_job(job).await.unwrap();
         let next = tracking.request(1).await;
         let text = rendered(&next);
         assert!(text.contains("cancel"), "{text}");
-        let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
+        let state = session.runtime.jobs.snapshot(job).unwrap().state;
         assert_eq!(state, JobState::Cancelled);
         tracking.release(1);
         bounded(turn).await.unwrap().unwrap();
         session.shutdown().await.unwrap();
     }
 
-    /// Observed activity trails the journal; interrupting earlier races the guard.
+    /// Interrupting before `agent` runs tools races the guard.
     async fn running_tools(session: &SessionHandle, agent: &AgentId) {
-        bounded(async {
-            while !matches!(
-                session
-                    .observe()
-                    .await
-                    .snapshot
-                    .activity
-                    .get(agent)
-                    .map(|a| &a.state),
-                Some(AgentActivity::Tools)
-            ) {
-                poll().await;
-            }
-        })
-        .await;
+        let tools = |state: &_| matches!(state, crate::agent::AgentActivity::Tools);
+        activity_is(session, agent, tools).await;
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn interrupt_unblocks_an_agent_held_by_a_foreground_script_wait() {
         let source = json!({"source":"await tool.wait({timeout:30}); return 'late';"});
         let tracking = tracking(vec![
@@ -986,7 +1059,7 @@ mod tests {
             ("root", answer()),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let script = running_job(&session, &session.root, "script").await;
         let waiting = running_job(&session, &session.root, "wait").await;
@@ -994,7 +1067,7 @@ mod tests {
         assert_eq!(bounded(session.interrupt()).await, 1);
         assert!(bounded(turn).await.unwrap().is_err());
         for job in [script, waiting] {
-            let state = session.runtime.jobs.snapshot(job).await.unwrap().state;
+            let state = session.runtime.jobs.snapshot(job).unwrap().state;
             assert_eq!(state, JobState::Cancelled, "job {job:?}");
         }
         // The unwinding turn must not reach another request boundary.
@@ -1013,7 +1086,7 @@ mod tests {
 
     /// A model-delegated child is retained while the script blocking the same turn
     /// is cancelled. (A child the script launched would die with it.)
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn interrupt_cancels_blocking_tools_and_retains_delegated_children() {
         let delegate = json!({"prompt":"work", "model":"wait-test/child", "name":"kid"});
         let blocked = json!({"source":"await tool.wait({timeout:30});"});
@@ -1033,28 +1106,22 @@ mod tests {
             ("root", vec![answer()]),
         ]);
         let (_root, session) = start(&tracking).await;
-        let turn = prompt(&session);
+        let turn = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         let script = running_job(&session, &session.root, "script").await;
         let delegated = running_job(&session, &session.root, "agent").await;
         tracking.request(1).await;
-        let (child, _) = only_child(&session);
+        let child = only_child(&session);
         tracking.release(1);
         running_job(&session, &child, "wait").await;
         running_tools(&session, &session.root).await;
         assert_eq!(bounded(session.interrupt()).await, 2);
-        let state = async |job| session.runtime.jobs.snapshot(job).await.unwrap().state;
         // Both outcomes are journaled asynchronously; settle before comparing.
-        let settled = async |job, want| {
-            bounded(async {
-                while state(job).await != want {
-                    poll().await;
-                }
-            })
-            .await;
-        };
-        settled(script, JobState::Cancelled).await;
-        settled(delegated, JobState::Interrupted).await;
+        until(&session, script, |job| job.state == JobState::Cancelled).await;
+        until(&session, delegated, |job| {
+            job.state == JobState::Interrupted
+        })
+        .await;
         assert!(!tracking.requested_from(2));
         // A suspended child keeps the parent's `agent` call waiting for `continue`;
         // cancelling it releases the held turn, which runs on.
@@ -1064,26 +1131,25 @@ mod tests {
         session.shutdown().await.unwrap();
     }
 
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn idle_agent_batches_background_notifications_without_a_wait_call() {
         let tracking = tracking(vec![("root", answer()); 3]);
-        let (_root, session) = start(&tracking).await;
+        let (window, gate) = Coalescing::held();
+        let (_root, session) = start_coalescing(&tracking, window).await;
         let root = &session.root;
-        let initial = prompt(&session);
+        let initial = spawn_prompt(&session, "start");
         tracking.pass(0).await;
         bounded(initial).await.unwrap().unwrap();
 
         let first = complete_background(&session, root, "idle-first-output").await;
         let second = complete_background(&session, root, "idle-second-output").await;
+        gate.add_permits(1);
         let next = tracking.request(1).await;
         let notifications = events(&next);
         let expected = [(first, "idle-first-output"), (second, "idle-second-output")];
         assert_notifications(&notifications, &expected);
 
-        let barrier = tokio::spawn({
-            let session = session.clone();
-            async move { session.prompt("idle-batch-barrier").await }
-        });
+        let barrier = spawn_prompt(&session, "idle-batch-barrier");
         tracking.release(1);
         let final_request = tracking.pass(2).await;
         let messages = rendered(&final_request);
@@ -1091,6 +1157,26 @@ mod tests {
         // completed output must not be injected twice
         assert_eq!(events(&final_request), notifications);
         bounded(barrier).await.unwrap().unwrap();
+        session.shutdown().await.unwrap();
+    }
+    /// A sibling call that fails before it has a job is answered with the same batch.
+    #[tokio::test]
+    async fn a_jobless_sibling_answer_resolves_its_responses_wait() {
+        let tracking = tracking_all(vec![
+            (
+                "root",
+                vec![
+                    call_at(0, "unknown", "no_such_tool", json!({})),
+                    call_at(1, "waiting", "wait", json!({})),
+                ],
+            ),
+            ("root", vec![answer()]),
+        ]);
+        let (_root, session) = start(&tracking).await;
+        let turn = spawn_prompt(&session, "start");
+        tracking.pass(0).await;
+        assert_reason(&tracking.pass(1).await, "waiting", "event");
+        assert_eq!(bounded(turn).await.unwrap().unwrap(), "done");
         session.shutdown().await.unwrap();
     }
 }

@@ -3,307 +3,308 @@
 use super::*;
 
 impl JobManager {
+    #[cfg(test)]
     pub(crate) async fn set_resume_handler(
         &self,
         id: JobId,
-        handler: ResumeHandler,
+        resume: impl Into<Resume>,
     ) -> Result<(), JobError> {
-        let mut jobs = self.inner.jobs.lock().await;
-        let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-        entry.child_mut().ok_or(JobError::NoChild(id))?.resume = Some(handler);
+        let (manager, resume) = (self.clone(), resume.into());
+        (self.inner.store)
+            .live(move |state| manager.install(state, id, resume))
+            .await
+    }
+
+    /// Let `resume` restart agent job `id` once it ends, in the change being
+    /// applied: the core records that it can, and the supervisor holds what does.
+    pub(crate) fn install(
+        &self,
+        state: &mut CoreState,
+        id: JobId,
+        resume: Resume,
+    ) -> Result<(), JobError> {
+        state.jobs.set_resume(id, resume.retained())?;
+        self.handles(id, |handles| handles.resume = Some(resume));
         Ok(())
     }
 
     /// Without a handler an interrupted job is no longer suspended but settled,
-    /// which a wait on it must see even when nothing releases it.
+    /// which a wait on it must see even when nothing releases it. A session
+    /// shutting down leaves it suspended.
     pub(crate) async fn clear_resume_handler(&self, id: JobId) {
-        let mut jobs = self.inner.jobs.lock().await;
-        if let Some(entry) = jobs.get_mut(&id)
-            && let Some(child) = entry.child_mut()
-        {
-            child.resume = None;
-            entry.notify.notify_waiters();
-        }
+        let clear = move |_: &CoreState| {
+            Ok::<_, SessionError>(Plan::new(Vec::new(), move |state, _| {
+                let entry = state.jobs.entries.get_mut(&id);
+                if let Some(entry) = entry.filter(|entry| entry.child().is_some()) {
+                    entry.resume = None;
+                }
+            }))
+        };
+        let _ = self.inner.store.commit(Command::AgentExited, clear).await;
     }
 
-    /// Restored agent jobs whose child can resume but has no live handler yet.
-    pub(crate) async fn retained_children(&self) -> Vec<RetainedChild> {
-        self.inner
-            .jobs
-            .lock()
-            .await
-            .iter()
-            .filter_map(|(id, entry)| {
-                let child = entry.child()?;
-                let retained = entry.accepts_input
-                    && child.resume.is_none()
-                    && !entry.cancellation.is_cancelled()
-                    && entry.end() != Some(JobEnd::Cancelled);
-                retained.then_some(())?;
-                Some(RetainedChild {
-                    job: *id,
-                    owner: entry.agent.clone(),
-                    parent: entry.parent,
-                    child: child.agent.clone()?,
-                    location: entry.location.clone(),
-                    cancellation: entry.cancellation.clone(),
-                })
-            })
+    /// The child agent job `id` installed, if any.
+    pub(crate) fn child_agent(&self, id: JobId) -> Option<AgentId> {
+        self.entry(id, |entry| entry.child()?.agent.clone())
+            .ok()
+            .flatten()
+    }
+
+    /// Restored agent jobs that can run again but have no live handler yet: those
+    /// whose call installed a child, and calls a stopped process interrupted
+    /// before accepting them.
+    pub(crate) fn retained_children(&self, state: &CoreState) -> Vec<RetainedChild> {
+        let retained = state.jobs.entries.iter().filter(|(_, entry)| {
+            let Some(child) = entry.child() else {
+                return false;
+            };
+            let ended = match entry.end() {
+                Some(JobEnd::Cancelled) => false,
+                Some(JobEnd::Interrupted) | None => true,
+                Some(JobEnd::Completed | JobEnd::Failed) => child.agent.is_some(),
+            };
+            let restarts = entry.accepts_input && entry.resume.is_none();
+            restarts && ended && !entry.cancel_requested()
+        });
+        retained
+            .map(|(id, entry)| self.retained(*id, entry))
             .collect()
     }
 
-    /// Find a caller-owned child (or a launch still in progress) using this name.
-    /// Installed children retain their names after completion because follow-ups
-    /// address their existing job. A failed admission with no child identity must
-    /// not reserve the name permanently. The current invocation excludes itself.
-    pub(crate) async fn child_name_owner(
-        &self,
-        owner: &AgentId,
-        name: &JobName,
-        current: JobId,
-    ) -> Option<JobId> {
-        self.inner.jobs.lock().await.iter().find_map(|(id, entry)| {
-            let launched = entry.child()?;
-            (*id != current
-                && &entry.agent == owner
-                && entry.name.as_ref() == Some(name)
-                // Earlier pending launches reserve the name. Without ordering,
-                // simultaneous invocations could both reject one another before
-                // either has installed a child.
-                && (launched.agent.is_some() || (*id < current && entry.end().is_none())))
-            .then_some(*id)
-        })
-    }
-
-    /// Record the agent identity as soon as it is launched, including turns that
-    /// fail before producing visible assistant text.
-    pub(crate) async fn set_child_agent(&self, id: JobId, child: AgentId) -> Result<(), JobError> {
-        let mut jobs = self.inner.jobs.lock().await;
-        let entry = jobs.get_mut(&id).ok_or(JobError::Unknown(id))?;
-        entry.child_mut().ok_or(JobError::NoChild(id))?.agent = Some(child);
-        Ok(())
+    fn retained(&self, job: JobId, entry: &JobFacts) -> RetainedChild {
+        let restart = match entry.child().and_then(|child| child.agent.as_ref()) {
+            Some(_) => Restart::Child {
+                parent: entry.parent,
+                location: entry.location.clone(),
+                cancellation: self.handles(job, |handles| handles.cancellation.clone()),
+            },
+            None => Restart::Call,
+        };
+        let owner = entry.agent.clone();
+        RetainedChild {
+            job,
+            owner,
+            restart,
+        }
     }
 
     /// Accept input into the current mailbox or start a retained resumption.
     /// Success does not confirm that the worker has consumed or acted on it.
     pub async fn send(&self, id: JobId, mut value: Value) -> Result<(), JobError> {
         loop {
-            // Serialize resumption against finishing and other senders.
-            let operation = self.operation(id).await?;
-            let guard = operation.lock_owned().await;
-            let sender = {
-                let jobs = self.inner.jobs.lock().await;
-                let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
+            let resumable = self.entry(id, |entry| {
                 if !entry.accepts_input {
                     return Err(JobError::InputUnsupported(id));
                 }
-                if entry.resumable_end() {
-                    drop(jobs);
-                    let admitted = self.admit_resumption().ok_or(JobError::InputUnavailable {
-                        job: id,
-                        reason: InputUnavailableReason::Closing,
-                    })?;
-                    return self.resume_locked(id, Some(value), guard, admitted).await;
-                }
-                if !matches!(entry.phase, Phase::Running | Phase::WaitingInput(_)) {
+                if !entry.resumable_end()
+                    && !matches!(entry.phase, Phase::Running | Phase::WaitingInput(_))
+                {
                     return Err(JobError::InputUnavailable {
                         job: id,
                         reason: InputUnavailableReason::State(entry.state()),
                     });
                 }
-                entry.input.clone()
-            };
-            // Enqueue under the same lock used to drain/close the mailbox.
-            // Never hold that lock while waiting for capacity.
-            let sent = sender.try_send(value);
-            drop(guard);
-            match sent {
+                Ok(entry.resumable_end())
+            })??;
+            if resumable {
+                match self.resume(id, value).await? {
+                    Resumption::Started => return Ok(()),
+                    Resumption::Running(pending) => value = pending,
+                }
+                continue;
+            }
+            let sender = self.handles(id, |handles| handles.input.clone());
+            // Accepted under the core's read lock, so the handler's close, a core
+            // live command, orders with it and its drain sees every accepted input.
+            match self.facts(|_| sender.try_send(value)) {
                 Ok(()) => return Ok(()),
                 Err(mpsc::error::TrySendError::Full(pending)) => {
                     value = pending;
-                    // Do not carry a reserved permit across the close boundary.
-                    if let Ok(permit) = sender.reserve().await {
-                        drop(permit);
-                    }
+                    // Wait for room, carrying no permit across the close boundary.
+                    let _ = sender.reserve().await;
                 }
                 Err(mpsc::error::TrySendError::Closed(pending)) => {
                     value = pending;
                     // Child request handlers close their mailbox before finalizing.
                     // A rejected send retries against the next lifecycle, never losing input.
-                    loop {
-                        let notified = {
-                            let jobs = self.inner.jobs.lock().await;
-                            let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-                            if entry.resume().is_none() {
-                                return Err(JobError::InputClosed(id));
-                            }
-                            if entry.end().is_some() || !entry.input.same_channel(&sender) {
-                                break;
-                            }
-                            entry.notify.clone().notified_owned()
+                    let manager = self.clone();
+                    let moved = move |state: &mut CoreState| {
+                        let Some(entry) = state.jobs.entries.get(&id) else {
+                            return Some(Err(JobError::Unknown(id)));
                         };
-                        notified.await;
-                    }
+                        let current = manager.handles(id, |handles| handles.input.clone());
+                        match entry.resume {
+                            None => Some(Err(JobError::InputClosed(id))),
+                            Some(_) if entry.end().is_some() || !current.same_channel(&sender) => {
+                                Some(Ok(()))
+                            }
+                            Some(_) => None,
+                        }
+                    };
+                    self.inner.store.until(moved).await??;
                 }
             }
         }
     }
 
-    /// Wait for requested child interruptions to finish publishing their outcome.
-    /// This does not claim or deliver the interrupted result to the parent.
-    pub(crate) async fn settle_interrupted_agents(&self, agents: &[AgentId]) {
-        loop {
-            let pending = {
-                let jobs = self.inner.jobs.lock().await;
-                (unpublished_interruptions(&jobs, agents).next())
-                    .map(|(_, entry)| entry.notify.clone().notified_owned())
-            };
-            let Some(pending) = pending else {
-                return;
-            };
-            pending.await;
-        }
-    }
-
-    /// Publish requested child interruptions now, as their unwinding turns would:
-    /// what still runs in them is cancelled otherwise.
-    pub(crate) async fn finish_interrupted_agents(&self, agents: &[AgentId]) {
-        let jobs = {
-            let jobs = self.inner.jobs.lock().await;
-            let unpublished = unpublished_interruptions(&jobs, agents);
-            unpublished.map(|(id, _)| *id).collect::<Vec<_>>()
-        };
-        for id in jobs {
-            self.settle(id, ToolError::interrupted().into()).await;
-        }
-    }
-
-    /// Admit resumption, unless closing has begun. Never waits, so a caller can
-    /// hold it across other locks.
-    pub(crate) fn admit_resumption(&self) -> Option<Admitted> {
-        let open = self.inner.resumption.clone().try_read_owned().ok()?;
-        (*open == Resumption::Open).then(|| Admitted {
-            _open: Arc::new(open),
-        })
-    }
-
-    /// Refuse resumption from now on, once what was admitted is running.
-    pub(crate) async fn close_resumption(&self) {
-        *self.inner.resumption.write().await = Resumption::Closed;
-    }
-
-    /// Restart every session-retryable child, deepest descendants first.
-    pub(crate) async fn continue_resumable_children(
+    /// End the running agent invocations `scope` selects interrupted now, rather
+    /// than once their turns unwind: resumable where the child is installed, as
+    /// a crash would leave them. Each finish is claimed here, so nothing its
+    /// worker reports meanwhile ends it otherwise; one already finishing keeps
+    /// its own outcome. An invocation yet to begin gives up the input that would
+    /// begin it. What a script launched ends with the script instead.
+    /// A call that installed no child is stopped as a crash stops it, and
+    /// returned for a handler that asks for it again, as a reopen gives one.
+    pub(crate) fn conclude(
         &self,
-        admitted: &Admitted,
-    ) -> Result<usize, JobError> {
-        let mut jobs = {
-            let entries = self.inner.jobs.lock().await;
-            entries
-                .iter()
-                .filter(|(_, entry)| entry.session_retryable())
-                .filter_map(|(id, entry)| Some((*id, entry.child()?.agent.clone()?)))
-                .collect::<Vec<_>>()
+        state: &mut CoreState,
+        scope: Concluding<'_>,
+    ) -> Vec<RetainedChild> {
+        let (jobs, agents) = (&state.jobs.entries, &state.agents);
+        let concluded = |id: &JobId, child: &Child| match scope {
+            Concluding::Every => true,
+            Concluding::Released(links) => {
+                let stopped = |agent: &AgentId| agents.stopped(agent);
+                links.iter().any(|(link, _)| link == id)
+                    && (child.start == Start::Preempted
+                        || child.agent.as_ref().is_some_and(stopped))
+            }
         };
-        jobs.sort_by_key(|(_, child)| std::cmp::Reverse(child.depth()));
-        let mut resumed = 0;
-        for (id, _) in jobs {
-            let operation = match self.operation(id).await {
-                Ok(operation) => operation,
-                Err(JobError::Unknown(_)) => continue,
-                Err(error) => return Err(error),
-            };
-            let guard = operation.lock_owned().await;
-            // The snapshot can go stale while waiting on another child's operation.
-            let eligible = self
-                .inner
-                .jobs
-                .lock()
-                .await
-                .get(&id)
-                .is_some_and(JobEntry::session_retryable);
-            if !eligible {
+        let running = jobs.iter().filter(|(id, entry)| {
+            entry.end().is_none()
+                && entry.child().is_some_and(|child| concluded(id, child))
+                && !views::launched_by_blocking(jobs, entry)
+        });
+        let runs: Vec<_> = running
+            .map(|(id, entry)| Run(*id, entry.invocation))
+            .collect();
+        let mut unaccepted = Vec::new();
+        for run in runs {
+            let Ok(claim) = super::lifecycle::claim(state, run, JobEnd::Interrupted) else {
                 continue;
+            };
+            let entry = &state.jobs.entries[&run.0];
+            let unbegun = entry.child().filter(|child| child.start != Start::Begun);
+            match (unbegun.map(|child| child.agent.clone()), entry.parent) {
+                (Some(Some(child)), _) => drop(state.agents.hand_back(&child, &state.jobs)),
+                (Some(None), parent) => {
+                    self.abandon(state, run, parent);
+                    unaccepted.push(self.retained(run.0, &state.jobs.entries[&run.0]));
+                }
+                (None, _) => {}
             }
-            match self.resume_locked(id, None, guard, admitted.clone()).await {
-                Ok(()) => resumed += 1,
-                // Cancellation or handler removal can invalidate eligibility
-                // without the operation lock.
-                Err(JobError::InputUnavailable { .. } | JobError::Unknown(_)) => continue,
-                Err(error) => return Err(error),
-            }
+            let manager = self.clone();
+            state.defer(move || {
+                let published = manager.clone();
+                let publish = async move {
+                    published
+                        .publish_claimed(claim, ToolError::interrupted().into())
+                        .await
+                };
+                manager.inner.supervisor.spawn(publish);
+            });
         }
-        Ok(resumed)
+        unaccepted
     }
 
-    /// Holds the operation guard through the handler launch, so a waiting parent
-    /// sees the job running rather than a stale terminal delivery.
-    async fn resume_locked(
-        &self,
-        id: JobId,
-        value: Option<Value>,
-        guard: OwnedMutexGuard<()>,
-        admitted: Admitted,
-    ) -> Result<(), JobError> {
-        // Accepted resumption owns its operation gate and admission through
-        // mailbox/output publication and worker handoff even when the sender
-        // disappears.
-        let held = (guard, admitted, self.inner.supervision.enter());
-        self.spawn_owned(held, "job resumption", move |manager| async move {
-            let handler = {
-                let jobs = manager.inner.jobs.lock().await;
-                let entry = jobs.get(&id).ok_or(JobError::Unknown(id))?;
-                if !entry.accepts_input {
-                    return Err(JobError::InputUnsupported(id));
-                }
-                if entry.cancellation.is_cancelled() {
-                    return Err(JobError::InputUnavailable {
-                        job: id,
-                        reason: InputUnavailableReason::CancellationRequested,
-                    });
-                }
-                if !entry.resumable_end() {
-                    return Err(JobError::InputUnavailable {
-                        job: id,
-                        reason: InputUnavailableReason::State(entry.state()),
-                    });
-                }
-                entry.resume().cloned().ok_or(JobError::InputUnavailable {
-                    job: id,
-                    reason: InputUnavailableReason::ResumeUnavailable,
-                })?
-            };
-            // Delivery reservation and its journal event are one ordered unit relative
-            // to resumption, including batched background injection.
-            let _delivery = manager.inner.delivery_operation.lock().await;
-            // The running transition starts a new output generation, so old saved
-            // results cannot masquerade as the new invocation's output.
-            let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
-            let (notify, cancellation) = manager
-                .journal_change(
-                    id,
-                    JobChange::Advance(JobTransition::Running),
-                    Dated::Now,
-                    Rejected::input,
-                    |entry| {
-                        entry.input = input;
-                        (entry.notify.clone(), entry.cancellation.clone())
-                    },
-                )
-                .await?;
-            let worker = super::supervisor::JobWorker::new(manager.clone(), id, cancellation);
-            notify.notify_waiters();
+    /// Stop what still works for invocation `run`: its worker, and what runs
+    /// under its token, which later invocations no longer share.
+    fn abandon(&self, state: &mut CoreState, Run(id, invocation): Run, parent: Option<JobId>) {
+        let fresh = self.token_under(parent);
+        let (stopped, worker) = self.handles(id, |handles| {
+            let worker = handles.task_abort.take_if(|(run, _)| *run == invocation);
+            (std::mem::replace(&mut handles.cancellation, fresh), worker)
+        });
+        state.defer(move || {
+            stopped.cancel();
+            worker.into_iter().for_each(|(_, worker)| worker.abort());
+        });
+    }
 
-            worker
-                .start(
-                    async move { handler(value, receiver).await },
-                    "agent resume handler panicked",
-                )
-                .await?;
-            notify.notify_waiters();
-            Ok(())
-        })
-        .await
+    /// Restart every session-retryable child, deepest descendants first, in one
+    /// transaction: what it journals, and the change that then starts them and
+    /// reports how many invocations it resumed.
+    pub(crate) fn continue_resumable(
+        &self,
+        state: &CoreState,
+    ) -> (
+        Vec<(AgentId, SessionEvent)>,
+        impl FnOnce(&mut CoreState) -> usize + use<>,
+    ) {
+        let mut jobs = (state.jobs.entries.iter())
+            .filter(|(_, entry)| entry.accepts_input && session_retryable(entry))
+            .map(|(id, entry)| (*id, entry.agent.depth(), entry.agent.clone()))
+            .collect::<Vec<_>>();
+        jobs.sort_by_key(|(_, depth, ..)| std::cmp::Reverse(*depth));
+        let running = (jobs.iter())
+            .map(|(id, _, owner)| (owner.clone(), running(*id)))
+            .collect();
+        let manager = self.clone();
+        let restart = move |state: &mut CoreState| {
+            // An invocation an interrupt stopped before it began begins after all.
+            let resumed = jobs.len() + state.jobs.resume_preempted();
+            for (id, ..) in jobs {
+                manager.restart(state, id, None);
+            }
+            resumed
+        };
+        (running, restart)
+    }
+
+    /// Restart job `id` with `value` if it ended resumably, journaling it running
+    /// and starting its handler in one step.
+    async fn resume(&self, id: JobId, value: Value) -> Result<Resumption, JobError> {
+        let manager = self.clone();
+        let resume = move |state: &CoreState| {
+            let entry = state.jobs.entries.get(&id).ok_or(JobError::Unknown(id))?;
+            if !entry.resumable_end() {
+                let running = Resumption::Running(value);
+                return Ok(Plan::new(Vec::new(), move |_, _| running));
+            }
+            let reason = if entry.cancel_requested() {
+                InputUnavailableReason::CancellationRequested
+            } else if entry.resume.is_some() {
+                let running = vec![(entry.agent.clone(), running(id))];
+                return Ok(Plan::new(running, move |state, _| {
+                    manager.restart(state, id, Some(value));
+                    Resumption::Started
+                }));
+            } else {
+                InputUnavailableReason::ResumeUnavailable
+            };
+            Err(JobError::InputUnavailable { job: id, reason })
+        };
+        self.inner.store.commit(Command::Send, resume).await
+    }
+
+    /// Start a journaled restart's handler on a fresh mailbox: the running
+    /// transition starts a new output generation, so old saved results cannot
+    /// masquerade as the new invocation's output. A relaunched call finds the
+    /// input that restarted it waiting in its mailbox.
+    fn restart(&self, state: &mut CoreState, id: JobId, value: Option<Value>) {
+        let (input, receiver) = mpsc::channel(JOB_INPUT_CAPACITY);
+        let (cancellation, resume) = self.handles(id, |handles| {
+            handles.input = input.clone();
+            (handles.cancellation.clone(), handles.resume.clone())
+        });
+        let resume = resume.expect("the supervisor holds what restarts a resumable job");
+        let run = Run(id, state.jobs.entries[&id].invocation);
+        let manager = self.clone();
+        match resume {
+            Resume::Child(handler) => {
+                let worker = super::supervisor::JobWorker::new(manager, run, cancellation);
+                let resumed = async move { handler(value, receiver).await };
+                state.defer(move || worker.launch(resumed, "agent resume handler panicked"));
+            }
+            Resume::Call(relaunch) => {
+                if let Some(value) = value {
+                    let _ = input.try_send(value);
+                }
+                let lease = JobLease::new(manager, run, cancellation, receiver);
+                let supervisor = self.inner.supervisor.clone();
+                state.defer(move || drop(supervisor.spawn(relaunch(lease))));
+            }
+        }
     }
 
     /// Suspend a running job until its caller supplies input. Already waiting
@@ -313,35 +314,87 @@ impl JobManager {
         id: JobId,
         question: QuestionOutput,
     ) -> Result<(), JobError> {
-        self.change_input(id, JobChange::Ask(question)).await
+        let ask = JobChange::Ask(question);
+        (self.journal_change(id, ask, Rejected::input)).await
     }
 
     /// Resume a waiting job whose question was answered.
     pub async fn resume_input(&self, id: JobId) -> Result<(), JobError> {
-        self.change_input(id, JobChange::Answer).await
-    }
-
-    async fn change_input(&self, id: JobId, change: JobChange) -> Result<(), JobError> {
-        let operation = self.operation(id).await?.lock_owned().await;
-        let held = (operation, self.inner.supervision.enter());
-        self.spawn_owned(held, "job input publication", move |manager| async move {
-            let _delivery = manager.inner.delivery_operation.lock().await;
-            (manager.journal_change(id, change, Dated::Now, Rejected::input, |_| ())).await
-        })
-        .await
+        (self.journal_change(id, JobChange::Answer, Rejected::input)).await
     }
 }
 
-/// Running jobs of `agents`: an interruption they accepted has yet to publish.
-fn unpublished_interruptions<'a>(
-    jobs: &'a HashMap<JobId, JobEntry>,
-    agents: &'a [AgentId],
-) -> impl Iterator<Item = (&'a JobId, &'a JobEntry)> {
-    jobs.iter().filter(|(_, entry)| {
-        entry.end().is_none()
-            && (entry.child().and_then(|launched| launched.agent.as_ref()))
-                .is_some_and(|child| agents.contains(child))
-    })
+/// Which running agent invocations a stop ends interrupted.
+#[derive(Clone, Copy)]
+pub(crate) enum Concluding<'a> {
+    /// Every one, as closing leaves them.
+    Every,
+    /// Of the links a redirect released, those an interrupt stopped: whose
+    /// child's turn it stopped, or which had yet to begin.
+    Released(&'a [(JobId, AgentId)]),
+}
+
+/// What a send that found its job ended resumably did.
+enum Resumption {
+    Started,
+    /// Another resumption won: the input joins the invocation it started.
+    Running(Value),
+}
+
+fn running(job: JobId) -> SessionEvent {
+    let state = JobTransition::Running;
+    SessionEvent::JobStateChanged { job, state }
+}
+
+/// Failed or interrupted, uncancelled, with a live handler: a session-wide retry
+/// restarts it. Unlike an explicit send, it never restarts Completed.
+fn session_retryable(entry: &JobFacts) -> bool {
+    matches!(entry.end(), Some(JobEnd::Failed | JobEnd::Interrupted))
+        && entry.resume.is_some()
+        && !entry.cancel_requested()
+}
+
+impl Jobs {
+    /// Record that `retained` runs agent job `id` again once it ends: only as the
+    /// supervisor takes the handler that does, so the two never disagree.
+    fn set_resume(&mut self, id: JobId, retained: Retained) -> Result<(), JobError> {
+        let entry = self.entries.get_mut(&id).ok_or(JobError::Unknown(id))?;
+        entry.child().ok_or(JobError::NoChild(id))?;
+        entry.resume = Some(retained);
+        Ok(())
+    }
+
+    /// Whether agent call `id` may install its child: it still runs, and no
+    /// installed child of its owner, in any end state, has its name. A call that
+    /// installs none holds no name, so of two taking one, the first to install
+    /// has it.
+    pub(crate) fn accepts(&self, id: JobId) -> Result<(), JobError> {
+        let entry = self.entries.get(&id).ok_or(JobError::Unknown(id))?;
+        if entry.end().is_some() {
+            return Err(JobError::AlreadyTerminal(id));
+        }
+        let named = self.entries.iter().find(|(_, other)| {
+            entry.name.is_some()
+                && (other.agent == entry.agent && other.name == entry.name)
+                && other.child().is_some_and(|child| child.agent.is_some())
+        });
+        named.map_or(Ok(()), |(job, other)| {
+            let name = other.name.clone().expect("it has the call's name");
+            Err(JobError::NameTaken { name, job: *job })
+        })
+    }
+
+    /// Whether every interruption `agents` accepted has published its outcome:
+    /// none still answers a running invocation it had begun.
+    pub(crate) fn interruptions_published(&self, agents: &[AgentId]) -> bool {
+        !self.entries.values().any(|entry| {
+            entry.end().is_none()
+                && entry.child().is_some_and(|launched| {
+                    launched.start == Start::Begun
+                        && (launched.agent.as_ref()).is_some_and(|child| agents.contains(child))
+                })
+        })
+    }
 }
 
 #[cfg(test)]
@@ -349,8 +402,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// A child's name belongs to its owner's installed children, whatever their
+    /// end: a call that installed none holds no name, so the first of two to
+    /// install has it, and another owner's children share none.
     #[tokio::test]
-    async fn pending_child_names_reserve_in_order_without_creating_terminal_ghosts() {
+    async fn a_name_belongs_to_the_installed_children_of_its_owner() {
         let runtime = crate::tests::TestRuntime::new().await;
         let jobs = &runtime.jobs;
         let worker: JobName = "worker".parse().unwrap();
@@ -364,54 +420,23 @@ mod tests {
             .unwrap()
             .into_test_id()
         };
-        let first = launch(&runtime.agent).await;
-        let second = launch(&runtime.agent).await;
-        assert_eq!(
-            jobs.child_name_owner(&runtime.agent, &worker, first).await,
-            None
-        );
-        assert_eq!(
-            jobs.child_name_owner(&runtime.agent, &worker, second).await,
-            Some(first)
-        );
-
-        jobs.finish(
-            first,
-            crate::tool::ToolError::failed("launch failed before installing a child").into(),
-        )
-        .await
-        .unwrap();
-        assert_eq!(
-            jobs.child_name_owner(&runtime.agent, &worker, second).await,
-            None
-        );
-        jobs.set_child_agent(second, runtime.agent.child(1))
-            .await
-            .unwrap();
-        jobs.finish(
-            second,
-            JobOutcome::Completed(crate::tool::ToolOutput::new(Value::Null)),
-        )
-        .await
-        .unwrap();
-        let third = launch(&runtime.agent).await;
-        assert_eq!(
-            jobs.child_name_owner(&runtime.agent, &worker, third).await,
-            Some(second)
-        );
-        let other = crate::session::tests::start_child(
-            &runtime.store,
-            &runtime.agent,
-            2,
-            None,
-            runtime.root.path(),
-        )
-        .await;
-        let independent = launch(&other).await;
-        assert_eq!(
-            jobs.child_name_owner(&other, &worker, independent).await,
-            None
-        );
+        let accepts = |job| jobs.facts(|jobs| jobs.accepts(job));
+        let (first, second) = (launch(&runtime.agent).await, launch(&runtime.agent).await);
+        assert!(accepts(first).is_ok() && accepts(second).is_ok());
+        let root = runtime.root.path();
+        crate::session::tests::start_child(&runtime.store, &runtime.agent, 1, Some(second), root)
+            .await;
+        let taken =
+            |refused| matches!(refused, Err(JobError::NameTaken { job, .. }) if job == second);
+        assert!(taken(accepts(first)));
+        let failed = crate::tool::ToolError::failed("refused before installing a child");
+        jobs.finish(first, failed.into()).await.unwrap();
+        let completed = JobOutcome::Completed(crate::tool::ToolOutput::new(Value::Null));
+        jobs.finish(second, completed).await.unwrap();
+        assert!(taken(accepts(launch(&runtime.agent).await)));
+        let other =
+            crate::session::tests::start_child(&runtime.store, &runtime.agent, 2, None, root).await;
+        assert!(accepts(launch(&other).await).is_ok());
     }
 
     /// A running retained agent job whose resume handler echoes and counts calls.
@@ -436,7 +461,7 @@ mod tests {
         (lease, calls)
     }
 
-    async fn settled(jobs: &JobManager, id: JobId) -> JobEnvelope {
+    async fn settled(jobs: &JobManager, id: JobId) -> crate::job::tests::Hydrated {
         crate::tests::bounded(jobs.wait(id, None, true))
             .await
             .unwrap()
@@ -474,13 +499,13 @@ mod tests {
             let (lease, calls) = retained(&jobs, &agent).await;
             jobs.finish(lease.id(), outcome).await.unwrap();
             jobs.clear_resume_handler(lease.id()).await;
-            let before = jobs.snapshot(lease.id()).await.unwrap();
+            let before = jobs.snapshot(lease.id()).unwrap();
             assert!(matches!(
                 jobs.send(lease.id(), serde_json::json!("not accepted")).await,
                 Err(JobError::InputUnavailable { job, reason: InputUnavailableReason::ResumeUnavailable })
                     if job == lease.id()
             ));
-            assert_eq!(jobs.snapshot(lease.id()).await.unwrap(), before);
+            assert_eq!(jobs.snapshot(lease.id()).unwrap(), before);
             assert_eq!(calls.load(Ordering::SeqCst), 0);
         }
     }
@@ -500,62 +525,8 @@ mod tests {
         tokio::pin!(wait);
         assert!((&mut wait).now_or_never().is_none());
         jobs.clear_resume_handler(id).await;
-        let envelope = crate::tests::bounded(wait).await.unwrap();
+        let (envelope, _) = crate::tests::bounded(wait).await.unwrap();
         assert_eq!(envelope.state, JobState::Interrupted);
-    }
-
-    #[tokio::test]
-    async fn session_retry_skips_children_changed_after_its_snapshot() {
-        for end in [None, Some(JobEnd::Completed), Some(JobEnd::Cancelled)] {
-            let state = end.map_or(JobState::Running, JobState::from);
-            let (_root, jobs, owner) = super::super::tests::runtime().await;
-            let mut candidates = Vec::new();
-            // Distinct depths guarantee snapshot order A, B, C.
-            for depth in (1..=3).rev() {
-                let (lease, calls) = retained(&jobs, &owner).await;
-                let child = (0..depth).fold(owner.clone(), |agent, _| agent.child(1));
-                jobs.set_child_agent(lease.id(), child).await.unwrap();
-                let failure = crate::tool::ToolError::failed("fixture failure");
-                jobs.finish(lease.id(), failure.into()).await.unwrap();
-                candidates.push((lease, calls));
-            }
-            let a = jobs.operation(candidates[0].0.id()).await.unwrap();
-            let guard = a.lock().await;
-            let admitted = jobs.admit_resumption().unwrap();
-            let sweep = jobs.continue_resumable_children(&admitted);
-            tokio::pin!(sweep);
-            // All other locks are free: one poll takes the snapshot and blocks at A.
-            assert!(futures_util::poll!(&mut sweep).is_pending());
-            let b = jobs.operation(candidates[1].0.id()).await.unwrap();
-            {
-                let _guard = b.lock().await;
-                let mut entries = jobs.inner.jobs.lock().await;
-                let entry = entries.get_mut(&candidates[1].0.id()).unwrap();
-                entry.phase = end.map_or(Phase::Running, |end| {
-                    Phase::Finished(Box::new(Finished {
-                        end,
-                        images: Vec::new(),
-                        diagnostic: None,
-                        output_diagnostic: None,
-                    }))
-                });
-                if end == Some(JobEnd::Cancelled) {
-                    entry.cancellation.cancel();
-                }
-            }
-            drop(guard);
-            assert_eq!(sweep.await.unwrap(), 2, "{state:?}");
-            for (index, (lease, calls)) in candidates.iter().enumerate() {
-                let id = lease.id();
-                if index == 1 {
-                    assert_eq!(jobs.snapshot(id).await.unwrap().state, state);
-                    assert_eq!(calls.load(Ordering::SeqCst), 0, "{state:?}");
-                } else {
-                    assert_eq!(settled(&jobs, id).await.state, JobState::Completed);
-                    assert_eq!(calls.load(Ordering::SeqCst), 1);
-                }
-            }
-        }
     }
 
     /// An interrupted retained child resumes on send unless it was cancelled,
@@ -568,7 +539,7 @@ mod tests {
             jobs.finish(lease.id(), ToolError::interrupted().into())
                 .await
                 .unwrap();
-            let sent = if cancel {
+            if cancel {
                 let (cancelled, _) = crate::tests::expire(
                     jobs.wait(lease.id(), None, true),
                     async { jobs.cancel(lease.id()).await.unwrap() },
@@ -576,10 +547,8 @@ mod tests {
                 )
                 .await;
                 assert_eq!(cancelled.unwrap().state, JobState::Cancelled);
-                jobs.send(lease.id(), serde_json::json!("retry")).await
-            } else {
-                jobs.send(lease.id(), serde_json::json!("retry")).await
-            };
+            }
+            let sent = jobs.send(lease.id(), serde_json::json!("retry")).await;
             if cancel {
                 assert!(matches!(
                     sent,

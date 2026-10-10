@@ -424,14 +424,13 @@ impl Drop for PendingAuthorization {
 impl<W: AsyncWrite + Unpin + Send + 'static> LocalAuthorizer for ForwardAuthorization<W> {
     fn authorize(
         &self,
-        mut request: Reauthorization,
+        request: Reauthorization,
     ) -> BoxFuture<'static, Result<(), AdmissionError>> {
-        if let Reauthorization::Permissions(permissions) = &mut request {
-            permissions.retain(|permission| permission.resource.resolved_at_destination());
-            if permissions.is_empty() {
-                return Box::pin(async { Ok(()) });
-            }
-        }
+        let request = match super::protocol::Forwarded::of(request) {
+            Ok(Some(request)) => request,
+            Ok(None) => return Box::pin(async { Ok(()) }),
+            Err(error) => return Box::pin(async move { Err(AdmissionError::failed(error)) }),
+        };
         let id = self.ids.next();
         let pending = self.pending.clone();
         let output = self.output.clone();
@@ -484,7 +483,7 @@ mod tests {
     use crate::{
         execution::ExecutionLocation,
         identity::JobId,
-        job::{JobEnvelope, JobSpec, JobState},
+        job::{JobSpec, JobState},
         remote::{
             RejectSensitivePrompts, RemoteError, client::PooledConnection, transport::Transport,
         },
@@ -538,6 +537,7 @@ mod tests {
                     owner: Box::new(()),
                 },
                 location(),
+                Vec::new(),
                 Arc::new(RejectSensitivePrompts),
                 &tokio_util::task::TaskTracker::new(),
                 CancellationToken::new(),
@@ -650,20 +650,14 @@ mod tests {
                         result.map_err(RemoteError::into_tool_error)
                     }
                 })
-                .await
                 .unwrap();
             job
         }
 
-        async fn result(&self, job: JobId) -> JobEnvelope {
+        async fn result(&self, job: JobId) -> crate::job::tests::Hydrated {
             bounded(self.runtime.jobs.wait_settled(job)).await.unwrap();
-            let mut envelope = self.runtime.jobs.metadata(job).await.unwrap();
-            self.runtime
-                .jobs
-                .hydrate_envelope(&mut envelope)
-                .await
-                .unwrap();
-            envelope
+            let envelope = self.runtime.jobs.metadata(job).unwrap();
+            self.runtime.jobs.hydrated(envelope).await.unwrap()
         }
 
         async fn finish(self) {
@@ -931,7 +925,7 @@ mod tests {
         let refused = worker.result(job).await;
         assert_eq!(refused.state, JobState::Failed);
         assert_eq!(
-            refused.diagnostic.unwrap().cause,
+            refused.envelope.diagnostic.unwrap().cause,
             crate::tool::diagnostic::Cause::Unavailable {
                 tool: "write".into()
             }
@@ -1058,7 +1052,7 @@ mod tests {
             )
             .await;
         assert_eq!(worker.result(job).await.state, JobState::Completed);
-        let images = worker.runtime.jobs.images(job).await.unwrap();
+        let images = worker.runtime.jobs.snapshot(job).unwrap().images;
         assert_eq!(images.len(), 1);
         assert_eq!(images[0].file.as_deref(), image_path.to_str());
         let bytes = worker
@@ -1089,7 +1083,7 @@ mod tests {
         assert_eq!(result.output.unwrap()["kind"], "error");
         // The completed read error is bound to the invocation's trusted location.
         assert_eq!(
-            result.output_diagnostic.unwrap().context.site,
+            result.envelope.output_diagnostic.unwrap().context.site,
             crate::tool::diagnostic::FailureSite::Execution(location()),
         );
         worker.finish().await;
@@ -1192,7 +1186,7 @@ mod tests {
             "reusable"
         );
         assert_eq!(
-            worker.runtime.jobs.metadata(blocked).await.unwrap().state,
+            worker.runtime.jobs.metadata(blocked).unwrap().state,
             JobState::Cancelled
         );
         worker.finish().await;
@@ -1225,7 +1219,6 @@ mod tests {
                 .runtime
                 .jobs
                 .metadata(job)
-                .await
                 .unwrap()
                 .state
                 .is_terminal()

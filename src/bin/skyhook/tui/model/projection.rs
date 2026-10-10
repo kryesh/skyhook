@@ -5,13 +5,12 @@ use super::entries::Dep;
 use super::{Timing, state_name};
 use serde_json::Value;
 use skyhook::agent::{AgentActivity, ObservationSnapshot, TodoItem, TurnFailure};
-use skyhook::execution::ExecutionLocation;
 use skyhook::identity::{AgentId, JobId};
-use skyhook::job::{JobRole, JobState, JobTransition};
+use skyhook::job::{JobEnvelope, JobRole, JobState, JobTransition};
 use skyhook::provider::protocol::Usage;
 use skyhook::session::{MessageSeq, RecordSeq, SessionEvent, Turns};
 use skyhook::target::TargetRef;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 use std::ops::Bound;
 use std::time::{Duration, Instant};
 
@@ -130,43 +129,9 @@ impl AgentInfo {
     }
 }
 
-#[derive(Clone)]
-pub struct JobInfo {
-    pub id: JobId,
-    pub agent: AgentId,
-    pub name: Option<String>,
-    pub tool: String,
-    pub role: JobRole,
-    pub args: Value,
-    pub parent: Option<JobId>,
-    pub state: JobState,
-    pub location: ExecutionLocation,
-    pub error: Option<String>,
-    /// From its first run to its end; untimed while it has not run.
-    pub timing: Timing,
-}
-
-impl JobInfo {
-    pub fn location_label(&self) -> String {
-        format!(
-            "{} · {}",
-            self.location.target,
-            self.location.workspace.display()
-        )
-    }
-
-    pub fn remote(&self) -> bool {
-        !self.location.is_root()
-    }
-}
-
 #[derive(Default)]
 pub struct Projection {
     pub agents: Vec<AgentInfo>,
-    /// Written only through the record fold, which keeps `open_jobs` in step.
-    jobs: BTreeMap<JobId, JobInfo>,
-    /// Each agent's unfinished jobs.
-    open_jobs: HashMap<AgentId, BTreeSet<JobId>>,
     pub usage: Usage,
     pub agent_usage: HashMap<AgentId, Usage>,
     pub todos: HashMap<AgentId, Vec<TodoItem>>,
@@ -174,15 +139,29 @@ pub struct Projection {
     pub(super) records_by_agent: HashMap<AgentId, Vec<RecordSeq>>,
     /// Calls that admitted a job, so the job card stands in for the call.
     pub(super) tool_origins: HashSet<(AgentId, MessageSeq, String)>,
-    /// What records folded since the last `take_changes` touched.
+    /// What records and job views folded since the last `take_changes` touched.
     changes: HashSet<Dep>,
     turns: Turns,
     /// Each agent's most recently finished turn.
     last_turn: HashMap<AgentId, Timing>,
 }
+/// Whether any job the session holds has yet to end.
+pub fn open_jobs(snapshot: &ObservationSnapshot) -> bool {
+    snapshot.jobs.values().any(|job| !job.state.is_terminal())
+}
+
 impl Projection {
-    pub fn jobs(&self) -> &BTreeMap<JobId, JobInfo> {
-        &self.jobs
+    /// A projection of everything `snapshot` holds.
+    pub fn new(snapshot: &ObservationSnapshot) -> Self {
+        let mut projection = Self::default();
+        (snapshot.jobs.values()).for_each(|job| projection.observe_job(job));
+        projection.rebuild(snapshot);
+        projection
+    }
+
+    /// Fold a job's view as it arrives, before the record that moved it.
+    pub fn observe_job(&mut self, job: &JobEnvelope) {
+        self.changes.insert(Dep::Job(job.id));
     }
 
     pub(super) fn agent_name(&self, agent: &AgentId) -> &str {
@@ -217,31 +196,9 @@ impl Projection {
         changed
     }
 
-    /// Everything records folded since the last call touched, for history to rebuild.
+    /// Everything folded since the last call touched, for history to rebuild.
     pub(super) fn take_changes(&mut self) -> HashSet<Dep> {
         std::mem::take(&mut self.changes)
-    }
-
-    /// Every job state change goes through here, so the open index follows each
-    /// transition, including a finished child resumed under its own job.
-    fn set_job_state(&mut self, job: JobId, state: JobState, at: i64) -> Option<&mut JobInfo> {
-        let info = self.jobs.get_mut(&job)?;
-        info.state = state;
-        info.timing = match (state, info.timing) {
-            (JobState::Running | JobState::WaitingInput, Timing::Since(_)) => info.timing,
-            (JobState::Running | JobState::WaitingInput, _) => Timing::Since(at),
-            (state, Timing::Since(since)) if state.is_terminal() => {
-                Timing::Took { since, until: at }
-            }
-            (_, timing) => timing,
-        };
-        let open = self.open_jobs.entry(info.agent.clone()).or_default();
-        if state.is_terminal() {
-            open.remove(&job);
-        } else {
-            open.insert(job);
-        }
-        Some(info)
     }
 
     /// An agent's clock: its turn while busy and not terminal, otherwise its owner
@@ -252,8 +209,8 @@ impl Projection {
             Some(activity) if !agent.terminal() && activity.state.is_busy() => {
                 Timing::Since(activity.since)
             }
-            _ => match agent.owner.and_then(|job| self.jobs.get(&job)) {
-                Some(job) => job.timing,
+            _ => match agent.owner.and_then(|job| snapshot.jobs.get(&job)) {
+                Some(job) => job.timing.into(),
                 None => (self.last_turn.get(&agent.id).copied()).unwrap_or(Timing::Untimed),
             },
         }
@@ -302,47 +259,14 @@ impl Projection {
                     });
                 }
                 SessionEvent::JobCreated {
-                    job,
-                    tool,
-                    role,
-                    name,
-                    arguments,
-                    parent,
-                    location,
-                    origin,
+                    origin: Some(origin),
                     ..
                 } => {
-                    self.changes.insert(Dep::Job(*job));
-                    if let Some(origin) = origin {
-                        let call = origin.call_id.clone();
-                        self.changes.insert(Dep::Call(origin.message, call));
-                        self.tool_origins.insert((
-                            record.agent.clone(),
-                            origin.message,
-                            origin.call_id.clone(),
-                        ));
-                    }
-                    self.jobs.insert(
-                        *job,
-                        JobInfo {
-                            id: *job,
-                            agent: record.agent.clone(),
-                            name: name.clone().map(String::from),
-                            tool: tool.clone(),
-                            role: *role,
-                            args: arguments.clone(),
-                            parent: *parent,
-                            state: JobState::Queued,
-                            location: location.clone(),
-                            error: None,
-                            timing: Timing::Untimed,
-                        },
-                    );
-                    self.set_job_state(*job, JobState::Queued, record.timestamp_millis);
+                    let call = origin.call_id.clone();
+                    self.changes.insert(Dep::Call(origin.message, call.clone()));
+                    (self.tool_origins).insert((record.agent.clone(), origin.message, call));
                 }
                 SessionEvent::JobStateChanged { job, state } => {
-                    self.changes.insert(Dep::Job(*job));
-                    self.set_job_state(*job, (*state).into(), record.timestamp_millis);
                     // Resuming a retained child reuses its owner job and does not
                     // emit AgentStarted again. Reopen its tree row on that job's
                     // Running event, not on ordinary model/tool activity updates.
@@ -354,26 +278,6 @@ impl Projection {
                         {
                             agent.lifecycle = AgentLifecycle::Active;
                         }
-                    }
-                }
-                SessionEvent::JobFinished {
-                    job,
-                    state,
-                    diagnostic,
-                    ..
-                } => {
-                    self.changes.insert(Dep::Job(*job));
-                    let capabilities = self
-                        .agents
-                        .iter()
-                        .find(|agent| agent.id == record.agent)
-                        .map(|agent| agent.capabilities.iter().copied().collect())
-                        .unwrap_or_else(skyhook::tool::policy::CapabilitySet::empty);
-                    let at = record.timestamp_millis;
-                    if let Some(info) = self.set_job_state(*job, (*state).into(), at) {
-                        info.error = diagnostic
-                            .as_ref()
-                            .map(|diagnostic| diagnostic.render(&capabilities));
                     }
                 }
                 // Stopping the root ends its process, not the agent: a reopened
@@ -412,9 +316,9 @@ impl Projection {
             }
         }
         for agent in &mut self.agents {
-            if let Some(job) = agent.owner.and_then(|id| self.jobs.get(&id)) {
+            if let Some(job) = agent.owner.and_then(|id| snapshot.jobs.get(&id)) {
                 if let Some(name) = &job.name {
-                    agent.name = name.clone();
+                    agent.name = name.to_string();
                 }
                 if job.state.is_terminal() {
                     agent.lifecycle.complete(Instant::now());
@@ -444,27 +348,32 @@ impl Projection {
                 .map_or(TargetRef::Root, |agent| agent.target.clone())),
         }
     }
-    pub(super) fn job_target<'a>(&self, job: &'a JobInfo) -> Result<TargetRef, &'a str> {
+    pub(super) fn job_target<'a>(&self, job: &'a JobEnvelope) -> Result<TargetRef, &'a str> {
         if job.role == JobRole::Agent {
             self.agents
                 .iter()
                 .find(|agent| agent.owner == Some(job.id))
                 .map_or_else(
-                    || self.child_target(&job.agent, job.args.get(skyhook::tool::TARGET)),
+                    || self.child_target(&job.agent, job.arguments.get(skyhook::tool::TARGET)),
                     |agent| Ok(agent.target.clone()),
                 )
         } else {
             Ok(job.location.target.clone())
         }
     }
+    /// Why `job` failed, as its agent's capabilities render it.
+    pub(super) fn job_error(&self, job: &JobEnvelope) -> Option<String> {
+        let agent = self.agents.iter().find(|agent| agent.id == job.agent);
+        let capabilities = agent.map(|agent| agent.capabilities.iter().copied().collect());
+        let capabilities = capabilities.unwrap_or_else(skyhook::tool::policy::CapabilitySet::empty);
+        job.diagnostic()
+            .map(|diagnostic| diagnostic.render(&capabilities))
+    }
     /// An agent's footer statistics.
     pub fn agent_stats(&self, snapshot: &ObservationSnapshot, agent: &AgentId) -> [String; 3] {
         let usage = self.agent_usage.get(agent).copied().unwrap_or_default();
         let context = snapshot.context.get(agent);
         super::super::format::footer_stats(usage, context.map(|c| (c.tokens, c.capacity)))
-    }
-    pub fn has_open_jobs(&self) -> bool {
-        self.open_jobs.values().any(|jobs| !jobs.is_empty())
     }
     /// Indices of the agents the live tree shows.
     pub fn visible<'a>(&'a self, selected: &'a AgentId) -> impl Iterator<Item = usize> + 'a {
@@ -479,15 +388,11 @@ impl Projection {
     }
     pub fn status(&self, agent: &AgentInfo, snapshot: &ObservationSnapshot) -> AgentDisplayState {
         use AgentDisplayState as State;
+        let owner = agent.owner.and_then(|id| snapshot.jobs.get(&id));
         if agent.terminal() {
-            return State::Job(
-                agent
-                    .owner
-                    .and_then(|j| self.jobs.get(&j))
-                    .map_or(JobState::Completed, |j| j.state),
-            );
+            return State::Job(owner.map_or(JobState::Completed, |job| job.state));
         }
-        if let Some(owner) = agent.owner.and_then(|id| self.jobs.get(&id))
+        if let Some(owner) = owner
             && owner.state == JobState::WaitingInput
         {
             return State::Waiting(WaitReason::ParentInput);
@@ -505,8 +410,9 @@ impl Projection {
             Some(AgentActivity::Stopped(failure)) => State::stopped(failure),
             Some(AgentActivity::WaitingChildren) => State::Waiting(WaitReason::Child),
             activity => {
-                let open = self.open_jobs.get(&agent.id).into_iter().flatten();
-                let jobs: Vec<_> = open.filter_map(|id| self.jobs.get(id)).collect();
+                let jobs: Vec<_> = (snapshot.jobs.values())
+                    .filter(|job| job.agent == agent.id && !job.state.is_terminal())
+                    .collect();
                 if !jobs.is_empty() && jobs.iter().all(|j| j.state == JobState::AwaitingApproval) {
                     State::Waiting(WaitReason::Permission)
                 } else if jobs
@@ -534,346 +440,352 @@ impl Projection {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Journal, created, finished};
     use super::*;
+    use crate::interaction::{ApprovalReply, Prompt, PromptKind, Reply};
+    use crate::tests::bounded;
+    use crate::tui::app::{
+        App,
+        played::{
+            activity, answer_child, answered, ask, asking, at, attended_fixture, call, children,
+            completed, count, delegate, exchange, job_finished, job_of_call, job_state, next_turn,
+            observe_find, observe_record, observe_until, played_fixture, reached, recorded,
+            requested, spawn_children,
+        },
+    };
+    use serde_json::json;
     use skyhook::agent::ObservedActivity;
+    use skyhook::provider::protocol::{AssistantItem, ContextId};
+    use tokio::sync::mpsc::UnboundedReceiver;
 
-    fn agent(id: AgentId) -> AgentInfo {
-        AgentInfo {
-            id,
-            name: "Failed Waiting for permission".into(),
-            model: Some("test/test".parse().unwrap()),
-            mode: None,
-            capabilities: Vec::new(),
-            target: TargetRef::Root,
-            owner: None,
-            lifecycle: AgentLifecycle::Active,
-        }
+    fn agent(projection: &Projection, id: &AgentId) -> AgentInfo {
+        let mut agents = projection.agents.iter();
+        agents.find(|agent| &agent.id == id).unwrap().clone()
     }
 
-    fn changed(id: u64, state: JobTransition) -> SessionEvent {
-        let job = JobId::new(id).unwrap();
-        SessionEvent::JobStateChanged { job, state }
+    /// What `app` shows agent `id` doing, as a fresh projection of its snapshot,
+    /// as a resubscription builds, agrees.
+    fn status(app: &App, id: &AgentId) -> AgentDisplayState {
+        let state = (app.projection).status(&agent(&app.projection, id), &app.snapshot);
+        let fresh = Projection::new(&app.snapshot);
+        assert_eq!(fresh.status(&agent(&fresh, id), &app.snapshot), state);
+        state
     }
 
-    /// A journal whose projection folds each record, stamped `sequence` seconds in.
-    struct Folded {
-        journal: Journal,
-        projection: Projection,
+    /// The job `app` last saw created for `tool`, once there is one.
+    fn job_for(app: &App, tool: &str) -> Option<JobId> {
+        let mut jobs = app.snapshot.jobs.values().rev();
+        jobs.find(|job| job.tool == tool).map(|job| job.id)
     }
 
-    impl Folded {
-        async fn new() -> Self {
-            let (journal, projection) = (Journal::new().await, Projection::default());
-            Self {
-                journal,
-                projection,
-            }
-        }
-
-        /// Record `event` on the root and fold it, returning when it landed.
-        async fn step(&mut self, event: SessionEvent) -> i64 {
-            let root = self.journal.agent();
-            let at = self.journal.record(&root, event).await.get() as i64 * 1000;
-            self.projection.rebuild(&self.journal.stamped());
-            at
-        }
-
-        fn timing(&self, job: u64) -> Timing {
-            self.projection.jobs()[&JobId::new(job).unwrap()].timing
-        }
+    /// The reply to the next approval the session asks for.
+    async fn approval(prompts: &mut UnboundedReceiver<Prompt>) -> Reply<ApprovalReply> {
+        let prompt = bounded(prompts.recv()).await.unwrap();
+        let PromptKind::Approval { reply, .. } = prompt.kind else {
+            panic!("an approval")
+        };
+        reply
     }
 
-    /// An agent no job owns (the root) shows its last finished turn once idle,
-    /// so a resumed session's root has a time before it does anything.
+    /// An agent no job owns (the root) shows its last finished turn once idle.
     #[tokio::test]
     async fn an_idle_root_shows_its_last_turn() {
-        use skyhook::session::{AttemptRef, CompletedOutcome};
-        let mut journal = Journal::new().await;
-        let root = journal.agent();
-        let mut projection = Projection::default();
-        let request = journal.request(&root, None).await.request;
-        let answer = skyhook::provider::protocol::AssistantItem::text("text", 0, "done");
-        let message = SessionEvent::MessageCommitted {
-            message: skyhook::session::Message::Assistant(vec![answer]),
-        };
-        let message = journal.record(&root, message).await.message();
-        let completed = SessionEvent::ResponseCompleted {
-            attempt: AttemptRef {
-                request,
-                attempt: 1,
-            },
-            message,
-            outcome: CompletedOutcome::Answer,
-        };
-        let until = journal.record(&root, completed).await.get() as i64 * 1000;
-        let mut snapshot = journal.stamped();
-        projection.rebuild(&snapshot);
-        // A root's turn end isn't journaled: the resumed runtime reports it idle.
-        let idle = ObservedActivity {
-            state: AgentActivity::Idle,
-            since: until,
-        };
-        snapshot.activity.insert(root.clone(), idle);
-        let since = RecordSeq::from(request).get() as i64 * 1000;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let root = app.root_agent().clone();
+        let answer = vec![AssistantItem::text("text", 0, "done")];
+        exchange(&mut app, &mut model, "question", answer).await;
+        observe_until(&mut app, |app| {
+            activity(&app.snapshot, &root) == Some(&AgentActivity::Idle)
+                && recorded(&app.snapshot, completed)
+        })
+        .await;
+        let since = at(&app.snapshot, requested, 0);
+        let until = at(&app.snapshot, completed, 0);
         let took = Timing::Took { since, until };
-        assert_eq!(projection.timing(&agent(root), &snapshot), took);
+        let root = agent(&app.projection, &root);
+        assert_eq!(app.projection.timing(&root, &app.snapshot), took);
     }
 
-    /// A job is timed from its first run to its end, through waits for input, and
-    /// again from a resumed run; one that never ran stays untimed. An agent shows
-    /// its turn while busy and its owner job's run otherwise.
+    /// A child shows its turn while busy and its owner job's run otherwise, also
+    /// once a crash before its completion record leaves it busy though finished.
     #[tokio::test]
-    async fn jobs_time_their_run_and_agents_their_turn_or_job() {
-        use JobTransition::{AwaitingApproval, Running, WaitingInput};
-        let mut folded = Folded::new().await;
-        let id = folded.journal.agent().child(1);
-        let mut child = agent(id.clone());
-        child.owner = JobId::new(1).ok();
-        for event in [
-            created(1, "agent", JobRole::Agent),
-            changed(1, AwaitingApproval),
-        ] {
-            folded.step(event).await;
-            assert_eq!(folded.timing(1), Timing::Untimed);
-        }
-        let since = folded.step(changed(1, Running)).await;
-        for transition in [WaitingInput, Running] {
-            folded.step(changed(1, transition)).await;
-            assert_eq!(folded.timing(1), Timing::Since(since));
-        }
-        let until = folded.step(finished(1)).await;
-        let took = Timing::Took { since, until };
-        assert_eq!(folded.timing(1), took);
-        let mut snapshot = folded.journal.stamped();
-        assert_eq!(folded.projection.timing(&child, &snapshot), took);
+    async fn a_child_shows_its_turn_while_busy_and_its_owner_jobs_run_otherwise() {
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let (children, mut turns) = spawn_children(&mut app, &mut model, 1).await;
+        turns.remove(0).answer("done");
+        let owner = observe_find(&mut app, |app| job_of_call(&app.snapshot, "agent-0")).await;
+        observe_record(&mut app, job_finished(owner)).await;
+        // As it shows before its completion record lands.
+        let mut child = AgentInfo {
+            lifecycle: AgentLifecycle::Active,
+            ..agent(&app.projection, &children[0])
+        };
+        let mut snapshot = app.snapshot.clone();
+        let ran = Timing::from(snapshot.jobs[&owner].timing);
+        assert_eq!(app.projection.timing(&child, &snapshot), ran);
         let working = ObservedActivity {
             state: AgentActivity::Working,
             since: 7,
         };
-        snapshot.activity.insert(id, working);
-        assert_eq!(
-            folded.projection.timing(&child, &snapshot),
-            Timing::Since(7)
-        );
-        // A crash before its completion record leaves a finished child's replayed
-        // activity busy: its finished owner job still times it.
+        snapshot.activity.insert(child.id.clone(), working);
+        assert_eq!(app.projection.timing(&child, &snapshot), Timing::Since(7));
         child.lifecycle = AgentLifecycle::Terminal {
             grace_started: None,
         };
-        assert_eq!(folded.projection.timing(&child, &snapshot), took);
-        let resumed = folded.step(changed(1, Running)).await;
-        assert_eq!(folded.timing(1), Timing::Since(resumed));
-
-        folded.step(created(2, "exec", JobRole::Tool)).await;
-        folded
-            .step(SessionEvent::JobFinished {
-                job: JobId::new(2).unwrap(),
-                state: skyhook::job::JobEnd::Cancelled,
-                diagnostic: None,
-                output_diagnostic: None,
-                images: Vec::new(),
-            })
-            .await;
-        assert_eq!(folded.timing(2), Timing::Untimed);
+        assert_eq!(app.projection.timing(&child, &snapshot), ran);
     }
 
-    /// Closing a session stops its root, which a reopen resumes: the session shows
-    /// how it resumes, as the session list does before opening it, never completed.
+    /// Closing a session stops its root mid-turn, and what it runs, as a crash
+    /// would: the session no longer works, and a reopen resumes the root, which
+    /// shows how it resumes, viewed and once running, never completed.
     #[tokio::test]
     async fn a_stopped_root_resumes_rather_than_completing() {
         use crate::tui::app::{
             SlotKey,
-            tests::{fixture, push_record},
+            played::{played_fixture, sleeping_script},
+            tests::attach,
         };
-        let (_root, mut app) = fixture().await;
+        use skyhook::session::SessionPhase;
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let _asked = ask(&session, "question");
+        let _turn = model.turn().await;
+        let _script = sleeping_script(&session);
+        observe_until(&mut app, |app| open_jobs(&app.snapshot)).await;
+        session.close().await.unwrap();
+        observe_until(&mut app, |app| app.snapshot.phase == SessionPhase::Closed).await;
+        assert!(!app.peer(SlotKey::default(), true).working);
+        let session = app.launch.create(Some(session.id())).await.unwrap();
+        attach(&mut app, session.clone());
+        let stopped = AgentDisplayState::stopped(&TurnFailure::Interrupted);
+        assert_eq!(app.peer(SlotKey::default(), true).state, stopped);
         let root = app.root_agent().clone();
-        push_record(&mut app, SessionEvent::AgentInterrupted).await;
-        let idle = ObservedActivity {
-            state: AgentActivity::Idle,
-            since: 0,
-        };
-        app.snapshot.activity.insert(root, idle);
-        app.refresh();
-        let peer = app.peer(SlotKey::default(), true);
-        assert_eq!(peer.state, AgentDisplayState::Ready);
+        session
+            .record_status(root, "reopened".into())
+            .await
+            .unwrap();
+        let reopened = |event: &SessionEvent| matches!(event, SessionEvent::Status { message } if message == "reopened");
+        observe_record(&mut app, reopened).await;
+        assert_eq!(app.peer(SlotKey::default(), true).state, stopped);
+        session.shutdown().await.unwrap();
     }
 
-    fn status(
-        journal: &Journal,
-        projection: &mut Projection,
-        agent: &AgentInfo,
-    ) -> AgentDisplayState {
-        projection.rebuild(&journal.snapshot);
-        projection.status(agent, &journal.snapshot)
-    }
-
+    /// A finished child shows its owner job's state; a child whose owner waits
+    /// for its parent's input shows that over its own activity; recovery shows
+    /// without any job. Otherwise an agent's jobs say what it waits on, over its
+    /// running tools: approval while every job awaits it, then input, an event or
+    /// its children, as does an answered child whose own work still runs.
     #[tokio::test]
     async fn display_precedence_preserves_terminal_owner_activity_and_job_order() {
         use AgentDisplayState as State;
-        use JobTransition::{AwaitingApproval, Running, WaitingInput};
-        let mut journal = Journal::new().await;
-        let root = journal.agent();
-        let id = root.child(1);
-        let mut agent = agent(id.clone());
-        let mut projection = Projection::default();
-        let activity = |journal: &mut Journal, state| {
+        let (_root, mut app, mut model, session, mut prompts) = attended_fixture().await;
+        let root = app.root_agent().clone();
+        let mut turns = delegate(&session, &mut model, &[json!({"prompt": "ask"})]).await;
+        observe_until(&mut app, |app| !children(&app.snapshot).is_empty()).await;
+        let child = children(&app.snapshot).remove(0);
+        let doing = |app: &mut App, state| {
             let activity = ObservedActivity { state, since: 0 };
-            journal.snapshot.activity.insert(id.clone(), activity);
+            app.snapshot.activity.insert(child.clone(), activity);
         };
-        activity(&mut journal, AgentActivity::Reconnecting { attempt: 2 });
-        // Recovery is active without any job.
-        let state = status(&journal, &mut projection, &agent);
-        assert_eq!(state, State::Reconnecting { attempt: 2 });
-        // Behavior comes from roles, not the deliberately misleading tool names.
-        journal
-            .record(&root, created(1, "agent", JobRole::Agent))
-            .await;
-        journal.record(&root, changed(1, WaitingInput)).await;
-        agent.owner = JobId::new(1).ok();
-        journal.record(&id, start(agent.owner)).await;
-        activity(&mut journal, AgentActivity::Working);
-        let state = status(&journal, &mut projection, &agent);
-        assert_eq!(state, State::Waiting(WaitReason::ParentInput));
-        agent.lifecycle.complete(Instant::now());
-        let state = status(&journal, &mut projection, &agent);
-        assert_eq!(state, State::Job(JobState::WaitingInput));
-        agent.lifecycle = AgentLifecycle::Active;
-        agent.owner = None;
-        assert_eq!(status(&journal, &mut projection, &agent), State::Working);
-        journal.snapshot.activity.clear();
-        journal
-            .record(&id, created(2, "agent", JobRole::Tool))
-            .await;
-        journal.record(&id, changed(2, Running)).await;
-        assert_eq!(
-            status(&journal, &mut projection, &agent),
-            State::RunningTools
-        );
-        journal.record(&id, finished(2)).await;
-        journal
-            .record(&id, created(3, "agent", JobRole::Agent))
-            .await;
-        let state = status(&journal, &mut projection, &agent);
-        assert_eq!(state, State::Waiting(WaitReason::Child));
-        journal.record(&id, created(4, "wait", JobRole::Wait)).await;
-        journal.record(&id, changed(4, Running)).await;
-        let state = status(&journal, &mut projection, &agent);
-        assert_eq!(state, State::Waiting(WaitReason::Event));
-        journal
-            .record(&id, created(5, "agent", JobRole::Question))
-            .await;
-        let state = status(&journal, &mut projection, &agent);
-        assert_eq!(state, State::Waiting(WaitReason::Input));
-        for job in [3, 4, 5] {
-            journal.record(&id, changed(job, AwaitingApproval)).await;
+        doing(&mut app, AgentActivity::Reconnecting { attempt: 2 });
+        assert_eq!(status(&app, &child), State::Reconnecting { attempt: 2 });
+        assert_eq!(status(&app, &root), State::Waiting(WaitReason::Child));
+
+        let sleep = json!({"command": ["sleep", "60"]});
+        turns.remove(0).end(vec![
+            call("exec-0", "exec", sleep.clone(), 0),
+            call("exec-1", "exec", sleep, 1),
+        ]);
+        let allow = approval(&mut prompts).await;
+        let mut execs = Vec::new();
+        for id in ["exec-0", "exec-1"] {
+            let exec = observe_find(&mut app, |app| job_of_call(&app.snapshot, id)).await;
+            reached(&mut app, exec, JobTransition::AwaitingApproval).await;
+            execs.push(exec);
         }
-        let state = status(&journal, &mut projection, &agent);
-        assert_eq!(state, State::Waiting(WaitReason::Permission));
-        activity(&mut journal, AgentActivity::WaitingChildren);
-        let state = status(&journal, &mut projection, &agent);
-        assert_eq!(state, State::Waiting(WaitReason::Child));
+        assert_eq!(status(&app, &child), State::Waiting(WaitReason::Permission));
+        // Allowed once, one call runs while the other still awaits approval.
+        allow.send(Ok(ApprovalReply::Allow)).unwrap();
+        let running = |app: &App| {
+            let ran =
+                |exec: &JobId| recorded(&app.snapshot, job_state(*exec, JobTransition::Running));
+            execs.iter().any(ran)
+        };
+        observe_until(&mut app, running).await;
+        assert_eq!(status(&app, &child), State::RunningTools);
+        for exec in execs {
+            session.cancel_job(exec).await.unwrap();
+        }
+
+        let turn = next_turn(&mut model, &child).await;
+        let work = json!({"source": "return await receive();", "bg": true});
+        turn.end(vec![
+            call("work", "script", work, 0),
+            call("wait", "wait", json!({}), 1),
+        ]);
+        let work = observe_find(&mut app, |app| job_for(app, "script")).await;
+        let wait = observe_find(&mut app, |app| job_for(app, "wait")).await;
+        reached(&mut app, wait, JobTransition::Running).await;
+        assert_eq!(status(&app, &child), State::Waiting(WaitReason::Event));
+        session.cancel_job(wait).await.unwrap();
+
+        let turn = next_turn(&mut model, &child).await;
+        turn.end(vec![asking()]);
+        let owner = agent(&app.projection, &child).owner.unwrap();
+        reached(&mut app, owner, JobTransition::WaitingInput).await;
+        // The root waits on with the question open: input over an event.
+        model
+            .turn()
+            .await
+            .end(vec![call("hold", "wait", json!({}), 0)]);
+        let hold = observe_find(&mut app, |app| job_of_call(&app.snapshot, "hold")).await;
+        reached(&mut app, hold, JobTransition::Running).await;
+        doing(&mut app, AgentActivity::Working);
+        assert_eq!(
+            status(&app, &child),
+            State::Waiting(WaitReason::ParentInput)
+        );
+        assert_eq!(status(&app, &root), State::Waiting(WaitReason::Input));
+
+        answer_child(&session, owner, "{pick: 'this'}").await;
+        let turn = next_turn(&mut model, &child).await;
+        turn.answer("progress");
+        let waiting =
+            |app: &App| activity(&app.snapshot, &child) == Some(&AgentActivity::WaitingChildren);
+        observe_until(&mut app, waiting).await;
+        assert_eq!(status(&app, &child), State::Waiting(WaitReason::Child));
+
+        session.cancel_job(work).await.unwrap();
+        let turn = next_turn(&mut model, &child).await;
+        turn.answer("done");
+        observe_record(&mut app, job_finished(owner)).await;
+        doing(&mut app, AgentActivity::Working);
+        assert_eq!(status(&app, &child), State::Job(JobState::Completed));
     }
 
+    /// A wait pauses the agent even with other owned work still running; any
+    /// other running tool leaves it running tools.
     #[tokio::test]
     async fn wait_tool_status_tracks_classification_and_settlement() {
         use AgentDisplayState as State;
-        let waiting = State::Waiting(WaitReason::Event);
-        for (tool, role, running) in [
-            ("wait", JobRole::Wait, waiting),
-            ("exec", JobRole::Tool, State::RunningTools),
+        for (tool, arguments, running) in [
+            ("wait", json!({}), State::Waiting(WaitReason::Event)),
+            (
+                "exec",
+                json!({"command": ["sleep", "60"]}),
+                State::RunningTools,
+            ),
         ] {
-            let mut journal = Journal::new().await;
-            let agent = agent(journal.agent());
-            let mut projection = Projection::default();
-            // A wait pauses the agent even with other owned work still running.
-            let work = [
-                created(1, "exec", JobRole::Tool),
-                changed(1, JobTransition::Running),
-            ];
-            for event in work.into_iter().chain([created(2, tool, role)]) {
-                journal.record(&agent.id, event).await;
-            }
-            let state = status(&journal, &mut projection, &agent);
-            assert_eq!(state, State::RunningTools, "{tool}");
-            journal
-                .record(&agent.id, changed(2, JobTransition::Running))
-                .await;
-            assert_eq!(status(&journal, &mut projection, &agent), running, "{tool}");
-            journal.record(&agent.id, finished(2)).await;
-            let state = status(&journal, &mut projection, &agent);
-            assert_eq!(state, State::RunningTools, "{tool}");
+            let (_root, mut app, mut model, session) = played_fixture().await;
+            let root = app.root_agent().clone();
+            let _asked = ask(&session, "work");
+            let background = json!({"command": ["sleep", "60"], "bg": true});
+            model.turn().await.end(vec![
+                call("background", "exec", background, 0),
+                call("foreground", tool, arguments, 1),
+            ]);
+            let job = observe_find(&mut app, |app| job_of_call(&app.snapshot, "foreground")).await;
+            reached(&mut app, job, JobTransition::Running).await;
+            assert_eq!(status(&app, &root), running, "{tool}");
+            // Created first, but it starts beside the foreground call.
+            let background = job_of_call(&app.snapshot, "background").unwrap();
+            reached(&mut app, background, JobTransition::Running).await;
+            session.cancel_job(job).await.unwrap();
+            observe_record(&mut app, job_finished(job)).await;
+            // The root may already be requesting its next turn: its jobs alone decide.
+            let idle = ObservedActivity {
+                state: AgentActivity::Idle,
+                since: 0,
+            };
+            app.snapshot.activity.insert(root.clone(), idle);
+            assert_eq!(status(&app, &root), State::RunningTools, "{tool}");
+            session.cancel_job(background).await.unwrap();
         }
     }
 
-    fn start(owner_job: Option<JobId>) -> SessionEvent {
-        SessionEvent::AgentStarted {
-            owner_job,
-            profile: None,
-            available_depth: 0,
-            mode: None,
-            capabilities: Vec::new(),
-            location: ExecutionLocation::root("/workspace".into()),
-        }
-    }
-
+    /// A completed child stays briefly in the tree and retires once. Input to its
+    /// finished owner job runs it again, as open work its owner waits on, and its
+    /// next completion starts another grace.
     #[tokio::test]
     async fn completion_grace_retires_once_and_running_owner_reopens() {
-        let mut journal = Journal::new().await;
-        let root = journal.agent();
-        let child = root.child(1);
-        let mut projection = Projection::default();
-        journal
-            .record(&root, created(1, "agent", JobRole::Agent))
-            .await;
-        journal
-            .record(&root, changed(1, JobTransition::WaitingInput))
-            .await;
-        let owner_id = JobId::new(1).unwrap();
-        journal.record(&child, start(Some(owner_id))).await;
-        journal.record(&child, SessionEvent::AgentCompleted).await;
-        projection.rebuild(&journal.snapshot);
-        assert!(projection.agents[0].terminal());
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let root = app.root_agent().clone();
+        let _asked = ask(&session, "delegate");
+        let task = json!({"prompt": "work", "bg": true});
+        model
+            .turn()
+            .await
+            .end(vec![call("agent-0", "agent", task, 0)]);
+        // The root goes on beside its background child, and notes its completion.
+        let mut turns = [model.turn().await, model.turn().await];
+        if turns[0].context != ContextId::from(&root) {
+            turns.swap(0, 1);
+        }
+        let [root_turn, child_turn] = turns;
+        root_turn.answer("waiting");
+        let agent_completed = |event: &SessionEvent| matches!(event, SessionEvent::AgentCompleted);
+        let settled = |answers| {
+            let root = &root;
+            move |app: &App| {
+                count(&app.snapshot, answered) == answers
+                    && activity(&app.snapshot, root) == Some(&AgentActivity::Idle)
+            }
+        };
+        observe_until(&mut app, settled(1)).await;
+        child_turn.answer("done");
+        model.turn().await.answer("noted");
+        observe_until(&mut app, settled(3)).await;
+        assert!(recorded(&app.snapshot, agent_completed));
+        let child = children(&app.snapshot).remove(0);
+        let mut projection = Projection::new(&app.snapshot);
+        let index = projection
+            .agents
+            .iter()
+            .position(|agent| agent.id == child)
+            .unwrap();
+        assert!(projection.agents[index].terminal());
         assert!(!projection.has_active_children());
-        assert_eq!(projection.visible(&root).count(), 1);
-        let initial = projection.agents[0].lifecycle;
+        let visible = |projection: &Projection, selected: &AgentId| {
+            let mut visible = projection.visible(selected);
+            visible.any(|visible| visible == index)
+        };
+        assert!(visible(&projection, &root));
+        let initial = projection.agents[index].lifecycle;
         projection.complete_agent(&child);
-        assert_eq!(projection.agents[0].lifecycle, initial);
-        projection.agents[0].lifecycle = expired_grace();
+        assert_eq!(projection.agents[index].lifecycle, initial);
+        projection.agents[index].lifecycle = expired_grace();
         assert!(projection.retire_completed_grace());
         assert!(!projection.retire_completed_grace());
-        assert_eq!(projection.visible(&root).count(), 0);
-        assert_eq!(projection.visible(&child.child(2)).count(), 1);
-        // Ordinary activity cannot reopen a completed agent with a waiting owner.
-        journal.snapshot.activity.insert(
+        assert!(!visible(&projection, &root));
+        // A retired agent stays in the tree while a descendant is selected.
+        assert!(visible(&projection, &child.child(2)));
+        // Ordinary activity cannot reopen a completed agent.
+        app.snapshot.activity.insert(
             child.clone(),
             ObservedActivity {
                 state: AgentActivity::Working,
                 since: 0,
             },
         );
-        projection.rebuild(&journal.snapshot);
-        assert!(projection.agents[0].terminal());
-        journal
-            .record(&child, changed(1, JobTransition::Running))
-            .await;
-        projection.rebuild(&journal.snapshot);
-        assert!(!projection.agents[0].terminal());
-        assert!(projection.has_active_children());
-        journal.record(&root, finished(1)).await;
-        projection.rebuild(&journal.snapshot);
-        assert!(projection.agents[0].terminal());
-        // Explicit repeated completion, unlike owner reconciliation, renews grace.
-        projection.complete_agent(&child);
-        assert_eq!(projection.visible(&root).count(), 1);
-        // A retained child resumes under its finished owner job, which is open work.
-        journal
-            .record(&child, changed(1, JobTransition::Running))
-            .await;
-        projection.rebuild(&journal.snapshot);
-        assert!(projection.has_open_jobs());
-        let owner = projection.status(&agent(root), &journal.snapshot);
-        assert_eq!(owner, AgentDisplayState::Waiting(WaitReason::Child));
+        projection.rebuild(&app.snapshot);
+        assert!(projection.agents[index].terminal());
+        let owner = projection.agents[index].owner.unwrap();
+        answer_child(&session, owner, "'more'").await;
+        let running = job_state(owner, JobTransition::Running);
+        observe_until(&mut app, |app| count(&app.snapshot, &running) == 2).await;
+        let sent = observe_find(&mut app, |app| job_for(app, "script")).await;
+        observe_record(&mut app, job_finished(sent)).await;
+        (app.snapshot.jobs.values()).for_each(|job| projection.observe_job(job));
+        projection.rebuild(&app.snapshot);
+        assert!(!projection.agents[index].terminal());
+        assert!(projection.has_active_children() && open_jobs(&app.snapshot));
+        let waiting = projection.status(&agent(&projection, &root), &app.snapshot);
+        assert_eq!(waiting, AgentDisplayState::Waiting(WaitReason::Child));
+
+        next_turn(&mut model, &child).await.answer("done again");
+        observe_until(&mut app, |app| count(&app.snapshot, agent_completed) == 2).await;
+        (app.snapshot.jobs.values()).for_each(|job| projection.observe_job(job));
+        projection.rebuild(&app.snapshot);
+        assert!(projection.agents[index].terminal());
+        assert!(visible(&projection, &root));
     }
 
     fn expired_grace() -> AgentLifecycle {

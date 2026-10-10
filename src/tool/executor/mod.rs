@@ -5,8 +5,8 @@ mod planning;
 mod results;
 
 pub use results::ExecutionResult;
-pub(crate) use results::StartedExecution;
 pub(crate) use results::failure_response;
+pub(crate) use results::{Reported, StartedExecution};
 
 use serde_json::Value;
 use std::{path::PathBuf, sync::Arc};
@@ -323,27 +323,47 @@ impl ToolExecutor {
         Ok(CreatedInvocation { kind, plan, lease })
     }
 
-    /// Authorize, launch and collect a created invocation.
+    /// Authorize, launch and collect a created invocation for the host,
+    /// acknowledging what its result reports as it returns: the host journals
+    /// no result to acknowledge it with.
     pub(crate) async fn run(
         &self,
         created: CreatedInvocation,
     ) -> Result<ExecutionResult, ToolError> {
-        let CreatedInvocation { kind, plan, lease } = created;
-        let result_policy = plan.result_policy;
-        let fallback = prepare_fallback(&plan);
-        let started = self
-            .start(plan, lease)
-            .await
-            .map_err(|error| error.or(fallback))?;
-        match kind {
-            InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
-                self.collect_model_started(started).await
+        let Reported {
+            outcome,
+            acknowledges,
+        } = self.run_reported(created).await;
+        let acknowledged = self.shared.jobs.acknowledge(acknowledges);
+        acknowledged.await.map_err(job_error)?;
+        outcome
+    }
+
+    /// Authorize, launch and collect a created invocation, with the delivery
+    /// its result reports for the caller to acknowledge with its record. Boxed,
+    /// like `create`, so callers prove the run `Send` at this boundary.
+    pub(crate) fn run_reported(
+        &self,
+        created: CreatedInvocation,
+    ) -> futures_util::future::BoxFuture<'_, Reported> {
+        Box::pin(async move {
+            let CreatedInvocation { kind, plan, lease } = created;
+            let result_policy = plan.result_policy;
+            let fallback = prepare_fallback(&plan);
+            let started = match self.start(plan, lease).await {
+                Ok(started) => started,
+                Err(error) => return Err(error.or(fallback)).into(),
+            };
+            match kind {
+                InvocationKind::Model if result_policy != super::ToolResultPolicy::JobView => {
+                    self.collect_model_started(started).await
+                }
+                InvocationKind::Model | InvocationKind::Script => {
+                    self.collect_full_view_started(started, result_policy).await
+                }
+                InvocationKind::Host => self.collect_started(started).await,
             }
-            InvocationKind::Model | InvocationKind::Script => {
-                self.collect_full_view_started(started, result_policy).await
-            }
-            InvocationKind::Host => self.collect_started(started).await,
-        }
+        })
     }
 }
 

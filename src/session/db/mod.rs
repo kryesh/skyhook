@@ -14,7 +14,6 @@ use crate::{
     session::{MessageSeq, RecordSeq, RequestSeq},
 };
 
-mod approval;
 mod contract;
 mod decode;
 mod diagnostic;
@@ -27,25 +26,19 @@ mod state;
 
 pub(super) use decode::{decode_records, u64_of};
 pub(super) use encode::Encoder;
-pub(crate) use output::{CaptureExtent, CaptureRow};
+pub(crate) use output::{CaptureExtent, CaptureRow, OffloadedCapture, OutputRows};
 pub use state::{SessionSummary, SessionTitle};
-pub(super) use state::{stopped_turn, summary, title};
+pub(super) use state::{summary, title};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 20;
+pub(super) const USER_VERSION: i64 = 21;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.
 const JOURNAL_SIZE_LIMIT: u64 = 64 * 1024 * 1024;
-/// Payload tables outside the append-only ledger: blob writes and output upserts.
-const MUTABLE_TABLES: [&str; 6] = [
-    "blob",
-    "job_output",
-    "job_capture",
-    "job_capture_chunk",
-    "job_output_field",
-    "job_field_presentation",
-];
+/// Payload tables outside the append-only ledger: blobs, and captures, which stream
+/// before the output that references them is saved with its finish.
+const MUTABLE_TABLES: [&str; 3] = ["blob", "job_capture", "job_capture_chunk"];
 
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -309,7 +302,7 @@ impl Dictionaries<'_> {
             target::{SshAuth, TargetSource},
             tool::{
                 diagnostic::{Effects, IoKind, Operation, PathRole},
-                policy::{ApprovalCoverage, Capability, ResourceKind},
+                policy::Capability,
             },
         };
         self.names("capability", &Capability::ALL)?;
@@ -336,7 +329,13 @@ impl Dictionaries<'_> {
             ),
             (
                 "delivery_kind",
-                &[E::JobClaimed, E::JobInjected, E::JobMessageDelivered],
+                &[
+                    E::JobClaimed,
+                    E::JobReleased,
+                    E::JobMessageReleased,
+                    E::JobInjected,
+                    E::JobMessageDelivered,
+                ],
             ),
         ] {
             self.names(table, kinds)?;
@@ -388,10 +387,6 @@ impl Dictionaries<'_> {
         )?;
         self.names("diagnostic_io_kind", &IoKind::ALL)?;
         self.names("diagnostic_path_role", &PathRole::ALL)?;
-        self.names("approval_coverage", &ApprovalCoverage::ALL)?;
-        self.flagged("resource_kind", ["target"], &ResourceKind::ALL, |kind| {
-            [approval::targeted(kind)]
-        })?;
         self.flagged("job_state", ["terminal"], &JobState::ALL, |state| {
             [state.is_terminal()]
         })?;
@@ -902,8 +897,13 @@ mod tests {
             images: Vec::new(),
         };
         let state = |state| SessionEvent::JobStateChanged { job, state };
-        let generation =
-            |fixture: &Fixture| super::output::generation(&fixture.db, job.get()).unwrap();
+        let generation = |fixture: &Fixture| {
+            let latest = "SELECT max(generation) FROM job_run WHERE job = ?1";
+            let latest = fixture
+                .db
+                .query_row(latest, params![job.get()], |row| Ok(row.get::<i64>(0)?));
+            latest.unwrap().unwrap()
+        };
         for (event, expected) in [
             (state(JobTransition::Running), 0),
             (state(JobTransition::WaitingInput), 0),
@@ -921,20 +921,17 @@ mod tests {
         }
     }
 
-    /// Reopening a session, and closing it, which interrupts its agents, leave its
-    /// last activity where it was; a message moves it on.
+    /// Closing a session, which interrupts its agents, leaves its last activity
+    /// where it was; a message moves it on.
     #[test]
-    fn last_activity_ignores_reopening_and_closing() {
+    fn last_activity_ignores_closing() {
         let mut fixture = Fixture::new();
         let root = fixture.start("/w");
         let text = "prompt".into();
         let message = SessionEvent::MessageCommitted {
             message: Message::User(vec![UserPart::Text { text }]),
         };
-        let (reopened, interrupted) = (
-            SessionEvent::SessionReopened,
-            SessionEvent::AgentInterrupted,
-        );
+        let interrupted = SessionEvent::AgentInterrupted;
         let mut last_after = |events: Vec<SessionEvent>, activity: usize| {
             let events = events.into_iter().map(|event| (root.clone(), event));
             let sequences = fixture.commit(events.collect()).unwrap();
@@ -948,8 +945,8 @@ mod tests {
             assert_eq!(last, at(activity));
             last
         };
-        let before = last_after(vec![message.clone(), reopened.clone(), interrupted], 0);
-        let after = last_after(vec![reopened, message], 1);
+        let before = last_after(vec![message.clone(), interrupted.clone()], 0);
+        let after = last_after(vec![interrupted, message], 1);
         assert!(after > before);
     }
 }

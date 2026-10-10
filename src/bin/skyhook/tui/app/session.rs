@@ -176,15 +176,11 @@ impl App {
     pub fn peer(&self, key: SlotKey, current: bool) -> Peer {
         let root = self.root_agent();
         let agent = self.projection.agents.iter().find(|a| &a.id == root);
-        let mut records = self.snapshot.records.values().rev();
-        let activity = records.find(|record| record.event.is_activity());
+        let activity = EventRecord::last_activity(self.snapshot.records.values());
         Peer {
             key,
             session: match (self.session_id(), activity) {
-                (Some(id), Some(record)) => PeerSession::Open {
-                    id,
-                    last: record.timestamp_millis,
-                },
+                (Some(id), Some(last)) => PeerSession::Open { id, last },
                 (Some(id), None) => PeerSession::Started(id),
                 (None, _) => PeerSession::Draft,
             },
@@ -263,26 +259,5 @@ mod tests {
         click(&mut app, title);
         assert!(renaming(&app));
         assert_eq!(app.prompt_input().editor.text(), "Renamed");
-    }
-
-    /// Reopening a session, and closing it, which interrupts its agents, are not
-    /// the activity the session list orders by.
-    #[tokio::test]
-    async fn peer_last_activity_ignores_reopening_and_closing() {
-        let (_root, mut app) = fixture().await;
-        let last = |app: &App| match app.peer(SlotKey::default(), true).session {
-            PeerSession::Open { last, .. } => last,
-            session => panic!("{session:?}"),
-        };
-        // Observed history dates from the epoch, so anything journaled now is later.
-        for record in app.snapshot.records.values_mut() {
-            record.timestamp_millis = 0;
-        }
-        push_record(&mut app, SessionEvent::SessionReopened).await;
-        push_record(&mut app, SessionEvent::AgentInterrupted).await;
-        assert_eq!(last(&app), 0);
-        let message = "working".into();
-        push_record(&mut app, SessionEvent::Status { message }).await;
-        assert!(last(&app) > 0);
     }
 }

@@ -1,20 +1,23 @@
-//! Historical job notifications, independent of the latest job state.
+//! Job notifications as the model received them, headed by the job's current state.
 
 use super::super::tool_view::{Document, Hints, Role, Run};
 use super::jobs::{HEADER_DETAIL, state_name, state_role};
-use super::{Entry, EntryKey, Projection, View, clean};
+use super::{Entry, EntryKey, View, clean};
 use crate::text::brief;
 use serde_json::Value;
+use skyhook::agent::ObservationSnapshot;
 use skyhook::job::JobRole;
 use skyhook::session::{JobEvent, RecordSeq};
 
 /// Show the events where the model received them, using their historical payload
-/// rather than the job's latest output (the same job may have since resumed).
+/// rather than the job's latest output (the same job may have since resumed). A
+/// job card's header shows the job's current state, so a question it asked reads
+/// as answered once the job moves on.
 pub(super) fn job_event_entries(
     record: RecordSeq,
     block: usize,
     events: &[JobEvent],
-    projection: &Projection,
+    snapshot: &ObservationSnapshot,
     view: &View,
     all: bool,
 ) -> Vec<Entry> {
@@ -37,15 +40,13 @@ pub(super) fn job_event_entries(
             let mut body = open.then(Document::default);
             match event {
                 JobEvent::Message(message) => {
-                    let job = projection.jobs().get(&message.id);
+                    let job = snapshot.jobs.get(&message.id);
                     let tool = job.map_or(JobRole::Agent.as_str(), |job| job.tool.as_str());
                     header.push(Run::new(tool, Role::ToolName));
                     header.push(Run::new(format!(" #{}", message.id), Role::Muted));
-                    let name = message
-                        .name
-                        .as_ref()
-                        .map(|name| name.as_str())
-                        .or_else(|| job.and_then(|job| job.name.as_deref()));
+                    let name = (message.name.as_ref())
+                        .or_else(|| job.and_then(|job| job.name.as_ref()))
+                        .map(|name| name.as_str());
                     if let Some(name) = name {
                         header.push(Run::new(" · ", Role::Muted));
                         header.push(Run::new(brief(&clean(name), HEADER_DETAIL), Role::Plain));
@@ -62,12 +63,12 @@ pub(super) fn job_event_entries(
                 }
                 JobEvent::Job(job_view) => {
                     let id = job_view.id();
-                    let job = id.and_then(|id| projection.jobs().get(&id));
+                    let job = id.and_then(|id| snapshot.jobs.get(&id));
                     let tool = job_view
                         .tool()
                         .or_else(|| job.map(|job| job.tool.as_str()))
                         .unwrap_or("job");
-                    let state = job_view.state();
+                    let state = job.map_or(job_view.state(), |job| job.state);
                     header.push(Run::new(tool, Role::ToolName));
                     header.push(Run::new(
                         id.map_or(String::new(), |id| format!(" #{id}")),
@@ -77,7 +78,7 @@ pub(super) fn job_event_entries(
                     header.push(Run::new(state_name(state), state_role(state)));
                     if let Some(body) = &mut body {
                         body.line("Notification received by model", Role::Muted);
-                        let args = job.map_or(&Value::Null, |job| &job.args);
+                        let args = job.map_or(&Value::Null, |job| &job.arguments);
                         body.output(Hints::new(tool, args), Some(job_view), &[]);
                     }
                 }
@@ -89,29 +90,42 @@ pub(super) fn job_event_entries(
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{Journal, created, finished};
     use super::*;
+    use crate::tui::app::played::{
+        answer_child, asking_child, job_finished, job_of_call, observe_find, observe_record,
+        played_fixture, reached,
+    };
     use crate::tui::model::Surface;
-    use skyhook::execution::ExecutionLocation;
-    use skyhook::session::{RecordSeq, SessionEvent};
+    use serde_json::json;
+    use skyhook::job::JobTransition;
+    use skyhook::session::RecordSeq;
 
-    fn events(events: &[JobEvent], projection: &Projection, view: &View, all: bool) -> Vec<Entry> {
-        job_event_entries(RecordSeq::default(), 0, events, projection, view, all)
+    fn events(
+        events: &[JobEvent],
+        snapshot: &ObservationSnapshot,
+        view: &View,
+        all: bool,
+    ) -> Vec<Entry> {
+        job_event_entries(RecordSeq::default(), 0, events, snapshot, view, all)
     }
 
     #[tokio::test]
     async fn intermediate_agent_messages_are_historical_expandable_job_events() {
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let task = json!({"prompt": "ask", "name": "current-name"});
+        asking_child(&session, &mut model, task).await;
+        let job = observe_find(&mut app, |app| job_of_call(&app.snapshot, "agent-0")).await;
+        reached(&mut app, job, JobTransition::WaitingInput).await;
         let message = "Both reviewer gaps are fixed.\nChecking \"native\" replay — next.";
         let reply = [JobEvent::Message(skyhook::job::AgentMessage {
-            id: skyhook::identity::JobId::new(253).unwrap(),
+            id: job,
             name: Some("implement-native-replay".parse().unwrap()),
             message: RecordSeq::default().message(),
             text: message.into(),
         })];
-        let (mut journal, mut projection) = (Journal::new().await, Projection::default());
-        let agent = journal.agent();
         let mut view = View::default();
-        let collapsed = events(&reply, &projection, &view, false);
+        let unknown = ObservationSnapshot::default();
+        let collapsed = events(&reply, &unknown, &view, false);
         assert_eq!(collapsed.len(), 1);
         let card = &collapsed[0];
         assert_eq!(
@@ -124,31 +138,43 @@ mod tests {
             event: 0,
         };
         assert_eq!(card.key(), &key);
-        let header = "Job event · agent #253 · implement-native-replay · message #0";
-        assert!(card.text().contains(header));
+        let header = format!("Job event · agent #{job} · implement-native-replay · message #0");
+        assert!(card.text().contains(&header));
         assert!(!card.text().contains("skyhook_job_events") && !card.text().contains(message));
         view.set_expanded(key.clone(), true);
-        let expanded = events(&reply, &projection, &view, false);
+        let expanded = events(&reply, &unknown, &view, false);
         assert!(expanded[0].document().is_some());
         let expanded = expanded[0].text();
         assert!(expanded.contains(message));
         assert!(!expanded.contains("<skyhook_") && !expanded.contains("\\\"text\\\""));
 
-        // A later terminal job snapshot must not relabel or replace the historical message.
-        let mut created = created(253, "agent", JobRole::Agent);
-        if let SessionEvent::JobCreated { name, location, .. } = &mut created {
-            *name = Some("current-name".parse().unwrap());
-            *location = ExecutionLocation::named("host".parse().unwrap(), ".".into());
-        }
-        journal.record(&agent, created).await;
-        journal.record(&agent, finished(253)).await;
-        projection.rebuild(&journal.snapshot);
-        let after_completion = events(&reply, &projection, &view, false);
+        // A job card is headed by the job's current state over the question it asked.
+        let question = json!({"id": job, "state": "waiting_input",
+            "presentation": {"question": {"questions": [{"id": "pick", "prompt": "Which one?"}]}}});
+        let question = [JobEvent::Job(serde_json::from_value(question).unwrap())];
+        let headed = |snapshot: &ObservationSnapshot, state: &str| {
+            let text = events(&question, snapshot, &view, false)[0]
+                .text()
+                .to_owned();
+            assert!(
+                text.contains(&format!("agent #{job} · {state}\n")),
+                "{text}"
+            );
+            assert!(text.contains("Which one?"));
+        };
+        headed(&app.snapshot, "Waiting for input");
+        answer_child(&session, job, "{pick: 'this'}").await;
+        model.turn().await.answer("done");
+        observe_record(&mut app, job_finished(job)).await;
+        headed(&app.snapshot, "Completed");
+        // Its terminal snapshot, under another name, must not relabel or replace
+        // the historical message.
+        let after_completion = events(&reply, &app.snapshot, &view, false);
         assert_eq!(after_completion[0].text(), expanded);
         assert!(after_completion[0].job_id().is_none());
         view.set_expanded(key, false);
         assert!(
-            events(&reply, &projection, &view, true)[0]
+            events(&reply, &app.snapshot, &view, true)[0]
                 .document()
                 .is_none()
         );

@@ -2,7 +2,7 @@
 use chrono::Local;
 
 use crate::{
-    agent::{TodoItem, todo::TodoStore},
+    agent::TodoItem,
     execution::ExecutionLocation,
     identity::AgentId,
     job::JobManager,
@@ -10,22 +10,21 @@ use crate::{
     tool::policy::CapabilitySet,
 };
 
-pub(super) async fn runtime_state_content(
+pub(super) fn runtime_state_content(
     jobs: &JobManager,
-    todos: &TodoStore,
+    store: &crate::session::SessionStore,
     agent: &AgentId,
     capabilities: &CapabilitySet,
     location: &ExecutionLocation,
 ) -> UserPart {
-    let items = todos
-        .inspect(agent, None)
-        .await
+    let items = store
+        .inspect_todos(agent, None)
         .expect("own todo list is always readable");
-    runtime_state_with_todos(jobs, agent, capabilities, items, location).await
+    runtime_state_with_todos(jobs, agent, capabilities, items, location)
 }
 
 /// Preview a candidate compaction's state without publishing its todos.
-pub(super) async fn runtime_state_with_todos(
+pub(super) fn runtime_state_with_todos(
     jobs: &JobManager,
     agent: &AgentId,
     capabilities: &CapabilitySet,
@@ -33,9 +32,7 @@ pub(super) async fn runtime_state_with_todos(
     location: &ExecutionLocation,
 ) -> UserPart {
     let now = Local::now();
-    let jobs = jobs
-        .active_states(agent, capabilities, now.timestamp_millis())
-        .await;
+    let jobs = jobs.active_states(agent, capabilities, now.timestamp_millis());
     UserPart::State {
         state: RuntimeState {
             date: now.format("%Y-%m-%d").to_string(),

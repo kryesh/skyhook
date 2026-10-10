@@ -67,6 +67,13 @@ pub(crate) enum OperationError {
     Attachment(String),
 }
 
+impl OperationError {
+    /// Whether the session's journal failed, which stopped the session.
+    pub(crate) fn journal_failed(&self) -> bool {
+        matches!(self, Self::Harness(error) if error.journal_failed())
+    }
+}
+
 /// Read the images named on the command line.
 pub(crate) async fn read_images(
     workspace: &Path,

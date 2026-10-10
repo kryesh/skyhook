@@ -134,7 +134,6 @@ stored_enum! {
         ModelHidden { tool: text } = "model_hidden",
         ScriptUnavailable { tool: text } = "script_unavailable",
         UnknownJob { job: job } = "unknown_job",
-        JobNotTerminal { job: job } = "job_not_terminal",
         JobAlreadyTerminal { job: job } = "job_already_terminal",
     }
 }
