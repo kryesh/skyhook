@@ -470,8 +470,11 @@ impl JobFacts {
         }
     }
 
-    pub(super) fn waiting(&self) -> bool {
-        self.question().is_some()
+    /// Waiting on a question for its owner to see. An ask job's question is the
+    /// owner's own, answered by the host or the owner's parent, so only its answer
+    /// is delivered.
+    pub(super) fn asks_owner(&self) -> bool {
+        self.question().is_some() && !matches!(self.role, RoleState::Question)
     }
 
     /// Interrupted with a handler that can restart it.
@@ -526,7 +529,7 @@ impl JobFacts {
     pub(super) fn deliverable(&self) -> bool {
         // Keep parent waits pending across a retryable interruption. Snapshots
         // still expose the interrupted state to the user.
-        !self.suspended() && (self.end().is_some() || self.waiting())
+        !self.suspended() && (self.end().is_some() || self.asks_owner())
     }
 
     /// The pending delivery a read of this entry presents.

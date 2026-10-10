@@ -713,7 +713,7 @@ pub(crate) mod tests {
         ) -> Result<Hydrated, JobError> {
             let ready = |entry: &JobFacts| {
                 !entry.suspended()
-                    && (entry.end().is_some() || entry.waiting() && entry.unacknowledged())
+                    && (entry.end().is_some() || entry.asks_owner() && entry.unacknowledged())
             };
             let until = self.until_job(id, ready);
             let (envelope, presented) = match timeout {

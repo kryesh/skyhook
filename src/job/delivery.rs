@@ -415,6 +415,24 @@ mod tests {
         }
     }
 
+    /// An ask job's question is its owner's own: only the answer is delivered.
+    #[tokio::test]
+    async fn an_ask_jobs_question_is_not_delivered_to_its_owner() {
+        let (_root, manager, owner) = crate::job::tests::runtime().await;
+        let spec = JobSpec {
+            background: true,
+            role: JobRole::Question,
+            ..JobSpec::test(owner.clone(), "ask")
+        };
+        let job = manager.test_running(spec).await.into_test_id();
+        let question = crate::job::tests::question("choose");
+        manager.request_input(job, question).await.unwrap();
+        assert_pending(&manager, &owner, false, "asking");
+        manager.resume_input(job).await.unwrap();
+        manager.test_finish(job, serde_json::json!("chosen")).await;
+        assert_pending(&manager, &owner, true, "answered");
+    }
+
     /// A read acknowledges only the delivery it showed: what replaced it is still
     /// delivered, whether an outcome or another question, or a restart's
     /// completion replacing the completion it read.
