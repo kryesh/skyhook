@@ -159,8 +159,8 @@ impl ToolExecutor {
         } else {
             StartedExecution::Foreground(job)
         };
-        worker
-            .start_supervised(async move {
+        worker.launch(
+            async move {
                 let cancellation = context.cancellation_token();
                 let fallback =
                     PartialContext::new(Operation::Execute, Subject::Tool(tool.name().to_owned()))
@@ -194,8 +194,9 @@ impl ToolExecutor {
                     crate::tool::ToolResultPolicy::Nothing => outcome.without_result(),
                     _ => outcome,
                 }
-            })
-            .map_err(job_error)?;
+            },
+            "tool handler panicked",
+        );
         Ok(started)
     }
 

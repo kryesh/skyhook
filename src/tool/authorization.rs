@@ -370,7 +370,7 @@ impl AuthorizationCoordinator {
             permissions,
             arguments,
         };
-        async move {
+        let decided = async move {
             match policy.authorize(request).await {
                 PolicyDecision::Deny { reason } => Err(AuthorizationError::Denied(reason)),
                 PolicyDecision::Allow { grants } => {
@@ -386,8 +386,13 @@ impl AuthorizationCoordinator {
                     Ok(grants)
                 }
             }
-        }
-        .boxed()
+        };
+        // A policy that panics fails the decision for every call sharing it,
+        // rather than unwinding the waiter that happens to poll it.
+        let decided = std::panic::AssertUnwindSafe(decided).catch_unwind();
+        decided
+            .map(|decided| decided.unwrap_or(Err(AuthorizationError::PolicyFailed)))
+            .boxed()
     }
 
     async fn wait(
@@ -503,6 +508,49 @@ mod tests {
             }
             assert!(asked.try_recv().is_err());
         }
+    }
+
+    /// Panics once released.
+    struct PanickingPolicy(tokio::sync::mpsc::UnboundedSender<tokio::sync::oneshot::Sender<()>>);
+
+    impl Policy for PanickingPolicy {
+        fn authorize(&self, _: AuthorizationRequest) -> super::super::policy::PolicyFuture<'_> {
+            let (release, released) = tokio::sync::oneshot::channel();
+            self.0.send(release).unwrap();
+            Box::pin(async move {
+                let _ = released.await;
+                panic!("policy panicked")
+            })
+        }
+    }
+
+    /// A policy that panics fails its one decision for every call sharing it.
+    #[tokio::test]
+    async fn a_panicking_policy_fails_every_call_waiting_on_it() {
+        let (prompts, mut asked) = tokio::sync::mpsc::unbounded_channel();
+        let coordinator = AuthorizationCoordinator::new(Arc::new(PanickingPolicy(prompts)));
+        let (subject, resource) = (
+            subject(CancellationToken::new()),
+            ResourceId::session("one"),
+        );
+        let mut asking = Box::pin(authorize(&coordinator, &subject, &resource));
+        let mut joined = Box::pin(authorize(&coordinator, &subject, &resource));
+        assert!(futures_util::poll!(&mut asking).is_pending());
+        assert!(futures_util::poll!(&mut joined).is_pending());
+        crate::tests::bounded(asked.recv())
+            .await
+            .unwrap()
+            .send(())
+            .unwrap();
+        let failed = crate::tests::bounded(futures_util::future::join(asking, joined)).await;
+        assert!(matches!(
+            failed,
+            (
+                Err(AuthorizationError::PolicyFailed),
+                Err(AuthorizationError::PolicyFailed)
+            )
+        ));
+        assert!(asked.try_recv().is_err());
     }
 
     #[test]

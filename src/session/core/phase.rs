@@ -183,10 +183,9 @@ mod tests {
     /// all but activate; one shutting down only records how its running work
     /// ends; a closed one only shuts down or closes, staying closed. Only a
     /// running session that goes on running dates what it journals now, the rest
-    /// at their last activity. A refused command journals nothing and leaves the
-    /// phase as it was.
-    #[tokio::test]
-    async fn each_phase_admits_its_commands_and_a_refusal_journals_nothing() {
+    /// at their last activity.
+    #[test]
+    fn each_phase_admits_its_commands() {
         use Command::*;
         let commands = [
             Activate,
@@ -200,48 +199,84 @@ mod tests {
             AgentExited,
             Journal,
             BeginShutdown,
+            Close,
         ];
         for phase in [Viewing, Running, ShuttingDown, Closed] {
             for command in commands {
-                let (_root, store, agent) = in_phase(&phase).await;
-                // Strictly later, so a record dated now would show.
-                let last = store.records().last().unwrap().timestamp_millis;
-                crate::tests::past(last).await;
-                let (admitted, next) = match (&phase, command) {
-                    (Viewing, Activate) | (Running, Activate) => (phase == Viewing, Running),
-                    (Viewing | Closed, BeginShutdown) => (true, Closed),
-                    (Running, BeginShutdown) => (true, ShuttingDown),
-                    (Running, _) => (true, Running),
-                    (ShuttingDown, Journal | BeginShutdown) => (true, ShuttingDown),
-                    _ => (false, phase.clone()),
-                };
-                let next = if admitted { next } else { phase.clone() };
-                let before = store.records().len();
-                let status = SessionEvent::Status {
-                    message: format!("{command:?}"),
-                };
-                // Closing journals nothing.
-                let entries = Vec::from_iter((next != Closed).then(|| (agent.clone(), status)));
-                let plan = move |_: &_| Ok::<_, SessionError>(Plan::journal(entries));
-                match store.commit(command, plan).await {
-                    Ok(()) => assert!(admitted, "{phase} admitted {command:?}"),
-                    Err(SessionError::Refused(refused)) => {
-                        assert!(!admitted && refused == phase, "{phase} refused {command:?}");
+                let expected = match (&phase, command) {
+                    (Viewing, Activate) => Some(Running),
+                    (_, Close) | (Viewing | Closed, BeginShutdown) => Some(Closed),
+                    (Running | ShuttingDown, BeginShutdown) | (ShuttingDown, Journal) => {
+                        Some(ShuttingDown)
                     }
-                    Err(error) => panic!("{phase} {command:?}: {error}"),
+                    (Running, Activate) => None,
+                    (Running, _) => Some(Running),
+                    _ => None,
+                };
+                match (phase.admits(command), expected) {
+                    (Ok((next, dated)), Some(expected)) => {
+                        assert_eq!(next, expected, "{phase} {command:?}");
+                        let now = phase == Running && next == Running;
+                        assert_eq!(matches!(dated, Dated::Now), now, "{phase} {command:?}");
+                    }
+                    (Err(SessionError::Refused(refused)), None) => assert_eq!(refused, phase),
+                    (admitted, _) => panic!("{phase} {command:?}: {admitted:?}"),
                 }
-                let records = store.records();
-                let journaled = admitted && next != Closed;
-                assert_eq!(records.len(), before + usize::from(journaled));
-                if journaled {
-                    let (new, earlier) = records.split_last().unwrap();
-                    let activity = earlier.iter().rev().find(|r| r.event.is_activity());
-                    let dated_now = new.timestamp_millis != activity.unwrap().timestamp_millis;
-                    let now = phase == Running && next == Running;
-                    assert_eq!(dated_now, now, "{phase} {command:?}");
-                }
-                assert_eq!(store.read(|state| state.phase.clone()), next);
             }
+        }
+    }
+
+    /// The store applies what the phase admits: an admitted command journals as
+    /// dated and moves the phase, closing journals nothing, and a refused command
+    /// journals nothing and leaves the phase as it was.
+    #[tokio::test]
+    async fn the_store_journals_what_its_phase_admits_and_nothing_it_refuses() {
+        use Command::*;
+        for (phase, command) in [
+            (Running, Submit),
+            (Viewing, Activate),
+            (ShuttingDown, Journal),
+            (Viewing, BeginShutdown),
+            (ShuttingDown, Submit),
+            (Closed, Journal),
+        ] {
+            let (_root, store, agent) = in_phase(&phase).await;
+            let admitted = phase.admits(command).ok();
+            let next = admitted
+                .as_ref()
+                .map_or(phase.clone(), |(next, _)| next.clone());
+            let journaled = admitted.is_some() && next != Closed;
+            if journaled {
+                // Strictly later, so a record dated now would show.
+                crate::tests::past(store.records().last().unwrap().timestamp_millis).await;
+            }
+            let before = store.records().len();
+            let status = SessionEvent::Status {
+                message: format!("{command:?}"),
+            };
+            // A refused command carries its entry, so a write would show.
+            let entries = Vec::from_iter((next != Closed).then(|| (agent.clone(), status)));
+            let plan = move |_: &_| Ok::<_, SessionError>(Plan::journal(entries));
+            match store.commit(command, plan).await {
+                Ok(()) => assert!(admitted.is_some(), "{phase} admitted {command:?}"),
+                Err(SessionError::Refused(refused)) => {
+                    assert!(
+                        admitted.is_none() && refused == phase,
+                        "{phase} {command:?}"
+                    );
+                }
+                Err(error) => panic!("{phase} {command:?}: {error}"),
+            }
+            let records = store.records();
+            assert_eq!(records.len(), before + usize::from(journaled));
+            if journaled {
+                let (new, earlier) = records.split_last().unwrap();
+                let activity = earlier.iter().rev().find(|r| r.event.is_activity());
+                let dated_now = new.timestamp_millis != activity.unwrap().timestamp_millis;
+                let now = matches!(admitted, Some((_, Dated::Now)));
+                assert_eq!(dated_now, now, "{phase} {command:?}");
+            }
+            assert_eq!(store.read(|state| state.phase.clone()), next);
         }
     }
 }

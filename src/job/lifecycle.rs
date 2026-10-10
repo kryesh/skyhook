@@ -153,9 +153,10 @@ impl JobManager {
     /// acknowledgement of what the job read, refused once a later invocation
     /// runs. An output that cannot be prepared stops the session.
     async fn publish(&self, claim: &FinishClaim, outcome: JobOutcome) -> Result<(), JobError> {
-        let FinishClaim(run @ Run(id, _)) = *claim;
+        let FinishClaim(run @ Run(id, invocation)) = *claim;
         let end = outcome.end();
         let (finish, output) = self.finished(run, outcome).await?;
+        let manager = self.clone();
         let finished = move |state: &CoreState| {
             let entry = state.jobs.entries.get(&id).ok_or(JobError::Unknown(id))?;
             (entry.ends(run, end).then_some(())).ok_or(JobError::AlreadyTerminal(id))?;
@@ -164,6 +165,14 @@ impl JobManager {
             let acknowledged = Plan::new(journaled, move |state, _| {
                 if let Some(entry) = state.jobs.entries.get_mut(&id) {
                     entry.reads.clear();
+                }
+                let attached = |handles: &mut JobHandles| {
+                    handles
+                        .task_abort
+                        .take_if(|(attached, _)| *attached == invocation)
+                };
+                if let Some((_, worker)) = manager.handles(id, attached) {
+                    worker.abort();
                 }
                 woken(state, id)
             });

@@ -40,7 +40,9 @@ discarded when its session is closed.
 
 `/retry` continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
-which agent is selected. Parents with pending waits stay in those waits.
+which agent is selected. Parents with pending waits stay in those waits. On a reopened session
+that has not run anything yet, `/retry` always starts it and continues whatever it left
+unfinished, or reports that there was nothing.
 Automatic model retries display the attempt number, a countdown to the next attempt, and the
 latest diagnostic in one error block. Partial output from the failed attempt clears when the next
 attempt starts; successful replies have no retry labels. Retries continue until success or

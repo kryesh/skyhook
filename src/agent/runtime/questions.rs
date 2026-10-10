@@ -829,7 +829,7 @@ mod tests {
             role: crate::job::JobRole::Question,
             ..JobSpec::test(session.root.clone(), "ask")
         };
-        let (context, _worker) = ask_context(&session, root.path(), spec()).await;
+        let (context, worker) = ask_context(&session, root.path(), spec()).await;
         let sibling = session.runtime.jobs.test_running(spec()).await;
         let questions = &session.runtime.questions;
         let script = (session.runtime.jobs)
@@ -839,7 +839,7 @@ mod tests {
             parent: Some(script.id()),
             ..spec()
         };
-        let (scripted, _scripted_worker) = ask_context(&session, root.path(), scripted).await;
+        let (scripted, scripted_worker) = ask_context(&session, root.path(), scripted).await;
         let scripted = questions.coordinate_question(scripted, question("scripted"));
         assert_eq!(bounded(scripted).await.unwrap(), json!("yes"));
         let mut asked = Box::pin(questions.coordinate_question(context, question("first")));
@@ -854,12 +854,14 @@ mod tests {
                 .get(&key)
                 .map(|entry| entry.1)
         };
-        let (dropped, _dropped_worker) = ask_context(&session, root.path(), spec()).await;
+        let (dropped, dropped_worker) = ask_context(&session, root.path(), spec()).await;
         let mut dropped = Box::pin(questions.coordinate_question(dropped, question("dropped")));
         pending_until(&mut dropped, async || joined() == Some(2)).await;
         drop(dropped);
         assert_eq!(joined(), Some(1));
+        // Its worker stops on the cancellation, as a cooperative one does.
         session.runtime.jobs.cancel(sibling.id()).await.unwrap();
+        drop(sibling);
         assert_eq!(bounded(asked).await.unwrap(), json!("yes"));
         assert_eq!(joined(), None);
         let presented = batches.lock().unwrap().clone();
@@ -867,6 +869,7 @@ mod tests {
             .map(|batch| batch.iter().map(|question| question.id.as_str()).collect())
             .collect();
         assert_eq!(ids, [["scripted"], ["first"]]);
+        drop((worker, scripted_worker, dropped_worker, script));
         shutdown_session(session).await;
     }
 

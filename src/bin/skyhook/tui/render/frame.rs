@@ -575,9 +575,9 @@ mod tests {
         app::{
             Work,
             played::{
-                Model, activity, ask, asking_child, call, committed, exchange, observe_find,
-                observe_record, observe_until, played_fixture, sleeping_script, spawn_children,
-                user,
+                Model, activity, answered, ask, asking_child, call, committed, exchange,
+                failing_call, observe_find, observe_record, observe_until, played_fixture,
+                recorded, sleeping_script, spawn_children, user,
             },
             tests::{fetch_output, fixture, job_named, run_script},
         },
@@ -631,14 +631,22 @@ mod tests {
                 let root = activity(&app.snapshot, app.root_agent());
                 !root.is_some_and(AgentActivity::is_busy)
             };
-            let job = observe_find(&mut app, |app| live(app).filter(|_| idle(app))).await;
+            let label = |job| format!(" · {name} · #{job}");
+            let shown = |app: &App, job| {
+                let mut entries = app.entries().iter();
+                entries.any(|entry| entry.text().contains(&label(job)))
+            };
+            let job = observe_find(&mut app, |app| {
+                live(app).filter(|&job| idle(app) && shown(app, job))
+            })
+            .await;
             app.tick_count = 0;
             let model::Timing::Since(since) = app.snapshot.jobs[&job].timing.into() else {
                 panic!("a live job counts from when it started");
             };
             app.clock = model::Clock::at(since + 12_400);
             let before = screen(&mut app);
-            let label = format!(" · {name} · #{job}");
+            let label = label(job);
             let y = (before.iter())
                 .position(|line| line.concat().contains(&label))
                 .unwrap();
@@ -757,12 +765,15 @@ mod tests {
 
     #[tokio::test]
     async fn request_headers_stay_outside_the_scrolling_rows() {
-        let (_root, mut app, mut model, _session) = played_fixture().await;
-        for _ in 0..30 {
-            reply(&mut app, &mut model, "done").await;
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let _asked = ask(&session, "question");
+        for index in 0..29 {
+            let failing = failing_call(&format!("call-{index}"));
+            model.turn().await.end(vec![failing]);
         }
+        model.turn().await.answer("done");
         app.tab = Tab::Requests;
-        app.refresh();
+        observe_until(&mut app, |app| recorded(&app.snapshot, answered)).await;
         for (width, header) in [(140, true), (40, false)] {
             let mut terminal = Terminal::new(TestBackend::new(width, 25)).unwrap();
             for scroll in [0, 5] {
@@ -920,7 +931,7 @@ mod tests {
     #[tokio::test]
     async fn composer_grows_to_half_the_body_without_shaping_a_childs_tree() {
         let (_root, mut app, mut model, _session) = played_fixture().await;
-        let (children, _turns) = spawn_children(&mut app, &mut model, 20).await;
+        let (children, _turns) = spawn_children(&mut app, &mut model, 12).await;
         app.editor.set("line\n".repeat(40));
         let mut terminal = Terminal::new(TestBackend::new(60, 40)).unwrap();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -931,6 +942,8 @@ mod tests {
         app.selected = children[0].clone();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let tree = app.tree_rect;
+        // More agents than rows: the layout, not the tree, sets its height.
+        assert!(tree.height - 2 < children.len() as u16 + 1);
         app.editor.clear();
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         assert_eq!(app.tree_rect, tree);

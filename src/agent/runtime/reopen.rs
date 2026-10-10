@@ -417,13 +417,16 @@ mod tests {
         // Reopen strictly later, so a repair dated now would show.
         crate::tests::past(last.timestamp_millis).await;
         let resumed = harness.resume_session(id).await.unwrap();
-        resumed.running().await.unwrap();
-        let records = resumed.runtime.store.records();
         let request = retrying.sequence.request();
         let cut = |attempt| RequestPhase::Interrupted {
             attempt,
             at: last.timestamp_millis,
         };
+        // Viewed, it already reads as the settlement leaves it.
+        let viewed = resumed.observe().snapshot.ledger;
+        assert_eq!(viewed.get(request).unwrap().phase, cut(Some(1)));
+        resumed.running().await.unwrap();
+        let records = resumed.runtime.store.records();
         assert_eq!(settled(&records, request), cut(Some(1)));
         assert_eq!(interrupted(&records), before + 1);
         let repairs = records.iter().filter(|record| {

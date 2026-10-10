@@ -15,23 +15,12 @@ use crate::{
 /// Context/validation recovery is bounded independently of transient retries.
 pub(super) const MAX_COMPACTION_ATTEMPTS: u8 = 3;
 /// Each validation retry waits this much longer than the one before.
-const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
+pub(super) const RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(100);
 
 mod checkpoint;
 mod retention;
 mod summary;
 use checkpoint::CompactionInput;
-
-pub(super) async fn retry_delay(
-    cancellation: &crate::job::CancellationToken,
-    attempt: u8,
-) -> Result<(), HarnessError> {
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => Err(HarnessError::Interrupted),
-        () = tokio::time::sleep(RETRY_BACKOFF * u32::from(attempt)) => Ok(()),
-    }
-}
 
 /// Scale estimates by the last provider-reported prompt size. A ratio, unlike an
 /// offset, stays valid when compaction shrinks the history.
@@ -152,11 +141,17 @@ impl SessionRuntime {
                         failure,
                         error: fault,
                     };
+                    // The backoff runs from the failure, however long its record takes to commit.
+                    let backoff = tokio::time::sleep(RETRY_BACKOFF * u32::from(attempt));
                     self.store.append(turn.agent.clone(), failed).await?;
                     if !retryable || attempt == MAX_COMPACTION_ATTEMPTS {
                         return Err(error);
                     }
-                    retry_delay(turn.cancellation, attempt).await?;
+                    tokio::select! {
+                        biased;
+                        () = turn.cancellation.cancelled() => return Err(HarnessError::Interrupted),
+                        () = backoff => {}
+                    }
                 }
             }
         }
@@ -174,8 +169,8 @@ mod tests {
     use super::{TokenMeter, summary_max_output};
     pub(super) use crate::agent::runtime::tests::{
         Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta, events, models,
-        provider_name, recoverable, response, set_root_turn, summary_json, test_builder, todo,
-        usage,
+        provider_name, recoverable, response, retrying, set_root_turn, summary_json, test_builder,
+        todo, usage,
     };
     use crate::agent::runtime::{
         HarnessError, SessionHandle, Turn, TurnContext, compaction, state,
@@ -458,10 +453,9 @@ mod tests {
                 .await
                 .unwrap();
             let before = project_history(&fixture.records(), agent);
-            let error = fixture
-                .compact(&CancellationToken::new())
-                .await
-                .unwrap_err();
+            let cancellation = CancellationToken::new();
+            let compacted = retrying(&fixture.session, fixture.compact(&cancellation));
+            let error = compacted.await.unwrap_err();
             assert_eq!(CompactionFault::from(&error).kind(), fault);
             let records = fixture.records();
             let faults = events!(&records, SessionEvent::CompactionFailed { failure, error }
@@ -515,10 +509,9 @@ mod tests {
                 set_root_turn(&fixture.session, Turn::Busy);
                 runtime.jobs.create(spec).await.unwrap().into_test_id();
             }
-            let error = fixture
-                .compact(&CancellationToken::new())
-                .await
-                .unwrap_err();
+            let cancellation = CancellationToken::new();
+            let compacted = retrying(&fixture.session, fixture.compact(&cancellation));
+            let error = compacted.await.unwrap_err();
             let failed = matches!(
                 error,
                 HarnessError::Session(crate::session::SessionError::JournalFailed(_))

@@ -433,4 +433,73 @@ mod tests {
         app.work(next_lifecycle(&mut rx).await);
         assert!(app.exit);
     }
+
+    /// What a failed journal cut short reads as stopped where it is already
+    /// shown, as its own update would show it: a job's card on the Jobs tab,
+    /// a request's row on the Requests tab, and a child its background work
+    /// kept alive after it answered as interrupted, out of the live tree.
+    #[tokio::test]
+    async fn a_failed_journal_stops_the_calls_it_cut_short() {
+        use super::super::played::{
+            answered, ask, call, children, count, observe_until, played_fixture,
+        };
+        use crate::tui::model::AgentDisplayState;
+        use serde_json::json;
+        use skyhook::identity::SessionId;
+        use skyhook::job::JobState;
+        use skyhook::provider::protocol::ContextId;
+        for tab in [model::Tab::Jobs, model::Tab::Requests] {
+            let (_root, mut app, mut played, session) = played_fixture().await;
+            app.tab = tab;
+            let root = app.root_agent().clone();
+            let _asked = ask(&session, "delegate");
+            let task = json!({"prompt": "work", "bg": true});
+            played
+                .turn()
+                .await
+                .end(vec![call("agent", "agent", task, 0)]);
+            // The root's next request stays open while its child answers.
+            let mut turns = [played.turn().await, played.turn().await];
+            if turns[0].context == ContextId::from(&root) {
+                turns.swap(0, 1);
+            }
+            let [child_turn, _turn] = turns;
+            let work = json!({"source": "await sleep(60000);", "bg": true});
+            child_turn.end(vec![call("work", "script", work, 0)]);
+            played.turn().await.answer("done");
+            let shown = |app: &App| {
+                let mut entries = app.entries().iter().rev();
+                entries.find_map(|entry| {
+                    let call = matches!(entry.key(), model::EntryKey::Request(_));
+                    (call || entry.job_id().is_some()).then_some(entry.timing)
+                })
+            };
+            // Folded as the host folds, so only what the update changed rebuilds.
+            observe_until(&mut app, |app| {
+                matches!(shown(app), Some(model::Timing::Since(_)))
+                    && count(&app.snapshot, answered) == 1
+            })
+            .await;
+            assert!(app.projection.has_active_children());
+            let foreign = AgentId::root(SessionId::generate().unwrap());
+            let refused = session.record_status(foreign, "elsewhere".into()).await;
+            assert!(refused.is_err());
+            observe_until(&mut app, |app| app.snapshot.phase.failure().is_some()).await;
+            let stopped = shown(&app);
+            assert!(
+                matches!(stopped, Some(model::Timing::Took { .. })),
+                "{tab:?}"
+            );
+            let child = children(&app.snapshot).remove(0);
+            let mut agents = app.projection.agents.iter();
+            let child = agents.find(|info| info.id == child).unwrap();
+            let interrupted = AgentDisplayState::Job(JobState::Interrupted);
+            assert_eq!(
+                app.projection.status(child, &app.snapshot),
+                interrupted,
+                "{tab:?}"
+            );
+            assert!(!app.projection.has_active_children(), "{tab:?}");
+        }
+    }
 }

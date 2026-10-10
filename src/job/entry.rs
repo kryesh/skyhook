@@ -592,7 +592,8 @@ pub(super) enum DeliveryState {
 pub(super) struct JobHandles {
     pub(super) input: mpsc::Sender<Value>,
     pub(super) cancellation: CancellationToken,
-    /// The worker of the invocation running it, which a forced abort stops.
+    /// The worker attached to the invocation running it, which a forced abort
+    /// or that invocation's finish stops.
     pub(super) task_abort: Option<(Invocation, AbortHandle)>,
     /// What restarts it once it ends, while the core records that it can.
     pub(super) resume: Option<Resume>,

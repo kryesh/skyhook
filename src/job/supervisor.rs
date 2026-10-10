@@ -8,7 +8,7 @@ use std::{
 };
 
 use tokio::{
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::{AbortHandle, JoinHandle},
 };
 
@@ -163,36 +163,34 @@ impl JobWorker {
         let _ = spawn_completion(jobs, run, async move { outcome }).await;
     }
 
-    pub(crate) fn start_supervised<F>(self, future: F) -> Result<(), JobError>
+    /// Start invocation `run`'s worker, attached to it in core order: refused
+    /// once that invocation has ended or a later one runs, and then the worker
+    /// never starts its body. The finish that commits aborts what its invocation
+    /// attached, so in either order no worker outlives its invocation.
+    pub(crate) fn launch<F>(self, future: F, panic_message: &'static str)
     where
         F: Future<Output: Into<JobOutcome> + Send> + Send + 'static,
     {
-        if self
-            .owned()
-            .0
-            .entry(self.run.0, |entry| entry.end().is_some())?
-        {
-            return Err(JobError::AlreadyTerminal(self.run.0));
-        }
-        self.launch(future, "tool handler panicked");
-        Ok(())
-    }
-
-    /// Start the worker of a job that has not ended, as a restart does where its
-    /// journaled running transition applies.
-    pub(super) fn launch<F>(self, future: F, panic_message: &'static str)
-    where
-        F: Future<Output: Into<JobOutcome> + Send> + Send + 'static,
-    {
-        let worker = WorkerGuard(self.owned().0.inner.supervisor.spawn(future));
-        let abort = worker.abort_handle();
-        let Run(id, invocation) = self.run;
-        (self.owned().0).handles(id, |handles| handles.task_abort = Some((invocation, abort)));
-        let run = self.run;
+        let run @ Run(id, invocation) = self.run;
         let (jobs, _) = self.into_owned();
+        let (attach, attached) = oneshot::channel();
+        let worker = WorkerGuard(jobs.inner.supervisor.spawn(async move {
+            attached.await.ok()?;
+            Some(future.await)
+        }));
+        let abort = worker.abort_handle();
+        let attaching = jobs.clone();
+        // A refused attach drops `attach`, ending the worker before its body.
+        jobs.inner.store.enqueue(move |state| {
+            let entry = state.jobs.entries.get(&id);
+            if entry.is_some_and(|entry| entry.invocation == invocation && entry.end().is_none()) {
+                attaching.handles(id, |handles| handles.task_abort = Some((invocation, abort)));
+                let _ = attach.send(());
+            }
+        });
         // No suspension point between relinquishing the permit and supervising.
         spawn_completion(jobs, run, async move {
-            match worker.join().await {
+            match worker.join().await.map(Option::flatten) {
                 Ok(Some(outcome)) => outcome.into(),
                 Ok(None) => ToolError::cancelled().into(),
                 Err(error) if error.is_cancelled() => ToolError::cancelled().into(),
@@ -332,7 +330,6 @@ mod tests {
         job::{JobError, JobId, JobManager, JobSpec, JobState},
         tool::{ToolOutput, policy::CapabilitySet},
     };
-    use tokio::sync::oneshot;
     async fn leased(tool: &str) -> (tempfile::TempDir, JobManager, JobLease, JobId) {
         let (root, jobs, agent) = crate::job::tests::runtime().await;
         let lease = jobs.create(JobSpec::test(agent, tool)).await.unwrap();
@@ -346,7 +343,8 @@ mod tests {
 
     /// Every startup obligation is consumed exactly once: abandonment at any
     /// stage cancels, explicit failure and supervised panics fail, and a job
-    /// finished underneath its lease can neither advance nor attach.
+    /// can neither advance once finished nor keep a worker running, whichever
+    /// of its finish and its worker's attachment comes first.
     #[tokio::test]
     async fn startup_obligations_settle_through_the_drained_owner() {
         for (tool, expected, error) in [
@@ -357,6 +355,7 @@ mod tests {
             ("panic", JobState::Failed, Some("tool handler panicked")),
             ("terminal", JobState::Completed, None),
             ("terminal-running", JobState::Completed, None),
+            ("finished-running", JobState::Completed, None),
         ] {
             let (_root, jobs, lease, id) = leased(tool).await;
             let cancellation = lease.cancellation_token();
@@ -371,9 +370,10 @@ mod tests {
                 }
                 "panic" => {
                     let (_input, worker) = lease.test_run().await.split();
-                    worker
-                        .start_supervised(async { panic!("handler panic") as JobOutcome })
-                        .unwrap();
+                    worker.launch(
+                        async { panic!("handler panic") as JobOutcome },
+                        "tool handler panicked",
+                    );
                 }
                 "terminal" => {
                     let approving = lease.await_approval().await.unwrap();
@@ -382,15 +382,24 @@ mod tests {
                     let running = approving.run().await;
                     assert!(matches!(running, Err(JobError::AlreadyTerminal(_))));
                 }
-                _ => {
+                "terminal-running" => {
                     let (_input, worker) = lease.test_run().await.split();
                     jobs.test_finish(id, serde_json::json!(42)).await;
-                    let output = async { Ok(ToolOutput::new(serde_json::json!(0))) };
-                    let started = worker.start_supervised(output);
-                    assert!(matches!(started, Err(JobError::AlreadyTerminal(_))));
+                    worker.launch(
+                        std::future::pending::<JobOutcome>(),
+                        "tool handler panicked",
+                    );
+                }
+                _ => {
+                    let (_input, worker) = lease.test_run().await.split();
+                    worker.launch(
+                        std::future::pending::<JobOutcome>(),
+                        "tool handler panicked",
+                    );
+                    jobs.test_finish(id, serde_json::json!(42)).await;
                 }
             }
-            jobs.supervisor().drain().await;
+            crate::tests::bounded(jobs.supervisor().drain()).await;
             let result = jobs.metadata(id).unwrap();
             assert_eq!(result.state, expected, "{tool}");
             if let Some(error) = error {
@@ -418,7 +427,7 @@ mod tests {
             released.await.unwrap();
             Ok(ToolOutput::new(serde_json::json!({"done": true})))
         };
-        worker.start_supervised(work).unwrap();
+        worker.launch(work, "tool handler panicked");
         let drain = jobs.supervisor().drain();
         tokio::pin!(drain);
         assert!(futures_util::poll!(&mut drain).is_pending());

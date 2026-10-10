@@ -14,7 +14,7 @@ pub use interaction::{
 };
 pub use observation::{
     AgentActivity, ContextUsage, Observation, ObservationSnapshot, ObservedActivity, ObservedEvent,
-    ObservedResponse, Settlement,
+    ObservedResponse, Settlement, StoppedReading,
 };
 pub use runtime::{
     ContinueOutcome, Harness, HarnessBuilder, QueuedPrompt, QueuedPromptCancellation,

@@ -106,7 +106,8 @@ mod tests {
             let steps = (0..3).map(|_| Step::new(cut(partial(), reason)));
             let fixture = Fixture::new(steps).await;
             fixture.add_history(20_000).await;
-            let error = fixture.compact(&CancellationToken::new()).await;
+            let error =
+                retrying(&fixture.session, fixture.compact(&CancellationToken::new())).await;
             assert_eq!(CompactionFault::from(&error.unwrap_err()), fault);
             assert_eq!(fixture.requests().len() - 1, attempts, "{reason:?}");
             let records = fixture.records();

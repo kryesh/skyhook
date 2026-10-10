@@ -270,6 +270,7 @@ mod tests {
         let profile = |model: &str| crate::tests::profile(model, true);
         let harness = HarnessBuilder::new(root.path())
             .session_root(root.path().join("sessions"))
+            .coalescing(wait::Coalescing::NONE)
             .provider(
                 provider_name("queue-test"),
                 tracking.clone(),

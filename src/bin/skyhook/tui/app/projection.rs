@@ -50,7 +50,8 @@ impl App {
             RuntimeEvent::TurnCompleted { .. } => (false, true, false),
             RuntimeEvent::Phase(_) => (false, true, true),
         };
-        self.snapshot.apply(event);
+        let stopped = self.snapshot.apply(event);
+        let records = self.projection.observe_stopped(stopped) || records;
         self.refresh_menu();
         self.deliver_queue();
         self.dirty |= repaint;

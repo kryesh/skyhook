@@ -155,14 +155,13 @@ impl App {
     }
 
     fn retry(&mut self) {
-        if self.start.is_creating()
-            || self.stopping
-            || !self
-                .snapshot
-                .activity
-                .values()
-                .any(|activity| activity.state.is_retryable())
-        {
+        // A viewed session reads its root as it closed; only activation, which
+        // continuing runs first, decides whether it resumes, as it does for
+        // deliveries pending at close.
+        let viewed = self.snapshot.phase == skyhook::session::SessionPhase::Viewing;
+        let mut activity = self.snapshot.activity.values();
+        let retryable = viewed || activity.any(|activity| activity.state.is_retryable());
+        if self.start.is_creating() || self.stopping || !retryable {
             self.notice("No failed or interrupted turns to retry");
             return;
         }
@@ -171,7 +170,7 @@ impl App {
         };
         // Only own a new root operation if the old one has already ended.
         // Resuming suspended children must leave a waiting parent alone.
-        let operation = if !self.operation && self.root_interrupted() {
+        let operation = if !self.operation && (viewed || self.root_interrupted()) {
             self.operation = true;
             Operation::Owned
         } else {
@@ -339,6 +338,39 @@ mod tests {
         assert_eq!(app.initial_input, initial_input);
         assert_eq!(app.snapshot.activity.get(&root), Some(&waiting));
         session.shutdown().await.unwrap();
+    }
+
+    /// On a viewed session /retry asks the runtime, which activates it and alone
+    /// knows whether anything resumes: here nothing does, and it says so.
+    #[tokio::test]
+    async fn retry_on_a_viewed_session_reaches_the_runtime() {
+        use crate::tui::app::observation::PreparedObservation;
+        use skyhook::session::SessionPhase;
+        let (_root, app, _model, session) = played_fixture().await;
+        session.close().await.unwrap();
+        let viewed = app.launch.create(Some(session.id())).await.unwrap();
+        let prepared = PreparedObservation::subscribe(viewed.clone());
+        let (tx, mut work) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = app.sibling(Some(prepared), app.launch.clone(), tx);
+        assert_eq!(app.snapshot.phase, SessionPhase::Viewing);
+        app.command(Command::Retry);
+        bounded(async {
+            loop {
+                match work.recv().await.unwrap() {
+                    Work::Continued { result, .. } => break assert!(result.is_ok()),
+                    work => app.work(work),
+                }
+            }
+        })
+        .await;
+        app.status.flush().await;
+        let nothing = "Nothing to continue: no retained turn is failed or interrupted";
+        let records = viewed.observe().snapshot.records;
+        assert!(records.values().any(|record| matches!(
+            &record.event,
+            SessionEvent::Status { message } if message == nothing
+        )));
+        viewed.shutdown().await.unwrap();
     }
 
     #[tokio::test]

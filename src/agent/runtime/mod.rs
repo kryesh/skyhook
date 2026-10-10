@@ -1244,13 +1244,18 @@ mod tests {
 
     /// Let the backoff a retried failure `record` waits out elapse.
     pub(super) async fn elapse_backoff(record: &EventRecord) {
-        if let SessionEvent::ModelFailed {
-            failure: crate::session::AttemptFailure::Retrying { delay, .. },
-            ..
-        } = &record.event
-        {
-            crate::tests::elapse(Duration::from_millis(delay.millis())).await;
-        }
+        let backoff = match &record.event {
+            SessionEvent::ModelFailed {
+                failure: crate::session::AttemptFailure::Retrying { delay, .. },
+                ..
+            } => Duration::from_millis(delay.millis()),
+            // The record does not say which attempt failed: the longest backoff.
+            SessionEvent::CompactionFailed { error, .. } if error.retryable() => {
+                compact::RETRY_BACKOFF * u32::from(compact::MAX_COMPACTION_ATTEMPTS)
+            }
+            _ => return,
+        };
+        crate::tests::elapse(backoff).await;
     }
 
     /// A valid, otherwise empty compaction continuation.

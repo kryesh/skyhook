@@ -380,6 +380,15 @@ impl RequestLedger {
         })
     }
 
+    /// Read every pending request as interrupted at `at`, as a session whose
+    /// work stopped leaves it, returning those it changed.
+    pub(crate) fn stop(&mut self, at: i64) -> Vec<RequestSeq> {
+        let agents = self.latest.keys().cloned().collect::<Vec<_>>();
+        (agents.iter())
+            .filter_map(|agent| self.interrupt(agent, at))
+            .collect()
+    }
+
     #[must_use]
     pub fn get(&self, request: RequestSeq) -> Option<&RequestRecord> {
         self.requests.get(&request)

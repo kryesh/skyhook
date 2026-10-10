@@ -94,7 +94,9 @@ mod tests {
     /// Fire every timer due within `limit` at once. Current-thread only.
     pub(crate) async fn elapse(limit: std::time::Duration) {
         tokio::time::pause();
-        tokio::time::advance(limit).await;
+        // Timers fire on whole milliseconds: a deadline `limit` after a moment
+        // inside the current one rounds up past `limit`.
+        tokio::time::advance(limit + std::time::Duration::from_millis(1)).await;
         tokio::time::resume();
     }
 

@@ -111,8 +111,9 @@ impl SessionHandle {
         let mut jobs = self.runtime.jobs.list(agent);
         let stopped = |state: &CoreState| state.phase.stopped_at(&state.records);
         if let Some(at) = self.runtime.store.read(stopped) {
-            jobs.iter_mut()
-                .for_each(|job| crate::agent::observation::read_job(job, at));
+            jobs.iter_mut().for_each(|job| {
+                crate::agent::observation::read_job(job, at);
+            });
         }
         jobs
     }
@@ -603,7 +604,7 @@ mod tests {
         let spec = crate::job::JobSpec::test(session.root.clone(), "stubborn");
         let (_input, worker) = jobs.test_running(spec).await.split();
         let ignores = std::future::pending::<crate::job::JobOutcome>();
-        worker.start_supervised(ignores).unwrap();
+        worker.launch(ignores, "tool handler panicked");
         drop(session);
         bounded(jobs.supervisor().drain()).await;
     }

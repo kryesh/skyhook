@@ -61,6 +61,9 @@ its own workspace-local session root.
 
 `SessionHandle::observe()` returns a snapshot and receiver sharing an atomic revision
 boundary. Apply updates to the snapshot in revision order with `ObservationSnapshot::apply`.
+Once the session no longer runs (viewed, failed or closed), the snapshot reads every request,
+response, job and turn it left going as interrupted at its last activity; `apply` returns the jobs
+and requests an update read that way, which no update of their own reports.
 It contains:
 
 - Durable records keyed by their original journal sequence.

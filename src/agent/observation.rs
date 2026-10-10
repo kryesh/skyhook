@@ -130,8 +130,8 @@ impl ObservedResponse {
 #[derive(Clone, Debug, Default)]
 pub struct ObservationSnapshot {
     /// Where the session is in its life. Once its work stops, as a crash stops
-    /// it, every turn, response and job it left going reads as interrupted at
-    /// its last activity, as reopening settles them.
+    /// it, every turn, request, response and job it left going reads as
+    /// interrupted at its last activity, as reopening settles them.
     pub phase: SessionPhase,
     pub revision: u64,
     pub records: BTreeMap<RecordSeq, EventRecord>,
@@ -146,17 +146,25 @@ pub struct ObservationSnapshot {
 
 pub(crate) type Responses = HashMap<(AgentId, RequestSeq), ObservedResponse>;
 
+/// The jobs and requests an update read as interrupted because the session's
+/// work stopped, which no update of their own reports.
+#[derive(Debug, Default)]
+pub struct StoppedReading {
+    pub jobs: Vec<JobId>,
+    pub requests: Vec<RequestSeq>,
+}
+
 impl ObservationSnapshot {
     /// Idempotent journal projection; live deltas are applied once by revision.
-    pub fn apply(&mut self, update: ObservedEvent) {
+    pub fn apply(&mut self, update: ObservedEvent) -> StoppedReading {
         if update.revision <= self.revision {
-            return;
+            return StoppedReading::default();
         }
         self.revision = update.revision;
         match update.event {
             RuntimeEvent::Record(record) => {
                 if self.records.contains_key(&record.sequence) {
-                    return;
+                    return StoppedReading::default();
                 }
                 let views = Views {
                     ledger: &mut self.ledger,
@@ -181,31 +189,37 @@ impl ObservationSnapshot {
                 );
             }
         }
-        self.read_phase();
+        self.read_phase()
     }
 
     /// Read what a session whose work stopped left going as interrupted at its
     /// last activity.
-    pub(crate) fn read_phase(&mut self) {
+    pub(crate) fn read_phase(&mut self) -> StoppedReading {
         let Some(at) = self.phase.stopped_at(self.records.values()) else {
-            return;
+            return StoppedReading::default();
         };
         for response in self.responses.values_mut() {
             if response.settlement().is_none() {
                 response.settle(Settlement::Failed(TurnFailure::Interrupted));
             }
         }
-        self.jobs.values_mut().for_each(|job| read_job(job, at));
+        let jobs = self.jobs.values_mut().filter_map(|job| read_job(job, at));
+        StoppedReading {
+            jobs: jobs.collect(),
+            requests: self.ledger.stop(at),
+        }
     }
 }
 
 /// Read a job a stopped session left going as interrupted at its last activity,
-/// `at`.
-pub(crate) fn read_job(job: &mut JobEnvelope, at: i64) {
-    if !job.state.is_terminal() {
-        job.state = JobState::Interrupted;
-        job.timing = job.timing.after(JobState::Interrupted, at);
+/// `at`, returning it if that changed it.
+pub(crate) fn read_job(job: &mut JobEnvelope, at: i64) -> Option<JobId> {
+    if job.state.is_terminal() {
+        return None;
     }
+    job.state = JobState::Interrupted;
+    job.timing = job.timing.after(JobState::Interrupted, at);
+    Some(job.id)
 }
 
 /// What observers fold from each committed record beside the record itself.

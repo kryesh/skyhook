@@ -382,8 +382,8 @@ transaction, a commit whose outcome is unknown, a failed blob insert, a finished
 that cannot be prepared for its finish, or a panic on the core thread. In the same critical section the session moves to failed, its connection takes no more
 writes, everything it runs is cancelled, no agent runs, and every wait and reply resolves with the
 failure, which every later write reports too. Observers see the phase change, and read every
-turn, response and job the session left going as interrupted at its last activity, as reopening
-settles them. Rules a concurrent change can break, such as the stale-todos check on a compaction
+turn, request, response and job the session left going as interrupted at its last activity, as
+reopening settles them. Rules a concurrent change can break, such as the stale-todos check on a compaction
 checkpoint, are decided by their command's plan against the state it commits to, so a refusal
 there is not a failure.
 

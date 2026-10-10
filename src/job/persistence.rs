@@ -639,8 +639,14 @@ mod tests {
             };
             jobs.finish(id, outcome).await.unwrap();
             if case == 6 {
-                jobs.cancel(id).await.unwrap();
-                crate::tests::bounded(jobs.wait_settled(id)).await.unwrap();
+                // Nothing runs to stop: the cancellation settles at its grace.
+                let (settled, _) = crate::tests::expire(
+                    jobs.wait_settled(id),
+                    async { jobs.cancel(id).await.unwrap() },
+                    super::super::cancellation::CANCELLATION_GRACE,
+                )
+                .await;
+                settled.unwrap();
             }
             let projection = stored_projection(&jobs, id);
             assert_eq!(projection["resumable"], !matches!(case, 4 | 6));

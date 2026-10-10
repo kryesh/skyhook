@@ -185,7 +185,9 @@ pub(in crate::tui) fn ask(
 pub(in crate::tui) async fn observe_next(app: &mut App) -> RuntimeEvent {
     let event = bounded(app.recv_observation()).await;
     let event = event.expect("observation open");
-    app.observe(event.clone());
+    if app.observe(event.clone()) {
+        app.rebuild_projection();
+    }
     event.event
 }
 
@@ -202,7 +204,6 @@ pub(in crate::tui) async fn observe_find<T>(app: &mut App, find: impl Fn(&App) -
                 return found;
             }
             observe_next(app).await;
-            app.refresh();
             app.rebuild_content();
         }
     })

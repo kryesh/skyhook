@@ -641,16 +641,17 @@ mod tests {
             )
             .with_source(source);
             let connection = self.connection.clone();
-            worker
-                .start_supervised(async move {
+            worker.launch(
+                async move {
                     let result = call(connection, context.clone()).await;
                     if context.is_cancelled() {
                         Err(crate::tool::ToolError::cancelled())
                     } else {
                         result.map_err(RemoteError::into_tool_error)
                     }
-                })
-                .unwrap();
+                },
+                "tool handler panicked",
+            );
             job
         }
 

@@ -4,7 +4,7 @@ use super::super::format::agent_label;
 use super::entries::Dep;
 use super::{Timing, state_name};
 use serde_json::Value;
-use skyhook::agent::{AgentActivity, ObservationSnapshot, TodoItem, TurnFailure};
+use skyhook::agent::{AgentActivity, ObservationSnapshot, StoppedReading, TodoItem, TurnFailure};
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobEnvelope, JobRole, JobState, JobTransition};
 use skyhook::provider::protocol::Usage;
@@ -162,6 +162,18 @@ impl Projection {
     /// Fold a job's view as it arrives, before the record that moved it.
     pub fn observe_job(&mut self, job: &JobEnvelope) {
         self.changes.insert(Dep::Job(job.id));
+    }
+
+    /// Fold the jobs and requests the session's stopped reading changed, which
+    /// no record reports, as their own updates would. Returns whether it changed
+    /// any: the projection then rebuilds as for a record, so agents reconcile
+    /// with their owner jobs.
+    pub fn observe_stopped(&mut self, reading: StoppedReading) -> bool {
+        let changed = !(reading.jobs.is_empty() && reading.requests.is_empty());
+        self.changes.extend(reading.jobs.into_iter().map(Dep::Job));
+        self.changes
+            .extend(reading.requests.into_iter().map(Dep::Request));
+        changed
     }
 
     pub(super) fn agent_name(&self, agent: &AgentId) -> &str {

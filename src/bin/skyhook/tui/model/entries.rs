@@ -927,45 +927,35 @@ mod tests {
 
     #[tokio::test]
     async fn whitespace_only_turns_neither_create_agent_cards_nor_steal_the_answer_footer() {
-        let read = call("call_read", "read", json!({"path": "."}), 2);
-        for whitespace in ["\n\n", "\n\n\n", " \t\r\n", "\u{2003}"] {
-            let (_root, mut app, mut model, session) = played_fixture().await;
-            let agent = app.root_agent().clone();
-            let _asked = ask(&session, "look");
-            let reasoning = "Inspect the repository.";
+        let (_root, mut app, mut model, session) = played_fixture().await;
+        let agent = app.root_agent().clone();
+        let _asked = ask(&session, "look");
+        let reasoning = "Inspect the repository.";
+        let whitespace = ["\n\n", "\n\n\n", " \t\r\n", "\u{2003}"];
+        for (index, whitespace) in whitespace.into_iter().enumerate() {
+            let read = call(&format!("read-{index}"), "read", json!({"path": "."}), 2);
             model.turn().await.end(vec![
                 AssistantItem::reasoning("reasoning", 0, reasoning, Some(replay())),
                 AssistantItem::text("separator", 1, whitespace),
-                read.clone(),
+                read,
             ]);
-            observe_until(&mut app, |app| {
-                count(&app.snapshot, committed(results)) == 1
-            })
-            .await;
-
-            let cards = render(&app.snapshot, &agent, true);
-            assert!(cards.iter().all(|card| card.surface != Surface::Agent));
-            assert!(
-                cards
-                    .iter()
-                    .any(|card| card.surface == Surface::Reasoning
-                        && card.text().contains(reasoning))
-            );
-            assert!(
-                cards
-                    .iter()
-                    .any(|card| card.surface == Surface::Tool && card.text().contains("read"))
-            );
         }
-
-        let (_root, mut app, mut model, _session) = played_fixture().await;
-        let agent = app.root_agent().clone();
         let answer = "  Actual answer with spacing.\n";
-        let items = vec![
+        model.turn().await.end(vec![
             AssistantItem::text("answer", 0, answer),
             AssistantItem::text("separator", 1, "\n\n"),
-        ];
-        exchange(&mut app, &mut model, "answer", items).await;
+        ]);
+        observe_until(&mut app, |app| recorded(&app.snapshot, answered)).await;
+
+        let cards = render(&app.snapshot, &agent, true);
+        let surfaced = |surface, text| {
+            let cards = cards.iter();
+            cards
+                .filter(|card| card.surface == surface && card.text().contains(text))
+                .count()
+        };
+        assert_eq!(surfaced(Surface::Reasoning, reasoning), whitespace.len());
+        assert_eq!(surfaced(Surface::Tool, "read"), whitespace.len());
         let cards = render(&app.snapshot, &agent, false);
         let answers: Vec<_> = cards
             .iter()

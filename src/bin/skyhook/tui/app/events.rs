@@ -718,53 +718,54 @@ mod tests {
     #[tokio::test]
     async fn message_drag_selects_only_the_requested_text_including_unicode() {
         use skyhook::provider::protocol::AssistantItem;
-        for surface in [model::Surface::User, model::Surface::Agent] {
-            for word in ["bravo", "e\u{301}界🙂"] {
-                let (_root, mut app, mut model, _session) = played_fixture().await;
-                let text = format!("Alpha **{word}** omega");
-                if surface == model::Surface::User {
-                    let _asked = ask(app.session().unwrap(), &text);
-                    observe_record(&mut app, committed(user)).await;
-                } else {
-                    let answer = vec![AssistantItem::text("drag", 0, &text)];
-                    exchange(&mut app, &mut model, "question", answer).await;
-                }
-                let buffer = draw_buffer(&mut app);
-                let (x, y) = (0..24)
-                    .find_map(|y| {
-                        let row = (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>();
-                        row.find("Alpha ").map(|x| (x as u16 + 6, y))
-                    })
-                    .unwrap();
-                // Both fixtures occupy five cells; drag backwards as well as forwards.
-                let (start, end) = if surface == model::Surface::User {
-                    (x + 5, x)
-                } else {
-                    (x, x + 5)
-                };
-                let left = MouseButton::Left;
-                for (column, kind) in [
-                    (start, MouseEventKind::Down(left)),
-                    (end, MouseEventKind::Drag(left)),
-                    (end, MouseEventKind::Up(left)),
-                ] {
-                    mouse(&mut app, Rect::new(column, y, 1, 1), kind);
-                }
-                let selected = draw_buffer(&mut app);
-                let color = crate::tui::theme::THEME.selected;
-                // Terminals paint wide characters from their leading cell; Ratatui's
-                // backend diff skips their continuation cells.
-                let mut column = x;
-                while column < x + 5 {
-                    assert_eq!(selected[(column, y)].bg, color);
-                    let symbol = selected[(column, y)].symbol();
-                    column += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
-                }
-                assert_ne!(selected[(x - 1, y)].bg, color);
-                assert_ne!(selected[(x + 5, y)].bg, color);
-                chord(&mut app, KeyCode::Char('y'));
-                assert_eq!(app.clipboard.as_deref(), Some(word));
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let (ascii, unicode) = ("bravo", "e\u{301}界🙂");
+        let text = |first, second| format!("Alpha **{first}** omega\n\nAlpha **{second}** omega");
+        let answer = vec![AssistantItem::text("drag", 0, text(unicode, ascii))];
+        exchange(&mut app, &mut model, &text(ascii, unicode), answer).await;
+        let buffer = draw_buffer(&mut app);
+        let rows = (0..24).filter_map(|y| {
+            let row = (0..60).map(|x| buffer[(x, y)].symbol()).collect::<String>();
+            row.find("Alpha ").map(|x| (x as u16 + 6, y))
+        });
+        let (user, agent) = (model::Surface::User, model::Surface::Agent);
+        let cases = [
+            (user, ascii),
+            (user, unicode),
+            (agent, unicode),
+            (agent, ascii),
+        ];
+        let rows: Vec<_> = rows.collect();
+        assert_eq!(rows.len(), cases.len());
+        for ((surface, word), (x, y)) in cases.into_iter().zip(rows) {
+            // Both words occupy five cells; drag backwards as well as forwards.
+            let (start, end) = if surface == user {
+                (x + 5, x)
+            } else {
+                (x, x + 5)
+            };
+            let left = MouseButton::Left;
+            for (column, kind) in [
+                (start, MouseEventKind::Down(left)),
+                (end, MouseEventKind::Drag(left)),
+                (end, MouseEventKind::Up(left)),
+            ] {
+                mouse(&mut app, Rect::new(column, y, 1, 1), kind);
             }
+            let selected = draw_buffer(&mut app);
+            let color = crate::tui::theme::THEME.selected;
+            // Terminals paint wide characters from their leading cell; Ratatui's
+            // backend diff skips their continuation cells.
+            let mut column = x;
+            while column < x + 5 {
+                assert_eq!(selected[(column, y)].bg, color);
+                let symbol = selected[(column, y)].symbol();
+                column += unicode_width::UnicodeWidthStr::width(symbol).max(1) as u16;
+            }
+            assert_ne!(selected[(x - 1, y)].bg, color);
+            assert_ne!(selected[(x + 5, y)].bg, color);
+            chord(&mut app, KeyCode::Char('y'));
+            assert_eq!(app.clipboard.as_deref(), Some(word));
         }
     }
 
