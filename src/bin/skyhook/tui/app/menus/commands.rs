@@ -25,7 +25,7 @@ impl App {
                     .collect();
                 let selected = items.iter().position(|item| item.value == self.model);
                 self.open("Model", MenuKind::Models(items));
-                self.menu_mut().unwrap().selected = selected.unwrap_or(0);
+                self.menu_mut().unwrap().select(selected.unwrap_or(0));
             }
             Command::Mode => {
                 let items: Vec<_> = self
@@ -39,7 +39,7 @@ impl App {
                     .collect();
                 let selected = items.iter().position(|item| item.value == self.mode);
                 self.open("Mode", MenuKind::Modes(items));
-                self.menu_mut().unwrap().selected = selected.unwrap_or(0);
+                self.menu_mut().unwrap().select(selected.unwrap_or(0));
             }
             Command::Agents => self.open("Agents", MenuKind::Agents(self.agent_items())),
             Command::Inspect => {
@@ -140,7 +140,7 @@ impl App {
                         "Context belongs to the selected agent and includes system, tools and runtime state.\n",
                         "Messages always go to skyhook, including while viewing a child.\n",
                         "Model and mode changes apply from the next submitted message, or from continuing a failed root turn. Instruction changes apply to new sessions.\n",
-                        "Mouse: click agent or tool, scroll, drag text then copy.\n",
+                        "Mouse: click agent or tool, scroll, drag text to copy it.\n",
                         "The workspace and session ID are plain text; use terminal selection to copy them.\n",
                         "Copy message uses the terminal clipboard (OSC 52).",
                     ),

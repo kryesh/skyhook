@@ -380,6 +380,7 @@ mod tests {
                 label,
                 detail: "",
                 columns,
+                emphasis: Emphasis::Normal,
                 search: "",
             })
             .collect();

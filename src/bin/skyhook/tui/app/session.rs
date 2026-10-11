@@ -18,17 +18,40 @@ pub enum HostRequest {
     Quit,
 }
 
+/// Whether an open session has run here: a reopened one is only viewed until
+/// the first call that changes it activates it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Activation {
+    Viewed,
+    Activated,
+}
+
 /// An open session's journal, once one has been observed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PeerSession {
     Draft,
     /// Its journal exists, but none of its activity has been observed yet.
-    Started(SessionId),
+    Started {
+        id: SessionId,
+        activation: Activation,
+    },
     /// `last` is its newest observed activity's time, in epoch milliseconds.
     Open {
         id: SessionId,
         last: i64,
+        activation: Activation,
     },
+}
+
+impl PeerSession {
+    pub fn activated(self) -> bool {
+        match self {
+            Self::Draft => false,
+            Self::Started { activation, .. } | Self::Open { activation, .. } => {
+                activation == Activation::Activated
+            }
+        }
+    }
 }
 
 /// One open session as the others see it.
@@ -177,11 +200,19 @@ impl App {
         let root = self.root_agent();
         let agent = self.projection.agents.iter().find(|a| &a.id == root);
         let activity = EventRecord::last_activity(self.snapshot.records.values());
+        let activation = match self.snapshot.phase {
+            skyhook::session::SessionPhase::Viewing => Activation::Viewed,
+            _ => Activation::Activated,
+        };
         Peer {
             key,
             session: match (self.session_id(), activity) {
-                (Some(id), Some(last)) => PeerSession::Open { id, last },
-                (Some(id), None) => PeerSession::Started(id),
+                (Some(id), Some(last)) => PeerSession::Open {
+                    id,
+                    last,
+                    activation,
+                },
+                (Some(id), None) => PeerSession::Started { id, activation },
                 (None, _) => PeerSession::Draft,
             },
             current,

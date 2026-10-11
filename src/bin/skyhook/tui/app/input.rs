@@ -461,35 +461,43 @@ impl App {
         }
         self.notice("No matches");
     }
+    /// Copy the composer's selection while it is focused, else the transcript's,
+    /// else the selected or last agent message.
     pub(super) fn copy(&mut self) {
-        if self.focus == Focus::Composer
-            && let Some(text) = self.editor.selected_text()
-        {
-            self.clipboard = Some(text.to_owned());
-            self.toast("Copied selected input");
-            return;
-        }
-        if let Some((a, b)) = self.selection
-            && a != b
-        {
-            self.clipboard = Some(crate::tui::render::selected_text(&self.render.rows, (a, b)));
-        } else {
+        let composer = (self.focus == Focus::Composer)
+            .then(|| self.editor.selected_text())
+            .flatten();
+        let text = composer.or_else(|| self.selected_text()).or_else(|| {
             let row = self.view().row;
-            self.clipboard = self
-                .entries()
-                .get(row)
-                .filter(|entry| entry.selectable())
-                .or_else(|| {
-                    self.entries()
-                        .iter()
-                        .rev()
-                        .find(|e| e.surface == model::Surface::Agent)
-                })
-                .map(|e| e.text().to_owned());
+            let entries = self.entries();
+            let selected = entries.get(row).filter(|entry| entry.selectable());
+            let last = || {
+                let mut entries = entries.iter().rev();
+                entries.find(|entry| entry.surface == model::Surface::Agent)
+            };
+            selected.or_else(last).map(|entry| entry.text().to_owned())
+        });
+        if let Some(text) = text.filter(|text| !text.is_empty()) {
+            self.copy_text(text);
         }
-        if self.clipboard.is_some() {
-            self.toast("Copied to terminal clipboard");
-        }
+    }
+    /// The transcript text the pointer selected, unless it holds none. Distinct
+    /// endpoints are not enough: a span across a soft wrap has no source text.
+    pub(super) fn selected_text(&self) -> Option<String> {
+        let selection = self.selection?;
+        let text = crate::tui::render::selected_text(&self.render.rows, selection);
+        (!text.is_empty()).then_some(text)
+    }
+    /// Send `text` to the terminal clipboard and say how much was sent. OSC 52
+    /// reports nothing back, so that is all the message can claim.
+    pub(super) fn copy_text(&mut self, text: String) {
+        let chars = text.chars().count();
+        let unit = if chars == 1 { "char" } else { "chars" };
+        self.toast(format!(
+            "Copied {} {unit} to clipboard",
+            crate::tui::format::grouped(chars)
+        ));
+        self.clipboard = Some(text);
     }
     pub(super) fn interrupt(&mut self) {
         self.pause_queue();
@@ -624,6 +632,26 @@ mod tests {
         assert_eq!(app.composer_scroll, None);
     }
 
+    /// Every copy reports the Unicode characters it sent, not bytes, and claims
+    /// no more than that.
+    #[tokio::test]
+    async fn copies_report_how_many_characters_were_sent() {
+        let (_root, mut app) = draft_fixture().await;
+        for (text, toast) in [
+            ("界".to_owned(), "Copied 1 char to clipboard"),
+            ("é🙂".to_owned(), "Copied 2 chars to clipboard"),
+            ("界".repeat(1234), "Copied 1,234 chars to clipboard"),
+            ("x".repeat(1_234_567), "Copied 1,234,567 chars to clipboard"),
+        ] {
+            app.copy_text(text.clone());
+            assert_eq!(app.clipboard.take(), Some(text));
+            assert_eq!(
+                app.toast.take().map(|(toast, _)| toast).as_deref(),
+                Some(toast)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn composer_pastes_submit_in_place() {
         let (_root, mut app) = draft_fixture().await;
@@ -642,6 +670,8 @@ mod tests {
         app.editor.set_selection(Some(0), app.editor.text().len());
         app.copy();
         assert_eq!(app.clipboard.as_deref(), Some(expected.as_str()));
+        let toast = format!("Copied {} chars to clipboard", expected.chars().count());
+        assert_eq!(app.toast.take().map(|(toast, _)| toast), Some(toast));
         app.editor.set_selection(None, app.editor.cursor());
         key(&mut app, KeyCode::Enter, M::NONE);
         assert_eq!(app.queue.len(), 1);

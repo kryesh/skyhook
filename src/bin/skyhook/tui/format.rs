@@ -12,6 +12,18 @@ pub fn number(n: u64) -> String {
         n.to_string()
     }
 }
+/// `n` in full, its thousands separated by commas.
+pub fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
+}
 pub fn footer(usage: UsageTotals, context: Option<(u64, u64)>) -> String {
     footer_stats(usage, context).join(" · ")
 }

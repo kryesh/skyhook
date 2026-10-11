@@ -12,9 +12,11 @@ saved sessions only in `<workspace>/.skyhook/sessions`, where `--workspace` sele
 written by an incompatible earlier session format cannot be reopened.
 
 The terminal keeps several sessions open at once. `/new` opens a draft beside the current session,
-and `/sessions` lists the open and saved sessions: sessions still working come first, then every
-other session by most recent activity; opening a session and closing it again with nothing running
-does not count as activity. The current session is marked `>`. Open sessions show their live status,
+and `/sessions` lists the open and saved sessions: the current session first, then the other
+activated sessions, those still working first, then every other session by most recent activity.
+An open session is activated once it has run here: a new session from its first message, a reopened
+one from the first action that changes it. Activated sessions are shown in bold. Opening a session
+and closing it again with nothing running does not count as activity. The current session is marked `>`. Open sessions show their live status,
 and saved ones how they would resume: idle, interrupted, or failed. Opening a saved session changes
 nothing in it until you act on it, by sending a message, continuing it, or anything else that is
 saved with it; notices about it meanwhile are shown, not saved. A session closed idle with results

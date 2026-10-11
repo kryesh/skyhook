@@ -203,7 +203,7 @@ mod tests {
         let mut rx = capture_work(&mut app);
         let element = "/result/value/custom/a~1b~0c/0";
         let chosen = offered(&mut app, element).unwrap();
-        app.menu_mut().unwrap().selected = chosen;
+        app.menu_mut().unwrap().select(chosen);
         app.choose();
         assert_eq!(
             app.outputs.query(job).unwrap().field,
@@ -252,7 +252,7 @@ mod tests {
         };
         let chosen = items.iter().position(|item| item.value == more).unwrap();
         let mut rx = capture_work(&mut app);
-        app.menu_mut().unwrap().selected = chosen;
+        app.menu_mut().unwrap().select(chosen);
         app.choose();
         let work = recv(&mut rx).await;
         app.work(work);

@@ -1,7 +1,9 @@
 pub use events::{Hit, Operation, Work};
 pub use input::InputTarget;
 use lifecycle::{PendingStart, StartState};
-pub use menus::{ConfirmAction, Item, ItemRef, MenuId, MenuKind, Overlay, SavedState, SessionRef};
+pub use menus::{
+    ConfirmAction, Emphasis, Item, ItemRef, MenuId, MenuKind, Overlay, SavedState, SessionRef,
+};
 use prompts::UiPrompt;
 use queue::{QueueDelivery, RowState};
 pub use queue::{QueuedInput, QueuedInputId};

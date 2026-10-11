@@ -283,10 +283,8 @@ impl App {
                 if let Some(index) = self.hits.iter().rev().find_map(|(rect, hit)| match hit {
                     Hit::Menu(index) if rect.contains(point.into()) => Some(*index),
                     _ => None,
-                }) && index < menu.filtered().len()
-                    && menu.selected != index
+                }) && menu.point(index)
                 {
-                    menu.selected = index;
                     self.dirty = true;
                 }
                 return;
@@ -325,7 +323,7 @@ impl App {
                     InputTarget::Menu | InputTarget::Search => match &mut self.overlay {
                         Some(Overlay::Menu(menu)) => {
                             menu.input.insert(&text);
-                            menu.selected = 0;
+                            menu.select(0);
                         }
                         Some(Overlay::Search(editor)) => {
                             editor.insert(&text);
@@ -384,7 +382,9 @@ impl App {
                     MouseEventKind::Down(MouseButton::Left) => {
                         self.pressed_entry = None;
                         self.selection = None;
-                        let mut select_text = true;
+                        // An open palette owns the pointer, as it owns hover: the
+                        // transcript beneath it is not selectable.
+                        let mut select_text = self.menu().is_none();
                         if let Some((_, hit)) = self
                             .hits
                             .iter()
@@ -406,9 +406,13 @@ impl App {
                                 }
                                 Hit::Menu(index) => {
                                     if let Some(menu) = self.menu_mut() {
-                                        menu.selected = index;
+                                        menu.point(index);
                                     }
-                                    self.choose();
+                                    // Only the row clicked is chosen: a text page picks
+                                    // nothing, and a stale hit misses.
+                                    if self.menu().is_some_and(|menu| menu.selected() == index) {
+                                        self.choose();
+                                    }
                                 }
                                 Hit::Tab(tab) => self.set_tab(tab),
                                 Hit::Composer => self.focus = Focus::Composer,
@@ -448,11 +452,16 @@ impl App {
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if self.pressed_entry.is_none()
-                            && let Some((anchor, _)) = self.selection
-                            && let Some(head) = self.text_position(point)
-                        {
-                            self.selection = Some((anchor, head));
+                        if self.pressed_entry.is_none() {
+                            if let Some((anchor, _)) = self.selection
+                                && let Some(head) = self.text_position(point)
+                            {
+                                self.selection = Some((anchor, head));
+                            }
+                            // Copied once, on release, rather than on every drag motion.
+                            if let Some(text) = self.selected_text() {
+                                self.copy_text(text);
+                            }
                         }
                         if let Some(key) = self.pressed_entry.take()
                             && let Some((_, Hit::Entry(index, true))) = self
@@ -715,8 +724,10 @@ mod tests {
         assert!(app.prompts.is_empty());
     }
 
+    /// Releasing a drag copies just the selected text and reports how many
+    /// characters were sent; a plain click copies nothing.
     #[tokio::test]
-    async fn message_drag_selects_only_the_requested_text_including_unicode() {
+    async fn message_drag_selects_and_copies_only_the_requested_text_including_unicode() {
         use skyhook::provider::protocol::AssistantItem;
         let (_root, mut app, mut model, _session) = played_fixture().await;
         let (ascii, unicode) = ("bravo", "e\u{301}界🙂");
@@ -737,7 +748,7 @@ mod tests {
         ];
         let rows: Vec<_> = rows.collect();
         assert_eq!(rows.len(), cases.len());
-        for ((surface, word), (x, y)) in cases.into_iter().zip(rows) {
+        for ((surface, word), (x, y)) in cases.into_iter().zip(rows.iter().copied()) {
             // Both words occupy five cells; drag backwards as well as forwards.
             let (start, end) = if surface == user {
                 (x + 5, x)
@@ -764,9 +775,67 @@ mod tests {
             }
             assert_ne!(selected[(x - 1, y)].bg, color);
             assert_ne!(selected[(x + 5, y)].bg, color);
+            // The unicode word is four characters in ten bytes.
+            let chars = word.chars().count();
+            let toast = format!("Copied {chars} chars to clipboard");
+            assert_eq!(app.clipboard.take().as_deref(), Some(word));
+            assert_eq!(app.toast.take().map(|(toast, _)| toast), Some(toast));
             chord(&mut app, KeyCode::Char('y'));
-            assert_eq!(app.clipboard.as_deref(), Some(word));
+            assert_eq!(app.clipboard.take().as_deref(), Some(word));
         }
+        app.toast = None;
+        app.clipboard = Some("earlier".into());
+        let (x, y) = rows.last().copied().unwrap();
+        click(&mut app, Rect::new(x, y, 1, 1));
+        assert!(app.selection.is_some_and(|(anchor, head)| anchor == head));
+        assert_eq!(app.clipboard.as_deref(), Some("earlier"));
+        assert!(app.toast.is_none());
+    }
+
+    /// Pressing, dragging and releasing in the inspector leave its rows where
+    /// they are, following or scrolled; the keyboard still reveals the row it
+    /// selects.
+    #[tokio::test]
+    async fn inspector_selection_keeps_the_scroll_offset() {
+        let (_root, mut app) = fixture().await;
+        for index in 0..40 {
+            app.local_notice(format!("Message number {index} with some text"));
+        }
+        draw(&mut app);
+        let left = MouseButton::Left;
+        for scroll in [None, Some(5)] {
+            app.view().scroll = scroll;
+            draw(&mut app);
+            let offset = app.scroll_offset();
+            let content = app.content_rect;
+            let (from, to) = (
+                Rect {
+                    x: content.x + 4,
+                    y: content.y + 3,
+                    ..content
+                },
+                Rect {
+                    x: content.x + 10,
+                    y: content.y + 6,
+                    ..content
+                },
+            );
+            for (rect, kind) in [
+                (from, MouseEventKind::Down(left)),
+                (to, MouseEventKind::Drag(left)),
+                (to, MouseEventKind::Up(left)),
+            ] {
+                mouse(&mut app, rect, kind);
+                draw(&mut app);
+                assert_eq!(app.scroll_offset(), offset, "{scroll:?} {kind:?}");
+            }
+            assert!(app.clipboard.take().is_some());
+        }
+        app.view().row = 0;
+        key(&mut app, KeyCode::Down, M::NONE);
+        let row = app.view().row;
+        assert!(row > 0);
+        assert_eq!(Some(app.scroll_offset()), app.render.rows.entry_start(row));
     }
 
     #[tokio::test]
@@ -849,11 +918,36 @@ mod tests {
         let next = items
             .iter()
             .position(|item| item.value == menus::OutputAction::Next);
-        menu.selected = next.unwrap();
+        menu.select(next.unwrap());
         app.choose();
         let query = app.outputs.query(job).unwrap().clone();
         assert_eq!((query.start, query.offset), (Some(start), offset));
         assert_eq!(query.field.as_ref(), field);
         assert_eq!(field.unwrap().as_str(), "/result/content");
+    }
+
+    /// A drag across a soft wrap spans no source text: releasing it leaves the
+    /// clipboard and toast untouched.
+    #[tokio::test]
+    async fn an_empty_drag_copies_nothing() {
+        let (_root, mut app) = fixture().await;
+        app.local_notice("word ".repeat(40));
+        draw(&mut app);
+        let content = app.content_rect;
+        let (end, start) = (
+            Rect::new(content.right() - 2, content.y, 1, 1),
+            Rect::new(content.x, content.y + 1, 1, 1),
+        );
+        app.clipboard = Some("earlier".into());
+        let left = MouseButton::Left;
+        mouse(&mut app, end, MouseEventKind::Down(left));
+        mouse(&mut app, start, MouseEventKind::Drag(left));
+        mouse(&mut app, start, MouseEventKind::Up(left));
+        assert!(
+            app.selection
+                .is_some_and(|(anchor, head)| anchor.row != head.row)
+        );
+        assert_eq!(app.clipboard.as_deref(), Some("earlier"));
+        assert!(app.toast.is_none());
     }
 }

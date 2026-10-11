@@ -45,6 +45,13 @@ pub enum ConfirmChoice {
     KeepWorking,
     Proceed(ConfirmAction),
 }
+/// How strongly a menu row is drawn.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Emphasis {
+    #[default]
+    Normal,
+    Strong,
+}
 /// A menu row. Its text is cleaned once, so it measures as it paints.
 #[derive(Clone)]
 pub struct Item<T> {
@@ -55,6 +62,7 @@ pub struct Item<T> {
     /// Searchable metadata aligned at the right edge, such as a shortcut or a
     /// time. Short of room, the leftmost goes first.
     pub columns: Vec<String>,
+    pub emphasis: Emphasis,
     /// The label, detail and columns lowercased once, for filtering on every key.
     search: String,
 }
@@ -77,8 +85,13 @@ impl<T> Item<T> {
             label,
             detail,
             columns,
+            emphasis: Emphasis::Normal,
             search,
         }
+    }
+
+    fn emphasized(self, emphasis: Emphasis) -> Self {
+        Self { emphasis, ..self }
     }
 }
 #[derive(Clone)]
@@ -104,6 +117,7 @@ pub struct ItemRef<'a> {
     pub label: &'a str,
     pub detail: &'a str,
     pub columns: &'a [String],
+    pub emphasis: Emphasis,
     pub search: &'a str,
 }
 impl MenuKind {
@@ -117,6 +131,7 @@ impl MenuKind {
                     label: &item.label,
                     detail: &item.detail,
                     columns: &item.columns,
+                    emphasis: item.emphasis,
                     search: &item.search,
                 })
                 .collect()
@@ -154,9 +169,26 @@ pub struct Menu {
     pub title: String,
     pub kind: MenuKind,
     pub input: Editor,
-    pub selected: usize,
+    /// The highlighted row among the filtered ones.
+    selected: usize,
+    /// The first filtered row in view. Each draw moves it only as far as it
+    /// must to show the selection, so a pointer, which only selects rows in
+    /// view, never moves it, while the keyboard, filtering and a shorter
+    /// viewport do.
+    top: usize,
 }
 impl Menu {
+    fn new(id: MenuId, title: String, kind: MenuKind) -> Self {
+        Self {
+            id,
+            title,
+            kind,
+            input: Editor::default(),
+            selected: 0,
+            top: 0,
+        }
+    }
+
     /// Replace the rows of an open menu, keeping the selected value selected.
     fn replace_items(&mut self, kind: MenuKind) {
         let index = self.selected_index();
@@ -164,7 +196,46 @@ impl Menu {
         let index = index.and_then(|index| self.kind.find(&previous, index));
         let selected =
             index.and_then(|index| self.filtered().iter().position(|row| row.index == index));
-        self.selected = selected.unwrap_or(0);
+        self.select(selected.unwrap_or(0));
+    }
+
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    /// Select a filtered row, which the next draw scrolls into view.
+    pub fn select(&mut self, index: usize) {
+        self.selected = index;
+    }
+
+    /// Select the filtered row under the pointer, leaving the rows in view where
+    /// they are. Returns whether the selection changed.
+    pub fn point(&mut self, index: usize) -> bool {
+        let changed = !self.page() && index < self.filtered().len() && self.selected != index;
+        if changed {
+            self.selected = index;
+        }
+        changed
+    }
+
+    /// A text page has nothing to pick: its selection is the first visible line.
+    pub fn page(&self) -> bool {
+        matches!(self.kind, MenuKind::Info(_))
+    }
+
+    /// The first filtered row in view when `rows` fit, showing the selection.
+    pub fn viewport(&mut self, rows: usize) -> usize {
+        let count = self.filtered().len();
+        self.top = if self.page() {
+            self.selected
+        } else {
+            crate::tui::render::scroll_to(self.top, self.selected, rows.max(1))
+        };
+        self.top = self.top.min(count.saturating_sub(rows));
+        if self.page() {
+            self.selected = self.top;
+        }
+        self.top
     }
 
     pub fn filtered(&self) -> Vec<ItemRef<'_>> {
@@ -244,13 +315,11 @@ impl App {
     }
     pub(super) fn open(&mut self, title: &str, kind: MenuKind) {
         self.next_menu_id.0 = self.next_menu_id.0.wrapping_add(1);
-        self.overlay = Some(Overlay::Menu(Menu {
-            id: self.next_menu_id,
-            title: title.into(),
+        self.overlay = Some(Overlay::Menu(Menu::new(
+            self.next_menu_id,
+            title.into(),
             kind,
-            input: Editor::default(),
-            selected: 0,
-        }));
+        )));
     }
     pub(super) fn menu_loaded(&mut self, loaded: MenuLoaded) -> bool {
         let Some(menu) = self.menu_mut() else {
@@ -317,7 +386,7 @@ impl App {
             _ => None,
         };
         if let Some(selected) = selected {
-            menu.selected = selected;
+            menu.select(selected);
             return;
         }
         match key.code {
@@ -326,7 +395,7 @@ impl App {
             KeyCode::Delete => self.delete_draft_item(),
             _ => {
                 menu.input.handle(key);
-                menu.selected = 0;
+                menu.select(0);
             }
         }
     }
@@ -506,7 +575,7 @@ mod tests {
             ]),
         );
         let second = row(&mut app, 1);
-        let selected = |app: &App| app.menu().unwrap().selected;
+        let selected = |app: &App| app.menu().unwrap().selected();
         mouse(&mut app, second, MouseEventKind::Moved);
         assert_eq!(selected(&app), 1);
         key(&mut app, KeyCode::Down, M::NONE);
@@ -543,5 +612,115 @@ mod tests {
         mouse(&mut app, visible_second, MouseEventKind::Moved);
         key(&mut app, KeyCode::Enter, M::NONE);
         assert_eq!(app.model, "test/second".parse().unwrap());
+    }
+
+    /// The pointer picks among the rows shown without moving them, in a palette
+    /// and on a text page, which it never selects beneath; the keyboard still
+    /// scrolls to what it selects.
+    #[tokio::test]
+    async fn pointer_keeps_a_scrolled_menu_in_place_while_keys_reveal() {
+        use crossterm::event::MouseButton;
+        let (_root, mut app) = fixture().await;
+        for index in 0..40 {
+            app.local_notice(format!("Message number {index} beneath the menu"));
+        }
+        let rows = |app: &mut App| -> Vec<(usize, Rect)> {
+            draw(app);
+            let hits = app.hits.iter();
+            let rows = hits.filter_map(|(rect, hit)| match hit {
+                Hit::Menu(index) => Some((*index, *rect)),
+                _ => None,
+            });
+            rows.collect()
+        };
+        let top = |app: &mut App| rows(app)[0].0;
+        let left = MouseButton::Left;
+        let drag = |app: &mut App, rows: &[(usize, Rect)]| {
+            for (index, kind) in [
+                (1, MouseEventKind::Moved),
+                (3, MouseEventKind::Down(left)),
+                (6, MouseEventKind::Drag(left)),
+                (6, MouseEventKind::Up(left)),
+            ] {
+                mouse(app, rows[index].1, kind);
+            }
+        };
+
+        let models = (0..30).map(|index| {
+            let name = format!("test/model-{index}");
+            Item::new(name.parse().unwrap(), name, "")
+        });
+        app.open("Models", MenuKind::Models(models.collect()));
+        key(&mut app, KeyCode::End, M::NONE);
+        let shown = rows(&mut app);
+        let first = shown[0].0;
+        assert!(first > 0 && shown.last().unwrap().0 == 29);
+        for row in [1, 4] {
+            mouse(&mut app, shown[row].1, MouseEventKind::Moved);
+            mouse(&mut app, shown[row].1, MouseEventKind::Drag(left));
+            assert_eq!(top(&mut app), first);
+            assert_eq!(app.menu().unwrap().selected(), first + row);
+        }
+        // Up moves within the rows shown, then scrolls one at a time.
+        for _ in 0..5 {
+            key(&mut app, KeyCode::Up, M::NONE);
+        }
+        assert_eq!(top(&mut app), first - 1);
+        key(&mut app, KeyCode::Home, M::NONE);
+        assert_eq!(top(&mut app), 0);
+        key(&mut app, KeyCode::End, M::NONE);
+        assert_eq!(top(&mut app), first);
+        // Clicking a row still chooses it.
+        let shown = rows(&mut app);
+        click(&mut app, shown[2].1);
+        assert!(app.menu().is_none());
+        assert_eq!(app.model.to_string(), format!("test/model-{}", first + 2));
+
+        let lines: Vec<_> = (0..60).map(|line| format!("line {line}")).collect();
+        app.info("Page", lines.join("\n"));
+        key(&mut app, KeyCode::PageDown, M::NONE);
+        let shown = rows(&mut app);
+        assert_eq!(shown[0].0, MENU_PAGE);
+        drag(&mut app, &shown);
+        assert_eq!(top(&mut app), MENU_PAGE);
+        assert!(app.menu().is_some_and(Menu::page));
+        assert!(app.selection.is_none() && app.clipboard.is_none());
+        key(&mut app, KeyCode::Down, M::NONE);
+        assert_eq!(top(&mut app), MENU_PAGE + 1);
+        // At the end of the page, Up scrolls back at once.
+        key(&mut app, KeyCode::End, M::NONE);
+        let last = top(&mut app);
+        assert_eq!(last + shown.len(), lines.len());
+        key(&mut app, KeyCode::Up, M::NONE);
+        assert_eq!(top(&mut app), last - 1);
+    }
+
+    /// A shorter viewport scrolls to keep the selection in view, so Enter never
+    /// chooses a row that is not shown.
+    #[tokio::test]
+    async fn a_shrinking_palette_keeps_its_selection_in_view() {
+        let (_root, mut app) = fixture().await;
+        let models = (0..30).map(|index| {
+            let name = format!("test/model-{index}");
+            Item::new(name.parse().unwrap(), name, "")
+        });
+        app.open("Models", MenuKind::Models(models.collect()));
+        key(&mut app, KeyCode::End, M::NONE);
+        let shown = |app: &mut App, height| {
+            draw_sized_buffer(app, 80, height);
+            let hits = app.hits.iter();
+            let rows = hits.filter_map(|(_, hit)| match hit {
+                Hit::Menu(index) => Some(*index),
+                _ => None,
+            });
+            rows.collect::<Vec<_>>()
+        };
+        let tall = shown(&mut app, 32);
+        let short = shown(&mut app, 22);
+        assert!(short.len() < tall.len());
+        assert_eq!(app.menu().unwrap().selected(), 29);
+        assert_eq!(short.last(), Some(&29));
+        key(&mut app, KeyCode::Enter, M::NONE);
+        assert_eq!(app.model.to_string(), "test/model-29");
     }
 }

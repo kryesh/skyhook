@@ -202,7 +202,7 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
     app.prompt_option_rows = option_lines.len();
     let input = app.prompt_input_mut();
     if !input.options_scrolled {
-        input.option_scroll = scroll_to(input.option_scroll, selected_start, option_height);
+        input.option_scroll = scroll_to(input.option_scroll, selected_start, option_height.into());
         input.options_scrolled = true;
     }
     input.option_scroll = input
@@ -318,9 +318,8 @@ pub(super) fn draw_prompt(frame: &mut Frame, app: &mut App, layout: &PromptLayou
 }
 
 /// Move a `height`-row window's first row as little as possible to show `cursor`.
-fn scroll_to(top: usize, cursor: usize, height: u16) -> usize {
-    top.min(cursor)
-        .max((cursor + 1).saturating_sub(height as usize))
+pub(in crate::tui) fn scroll_to(top: usize, cursor: usize, height: usize) -> usize {
+    top.min(cursor).max((cursor + 1).saturating_sub(height))
 }
 
 /// Visible agent hierarchy with shared statistics and navigation hit targets.
@@ -336,7 +335,7 @@ pub(super) fn draw_tree(
     fill(frame, app.tree_rect, THEME.panel);
     app.tree_cursor = app.tree_cursor.min(tree_agents.len().saturating_sub(1));
     if app.focus == Focus::Tree {
-        app.tree_scroll = scroll_to(app.tree_scroll, app.tree_cursor, tree_rows);
+        app.tree_scroll = scroll_to(app.tree_scroll, app.tree_cursor, tree_rows.into());
     }
     app.tree_scroll = app
         .tree_scroll

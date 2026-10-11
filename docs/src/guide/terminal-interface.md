@@ -178,9 +178,12 @@ without moving the cursor. It supports word movement, selection, `Ctrl+A/E`,
 start/end of the draft. Up/Down move through displayed input rows; in an empty composer they
 recall earlier prompts, and keep stepping through them until the recalled prompt is edited.
 Click agent and tool rows, scroll the relevant panel, or drag across text in user/agent messages
-and tool output, then copy the selected characters with `Ctrl+X Y` (or `y` while content is focused).
-Selection supports parts of a line and multiple lines; copying preserves Unicode and code indentation
-without adding newlines at visual wraps.
+and tool output: releasing the mouse copies the selected characters, and `Ctrl+X Y` (or `y` while
+content is focused) copies them again. A plain click copies nothing. Selecting text never scrolls the
+conversation, and open palettes and text pages stay where they are under the pointer. Selection
+supports parts of a line and multiple lines; copying preserves Unicode and code indentation without
+adding newlines at visual wraps. Each copy reports how many characters it sent to the terminal; the
+terminal does not confirm that it accepted them.
 The workspace path is centered in the top bar. The bottom bar shows the model ID, session ID,
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
 (usually Shift-drag) and copy shortcut. Copy uses the terminal's OSC 52 clipboard support. `@` or `Ctrl+X F` attaches a workspace file

@@ -1,5 +1,5 @@
 //! Switching between the open sessions and the workspace's saved ones.
-use super::{Item, MenuKind, MenuLoaded};
+use super::{Emphasis, Item, MenuKind, MenuLoaded};
 use crate::text::brief;
 use crate::tui::app::{App, Peer, PeerSession, SlotKey, TITLE_CHARS, Work};
 use crate::tui::format::{Precision, local_time};
@@ -36,6 +36,15 @@ enum Recency {
     Now,
 }
 
+/// Which group a row sorts into, last first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Group {
+    /// Viewed, unstarted and saved sessions.
+    Rest,
+    Activated,
+    Current,
+}
+
 /// A session saved in the workspace, as its row shows it.
 struct Saved {
     id: SessionId,
@@ -56,8 +65,9 @@ impl Saved {
     }
 }
 
-/// Working sessions first, then every other open or saved session newest first.
-/// Each row's columns, right to left by importance: when it was last active, its
+/// The current session first, then the other activated sessions, working ones
+/// first, then every other open or saved session, each group newest first.
+/// Activated rows are emphasized. Each row's columns, right to left by importance: when it was last active, its
 /// mode, how many events it holds, and its id.
 async fn load_sessions(
     root: PathBuf,
@@ -84,11 +94,11 @@ fn session_rows(mut saved: Vec<Saved>, peers: &[Peer], today: NaiveDate) -> Vec<
             let (label, columns, recency) = match peer.session {
                 PeerSession::Draft => draft(),
                 // It reads as a draft until its first record is observed.
-                PeerSession::Started(id) => {
+                PeerSession::Started { id, .. } => {
                     take(id);
                     draft()
                 }
-                PeerSession::Open { id, last } => {
+                PeerSession::Open { id, last, .. } => {
                     let (label, columns) = match take(id) {
                         Some(row) => row.row(time(last)),
                         None => {
@@ -100,18 +110,29 @@ fn session_rows(mut saved: Vec<Saved>, peers: &[Peer], today: NaiveDate) -> Vec<
                     (label, columns, Recency::At(last))
                 }
             };
+            let activated = peer.session.activated();
+            let emphasis = if activated {
+                Emphasis::Strong
+            } else {
+                Emphasis::Normal
+            };
             let item = Item::columned(SessionRef::Live(peer.key), label, "", columns);
-            (peer.working, recency, item)
+            let group = match (peer.current, activated) {
+                (true, _) => Group::Current,
+                (false, true) => Group::Activated,
+                (false, false) => Group::Rest,
+            };
+            ((group, peer.working, recency), item.emphasized(emphasis))
         })
         .collect();
     rows.extend(saved.into_iter().map(|row| {
         let (value, last) = (SessionRef::Saved(row.id, row.state), row.last);
         let (label, columns) = row.row(time(last));
         let item = Item::columned(value, label, "", columns);
-        (false, Recency::At(last), item)
+        ((Group::Rest, false, Recency::At(last)), item)
     }));
-    rows.sort_by_key(|(working, recency, _)| std::cmp::Reverse((*working, *recency)));
-    rows.into_iter().map(|(_, _, item)| item).collect()
+    rows.sort_by_key(|(order, _)| std::cmp::Reverse(*order));
+    rows.into_iter().map(|(_, item)| item).collect()
 }
 
 /// Sessions scanned at once.
@@ -195,17 +216,21 @@ impl App {
 mod tests {
     use super::*;
 
+    /// The current session leads even while only viewed, then the other
+    /// activated sessions, working first, then viewed, unstarted and saved ones,
+    /// each group newest first; activated rows are bold.
     #[tokio::test]
-    async fn switch_menu_pins_working_sessions_then_orders_by_last_activity() {
+    async fn switch_menu_pins_current_then_activated_sessions_then_orders_by_last_activity() {
         use crate::tui::app::{
             played::{ask, played},
+            session::Activation::{Activated, Viewed},
             tests::draft_fixture,
         };
         use skyhook::job::JobState;
         let (_root, app) = draft_fixture().await;
         let root = app.launch.sessions.clone();
         let mut stores = vec![];
-        for index in 0..6 {
+        for index in 0..8 {
             let (session, mut model) = played(&app.launch).await;
             // A prompt no answer followed resumes interrupted; its request, sent once
             // the prompt commits, stays open.
@@ -226,40 +251,54 @@ mod tests {
         }
         let ids: Vec<_> = stores.iter().map(|(session, _)| session.id()).collect();
         let mut saved = load_saved(&root).await.unwrap();
-        assert_eq!(saved.len(), 6);
+        assert_eq!(saved.len(), 8);
         for row in &mut saved {
             let index = ids.iter().position(|id| *id == row.id).unwrap();
             assert_eq!(row.last, stores[index].1);
             // Appends use wall time; row ordering must not depend on clock resolution.
-            row.last = [5, 6, 20, 40, 30, 7][index];
+            row.last = [5, 6, 20, 40, 30, 7, 8, 9][index];
         }
         let keys: Vec<_> = std::iter::successors(Some(SlotKey::default()), |key| Some(key.next()))
-            .take(4)
+            .take(6)
             .collect();
         let peer = |key, session, working| Peer {
             key,
             session,
             state: AgentDisplayState::Ready,
-            current: false,
+            current: key == keys[0],
             attention: false,
             working,
         };
-        let open = |id, last| PeerSession::Open { id, last };
-        // Long idle, then working, then fresh drafts, one whose journal exists:
-        // working pins, drafts are newest, and the idle session sorts below the
-        // saved ones by time. Open sessions are never listed again as saved.
+        let open = |id, last, activation| PeerSession::Open {
+            id,
+            last,
+            activation,
+        };
+        // The current session is viewed, idle and oldest; an activated session is
+        // older than every viewed and saved one; an unstarted draft is not
+        // activated, one whose journal exists is. Open sessions are never
+        // listed again as saved.
         let peers = vec![
-            peer(keys[0], open(ids[0], 1), false),
-            peer(keys[1], open(ids[1], 0), true),
+            peer(keys[0], open(ids[0], 1, Viewed), false),
+            peer(keys[1], open(ids[1], 0, Activated), true),
             peer(keys[2], PeerSession::Draft, false),
-            peer(keys[3], PeerSession::Started(ids[5]), false),
+            peer(
+                keys[3],
+                PeerSession::Started {
+                    id: ids[5],
+                    activation: Activated,
+                },
+                false,
+            ),
+            peer(keys[4], open(ids[6], 2, Activated), false),
+            peer(keys[5], open(ids[7], 50, Viewed), false),
         ];
         let today = Local::now().date_naive();
         let items = session_rows(saved, &peers, today);
         let rows: Vec<_> = items.iter().map(|item| item.value).collect();
-        let live = [keys[1], keys[2], keys[3]].map(SessionRef::Live);
-        assert!(rows.len() == 7 && rows[..3] == live);
-        assert!(rows[6] == SessionRef::Live(keys[0]));
+        let live = [keys[0], keys[1], keys[3], keys[4], keys[2], keys[5]].map(SessionRef::Live);
+        assert_eq!(rows.len(), 9);
+        assert!(rows[..6] == live);
         let saved = [
             SessionRef::Saved(
                 ids[3],
@@ -268,11 +307,23 @@ mod tests {
             SessionRef::Saved(ids[4], SavedState::Locked),
             SessionRef::Saved(ids[2], SavedState::Closed(AgentDisplayState::Ready)),
         ];
-        assert!(rows[3..6] == saved);
+        assert!(rows[6..] == saved);
+        let emphasis: Vec<_> = items.iter().map(|item| item.emphasis).collect();
+        let (normal, strong) = (Emphasis::Normal, Emphasis::Strong);
+        let expected = [
+            normal, strong, strong, strong, normal, normal, normal, normal, normal,
+        ];
+        assert_eq!(emphasis, expected);
         let time = |index: usize| items[index].columns.last().unwrap().as_str();
-        assert_eq!(time(6), local_time(1, today, &Local, Precision::Minutes));
-        assert_eq!(items[6].columns[0], ids[0].to_string());
-        assert!(time(1) == "draft" && time(2) == "draft");
+        assert_eq!(time(0), local_time(1, today, &Local, Precision::Minutes));
+        assert_eq!(items[0].columns[0], ids[0].to_string());
+        assert!(time(2) == "draft" && time(4) == "draft");
+
+        // Once activated, the current session is bold too.
+        let mut peers = peers;
+        peers[0].session = open(ids[0], 1, Activated);
+        let items = session_rows(vec![], &peers, today);
+        assert!(items[0].value == live[0] && items[0].emphasis == strong);
         stores[4].0.shutdown().await.unwrap();
         stores[4].0.close().await.unwrap();
     }

@@ -432,7 +432,10 @@ mod tests {
             }
         })
         .await;
-        slot.app.menu_mut().unwrap().selected = row.expect("a locked row");
+        slot.app
+            .menu_mut()
+            .unwrap()
+            .select(row.expect("a locked row"));
         let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         slot.app.event(Event::Key(enter));
     }

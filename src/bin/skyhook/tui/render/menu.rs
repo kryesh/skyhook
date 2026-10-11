@@ -157,15 +157,20 @@ pub(super) fn draw_menu_item(
     } else {
         format!("   {}", item.detail)
     };
+    let style = match item.emphasis {
+        Emphasis::Normal => Style::default(),
+        Emphasis::Strong => Style::default().add_modifier(Modifier::BOLD),
+    };
     let line = Line::from(vec![
-        Span::styled(item.label.to_owned(), Style::default().fg(fg)),
-        Span::styled(detail, Style::default().fg(THEME.muted)),
+        Span::styled(item.label.to_owned(), style.fg(fg)),
+        Span::styled(detail, style.fg(THEME.muted)),
     ]);
     let line = clipped(line, usize::from(text_width));
     text(frame, r(row.x, row.y, text_width, 1), line, fg, bg);
     if columns_width > 0 {
         let rect = r(row.right() - columns_width, row.y, columns_width, 1);
         let columns = format!("{MENU_GAP}{}", columns.format(item.columns));
+        let columns = Line::from(Span::styled(columns, style.fg(THEME.muted)));
         text(frame, rect, columns, THEME.muted, bg);
     }
 }
@@ -201,7 +206,6 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
         THEME.fg,
         THEME.input,
     );
-    let items = menu.filtered();
     let agent_menu = matches!(menu.kind, MenuKind::Agents(_));
     let agents = &app.projection.agents;
     let agent_stats: Vec<_> = if agent_menu {
@@ -232,16 +236,18 @@ pub(super) fn draw_menu(frame: &mut Frame, app: &mut App) {
         }
     }
     let height = rect.height.saturating_sub(3 + header_height) as usize;
-    // A text page has nothing to pick: its selection is the first visible line.
-    let page = matches!(menu.kind, MenuKind::Info(_));
-    let top = if page {
-        menu.selected.min(items.len().saturating_sub(height))
-    } else {
-        menu.selected.saturating_sub(height.saturating_sub(1))
+    let Some(Overlay::Menu(menu)) = &mut app.overlay else {
+        return;
     };
+    let top = menu.viewport(height);
+    let Some(Overlay::Menu(menu)) = &app.overlay else {
+        return;
+    };
+    let items = menu.filtered();
+    let page = menu.page();
     for (i, item) in items.iter().enumerate().skip(top).take(height) {
         let y = rect.y + 2 + header_height + (i - top) as u16;
-        let selected = i == menu.selected && !page;
+        let selected = i == menu.selected() && !page;
         let bg = if selected {
             THEME.selected
         } else {
@@ -442,6 +448,36 @@ mod tests {
         assert!(line.ends_with("1 · 2 · 3 · 1h 02m 03s"), "{line}");
     }
 
+    /// A strong row is bold throughout, label and columns alike; a normal one is not.
+    #[test]
+    fn strong_menu_rows_are_bold() {
+        let kind = MenuKind::Sessions(vec![]);
+        let columns = ["0123", "14:02"].map(String::from);
+        for (emphasis, bold) in [(Emphasis::Normal, false), (Emphasis::Strong, true)] {
+            let item = ItemRef {
+                index: 0,
+                label: "Session",
+                detail: "",
+                columns: &columns,
+                emphasis,
+                search: "",
+            };
+            let layout = MenuColumns::new(std::slice::from_ref(&item), 40);
+            let mut terminal = Terminal::new(TestBackend::new(40, 1)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let row = frame.area();
+                    draw_menu_item(frame, row, &item, &kind, &layout, false, THEME.input);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let text = (0..40).filter(|&x| buffer[(x, 0)].symbol() != " ");
+            let cells: Vec<_> = text.map(|x| buffer[(x, 0)].modifier).collect();
+            assert!(cells.len() > "Session".len() + "14:02".len());
+            assert!(cells.iter().all(|m| m.contains(Modifier::BOLD) == bold));
+        }
+    }
+
     /// Columns stay whole and right-aligned; the label keeps its room, so the
     /// leftmost columns go first, and the detail gives way to both.
     #[test]
@@ -465,6 +501,7 @@ mod tests {
                 label,
                 detail,
                 columns: &columns,
+                emphasis: Emphasis::Normal,
                 search: "",
             };
             for width in [0, 2, 8, 12, 21, 30, 44, 80] {

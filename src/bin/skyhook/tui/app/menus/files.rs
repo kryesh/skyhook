@@ -91,7 +91,7 @@ mod tests {
         for (path, expected) in [(relative, text), (image, png)] {
             app.open("Files", MenuKind::Files(items.clone(), None));
             let selected = items.iter().position(|item| item.value == path);
-            app.menu_mut().unwrap().selected = selected.unwrap();
+            app.menu_mut().unwrap().select(selected.unwrap());
             app.choose();
             let Work::File { result, .. } = recv(&mut rx).await else {
                 panic!("file read")
