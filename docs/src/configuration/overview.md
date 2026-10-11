@@ -137,7 +137,8 @@ to the old format. Use `skyhook dump config` to validate and inspect the effecti
 Relative MCP `cwd` values resolve against the directory of the **source file defining that
 value**. A user-defined `cwd` keeps its user-file base when other MCP fields are overlaid;
 a workspace-defined `cwd` uses the workspace config's directory (`<workspace>/.skyhook`),
-not the workspace root.
+not the workspace root. An MCP server without `cwd`, from either file, starts in the session
+workspace rather than the directory `skyhook` was launched from.
 
 The CLI always stores and discovers sessions in `<workspace>/.skyhook/sessions`, including
 headless execution and resume. It does not search other workspaces or honor `session_root` overrides.

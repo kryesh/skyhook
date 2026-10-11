@@ -36,7 +36,7 @@ impl SessionRuntime {
                 return Err(HarnessError::Interrupted);
             }
             let viewer = turn.diagnostic_viewer();
-            self.deliver_events(agent, viewer).await?;
+            self.deliver_events(agent, viewer, &[]).await?;
             agent_context.refresh(&self.store, agent)?;
             let profile = agent_context.profile.profile.clone();
             if !profile.supports_images && agent_context.contains_images() {
@@ -335,7 +335,7 @@ impl SessionRuntime {
             if calls.is_empty() && self.rejoin(agent).await {
                 // Events that arrived during the request precede the answer.
                 let viewer = turn.diagnostic_viewer();
-                let delivered = self.deliver_events(agent, viewer).await?.is_some();
+                let delivered = self.deliver_events(agent, viewer, &[]).await?.is_some();
                 if delivered
                     || self
                         .consume_queued_inputs(&mut turn, agent_context, settings)

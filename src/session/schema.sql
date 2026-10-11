@@ -1,4 +1,4 @@
--- Skyhook session database (application_id 0x534B5948, user_version 21). Tables are STRICT;
+-- Skyhook session database (application_id 0x534B5948, user_version 22). Tables are STRICT;
 -- subtype rows key (entry, kind) -> entry(seq, kind). db/mod.rs adds append-only triggers
 -- to tables outside MUTABLE_TABLES. u64 values saturate to i64::MAX.
 --
@@ -21,11 +21,6 @@ CREATE TABLE session (
 -- payload column several share; the payload's table references it through a
 -- generated column.
 CREATE TABLE capability (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
-
--- Pinned harness capability ceiling; every agent's set must be a subset (FK below).
-CREATE TABLE session_capability (
-  capability TEXT PRIMARY KEY REFERENCES capability(name)
-) STRICT, WITHOUT ROWID;
 
 -- 'root' is seeded at create; it has no revision rows.
 CREATE TABLE target (
@@ -156,36 +151,42 @@ CREATE TABLE mode_entry_kind (name TEXT PRIMARY KEY REFERENCES entry_kind(name))
 CREATE TABLE agent_capability (
   entry INTEGER NOT NULL,
   kind TEXT NOT NULL REFERENCES mode_entry_kind(name),
-  capability TEXT NOT NULL REFERENCES session_capability(capability),
+  capability TEXT NOT NULL REFERENCES capability(name),
   PRIMARY KEY (entry, capability),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT, WITHOUT ROWID;
 
--- Mode definitions pinned by the entry that first used them; the session keeps them
--- whatever the configuration later says.
+-- Each edition of a mode the session applied, recorded by the entry that first applied
+-- it. The session runs the configured definitions; earlier editions are kept so every
+-- entry still shows what it ran under. Versions count up from 1 per name.
 CREATE TABLE mode (
-  id INTEGER PRIMARY KEY,
-  entry INTEGER NOT NULL,
+  name TEXT NOT NULL,
+  version INTEGER NOT NULL CHECK (version > 0),
+  entry INTEGER NOT NULL UNIQUE,
   kind TEXT NOT NULL REFERENCES mode_entry_kind(name),
-  name TEXT NOT NULL UNIQUE,
   instructions TEXT,
   hint TEXT,
+  PRIMARY KEY (name, version),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
-) STRICT;
-
--- What the mode lists, which may exceed the session ceiling; agent_capability rows
--- hold what an agent was actually granted.
-CREATE TABLE mode_capability (
-  mode INTEGER NOT NULL REFERENCES mode(id),
-  capability TEXT NOT NULL REFERENCES capability(name),
-  PRIMARY KEY (mode, capability)
 ) STRICT, WITHOUT ROWID;
 
--- The agent's mode as of this entry.
+-- What the edition lists, which may exceed what the live ceiling allows; agent_capability
+-- rows hold what an agent was actually granted.
+CREATE TABLE mode_capability (
+  mode_name TEXT NOT NULL,
+  mode_version INTEGER NOT NULL,
+  capability TEXT NOT NULL REFERENCES capability(name),
+  PRIMARY KEY (mode_name, mode_version, capability),
+  FOREIGN KEY (mode_name, mode_version) REFERENCES mode(name, version)
+) STRICT, WITHOUT ROWID;
+
+-- The agent's mode edition as of this entry.
 CREATE TABLE agent_mode (
   entry INTEGER PRIMARY KEY,
   kind TEXT NOT NULL REFERENCES mode_entry_kind(name),
-  mode INTEGER NOT NULL REFERENCES mode(id),
+  mode_name TEXT NOT NULL,
+  mode_version INTEGER NOT NULL,
+  FOREIGN KEY (mode_name, mode_version) REFERENCES mode(name, version),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 

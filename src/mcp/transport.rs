@@ -3,6 +3,7 @@
 use std::{
     collections::{BTreeMap, HashMap},
     io,
+    path::Path,
     pin::Pin,
     process::Stdio,
     sync::Arc,
@@ -102,15 +103,13 @@ pub(crate) struct OwnedProcess {
 }
 
 impl OwnedProcess {
-    fn spawn(spec: &CommandSpec, piped: bool) -> Result<Self, McpError> {
+    fn spawn(spec: &CommandSpec, workspace: &Path, piped: bool) -> Result<Self, McpError> {
         let mut command = Command::new(&spec.argv[0]);
         command
             .args(&spec.argv[1..])
             .envs(&spec.env)
+            .current_dir(spec.directory(workspace))
             .kill_on_drop(true);
-        if let Some(cwd) = &spec.cwd {
-            command.current_dir(cwd);
-        }
         command.stdin(if piped { Stdio::piped() } else { Stdio::null() });
         command.stdout(if piped { Stdio::piped() } else { Stdio::null() });
         // Never leave an unread stderr pipe that could deadlock initialization.
@@ -581,11 +580,12 @@ where
 /// that future, so timeout/cancellation still explicitly kills and reaps children.
 pub(crate) async fn connect(
     config: &McpServerConfig,
+    workspace: &Path,
     process: &mut Option<OwnedProcess>,
 ) -> Result<Client, McpError> {
     match config.connection() {
         McpConnection::Stdio(command) => {
-            *process = Some(OwnedProcess::spawn(command, true)?);
+            *process = Some(OwnedProcess::spawn(command, workspace, true)?);
             let child = &mut process.as_mut().expect("process just created").child;
             let stdout = child.stdout.take().expect("piped stdout");
             let stdin = child.stdin.take().expect("piped stdin");
@@ -619,7 +619,7 @@ pub(crate) async fn connect(
                 },
                 Err(error) => return Err(initialize_error(*error)),
             };
-            *process = Some(OwnedProcess::spawn(command, false)?);
+            *process = Some(OwnedProcess::spawn(command, workspace, false)?);
             wait_for_readiness(
                 || async {
                     http_connect(client.clone(), transport.clone())

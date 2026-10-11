@@ -7,10 +7,10 @@ impl Harness {
     /// journaled and no agent runs until the first call that changes it, which
     /// first settles what the process that last ran it left open.
     pub async fn resume_session(&self, id: SessionId) -> Result<SessionHandle, HarnessError> {
-        let (store, records) = SessionStore::open(&self.inner.session_root, id).await?;
+        let (store, _) = SessionStore::open(&self.inner.session_root, id).await?;
         let jobs = JobManager::new(store.clone());
         let open = Arc::new(Open(store.clone(), jobs.supervisor().clone()));
-        let runtime = SessionRuntime::build(self.inner.clone(), store, jobs, &records).await?;
+        let runtime = SessionRuntime::build(self.inner.clone(), store, jobs).await?;
         let root = AgentId::root(runtime.store.id());
         Ok(SessionHandle {
             runtime,
@@ -888,10 +888,14 @@ mod tests {
         shutdown_session(resumed).await;
     }
 
-    /// A session never outgrows the ceiling it started with. A mode it has used keeps
-    /// the definition it was used under; a mode new to it is pinned on first use.
+    /// A reopened session runs the configured modes and capabilities, wider or
+    /// narrower than when it last ran. Viewing it, or work that does not run the
+    /// root, only warns of a changed mode; the next work that runs the root decides
+    /// its mode once, with the message it commits or before a script, moving onto
+    /// the configured edition or onto the default mode once its own is gone. The
+    /// journal keeps every edition it applied.
     #[tokio::test]
-    async fn resume_keeps_the_session_ceiling_and_its_pinned_modes() {
+    async fn resume_follows_the_configured_modes_and_journals_their_editions() {
         use crate::tool::policy::{Capability, CapabilitySet, Mode};
         let root = tempfile::tempdir().unwrap();
         let sessions = root.path().join("sessions");
@@ -925,59 +929,92 @@ mod tests {
         let id = session.id();
         shutdown_session(session).await;
 
-        let in_mode = |session: &SessionHandle, mode: &str| {
-            session.selection(None, Some(&mode_name(mode))).unwrap()
-        };
-        let changes = |records: &[EventRecord]| events!(records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
-        // A wider live ceiling does not widen the session: `work` grants no write here.
-        let wide = CapabilitySet::default;
-        let harness = build(wide(), &[look.clone(), work.clone()], "two")
-            .await
-            .unwrap();
-        let resumed = harness.resume_session(id).await.unwrap();
-        let prompt = resumed.prompt_with_options("widen", &[], in_mode(&resumed, "work"));
-        assert_eq!(prompt.await.unwrap(), "two");
-        let first = crate::session::ModeSelection {
-            name: "work".parse().unwrap(),
-            definition: Some(work.1.clone()),
-        };
-        let records = resumed.runtime.store.records();
-        assert_eq!(changes(&records), [(first.clone(), vec![Capability::Read])]);
-        shutdown_session(resumed).await;
-
-        // The configuration now redefines both modes and adds one. The session keeps
-        // its own `look`, pins the new `extra` when a message first uses it, and keeps
-        // that after it leaves the configuration again.
-        let relook = ("look", mode(&[], "Changed."));
-        let extra = ("extra", mode(&[Capability::Read], "Extra."));
-        for (configured, selected, reply) in [
-            (vec![relook.clone(), extra.clone()], "extra", "three"),
-            (vec![relook.clone()], "look", "four"),
-            (vec![relook], "extra", "five"),
-        ] {
-            let harness = build(wide(), &configured, reply).await.unwrap();
-            let resumed = harness.resume_session(id).await.unwrap();
-            let prompt = resumed.prompt_with_options("next", &[], in_mode(&resumed, selected));
-            assert_eq!(prompt.await.unwrap(), reply);
-            shutdown_session(resumed).await;
-        }
-        let (_store, records) = SessionStore::open(&sessions, id).await.unwrap();
         let named = |name: &str, definition: Option<&Mode>| crate::session::ModeSelection {
             name: mode_name(name),
             definition: definition.cloned(),
         };
-        let read = vec![Capability::Read];
-        let expected = [
-            (first, read.clone()),
-            (named("extra", Some(&extra.1)), read.clone()),
-            (named("look", None), read.clone()),
-            (named("extra", None), read),
-        ];
-        assert_eq!(changes(&records), expected);
+        let granted = |session: &SessionHandle, name: &str| -> Vec<Capability> {
+            let granted = session.mode_capabilities(&mode_name(name)).unwrap();
+            granted.iter().collect()
+        };
+        let in_mode = |session: &SessionHandle, mode: &str| {
+            session.selection(None, Some(&mode_name(mode))).unwrap()
+        };
+        let mut expected = Vec::new();
+        // A wider live ceiling widens the session: `work` now grants write.
+        let wide = CapabilitySet::default;
+        let harness = build(wide(), &[look.clone(), work.clone()], "two");
+        let resumed = harness.await.unwrap().resume_session(id).await.unwrap();
+        assert!(resumed.startup_warnings().is_empty());
+        let widened = granted(&resumed, "work");
+        assert!(widened.contains(&Capability::Write));
+        // The root's own mode now grants more too, but the message names `work`:
+        // that is the one change.
+        assert!(resumed.changes_mode(&mode_name("look")));
+        let prompt = resumed.prompt_with_options("widen", &[], in_mode(&resumed, "work"));
+        assert_eq!(prompt.await.unwrap(), "two");
+        expected.push((named("work", Some(&work.1)), widened));
+        shutdown_session(resumed).await;
+
+        // Redefining `look`, which the root no longer runs, warns of nothing; its
+        // next use records the configured edition.
+        let relook = ("look", mode(&[], "Changed."));
+        let harness = build(wide(), &[relook.clone(), work.clone()], "three");
+        let resumed = harness.await.unwrap().resume_session(id).await.unwrap();
+        assert!(resumed.startup_warnings().is_empty());
+        assert!(resumed.changes_mode(&mode_name("look")));
+        assert!(!resumed.changes_mode(&mode_name("work")));
+        // Activating work that does not run the root leaves its mode alone.
+        let root = resumed.root_agent().clone();
+        resumed.rename(Some("renamed".into())).await.unwrap();
+        resumed.record_status(root, "noted".into()).await.unwrap();
+        let prompt = resumed.prompt_with_options("next", &[], in_mode(&resumed, "look"));
+        assert_eq!(prompt.await.unwrap(), "three");
+        expected.push((named("look", Some(&relook.1)), granted(&resumed, "look")));
+        shutdown_session(resumed).await;
+
+        // Once `look`, which the root runs, is gone, viewing warns; a script runs the
+        // root in the default mode, and the message after it changes nothing more.
+        let harness = build(wide(), std::slice::from_ref(&work), "four");
+        let resumed = harness.await.unwrap().resume_session(id).await.unwrap();
+        let warnings = resumed.startup_warnings().join("\n");
+        assert!(warnings.contains("no longer has mode `look`"), "{warnings}");
+        assert!(warnings.contains("default mode `work`"), "{warnings}");
+        resumed.run_script("return 1;").await.unwrap();
+        assert_eq!(resumed.prompt("last").await.unwrap(), "four");
+        expected.push((named("work", None), granted(&resumed, "work")));
+        shutdown_session(resumed).await;
+        // Adopted, it warns no more.
+        let harness = build(wide(), std::slice::from_ref(&work), "unused");
+        let resumed = harness.await.unwrap().resume_session(id).await.unwrap();
+        assert!(resumed.startup_warnings().is_empty());
+        shutdown_session(resumed).await;
+
+        let (_store, records) = SessionStore::open(&sessions, id).await.unwrap();
+        let changes = events!(&records, SessionEvent::ModeChanged { mode, capabilities } => (mode.clone(), capabilities.clone()));
+        assert_eq!(changes, expected);
+        // A message's change commits with it; a script's precedes the script.
+        let follows =
+            records
+                .windows(2)
+                .filter_map(|pair| match (&pair[0].event, &pair[1].event) {
+                    (SessionEvent::ModeChanged { .. }, next) => Some(match next {
+                        SessionEvent::MessageCommitted {
+                            message: crate::session::Message::User(_),
+                        } => "message",
+                        SessionEvent::JobCreated { tool, .. } if tool == "script" => "script",
+                        _ => "other",
+                    }),
+                    _ => None,
+                });
+        assert_eq!(
+            follows.collect::<Vec<_>>(),
+            ["message", "message", "script"]
+        );
         let captured = requests.lock().unwrap().clone();
         let prompt = |index: usize| captured[index].system[0].text.clone();
-        assert!(prompt(3).contains("Look.") && !prompt(3).contains("Changed."));
-        assert!(prompt(4).contains("Extra."));
+        assert!(prompt(2).contains("Changed.") && !prompt(2).contains("Look."));
+        assert!(prompt(3).contains("Work."));
     }
 
     /// A retained child accepts owner input after a restart: its loop starts again
@@ -1035,6 +1072,192 @@ mod tests {
         let history = serde_json::to_string(&child.context).unwrap();
         assert!(history.contains("work") && history.contains("child done"));
         assert!(history.contains("Owner input"));
+        shutdown_session(resumed).await;
+    }
+
+    /// Events delivered to a reopened root that runs a redefined mode commit in one
+    /// transaction with the mode change its turn makes, ahead of the delivery.
+    #[tokio::test]
+    async fn a_delivery_to_a_reopened_root_commits_with_its_mode_change() {
+        use crate::tool::policy::{Capability, Mode};
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let look = |instructions: &str| Mode {
+            capabilities: vec![Capability::Read, Capability::Agents],
+            instructions: Some(instructions.parse().unwrap()),
+            hint: None,
+        };
+        let build = |provider, instructions: &str| {
+            let modes = [(mode_name("look"), look(instructions))]
+                .into_iter()
+                .collect();
+            test_builder(root.path(), &sessions, provider, false)
+                .modes(modes)
+                .build()
+        };
+        let delegate = tool_call(0, "delegate", "agent", json!({"prompt": "work"}));
+        let responses = [
+            response(vec![delegate]),
+            answer("child done"),
+            answer("root done"),
+        ];
+        let provider = scripted_provider(&requests, responses);
+        let session = build(provider, "Look.").await.unwrap().new_session().await;
+        let session = session.unwrap();
+        assert_eq!(session.prompt("delegate").await.unwrap(), "root done");
+        let records = session.runtime.store.records();
+        let job = events!(&records, SessionEvent::JobCreated { job, tool, .. } if tool == "agent" => *job)
+            [0];
+        let id = session.id();
+        shutdown_session(session).await;
+
+        // Owner input runs the retained child, whose answer reaches the idle root.
+        let responses = [answer("child resumed"), answer("root again")];
+        let provider = scripted_provider(&requests, responses);
+        let harness = build(provider, "Changed.").await.unwrap();
+        let resumed = harness.resume_session(id).await.unwrap();
+        // The root answered, so continuing only opens the session: it sends the
+        // root no input that could carry the mode change first.
+        let continued = resumed.continue_turn_with(Selection::default()).await;
+        assert!(continued.unwrap().answer.is_none());
+        resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
+        let root = resumed.root.clone();
+        let answered = move |state: &mut CoreState| {
+            let answers = state.records.iter().filter(|record| {
+                record.agent == root
+                    && matches!(
+                        &record.event,
+                        SessionEvent::MessageCommitted {
+                            message: Message::Assistant(_),
+                        }
+                    )
+            });
+            (answers.count() == 3).then_some(())
+        };
+        found(&resumed, answered).await;
+        let records = resumed.runtime.store.records();
+        let changed = (records.iter())
+            .position(|record| matches!(record.event, SessionEvent::ModeChanged { .. }))
+            .unwrap();
+        let (change, delivery) = (&records[changed], &records[changed + 1]);
+        let SessionEvent::ModeChanged { mode, .. } = &change.event else {
+            unreachable!()
+        };
+        assert_eq!(mode.definition, Some(look("Changed.")));
+        let SessionEvent::MessageCommitted {
+            message: Message::User(parts),
+        } = &delivery.event
+        else {
+            panic!("the delivery follows its mode change: {:?}", delivery.event);
+        };
+        assert!(matches!(parts[..], [UserPart::JobEvents { .. }]));
+        // One commit dates every entry it journals alike.
+        assert_eq!(change.timestamp_millis, delivery.timestamp_millis);
+        let captured = requests.lock().unwrap().clone();
+        let last = captured.last().unwrap();
+        assert!(last.system[0].text.contains("Changed."));
+        shutdown_session(resumed).await;
+    }
+
+    /// A session whose turn in `look` ended as `last` says, reopened to answer
+    /// `replies` after the configuration redefined `look`.
+    async fn reopened_in_a_redefined_mode<const N: usize>(
+        root: &Path,
+        sessions: &Path,
+        last: Step,
+        replies: [Step; N],
+    ) -> SessionHandle {
+        use crate::tool::policy::{Capability, Mode};
+        let requests = Requests::default();
+        let build = |provider, instructions: &str| {
+            let look = Mode {
+                capabilities: vec![Capability::Read],
+                instructions: Some(instructions.parse().unwrap()),
+                hint: None,
+            };
+            let modes = [(mode_name("look"), look)].into_iter().collect();
+            test_builder(root, sessions, provider, false)
+                .modes(modes)
+                .build()
+        };
+        let provider = Script::new([last], &requests);
+        let session = build(provider, "Look.").await.unwrap().new_session().await;
+        let session = session.unwrap();
+        let _ = session.prompt("start").await;
+        let id = session.id();
+        shutdown_session(session).await;
+        let provider = Script::new(replies, &requests);
+        let resumed = build(provider, "Changed.")
+            .await
+            .unwrap()
+            .resume_session(id)
+            .await;
+        let resumed = resumed.unwrap();
+        let warnings = resumed.startup_warnings().join("\n");
+        assert!(warnings.contains("changed mode `look`"), "{warnings}");
+        resumed.running().await.unwrap();
+        assert!(resumed.changes_mode(&mode_name("look")));
+        resumed
+    }
+
+    /// A script's mode change begins no turn: an interrupt that lands while it
+    /// commits stops nothing, and the script runs under the new mode.
+    #[tokio::test]
+    async fn an_interrupt_during_a_scripts_mode_change_stops_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let answered = Step::new(answer("done"));
+        let resumed = reopened_in_a_redefined_mode(root.path(), &sessions, answered, []).await;
+        let changed: fn(&SessionEvent) -> bool =
+            |event| matches!(event, SessionEvent::ModeChanged { .. });
+        let (reached, resume) = resumed.runtime.store.pause_committed(changed).await;
+        let script = tokio::spawn({
+            let resumed = resumed.clone();
+            async move { resumed.run_script("return 1;").await }
+        });
+        bounded(reached).await.unwrap();
+        assert_eq!(interrupt_behind(&resumed, resume).await, 0);
+        bounded(script).await.unwrap().unwrap();
+        let records = resumed.runtime.store.records();
+        assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 1);
+        assert!(!resumed.changes_mode(&mode_name("look")));
+        shutdown_session(resumed).await;
+    }
+
+    /// While a script's mode change commits, a reopened root whose turn failed
+    /// stays parked, so a `continue` issued then still resumes that turn.
+    #[tokio::test]
+    async fn a_continue_during_a_scripts_mode_change_resumes_the_parked_turn() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let rejected = crate::provider::ProviderErrorKind::InvalidRequest.error("rejected");
+        let replies = [Step::new(answer("continued"))];
+        let resumed =
+            reopened_in_a_redefined_mode(root.path(), &sessions, Step::fail(rejected), replies)
+                .await;
+        let changed: fn(&SessionEvent) -> bool =
+            |event| matches!(event, SessionEvent::ModeChanged { .. });
+        let (reached, resume) = resumed.runtime.store.pause_committed(changed).await;
+        let script = tokio::spawn({
+            let resumed = resumed.clone();
+            async move { resumed.run_script("return 1;").await }
+        });
+        bounded(reached).await.unwrap();
+        let root = resumed.root.clone();
+        let turn = resumed
+            .runtime
+            .agents(|agents| agents.get(&root).map(|facts| facts.turn.clone()));
+        assert!(matches!(turn, Some(Turn::Parked(_))), "{turn:?}");
+        // Queued behind the paused change: it reads the root as parked.
+        let mut continued = Box::pin(resumed.continue_turn_with(Selection::default()));
+        assert!(futures_util::poll!(&mut continued).is_pending());
+        resume.send(()).unwrap();
+        let continued = bounded(continued).await.unwrap();
+        assert_eq!(continued.answer.as_deref(), Some("continued"));
+        bounded(script).await.unwrap().unwrap();
+        let records = resumed.runtime.store.records();
+        assert_eq!(count!(&records, SessionEvent::ModeChanged { .. }), 1);
         shutdown_session(resumed).await;
     }
 

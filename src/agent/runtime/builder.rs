@@ -106,7 +106,7 @@ impl Assembled {
     }
 }
 
-/// A mode is a set: the journal pins it sorted and without repeats. Interaction
+/// A mode is a set: the journal records it sorted and without repeats. Interaction
 /// follows the host, so a mode never lists it.
 fn normalize_modes(modes: &mut indexmap::IndexMap<ModeName, Mode>) {
     for mode in modes.values_mut() {

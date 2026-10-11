@@ -41,18 +41,11 @@ impl Encoder {
     /// first, since every entry, including a session start, references its agent.
     pub(in crate::session) fn records(&mut self, db: &Db, records: &[EventRecord]) -> DbResult<()> {
         for record in records {
-            // The session's capability ceiling precedes the agent capabilities within it.
-            if let SessionEvent::SessionStarted { capabilities, .. } = &record.event {
+            if let SessionEvent::SessionStarted { .. } = &record.event {
                 db.execute(
                     "INSERT INTO session (singleton, public_id) VALUES (1, ?1)",
                     params![record.agent.session().to_bytes().to_vec()],
                 )?;
-                for capability in capabilities {
-                    db.execute(
-                        "INSERT INTO session_capability (capability) VALUES (?1)",
-                        params![*capability],
-                    )?;
-                }
             }
             self.start_agent(db, record)?;
         }
@@ -269,18 +262,24 @@ mod tests {
         let context = one!(SessionEvent::ModelContext {
             context: agent_context.clone(),
         });
-        // A mode that grants nothing still records the change.
-        for (mode, capabilities) in [
-            ("look", vec![crate::tool::policy::Capability::Read]),
-            ("none", vec![]),
-        ] {
-            // The first use of a mode pins its definition; a later one names it.
-            for first in [true, false] {
-                let definition = first.then(|| crate::tool::policy::Mode {
-                    capabilities: capabilities.clone(),
-                    instructions: (!capabilities.is_empty()).then(|| "Only look.".parse().unwrap()),
-                    hint: (!capabilities.is_empty()).then(|| "Read-only.".parse().unwrap()),
-                });
+        // A mode that grants nothing still records the change. An entry with a
+        // definition records its name's next edition; one without names the latest.
+        let edition = |instructions: Option<&str>| crate::tool::policy::Mode {
+            capabilities: instructions
+                .map(|_| crate::tool::policy::Capability::Read)
+                .into_iter()
+                .collect(),
+            instructions: instructions.map(|text| text.parse().unwrap()),
+            hint: instructions.map(|_| "Read-only.".parse().unwrap()),
+        };
+        let editions = [
+            ("look", edition(Some("Only look."))),
+            ("none", edition(None)),
+            ("look", edition(Some("Look closer."))),
+        ];
+        for (mode, definition) in editions {
+            let capabilities = definition.capabilities.clone();
+            for definition in [Some(definition), None] {
                 one!(SessionEvent::ModeChanged {
                     mode: crate::session::ModeSelection {
                         name: mode.parse().unwrap(),
@@ -663,5 +662,11 @@ mod tests {
             one!(event);
         }
         fixture.assert_round_trip();
+        let look = fixture.db.query(
+            "SELECT mode_version FROM agent_mode WHERE mode_name = 'look' ORDER BY entry",
+            Vec::new(),
+            |row| Ok(row.get::<i64>(0)?),
+        );
+        assert_eq!(look.unwrap(), [1, 1, 2, 2]);
     }
 }

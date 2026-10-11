@@ -31,7 +31,7 @@ pub use state::{SessionSummary, SessionTitle};
 pub(super) use state::{summary, title};
 
 pub(super) const APPLICATION_ID: i64 = 0x534B_5948;
-pub(super) const USER_VERSION: i64 = 21;
+pub(super) const USER_VERSION: i64 = 22;
 const SCHEMA: &str = include_str!("../schema.sql");
 const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// Bytes of write-ahead log kept after a checkpoint.

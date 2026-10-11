@@ -146,7 +146,7 @@ impl PreparedAgentLaunch {
             owner_job: agent_loop.owner_job,
             profile: Some(agent_loop.context.profile.clone()),
             available_depth: u32::try_from(self.available_depth).unwrap_or(u32::MAX),
-            mode: (agent_loop.settings.mode.as_ref()).map(|mode| runtime.mode_selection(mode)),
+            mode: (agent_loop.settings.mode.as_ref()).map(AppliedMode::selection),
             capabilities: agent_loop.settings.capabilities.iter().collect(),
             location: agent_loop.location.clone(),
         };
@@ -155,7 +155,6 @@ impl PreparedAgentLaunch {
         // root, the only agent that starts rather than resumes without an owner.
         let session = id.parent().is_none().then(|| SessionEvent::SessionStarted {
             targets: runtime.harness.target_definitions.clone(),
-            capabilities: runtime.capabilities.iter().collect(),
         });
         // The seed lands with the start, so the child never shows an empty list.
         let seeded = (todos.clone()).map(|items| SessionEvent::TodosReplaced { items });
@@ -389,13 +388,11 @@ impl SessionRuntime {
             .ok_or_else(|| HarnessError::UnknownModel(model.clone()))
     }
 
-    /// The journal form of a mode about to be applied. The session keeps the
-    /// definition of a mode's first use only.
-    pub(super) fn mode_selection(&self, name: &ModeName) -> crate::session::ModeSelection {
-        crate::session::ModeSelection {
-            name: name.clone(),
-            definition: self.modes.get(name).cloned(),
-        }
+    /// The edition of `name` the configuration defines now.
+    pub(super) fn applied(&self, name: &ModeName) -> Result<AppliedMode, HarnessError> {
+        let definition = self.modes.get(name);
+        let definition = definition.ok_or_else(|| HarnessError::UnknownMode(name.clone()))?;
+        Ok(AppliedMode::configured(name, definition))
     }
 
     pub(super) async fn system_prompt(
@@ -403,7 +400,7 @@ impl SessionRuntime {
         agent: &AgentId,
         location: &crate::execution::ExecutionLocation,
         available_depth: usize,
-        mode: Option<&ModeName>,
+        mode: Option<&AppliedMode>,
         capabilities: &CapabilitySet,
     ) -> Result<Vec<SystemSegment>, HarnessError> {
         let target = match &location.target {
@@ -418,7 +415,7 @@ impl SessionRuntime {
             location,
             target: target.as_ref(),
             available_depth,
-            mode: mode.and_then(|name| Some((name.as_str(), self.modes.get(name)?))),
+            mode: mode.map(|mode| (mode.name.as_str(), &*mode.definition)),
             capabilities,
         })];
         Ok(system)
@@ -531,12 +528,41 @@ impl SessionRuntime {
         agents: &Agents,
         agent: &AgentId,
     ) -> Option<RecordedContract> {
-        let mut contract = agents.contract(agent)?.clone();
+        let contract = agents.contract(agent)?;
+        let (available_depth, capabilities) = self.resumed_grants(agent, contract);
+        Some(RecordedContract {
+            available_depth,
+            capabilities,
+            ..contract.clone()
+        })
+    }
+
+    /// The depth and capabilities of `agent`'s journaled `contract` under the live
+    /// configuration.
+    fn resumed_grants(
+        &self,
+        agent: &AgentId,
+        contract: &RecordedContract,
+    ) -> (usize, CapabilitySet) {
         let remaining = self.harness.max_child_depth.saturating_sub(agent.depth());
-        contract.available_depth = contract.available_depth.min(remaining);
-        let allowed = self.capabilities.for_agent(contract.available_depth);
-        contract.capabilities = &contract.capabilities & &allowed;
-        Some(contract)
+        let depth = contract.available_depth.min(remaining);
+        let capabilities = &contract.capabilities & &self.capabilities.for_agent(depth);
+        (depth, capabilities)
+    }
+
+    /// The mode `agent` runs and what it holds under the live configuration,
+    /// without reading the rest of its contract.
+    pub(super) fn resumed_mode(
+        &self,
+        agent: &AgentId,
+    ) -> Option<(Option<AppliedMode>, CapabilitySet)> {
+        self.agents(|agents| {
+            let contract = agents.contract(agent)?;
+            Some((
+                contract.mode.clone(),
+                self.resumed_grants(agent, contract).1,
+            ))
+        })
     }
 }
 
@@ -553,8 +579,11 @@ impl SessionRuntime {
     /// runs or not yet: a call relaunched after a reopen may run before its owner
     /// resumes.
     pub(super) fn delegation(&self, agent: &AgentId) -> Option<(ModelRef, usize)> {
-        let contract = self.agents(|agents| self.resumed_contract(agents, agent))?;
-        Some((contract.profile.name, contract.available_depth))
+        self.agents(|agents| {
+            let contract = agents.contract(agent)?;
+            let (depth, _) = self.resumed_grants(agent, contract);
+            Some((contract.profile.name.clone(), depth))
+        })
     }
 }
 

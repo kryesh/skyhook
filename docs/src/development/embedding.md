@@ -33,8 +33,18 @@ root agent that capability set directly, and no mode applies.
 `SessionHandle::selection(model, mode)` issues the `Selection` a submitted message or a continued
 turn carries, rejecting a `provider/model` or mode the session does not have; omitted selections
 retain the active model and mode. A mode change applies to the root agent from the boundary that
-consumes it, not retroactively to children it already started. A session pins each mode's
-definition on first use and cannot outgrow its original capability ceiling.
+consumes it, not retroactively to children it already started. A session runs the harness's modes
+and capability ceiling, whatever it ran under before. A reopened session reports modes the
+configuration redefined or removed in `startup_warnings()` and changes nothing while viewed, nor
+when calls such as `rename`, `record_status` or `cancel_job` activate it. The next work that runs
+the root (a prompt, continue, job delivery or `run_script`) decides its mode once: the selected
+one, else its own as configured now, or the default mode once its own is gone (without a default
+mode, it keeps running its own edition). A message's
+`ModelChanged` and `ModeChanged` are journaled in one transaction with its `MessageCommitted`; a
+script's precede the script. Each `ModeChanged` or `AgentStarted` whose definition
+differs from that mode's latest journaled one records a new edition, which the journal keeps for
+auditing. `SessionHandle::changes_mode(mode)` reports whether the root's next message in `mode`
+would change what it runs.
 
 Each `SessionEvent::TitleSet` records its `TitleSource`: `Prompt`, `User` or `Generated`.
 `SessionHandle::set_title(title)` gives a session an automatic title from its first input (a prompt
@@ -127,7 +137,7 @@ input delivers them.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.
 
-Session databases use format 21. Earlier formats are not migrated and cannot be resumed with
+Session databases use format 22. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.
 

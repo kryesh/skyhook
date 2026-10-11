@@ -110,6 +110,13 @@ impl DriverPhase {
     }
 }
 
+/// What a turn begins with: input whose selection and message are still to
+/// commit, or delivered events committed together with their selection.
+enum Begins {
+    Input(Vec<UserPart>, Option<RequestCompletion>, Selection),
+    Delivered(Result<(), HarnessError>),
+}
+
 /// What an agent's loop takes next.
 enum Work {
     Command(AgentCommand),
@@ -157,7 +164,8 @@ impl SessionRuntime {
 
     /// `id`'s next command, or the deliveries an unparked agent has pending, with
     /// a fresh token for the turn it begins, busy from here on so an interrupt
-    /// stops it; or the session's refusal of new turns, with everything the agent
+    /// stops it (a selection alone begins none and leaves the agent as it was);
+    /// or the session's refusal of new turns, with everything the agent
     /// held. A paused session gives it no deliveries: they stay pending until
     /// `continue` or new input opens it. An `answered` invocation is settled once
     /// nothing keeps it open, however its last work went. Only the owner's
@@ -187,13 +195,16 @@ impl SessionRuntime {
             // The token is cancelled before anyone holds it.
             let begins = matches!(work, Work::Command(AgentCommand::Input { .. }));
             let token = supervisor.begin_turn(&id);
-            let turn = if begins && state.jobs.begin(&id) {
-                token.cancel();
-                Turn::Parked(TurnFailure::Interrupted)
-            } else {
-                Turn::Busy
+            let resting = match work {
+                // A selection alone begins no turn: the agent stays as it was, so
+                // neither an interrupt nor `continue` mistakes it for one.
+                Work::Command(AgentCommand::Select { .. }) => facts.turn.clone(),
+                _ if begins && state.jobs.begin(&id) => {
+                    token.cancel();
+                    facts.set_turn(Turn::Parked(TurnFailure::Interrupted))
+                }
+                _ => facts.set_turn(Turn::Busy),
             };
-            let resting = facts.set_turn(turn);
             Some(Taken::Work(work, token, resting))
         };
         self.store.until(take).await.unwrap_or(Taken::Gone)
@@ -374,7 +385,6 @@ impl SessionRuntime {
             };
             // Every input/notification path shares the same delivery window.
             let _ = self.flush_events(&id, &cancellation).await;
-            let mut delivered = Ok(());
             let mut turn = TurnContext {
                 agent: &id,
                 owner_job,
@@ -382,7 +392,7 @@ impl SessionRuntime {
                 location: &location,
                 capabilities: settings.capabilities.clone(),
             };
-            let empty = || (Vec::new(), None, Selection::default());
+            let empty = || Begins::Input(Vec::new(), None, Selection::default());
             let work = match work {
                 Work::Command(AgentCommand::QueuedInputs(inputs)) => {
                     let batch = self
@@ -397,42 +407,57 @@ impl SessionRuntime {
                     content,
                     done,
                     options,
-                }) => Some((content, done, options)),
-                Work::Jobs => match self.deliver_events(&id, turn.diagnostic_viewer()).await {
-                    Ok(None) => None,
-                    committed => {
-                        delivered = committed.map(drop);
-                        Some(empty())
-                    }
-                },
+                }) => Some(Begins::Input(content, done, options)),
+                Work::Command(AgentCommand::Select { options, done }) => {
+                    let selected =
+                        self.select(&mut turn, &mut context, &mut settings, options, false);
+                    let adopted = match selected.await {
+                        Ok(selected) => self
+                            .adopt(&mut turn, &mut context, &mut settings, selected, None)
+                            .await
+                            .map_err(HarnessError::from),
+                        Err(error) => Err(error),
+                    };
+                    let _ = done.send(adopted);
+                    None
+                }
+                Work::Jobs => {
+                    let delivered = self.deliver_selected(&mut turn, &mut context, &mut settings);
+                    delivered.await.map(Begins::Delivered)
+                }
             };
             // Work that runs no turn may still have been what kept an answered
             // invocation open.
-            let Some((content, done, options)) = work else {
+            let Some(begins) = work else {
                 self.rest(&id, resting).await;
                 self.settle_answered(&id, owner_job, &mut phase).await;
                 continue;
             };
-            let images = content.iter().any(UserPart::is_image);
-            let selected = self.select(&mut turn, &mut context, &mut settings, options, images);
-            if let Err(error) = selected.await {
-                // The phase is untouched: a parked child stays parked until an
-                // input with an admissible selection resumes its retained task.
-                self.rest(&id, resting).await;
-                if let Some(done) = done {
-                    done.settle(Err(error));
+            let (done, delivered) = match begins {
+                Begins::Input(content, done, options) => {
+                    let images = content.iter().any(UserPart::is_image);
+                    let selected =
+                        self.select(&mut turn, &mut context, &mut settings, options, images);
+                    let selected = match selected.await {
+                        Ok(selected) => selected,
+                        Err(error) => {
+                            // The phase is untouched: a parked child stays parked until
+                            // an input with an admissible selection resumes its task.
+                            self.rest(&id, resting).await;
+                            if let Some(done) = done {
+                                done.settle(Err(error));
+                            }
+                            continue;
+                        }
+                    };
+                    let done = phase.begin(done);
+                    let message = (!content.is_empty()).then(|| Message::User(content));
+                    let adopted =
+                        self.adopt(&mut turn, &mut context, &mut settings, selected, message);
+                    (done, adopted.await.map_err(HarnessError::from))
                 }
-                continue;
-            }
-            let done = phase.begin(done);
-            if !content.is_empty() && delivered.is_ok() {
-                let message = Message::User(content);
-                delivered = self
-                    .commit(&id, message)
-                    .await
-                    .map(drop)
-                    .map_err(Into::into);
-            }
+                Begins::Delivered(delivered) => (phase.begin(None), delivered),
+            };
             if let Err(error) = delivered {
                 let failure = TurnFailure::from(&error);
                 if let Some(done) = done {

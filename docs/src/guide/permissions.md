@@ -86,20 +86,28 @@ config that declares a mode replaces the whole definition of a user-config mode 
 modes it does not name are kept, in declaration order.
 
 `--mode NAME` selects the starting mode; without it the terminal starts in the mode last used in
-that workspace, and a batch job in `default_mode`. In the terminal, `Tab`/`Shift+Tab` in the composer (or
-`/mode`) choose the mode the next message is sent in; the footer shows it. A change takes effect
-with that message and forfeits the provider's prompt cache for the next request. Child agents keep what they start with: the capabilities and instructions of the mode their
-parent chose for them, or otherwise the capabilities their parent holds and no mode instructions.
-Background jobs and scripts already running keep their capabilities too. A session can only hold capabilities
-that some configured mode grants, and MCP servers start under that union, so switching modes
-never starts or stops a server. Approvals granted earlier stay granted but cannot be used while
-the mode lacks their capability. A resumed session continues in the mode it was last in. A
-session records each mode's definition the first time it is used and keeps it: editing or
-removing that mode in the configuration does not change the session, while modes added later
-can still be selected. A resumed session is also never granted more than it started with, so a
-batch session reopened in the terminal stays without `interactive`. Because `general` is always
-present, redeclare it with a narrower list if the terminal should never be able to switch to its
-default capabilities.
+that workspace, and a batch job in `default_mode`. In the terminal, `Tab`/`Shift+Tab` in the
+composer (or `/mode`) choose the mode the next message is sent in; the footer shows it. Cycling
+modes only makes that choice: it never changes the session. A change takes effect with that message
+and forfeits the provider's prompt cache for the next request. Child agents keep what they start
+with: the capabilities and instructions of the mode their parent chose for them, or otherwise the
+capabilities their parent holds and no mode instructions. Background jobs and scripts already
+running keep their capabilities too. A session can only hold capabilities that some configured mode
+grants, and MCP servers start under that union, so switching modes never starts or stops a server.
+Approvals granted earlier stay granted but cannot be used while the mode lacks their capability.
+
+A resumed session continues in the mode it was last in, as the current configuration defines it:
+the configuration decides what a reopened session's modes grant, more or less than before, and a
+batch session reopened in the terminal gains `interactive`. Opening a session whose modes the
+configuration has since changed or removed shows a warning and changes nothing, and neither do
+renaming it or cancelling a job. The change applies with the next work that runs the root agent: a
+prompt, retry, continue, script or job delivery. It is recorded together with the message that
+work commits, or just before a script starts. A root agent whose mode was removed moves to the
+default mode. Child agents it already started keep what they started with, within what the
+configuration still allows. The session's history keeps every
+definition of a mode it used, so earlier entries still show what they ran under. Because `general`
+is always present, redeclare it with a narrower list if the terminal should never be able to switch
+to its default capabilities.
 Continuing a failed or interrupted root turn also applies a newly chosen mode.
 
 Capabilities gate both tool discovery and invocation, including JavaScript. Approval policies and

@@ -7,23 +7,11 @@ impl SessionRuntime {
         harness: Arc<HarnessInner>,
         store: SessionStore,
         jobs: JobManager,
-        prior_records: &[EventRecord],
     ) -> Result<Arc<Self>, HarnessError> {
-        // A session never holds more than it started with: its journaled ceiling
-        // narrows the live one for as long as it is open.
-        let started = prior_records.iter().find_map(|record| match &record.event {
-            SessionEvent::SessionStarted { capabilities, .. } => {
-                Some(&harness.capabilities & &capabilities.iter().copied().collect())
-            }
-            _ => None,
-        });
-        // A new session journals its start alongside its root.
-        let new = || harness.capabilities.clone();
-        let capabilities = (started.or_else(|| prior_records.is_empty().then(new)))
-            .ok_or(HarnessError::MissingSessionStart)?;
-        let mut modes = harness.modes.clone();
-        let pinned = crate::session::pinned_modes(prior_records);
-        modes.extend(pinned.map(|(name, mode)| (name.clone(), mode.clone())));
+        // The live configuration is authoritative: a reopened session holds what it
+        // grants now, more or less than when the session last ran.
+        let capabilities = harness.capabilities.clone();
+        let modes = harness.modes.clone();
         let authorization =
             crate::tool::authorization::AuthorizationCoordinator::new(harness.policy.clone())
                 .with_targets(store.clone());
@@ -46,8 +34,12 @@ impl SessionRuntime {
         install_script_tool(&mut builder, Arc::downgrade(&executor_slot))?;
         tools::register(&mut builder, runtime_slot.clone(), &harness.models, &modes)?;
         builder.extend(&harness.extra_tools)?;
-        let (mcp, startup_warnings) =
+        let (mcp, mut startup_warnings) =
             tools::connect_mcp(&mut builder, &harness, &capabilities, &store).await;
+        let root = AgentId::root(store.id());
+        let running = store.read(|state| state.agents.contract(&root)?.mode.clone());
+        let default = harness.mode.as_ref();
+        startup_warnings.extend(modes::drift_warning(running.as_ref(), &modes, default));
         let executor = ToolExecutor::with_authorization(
             builder.build(),
             authorization,
@@ -132,9 +124,11 @@ impl SessionRuntime {
 
     /// A new session's root: the default model, in the configured mode.
     pub(super) fn new_root(&self) -> Result<AgentLaunch, HarnessError> {
-        let mode = self.harness.mode.clone();
+        let mode = (self.harness.mode.as_ref())
+            .map(|name| self.applied(name))
+            .transpose()?;
         let capabilities = match &mode {
-            Some(mode) => self.mode_capabilities(mode)?,
+            Some(mode) => self.granted_by(&mode.definition),
             None => self.capabilities.clone(),
         };
         Ok(AgentLaunch::New {

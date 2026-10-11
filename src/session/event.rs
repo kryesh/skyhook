@@ -152,7 +152,7 @@ impl RecordSeq {
 
     /// The sequence the next record takes.
     #[must_use]
-    pub(in crate::session) const fn next(self) -> Self {
+    pub(crate) const fn next(self) -> Self {
         Self(self.0.saturating_add(1))
     }
 
@@ -339,8 +339,9 @@ impl ModelContext {
     }
 }
 
-/// The mode an entry applies. The session pins a mode's definition on its first use
-/// and keeps it whatever the configuration later says.
+/// The mode an entry applies. An entry whose definition differs from the name's
+/// latest edition records a new edition; one without names the latest. Sessions run
+/// the configured definitions, so earlier editions only show what entries ran under.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ModeSelection {
     pub name: crate::tool::policy::ModeName,
@@ -351,10 +352,9 @@ pub struct ModeSelection {
 #[derive(Clone, Debug, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionEvent {
-    /// The session's pinned harness settings; every agent's capabilities are a subset.
+    /// The session's pinned target definitions.
     SessionStarted {
         targets: Vec<TargetDefinition>,
-        capabilities: Vec<Capability>,
     },
     TitleSet {
         title: String,

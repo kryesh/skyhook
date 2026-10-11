@@ -157,11 +157,6 @@ pub(in crate::session) fn decode_records(
     job::events(&mut events)?;
     let targets = contract::targets(db)?;
     let agents = agent_paths(db, session)?;
-    let session_capabilities = sorted(db.query(
-        "SELECT capability FROM session_capability",
-        Vec::new(),
-        |row| enum_column(row, 0),
-    )?);
     let entries = db.query(
         "SELECT seq, public_id, agent, created_millis, kind FROM entry ORDER BY seq",
         Vec::new(),
@@ -180,7 +175,6 @@ pub(in crate::session) fn decode_records(
         let event = match kind {
             EntryKind::SessionStarted => SessionEvent::SessionStarted {
                 targets: targets.get(&seq).cloned().unwrap_or_default(),
-                capabilities: session_capabilities.clone(),
             },
             EntryKind::TargetsUpserted => SessionEvent::TargetsUpserted {
                 targets: targets.get(&seq).cloned().unwrap_or_default(),

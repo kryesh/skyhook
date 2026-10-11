@@ -11,7 +11,7 @@ use crate::{
     session::{
         CoreState, EventRecord, Message, ModelPurpose, ProfileSnapshot, RequestPhase, SessionEvent,
     },
-    tool::policy::{CapabilitySet, ModeName},
+    tool::policy::{CapabilitySet, Mode, ModeName},
 };
 
 /// The agents whose loops run, and whether they take deliveries.
@@ -25,6 +25,8 @@ pub(crate) struct Agents {
     children: HashMap<AgentId, u32>,
     /// What each agent's journal says it runs under, whether it runs or not.
     contracts: HashMap<AgentId, RecordedContract>,
+    /// Each mode's latest journaled edition.
+    editions: HashMap<ModeName, std::sync::Arc<Mode>>,
     /// Where each agent's journal leaves its last turn, and when.
     last: HashMap<AgentId, (Last, i64)>,
 }
@@ -43,11 +45,52 @@ enum Last {
 pub(super) struct RecordedContract {
     pub(super) profile: ProfileSnapshot,
     pub(super) available_depth: usize,
-    pub(super) mode: Option<ModeName>,
+    pub(super) mode: Option<AppliedMode>,
     pub(super) capabilities: CapabilitySet,
     pub(super) location: ExecutionLocation,
     pub(super) system: Option<Vec<SystemSegment>>,
     pub(super) tools: Option<Vec<ToolDefinition>>,
+}
+
+/// A mode as an agent runs it: the edition it was applied under, which the
+/// configuration may since have changed.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct AppliedMode {
+    pub(super) name: ModeName,
+    pub(super) definition: std::sync::Arc<Mode>,
+}
+
+impl AppliedMode {
+    /// The configured `definition` of `name`, as an agent entering it now runs it.
+    pub(super) fn configured(name: &ModeName, definition: &Mode) -> Self {
+        Self {
+            name: name.clone(),
+            definition: definition.clone().into(),
+        }
+    }
+
+    /// The journal form of applying it, which records its definition only when
+    /// that is a new edition.
+    pub(super) fn selection(&self) -> crate::session::ModeSelection {
+        crate::session::ModeSelection {
+            name: self.name.clone(),
+            definition: Some(Mode::clone(&self.definition)),
+        }
+    }
+}
+
+/// The edition `selection` applies: the one it records, or its name's latest.
+fn applied(
+    editions: &mut HashMap<ModeName, std::sync::Arc<Mode>>,
+    selection: &crate::session::ModeSelection,
+) -> Option<AppliedMode> {
+    if let Some(definition) = &selection.definition {
+        editions.insert(selection.name.clone(), definition.clone().into());
+    }
+    Some(AppliedMode {
+        name: selection.name.clone(),
+        definition: editions.get(&selection.name)?.clone(),
+    })
 }
 
 /// Whether agents take their deliveries. An interrupt that stops anything pauses
@@ -116,7 +159,7 @@ pub(super) const INTERRUPTED: Turn = Turn::Parked(TurnFailure::Interrupted);
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Turn {
     Idle,
-    /// From taking work until the turn it begins ends, or commits its answer with
+    /// From taking work that begins a turn until that turn ends, or commits its answer with
     /// nothing left to carry. Only a busy turn requests, commits a response or
     /// makes calls.
     Busy,
@@ -281,7 +324,7 @@ impl Agents {
                 let contract = RecordedContract {
                     profile: profile.clone(),
                     available_depth: *available_depth as usize,
-                    mode: mode.as_ref().map(|mode| mode.name.clone()),
+                    mode: (mode.as_ref()).and_then(|mode| applied(&mut self.editions, mode)),
                     capabilities: capabilities.iter().copied().collect(),
                     location: location.clone(),
                     system: None,
@@ -293,7 +336,7 @@ impl Agents {
                 contract.profile = profile.clone();
             }
             (SessionEvent::ModeChanged { mode, capabilities }, Some(contract)) => {
-                contract.mode = Some(mode.name.clone());
+                contract.mode = applied(&mut self.editions, mode);
                 contract.capabilities = capabilities.iter().copied().collect();
                 // The mode's prompt and tools are pinned by its next model context.
                 (contract.system, contract.tools) = (None, None);
@@ -365,7 +408,9 @@ impl Agents {
         facts.inbox = kept;
         let batches = queued.into_iter().map(|command| match command {
             AgentCommand::QueuedInputs(inputs) => inputs,
-            AgentCommand::Input { .. } => unreachable!("partitioned out"),
+            AgentCommand::Input { .. } | AgentCommand::Select { .. } => {
+                unreachable!("partitioned out")
+            }
         });
         batches.collect()
     }

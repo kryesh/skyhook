@@ -70,8 +70,6 @@ pub enum HarnessError {
     ImageLimit,
     #[error("model `{0}` does not support image inputs")]
     ImagesUnsupported(crate::provider::protocol::WireModel),
-    #[error("session start event is missing")]
-    MissingSessionStart,
 }
 
 impl HarnessError {
@@ -305,9 +303,9 @@ mod tests {
         let refused = HarnessError::Refused("no".into());
         let summary = CompactionFault::Summary(FailureKind::Refused);
         assert_eq!(CompactionFault::from(&refused), summary);
-        let journaling = HarnessError::MissingSessionStart;
-        let other = CompactionFault::from(&journaling);
-        assert_eq!(other, CompactionFault::Other(journaling.to_string()));
+        let depth = HarnessError::ChildDepth;
+        let other = CompactionFault::from(&depth);
+        assert_eq!(other, CompactionFault::Other(depth.to_string()));
     }
 
     #[test]

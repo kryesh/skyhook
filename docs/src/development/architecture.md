@@ -13,7 +13,7 @@ See [embedding](embedding.md) for host API and replay contracts,
 | Owner | Responsibility |
 | --- | --- |
 | `config::RuntimeConfig` | An admitted, immutable configuration generation. A selected model retains the configuration that admitted it. |
-| `agent::Harness` | Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions. |
+| `agent::Harness` | Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, modes, and the capability ceiling every session it opens runs under. |
 | `agent::SessionHandle` / session runtime | One agent tree, its registry and jobs, target routing, MCP connections, observation stream, and session store. |
 | `AgentContext` | One agent loop's projected history, request template, model profile, and owned provider context. |
 | `provider::ProviderContext` | Conversation-scoped provider resources and one-attempt model invocations, not authoritative conversation history or retry policy. |

@@ -11,7 +11,7 @@ mcp:
     transport: "stdio"
     start_command: ["my-mcp-server", "--root", "/srv/project"]
     capabilities: ["read"]
-    cwd: "mcp-work"                  # Relative to the source config file's directory.
+    cwd: "mcp-work"                  # Relative to its config file's directory; default: workspace.
     env: { LOG_LEVEL: "warn" }        # Environment overrides for the launched process.
     startup_timeout_secs: 30         # Default; must be a positive integer.
     call_timeout_secs: 120           # Default; must be a positive integer.
@@ -34,7 +34,9 @@ unreachable—not on authentication, protocol, or other server errors. `cwd` and
 `start_command`; HTTP connections without a startup command must omit them. Relative `cwd` is
 resolved against the directory of the source configuration file that defines the value, not the
 agent workspace. Each server entry comes whole from one file, so a user server's `cwd` is relative to
-the user file's directory and a workspace server's to `<workspace>/.skyhook`. Timeouts must be positive
+the user file's directory and a workspace server's to `<workspace>/.skyhook`. Without `cwd`, the
+command runs in the session workspace, whichever file defines the server; MCP commands always run on
+the session host, never on a remote target. Timeouts must be positive
 whole seconds. Unknown settings and invalid transport combinations are rejected. Environment
 values must be strings; quote numeric-looking values such as `WORKERS: "4"`.
 

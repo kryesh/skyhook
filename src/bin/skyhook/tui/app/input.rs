@@ -764,6 +764,10 @@ mod tests {
             cells.map(|cell| cell.fg).collect::<Vec<_>>()
         };
         assert!(markers(&draw_buffer(&mut app)).is_empty());
+        // Cycling only chooses the next message's mode: the session and the saved
+        // preference stay as they were, drawn previews included.
+        let journaled = || app.session().unwrap().observe().snapshot.records.len();
+        let (records, remembered) = (journaled(), app.remembered_mode.clone());
         for (code, mode) in [
             (KeyCode::Tab, "look"),
             (KeyCode::Tab, "none"),
@@ -773,8 +777,11 @@ mod tests {
             key(&mut app, code, M::NONE);
             assert_eq!(app.mode.as_str(), mode);
             assert!(app.focus == Focus::Composer, "{mode}");
+            draw(&mut app);
         }
         assert!(draw(&mut app).contains("none · "));
+        let journaled = app.session().unwrap().observe().snapshot.records.len();
+        assert_eq!((journaled, &app.remembered_mode), (records, &remembered));
         assert_eq!(app.view().row, 0);
 
         app.focus = Focus::Content;

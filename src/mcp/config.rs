@@ -1,6 +1,10 @@
-use crate::tool::policy::Capability;
+use crate::tool::policy::{Capability, CapabilitySet};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::PathBuf, time::Duration};
+use std::{
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -38,6 +42,14 @@ pub(super) struct CommandSpec {
     pub(super) argv: Vec<String>,
     pub(super) cwd: Option<PathBuf>,
     pub(super) env: BTreeMap<String, String>,
+}
+
+impl CommandSpec {
+    /// The configured directory, else the session workspace: never the
+    /// directory Skyhook happened to be launched from.
+    pub(super) fn directory<'a>(&'a self, workspace: &'a Path) -> &'a Path {
+        self.cwd.as_deref().unwrap_or(workspace)
+    }
 }
 
 /// Editable external DTO. Conversion into [`McpServerConfig`] is mandatory before
@@ -155,6 +167,15 @@ impl McpServerConfig {
     }
     pub fn capabilities(&self) -> &[Capability] {
         &self.capabilities
+    }
+    /// Whether an agent holding `capabilities` may use this server: MCP itself
+    /// and every capability the server lists.
+    pub fn permitted_by(&self, capabilities: &CapabilitySet) -> bool {
+        capabilities.contains(Capability::Mcp)
+            && self
+                .capabilities
+                .iter()
+                .all(|cap| capabilities.contains(*cap))
     }
     pub fn startup_timeout(&self) -> Duration {
         self.startup_timeout

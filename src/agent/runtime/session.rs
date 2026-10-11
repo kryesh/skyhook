@@ -8,7 +8,7 @@ impl Harness {
         let store = SessionStore::create(&self.inner.session_root).await?;
         let jobs = JobManager::new(store.clone());
         let open = Arc::new(Open(store.clone(), jobs.supervisor().clone()));
-        let runtime = SessionRuntime::build(self.inner.clone(), store, jobs, &[]).await?;
+        let runtime = SessionRuntime::build(self.inner.clone(), store, jobs).await?;
         runtime.start_root(runtime.new_root()?, open).await
     }
 }
@@ -38,8 +38,8 @@ impl SessionHandle {
         self.runtime.mcp.servers()
     }
 
-    /// The modes the root agent can be sent into: the configured ones, except that a
-    /// mode the session has used keeps the definition it was used under.
+    /// The modes the root agent can be sent into: the configured ones. Editions the
+    /// session recorded earlier remain in its journal only.
     pub fn modes(&self) -> &indexmap::IndexMap<ModeName, crate::tool::policy::Mode> {
         &self.runtime.modes
     }
@@ -49,6 +49,27 @@ impl SessionHandle {
         let depth = (self.runtime.delegation(&self.root)).map_or(0, |(_, depth)| depth);
         let granted = self.runtime.mode_capabilities(mode).ok()?;
         Some(granted.for_agent(depth))
+    }
+
+    /// Whether sending the root agent's next message in `mode` changes what it runs:
+    /// another mode, a configured redefinition of its own, or different grants. An
+    /// unknown mode counts as a change, which sending it would refuse.
+    pub fn changes_mode(&self, mode: &ModeName) -> bool {
+        let Some((current, capabilities)) = self.runtime.resumed_mode(&self.root) else {
+            return true;
+        };
+        let change = (self.runtime).mode_change(&self.root, current.as_ref(), &capabilities, mode);
+        !matches!(change, Ok(None))
+    }
+
+    /// What `agent` holds now: its journaled capabilities, narrowed by the live
+    /// capability ceiling and depth limit.
+    pub fn agent_capabilities(
+        &self,
+        agent: &AgentId,
+    ) -> Option<crate::tool::policy::CapabilitySet> {
+        let resumed = self.runtime.resumed_mode(agent);
+        resumed.map(|(_, capabilities)| capabilities)
     }
 
     /// Model configuration, instruction, and skill diagnostics that must not
@@ -248,6 +269,25 @@ impl SessionHandle {
         })
     }
 
+    /// Have the root adopt the configuration's current definition of its mode, as
+    /// work that runs it but commits no message must before it starts.
+    async fn adopt_configured_mode(&self) -> Result<(), HarnessError> {
+        if !self.runtime.root_outdated(&self.root) {
+            return Ok(());
+        }
+        let (done, adopted) = oneshot::channel();
+        let command = AgentCommand::Select {
+            options: Selection::default(),
+            done,
+        };
+        let root = self.root.clone();
+        let send = move |state: &mut CoreState| state.agents.send(&root, command);
+        if !self.runtime.store.live(send).await {
+            return Err((self.runtime.store).read(|state| super::refused_input(&state.phase)));
+        }
+        adopted.await.map_err(|_| HarnessError::AgentStopped)?
+    }
+
     /// Execute a JavaScript workflow through the session's registered `script` tool.
     pub async fn run_script(
         &self,
@@ -256,6 +296,7 @@ impl SessionHandle {
         let source = source.into();
         let run = async {
             self.running().await?;
+            self.adopt_configured_mode().await?;
             // A host script is the root agent's work: it runs under the root's current mode.
             let root = (self.runtime).agents(|agents| {
                 agents.get(&self.root)?;
@@ -714,8 +755,8 @@ mod tests {
             Capability::Agents,
             Capability::Interactive,
         ];
-        // The first use of a mode pins the definition it was used under.
-        let pinned = |name: &str| {
+        // A mode's first use records its first edition.
+        let first_edition = |name: &str| {
             let mut definition = modes[name].clone();
             definition.capabilities.sort();
             definition.capabilities.dedup();
@@ -724,9 +765,9 @@ mod tests {
                 definition: Some(definition),
             }
         };
-        assert_eq!(changes, [(pinned("work"), granted.to_vec())]);
+        assert_eq!(changes, [(first_edition("work"), granted.to_vec())]);
         let started = events!(&records, SessionEvent::AgentStarted { mode, .. } => mode.clone());
-        assert_eq!(started, [Some(pinned("look")), None]);
+        assert_eq!(started, [Some(first_edition("look")), None]);
         let id = session.id();
         shutdown_session(session).await;
 

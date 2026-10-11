@@ -69,7 +69,7 @@ pub(in crate::session) fn summary(db: &Db) -> DbResult<SessionSummary> {
                  JOIN entry_kind k ON k.name = e.kind \
                  WHERE k.activity ORDER BY e.seq DESC LIMIT 1), 0), \
                (SELECT count(*) FROM entry), p.provider, p.name, \
-               (SELECT m.name FROM agent_mode am JOIN mode m ON m.id = am.mode \
+               (SELECT am.mode_name FROM agent_mode am \
                  JOIN entry x ON x.seq = am.entry {root} ORDER BY am.entry DESC LIMIT 1) \
              FROM (SELECT coalesce( \
                  (SELECT ms.profile FROM model_selection ms JOIN entry x ON x.seq = ms.entry \

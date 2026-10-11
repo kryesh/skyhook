@@ -40,11 +40,13 @@ use super::{Observation, Settlement};
 mod agents;
 #[cfg(test)]
 pub(crate) use agents::stopped_turn;
-use agents::{Activation, Flow, Invocation, RecordedContract, Turn};
+use agents::{Activation, AppliedMode, Flow, Invocation, RecordedContract, Turn};
 pub(crate) use agents::{Agents, activities};
+use modes::Selected;
 mod compact;
 mod compaction;
 mod context;
+mod modes;
 use context::AgentContext;
 mod prompt;
 mod questions;
@@ -211,11 +213,10 @@ impl SessionMode {
 struct SessionRuntime {
     instance: RuntimeInstance,
     harness: Arc<HarnessInner>,
-    /// The most any agent can hold: the harness ceiling, never more than the session
-    /// started with. A mode grants the root agent a subset.
+    /// The most any agent can hold: the live harness ceiling, whatever the session
+    /// held when it last ran. A mode grants the root agent a subset.
     capabilities: CapabilitySet,
-    /// The harness modes, except that a mode the session has used keeps the
-    /// definition it was used under.
+    /// The harness modes. Editions the session recorded earlier are only journaled.
     modes: indexmap::IndexMap<ModeName, Mode>,
     store: SessionStore,
     jobs: JobManager,
@@ -253,6 +254,12 @@ enum AgentCommand {
         content: Vec<UserPart>,
         done: Option<RequestCompletion>,
     },
+    /// Adopt `options` without input or a turn, as work that runs the root but
+    /// commits no message, such as a host script, must before it starts.
+    Select {
+        options: Selection,
+        done: oneshot::Sender<Result<(), HarnessError>>,
+    },
 }
 
 impl AgentCommand {
@@ -266,6 +273,9 @@ impl AgentCommand {
                 done: Some(done), ..
             } => done.settle(Err(error())),
             Self::Input { done: None, .. } => {}
+            Self::Select { done, .. } => {
+                let _ = done.send(Err(error()));
+            }
         }
     }
 }
@@ -279,7 +289,7 @@ enum AgentLaunch {
         available_depth: usize,
         location: crate::execution::ExecutionLocation,
         /// The agent's mode; a child has one only when its parent chose it.
-        mode: Option<ModeName>,
+        mode: Option<AppliedMode>,
         /// The most this agent may hold: its mode's set, or its parent's current set.
         capabilities: CapabilitySet,
     },
@@ -307,7 +317,7 @@ struct AgentLoop {
 /// What an agent currently runs under; a consumed input may change any of it.
 struct AgentSettings {
     /// The agent's mode, when it runs in one. Only the root's can change.
-    mode: Option<ModeName>,
+    mode: Option<AppliedMode>,
     capabilities: CapabilitySet,
 }
 
@@ -737,7 +747,7 @@ mod tests {
         let store = store.await.unwrap();
         let jobs = JobManager::new(store.clone());
         let open = Arc::new(Open(store.clone(), jobs.supervisor().clone()));
-        let runtime = SessionRuntime::build(harness.inner.clone(), store, jobs, &[]);
+        let runtime = SessionRuntime::build(harness.inner.clone(), store, jobs);
         let runtime = runtime.await.unwrap();
         runtime
             .start_root(runtime.new_root().unwrap(), open)

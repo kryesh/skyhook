@@ -55,8 +55,9 @@ pub const SESSION_FORMAT_VERSION: i64 = db::USER_VERSION;
 const DATABASE_FILE: &str = "session.db";
 const LOCK_FILE: &str = "lock";
 
-/// The mode definitions the session has pinned, in order of first use.
-pub fn pinned_modes(
+/// Every mode edition the session has recorded, oldest first: a name's last is its
+/// latest.
+pub fn mode_editions(
     records: &[EventRecord],
 ) -> impl Iterator<Item = (&crate::tool::policy::ModeName, &crate::tool::policy::Mode)> {
     let selections = records.iter().filter_map(|record| match &record.event {
@@ -918,7 +919,6 @@ pub(crate) mod tests {
                 agent.clone(),
                 SessionEvent::SessionStarted {
                     targets: Vec::new(),
-                    capabilities: Capability::ALL.to_vec(),
                 },
             ),
             (agent.clone(), agent_started(workspace)),

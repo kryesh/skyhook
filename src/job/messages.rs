@@ -302,7 +302,7 @@ mod tests {
     /// Acknowledge everything the receipt presents.
     async fn ack(receipt: Notification) {
         let message = notification(receipt.messages(), receipt.envelopes());
-        receipt.commit(message).await.unwrap();
+        receipt.commit(Vec::new(), message).await.unwrap();
     }
 
     async fn finish(manager: &JobManager, job: JobId) {
@@ -370,7 +370,7 @@ mod tests {
         assert_eq!(receipt.messages(), &expected);
         // The notification and its acknowledgement rows commit together.
         let message = notification(receipt.messages(), &[]);
-        receipt.commit(message).await.unwrap();
+        receipt.commit(Vec::new(), message).await.unwrap();
         let restored = manager.test_replay();
         assert!(!restored.has_pending(&owner));
     }
@@ -384,7 +384,7 @@ mod tests {
         let mut receipt = manager.pending_delivery(&owner).await.unwrap();
         let message = notification(receipt.messages(), receipt.envelopes());
         receipt.owner = AgentId::root(crate::identity::SessionId::generate().unwrap());
-        assert!(receipt.commit(message).await.is_err());
+        assert!(receipt.commit(Vec::new(), message).await.is_err());
         for state in [manager.clone(), manager.test_replay()] {
             let receipt = state.pending_delivery(&owner).await.unwrap();
             assert_eq!(sequences(&receipt), [sequence]);
@@ -612,7 +612,7 @@ mod tests {
             message: first,
             text: "before question".into(),
         })]);
-        receipt.commit(reply).await.unwrap();
+        receipt.commit(Vec::new(), reply).await.unwrap();
         // Acknowledging replies never claims the question the same job is holding.
         assert_eq!(
             manager

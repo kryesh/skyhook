@@ -5,7 +5,7 @@ use super::super::{
 };
 use super::{McpError, StartupError, catalog::discover};
 use rmcp::{Peer, RoleClient, model::Tool};
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 use tokio::sync::{Mutex, Semaphore};
 use tokio_util::sync::CancellationToken;
 
@@ -66,6 +66,7 @@ impl Server {
 /// Start one server, failing with a timeout once `deadline` completes.
 pub(super) async fn connect_one(
     config: McpServerConfig,
+    workspace: &Path,
     cancel: CancellationToken,
     deadline: impl Future<Output = ()>,
 ) -> Option<Result<(Vec<Tool>, Server), StartupError>> {
@@ -77,7 +78,7 @@ pub(super) async fn connect_one(
         client: None,
     };
     let startup = async {
-        let client = transport::connect(&config, &mut resources.process).await?;
+        let client = transport::connect(&config, workspace, &mut resources.process).await?;
         let client = resources.client.insert(client);
         Ok::<_, StartupError>((client.peer().clone(), discover(client).await?))
     };
@@ -211,7 +212,13 @@ server.serve_forever()
         let config: McpServerConfig = hanging(&fixture).try_into().unwrap();
         // The deadline expires once the child it must reap is running.
         let pid = fixture.directory.path().join("pid");
-        let connect = super::connect_one(config, CancellationToken::new(), wait_for_file(&pid));
+        let workspace = std::env::temp_dir();
+        let connect = super::connect_one(
+            config,
+            &workspace,
+            CancellationToken::new(),
+            wait_for_file(&pid),
+        );
         let result = bounded(connect).await;
         assert!(matches!(
             result,
@@ -301,7 +308,8 @@ server.serve_forever()
         let configs = BTreeMap::from([("fixture".to_owned(), config.try_into().unwrap())]);
         let cancel = CancellationToken::new();
         let capabilities = crate::tool::policy::CapabilitySet::default();
-        let connect = McpManager::connect(&configs, &capabilities, cancel.clone());
+        let workspace = std::env::temp_dir();
+        let connect = McpManager::connect(&configs, &capabilities, &workspace, cancel.clone());
         let methods = || std::fs::read_to_string(fixture.path("http-counts")).unwrap_or_default();
         // Abandon startup once discovery hangs inside an established session.
         let cancel_when_hung = async {
@@ -380,7 +388,8 @@ server.serve_forever()
             .collect();
         let cancel = CancellationToken::new();
         let capabilities = crate::tool::policy::CapabilitySet::default();
-        let connect = McpManager::connect(&configs, &capabilities, cancel.clone());
+        let workspace = std::env::temp_dir();
+        let connect = McpManager::connect(&configs, &capabilities, &workspace, cancel.clone());
         let cancel_when_started = async {
             for fixture in &started {
                 wait_for_file(&fixture.directory.path().join("pid")).await;

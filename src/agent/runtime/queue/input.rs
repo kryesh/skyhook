@@ -3,103 +3,149 @@
 use super::*;
 
 impl SessionRuntime {
-    /// Apply an input's model and mode, where given and different. A mode is the root
+    /// Resolve an input's model and mode, where given and different, without
+    /// journaling anything: a rejected selection changes nothing. A mode is the root
     /// agent's capabilities, the tools they allow and its instructions; children it
-    /// already started keep their own. Everything is resolved before one journal
-    /// append, so a rejected selection changes nothing; `images` rejects an
-    /// unsupported profile before any provider context opens.
-    pub(in crate::agent::runtime) async fn select(
+    /// already started keep their own. The root also adopts the configuration's
+    /// current definition of the mode it runs, or the default mode once its own is
+    /// gone, when the input names none. `images` rejects an unsupported profile
+    /// before any provider context opens.
+    // Boxed as a `dyn` future: proving the agent loop `Send` through this body
+    // otherwise exceeds the compiler's recursion limit. Exclusive borrows keep it
+    // `Send` without requiring the context to be `Sync`.
+    pub(in crate::agent::runtime) fn select<'a>(
+        &'a self,
+        turn: &'a mut TurnContext<'_>,
+        context: &'a mut AgentContext,
+        settings: &'a mut AgentSettings,
+        options: Selection,
+        images: bool,
+    ) -> futures_util::future::BoxFuture<'a, Result<Selected, HarnessError>> {
+        Box::pin(async move {
+            let agent = turn.agent;
+            let model = options
+                .model
+                .map(|model| model.name)
+                .filter(|name| name != &context.profile.name);
+            let snapshot = match &model {
+                Some(name) => crate::session::ProfileSnapshot {
+                    name: name.clone(),
+                    profile: self.model_entry(name)?.profile,
+                },
+                None => context.profile.clone(),
+            };
+            let profile = &snapshot.profile;
+            if images && !profile.supports_images {
+                return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
+            }
+            let requested = options.mode.map(|mode| mode.name);
+            let current = settings.mode.as_ref();
+            let mode = if agent.depth() != 0 {
+                // A child keeps the mode it started in.
+                match requested {
+                    Some(name) if current.is_none_or(|mode| mode.name != name) => {
+                        return Err(HarnessError::ModeChangeUnsupported(name));
+                    }
+                    _ => None,
+                }
+            } else {
+                match self.root_mode(current, requested) {
+                    Some(name) => {
+                        self.mode_change(agent, current, &settings.capabilities, &name)?
+                    }
+                    None => None,
+                }
+            };
+            let replacement = if let Some(change) = &mode {
+                let system = self.mode_prompt(agent, turn.location, change).await?;
+                Some(self.mode_context(agent, snapshot.clone(), system, change)?)
+            } else if model.is_some() {
+                let system = context.template.system().to_vec();
+                // The tools stay pinned across a model change.
+                let tools = Some(context.template.to_request().tools);
+                let capabilities = &settings.capabilities;
+                let opening =
+                    self.open_agent_context(agent, snapshot.clone(), system, capabilities, tools);
+                Some(opening?)
+            } else {
+                None
+            };
+            if !profile.supports_images
+                && replacement
+                    .as_ref()
+                    .is_some_and(AgentContext::contains_images)
+            {
+                return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
+            }
+            let mut events = Vec::new();
+            if model.is_some() {
+                let profile = snapshot;
+                events.push((agent.clone(), SessionEvent::ModelChanged { profile }));
+            }
+            if let Some(change) = &mode {
+                events.push((agent.clone(), change.event()));
+            }
+            Ok(Selected {
+                events,
+                replacement,
+                mode,
+            })
+        })
+    }
+
+    /// Journal `selected` and the `message` it applies to in one transaction, then
+    /// install them. `ModelChanged` and `ModeChanged` precede that message.
+    pub(in crate::agent::runtime) async fn adopt(
         &self,
         turn: &mut TurnContext<'_>,
         context: &mut AgentContext,
         settings: &mut AgentSettings,
-        options: Selection,
-        images: bool,
-    ) -> Result<(), HarnessError> {
-        let agent = turn.agent;
-        let model = options
-            .model
-            .map(|model| model.name)
-            .filter(|name| name != &context.profile.name);
-        let mode = options
-            .mode
-            .map(|mode| mode.name)
-            .filter(|name| settings.mode.as_ref() != Some(name));
-        let snapshot = match &model {
-            Some(name) => crate::session::ProfileSnapshot {
-                name: name.clone(),
-                profile: self.model_entry(name)?.profile,
-            },
-            None => context.profile.clone(),
-        };
-        let profile = &snapshot.profile;
-        if images && !profile.supports_images {
-            return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
+        mut selected: Selected,
+        message: Option<Message>,
+    ) -> Result<(), SessionError> {
+        let mut events = std::mem::take(&mut selected.events);
+        let message = message.map(|message| SessionEvent::MessageCommitted { message });
+        events.extend(message.map(|message| (turn.agent.clone(), message)));
+        if !events.is_empty() {
+            self.store.append_all(events).await?;
         }
-        let mode = match mode {
-            Some(name) if agent.depth() != 0 => {
-                return Err(HarnessError::ModeChangeUnsupported(name));
-            }
-            Some(name) => {
-                let depth = self.delegation(agent).map_or(0, |(_, depth)| depth);
-                let capabilities = self.granted_by(&self.modes[&name]).for_agent(depth);
-                Some((name, depth, capabilities))
-            }
-            None => None,
-        };
-        let replacement = if let Some((name, depth, capabilities)) = &mode {
-            let system = self
-                .system_prompt(agent, turn.location, *depth, Some(name), capabilities)
-                .await?;
-            let opening =
-                self.open_agent_context(agent, snapshot.clone(), system, capabilities, None);
-            // Projected before its `ModeChanged` is journaled, which later projections see.
-            let mut replacement = opening?;
-            replacement.strip_bound_reasoning();
-            Some(replacement)
-        } else if model.is_some() {
-            let system = context.template.system().to_vec();
-            // The tools stay pinned across a model change.
-            let tools = Some(context.template.to_request().tools);
-            let capabilities = &settings.capabilities;
-            let opening =
-                self.open_agent_context(agent, snapshot.clone(), system, capabilities, tools);
-            Some(opening?)
-        } else {
-            None
-        };
-        if !profile.supports_images
-            && replacement
-                .as_ref()
-                .is_some_and(AgentContext::contains_images)
-        {
-            return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
-        }
-        let mut events = Vec::new();
-        if model.is_some() {
-            let profile = snapshot;
-            events.push((agent.clone(), SessionEvent::ModelChanged { profile }));
-        }
-        if let Some((name, _, capabilities)) = &mode {
-            let event = SessionEvent::ModeChanged {
-                mode: self.mode_selection(name),
-                capabilities: capabilities.iter().collect(),
-            };
-            events.push((agent.clone(), event));
-        }
-        if events.is_empty() {
-            return Ok(());
-        }
-        self.store.append_all(events).await?;
         // No await between installation and its routing projection.
-        if let Some(replacement) = replacement {
-            *context = replacement;
-        }
-        if let Some((name, _, capabilities)) = mode {
-            turn.capabilities.clone_from(&capabilities);
-            (settings.mode, settings.capabilities) = (Some(name), capabilities);
-        }
+        selected.install(turn, context, settings);
         Ok(())
+    }
+
+    /// Deliver the owner's pending events with the selection its next turn makes
+    /// unasked, the root's configured mode, in one transaction. A selection that
+    /// cannot be prepared delivers nothing: the events stay pending for the input
+    /// that resumes the agent. None when nothing was pending.
+    pub(in crate::agent::runtime) async fn deliver_selected(
+        &self,
+        turn: &mut TurnContext<'_>,
+        context: &mut AgentContext,
+        settings: &mut AgentSettings,
+    ) -> Option<Result<(), HarnessError>> {
+        let options = Selection::default();
+        let mut selected = match self.select(turn, context, settings, options, false).await {
+            Ok(selected) => selected,
+            Err(error) => return Some(Err(error)),
+        };
+        let preceding: Vec<_> = std::mem::take(&mut selected.events)
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect();
+        // The delivery commits after the selection, so it is presented under the
+        // grants the selection gives.
+        let capabilities =
+            (selected.mode.as_ref()).map_or(&turn.capabilities, |change| &change.capabilities);
+        let viewer = crate::tool::diagnostic::DiagnosticViewer::new(capabilities, turn.location);
+        match self.deliver_events(turn.agent, viewer, &preceding).await {
+            Ok(None) => None,
+            Ok(Some(_)) => {
+                selected.install(turn, context, settings);
+                Some(Ok(()))
+            }
+            Err(error) => Some(Err(error)),
+        }
     }
 
     pub(in crate::agent::runtime) async fn consume_queued_input(
@@ -109,7 +155,6 @@ impl SessionRuntime {
         settings: &mut AgentSettings,
         input: QueuedInput,
     ) -> bool {
-        let agent = turn.agent;
         if let Err(refused) = self.store.admits(Command::Submit) {
             input.reject(refused.into());
             return false;
@@ -125,11 +170,13 @@ impl SessionRuntime {
             ..
         } = input;
         let images = content.iter().any(UserPart::is_image);
-        // ModelChanged and ModeChanged precede the MessageCommitted they apply to.
         let result = async {
-            self.select(turn, context, settings, options, images)
+            let selected = self
+                .select(turn, context, settings, options, images)
                 .await?;
-            self.commit(agent, Message::User(content)).await?;
+            let message = Some(Message::User(content));
+            self.adopt(turn, context, settings, selected, message)
+                .await?;
             Ok(())
         }
         .await;

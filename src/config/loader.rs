@@ -600,12 +600,12 @@ mod tests {
         write(
             &f.xdg,
             format!(
-                "session_root: sessions\n{CONFIG}    api_key: {{env: USER_KEY}}\n  retained:\n    dialect: codex\n    codec: responses\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  changed:\n    transport: stdio\n    start_command: [old, arg]\n    startup_timeout_secs: 77\n    env: {{A: a}}\n"
+                "session_root: sessions\n{CONFIG}    api_key: {{env: USER_KEY}}\n  retained:\n    dialect: codex\n    codec: responses\nmcp:\n  inherited:\n    transport: stdio\n    start_command: [old]\n    cwd: user-work\n  user-default:\n    transport: stdio\n    start_command: [old]\n  changed:\n    transport: stdio\n    start_command: [old, arg]\n    startup_timeout_secs: 77\n    env: {{A: a}}\n"
             ),
         );
         write(
             &f.local,
-            "providers:\n  local:\n    dialect: compatible\n    codec: chat_completions\n    base_url: https://other.example/v1\n  added:\n    dialect: codex\n    codec: responses\nmcp:\n  changed:\n    transport: stdio\n    start_command: [new]\n    cwd: workspace-work\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      auth: {kind: key, path: origin-key}\n",
+            "providers:\n  local:\n    dialect: compatible\n    codec: chat_completions\n    base_url: https://other.example/v1\n  added:\n    dialect: codex\n    codec: responses\nmcp:\n  changed:\n    transport: stdio\n    start_command: [new]\n    cwd: workspace-work\n  workspace-default:\n    transport: stdio\n    start_command: [new]\ntargets:\n  remote:\n    type: ssh\n    host: host\n    workspace: remote-work\n    ssh:\n      auth: {kind: key, path: origin-key}\n",
         );
         let resolved = f.resolve().await.unwrap();
         let config = &resolved.config;
@@ -627,6 +627,9 @@ mod tests {
         assert_eq!(changed.cwd, Some(workspace.join("workspace-work")));
         assert_eq!(changed.start_command.unwrap(), ["new"]);
         assert!(changed.env.is_empty());
+        // An omitted cwd stays omitted in either layer: it means the session workspace.
+        assert_eq!(raw("user-default").cwd, None);
+        assert_eq!(raw("workspace-default").cwd, None);
         // Only MCP cwd follows its file; these keep their own meaning.
         assert_eq!(config.session_root, Some(PathBuf::from("sessions")));
         let remote = &config.targets.entries["remote"];

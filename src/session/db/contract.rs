@@ -1,4 +1,4 @@
-//! Targets and the pinned contract: agent starts, modes, profiles and model contexts.
+//! Targets and the journaled contract: agent starts, modes, profiles and model contexts.
 
 use std::collections::HashMap;
 
@@ -121,35 +121,38 @@ impl Encoder {
     }
 }
 
-/// Apply a mode, pinning its definition to the entry that first uses it.
+/// Apply a mode: an entry with a definition records the name's next edition, and
+/// every entry names the latest one.
 fn mode(db: &Db, entry: Entry, mode: &ModeSelection) -> DbResult<()> {
     let name = &mode.name;
     if let Some(definition) = &mode.definition {
         db.execute(
-            "INSERT INTO mode (entry, kind, name, instructions, hint) VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO mode (name, version, entry, kind, instructions, hint) \
+             SELECT ?1, coalesce(max(version), 0) + 1, ?2, ?3, ?4, ?5 FROM mode WHERE name = ?1",
             params![
+                name,
                 entry.seq,
                 entry.kind,
-                name,
                 definition.instructions.as_ref(),
                 definition.hint.as_ref()
             ],
         )?;
         for capability in &definition.capabilities {
             db.execute(
-                "INSERT INTO mode_capability (mode, capability) \
-                 SELECT id, ?2 FROM mode WHERE name = ?1",
-                params![name, *capability],
+                "INSERT INTO mode_capability (mode_name, mode_version, capability) \
+                 SELECT name, version, ?2 FROM mode WHERE entry = ?1",
+                params![entry.seq, *capability],
             )?;
         }
     }
     let inserted = db.execute(
-        "INSERT INTO agent_mode (entry, kind, mode) SELECT ?1, ?2, id FROM mode WHERE name = ?3",
+        "INSERT INTO agent_mode (entry, kind, mode_name, mode_version) \
+         SELECT ?1, ?2, name, max(version) FROM mode WHERE name = ?3 GROUP BY name",
         params![entry.seq, entry.kind, name],
     )?;
     if inserted == 0 {
         return Err(rejected(format!(
-            "mode {name:?} is not pinned by the session"
+            "mode {name:?} has no edition recorded in the session"
         )));
     }
     Ok(())
@@ -336,33 +339,32 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
         let capabilities = agent_capabilities.get(&entry);
         sorted(capabilities.cloned().unwrap_or_default())
     };
-    let mode_capabilities = grouped(db, "SELECT mode, capability FROM mode_capability", |row| {
-        enum_column(row, 1)
-    })?;
-    // Mode definitions by the entry that pinned them.
-    let pinned_modes = keyed(
+    // Mode editions by the entry that recorded them.
+    let mode_capabilities = grouped(
         db,
-        "SELECT entry, id, instructions, hint FROM mode",
-        |row| {
-            let capabilities = mode_capabilities.get(&row.get::<i64>(1)?);
-            Ok(Mode {
-                capabilities: sorted(capabilities.cloned().unwrap_or_default()),
-                instructions: row.get::<Option<String>>(2)?.map(parsed).transpose()?,
-                hint: row.get::<Option<String>>(3)?.map(parsed).transpose()?,
-            })
-        },
+        "SELECT m.entry, c.capability FROM mode_capability c \
+         JOIN mode m ON m.name = c.mode_name AND m.version = c.mode_version",
+        |row| enum_column(row, 1),
     )?;
+    let editions = keyed(db, "SELECT entry, instructions, hint FROM mode", |row| {
+        let capabilities = mode_capabilities.get(&row.get::<i64>(0)?);
+        Ok(Mode {
+            capabilities: sorted(capabilities.cloned().unwrap_or_default()),
+            instructions: row.get::<Option<String>>(1)?.map(parsed).transpose()?,
+            hint: row.get::<Option<String>>(2)?.map(parsed).transpose()?,
+        })
+    })?;
     let selection = |entry: i64, name: Option<String>| {
-        let definition = pinned_modes.get(&entry).cloned();
+        let definition = editions.get(&entry).cloned();
         let name = name.map(parsed).transpose()?;
         DbResult::Ok(name.map(|name| ModeSelection { name, definition }))
     };
     events.load(
         "SELECT s.entry, a.owner_job, a.available_depth, t.name, s.location_workspace, \
-         s.profile, m.name FROM agent_start s \
+         s.profile, am.mode_name FROM agent_start s \
          JOIN entry e ON e.seq = s.entry JOIN agent a ON a.id = e.agent \
          JOIN target t ON t.id = s.location_target \
-         LEFT JOIN agent_mode am ON am.entry = s.entry LEFT JOIN mode m ON m.id = am.mode",
+         LEFT JOIN agent_mode am ON am.entry = s.entry",
         |row| {
             Ok(SessionEvent::AgentStarted {
                 owner_job: row.get::<Option<i64>>(1)?.map(job).transpose()?,
@@ -375,8 +377,7 @@ pub(super) fn events(events: &mut Events) -> DbResult<()> {
         },
     )?;
     events.load_with(
-        "SELECT am.entry, m.name FROM agent_mode am JOIN mode m ON m.id = am.mode \
-         WHERE am.kind = ?1",
+        "SELECT entry, mode_name FROM agent_mode WHERE kind = ?1",
         params![EntryKind::ModeChanged],
         |row| {
             Ok(SessionEvent::ModeChanged {

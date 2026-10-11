@@ -152,14 +152,15 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let tree_y = composer_y.saturating_sub(tree_height);
     app.composer_rect = r(0, composer_y, width, composer_height);
     app.tree_rect = r(0, tree_y, width, tree_height);
-    let content_width = width - sidebar_width(app, width);
+    let sidebar = Sidebar::of(app, width);
+    let content_width = width - sidebar.as_ref().map_or(0, Sidebar::width);
     app.content_rect = r(
         0,
         2,
         content_width,
         tree_y.saturating_sub(2 + notice_height),
     );
-    if content_width < width {
+    if let Some(sidebar) = sidebar {
         // The notice row belongs to the conversation; the sidebar runs beside it.
         let rect = r(
             content_width,
@@ -167,7 +168,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
             width - content_width,
             app.content_rect.height + notice_height,
         );
-        draw_sidebar(frame, app, rect);
+        draw_sidebar(frame, app, sidebar, rect);
     }
     draw_header(frame, app, width);
     prepare_rows(app, content_width);

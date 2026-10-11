@@ -68,11 +68,16 @@ impl Notification {
         &self.envelopes
     }
 
-    /// Commit the owner's `message` presenting this batch, with an
-    /// acknowledgement row for each job outcome and child reply it delivers, in
-    /// one transaction. Refused [`JobError::Stale`] when any of them is no longer
-    /// pending as it was read, so the owner presents what is pending now instead.
-    pub(crate) async fn commit(self, message: Message) -> Result<MessageSeq, JobError> {
+    /// Commit the owner's `message` presenting this batch, after the owner's
+    /// `preceding` entries that apply to it, with an acknowledgement row for each
+    /// job outcome and child reply it delivers, in one transaction. Refused
+    /// [`JobError::Stale`] when any of them is no longer pending as it was read, so
+    /// the owner presents what is pending now instead.
+    pub(crate) async fn commit(
+        self,
+        preceding: Vec<SessionEvent>,
+        message: Message,
+    ) -> Result<MessageSeq, JobError> {
         let Self {
             manager,
             owner,
@@ -95,7 +100,9 @@ impl Notification {
             if !(current && queued) {
                 return Err(JobError::Stale);
             }
-            let notification = state.next_sequence().message();
+            let at = preceding.len();
+            let next = state.next_sequence();
+            let notification = preceding.iter().fold(next, |seq, _| seq.next()).message();
             let injected = (deliveries.into_iter())
                 .map(|Delivery { job, .. }| SessionEvent::JobInjected { job });
             let replies = messages
@@ -105,12 +112,13 @@ impl Notification {
                     source: reply.message,
                     notification,
                 });
-            let events = std::iter::once(SessionEvent::MessageCommitted { message })
+            let events = (preceding.into_iter())
+                .chain([SessionEvent::MessageCommitted { message }])
                 .chain(injected)
                 .chain(replies);
             let entries = events.map(|event| (owner.clone(), event)).collect();
-            Ok(Plan::new(entries, |_, records| {
-                records[0].sequence.message()
+            Ok(Plan::new(entries, move |_, records| {
+                records[at].sequence.message()
             }))
         };
         store.commit(Command::Journal, notify).await
@@ -289,7 +297,7 @@ mod tests {
 
     async fn commit_pending(manager: &JobManager, owner: &AgentId, message: Message) -> MessageSeq {
         let receipt = manager.pending_delivery(owner).await.unwrap();
-        receipt.commit(message).await.unwrap()
+        receipt.commit(Vec::new(), message).await.unwrap()
     }
 
     /// Asserts the owner has (or has no) pending delivery both live and after replay.
@@ -321,10 +329,10 @@ mod tests {
             let message = notification(job, JobState::Completed);
             if claim_first {
                 manager.test_claim(job).await.unwrap();
-                let stale = read.commit(message).await;
+                let stale = read.commit(Vec::new(), message).await;
                 assert!(matches!(stale, Err(JobError::Stale)), "{stale:?}");
             } else {
-                read.commit(message).await.unwrap();
+                read.commit(Vec::new(), message).await.unwrap();
                 manager.test_claim(job).await.unwrap();
             }
             let records = manager.store().records();
@@ -502,7 +510,7 @@ mod tests {
         assert_eq!(receipt.envelopes().len(), 1);
         assert_eq!(receipt.envelopes()[0].question, Some(question("q-3")));
         let message = notification(lease.id(), JobState::WaitingInput);
-        receipt.commit(message).await.unwrap();
+        receipt.commit(Vec::new(), message).await.unwrap();
         assert!(!manager.has_pending(&agent));
     }
 }

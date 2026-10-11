@@ -783,14 +783,20 @@ mod headless {
         let id = String::from_utf8(started.stdout).unwrap();
         let resumed = f.script(READ_CONFIG, &["--resume", id.trim()]);
         assert!(resumed.status.success(), "{}", f.journal(&resumed));
-        // It also keeps a mode the configuration has since dropped.
+        // Once the configuration drops that mode, it resumes in the default one,
+        // with a warning; approving everything grants no capability.
         f.config(
             "http://127.0.0.1:1/v1",
             "default_mode: none\nmodes:\n  none:\n    capabilities: []",
         );
+        // Only the first resume warns: its script moved the root to the default mode.
         for args in [&["--resume", id.trim()][..], &["--resume", id.trim(), "-a"]] {
             let resumed = f.script(READ_CONFIG, args);
-            assert!(resumed.status.success(), "{}", f.journal(&resumed));
+            assert!(!resumed.status.success());
+            let journal = f.journal(&resumed);
+            let warnings = journal.matches("no longer has mode `look`").count();
+            assert_eq!(warnings, 1, "{journal}");
+            assert!(journal.contains("Failed:"));
         }
         f.config("http://127.0.0.1:1/v1", "");
         let unapproved =

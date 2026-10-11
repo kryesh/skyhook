@@ -7,20 +7,23 @@ use crate::{
 };
 
 impl SessionRuntime {
-    /// Commit the owner's pending events as its next message. When another read
+    /// Commit the owner's pending events as its next message, after its
+    /// `preceding` entries that apply to it, in one transaction. When another read
     /// acknowledged part of what one presented first, present what is pending now
-    /// instead; None once nothing is.
+    /// instead; None, committing nothing, once nothing is.
     pub(in crate::agent::runtime) async fn deliver_events<'a>(
         &self,
         agent: &crate::identity::AgentId,
         viewer: impl Into<DiagnosticViewer<'a>> + Copy,
+        preceding: &[crate::session::SessionEvent],
     ) -> Result<Option<MessageSeq>, crate::agent::runtime::HarnessError> {
         loop {
             let pending = self.jobs.pending_delivery(agent).await?;
             let Some(content) = self.job_event_content(&pending, viewer.into()).await else {
                 return Ok(None);
             };
-            match pending.commit(Message::User(vec![content])).await {
+            let message = Message::User(vec![content]);
+            match pending.commit(preceding.to_vec(), message).await {
                 Err(JobError::Stale) => {}
                 committed => return Ok(Some(committed?)),
             }
@@ -792,7 +795,10 @@ mod tests {
         let (retry, batch) = pending_content(&session).await;
         // abandoning a notification must retain its source message
         assert_eq!(retry, content);
-        let sequence = batch.commit(Message::User(vec![retry])).await.unwrap();
+        let sequence = batch
+            .commit(Vec::new(), Message::User(vec![retry]))
+            .await
+            .unwrap();
         let records = runtime.store.records();
         let committed = records
             .iter()
@@ -849,13 +855,13 @@ mod tests {
                 let (content, read) = pending_content(&session).await;
                 fixture_message(&session, job, &child, "second-reply").await;
                 let message = Message::User(vec![content]);
-                Box::pin(async move { read.commit(message).await.map(drop).unwrap() })
+                Box::pin(async move { read.commit(Vec::new(), message).await.map(drop).unwrap() })
             };
             let (reached, resume) = runtime.store.pause_committed(|_| true).await;
             let competing = tokio::spawn(competing);
             bounded(reached).await.unwrap();
             // It reads before the competing commit applies; its own commit queues behind it.
-            let deliver = runtime.deliver_events(owner, &runtime.capabilities);
+            let deliver = runtime.deliver_events(owner, &runtime.capabilities, &[]);
             tokio::pin!(deliver);
             assert!(futures_util::poll!(deliver.as_mut()).is_pending());
             resume.send(()).unwrap();
@@ -921,7 +927,7 @@ mod tests {
         assert!(pending(&session, session.root_agent()));
         let mut updates = runtime.store.observe().updates;
         {
-            let commit = batch.commit(Message::User(vec![content.clone()]));
+            let commit = batch.commit(Vec::new(), Message::User(vec![content.clone()]));
             tokio::pin!(commit);
             // Dropping the caller once its commit is queued models an interrupt just
             // after this transaction's ownership boundary.
@@ -929,7 +935,9 @@ mod tests {
         }
         // A read of the same events, even without any terminal job, delivers
         // nothing the interrupted caller's transaction delivered.
-        let stale = competing.commit(Message::User(vec![content])).await;
+        let stale = competing
+            .commit(Vec::new(), Message::User(vec![content]))
+            .await;
         assert!(matches!(stale, Err(crate::job::JobError::Stale)));
         bounded(async {
             loop {

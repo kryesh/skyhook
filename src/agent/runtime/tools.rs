@@ -39,6 +39,7 @@ pub(super) async fn connect_mcp(
         crate::mcp::manager::McpManager::connect(
             &harness.mcp,
             &capabilities,
+            &harness.workspace,
             tokio_util::sync::CancellationToken::new(),
         )
         .await,
@@ -338,7 +339,8 @@ fn child_launch(
                 return Err(invalid_argument(["mode"], format!("unknown mode `{name}`")));
             };
             // Interaction follows the caller, as the root's follows the host.
-            (Some(name.clone()), &runtime.granted_by(mode) & caller)
+            let applied = super::AppliedMode::configured(name, mode);
+            (Some(applied), &runtime.granted_by(mode) & caller)
         }
     };
     if input.depth >= available_depth {
@@ -934,7 +936,7 @@ for line in sys.stdin:
     }
 
     /// A child in a mode is held to it: depth still withholds `agents`, a mode it could
-    /// not hold is unknown to it, and a restart returns it to the mode as pinned.
+    /// not hold is unknown to it, and a restart returns it to the mode it started in.
     #[tokio::test]
     async fn a_child_keeps_its_mode_through_depth_delegation_and_restart() {
         use crate::tool::policy::Mode;
@@ -1012,9 +1014,11 @@ for line in sys.stdin:
         let id = session.id();
         shutdown_session(session).await;
 
-        // The configuration now widens `scout`; the session keeps the one it pinned.
+        // The configuration now widens `scout`; the retained child keeps the edition
+        // it started in.
         let widened = mode(&[read, write, agents], "Changed.");
-        let harness = build(widened, vec![answer("again")]).await.unwrap();
+        let responses = vec![answer("again"), answer("fresh")];
+        let harness = build(widened.clone(), responses).await.unwrap();
         let resumed = harness.resume_session(id).await.unwrap();
         resumed.running().await.unwrap();
         resumed.runtime.jobs.send(job, json!("more")).await.unwrap();
@@ -1036,18 +1040,25 @@ for line in sys.stdin:
             agent.input_schema["properties"]["mode"]["enum"],
             json!(["scout", null])
         );
+        // A child starting now runs the configured definition.
+        let fresh = resumed.run_script(spawn(0)).await.unwrap();
+        assert_eq!(fresh.value["value"]["result"], "fresh");
+        let child = requests.lock().unwrap().last().unwrap().clone();
+        assert!(child.system[0].text.contains("Changed."));
         shutdown_session(resumed).await;
-        // As decoded from the journal: pinned once, with its hint, by the first child.
+        // As decoded from the journal: the first child recorded `scout`'s first
+        // edition, with its hint, and the new child its second.
         let (_store, records) = crate::session::SessionStore::open(&sessions, id)
             .await
             .unwrap();
-        let pinned = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name.as_str() == "scout" => mode.definition.clone());
-        assert_eq!(pinned, [Some(scout), None]);
+        let recorded = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name.as_str() == "scout" => mode.definition.clone());
+        assert_eq!(recorded, [Some(scout), None, Some(widened)]);
     }
 
-    /// Children starting at once in a mode the session has not used pin it once.
+    /// Children starting at once in a mode the session has not used record its
+    /// edition once.
     #[tokio::test(flavor = "multi_thread")]
-    async fn children_starting_together_pin_their_mode_once() {
+    async fn children_starting_together_record_their_mode_once() {
         use crate::tool::policy::Mode;
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
@@ -1078,7 +1089,10 @@ for line in sys.stdin:
         let records = session.runtime.store.records();
         let looks = events!(&records, SessionEvent::AgentStarted { mode: Some(mode), .. } if mode.name.as_str() == "look" => mode.definition.is_some());
         assert_eq!(
-            (looks.len(), looks.iter().filter(|pinned| **pinned).count()),
+            (
+                looks.len(),
+                looks.iter().filter(|recorded| **recorded).count()
+            ),
             (8, 1)
         );
         shutdown_session(session).await;

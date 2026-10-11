@@ -24,7 +24,7 @@ use rmcp::{
     service::{PeerRequestOptions, RequestHandle, ServiceError},
 };
 use serde_json::{Map, Value};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, path::Path, sync::Arc, time::Duration};
 use tokio_util::sync::CancellationToken;
 
 const MAX_ARGUMENT_BYTES: usize = 4 * 1024 * 1024;
@@ -181,10 +181,12 @@ pub struct McpManager {
 impl McpManager {
     /// Filter before creating startup futures: even secret lookup or a failed
     /// connection for an ineligible server would cross the capability boundary.
-    /// An individual eligible server failure is a warning, not fatal.
+    /// An individual eligible server failure is a warning, not fatal. Commands
+    /// run on this host, in `workspace` unless their config names a directory.
     pub async fn connect(
         configs: &BTreeMap<String, McpServerConfig>,
         capabilities: &CapabilitySet,
+        workspace: &Path,
         cancel: CancellationToken,
     ) -> Self {
         let mut manager = Self {
@@ -199,23 +201,18 @@ impl McpManager {
         // lifetime leaks into the public Send future (including cross-crate use).
         let entries: Vec<_> = configs
             .iter()
-            .filter(|(_, config)| {
-                capabilities.contains(Capability::Mcp)
-                    && config
-                        .capabilities()
-                        .iter()
-                        .all(|cap| capabilities.contains(*cap))
-            })
+            .filter(|(_, config)| config.permitted_by(capabilities))
             .map(|(name, config)| (name.clone(), config.clone()))
             .collect();
         let futures: Vec<_> = entries
             .into_iter()
             .map(|(name, config)| {
                 let cancel = cancel.clone();
+                let workspace = workspace.to_path_buf();
                 async move {
                     let policy = config.capabilities().to_vec();
                     let deadline = tokio::time::sleep(config.startup_timeout());
-                    let result = connect_one(config, cancel, deadline).await?;
+                    let result = connect_one(config, &workspace, cancel, deadline).await?;
                     Some((name, policy, result))
                 }
             })
@@ -598,13 +595,17 @@ for line in sys.stdin:
     // fallbacks. Do not kill by saved PID: a reaped PID can be reused.
 
     pub(super) async fn connect(config: crate::mcp::config::RawMcpServerConfig) -> McpManager {
-        connect_admitted(config.try_into().unwrap()).await
+        connect_in(config, &std::env::temp_dir()).await
     }
 
-    async fn connect_admitted(config: McpServerConfig) -> McpManager {
-        let configs = BTreeMap::from([("fixture".into(), config)]);
+    async fn connect_in(
+        config: crate::mcp::config::RawMcpServerConfig,
+        workspace: &Path,
+    ) -> McpManager {
+        let configs = BTreeMap::from([("fixture".into(), config.try_into().unwrap())]);
         let capabilities = CapabilitySet::default();
-        let connect = McpManager::connect(&configs, &capabilities, CancellationToken::new());
+        let connect =
+            McpManager::connect(&configs, &capabilities, workspace, CancellationToken::new());
         bounded(connect).await
     }
 
@@ -684,8 +685,13 @@ for line in sys.stdin:
         for missing in [Capability::Mcp, Capability::Read, Capability::Exec] {
             let mut capabilities = CapabilitySet::default();
             capabilities.remove(missing);
-            let manager =
-                McpManager::connect(&configs, &capabilities, CancellationToken::new()).await;
+            let manager = McpManager::connect(
+                &configs,
+                &capabilities,
+                &std::env::temp_dir(),
+                CancellationToken::new(),
+            )
+            .await;
             assert!(manager.catalog().is_empty());
             // Missing header resolution or command startup would produce a warning.
             assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
@@ -703,29 +709,38 @@ for line in sys.stdin:
         let Some(fixture) = Fixture::new() else {
             return;
         };
-        let manager = connect(fixture.config()).await;
-        assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
-        let catalog = manager.catalog();
-        let names: Vec<_> = catalog
-            .iter()
-            .map(|entry| entry.tool.name.as_ref())
-            .collect();
-        assert_eq!(names, ["echo", "rpc_error", "slow", "tool_error"]);
+        let workspace = tempfile::tempdir().unwrap();
+        let workspace = std::fs::canonicalize(workspace.path()).unwrap();
+        let process = std::fs::canonicalize(std::env::current_dir().unwrap()).unwrap();
+        assert_ne!(workspace, process);
+        let configured = std::fs::canonicalize(fixture.directory.path()).unwrap();
+        let mut omitted = fixture.config();
+        omitted.cwd = None;
+        // A loaded config's origin is gone by now: an omitted cwd from either
+        // layer is `None` and must not inherit Skyhook's own directory.
+        for (config, expected) in [(fixture.config(), configured), (omitted, workspace.clone())] {
+            let manager = connect_in(config, &workspace).await;
+            assert!(manager.warnings().is_empty(), "{:?}", manager.warnings());
+            let catalog = manager.catalog();
+            let names: Vec<_> = catalog
+                .iter()
+                .map(|entry| entry.tool.name.as_ref())
+                .collect();
+            assert_eq!(names, ["echo", "rpc_error", "slow", "tool_error"]);
 
-        let arguments = json!({"message": "hello", "nested": {"number": 7}, "list": [true, null]});
-        let object = arguments.as_object().unwrap().clone();
-        let call = manager.call("fixture", "echo", object, CancellationToken::new());
-        let result = serde_json::to_value(call.await.expect("echo call succeeds")).unwrap();
-        let payload: Value =
-            serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
-        assert_eq!(payload["arguments"], arguments);
-        assert_eq!(payload["env"], "configured child value");
-        let cwd = std::fs::canonicalize(payload["cwd"].as_str().unwrap()).unwrap();
-        assert_eq!(
-            cwd,
-            std::fs::canonicalize(fixture.directory.path()).unwrap()
-        );
-        shutdown(&manager).await;
+            let arguments =
+                json!({"message": "hello", "nested": {"number": 7}, "list": [true, null]});
+            let object = arguments.as_object().unwrap().clone();
+            let call = manager.call("fixture", "echo", object, CancellationToken::new());
+            let result = serde_json::to_value(call.await.expect("echo call succeeds")).unwrap();
+            let payload: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            assert_eq!(payload["arguments"], arguments);
+            assert_eq!(payload["env"], "configured child value");
+            let cwd = std::fs::canonicalize(payload["cwd"].as_str().unwrap()).unwrap();
+            assert_eq!(cwd, expected);
+            shutdown(&manager).await;
+        }
     }
 
     #[tokio::test]
@@ -867,7 +882,13 @@ for line in sys.stdin:
             ("fixture".into(), fixture.config().try_into().unwrap()),
         ]);
         let capabilities = CapabilitySet::default();
-        let connect = McpManager::connect(&configs, &capabilities, CancellationToken::new());
+        let workspace = std::env::temp_dir();
+        let connect = McpManager::connect(
+            &configs,
+            &capabilities,
+            &workspace,
+            CancellationToken::new(),
+        );
         let manager = bounded(connect).await;
         assert_eq!(manager.catalog().len(), 4);
         assert!(

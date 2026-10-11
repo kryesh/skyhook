@@ -136,7 +136,13 @@ for line in sys.stdin:
         .unwrap();
         let mut configs = std::collections::BTreeMap::from([("fixture".to_owned(), config)]);
         let defaults = CapabilitySet::default();
-        let manager = McpManager::connect(&configs, &defaults, CancellationToken::new()).await;
+        let manager = McpManager::connect(
+            &configs,
+            &defaults,
+            &std::env::temp_dir(),
+            CancellationToken::new(),
+        )
+        .await;
         let manager = Arc::new(manager);
         assert_eq!(manager.catalog().len(), 3, "{:?}", manager.warnings());
         // Registration must use admitted catalog policy, not a later config join.

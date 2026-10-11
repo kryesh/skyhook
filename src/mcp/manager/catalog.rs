@@ -125,7 +125,13 @@ mod tests {
                 (mode.to_owned(), config.try_into().unwrap())
             })
             .collect();
-        let manager = McpManager::connect(&configs, &Default::default(), Default::default()).await;
+        let manager = McpManager::connect(
+            &configs,
+            &Default::default(),
+            &std::env::temp_dir(),
+            Default::default(),
+        )
+        .await;
         assert!(manager.catalog().is_empty());
         for (mode, limit) in LIMITS {
             assert!(matches!(*failure(&manager, mode), StartupError::Limit(l) if l == limit));
@@ -142,8 +148,10 @@ mod tests {
         config
             .env
             .insert("MCP_TEST_DISCOVERY".into(), "rpc_error".into());
+        let workspace = std::env::temp_dir();
         let connect = super::super::connection::connect_one(
             config.try_into().unwrap(),
+            &workspace,
             Default::default(),
             std::future::pending(),
         );

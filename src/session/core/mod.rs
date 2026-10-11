@@ -9,7 +9,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use super::{
     EventRecord, JournalFailure, RecordSeq, SessionError, SessionEvent, SessionLock, db,
-    pinned_modes, request,
+    mode_editions, request,
 };
 #[cfg(test)]
 use super::{Held, Hold};
@@ -396,9 +396,11 @@ impl Writer {
             Dated::LastActivity => EventRecord::last_activity(&state.records).unwrap_or_else(now),
         };
         let mut records = Vec::with_capacity(entries.len());
-        // A mode's first use pins its definition. Appends are serialized here, so
-        // agents applying one mode at once still pin it once.
-        let mut pinned: Option<std::collections::HashSet<crate::tool::policy::ModeName>> = None;
+        // A definition that differs from its name's latest edition records a new one.
+        // Appends are serialized here, so agents applying one at once record it once.
+        let mut editions: Option<
+            std::collections::HashMap<crate::tool::policy::ModeName, crate::tool::policy::Mode>,
+        > = None;
         for (offset, (agent, mut event)) in entries.into_iter().enumerate() {
             if agent.session() != self.shared.id {
                 return Err(SessionError::WrongSession);
@@ -407,15 +409,18 @@ impl Writer {
                 mode: Some(mode), ..
             }
             | SessionEvent::ModeChanged { mode, .. } = &mut event
-                && mode.definition.is_some()
+                && let Some(definition) = &mode.definition
             {
-                let pinned = pinned.get_or_insert_with(|| {
-                    pinned_modes(&state.records)
-                        .map(|(name, _)| name.clone())
+                let editions = editions.get_or_insert_with(|| {
+                    let recorded = mode_editions(&state.records);
+                    recorded
+                        .map(|(name, mode)| (name.clone(), mode.clone()))
                         .collect()
                 });
-                if !pinned.insert(mode.name.clone()) {
+                if editions.get(&mode.name) == Some(definition) {
                     mode.definition = None;
+                } else {
+                    editions.insert(mode.name.clone(), definition.clone());
                 }
             }
             records.push(EventRecord {

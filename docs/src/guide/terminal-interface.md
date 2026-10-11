@@ -103,10 +103,14 @@ The interface stores the last submitted model and mode and the sidebar setting i
 Session titles are saved with their history.
 
 A sidebar beside the conversation shows the session's title on its first line; click it to rename
-the session. Below, it lists each configured MCP server with its startup status and the
-viewed agent's todos, with the viewed agent's capabilities pinned to its bottom. For the root agent
-these are what the mode of the next message grants. A section with nothing to list
-is left out, title included. The sidebar is shown by default; `Ctrl+X B` or `/sidebar` toggles it.
+the session. Below, it lists the MCP servers the viewed agent can use, with their startup status,
+and the viewed agent's todos, with the viewed agent's capabilities pinned to its bottom. For the
+root agent of a new session these are what the mode of the next message grants, so cycling modes
+changes them. Once the root agent runs, choosing a mode for the next message that changes what it
+runs, including its own mode after the configuration redefined it, previews the change: a green
+`+` marks a server that mode would add, and a server it would remove is greyed out. A section with
+nothing to list is left out, title included. The sidebar is shown by default; `Ctrl+X B` or
+`/sidebar` toggles it.
 Terminals narrower than 100 columns hide it without changing the saved setting.
 
 The bottom bar uses this format:
