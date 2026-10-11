@@ -1,9 +1,10 @@
 //! A LiteLLM proxy. The model alias hides which family serves it, and the proxy
-//! translates each codec to that family, so the entry names the upstream: Claude
+//! translates each codec to that family, so the entry names the upstream: Anthropic
 //! behind Chat replays signed `thinking_blocks` and takes `cache_control` on
-//! content parts, while OpenAI behind Chat rejects both; Messages goes through
-//! the proxy's translation whatever the upstream. Every codec takes the proxy's
-//! virtual key as a bearer token; session affinity and spend logs key on
+//! content parts, while OpenAI behind Chat rejects both. Anthropic behind Messages
+//! receives the request as sent, so it takes Anthropic's own Messages conventions;
+//! any other upstream goes through the proxy's translation. Every codec takes the
+//! proxy's virtual key as a bearer token; session affinity and spend logs key on
 //! `x-litellm-session-id`; deployment tags ride `x-litellm-tags`.
 
 use reqwest::header::HeaderValue;
@@ -38,9 +39,16 @@ named_enum! {
 }
 
 impl Upstream {
-    /// Bedrock serves Claude with the same conventions as Anthropic.
-    const fn is_claude(self) -> bool {
+    /// On Chat, Bedrock serves Anthropic's models with the same conventions as Anthropic.
+    const fn is_anthropic(self) -> bool {
         matches!(self, Self::Anthropic | Self::Bedrock)
+    }
+
+    /// Whether Anthropic's own Messages conventions reach the service intact. The proxy
+    /// forwards Anthropic's request as sent, but its Bedrock path drops the
+    /// turn-scoped beta those conventions need.
+    const fn takes_anthropic_messages(self) -> bool {
+        matches!(self, Self::Anthropic)
     }
 
     /// Replayed state means something different behind each family.
@@ -59,9 +67,9 @@ fn chat_openai() -> chat_completions::Dialect {
     }
 }
 
-/// Claude's tool-name alphabet is OpenAI's; `strict` is not honoured, so the
+/// Anthropic's tool-name alphabet is OpenAI's; `strict` is not honoured, so the
 /// schema goes as written.
-fn chat_claude() -> chat_completions::Dialect {
+fn chat_anthropic() -> chat_completions::Dialect {
     chat_completions::Dialect {
         reasoning_replay: ReasoningReplay::ThinkingBlocks(const { path("thinking_blocks") }),
         empty_content: EmptyContent::Null,
@@ -115,23 +123,32 @@ crate::provider::settings::settings! {
         /// Sent as `x-litellm-tags`, for tag-based routing and spend logs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub tags: Vec<Tag> => default,
-        /// The role runtime state takes: `user` (default) sends it as user content;
-        /// `system` needs a server that accepts system messages mid-conversation.
+        /// The role runtime state takes: `user` sends it as user content; `system`
+        /// needs a server that accepts system messages mid-conversation. Anthropic
+        /// behind Messages defaults to `system`, turn-scoped; every other upstream
+        /// and codec to `user`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub state_role: Option<StateRole> => default,
     }
 }
 
 impl DialectConfig for Config {
-    /// The bridge to Claude may drop `prompt_cache_key`, so affinity travels as
+    /// The bridge to Anthropic may drop `prompt_cache_key`, so affinity travels as
     /// a header whatever the upstream and codec.
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
-        let claude = self.upstream.is_claude();
+        let anthropic = self.upstream.is_anthropic();
+        let anthropic_messages =
+            codec == CodecName::Messages && self.upstream.takes_anthropic_messages();
         let mut conventions = match codec {
-            CodecName::ChatCompletions => {
-                Codec::ChatCompletions(if claude { chat_claude() } else { chat_openai() })
-            }
+            CodecName::ChatCompletions => Codec::ChatCompletions(if anthropic {
+                chat_anthropic()
+            } else {
+                chat_openai()
+            }),
             CodecName::Responses => Codec::Responses(super::openai::responses()),
+            CodecName::Messages if anthropic_messages => {
+                Codec::Messages(super::anthropic::messages())
+            }
             CodecName::Messages => Codec::Messages(messages::Dialect::standard()),
         };
         conventions.identity_mut().cache_key = header("x-litellm-session-id");
@@ -139,7 +156,14 @@ impl DialectConfig for Config {
             scope: self.upstream.scope(),
             ..Profile::new(conventions, transport(), Dialect::Litellm)
         };
-        profile.state_role(self.state_role, StateRole::User);
+        if anthropic_messages {
+            // These conventions send state as turn-scoped system messages, which the
+            // bare upstream scope does not mean.
+            profile.discriminate("messages", &"anthropic");
+            super::anthropic::state(&mut profile, self.state_role);
+        } else {
+            profile.state_role(self.state_role, StateRole::User);
+        }
         if !self.tags.is_empty() {
             profile.discriminate("tags", &self.tags);
             let tags: Vec<_> = self.tags.iter().map(Tag::as_str).collect();
@@ -157,13 +181,14 @@ mod tests {
 
     #[test]
     fn replay_identity_tracks_upstream_and_routing_tags() {
-        let scope = |yaml| {
-            crate::yaml::parse::<Config>(yaml)
-                .unwrap()
-                .admit(CodecName::ChatCompletions)
-                .unwrap()
-                .scope
+        let scope_for = |yaml, codec| {
+            let config = crate::yaml::parse::<Config>(yaml).unwrap();
+            config.admit(codec).unwrap().scope
         };
+        let scope = |yaml| scope_for(yaml, CodecName::ChatCompletions);
+        // Anthropic's conventions behind Messages are a conversation of their own.
+        let messages = scope_for("upstream: anthropic", CodecName::Messages);
+        assert_ne!(messages, Upstream::Anthropic.scope());
         let tagged = scope("upstream: anthropic\ntags: [deployment-a]");
         for other in [
             "upstream: anthropic",
@@ -192,6 +217,40 @@ mod tests {
         assert_eq!(header_values(&responses, "x-litellm-session-id"), ["ctx"]);
         assert_eq!(Upstream::Bedrock.scope(), "litellm:bedrock");
         assert!(crate::yaml::parse::<Config>("{upstream: openai, tags: ['a,b']}").is_err());
+    }
+
+    /// Anthropic behind Messages takes the anthropic dialect's conventions: turn-scoped system
+    /// state, thinking dropped on a binding mismatch, and the betas both need. Every
+    /// other upstream and codec keeps user-role state and announces no beta.
+    #[tokio::test]
+    async fn anthropic_behind_messages_takes_the_anthropic_dialects_conventions() {
+        let config = |yaml| crate::yaml::parse::<Config>(yaml).unwrap();
+        let betas = async |config: &Config, codec| {
+            header_values(&head(config, codec, "k").await, "anthropic-beta")
+        };
+        let anthropic = config("upstream: anthropic");
+        let mut expected = Codec::Messages(messages::Dialect {
+            state_role: StateRole::System,
+            ..super::super::anthropic::messages()
+        });
+        expected.identity_mut().cache_key = header("x-litellm-session-id");
+        assert_eq!(
+            anthropic.admit(CodecName::Messages).unwrap().codec,
+            expected
+        );
+        assert_eq!(
+            betas(&anthropic, CodecName::Messages).await,
+            ["thinking-binding-controls-2026-08-01, mid-conversation-system-clear-at-2026-08-21"]
+        );
+        for (config, codec) in [
+            (config("upstream: bedrock"), CodecName::Messages),
+            (config("upstream: openai"), CodecName::Messages),
+            (anthropic, CodecName::ChatCompletions),
+        ] {
+            let mut admitted = config.admit(codec).unwrap().codec;
+            assert_eq!(*admitted.state_role_mut(), StateRole::User, "{codec}");
+            assert!(betas(&config, codec).await.is_empty(), "{codec}");
+        }
     }
 
     /// The proxy names an overflow only in its message, and a spent budget by

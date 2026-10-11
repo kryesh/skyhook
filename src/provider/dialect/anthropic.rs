@@ -15,11 +15,12 @@ use crate::provider::{
     },
 };
 
-/// Signed thinking is bound to the exact conversation before it; letting the
-/// service drop a mismatched block keeps mode switches and compaction from
-/// failing, and the runtime still unbinds client-side. System-role state is
-/// turn-scoped, which keeps that conversation fixed as the state changes.
-fn messages() -> messages::Dialect {
+/// Anthropic's Messages conventions, wherever the service is reached. Signed thinking
+/// is bound to the exact conversation before it; letting the service drop a
+/// mismatched block keeps mode switches and compaction from failing, and the
+/// runtime still unbinds client-side. System-role state is turn-scoped, which
+/// keeps that conversation fixed as the state changes.
+pub(super) fn messages() -> messages::Dialect {
     messages::Dialect {
         thinking_binding: ThinkingBinding::DropOnMismatch,
         system_state: SystemState::TurnScoped,
@@ -32,6 +33,18 @@ const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
 
 /// The service's beta for turn-scoped (`clear_at`) system messages.
 const CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
+
+/// Send state in the configured role, `system` by default, and announce the betas
+/// Anthropic's conventions need: block binding, and turn-scoped system messages when
+/// state takes the system role.
+pub(super) fn state(profile: &mut Profile, configured: Option<StateRole>) {
+    let state_role = profile.state_role(configured, StateRole::System);
+    let turn_scoped = (state_role == StateRole::System).then_some(CLEAR_AT_BETA);
+    profile.listed(
+        messages::BETA_HEADER,
+        [BINDING_BETA].into_iter().chain(turn_scoped),
+    );
+}
 
 /// A spend cap is reported as a rate limit without a retry hint.
 const ERRORS: ErrorSignals = ErrorSignals {
@@ -93,12 +106,7 @@ impl DialectConfig for Config {
             key: Scheme::XApiKey,
             ..Profile::new(codec, transport(), Dialect::Anthropic)
         };
-        let state_role = profile.state_role(self.state_role, StateRole::System);
-        let turn_scoped = (state_role == StateRole::System).then_some(CLEAR_AT_BETA);
-        profile.listed(
-            messages::BETA_HEADER,
-            [BINDING_BETA].into_iter().chain(turn_scoped),
-        );
+        state(&mut profile, self.state_role);
         if let Some(workspace) = &self.workspace_id {
             profile.discriminate("workspace_id", workspace);
             profile.fixed("anthropic-workspace-id", workspace.value());
@@ -144,6 +152,16 @@ mod tests {
 
     #[tokio::test]
     async fn key_and_workspace_ride_the_version_header() {
+        // State in the user role needs only the block-binding beta.
+        let user = Config {
+            state_role: Some(StateRole::User),
+            ..Config::default()
+        };
+        let binding_only = header_values(
+            &head(&user, CodecName::Messages, "k").await,
+            "anthropic-beta",
+        );
+        assert_eq!(binding_only, ["thinking-binding-controls-2026-08-01"]);
         let keyed = head(&Config::default(), CodecName::Messages, "k").await;
         assert!(keyed.starts_with("POST /v1/messages HTTP/1.1"));
         assert_eq!(header_values(&keyed, "x-api-key"), ["k"]);

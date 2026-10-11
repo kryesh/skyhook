@@ -321,7 +321,7 @@ mod tests {
     }
 
     fn request() -> ModelRequest {
-        crate::provider::codec::common::tests::request("claude-test")
+        crate::provider::codec::common::tests::request("test-model")
     }
 
     fn text(text: &str) -> UserContent {

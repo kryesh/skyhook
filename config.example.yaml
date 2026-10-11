@@ -117,8 +117,9 @@ providers:
 
   # A LiteLLM virtual key is a bearer token for every codec, including messages.
   # upstream asserts the family behind an alias; configure actual routing in LiteLLM.
+  # Claude behind messages keeps its signed thinking across requests.
   # proxy:
-  #   codec: "chat_completions"
+  #   codec: "messages"
   #   dialect: "litellm"
   #   base_url: "https://litellm.example.com/v1"
   #   api_key:

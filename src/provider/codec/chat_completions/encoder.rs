@@ -467,7 +467,7 @@ mod tests {
     fn thinking_blocks_replay_and_cache_breakpoints_take_the_parts_form() {
         use crate::provider::codec::path;
         use crate::provider::protocol::HistoryLifetime;
-        let claude = Dialect {
+        let thinking_blocks = Dialect {
             reasoning_replay: ReasoningReplay::ThinkingBlocks(path("thinking_blocks")),
             cache: Cache::ContentPartBreakpoints { ttl: None },
             ..Dialect::compatible()
@@ -515,7 +515,7 @@ mod tests {
         ]));
         let current = crate::provider::protocol::StateLifetime::Current;
         (request.context).push(state("<state>", current));
-        let body = encode(&request, &claude).unwrap();
+        let body = encode(&request, &thinking_blocks).unwrap();
         let messages = body["messages"].as_array().unwrap();
         // Marked system segments keep their parts; the text-only replay is foreign here.
         assert_eq!(
@@ -542,7 +542,7 @@ mod tests {
         assert_eq!(messages[4], json!({"role":"user","content":"<state>"}));
         assert_eq!(messages.len(), 5);
         request.history_lifetime = HistoryLifetime::Detached;
-        let detached = encode(&request, &claude).unwrap();
+        let detached = encode(&request, &thinking_blocks).unwrap();
         assert!(detached["messages"][3]["content"].is_string());
         assert!(detached["messages"][0]["content"].is_array());
         // Without a cache convention, the same request flattens to strings, and a
@@ -628,18 +628,21 @@ mod tests {
         assert!(turns[0].get("reasoning_details").is_none());
         assert_eq!(turns[1]["reasoning_details"], json!([summary, encrypted]));
         // Thinking blocks are filtered one by one.
-        let claude = Dialect {
+        let thinking_blocks = Dialect {
             reasoning_replay: ReasoningReplay::ThinkingBlocks(path("thinking_blocks")),
             ..Dialect::compatible()
         };
         let open = json!({"type":"thinking","thinking":"open"});
         let sealed = json!({"type":"thinking","thinking":"sealed","signature":"sig"});
         let block = ReplayFormat::ChatThinkingBlock;
-        let turns = encode_turns(&claude, vec![turn(block, &[(open.clone(), free)], "one")]);
+        let turns = encode_turns(
+            &thinking_blocks,
+            vec![turn(block, &[(open.clone(), free)], "one")],
+        );
         assert_eq!(turns[0]["thinking_blocks"], json!([open]));
         let blocks = [(open.clone(), free), (sealed.clone(), bound)];
         let turns = encode_turns(
-            &claude,
+            &thinking_blocks,
             vec![
                 turn(block, &[(open, free)], "one"),
                 turn(block, &blocks, "two"),

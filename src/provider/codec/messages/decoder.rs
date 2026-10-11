@@ -459,7 +459,7 @@ mod tests {
 
     fn start() -> Value {
         json!({"type":"message_start", "message":{
-            "id":"msg_1", "type":"message", "role":"assistant", "model":"claude-test-20260101",
+            "id":"msg_1", "type":"message", "role":"assistant", "model":"test-model-20260101",
             "content":[], "stop_reason":null, "stop_sequence":null,
             "usage":{"input_tokens":11, "cache_creation_input_tokens":13,
                 "cache_read_input_tokens":17, "output_tokens":1}
@@ -471,7 +471,7 @@ mod tests {
     }
 
     fn started() -> Decoder {
-        let mut decoder = Decoder::new("claude-test".into(), scope(), ErrorSignals::NONE);
+        let mut decoder = Decoder::new("test-model".into(), scope(), ErrorSignals::NONE);
         let usage = usage(1);
         let events = decoder.decode(&event(start())).unwrap();
         assert_eq!(events, [ResponseEvent::Usage(usage)]);
@@ -615,7 +615,7 @@ mod tests {
     #[test]
     fn text_lifecycle_preserves_initial_and_streamed_text_and_usage() {
         let reduced = reduced(
-            "claude",
+            "model",
             vec![
                 start(),
                 block_start(0, json!({"type":"text","text":"hel"})),
@@ -641,7 +641,7 @@ mod tests {
 
     #[test]
     fn signed_and_redacted_reasoning_tool_roundtrip_replays_to_its_model() {
-        let mut request = crate::provider::codec::common::tests::request("claude-test");
+        let mut request = crate::provider::codec::common::tests::request("test-model");
         let native = json!({"type":"thinking", "thinking":"original private text", "signature":"sig+/=",
             "future_field":{"opaque":"preserve"}});
         let redacted =
@@ -787,7 +787,7 @@ mod tests {
                 frames.push(stop(index));
             }
             frames.extend([terminal(reason, 19), message_stop()]);
-            let reduced = reduced("claude-test", frames);
+            let reduced = reduced("test-model", frames);
             assert_eq!(
                 (reduced.completion.outcome(), reduced.usage),
                 (Outcome::Cut(expected), usage(19))

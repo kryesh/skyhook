@@ -21,7 +21,7 @@ Different models on one provider may use different supported codecs:
 | `anthropic` | `messages` | `base_url` defaults to `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`, `state_role` (default `system`). |
 | `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login <provider>`. `base_url` defaults to the ChatGPT backend root `https://chatgpt.com/backend-api` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. |
 | `openrouter` | any | `base_url` defaults to `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: `routing` (Chat only: `order`, `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, `fallback_models`), `cache_ttl: "5m"` or `"1h"`, and `state_role` (default `user`). A response schema always sets `require_parameters`. |
-| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; `messages` behind an OpenAI upstream goes through the proxy's translation, which drops reasoning. Optional `tags` select LiteLLM's tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session. Extra field: `state_role` (default `user`). |
+| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Claude on Chat replays signed thinking and takes prompt caching, OpenAI on Chat has neither. `messages` behind an Anthropic upstream reaches the service as sent and gets the `anthropic` dialect's conventions: turn-scoped system state, signed thinking kept, and the betas both need, which the proxy forwards. Behind Bedrock it does not, since LiteLLM drops the turn-scoped beta on its Bedrock path; behind OpenAI it goes through the proxy's translation, which drops reasoning. Chat, and `messages` behind Bedrock, drop superseded state, which breaks models that bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): use `messages` behind Anthropic for them, or `state_mode: persist`. Optional `tags` select LiteLLM's tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session. Extra field: `state_role` (default `system` for `messages` behind Anthropic, `user` otherwise). |
 
 Every dialect but `codex` accepts `api_key` (see [authentication](authentication.md)); every
 dialect accepts fixed request `headers` for proxies or attribution, the
@@ -163,13 +163,14 @@ Runtime state is the harness speaking, so it never appears as tool output. A dia
 
 - `system` uses the protocol's harness role: a system message on `messages`, a system or
   developer message on `chat_completions`, and a developer message on `responses`. Through
-  `anthropic`, a `dynamic` state is a turn-scoped system message: the model reads it for one
-  request, and afterwards it costs no input tokens but stays in the conversation, so models that
-  bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku
-  5.5) keep it with `dynamic` state. It needs a model that supports mid-conversation system
-  messages (Claude Opus 4.8 and later, Fable, Sonnet 5.5, Haiku 5.5; not Sonnet 5). Other
-  dialects send plain system messages and drop superseded state, as `user` does. On `messages`, a
-  state with no valid place, such as right after an assistant turn, is not sent.
+  `anthropic`, or `litellm` with an Anthropic upstream on `messages`, a `dynamic` state is a
+  turn-scoped system message: the model reads it for one request, and afterwards it costs no input
+  tokens but stays in the conversation, so models that bind thinking to the exact earlier
+  conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) keep it with `dynamic` state.
+  It needs a model that supports mid-conversation system messages (Claude Opus 4.8 and later,
+  Fable, Sonnet 5.5, Haiku 5.5; not Sonnet 5). Other dialects send plain system messages and drop
+  superseded state, as `user` does. On `messages`, a state with no valid place, such as right
+  after an assistant turn, is not sent.
 - `user` sends state as user content, joining the user turn before it or as a turn of its own,
   for servers without a harness role mid-conversation, such as many open-model chat templates.
   Superseded state is then dropped, which changes the end of the conversation between requests.
@@ -178,9 +179,13 @@ Runtime state is the harness speaking, so it never appears as tool output. A dia
   `state_mode`. For such models, enable the template's option to keep earlier reasoning
   (Qwen's `preserve_thinking`, for example).
 
-`anthropic` defaults to `system`, `openai` and `codex` always use it, and `compatible`, `litellm`
-and `openrouter` default to `user`. Changing a provider's `state_role` changes the conversation
-earlier reasoning was produced in, so that reasoning is not replayed afterward.
+`anthropic` defaults to `system`, as does `litellm` for `messages` behind an Anthropic upstream;
+`openai` and `codex` always use it, and `compatible`, `openrouter` and every other `litellm`
+combination default to `user`. Changing a provider's `state_role` changes the conversation
+earlier reasoning was produced in, so that reasoning is not replayed afterward. Through
+`anthropic`, or `litellm` with an Anthropic upstream on `messages`, set `reasoning` to a level
+other than `off` on models that bind thinking: only then does Skyhook ask the service to drop a
+thinking block whose earlier conversation changed, rather than reject the request.
 
 The [complete example](overview.md#complete-example) uses published hosted-model limits:
 

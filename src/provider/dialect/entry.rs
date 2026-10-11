@@ -566,7 +566,7 @@ providers:
         for text in [
             format!("codec: responses\n{root}"),
             format!("dialect: openai\n{root}"),
-            format!("dialect: claude\ncodec: messages\n{root}"),
+            format!("dialect: unknown\ncodec: messages\n{root}"),
             format!("dialect: compatible\ncodec: completions\n{root}"),
             // Only a dialect with its own service has a default root.
             "dialect: compatible\ncodec: responses".to_owned(),
@@ -672,8 +672,8 @@ providers:
         tags: []
         max_context: 4096
         max_output: 512
-      claude:
-        model: claude-alias
+      anthropic:
+        model: anthropic-alias
         codec: messages
         upstream: anthropic
         max_context: 4096
@@ -705,7 +705,7 @@ providers:
             CodecName::Responses
         );
         assert_eq!(
-            admitted.models()["claude"].wire.codec.name(),
+            admitted.models()["anthropic"].wire.codec.name(),
             CodecName::Messages
         );
         for (field, value) in [("codec", "responses"), ("upstream", "openai")] {
