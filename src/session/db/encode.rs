@@ -313,6 +313,7 @@ mod tests {
             context,
             checkpoint: None,
             through: Some(prompt.message()),
+            from: None,
             tail: vec![user("tail")],
             history_lifetime: HistoryLifetime::Detached,
         });
@@ -360,12 +361,7 @@ mod tests {
         });
         one!(SessionEvent::Usage {
             request: request.request(),
-            usage: Usage {
-                input_tokens: 10,
-                cached_input_tokens: 2,
-                cache_write_input_tokens: 1,
-                output_tokens: 3,
-            },
+            usage: Usage::prompted(10, 2, 1, 3),
         });
         one!(SessionEvent::ResponseCompleted {
             attempt: attempt(2),
@@ -446,6 +442,7 @@ mod tests {
             context: summary_context,
             checkpoint: None,
             through: Some(assistant.message()),
+            from: None,
             tail: vec![user("summarize")],
             history_lifetime: HistoryLifetime::Detached,
         });
@@ -466,14 +463,14 @@ mod tests {
                 }],
                 retained: vec![prompt.message()],
                 attempt: summary_attempt,
-                before_tokens: 100,
-                after_tokens: 10,
+                trigger: crate::session::CompactionTrigger::Occupancy(100),
             },
         });
         one!(SessionEvent::ModelRequested {
             context,
             checkpoint: Some(checkpoint),
             through: Some(prompt.message()),
+            from: None,
             tail: Vec::new(),
             history_lifetime: HistoryLifetime::Extends,
         });
@@ -631,10 +628,10 @@ mod tests {
             })),
         ];
         one!(SessionEvent::MessageCommitted {
-            message: Message::User(vec![
-                UserPart::State { state },
-                UserPart::JobEvents { events },
-            ]),
+            message: Message::State(state),
+        });
+        one!(SessionEvent::MessageCommitted {
+            message: Message::User(vec![UserPart::JobEvents { events }]),
         });
         let location = ExecutionLocation::root("/workspace".into());
         let failed = SessionEvent::AgentFailed {

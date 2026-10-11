@@ -12,7 +12,7 @@ use crate::{
     agent::Failure,
     identity::{AgentId, JobId, SessionId},
     job::JobRole,
-    provider::{profile::ModelRef, protocol::Usage},
+    provider::{profile::ModelRef, protocol::UsageTotals},
     session::{
         EventRecord, Message, ModelPurpose, RequestLedger, RequestPhase, SessionEvent, Turns,
         UserPart,
@@ -52,7 +52,7 @@ pub struct AgentStats {
     pub outcome: AgentOutcome,
     pub started: DateTime<Utc>,
     /// Every usage report of the agent, including compaction requests.
-    pub usage: Usage,
+    pub usage: UsageTotals,
     pub requests: RequestStats,
     pub compactions: CompactionStats,
     pub tools: BTreeMap<String, ToolStats>,
@@ -110,8 +110,6 @@ pub struct CompactionStats {
     pub requested: u64,
     pub completed: u64,
     pub failed: u64,
-    pub before_tokens: u64,
-    pub after_tokens: u64,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
@@ -132,14 +130,14 @@ pub struct JobCounts {
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct ModelStats {
-    pub usage: Usage,
+    pub usage: UsageTotals,
     pub requests: RequestStats,
 }
 
 #[derive(Clone, Copy, Debug, Default, Serialize, PartialEq, Eq)]
 pub struct Totals {
     pub agents: u64,
-    pub usage: Usage,
+    pub usage: UsageTotals,
     pub requests: RequestStats,
     pub compactions: CompactionStats,
     pub tool_calls: ToolStats,
@@ -161,8 +159,6 @@ impl CompactionStats {
         self.requested += other.requested;
         self.completed += other.completed;
         self.failed += other.failed;
-        self.before_tokens = self.before_tokens.saturating_add(other.before_tokens);
-        self.after_tokens = self.after_tokens.saturating_add(other.after_tokens);
     }
 }
 
@@ -257,17 +253,9 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
                     }
                 }
             }
-            SessionEvent::Compaction { checkpoint } => {
+            SessionEvent::Compaction { .. } => {
                 if let Some(stats) = agents.get_mut(agent) {
                     stats.compactions.completed += 1;
-                    stats.compactions.before_tokens = stats
-                        .compactions
-                        .before_tokens
-                        .saturating_add(checkpoint.before_tokens);
-                    stats.compactions.after_tokens = stats
-                        .compactions
-                        .after_tokens
-                        .saturating_add(checkpoint.after_tokens);
                 }
             }
             SessionEvent::CompactionFailed { .. } => {
@@ -358,10 +346,10 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
     // The request's context names the profile, not the agent's current selection.
     for (_, request) in ledger.iter() {
         let model = models.entry(request.profile.name.clone()).or_default();
-        model.usage.accumulate(request.usage);
+        model.usage.add(request.usage);
         let agent = agents.get_mut(&request.agent);
         let agent = agent.map(|stats| {
-            stats.usage.accumulate(request.usage);
+            stats.usage.add(request.usage);
             &mut stats.requests
         });
         if request.purpose != ModelPurpose::Agent {
@@ -407,7 +395,7 @@ pub fn session_stats(session: SessionId, records: &[EventRecord]) -> SessionStat
         }
         paths.insert(agent.clone(), stats.path.clone());
         totals.agents += 1;
-        totals.usage.accumulate(stats.usage);
+        totals.usage.merge(stats.usage);
         totals.requests.add(stats.requests);
         totals.compactions.add(stats.compactions);
         totals.jobs.add(stats.jobs);
@@ -452,6 +440,7 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::protocol::Usage;
     use crate::{
         execution::ExecutionLocation,
         job::{JobEnd, JobRole},
@@ -463,6 +452,15 @@ mod tests {
         },
     };
     use serde_json::json;
+
+    fn totals(input: u64, cached: u64, output: u64) -> UsageTotals {
+        UsageTotals {
+            input_tokens: input,
+            cached_input_tokens: cached,
+            cache_write_input_tokens: 0,
+            output_tokens: output,
+        }
+    }
 
     fn context_event(name: &str) -> SessionEvent {
         let mut profile = tests::profile();
@@ -691,7 +689,12 @@ mod tests {
             &child,
             SessionEvent::Usage {
                 request: open,
-                usage: usage(5, 0, 1),
+                // Unreported counts add nothing to the totals.
+                usage: Usage {
+                    input_tokens: Some(5),
+                    output_tokens: Some(1),
+                    ..Usage::default()
+                },
             },
         )
         .await;
@@ -771,7 +774,7 @@ mod tests {
             (2, 2)
         );
         assert_eq!(stats.models[&big].requests.requested, 4);
-        assert_eq!(root_stats.usage, usage(100, 40, 7));
+        assert_eq!(root_stats.usage, totals(100, 40, 7));
         assert_eq!(root_stats.jobs.agents, 1);
         let read = root_stats.tools["read"];
         let exec = root_stats.tools["exec"];
@@ -779,10 +782,10 @@ mod tests {
         assert_eq!((exec.calls, exec.errors, exec.unanswered), (1, 0, 1));
         // The request's context names the profile, not the agent's current selection.
         assert_eq!(stats.models.keys().collect::<Vec<_>>(), [&big]);
-        assert_eq!(stats.models[&big].usage, usage(105, 40, 8));
+        assert_eq!(stats.models[&big].usage, totals(105, 40, 8));
         assert_eq!(stats.models[&big].requests.completed, 2);
         assert_eq!(stats.models[&big].requests.attempts, 4);
-        assert_eq!(stats.totals.usage, usage(105, 40, 8));
+        assert_eq!(stats.totals.usage, totals(105, 40, 8));
         assert_eq!(stats.totals.tool_calls.calls, 2);
         assert_eq!(stats.tools.len(), 2);
         assert_eq!(stats.totals.agents, 2);

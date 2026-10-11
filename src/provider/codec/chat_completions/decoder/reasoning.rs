@@ -252,7 +252,10 @@ mod tests {
         ];
         let (items, usage, outcome) = decode(frames.clone());
         assert_eq!(outcome, Outcome::ToolUse);
-        assert_eq!((usage.input_tokens, usage.output_tokens), (447, 84));
+        assert_eq!(
+            (usage.input_tokens.unwrap(), usage.output_tokens.unwrap()),
+            (447, 84)
+        );
         let expected = [
             reasoning("Compare."),
             text("399 is larger."),

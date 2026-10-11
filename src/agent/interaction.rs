@@ -91,10 +91,6 @@ pub enum RuntimeEvent {
         agent: AgentId,
         activity: super::ObservedActivity,
     },
-    Context {
-        agent: AgentId,
-        usage: super::ContextUsage,
-    },
     TurnCompleted {
         agent: AgentId,
     },

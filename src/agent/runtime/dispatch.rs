@@ -38,7 +38,7 @@ impl PreparedAgentLaunch {
             return Err(HarnessError::ChildDepth);
         }
         let remaining_depth = runtime.harness.max_child_depth.saturating_sub(id.depth());
-        let (contract, meter, start) = match launch {
+        let (contract, start) = match launch {
             AgentLaunch::New {
                 model,
                 todos,
@@ -62,16 +62,13 @@ impl PreparedAgentLaunch {
                     system: None,
                     tools: None,
                 };
-                let meter = super::compact::TokenMeter::default();
-                (contract, meter, Start::New(todos))
+                (contract, Start::New(todos))
             }
             AgentLaunch::Resume(resumed) => {
-                let (contract, meter) = runtime.store.read(|state| {
-                    let meter = super::compact::TokenMeter::restore(&state.records, &id);
-                    (runtime.resumed_contract(&state.agents, &id), meter)
-                });
+                let contract =
+                    (runtime.store).read(|state| runtime.resumed_contract(&state.agents, &id));
                 let contract = contract.ok_or_else(|| HarnessError::NoRecordedModel(id.clone()))?;
-                (contract, meter, Start::Resume(resumed))
+                (contract, Start::Resume(resumed))
             }
         };
         let RecordedContract {
@@ -99,8 +96,7 @@ impl PreparedAgentLaunch {
                     .await?
             }
         };
-        let mut context = runtime.open_agent_context(&id, profile, system, &capabilities, tools)?;
-        context.meter = meter;
+        let context = runtime.open_agent_context(&id, profile, system, &capabilities, tools)?;
         Ok(Self {
             runtime,
             agent_loop: AgentLoop {
@@ -463,8 +459,7 @@ impl SessionRuntime {
         let template = ModelRequest {
             model: profile.profile.model.clone(),
             system,
-            history: Vec::new(),
-            tail: Vec::new(),
+            context: Vec::new(),
             history_lifetime: Default::default(),
             tools,
             reasoning: profile.profile.reasoning.clone(),
@@ -569,7 +564,7 @@ mod tests {
     use crate::agent::runtime::tests::*;
 
     fn last_tool_results(request: &ModelRequest) -> &[ToolResult] {
-        let Some(Sent::Tool(results)) = request.history.last() else {
+        let Some(Sent::Tool(results)) = request.messages().last() else {
             panic!("expected tool results at the end of the history");
         };
         results

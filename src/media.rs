@@ -414,7 +414,7 @@ mod tests {
             assert_eq!(image.file.as_deref(), Some("shot.png"));
             assert_eq!(image.format, ImageFormat::Png);
             let mut request = ModelRequest {
-                history: vec![
+                context: crate::provider::protocol::entries(vec![
                     Message::User(vec![UserContent::Attachment {
                         attachment: AttachmentRef::Text(text.clone()),
                     }]),
@@ -425,7 +425,7 @@ mod tests {
                         images: vec![image.clone()],
                         is_error: false,
                     }]),
-                ],
+                ]),
                 ..ModelRequest::test("fixture")
             };
             assert!(matches!(
@@ -459,7 +459,7 @@ mod tests {
                 assert!(files.next().is_none());
             }
             // A reused request and its cache keep only what its history still references.
-            request.history.pop();
+            request.context.pop();
             store.load_blobs(&mut request, &mut cache).await.unwrap();
             for blobs in [&request.blobs, &cache] {
                 assert!(matches!(blobs.get(&image.blob), Err(MediaError::NotLoaded)));

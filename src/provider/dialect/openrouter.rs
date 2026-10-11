@@ -7,11 +7,11 @@
 use reqwest::header::HeaderValue;
 use serde::Deserialize;
 
-use super::{Dialect, DialectConfig, DialectError, Profile};
+use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheTtl, Codec, CodecName, Effort, OPENAI_EFFORT, SchemaConstraint, ToolNames,
+        CacheTtl, Codec, CodecName, Effort, OPENAI_EFFORT, SchemaConstraint, StateRole, ToolNames,
         chat_completions::{self, Cache, EmptyContent, ReasoningReplay, Routing, UsageRequest},
         header, messages, path,
     },
@@ -175,6 +175,10 @@ crate::provider::settings::settings! {
         /// Cache breakpoint lifetime for models that take one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cache_ttl: Option<CacheTtl> => default,
+        /// The role runtime state takes: `user` (default) sends it as user content;
+        /// `system` needs a server that accepts system messages mid-conversation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state_role: Option<StateRole> => default,
     }
 }
 
@@ -185,6 +189,10 @@ pub enum Error {
 }
 
 impl DialectConfig for Config {
+    fn base_url() -> BaseUrl {
+        BaseUrl::Default("https://openrouter.ai/api/v1")
+    }
+
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if self.routing.is_some() && codec != CodecName::ChatCompletions {
             return Err(Error::RoutingNeedsChat.into());
@@ -197,13 +205,14 @@ impl DialectConfig for Config {
             CodecName::Responses => Codec::Responses(super::openai::responses()),
             CodecName::Messages => Codec::Messages(messages::Dialect {
                 cache_ttl: self.cache_ttl,
-                ..messages::Dialect::anthropic()
+                ..messages::Dialect::standard()
             }),
         };
         codec.identity_mut().cache_key = header("x-session-id");
         let mut profile = Profile::new(codec, transport, Dialect::Openrouter);
+        profile.state_role(self.state_role, StateRole::User);
         if let Some(routing) = &self.routing {
-            profile.discriminate(routing);
+            profile.discriminate("routing", routing);
         }
         for (name, value) in [
             ("http-referer", "https://github.com/kryesh/skyhook"),

@@ -24,6 +24,7 @@ named_enum! {
         User = "user",
         Assistant = "assistant",
         Tool = "tool",
+        State = "state",
     }
 }
 
@@ -32,7 +33,6 @@ named_enum! {
     pub(super) enum UserPartKind {
         Text = "text",
         Attachment = "attachment",
-        State = "state",
         JobEvents = "job_events",
         ParentInput = "parent_input",
         Compaction = "compaction",
@@ -107,7 +107,6 @@ impl Encoder {
                         UserPart::Attachment { attachment } => {
                             (UserPartKind::Attachment, None, Some(attachment))
                         }
-                        UserPart::State { .. } => (UserPartKind::State, None, None),
                         UserPart::JobEvents { .. } => (UserPartKind::JobEvents, None, None),
                     };
                     let (blob, format, file) = match attachment {
@@ -125,10 +124,8 @@ impl Encoder {
                          image_format, file) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         params![id, position, kind, text, blob, format, file],
                     )?;
-                    match part {
-                        UserPart::State { state } => self.state(db, row, state)?,
-                        UserPart::JobEvents { events } => job_events(db, row, events)?,
-                        _ => {}
+                    if let UserPart::JobEvents { events } = part {
+                        job_events(db, row, events)?;
                     }
                 }
                 Ok(id)
@@ -143,30 +140,38 @@ impl Encoder {
                 }
                 Ok(id)
             }
+            Message::State(state) => {
+                let id = db.insert(
+                    "INSERT INTO message (role) VALUES (?1)",
+                    params![MessageRole::State],
+                )?;
+                self.state(db, id, state)?;
+                Ok(id)
+            }
             Message::Tool(_) => Err(rejected(
                 "tool results are only stored as committed agent messages",
             )),
         }
     }
 
-    fn state(&mut self, db: &Db, part: i64, state: &RuntimeState) -> DbResult<()> {
+    fn state(&mut self, db: &Db, message: i64, state: &RuntimeState) -> DbResult<()> {
         let target = self.target(db, &state.location.target)?;
         db.execute(
-            "INSERT INTO user_part_state (part, date, location_target, location_workspace) \
+            "INSERT INTO message_state (message, date, location_target, location_workspace) \
              VALUES (?1, ?2, ?3, ?4)",
             params![
-                part,
+                message,
                 &state.date,
                 target,
                 path_bytes(&state.location.workspace)
             ],
         )?;
-        self.state_jobs(db, part, &state.jobs, None, &mut 0)?;
+        self.state_jobs(db, message, &state.jobs, None, &mut 0)?;
         for (position, item) in state.todos.iter().enumerate() {
             db.execute(
-                "INSERT INTO user_part_state_todo (part, position, text, status) \
+                "INSERT INTO message_state_todo (message, position, text, status) \
                  VALUES (?1, ?2, ?3, ?4)",
-                params![part, position, &item.text, item.status],
+                params![message, position, &item.text, item.status],
             )?;
         }
         Ok(())
@@ -176,7 +181,7 @@ impl Encoder {
     fn state_jobs(
         &mut self,
         db: &Db,
-        part: i64,
+        message: i64,
         jobs: &[StateJob],
         parent: Option<u64>,
         next: &mut u64,
@@ -194,11 +199,11 @@ impl Encoder {
                 StateJobKind::Tool { tool } => (Some(tool), None),
             };
             db.execute(
-                "INSERT INTO user_part_state_job (part, position, parent_position, job, tool, \
+                "INSERT INTO message_state_job (message, position, parent_position, job, tool, \
                  name, state, target, workspace, age_seconds, turns, tool_calls) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
                 params![
-                    part,
+                    message,
                     position,
                     parent,
                     job.job.get(),
@@ -212,7 +217,7 @@ impl Encoder {
                     progress.map(|progress| progress.tool_calls),
                 ],
             )?;
-            self.state_jobs(db, part, &job.children, Some(position), next)?;
+            self.state_jobs(db, message, &job.children, Some(position), next)?;
         }
         Ok(())
     }
@@ -395,7 +400,7 @@ type StateJobRow = (u64, Option<u64>, StateJob);
 pub(super) struct Messages {
     roles: HashMap<i64, MessageRole>,
     parts: HashMap<i64, Vec<UserPartRow>>,
-    /// date, location, per state part
+    /// date, location, per state message
     states: HashMap<i64, (String, ExecutionLocation)>,
     state_jobs: HashMap<i64, Vec<StateJobRow>>,
     state_todos: HashMap<i64, Vec<TodoItem>>,
@@ -521,21 +526,21 @@ impl Messages {
             )?,
             states: keyed(
                 db,
-                "SELECT s.part, s.date, t.name, s.location_workspace FROM user_part_state s \
+                "SELECT s.message, s.date, t.name, s.location_workspace FROM message_state s \
                  JOIN target t ON t.id = s.location_target",
                 |row| Ok((row.get(1)?, location(row.get(2)?, row.get(3)?)?)),
             )?,
             state_jobs: grouped(
                 db,
-                "SELECT j.part, j.position, j.parent_position, j.job, j.tool, j.name, j.state, \
+                "SELECT j.message, j.position, j.parent_position, j.job, j.tool, j.name, j.state, \
                  t.name, j.workspace, j.age_seconds, j.turns, j.tool_calls \
-                 FROM user_part_state_job j LEFT JOIN target t ON t.id = j.target \
-                 ORDER BY j.part, j.position",
+                 FROM message_state_job j LEFT JOIN target t ON t.id = j.target \
+                 ORDER BY j.message, j.position",
                 state_job,
             )?,
             state_todos: grouped(
                 db,
-                "SELECT part, text, status FROM user_part_state_todo ORDER BY part, position",
+                "SELECT message, text, status FROM message_state_todo ORDER BY message, position",
                 todo,
             )?,
             job_events: grouped(
@@ -608,27 +613,6 @@ impl Messages {
                         UserPartKind::Text => UserPart::Text { text: text()? },
                         UserPartKind::ParentInput => UserPart::ParentInput { text: text()? },
                         UserPartKind::Compaction => UserPart::Compaction { text: text()? },
-                        UserPartKind::State => {
-                            let (date, location) = self
-                                .states
-                                .get(part)
-                                .cloned()
-                                .ok_or_else(|| corrupt("state part has no state"))?;
-                            let mut rows =
-                                self.state_jobs.get(part).into_iter().flatten().peekable();
-                            let jobs = state_tree(&mut rows, None);
-                            if rows.next().is_some() {
-                                return Err(corrupt("state jobs are not in pre-order"));
-                            }
-                            UserPart::State {
-                                state: RuntimeState {
-                                    date,
-                                    jobs,
-                                    todos: self.state_todos.get(part).cloned().unwrap_or_default(),
-                                    location,
-                                },
-                            }
-                        }
                         UserPartKind::JobEvents => UserPart::JobEvents {
                             events: self.job_events.get(part).cloned().unwrap_or_default(),
                         },
@@ -650,6 +634,24 @@ impl Messages {
                     });
                 }
                 Message::User(content)
+            }
+            MessageRole::State => {
+                let (date, location) = self
+                    .states
+                    .get(&id)
+                    .cloned()
+                    .ok_or_else(|| corrupt("state message has no state"))?;
+                let mut rows = self.state_jobs.get(&id).into_iter().flatten().peekable();
+                let jobs = state_tree(&mut rows, None);
+                if rows.next().is_some() {
+                    return Err(corrupt("state jobs are not in pre-order"));
+                }
+                Message::State(RuntimeState {
+                    date,
+                    jobs,
+                    todos: self.state_todos.get(&id).cloned().unwrap_or_default(),
+                    location,
+                })
             }
             MessageRole::Assistant => {
                 let mut items = Vec::new();

@@ -763,7 +763,7 @@ mod tests {
             assert_eq!(ids, ["first", "second"]);
             let requests = requests.lock().unwrap();
             let crate::provider::protocol::Message::Tool(results) =
-                requests[1].history.last().unwrap()
+                requests[1].messages().last().unwrap()
             else {
                 panic!("missing tool results")
             };

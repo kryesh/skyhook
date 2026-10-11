@@ -46,7 +46,6 @@ impl App {
                 (false, agent == &self.selected, agent == &self.selected)
             }
             RuntimeEvent::Activity { agent, .. } => (false, true, agent == &self.selected),
-            RuntimeEvent::Context { agent, .. } => (false, agent == &self.selected, false),
             RuntimeEvent::TurnCompleted { .. } => (false, true, false),
             RuntimeEvent::Phase(_) => (false, true, true),
         };

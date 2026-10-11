@@ -446,6 +446,7 @@ mod tests {
     use super::*;
     use crate::provider::ProviderErrorKind;
     use crate::provider::codec::common::tests::{Reduced, reduce, scope};
+    use crate::provider::protocol::Entry;
     use crate::provider::protocol::{CutReason, Message, ModelRequest, Outcome, ToolResult, Usage};
     use serde_json::json;
 
@@ -466,12 +467,7 @@ mod tests {
     }
 
     fn usage(output_tokens: u64) -> Usage {
-        Usage {
-            input_tokens: 24,
-            cached_input_tokens: 17,
-            cache_write_input_tokens: 13,
-            output_tokens,
-        }
+        Usage::prompted(24, 17, 13, output_tokens)
     }
 
     fn started() -> Decoder {
@@ -635,7 +631,10 @@ mod tests {
         assert_eq!(item.id().as_str(), "0");
         assert_eq!(item.text_content().as_deref(), Some("hello"));
         assert_eq!(
-            (reduced.usage.output_tokens, reduced.completion.outcome()),
+            (
+                reduced.usage.output_tokens.unwrap(),
+                reduced.completion.outcome()
+            ),
             (7, Outcome::Answer)
         );
     }
@@ -692,16 +691,18 @@ mod tests {
             panic!("signed thinking is a reasoning item")
         };
         blocks[0].text = "display summary only".into();
-        request.history.push(Message::Assistant(items));
-        request.history.push(Message::Tool(vec![ToolResult {
-            call_id: "call_1".into(),
-            name: "inspect".into(),
-            result: json!({"ok":true}),
-            images: vec![],
-            is_error: false,
-        }]));
+        request.context.push(Entry::from(Message::Assistant(items)));
+        request
+            .context
+            .push(Entry::from(Message::Tool(vec![ToolResult {
+                call_id: "call_1".into(),
+                name: "inspect".into(),
+                result: json!({"ok":true}),
+                images: vec![],
+                is_error: false,
+            }])));
         let original = request;
-        let body = encode(&original, &Dialect::anthropic()).unwrap();
+        let body = encode(&original, &Dialect::standard()).unwrap();
         assert_eq!(
             body["messages"][1]["content"],
             json!([native, redacted, tool])
@@ -709,7 +710,7 @@ mod tests {
         assert_eq!(body["messages"][2]["content"][0]["tool_use_id"], "call_1");
         assert!(body.get("thinking").is_none()); // replay does not require enabling new thinking
         let assistant = |request: &ModelRequest| {
-            encode(request, &Dialect::anthropic()).unwrap()["messages"][1]["content"].clone()
+            encode(request, &Dialect::standard()).unwrap()["messages"][1]["content"].clone()
         };
         let mut foreign = original.clone();
         foreign.model = "different-model".parse().unwrap();
@@ -938,7 +939,10 @@ mod tests {
             Outcome::Cut(CutReason::Incomplete)
         );
         assert_eq!(
-            (reduced.usage.input_tokens, reduced.usage.output_tokens),
+            (
+                reduced.usage.input_tokens.unwrap(),
+                reduced.usage.output_tokens.unwrap()
+            ),
             (3, 5)
         );
         let items = reduced.items();

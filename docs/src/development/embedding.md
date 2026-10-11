@@ -75,7 +75,8 @@ It contains:
 - Request-scoped live responses keyed by agent and logical request: their streamed blocks in
   arrival order, then the authoritative blocks once the response has ended.
 - Current agent activity, with when its turn began (or, once it is no longer busy, when that
-  turn ended), and context-usage estimates.
+  turn ended), and the context gauge: each agent's occupancy as its last committed response
+  reported it, folded from the journal and cleared by a checkpoint.
 
 Live response deltas are provisional, not additional committed messages. A new attempt of the
 same logical request resets its live response without removing durable attempt records. On
@@ -192,16 +193,19 @@ or authentication headers:
   settings, not the lifetime of a `ProviderContext` resource.
 - `model_requested` identifies one frozen logical request before its first invocation. It references
   the context record and stores the checkpoint it opens with, its history as the agent's commits
-  through a message sequence, `tail` as exact inline messages, and
-  `history_lifetime`. Retries refer back to this
+  through a message sequence (a summary that overflowed resumes `from` a later one), `tail` as
+  exact inline messages, and `history_lifetime`. Retries refer back to this
   request using `model_attempt_started`, with separate failure/interruption or completion outcomes.
   Ordinary requests reuse a context record while their settings remain applicable; summarization
   has a separate context with its structured response schema.
 - `compaction` stores the exact replacement message, retained original message references, covered
-  frontier, the summary attempt that produced it, token estimates, and reconciled owner todos.
+  frontier, the summary attempt that produced it, the reported occupancy that triggered it (none
+  after an overflow), and reconciled owner todos.
   History and todos become active together after persistence.
 - Runtime state and job-event content are stored structurally and rendered for the model on
-  reconstruction, so a request replays the text the model was sent.
+  reconstruction, so a request replays the text the model was sent. A reconstructed context
+  carries, before each response since its checkpoint or the agent's latest mode switch, the state
+  the request that produced it sent; codecs decide whether to send it.
 - Reconstruction resolves those references and inline values. It does not consult current
   configuration, live jobs, or the current compaction renderer. Runtime state and job events are
   rendered by the current state renderer and job-view serialization, which are therefore part of
@@ -219,7 +223,7 @@ exactly this request's blobs in `cache`; unlike `read_records`, opening a store 
 session's writer lock. Reconstruction reproduces Skyhook's provider-neutral input, not an
 API-specific wire encoding or a replay of the external call.
 
-The `ModelRequest` contract preserves the history/tail split and `history_lifetime` cache hints.
+The `ModelRequest` contract preserves the typed context entries and `history_lifetime` cache hints.
 See [history, transient state, and caching](architecture.md#history-transient-state-and-caching)
 for their semantics and provider rationale.
 

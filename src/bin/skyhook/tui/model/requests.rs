@@ -34,8 +34,7 @@ pub struct RequestRow {
     pub purpose: ModelPurpose,
     pub model: String,
     pub status: RequestStatus,
-    /// None until an attempt reports usage.
-    pub usage: Option<Usage>,
+    pub usage: Usage,
     /// When the request was sent, on the local clock.
     pub sent: String,
     pub timing: Timing,
@@ -57,11 +56,11 @@ impl RequestRow {
     }
 
     pub fn statistics(&self) -> [String; 4] {
-        let tokens = |value: fn(Usage) -> String| self.usage.map_or_else(|| "—".into(), value);
+        let tokens = |count: Option<u64>| count.map_or_else(|| "—".into(), number);
         [
-            tokens(|usage| number(usage.output_tokens)),
-            tokens(|usage| number(usage.input_tokens)),
-            tokens(|usage| number(usage.cached_input_tokens)),
+            tokens(self.usage.output_tokens),
+            tokens(self.usage.input_tokens),
+            tokens(self.usage.cached_input_tokens),
             self.timing.took().unwrap_or_default(),
         ]
     }
@@ -77,7 +76,7 @@ pub(super) fn request_entry(
         purpose: record.purpose,
         model: clean(record.profile.profile.model.as_str()).replace('\n', " "),
         status: request_status(&record.phase),
-        usage: reported(record.usage),
+        usage: record.usage,
         sent: local_time(record.requested_millis, today, &Local, Precision::Seconds),
         timing: request_timing(record),
     })
@@ -103,9 +102,4 @@ fn request_status(phase: &RequestPhase) -> RequestStatus {
         RequestPhase::Interrupted { .. } => RequestStatus::Interrupted,
         RequestPhase::Completed { .. } => RequestStatus::Completed,
     }
-}
-
-/// The runtime journals usage only once an attempt observed some.
-fn reported(usage: Usage) -> Option<Usage> {
-    (usage != Usage::default()).then_some(usage)
 }

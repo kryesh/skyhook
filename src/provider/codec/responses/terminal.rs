@@ -171,9 +171,9 @@ mod tests {
                             // Cached tokens are clamped to the prompt, and an
                             // unusable counter is absent.
                             let (reported, cached) = if tag == "response.completed" {
-                                (json!(30), 20)
+                                (json!(30), Some(20))
                             } else {
-                                (json!("garbage"), 0)
+                                (json!("garbage"), None)
                             };
                             let usage = json!({"input_tokens":20,"output_tokens":11,
                                 "input_tokens_details":{"cached_tokens":reported}});
@@ -187,8 +187,9 @@ mod tests {
                             let reduced = assemble_with(decoder, frames).unwrap();
                             assert_eq!(reduced.completion.outcome(), Outcome::Cut(reason));
                             let usage = reduced.usage;
-                            assert_eq!(usage.output_tokens, 11);
-                            assert_eq!(usage.input_tokens, 20 - cached);
+                            assert_eq!(usage.output_tokens.unwrap(), 11);
+                            let input = 20 - cached.unwrap_or_default();
+                            assert_eq!(usage.input_tokens, Some(input));
                             assert_eq!(usage.cached_input_tokens, cached);
                             let items = reduced.items();
                             assert_eq!(items.len(), 2);

@@ -502,9 +502,9 @@ mod tests {
         assert_eq!(items[1].text_content().as_deref(), Some("authoritative"));
         let usage = reduced.usage;
         let tokens = (
-            usage.input_tokens,
-            usage.cached_input_tokens,
-            usage.output_tokens,
+            usage.input_tokens.unwrap(),
+            usage.cached_input_tokens.unwrap(),
+            usage.output_tokens.unwrap(),
         );
         assert_eq!(
             (tokens, reduced.completion.outcome()),

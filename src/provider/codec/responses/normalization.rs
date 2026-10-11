@@ -6,7 +6,7 @@ use super::native::{NativeItem, PartType, is_foreign};
 use super::*;
 use crate::named_enum::NamedEnum;
 use crate::provider::codec::{common::tagged, openai};
-use crate::provider::http::errors;
+use crate::provider::{ProviderErrorKind, http::errors};
 
 /// Local item/part indices are produced only by this module's resolution
 /// algorithm; they are not interchangeable with provider-supplied wire indices.
@@ -215,9 +215,9 @@ impl Decoder {
                 Err(failure(response))
             }
             Event::Error => Err(failure(event)),
-            // A top-level event ending the response abnormally must not be
-            // mistaken for progress, or the stream would appear to stall.
-            Event::Aborted => Err(NATIVE.error(format_args!("response ended abnormally: {name}"))),
+            // The service gave up on the response; retrying the request is standard.
+            Event::Aborted => Err(ProviderErrorKind::Unavailable
+                .error(format!("the service ended the response with {name}"))),
         }
     }
 
@@ -347,7 +347,6 @@ impl Decoder {
 mod tests {
     use super::super::tests::*;
     use super::*;
-    use crate::provider::ProviderErrorKind;
 
     #[test]
     fn lifecycle_events_require_a_response_and_failed_events_are_errors() {
@@ -410,6 +409,11 @@ mod tests {
         for name in ["response.aborted", "response.cancelled"] {
             assert!(decoder().feed(json!({"type":name})).is_err(), "{name}");
         }
+        // An aborted response is a failure to retry.
+        let aborted = decoder()
+            .feed(json!({"type":"response.aborted"}))
+            .unwrap_err();
+        assert_eq!(aborted.kind(), ProviderErrorKind::Unavailable);
         // Sub-events of hosted tools are not the response ending.
         let hosted = json!({"type":"response.web_search_call.failed", "item_id":"ws_1"});
         assert!(decoder().feed(hosted).unwrap().is_empty());

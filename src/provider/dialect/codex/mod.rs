@@ -19,7 +19,7 @@ use super::{
 use crate::provider::{
     ProviderError,
     codec::{
-        Codec, CodecName, Identity, header,
+        Codec, CodecName, Identity, StateRole, header,
         responses::{self, Instructions, TerminalOutput},
     },
     http::{Headers, Session, Transport, auth::Authenticator, headers::Value},
@@ -33,10 +33,6 @@ const SKYHOOK: HeaderValue = HeaderValue::from_static("skyhook");
 /// The most of a JSON answer's body that is read.
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
-/// The ChatGPT backend's API root, unless the entry names another. Codex
-/// inference and account usage are services beneath it.
-const DEFAULT_BASE_URL: &str = "https://chatgpt.com/backend-api";
-
 /// The subscription service's Responses conventions: `instructions` is required, no
 /// output limit is accepted, cache affinity travels as a header, completed items
 /// are not restated in the terminal event, and quota notices ride the stream.
@@ -49,6 +45,7 @@ fn responses() -> responses::Dialect {
             user_id: None,
         },
         terminal_output: TerminalOutput::StreamedOnly,
+        state_role: StateRole::System,
         metadata_events: &[
             "codex.rate_limits",
             "codex.response.metadata",
@@ -90,8 +87,8 @@ pub enum Error {
 }
 
 impl ProviderOptions for Options {
-    fn admit(&self, common: &Common) -> Result<Connection, AdmissionError> {
-        let connection = common.admit(BaseUrl::Default(DEFAULT_BASE_URL))?;
+    fn admit(&self, common: &Common, base_url: BaseUrl) -> Result<Connection, AdmissionError> {
+        let connection = common.admit(base_url)?;
         if common.api_key.is_some() {
             return Err(DialectError::Codex(Error::ApiKey).into());
         }
@@ -121,6 +118,11 @@ impl Options {
 }
 
 impl DialectConfig for Config {
+    /// The ChatGPT backend; Codex inference and account usage are services beneath it.
+    fn base_url() -> BaseUrl {
+        BaseUrl::Default("https://chatgpt.com/backend-api")
+    }
+
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if codec != CodecName::Responses {
             return Err(UnsupportedCodec {
@@ -292,7 +294,11 @@ mod tests {
         assert_eq!(options.issuer().as_str(), "https://auth.openai.com/");
         Config::default().admit(CodecName::Responses).unwrap();
         assert_eq!(
-            options.admit(&Common::default()).unwrap().root.as_str(),
+            options
+                .admit(&Common::default(), Config::base_url())
+                .unwrap()
+                .root
+                .as_str(),
             "https://chatgpt.com/backend-api"
         );
         for base_url in [None, Some("https://api.example/codex".to_owned())] {
@@ -302,7 +308,7 @@ mod tests {
                 ..Common::default()
             };
             assert!(matches!(
-                options.admit(&common),
+                options.admit(&common, Config::base_url()),
                 Err(AdmissionError::Dialect(DialectError::Codex(Error::ApiKey)))
             ));
         }

@@ -29,8 +29,9 @@ use crate::provider::{
 pub(crate) trait ProviderOptions:
     Settings + Clone + Debug + Serialize + DeserializeOwned
 {
-    fn admit(&self, common: &Common) -> Result<Connection, AdmissionError> {
-        common.admit(BaseUrl::Required)
+    /// The entry's connection, at `base_url` when the entry names none.
+    fn admit(&self, common: &Common, base_url: BaseUrl) -> Result<Connection, AdmissionError> {
+        common.admit(base_url)
     }
 
     /// The credentials `skyhook auth` manages for the entry `name`, which replace
@@ -97,7 +98,7 @@ impl<P: Patch, O> ProviderModels<P, O> {
         C: Settings<Patch = P> + DialectConfig,
         O: ProviderOptions,
     {
-        let connection = self.options.admit(common)?;
+        let connection = self.options.admit(common, C::base_url())?;
         let models = self
             .models
             .iter()
@@ -168,7 +169,7 @@ macro_rules! providers {
             ) -> Result<Option<Login>, LoginError> {
                 Ok(match self {
                     $(Self::$variant(entry) => {
-                        let connection = entry.options.admit(common)?;
+                        let connection = entry.options.admit(common, <$module::Config as DialectConfig>::base_url())?;
                         entry.options.login(name, home, &connection)?
                     }),+
                 })
@@ -567,13 +568,19 @@ providers:
             format!("dialect: openai\n{root}"),
             format!("dialect: claude\ncodec: messages\n{root}"),
             format!("dialect: compatible\ncodec: completions\n{root}"),
-            "dialect: openai\ncodec: responses".to_owned(),
+            // Only a dialect with its own service has a default root.
+            "dialect: compatible\ncodec: responses".to_owned(),
         ] {
             assert!(!admits(&format!("{text}\n{model}")), "{text}");
         }
-        assert!(admits(&format!(
-            "dialect: openai\ncodec: responses\n{root}\n{model}"
-        )));
+        for text in [
+            format!("dialect: openai\ncodec: responses\n{root}"),
+            "dialect: openai\ncodec: responses".to_owned(),
+            "dialect: anthropic\ncodec: messages".to_owned(),
+            "dialect: openrouter\ncodec: chat_completions".to_owned(),
+        ] {
+            assert!(admits(&format!("{text}\n{model}")), "{text}");
+        }
     }
 
     /// Each model is served with its own settings: one caps output under

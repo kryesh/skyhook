@@ -13,8 +13,8 @@ pub use interaction::{
     QuestionReply, RuntimeEvent,
 };
 pub use observation::{
-    AgentActivity, ContextUsage, Observation, ObservationSnapshot, ObservedActivity, ObservedEvent,
-    ObservedResponse, Settlement, StoppedReading,
+    AgentActivity, ContextGauge, ContextUsage, Observation, ObservationSnapshot, ObservedActivity,
+    ObservedEvent, ObservedResponse, Settlement, StoppedReading,
 };
 pub use runtime::{
     ContinueOutcome, Harness, HarnessBuilder, QueuedPrompt, QueuedPromptCancellation,
@@ -27,4 +27,4 @@ pub(crate) use interaction::QuestionOutput;
 pub(crate) use observation::{Responses, Views, live};
 #[cfg(test)]
 pub(crate) use runtime::stopped_turn;
-pub(crate) use runtime::{Agents, Catalog, ModelEntry, activities, recorded_context};
+pub(crate) use runtime::{Agents, Catalog, ModelEntry, activities};

@@ -59,6 +59,20 @@ pub(crate) enum Codec {
     Messages(messages::Dialect),
 }
 
+crate::named_enum::named_enum! {
+    /// The role runtime state takes on the wire.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+    pub enum StateRole {
+        /// The protocol's harness role: a system message on Messages, turn-scoped where
+        /// its dialect says; a system or developer message on Chat; a developer message
+        /// on Responses.
+        System = "system",
+        /// User content, for servers without a harness role mid-conversation: it joins
+        /// the user turn before it, or is a user turn of its own.
+        User = "user",
+    }
+}
+
 /// An encoded request: the body and the headers the dialect places values in.
 pub(crate) struct Encoded {
     pub body: Value,
@@ -145,6 +159,14 @@ impl Codec {
             Self::ChatCompletions(dialect) => &mut dialect.effort,
             Self::Responses(dialect) => &mut dialect.effort,
             Self::Messages(dialect) => &mut dialect.effort,
+        }
+    }
+
+    pub(crate) fn state_role_mut(&mut self) -> &mut StateRole {
+        match self {
+            Self::ChatCompletions(dialect) => &mut dialect.state_role,
+            Self::Responses(dialect) => &mut dialect.state_role,
+            Self::Messages(dialect) => &mut dialect.state_role,
         }
     }
 
@@ -313,12 +335,12 @@ mod tests {
                 cache_key: header("x-session-id"),
                 user_id: None,
             },
-            ..messages::Dialect::anthropic()
+            ..messages::Dialect::standard()
         });
         let encoded = keyed.encode(&request, &context).unwrap();
         assert_eq!(encoded.headers.len(), 1);
         assert_eq!(encoded.headers["x-session-id"], "session");
-        let plain = Codec::Messages(messages::Dialect::anthropic());
+        let plain = Codec::Messages(messages::Dialect::standard());
         assert!(plain.encode(&request, &context).unwrap().headers.is_empty());
     }
 
@@ -375,7 +397,7 @@ mod tests {
         };
         let nested = messages::Dialect {
             output_limit: path("output_config.max_tokens"),
-            ..messages::Dialect::anthropic()
+            ..messages::Dialect::standard()
         };
         for (codec, fields, placed) in [
             (
@@ -389,7 +411,7 @@ mod tests {
                 &["max_output_tokens", "reasoning.effort", "prompt_cache_key"],
             ),
             (
-                Codec::Messages(messages::Dialect::anthropic()),
+                Codec::Messages(messages::Dialect::standard()),
                 messages::BODY_FIELDS,
                 &["max_tokens", "output_config.effort"],
             ),

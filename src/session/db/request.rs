@@ -13,8 +13,8 @@ use crate::{
     named_enum::named_enum,
     provider::protocol::Usage,
     session::{
-        AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome,
-        EntryKind, SessionEvent,
+        AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompactionTrigger,
+        CompletedOutcome, EntryKind, SessionEvent,
     },
 };
 
@@ -36,13 +36,21 @@ impl Encoder {
                 context,
                 checkpoint,
                 through,
+                from,
                 tail,
                 history_lifetime,
             } => {
                 db.execute(
                     "INSERT INTO model_request (entry, context, checkpoint, history_through, \
-                     history_lifetime) VALUES (?1, ?2, ?3, ?4, ?5)",
-                    params![seq, *context, *checkpoint, *through, *history_lifetime],
+                     history_from, history_lifetime) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    params![
+                        seq,
+                        *context,
+                        *checkpoint,
+                        *through,
+                        *from,
+                        *history_lifetime
+                    ],
                 )?;
                 for (position, message) in tail.iter().enumerate() {
                     let message = self.message(db, message)?;
@@ -128,14 +136,16 @@ impl Encoder {
         let message = self.message(db, &checkpoint.message)?;
         outcome(db, entry, checkpoint.attempt)?;
         db.execute(
-            "INSERT INTO compaction (entry, frontier, message, before_tokens, after_tokens) \
-             VALUES (?1, ?2, ?3, ?4, ?5)",
+            "INSERT INTO compaction (entry, frontier, message, reported_tokens) \
+             VALUES (?1, ?2, ?3, ?4)",
             params![
                 entry.seq,
                 checkpoint.frontier,
                 message,
-                checkpoint.before_tokens,
-                checkpoint.after_tokens
+                match checkpoint.trigger {
+                    CompactionTrigger::Occupancy(tokens) => Some(tokens),
+                    CompactionTrigger::Overflow => None,
+                }
             ],
         )?;
         for source in &checkpoint.retained {
@@ -230,7 +240,8 @@ pub(super) fn events(
         |row| messages.message(row.get(1)?),
     )?;
     events.load(
-        "SELECT entry, context, checkpoint, history_lifetime, history_through FROM model_request",
+        "SELECT entry, context, checkpoint, history_lifetime, history_through, history_from \
+         FROM model_request",
         |row| {
             let seq = row.get::<i64>(0)?;
             Ok(SessionEvent::ModelRequested {
@@ -238,6 +249,9 @@ pub(super) fn events(
                 checkpoint: row.get::<Option<i64>>(2)?.map(sequence),
                 through: row
                     .get::<Option<i64>>(4)?
+                    .map(|source| sequence(source).message()),
+                from: row
+                    .get::<Option<i64>>(5)?
                     .map(|source| sequence(source).message()),
                 tail: tails.get(&seq).cloned().unwrap_or_default(),
                 history_lifetime: enum_column(row, 3)?,
@@ -250,8 +264,8 @@ pub(super) fn events(
         |row| Ok(sequence(row.get(1)?).message()),
     )?;
     events.load(
-        "SELECT c.entry, a.request, a.attempt, c.frontier, c.message, c.before_tokens, \
-         c.after_tokens FROM compaction c \
+        "SELECT c.entry, a.request, a.attempt, c.frontier, c.message, c.reported_tokens \
+         FROM compaction c \
          JOIN attempt_outcome o ON o.entry = c.entry JOIN model_attempt a ON a.entry = o.attempt",
         |row| {
             let seq = row.get::<i64>(0)?;
@@ -262,8 +276,10 @@ pub(super) fn events(
                     todos: todos.get(&seq).cloned().unwrap_or_default(),
                     retained: retained.get(&seq).cloned().unwrap_or_default(),
                     attempt: attempt(row, 1)?,
-                    before_tokens: row.get(5)?,
-                    after_tokens: row.get(6)?,
+                    trigger: match row.get::<Option<u64>>(5)? {
+                        Some(tokens) => CompactionTrigger::Occupancy(tokens),
+                        None => CompactionTrigger::Overflow,
+                    },
                 },
             })
         },

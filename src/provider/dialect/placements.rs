@@ -371,6 +371,7 @@ mod tests {
         let litellm = |upstream| litellm::Config {
             upstream,
             tags: Vec::new(),
+            state_role: None,
         };
         let presets: [&dyn DialectConfig; 7] = [
             &compatible::Config::default(),

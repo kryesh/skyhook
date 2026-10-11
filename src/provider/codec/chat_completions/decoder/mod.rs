@@ -313,10 +313,8 @@ pub(super) mod tests {
     }
 
     pub(super) const USAGE: Usage = Usage {
-        input_tokens: 20,
-        cached_input_tokens: 80,
-        cache_write_input_tokens: 0,
-        output_tokens: 10,
+        cache_write_input_tokens: None,
+        ..Usage::prompted(20, 80, 0, 10)
     };
 
     pub(super) const MAX_TOKENS: Outcome = Outcome::Cut(CutReason::MaxTokens);
@@ -496,7 +494,6 @@ pub(super) mod tests {
             if packet["choices"].get(0).is_some() {
                 for (finish, expected) in [
                     ("stop", Outcome::Answer),
-                    ("abort", Outcome::Cut(CutReason::Aborted)),
                     ("content_filter", Outcome::Cut(CutReason::Refusal)),
                 ] {
                     let mut repeated = packet.clone();
@@ -588,8 +585,6 @@ pub(super) mod tests {
         for (reason, expected) in [
             ("length", CutReason::MaxTokens),
             ("MAX_TOKENS", CutReason::MaxTokens),
-            ("aborted", CutReason::Aborted),
-            ("canceled", CutReason::Aborted),
             ("SAFETY", CutReason::Refusal),
             ("content_filter", CutReason::Refusal),
             ("error", CutReason::Incomplete),
@@ -619,17 +614,25 @@ pub(super) mod tests {
         }
     }
 
+    /// A finish naming a condition fails the attempt as that condition: an overflow
+    /// compacts, and a service that gave up is retried.
     #[test]
-    fn a_context_window_finish_is_the_context_window_error() {
-        let mut decoder = decoder();
-        decoder
-            .decode(&delta(json!({"content":"partial"})))
-            .unwrap();
-        decoder
-            .decode(&end("model_context_window_exceeded"))
-            .unwrap();
-        let error = decoder.finish().unwrap_err();
-        assert_eq!(error.kind(), ProviderErrorKind::ContextWindowExceeded);
+    fn a_condition_finish_fails_the_attempt_as_that_condition() {
+        for (reason, kind) in [
+            (
+                "model_context_window_exceeded",
+                ProviderErrorKind::ContextWindowExceeded,
+            ),
+            ("aborted", ProviderErrorKind::Unavailable),
+            ("canceled", ProviderErrorKind::Unavailable),
+        ] {
+            let mut decoder = decoder();
+            decoder
+                .decode(&delta(json!({"content":"partial"})))
+                .unwrap();
+            decoder.decode(&end(reason)).unwrap();
+            assert_eq!(decoder.finish().unwrap_err().kind(), kind, "{reason}");
+        }
     }
 
     #[test]
@@ -667,11 +670,7 @@ pub(super) mod tests {
             packet(json!({"cached_tokens":null}), 5),
             end("stop"),
         ]);
-        let expected = Usage {
-            output_tokens: 5,
-            cache_write_input_tokens: 5,
-            ..USAGE
-        };
+        let expected = Usage::prompted(20, 80, 5, 5);
         assert_eq!(usage, expected);
     }
 
@@ -711,8 +710,8 @@ pub(super) mod tests {
         let packet = json!({"usage":{"prompt_tokens":10,"completion_tokens":1,
             "prompt_tokens_details":{"cached_tokens":50}}});
         decoder.decode(&event(packet)).unwrap();
-        assert_eq!(decoder.usage.usage().cached_input_tokens, 10);
-        assert_eq!(decoder.usage.usage().input_tokens, 0);
+        assert_eq!(decoder.usage.usage().cached_input_tokens.unwrap(), 10);
+        assert_eq!(decoder.usage.usage().input_tokens.unwrap(), 0);
     }
 
     #[test]

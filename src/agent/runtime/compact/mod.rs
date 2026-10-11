@@ -4,12 +4,8 @@ use std::num::NonZeroU64;
 
 use super::{HarnessError, SessionRuntime, TurnContext, compaction};
 use crate::{
-    identity::AgentId,
-    provider::{
-        ProviderContext, ProviderErrorKind,
-        protocol::{ModelRequest, Usage},
-    },
-    session::{AttemptRef, CompactionFailure, EventRecord, ProfileSnapshot, SessionEvent},
+    provider::{ProviderContext, ProviderErrorKind, protocol::ModelRequest},
+    session::{AttemptRef, CompactionFailure, CompactionTrigger, ProfileSnapshot, SessionEvent},
 };
 
 /// Context/validation recovery is bounded independently of transient retries.
@@ -22,67 +18,48 @@ mod retention;
 mod summary;
 use checkpoint::CompactionInput;
 
-/// Scale estimates by the last provider-reported prompt size. A ratio, unlike an
-/// offset, stays valid when compaction shrinks the history.
-#[derive(Default)]
-pub(super) struct TokenMeter {
-    baseline: Option<(u64, u64)>,
+/// How a summary request is shrunk after one overflowed the context window: each stage
+/// changes something that can make the next fit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum SummaryFit {
+    #[default]
+    Full,
+    /// Half the output reserve.
+    HalfReserve,
+    /// Half the output reserve, and about the older half of the history after its
+    /// opening exchange dropped (`Projection::trim`).
+    HalfHistory,
 }
 
-impl TokenMeter {
-    /// The agent's latest reported request since its model or mode last changed.
-    pub(super) fn restore(records: &[EventRecord], agent: &AgentId) -> Self {
-        let mut meter = Self::default();
-        for record in records.iter().rev().filter(|record| &record.agent == agent) {
-            match &record.event {
-                SessionEvent::ModelChanged { .. } | SessionEvent::ModeChanged { .. } => break,
-                SessionEvent::Usage { request, usage } => {
-                    if let Ok((_, request)) =
-                        crate::session::reconstruct_model_request(records, *request)
-                    {
-                        meter.observe(compaction::estimate_request(&request), *usage);
-                    }
-                    if meter.baseline.is_some() {
-                        break;
-                    }
-                }
-                _ => {}
+impl SummaryFit {
+    /// The next stage after an overflow. Without a sent limit the reported occupancy left
+    /// no room at all, which a smaller reserve cannot fix, so history goes first.
+    fn after_overflow(self, sent: bool) -> Self {
+        match self {
+            Self::Full if sent => Self::HalfReserve,
+            Self::Full | Self::HalfReserve | Self::HalfHistory => Self::HalfHistory,
+        }
+    }
+
+    fn reserve(self, limit: NonZeroU64) -> NonZeroU64 {
+        match self {
+            Self::Full => limit,
+            Self::HalfReserve | Self::HalfHistory => {
+                NonZeroU64::new(limit.get() / 2).unwrap_or(limit)
             }
         }
-        meter
-    }
-
-    pub(super) fn estimate(&self, request: &ModelRequest) -> u64 {
-        self.scale(compaction::estimate_request(request))
-    }
-
-    pub(super) fn scale(&self, estimate: u64) -> u64 {
-        self.baseline.map_or(estimate, |(old_estimate, actual)| {
-            let scaled = u128::from(estimate) * u128::from(actual) / u128::from(old_estimate);
-            u64::try_from(scaled).unwrap_or(u64::MAX)
-        })
-    }
-
-    pub(super) fn observe(&mut self, estimate: u64, usage: Usage) {
-        let actual = usage.input_tokens.saturating_add(usage.cached_input_tokens);
-        if actual > 0 && estimate > 0 {
-            self.baseline = Some((estimate, actual));
-        }
     }
 }
 
-/// Reserve the larger of the completed response's reported occupancy and the summary's
-/// calibrated input: dropping tools may shrink the request, while its directive, schema
-/// and pending-response block can grow it.
+/// The summary's output limit: the configured one, within the space the completed
+/// response's reported occupancy leaves. A summary that overflows anyway is retried
+/// smaller (`SummaryFit`).
 fn summary_max_output(
     profile: &ProfileSnapshot,
-    meter: &TokenMeter,
-    summary: &ModelRequest,
-    completed: Option<Usage>,
+    occupied: Option<u64>,
 ) -> Result<NonZeroU64, HarnessError> {
-    let occupied = completed.map_or(0, super::context::occupancy);
-    let input = meter.estimate(summary).max(occupied);
-    let available = profile.profile.max_context.get().saturating_sub(input);
+    let occupied = occupied.unwrap_or_default();
+    let available = profile.profile.max_context.get().saturating_sub(occupied);
     NonZeroU64::new(profile.profile.max_output.get().min(available)).ok_or_else(|| {
         ProviderErrorKind::ContextWindowExceeded
             .error("compaction summary leaves no room for output within the model context window")
@@ -96,13 +73,15 @@ impl SessionRuntime {
         &self,
         turn: &TurnContext<'_>,
         provider: &mut dyn ProviderContext,
-        meter: &mut TokenMeter,
         profile: &ProfileSnapshot,
         input: &ModelRequest,
-        completed_usage: Option<Usage>,
+        trigger: CompactionTrigger,
     ) -> Result<(), HarnessError> {
         let mut launches = self.jobs.active_launches(turn.agent);
         let mut model_attempt = 0;
+        let mut fit = SummaryFit::default();
+        // A smaller stage never raises the output limit an earlier attempt sent.
+        let mut ceiling = None;
         for attempt in 1..=MAX_COMPACTION_ATTEMPTS {
             let mut request_sequence = None;
             let attempted = model_attempt;
@@ -111,10 +90,11 @@ impl SessionRuntime {
                     turn,
                     provider,
                     CompactionInput {
-                        meter,
                         profile,
                         request: input,
-                        completed_usage,
+                        trigger,
+                        fit,
+                        ceiling: &mut ceiling,
                         model_attempt: &mut model_attempt,
                     },
                     &mut request_sequence,
@@ -137,6 +117,9 @@ impl SessionRuntime {
                 Err(error) => {
                     let fault = crate::agent::CompactionFault::from(&error);
                     let retryable = fault.retryable();
+                    if fault == crate::agent::CompactionFault::Overflowed {
+                        fit = fit.after_overflow(ceiling.is_some());
+                    }
                     let failed = SessionEvent::CompactionFailed {
                         failure,
                         error: fault,
@@ -166,15 +149,13 @@ mod tests {
     use serde_json::json;
     use tokio_util::sync::CancellationToken;
 
-    use super::{TokenMeter, summary_max_output};
+    use super::summary_max_output;
     pub(super) use crate::agent::runtime::tests::{
         Requests, Script, Sent, SentPart, Step, answer, bounded, count, cut, delta, events, models,
         provider_name, recoverable, response, retrying, set_root_turn, summary_json, test_builder,
         todo, usage,
     };
-    use crate::agent::runtime::{
-        HarnessError, SessionHandle, Turn, TurnContext, compaction, state,
-    };
+    use crate::agent::runtime::{HarnessError, SessionHandle, Turn, TurnContext, state};
     use crate::provider::profile::StateMode;
     use crate::{
         agent::{CompactionFault, FaultKind, TodoStatus},
@@ -186,47 +167,30 @@ mod tests {
                 ToolCall, Usage,
             },
         },
-        session::{
-            Message, ModelContext, ModelPurpose, ProfileSnapshot, SessionEvent, UserPart,
-            project_history,
-        },
+        session::{CompactionTrigger, Message, SessionEvent, UserPart, project_history},
         tool::policy::CapabilitySet,
     };
 
-    fn summary_budget_fixture(input: u64) -> (ProfileSnapshot, TokenMeter, ModelRequest) {
+    /// The summary's output limit is the configured one within the space the completed
+    /// response's reported occupancy leaves; no space left fails as an overflow.
+    #[test]
+    fn summary_output_limit_fits_the_reported_occupancy() {
         let mut profile = crate::session::tests::profile();
         profile.profile.max_context = crate::tests::limit(1_000);
         profile.profile.max_output = crate::tests::limit(400);
-        let summary = ModelContext::test(ModelPurpose::Compaction, profile.clone()).template();
-        let mut meter = TokenMeter::default();
-        meter.observe(
-            compaction::estimate_request(&summary),
-            crate::session::tests::usage(input, 0, 0),
-        );
-        (profile, meter, summary)
-    }
-
-    #[test]
-    fn summary_output_budget_reserves_completed_occupancy_and_estimated_input() {
-        let usage = crate::session::tests::usage;
-        for (input, completed, expected) in [
-            (500, Some(usage(200, 200, 100)), Some(400)),
-            (600, Some(usage(200, 200, 200)), Some(400)),
-            (500, Some(usage(400, 200, 300)), Some(100)),
-            (900, Some(usage(200, 200, 100)), Some(100)),
-            (900, None, Some(100)),
-            (1_000, None, None),
-            (1_001, None, None),
-            (500, Some(usage(200, 300, 500)), None),
+        for (completed, expected) in [
+            (None, Some(400)),
+            (Some(500), Some(400)),
+            (Some(900), Some(100)),
+            (Some(1_000), None),
         ] {
-            let (profile, meter, summary) = summary_budget_fixture(input);
-            match summary_max_output(&profile, &meter, &summary, completed) {
-                Ok(budget) => assert_eq!(Some(budget.get()), expected, "{input}, {completed:?}"),
+            match summary_max_output(&profile, completed) {
+                Ok(limit) => assert_eq!(Some(limit.get()), expected, "{completed:?}"),
                 Err(error) => assert!(
                     expected.is_none()
                         && matches!(error, HarnessError::Provider(ref error)
                             if error.kind() == ProviderErrorKind::ContextWindowExceeded),
-                    "{input}, {completed:?}: {error}"
+                    "{completed:?}: {error}"
                 ),
             }
         }
@@ -296,7 +260,7 @@ mod tests {
                 session.prompt("Research the existing task and preserve its constraints.");
             research.await.unwrap();
             let mut template = script.request(0).await;
-            (template.history, template.tail) = (Vec::new(), Vec::new());
+            template.context.clear();
             template.history_lifetime = Default::default();
             Self {
                 workspace,
@@ -338,6 +302,15 @@ mod tests {
             &self,
             cancellation: &CancellationToken,
         ) -> Result<(), HarnessError> {
+            self.compact_for(cancellation, CompactionTrigger::Overflow)
+                .await
+        }
+
+        pub(super) async fn compact_for(
+            &self,
+            cancellation: &CancellationToken,
+            trigger: CompactionTrigger,
+        ) -> Result<(), HarnessError> {
             let runtime = &self.session.runtime;
             let agent = &self.session.root;
             let records = runtime.store.records();
@@ -348,15 +321,14 @@ mod tests {
             let profile = profile.expect("the fixture prompt journaled a model context");
             let mut input = self.template.clone();
             let history = project_history(&records, agent);
-            input.history = crate::session::render_history(history.history());
             let capabilities = CapabilitySet::default();
             let location = ExecutionLocation::root(self.workspace.path().to_path_buf());
             let (jobs, todos) = (&runtime.jobs, &runtime.store);
             let state = state::runtime_state_content(jobs, todos, agent, &capabilities, &location);
-            // As the agent's context builds it: only a stateless mode sends no tail.
-            if profile.profile.state_mode != StateMode::None {
-                input.tail = vec![crate::session::Message::User(vec![state]).render()];
-            }
+            // As the agent's context builds it: only a stateless mode sends no state.
+            let state = crate::session::Message::State(state);
+            let sends = profile.profile.state_mode != StateMode::None;
+            input.context = history.context(sends.then_some(&state));
             let turn = TurnContext {
                 agent,
                 owner_job: None,
@@ -365,10 +337,10 @@ mod tests {
                 capabilities: capabilities.clone(),
             };
             let mut provider = self.script.open_context(ContextId::from(agent))?;
-            let (provider, meter) = (provider.as_mut(), &mut Default::default());
             // Only a busy turn requests a summary.
             set_root_turn(&self.session, Turn::Busy);
-            let compacted = runtime.compact_history(&turn, provider, meter, &profile, &input, None);
+            let compacted =
+                runtime.compact_history(&turn, provider.as_mut(), &profile, &input, trigger);
             let compacted = compacted.await;
             set_root_turn(&self.session, Turn::Idle);
             compacted
@@ -390,7 +362,6 @@ mod tests {
         assert_eq!(fixture.script.opened.load(Ordering::SeqCst), 1);
         let requests = fixture.requests();
         assert_eq!(requests.len(), 4); // initial response, rejected stream, summary, retry
-        assert!(compaction::estimate_request(&requests[1]) < 128_000 * 4 / 5);
         let records = fixture.records();
         assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 1);
         fixture.session.shutdown().await.unwrap();

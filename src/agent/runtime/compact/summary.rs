@@ -4,7 +4,7 @@ use super::{HarnessError, SessionRuntime, TurnContext, compaction};
 use crate::agent::CompactionError;
 use crate::provider::{
     ProviderContext,
-    protocol::{Completion, CutReason, ModelRequest, Outcome, Usage, visible_text},
+    protocol::{Completion, CutReason, ModelRequest, Outcome, visible_text},
 };
 use crate::session::{AttemptRef, RequestSeq, SessionEvent};
 
@@ -16,7 +16,7 @@ impl SessionRuntime {
         request: ModelRequest,
         request_sequence: RequestSeq,
         model_attempt: &mut u64,
-    ) -> Result<(compaction::Continuation, Usage), HarnessError> {
+    ) -> Result<compaction::Continuation, HarnessError> {
         let mut transient_attempt = 0u64;
         loop {
             if turn.cancellation.is_cancelled() {
@@ -34,7 +34,7 @@ impl SessionRuntime {
                 Ok((completion, usage)) => {
                     self.record_model_usage(turn.agent, request_sequence, usage)
                         .await?;
-                    return Ok((continuation(&completion)?, usage));
+                    return continuation(&completion);
                 }
                 // The summary request stays frozen too, and transient failures do not
                 // consume the separate validation budget in `compact_history`.
@@ -51,8 +51,7 @@ impl SessionRuntime {
 }
 
 /// Only a cut-off summary is a truncated one, which a fresh summary may complete. A
-/// refusal is deterministic for the request and an abort is the provider's own
-/// failure: both fail the round as what they are.
+/// refusal is deterministic for the request, so it fails the round as what it is.
 fn continuation(completion: &Completion) -> Result<compaction::Continuation, HarnessError> {
     let text = visible_text(completion.items());
     match completion.outcome() {
@@ -62,7 +61,6 @@ fn continuation(completion: &Completion) -> Result<compaction::Continuation, Har
                 &text,
             )));
         }
-        Outcome::Cut(CutReason::Aborted) => return Err(HarnessError::ProviderAborted),
         Outcome::Cut(CutReason::MaxTokens | CutReason::Incomplete) => {
             return Err(CompactionError::Truncated.into());
         }
@@ -81,7 +79,7 @@ mod tests {
     };
     use tokio_util::sync::CancellationToken;
 
-    /// A cut-off summary is retried as truncated; a refused or aborted one fails the
+    /// A cut-off summary is retried as truncated; a refused one fails the
     /// round at once, diagnosed as what it was.
     #[tokio::test]
     async fn only_a_cut_off_summary_is_retried_as_truncated() {
@@ -94,11 +92,6 @@ mod tests {
                 CutReason::Refusal,
                 1,
                 CompactionFault::Summary(FailureKind::Refused),
-            ),
-            (
-                CutReason::Aborted,
-                1,
-                CompactionFault::Summary(FailureKind::Aborted),
             ),
         ];
         for (reason, attempts, fault) in cases {
@@ -116,6 +109,81 @@ mod tests {
             assert_eq!(faults, vec![fault; attempts]);
             fixture.session.shutdown().await.unwrap();
         }
+    }
+
+    /// A summary that overflows the context window is retried smaller: with half the
+    /// output reserve, then also without the older half of its history, which its
+    /// request journals so reconstruction sends what was sent. Dropping history never
+    /// raises the reserve again, even when the reported occupancy had constrained it.
+    #[tokio::test]
+    async fn an_overflowing_summary_is_retried_with_half_reserve_then_half_history() {
+        use crate::agent::CompactionFault;
+        use crate::provider::ProviderErrorKind::ContextWindowExceeded;
+        use crate::session::CompactionTrigger::{Occupancy, Overflow};
+        let overflow = || Step::fail(ContextWindowExceeded.error("prompt is too long"));
+        for (trigger, reserve) in [(Overflow, 16_384), (Occupancy(127_900), 100)] {
+            let steps = [overflow(), overflow(), Step::new(summary(summary_json()))];
+            let fixture = Fixture::new(steps).await;
+            fixture.add_history(2_000).await;
+            fixture.add_history(2_000).await;
+            let cancellation = CancellationToken::new();
+            retrying(
+                &fixture.session,
+                fixture.compact_for(&cancellation, trigger),
+            )
+            .await
+            .unwrap();
+            let requests = fixture.requests();
+            let [full, half, trimmed] = &requests[1..] else {
+                panic!("three summary attempts: {requests:?}")
+            };
+            let limit = |request: &crate::provider::protocol::ModelRequest| {
+                request.max_output_tokens.unwrap().get()
+            };
+            let limits = [limit(full), limit(half), limit(trimmed)];
+            assert_eq!(limits, [reserve, reserve / 2, reserve / 2], "{trigger:?}");
+            assert_eq!(full.messages().count(), half.messages().count());
+            assert!(trimmed.messages().count() < half.messages().count());
+            let records = fixture.records();
+            let faults =
+                events!(&records, SessionEvent::CompactionFailed { error, .. } => error.clone());
+            assert_eq!(
+                faults,
+                [CompactionFault::Overflowed, CompactionFault::Overflowed]
+            );
+            let requested = events!(&records, SessionEvent::ModelRequested { from, .. } => *from);
+            assert!(requested.last().unwrap().is_some());
+            let last = records
+                .iter()
+                .rev()
+                .find(|record| matches!(record.event, SessionEvent::ModelRequested { .. }));
+            let last = last.unwrap().sequence.request();
+            let (_, replayed) = crate::session::reconstruct_model_request(&records, last).unwrap();
+            assert_eq!(&replayed, trimmed);
+            fixture.session.shutdown().await.unwrap();
+        }
+    }
+
+    /// A completed response that reported a full context leaves the summary no room:
+    /// the first stage fails before sending anything, so the next drops history, no
+    /// longer reads that occupancy, and its smaller summary is sent.
+    #[tokio::test]
+    async fn a_full_reported_context_still_sends_the_trimmed_summary() {
+        use crate::agent::CompactionFault;
+        let fixture = Fixture::new([Step::new(summary(summary_json()))]).await;
+        fixture.add_history(2_000).await;
+        fixture.add_history(2_000).await;
+        let full = crate::session::CompactionTrigger::Occupancy(128_000);
+        let cancellation = CancellationToken::new();
+        let compacted = fixture.compact_for(&cancellation, full);
+        retrying(&fixture.session, compacted).await.unwrap();
+        let records = fixture.records();
+        let faults =
+            events!(&records, SessionEvent::CompactionFailed { error, .. } => error.clone());
+        assert_eq!(faults, [CompactionFault::Overflowed]);
+        let summaries = &fixture.requests()[1..];
+        assert_eq!(summaries.len(), 1, "only the trimmed summary is sent");
+        fixture.session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -188,9 +256,9 @@ mod tests {
                 .is_ok()
         );
         let expected = usage(
-            before.input_tokens + 44,
-            before.cached_input_tokens + 28,
-            before.output_tokens + 12,
+            before.input_tokens.unwrap() + 44,
+            before.cached_input_tokens.unwrap() + 28,
+            before.output_tokens.unwrap() + 12,
         );
         assert_eq!(journaled_usage(&fixture.session).await, expected);
         let records = fixture.records();

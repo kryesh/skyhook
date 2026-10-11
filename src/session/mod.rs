@@ -19,6 +19,7 @@ mod core;
 mod db;
 mod event;
 mod ledger;
+mod projection;
 mod request;
 pub mod stats;
 mod template;
@@ -34,15 +35,18 @@ pub(crate) use db::{CaptureExtent, CaptureRow, OffloadedCapture, OutputRows, Sha
 pub use db::{DbError, SessionSummary, SessionTitle};
 pub(crate) use event::EntryKind;
 pub use event::{
-    AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompletedOutcome,
-    EventRecord, MessageSeq, ModeSelection, ModelCallOrigin, ModelContext, ModelPurpose,
-    ProfileSnapshot, RecordSeq, RequestSeq, RetryDelay, SessionEvent, TitleSource, Truncation,
+    AttemptFailure, AttemptRef, CompactionCheckpoint, CompactionFailure, CompactionTrigger,
+    CompletedOutcome, EventRecord, MessageSeq, ModeSelection, ModelCallOrigin, ModelContext,
+    ModelPurpose, ProfileSnapshot, RecordSeq, Refused, RequestSeq, RetryDelay, SessionEvent,
+    TitleSource, Truncation,
 };
-pub use ledger::{RequestChanges, RequestFailure, RequestLedger, RequestPhase, RequestRecord};
+pub use ledger::{
+    CommittedUsage, RequestChanges, RequestFailure, RequestLedger, RequestPhase, RequestRecord,
+};
+pub use projection::{Projected, Projection, project_history, render_history};
 pub(crate) use request::stale_todos;
 pub use request::{
-    CheckpointError, Projection, ReplayError, project_history, reconstruct_model_request,
-    record_at, render_history, request_context,
+    CheckpointError, ReplayError, reconstruct_model_request, record_at, request_context,
 };
 pub use turns::Turns;
 
@@ -807,9 +811,13 @@ pub(crate) mod tests {
         agent::TurnFailure,
         execution::ExecutionLocation,
         identity::JobId,
-        provider::{profile::ModelProfile, protocol::Usage},
+        provider::{
+            profile::ModelProfile,
+            protocol::{HistoryLifetime, SystemSegment, ToolDefinition, Usage},
+        },
         tool::policy::Capability,
     };
+    use serde_json::json;
 
     /// Refuses, while held, every write `rule` matches, as a failing journal does.
     /// `rule` is a trigger's timing and event, such as `BEFORE INSERT ON job_finish`.
@@ -928,12 +936,7 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn usage(input: u64, cached: u64, output: u64) -> Usage {
-        Usage {
-            input_tokens: input,
-            cached_input_tokens: cached,
-            cache_write_input_tokens: 0,
-            output_tokens: output,
-        }
+        Usage::prompted(input, cached, 0, output)
     }
 
     /// A request against `context` with no checkpoint or history range.
@@ -942,6 +945,7 @@ pub(crate) mod tests {
             context,
             checkpoint: None,
             through: None,
+            from: None,
             tail: Vec::new(),
             history_lifetime: Default::default(),
         }
@@ -1002,6 +1006,70 @@ pub(crate) mod tests {
         let (root, store, agent) = on_disk().await;
         let id = store.id();
         (root, store, id, agent)
+    }
+
+    pub(crate) fn text_message(text: &str) -> Message {
+        Message::User(vec![UserPart::Text { text: text.into() }])
+    }
+
+    pub(crate) fn committed(message: Message) -> SessionEvent {
+        SessionEvent::MessageCommitted { message }
+    }
+
+    pub(crate) fn requested_history(
+        context: RecordSeq,
+        checkpoint: Option<RecordSeq>,
+        history: &[RecordSeq],
+        tail: &str,
+        history_lifetime: HistoryLifetime,
+    ) -> SessionEvent {
+        SessionEvent::ModelRequested {
+            context,
+            checkpoint,
+            through: history.last().map(|source| source.message()),
+            from: None,
+            tail: vec![text_message(tail)],
+            history_lifetime,
+        }
+    }
+
+    pub(crate) fn context(
+        purpose: ModelPurpose,
+        provider: &str,
+        model: &str,
+        system: &str,
+    ) -> SessionEvent {
+        let mut profile = profile();
+        profile.name.provider = provider.parse().unwrap();
+        profile.profile.model = model.parse().unwrap();
+        profile.profile.reasoning = Some("high".into());
+        SessionEvent::ModelContext {
+            context: crate::session::ModelContext {
+                purpose,
+                profile,
+                system: vec![SystemSegment {
+                    text: system.into(),
+                    cache: true,
+                }],
+                tools: vec![ToolDefinition {
+                    name: "read".into(),
+                    description: "original description".into(),
+                    input_schema: json!({"type":"object"}),
+                }],
+                response_schema: Some(crate::provider::protocol::ResponseSchema {
+                    name: "answer".into(),
+                    schema: json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}),
+                }),
+            },
+        }
+    }
+
+    pub(crate) fn sequences(projection: &Projection) -> Vec<u64> {
+        projection
+            .messages
+            .iter()
+            .map(|projected| projected.sequence.get())
+            .collect()
     }
 
     /// A command queued before its caller's runtime shuts down still commits:
@@ -1414,8 +1482,7 @@ pub(crate) mod tests {
                 request: summary,
                 attempt: 1,
             },
-            before_tokens: 10,
-            after_tokens: 5,
+            trigger: crate::session::CompactionTrigger::Occupancy(100),
         };
         append(SessionEvent::Compaction { checkpoint }).await;
         assert_eq!(stopped().await, None);

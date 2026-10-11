@@ -15,7 +15,7 @@ See [embedding](embedding.md) for host API and replay contracts,
 | `config::RuntimeConfig` | An admitted, immutable configuration generation. A selected model retains the configuration that admitted it. |
 | `agent::Harness` | Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions. |
 | `agent::SessionHandle` / session runtime | One agent tree, its registry and jobs, target routing, MCP connections, observation stream, and session store. |
-| `AgentContext` | One agent loop's projected history, request template, model profile, token calibration, and owned provider context. |
+| `AgentContext` | One agent loop's projected history, request template, model profile, and owned provider context. |
 | `provider::ProviderContext` | Conversation-scoped provider resources and one-attempt model invocations, not authoritative conversation history or retry policy. |
 | `tool::executor::ToolExecutor` | Shared admission, routing, authorization, and supervised execution for model and script tool calls. |
 | `session::SessionStore` | Durable events, content-addressed blobs, and saved job outputs and captures. |
@@ -58,17 +58,17 @@ OAuth state.
 
 The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context
-for later input; resources are released when that loop exits. A model change prepares
-its replacement before committing the selection, preserves journal history, and resets token
-calibration. Reselecting the current model keeps the current context. A mode change also replaces
-the prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
-context under the same context identity.
+for later input; resources are released when that loop exits. A model change prepares its
+replacement before committing the selection and preserves journal history. Reselecting the
+current model keeps the current context. A mode change also replaces the prompt and tool surface
+and invalidates earlier bound reasoning. Resume opens a fresh provider context under the same
+context identity.
 
-The session owns the durable conversation (`session::Message`): user text and attachments, the
-agent's state (date, live jobs, todos), job events (child replies and presented job views),
-parent input and compaction summaries. Providers receive it rendered: state and job events
-become runtime text that joins the final turn, so the provider layer knows nothing about jobs
-or todos, and those renderers are part of the session format.
+The session owns the durable conversation (`session::Message`): user text and attachments, job
+events (child replies and presented job views), parent input and compaction summaries, and the
+agent's state (date, live jobs, todos) as a message of its own. Providers receive it rendered:
+state becomes a context state entry and job events runtime text, so the provider layer knows
+nothing about jobs or todos, and those renderers are part of the session format.
 
 Providers receive complete provider-neutral requests; they do not privately replay failed
 submissions. A `response_schema` must be transmitted as a structured-output constraint or
@@ -79,12 +79,24 @@ encoding without deleting the durable transcript.
 
 ### History, transient state, and caching
 
-A `ModelRequest` separates committed `history` from request-specific `tail` content.
-`messages()` iterates history followed by tail. History is an unchanged prefix of later requests
-under the same context settings until compaction replaces it; the tail is rebuilt and never
-cacheable. A profile's `state_mode` puts runtime state in the tail (`dynamic`), commits it to
-history (`persist`), or omits it (`none`). Persisted state lets later requests extend an unchanged
-conversation, which matters for reasoning bound to that conversation.
+A `ModelRequest` carries its context as one ordered list of typed entries: messages, and runtime
+state the harness wrote, with how long the state stays in the model's view (`StateLifetime`). A
+profile's `state_mode` sends each request's own state (`current`, `dynamic`), commits it to the
+conversation (`persisted`, `persist`), or omits it (`none`). Everything before the first current
+state is a prefix later requests extend under the same context settings until compaction replaces
+it. Only a state whose request produced no response later drops out of it, since nothing is bound
+to it.
+
+The journal records each request's tail. The projection gives each committed response the state
+its request sent, attributed as the request ledger attributes responses, and later requests send
+it again before that response as `superseded` state, back to the latest checkpoint or mode switch
+(where bound reasoning ends). A superseded state never reaches the model, so the model always
+reads only the latest dynamic state. Each codec places state in its dialect's `StateRole`: the
+protocol's harness role, or user content where a server has none mid-conversation; never inside
+tool output. A Messages dialect may make system-role state turn-scoped, which lets that codec
+resend superseded state hidden from the model and keep the conversation unchanged for reasoning
+bound to it; every other placement omits superseded state. A state not followed by a response or
+the end of the context is omitted everywhere: its request produced nothing bound to it.
 
 `history_lifetime` communicates cache reuse without prescribing a provider implementation:
 
@@ -92,11 +104,8 @@ conversation, which matters for reasoning bound to that conversation.
 - `detached` marks one-off settings, such as a compaction summary request, with no reusable
   history prefix under those settings.
 
-Messages, and Chat dialects that select content-part breakpoints, mark the last history block as a
-cache breakpoint except for detached requests.
-OpenAI protocols use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
-to the final tool output or user message instead of introducing a separate user turn, which
-would look like the user speaking again after every tool call.
+Messages, and Chat dialects that select content-part breakpoints, mark the end of the prefix as a
+cache breakpoint except for detached requests. OpenAI protocols use automatic prefix caching.
 
 ## Request, response, and recovery lifecycle
 
@@ -109,8 +118,7 @@ would look like the user speaking again after every tool call.
    response ended (an answer, tool use, or a cut). Only a completion built for tool use carries
    tool calls, so nothing else can authorize execution. `LiveResponse` gives the runtime and
    observers the same provisional view of the deltas until the end arrives. Observers then see
-   each response settle as committed, committed-but-aborted, or failed, keyed by the journal
-   sequence it produced.
+   each response settle as committed or failed, keyed by the journal sequence it produced.
 3. Only an accepted response becomes model-visible history. Its message, usage, and outcome
    commit together before tool dispatch. Each tool result commits as its call finishes; request
    projection merges results back into the original call order. This preserves completed work
@@ -205,25 +213,28 @@ authentication failures, invalid requests, and protocol errors do not enter this
 Context-window recovery and unusable compaction summaries have their own bounded recovery path;
 a checkpoint that breaks a journal invariant is not retried.
 
-A refusal cut fails without committing the refused message; an abort cut can retain completed
-safe content but still fails the turn. Any other response with neither nonblank text nor a tool
-call fails with nothing committed: `OutputLimit` when cut at the output limit, `Empty` otherwise.
-A truncated or incomplete cut with content commits it as a completed response with that outcome.
+A refusal cut fails without committing the refused message. A response the service aborts is a
+failed attempt like a server error, retried with nothing committed. Any other response with
+neither nonblank text nor a tool call fails with nothing committed: `OutputLimit` when cut at the
+output limit, `Empty` otherwise. A truncated or incomplete cut with content commits it as a
+completed response with that outcome.
 Empty text is never committed, even beside a tool call.
 
 ## Compaction and context accounting
 
 The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a successful response's reported occupancy (uncached input,
-cached input, and output), at 90% of `max_context - max_output`, not from a display estimate.
+cached input, and output), at 90% of `max_context - max_output`. Skyhook estimates no token
+counts: every size it uses is one a provider reported.
 It runs after committing a response with tool calls, before creating or executing them. A final
 answer leaves busy in its own commit, so the compaction it triggers runs at the next request
 boundary, before the agent's next turn sends its first request. The need is folded from the
 agent's journal whenever its context opens or refreshes: the last committed response's occupancy,
 until a checkpoint installs, a round fails with a fault a fresh summary could not fix, or the
 agent's model or mode changes. An interrupted round and unusable summaries leave it, so a reopened
-or continued agent compacts first, as the live one would have. A context-window overflow compacts
-and retries within its turn only.
+or continued agent compacts first, as the live one would have. A summary that overflowed already
+shrank within its round, so it consumes the need, even if the round is then interrupted: the next
+request fits, or its own overflow compacts. A context-window overflow compacts and retries within its turn only.
 
 Summarization is a separate recorded request with a structured response schema and no callable
 tools. Native history ends before any trailing unanswered tool-call message, keeping the summary
@@ -237,17 +248,25 @@ Replacements made by that response's scripts run normally.
 All results join the retained calls in the first normal post-compaction request. Completed
 exchanges cannot be partially retained. The retained projection removes reasoning bound to the
 replaced context.
-Compaction reserves the greater of reported occupancy and calibrated summary-input size,
-including the temporary response block, directive, and schema. Its output limit is the smaller
-of the configured limit and the remaining context space; no available output space fails before
-invoking the provider. Normal request settings are unchanged, and the summary's effective limit
-is journaled for exact reconstruction.
+The summary's output limit is the smaller of the configured limit and the space the completed
+response's reported occupancy leaves; no space left fails before invoking the provider. A summary
+the provider rejects as too large is retried within the attempt limit, smaller at each step: with
+half the output reserve, then also without about half of the history after its opening exchange,
+cut at the user or assistant message nearest the middle, which the summary request journals as
+its history's first message; no stage raises the output limit an earlier one sent. The retained
+tail's sizes are inferred from reports: messages after the agent's last reported request stay
+whole, and earlier exchanges join them while the growth between the prompts of the requests
+around them fits the retention budget. Only consecutive requests under the same model context
+are compared, and growth that is zero or negative sizes nothing, which stops the walk. A
+checkpoint for an overflow retains only the last exchange: the messages the overflowing request
+added are unsized and may be what overflowed. Retention keeps conversation only; a committed
+state is stale once the next request sends its own. Normal request settings are unchanged, and
+the summary's effective limit is journaled for exact reconstruction.
 
 History replacement and todo reconciliation become active only after checkpoint persistence.
 Validation prevents a stale summary from overwriting newer todo state. Every valid, successfully
-persisted continuation replaces the context and reconciles todos, regardless of estimated size
-reduction. Replay uses the stored continuation rather than rerunning the summary or today's
-renderer. See [model-call reconstruction](embedding.md#reconstructing-model-calls) for the
+persisted continuation replaces the context and reconciles todos. Replay uses the stored
+continuation rather than rerunning the summary or today's renderer. See [model-call reconstruction](embedding.md#reconstructing-model-calls) for the
 durable reference contract.
 
 ## Tools, jobs, and execution

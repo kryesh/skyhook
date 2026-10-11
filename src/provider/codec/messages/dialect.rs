@@ -2,13 +2,13 @@
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::provider::{
-    codec::{BodyPath, CacheTtl, Effort, EffortLevels, Identity, ToolNames, path},
+    codec::{BodyPath, CacheTtl, Effort, EffortLevels, Identity, StateRole, ToolNames, path},
     http::{Headers, headers::Value},
 };
 
-/// Anthropic thinking settings: `off` and `adaptive` select a thinking mode;
+/// Messages thinking settings: `off` and `adaptive` select a thinking mode;
 /// the rest are `output_config.effort` levels under adaptive thinking.
-const ANTHROPIC_EFFORT: EffortLevels =
+const MESSAGES_EFFORT: EffortLevels =
     EffortLevels(&["off", "adaptive", "low", "medium", "high", "xhigh", "max"]);
 
 /// What happens to a signed thinking block whose conversation prefix changed.
@@ -16,18 +16,26 @@ const ANTHROPIC_EFFORT: EffortLevels =
 pub(crate) enum ThinkingBinding {
     /// The service rejects the request; the runtime unbinds client-side first.
     Unenforced,
-    /// The service drops the block instead of failing (`block_binding`, under
-    /// its beta), backing up the client-side unbinding.
+    /// The service drops the block instead of failing (`block_binding`), backing up
+    /// the client-side unbinding.
     DropOnMismatch,
+}
+
+/// How system-role state is sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SystemState {
+    /// Plain system messages; a superseded state is omitted.
+    Plain,
+    /// System messages the model reads for one turn (`clear_at`) unless persisted, so a
+    /// superseded state stays in the conversation without being read.
+    TurnScoped,
 }
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
-const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
-
-/// Beta features a request announces: a list header, which configured and
-/// dialect-selected betas join.
-const BETA_HEADER: HeaderName = HeaderName::from_static("anthropic-beta");
+/// Beta features a request announces: a list header, which the betas a vendor
+/// dialect and the configuration name join.
+pub(crate) const BETA_HEADER: HeaderName = HeaderName::from_static("anthropic-beta");
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dialect {
@@ -39,58 +47,35 @@ pub(crate) struct Dialect {
     /// Lifetime written on each cache breakpoint; None takes the service default.
     pub cache_ttl: Option<CacheTtl>,
     pub thinking_binding: ThinkingBinding,
+    pub state_role: StateRole,
+    pub system_state: SystemState,
 }
 
 impl Dialect {
-    pub(crate) fn anthropic() -> Self {
+    pub(crate) fn standard() -> Self {
         Self {
             output_limit: const { path("max_tokens") },
             effort: Effort {
                 path: const { path("output_config.effort") },
-                levels: ANTHROPIC_EFFORT,
+                levels: MESSAGES_EFFORT,
             },
             tool_names: ToolNames::Anthropic,
             identity: Identity::OMITTED,
             cache_ttl: None,
             thinking_binding: ThinkingBinding::Unenforced,
+            state_role: StateRole::User,
+            system_state: SystemState::Plain,
         }
     }
 
-    /// The API version every request names, and the betas these conventions need.
+    /// The API version every request names, and the beta list vendors add to.
     pub(crate) fn headers(&self) -> Headers {
         let mut headers = Headers::default();
         headers.insert(
             HeaderName::from_static("anthropic-version"),
             Value::Fixed(HeaderValue::from_static(ANTHROPIC_VERSION)),
         );
-        let betas =
-            (self.thinking_binding == ThinkingBinding::DropOnMismatch).then_some(BINDING_BETA);
-        headers.list(
-            BETA_HEADER,
-            betas.map(|beta| Value::Fixed(HeaderValue::from_static(beta))),
-        );
+        headers.list(BETA_HEADER, []);
         headers
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[tokio::test]
-    async fn every_request_names_the_version_and_only_needed_betas() {
-        let fixed = |binding| async move {
-            let dialect = Dialect {
-                thinking_binding: binding,
-                ..Dialect::anthropic()
-            };
-            dialect.headers().resolve().await.unwrap().map()
-        };
-        let bound = fixed(ThinkingBinding::DropOnMismatch).await;
-        assert_eq!(bound["anthropic-version"], ANTHROPIC_VERSION);
-        assert_eq!(bound[BETA_HEADER], BINDING_BETA);
-        let plain = fixed(ThinkingBinding::Unenforced).await;
-        assert_eq!(plain["anthropic-version"], ANTHROPIC_VERSION);
-        assert!(!plain.contains_key(BETA_HEADER));
     }
 }

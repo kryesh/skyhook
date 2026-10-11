@@ -1,30 +1,32 @@
 //! Build and atomically install compaction checkpoints against current runtime state.
 
 use super::retention::{
-    included_message_jobs, included_output_jobs, retained_sources, retention_budget,
+    Retain, included_message_jobs, included_output_jobs, retained_sources, retention_budget,
 };
-use super::{HarnessError, SessionRuntime, TokenMeter, TurnContext, compaction};
+use super::{HarnessError, SessionRuntime, TurnContext, compaction};
 use crate::{
     agent::{CompactionError, runtime::state},
     identity::JobId,
     job::JobView,
     provider::{
         ProviderContext,
-        protocol::{HistoryLifetime, ModelRequest, ResponseSchema, Usage},
+        protocol::{HistoryLifetime, ModelRequest, ResponseSchema},
     },
     session::{
-        AttemptRef, CheckpointError, Command, CompactionCheckpoint, CoreState, Message,
-        ModelCallOrigin, ModelPurpose, Plan, ProfileSnapshot, RecordSeq, RequestSeq, SessionEvent,
-        project_history,
+        AttemptRef, CheckpointError, Command, CompactionCheckpoint, CompactionTrigger, CoreState,
+        Message, ModelCallOrigin, ModelPurpose, Plan, ProfileSnapshot, RecordSeq, RequestSeq,
+        SessionEvent, project_history,
     },
 };
 use std::collections::BTreeSet;
 
 pub(super) struct CompactionInput<'a> {
-    pub(super) meter: &'a mut TokenMeter,
     pub(super) profile: &'a ProfileSnapshot,
     pub(super) request: &'a ModelRequest,
-    pub(super) completed_usage: Option<Usage>,
+    pub(super) trigger: CompactionTrigger,
+    pub(super) fit: super::SummaryFit,
+    /// The output limit the round's last attempt sent, if any.
+    pub(super) ceiling: &'a mut Option<std::num::NonZeroU64>,
     pub(super) model_attempt: &'a mut u64,
 }
 
@@ -38,10 +40,11 @@ impl SessionRuntime {
         launches: &mut Vec<(JobId, Option<ModelCallOrigin>)>,
     ) -> Result<(), HarnessError> {
         let CompactionInput {
-            meter,
             profile,
             request: input,
-            completed_usage,
+            trigger,
+            fit,
+            ceiling,
             model_attempt,
         } = source;
         let agent = turn.agent;
@@ -64,68 +67,67 @@ impl SessionRuntime {
             &turn.capabilities,
             turn.location,
         );
-        // A fresh snapshot replaces the input's state tail, when its state mode sends
-        // one. The summary always gets it: it must return the reconciled todo list.
-        let sends_state = !input.tail.is_empty();
-        let state = Message::User(vec![runtime]);
+        // The summary always gets the state: it must return the reconciled todo list.
+        let state = Message::State(runtime);
         let mut blobs = input.blobs.clone();
-        let mut input = ModelRequest {
+        let mut summary_tail = Vec::new();
+        let mut summary_request = ModelRequest {
             model: input.model.clone(),
             system: input.system.clone(),
-            history: crate::session::render_history(projected.history()),
-            tail: sends_state.then(|| state.render()).into_iter().collect(),
-            history_lifetime: HistoryLifetime::Extends,
-            tools: input.tools.clone(),
+            context: Vec::new(),
+            history_lifetime: HistoryLifetime::Detached,
+            // Summarization cannot execute tools. Keep their historical calls/results
+            // as evidence, but advertise no callable tools on this request.
+            tools: Vec::new(),
             reasoning: input.reasoning.clone(),
-            response_schema: input.response_schema.clone(),
+            response_schema: Some(ResponseSchema {
+                name: "skyhook_compaction".into(),
+                schema: compaction::response_schema(),
+            }),
             max_output_tokens: input.max_output_tokens,
             blobs: Default::default(),
         };
-        let before_tokens = compaction::estimate_request(&input);
-        // Keep only the original template for the post-compaction estimate.
-        input.history.clear();
-        input.tail.clear();
-        let mut summary_tail = vec![state];
-        let mut summary_request = input.clone();
-        // Summarization cannot execute tools. Keep their historical calls/results
-        // as evidence, but advertise no callable tools on this request.
-        summary_request.tools.clear();
-        summary_request.response_schema = Some(ResponseSchema {
-            name: "skyhook_compaction".into(),
-            schema: compaction::response_schema(),
-        });
         let template = summary_request.clone();
         let mut summary_history = projected.clone();
-        let pending = match summary_history.messages.last() {
-            Some((sequence, Message::Assistant(items))) => items
-                .iter()
-                .find_map(|item| item.call())
-                .map(|call| ModelCallOrigin {
-                    message: sequence.message(),
-                    call_id: call.id().to_owned(),
-                }),
-            _ => None,
-        };
+        let pending = summary_history.messages.last().and_then(|last| {
+            let Message::Assistant(items) = &last.message else {
+                return None;
+            };
+            let call = items.iter().find_map(|item| item.call())?;
+            Some(ModelCallOrigin {
+                message: last.sequence.message(),
+                call_id: call.id().to_owned(),
+            })
+        });
         // The summary sees this response as evidence in its tail, not unanswered
         // native calls. Retain the original for actual results after compaction.
         if pending.is_some()
-            && let Some((_, Message::Assistant(items))) = summary_history.messages.pop()
+            && let Some(Message::Assistant(items)) =
+                summary_history.messages.pop().map(|last| last.message)
         {
             summary_tail.push(compaction::pending_response(&items));
         }
-        summary_tail.push(compaction::directive());
+        // The state ends the request, where every codec has a slot for it.
+        summary_tail.extend([compaction::directive(), state]);
         let summary_through = summary_history.through();
-        // Dropping tools changes the conversation, invalidating bound reasoning.
-        summary_request.history = crate::session::render_history(
-            summary_history
-                .messages
-                .into_iter()
-                .map(|(_, message)| message.without_bound_reasoning()),
-        );
-        summary_request.tail = summary_tail.iter().map(Message::render).collect();
+        let summary_from = match fit {
+            super::SummaryFit::HalfHistory => summary_history.trim(),
+            super::SummaryFit::Full | super::SummaryFit::HalfReserve => None,
+        };
+        // Dropping tools changes the conversation, invalidating bound reasoning and the
+        // states sent for it.
+        summary_history.unbind(0);
         // The checkpoint replaces this history once the summary completes.
-        summary_request.history_lifetime = HistoryLifetime::Detached;
-        let limit = super::summary_max_output(profile, meter, &summary_request, completed_usage)?;
+        summary_request.context = summary_history.context(&summary_tail);
+        // Once history is dropped, the completed response's occupancy no longer
+        // describes this input.
+        let occupied = match trigger {
+            CompactionTrigger::Occupancy(tokens) if summary_from.is_none() => Some(tokens),
+            CompactionTrigger::Occupancy(_) | CompactionTrigger::Overflow => None,
+        };
+        let limit = fit.reserve(super::summary_max_output(profile, occupied)?);
+        let limit = ceiling.map_or(limit, |ceiling| limit.min(ceiling));
+        *ceiling = Some(limit);
         summary_request.max_output_tokens = Some(limit);
         let mut summary_profile = profile.clone();
         summary_profile.profile.max_output = limit;
@@ -148,16 +150,16 @@ impl SessionRuntime {
             context: summary_context.sequence,
             checkpoint: projected.checkpoint,
             through: summary_through,
+            from: summary_from,
             tail: summary_tail,
             history_lifetime: summary_request.history_lifetime,
         };
         let requested = self.request(agent, requested).await?;
         *request_sequence = Some(requested.sequence.request());
-        let summary_estimate = compaction::estimate_request(&summary_request);
         self.store
             .load_blobs(&mut summary_request, &mut blobs)
             .await?;
-        let (continuation, usage) = self
+        let continuation = self
             .summarize(
                 turn,
                 provider,
@@ -166,8 +168,6 @@ impl SessionRuntime {
                 model_attempt,
             )
             .await?;
-        meter.observe(summary_estimate, usage);
-        let before_tokens = meter.scale(before_tokens);
         let mut message = continuation.message;
         for launch in self.jobs.active_launches(agent) {
             if !launches.contains(&launch) {
@@ -179,15 +179,15 @@ impl SessionRuntime {
             .filter_map(|(_, origin)| origin.clone())
             .chain(pending)
             .collect();
-        let budget = retention_budget(profile.profile.max_context.get());
-        let retained = retained_sources(
-            &records,
-            agent,
-            &projected.messages,
-            &origins,
-            input.model.as_str(),
-            budget,
-        )?;
+        // The messages an overflowing request added are unsized and may be what
+        // overflowed, so only its last exchange stays.
+        let retain = match trigger {
+            CompactionTrigger::Occupancy(_) => {
+                Retain::Within(retention_budget(profile.profile.max_context.get()))
+            }
+            CompactionTrigger::Overflow => Retain::LastExchange,
+        };
+        let retained = retained_sources(&records, agent, &projected.messages, &origins, retain)?;
         let mut included = BTreeSet::new();
         for source in &retained {
             included_message_jobs(source.message(), &mut included);
@@ -246,25 +246,6 @@ impl SessionRuntime {
         {
             blocks.push(crate::session::UserPart::Compaction { text: format!("Previously started host work; these are launch facts, not requests to launch again. Current runtime state governs job status.\n{}", serde_json::Value::Array(facts)) });
         }
-        let mut compacted = input.clone();
-        // Estimate what projection sends: retained bound reasoning is dropped.
-        let retained_history = retained
-            .iter()
-            .map(|source| source.message().clone().without_bound_reasoning());
-        compacted.history = crate::session::render_history(
-            std::iter::once(message.clone()).chain(retained_history),
-        );
-        if sends_state {
-            let runtime = state::runtime_state_with_todos(
-                &self.jobs,
-                agent,
-                &turn.capabilities,
-                continuation.todos.clone(),
-                turn.location,
-            );
-            compacted.tail = vec![Message::User(vec![runtime]).render()];
-        }
-        let after_tokens = meter.estimate(&compacted);
         let attempt = AttemptRef {
             request: requested.sequence.request(),
             attempt: *model_attempt,
@@ -281,8 +262,7 @@ impl SessionRuntime {
                 .map(|source| source.into_sequence())
                 .collect(),
             attempt,
-            before_tokens,
-            after_tokens,
+            trigger,
         };
         // Todos changed since the frontier make those the summary reconciled stale,
         // which a fresh summary can correct.
@@ -295,16 +275,6 @@ impl SessionRuntime {
             Ok::<_, HarnessError>(Plan::journal(vec![(owner, compaction)]))
         };
         self.store.commit(Command::Journal, compaction).await?;
-        // A final response may return immediately after automatic compaction,
-        // without another normal request to refresh the observed occupancy.
-        self.store
-            .post(crate::agent::runtime::RuntimeEvent::Context {
-                agent: agent.clone(),
-                usage: crate::agent::ContextUsage {
-                    tokens: after_tokens,
-                    capacity: profile.profile.max_context.get(),
-                },
-            });
         Ok(())
     }
 }
@@ -323,7 +293,7 @@ mod tests {
     use crate::{
         agent::TodoStatus,
         job::{JobOutcome, JobSpec},
-        provider::protocol::{AssistantItem, ToolCall, ToolResult},
+        provider::protocol::{AssistantItem, Entry, State, StateLifetime, ToolCall, ToolResult},
         session::{EventRecord, Message, ModelPurpose, SessionEvent, UserPart},
         tool::ToolOutput,
     };
@@ -392,8 +362,18 @@ mod tests {
         assert_eq!(*through, prefix.through());
         assert!(tail.contains(&snapshot));
         let summary = fixture.script.request(2).await;
-        assert_eq!(summary.history, render_history(prefix.history()));
-        assert!(summary.tail.contains(&snapshot.render()));
+        assert!(
+            summary
+                .context
+                .starts_with(&render_history(prefix.history()))
+        );
+        let evidence = crate::agent::runtime::tests::sent(&snapshot);
+        assert!(summary.messages().any(|message| message == &evidence));
+        // The summary's own state ends it.
+        let last = summary.context.last();
+        assert!(
+            matches!(last, Some(Entry::State(state)) if state.lifetime == StateLifetime::Current)
+        );
         assert!(!summary.messages().any(|message| matches!(
             message, Sent::Assistant(items) if items.iter().any(|item| item.call().is_some())
         )));
@@ -402,10 +382,10 @@ mod tests {
         assert_eq!(replayed, summary);
         let projected = project_history(&records, agent);
         assert_eq!(
-            projected.messages.last().unwrap().1,
+            projected.messages.last().unwrap().message,
             assistant.without_bound_reasoning()
         );
-        assert!(!projected.history().any(|message| message == &snapshot));
+        assert!(!projected.history().any(|(message, _)| message == &snapshot));
         for (id, name) in [("pending-b", "todo"), ("pending-a", "read")] {
             runtime
                 .commit(
@@ -423,7 +403,7 @@ mod tests {
         }
         let projected = project_history(&fixture.records(), agent);
         let history = render_history(projected.history());
-        let Some(Sent::Tool(results)) = history.last() else {
+        let Some(Entry::Message(Sent::Tool(results))) = history.last() else {
             panic!("real results follow the retained assistant")
         };
         assert!(
@@ -555,11 +535,8 @@ mod tests {
         let next = fixture.session.prompt("Continue with the current state.");
         next.await.unwrap();
         let request = fixture.script.request(3).await;
-        let Some(Sent::User(content)) = request.tail.last() else {
+        let Some(Entry::State(State { text, .. })) = request.context.last() else {
             panic!("fresh state")
-        };
-        let SentPart::Runtime { text } = &content[0] else {
-            panic!("runtime state")
         };
         assert!(text.contains("Verify the fresh finding") && text.contains("in_progress"));
         assert!(!text.contains("root-research"));
@@ -613,7 +590,11 @@ mod tests {
         fixture.compact(&CancellationToken::new()).await.unwrap();
         let records = fixture.records();
         let checkpoint = checkpoint(&records);
-        assert!(checkpoint.after_tokens >= checkpoint.before_tokens);
+        // No response reported the occupancy this compaction ran at.
+        assert_eq!(
+            checkpoint.trigger,
+            crate::session::CompactionTrigger::Overflow
+        );
         assert!(
             matches!(&checkpoint.message, Message::User(blocks) if blocks.iter().any(|block| matches!(block, UserPart::Compaction { text } if text.contains(markdown) && !text.contains("Reasoning before the answer"))))
         );
@@ -640,7 +621,7 @@ mod tests {
         let fixture = Fixture::with_state_mode(steps, state_mode).await;
         let runtime = &fixture.session.runtime;
         let agent = &fixture.session.root;
-        assert!(fixture.script.request(0).await.tail.is_empty());
+        assert_eq!(fixture.script.request(0).await.states().count(), 0);
         fixture.add_history(20_000).await;
         runtime
             .store

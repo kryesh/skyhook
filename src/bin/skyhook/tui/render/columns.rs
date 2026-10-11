@@ -417,12 +417,7 @@ mod tests {
             purpose: skyhook::session::ModelPurpose::Agent,
             model: "model".into(),
             status,
-            usage: Some(skyhook::provider::protocol::Usage {
-                input_tokens: 80,
-                cached_input_tokens: 20,
-                cache_write_input_tokens: 0,
-                output_tokens: output,
-            }),
+            usage: skyhook::provider::protocol::Usage::prompted(80, 20, 0, output),
             sent: "14:02:31".into(),
             timing,
         }
@@ -525,7 +520,7 @@ mod tests {
             purpose: skyhook::session::ModelPurpose::Compaction,
             model: "long model 界界 😀".into(),
             status: model::RequestStatus::Running,
-            usage: None,
+            usage: Default::default(),
             sent: "Sep 28 23:59:10".into(),
             timing: model::Timing::Since(0),
         };

@@ -20,8 +20,8 @@ use skyhook::identity::JobId;
 use skyhook::job::JobEnvelope;
 use skyhook::provider::protocol::{AssistantItem, BlockRef, ToolResult};
 use skyhook::session::{
-    EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestLedger, RequestSeq, SessionEvent,
-    Turns, UserPart,
+    CompactionTrigger, EventRecord, JobEvent, Message, MessageSeq, RecordSeq, RequestLedger,
+    RequestSeq, SessionEvent, Turns, UserPart,
 };
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
@@ -610,8 +610,6 @@ impl History {
                                 }
                                 continue;
                             }
-                            // Persisted runtime state is model context, not conversation.
-                            UserPart::State { .. } => continue,
                             UserPart::Compaction { text } => {
                                 ("Compaction", text.clone(), Surface::Muted)
                             }
@@ -627,6 +625,8 @@ impl History {
                 Message::Assistant(items) => {
                     self.assistant(record, items, inputs, built);
                 }
+                // Persisted runtime state is model context, not conversation.
+                Message::State(_) => {}
                 Message::Tool(results) => {
                     for (index, result) in results.iter().enumerate() {
                         if !self.pairing.matched.contains(&(record.sequence, index)) {
@@ -649,11 +649,14 @@ impl History {
             }
             SessionEvent::Compaction { checkpoint } => {
                 let open = view.is_expanded(&key, false);
-                let title = format!(
-                    "Context compacted · {} → {}",
-                    number(checkpoint.before_tokens),
-                    number(checkpoint.after_tokens),
-                );
+                let title = match checkpoint.trigger {
+                    CompactionTrigger::Occupancy(tokens) => {
+                        format!("Context compacted at {} tokens", number(tokens))
+                    }
+                    CompactionTrigger::Overflow => {
+                        "Context compacted after it overflowed".to_owned()
+                    }
+                };
                 let body = if open {
                     format!("Summary and retained sources\n{}", pretty(checkpoint))
                 } else {

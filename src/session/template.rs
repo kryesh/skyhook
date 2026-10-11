@@ -13,7 +13,7 @@ impl TryFrom<ModelRequest> for ModelRequestTemplate {
     type Error = SessionError;
 
     fn try_from(mut request: ModelRequest) -> Result<Self, Self::Error> {
-        if !request.history.is_empty() || !request.tail.is_empty() {
+        if !request.context.is_empty() {
             return Err(SessionError::TemplateHistory);
         }
         request.history_lifetime = HistoryLifetime::default();
@@ -27,7 +27,7 @@ impl ModelRequestTemplate {
         &self.0.system
     }
 
-    /// The shared settings as a request with empty history/tail and the default lifetime;
+    /// The shared settings as a request with an empty context and the default lifetime;
     /// callers fill in the conversation with struct update syntax.
     pub(crate) fn to_request(&self) -> ModelRequest {
         self.0.clone()
@@ -61,19 +61,12 @@ mod tests {
         let message = Message::User(vec![UserContent::Text {
             text: "must not disappear".into(),
         }]);
-        for tail in [false, true] {
-            let mut raw = request();
-            if tail {
-                &mut raw.tail
-            } else {
-                &mut raw.history
-            }
-            .push(message.clone());
-            assert!(matches!(
-                ModelRequestTemplate::try_from(raw),
-                Err(SessionError::TemplateHistory)
-            ));
-        }
+        let mut raw = request();
+        raw.context.push(message.into());
+        assert!(matches!(
+            ModelRequestTemplate::try_from(raw),
+            Err(SessionError::TemplateHistory)
+        ));
         let mut raw = request();
         raw.history_lifetime = HistoryLifetime::Detached;
         let template = ModelRequestTemplate::try_from(raw).unwrap();

@@ -662,13 +662,24 @@ mod tests {
             let after = screen(&mut app);
             assert!(app.content_cache.entries() == entries);
             assert_eq!(after[y][right - 6..right].concat(), "1m 15s");
+            // Only the counters change: the job's, and a waiting child's elapsed time at
+            // the end of its switcher row.
             for (line, (old, new)) in before.iter().zip(&after).enumerate() {
+                let counter = if old.concat().contains("Waiting for parent input") {
+                    let end = new
+                        .iter()
+                        .rposition(|cell| !cell.trim().is_empty())
+                        .unwrap()
+                        + 1;
+                    end - 6..end
+                } else if line == y {
+                    right - 6..right
+                } else {
+                    0..0
+                };
                 let changed = (old.iter().zip(new).enumerate()).filter(|(_, (a, b))| a != b);
                 for (x, _) in changed {
-                    assert!(
-                        line == y && (right - 6..right).contains(&x),
-                        "({x}, {line})"
-                    );
+                    assert!(counter.contains(&x), "({x}, {line})");
                 }
             }
             session.cancel_job(job).await.unwrap();

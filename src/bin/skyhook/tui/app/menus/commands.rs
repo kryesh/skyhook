@@ -136,7 +136,7 @@ impl App {
                         "Content: / search; n/N next/previous; [ ] inspector tabs\n",
                         "Ctrl+A/E: line start/end; Ctrl+W: delete word; Ctrl+U/K: delete to line boundary\n",
                         "Ctrl+- / Ctrl+.: undo/redo\n\n",
-                        "Footer: session output · total input(uncached) · estimated context (current/capacity)\n",
+                        "Footer: session output · total input(uncached) · reported context (current/capacity)\n",
                         "Context belongs to the selected agent and includes system, tools and runtime state.\n",
                         "Messages always go to skyhook, including while viewing a child.\n",
                         "Model and mode changes apply from the next submitted message, or from continuing a failed root turn. Instruction changes apply to new sessions.\n",

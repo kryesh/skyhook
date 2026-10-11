@@ -52,11 +52,11 @@ impl SessionState {
 }
 
 /// Whether the request answers tool calls, rather than opening a turn with user
-/// input or a wake. Runtime state after the results is part of the same request.
+/// input or a wake. Runtime events after the results are part of the same request.
 fn continues_turn(request: &ModelRequest) -> bool {
     let runtime_only = |message: &&Message| matches!(message, Message::User(parts) if parts.iter().all(UserContent::is_runtime));
-    let mut history = request.history.iter().rev().skip_while(runtime_only);
-    matches!(history.next(), Some(Message::Tool(_)))
+    let mut messages = request.messages().rev().skip_while(runtime_only);
+    matches!(messages.next(), Some(Message::Tool(_)))
 }
 
 #[cfg(test)]
@@ -75,15 +75,19 @@ mod tests {
             header: HeaderName::from_static(HEADER),
         };
         let state = SessionState::default();
-        let exchange = reasoning_tool_request(&scope()).history;
+        let exchange: Vec<_> = reasoning_tool_request(&scope())
+            .messages()
+            .cloned()
+            .collect();
         let user = |part| Message::User(vec![part]);
         let runtime = || {
             user(UserContent::Runtime {
-                text: "<skyhook_state>".into(),
+                text: "<job_event>".into(),
             })
         };
-        // The opening request, a tool-loop request with persisted state, a wake by a
-        // runtime event alone, that new turn's own tool loop, then queued user input.
+        // The opening request, a tool-loop request with a runtime event after its results,
+        // a wake by a runtime event alone, that new turn's own tool loop, then queued
+        // user input.
         let steps: [(Vec<Message>, &str, Option<&str>); 5] = [
             (
                 vec![user(UserContent::Text {
@@ -115,9 +119,11 @@ mod tests {
             ),
         ];
         let mut request = reasoning_tool_request(&scope());
-        request.history.clear();
+        request.context.clear();
         for (step, received, expected) in steps {
-            request.history.extend(step);
+            request
+                .context
+                .extend(crate::provider::protocol::entries(step));
             let sent = state.prepare(&session, &request);
             assert_eq!(
                 sent.map(|(_, value)| value.to_str().unwrap().to_owned()),

@@ -5,8 +5,8 @@ use crate::{
     job::{JobEnvelope, JobState},
     provider::protocol::{LiveBlock, LiveResponse, Step},
     session::{
-        EventRecord, MessageSeq, RecordSeq, RequestLedger, RequestPhase, RequestSeq, SessionEvent,
-        SessionPhase,
+        CommittedUsage, EventRecord, MessageSeq, RecordSeq, RequestLedger, RequestSeq,
+        SessionEvent, SessionPhase,
     },
 };
 use std::collections::{BTreeMap, HashMap};
@@ -48,10 +48,43 @@ pub struct ObservedActivity {
     pub since: i64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ContextUsage {
     pub tokens: u64,
     pub capacity: u64,
+}
+
+/// Each agent's context as its last committed response reported it, at the capacity of
+/// that request's model, until a checkpoint replaces the agent's history: a fold of the
+/// journal.
+#[derive(Clone, Debug, Default)]
+pub struct ContextGauge {
+    committed: CommittedUsage,
+    usage: HashMap<AgentId, ContextUsage>,
+}
+
+impl ContextGauge {
+    #[must_use]
+    pub fn get(&self, agent: &AgentId) -> Option<&ContextUsage> {
+        self.usage.get(agent)
+    }
+
+    /// Fold `record`, which `ledger` has already observed.
+    fn fold(&mut self, ledger: &RequestLedger, record: &EventRecord) {
+        let agent = &record.agent;
+        if matches!(record.event, SessionEvent::Compaction { .. }) {
+            self.usage.remove(agent);
+        }
+        let Some((request, usage)) = self.committed.fold(record) else {
+            return;
+        };
+        // Only an agent's own requests complete responses; a summary installs a checkpoint.
+        if let (Some(requested), Some(tokens)) = (ledger.get(request), usage.occupancy()) {
+            let capacity = requested.profile.profile.max_context.get();
+            self.usage
+                .insert(agent.clone(), ContextUsage { tokens, capacity });
+        }
+    }
 }
 
 /// How a request's response settled, keyed by the journal sequence it produced.
@@ -59,9 +92,6 @@ pub struct ContextUsage {
 pub enum Settlement {
     /// The assistant message committed at this sequence.
     Committed(MessageSeq),
-    /// The provider cut the response: its completed content committed at this
-    /// sequence, but the turn failed.
-    Aborted(MessageSeq),
     /// Nothing committed.
     Failed(TurnFailure),
 }
@@ -112,10 +142,7 @@ impl ObservedResponse {
     /// Whether the response settled without becoming a complete answer.
     #[must_use]
     pub fn incomplete(&self) -> bool {
-        matches!(
-            self.settlement(),
-            Some(Settlement::Aborted(_) | Settlement::Failed(_))
-        )
+        matches!(self.settlement(), Some(Settlement::Failed(_)))
     }
 
     fn settle(&mut self, how: Settlement) {
@@ -141,7 +168,7 @@ pub struct ObservationSnapshot {
     pub jobs: BTreeMap<JobId, JobEnvelope>,
     pub responses: HashMap<(AgentId, RequestSeq), ObservedResponse>,
     pub activity: HashMap<AgentId, ObservedActivity>,
-    pub context: HashMap<AgentId, ContextUsage>,
+    pub context: ContextGauge,
 }
 
 pub(crate) type Responses = HashMap<(AgentId, RequestSeq), ObservedResponse>;
@@ -169,6 +196,7 @@ impl ObservationSnapshot {
                 let views = Views {
                     ledger: &mut self.ledger,
                     responses: &mut self.responses,
+                    context: &mut self.context,
                 };
                 views.record(&record);
                 self.records.insert(record.sequence, *record);
@@ -183,7 +211,6 @@ impl ObservationSnapshot {
                 live(
                     &mut self.responses,
                     Some(&mut self.activity),
-                    &mut self.context,
                     committed,
                     event,
                 );
@@ -226,11 +253,13 @@ pub(crate) fn read_job(job: &mut JobEnvelope, at: i64) -> Option<JobId> {
 pub(crate) struct Views<'a> {
     pub(crate) ledger: &'a mut RequestLedger,
     pub(crate) responses: &'a mut Responses,
+    pub(crate) context: &'a mut ContextGauge,
 }
 
 impl Views<'_> {
     pub(crate) fn record(self, record: &EventRecord) {
         self.ledger.observe(record);
+        self.context.fold(self.ledger, record);
         let agent = &record.agent;
         match &record.event {
             SessionEvent::ModelAttemptStarted(attempt) => {
@@ -242,35 +271,18 @@ impl Views<'_> {
             }
             SessionEvent::ModelFailed { attempt, failure } => {
                 // The runtime's own settlement is authoritative and may
-                // arrive before or after this record. An abort commits its
-                // partial message before journaling the failure: that
-                // commit is the attempt's settlement, and a committed
-                // response is retired, never revived as one that committed
-                // nothing.
-                let key = (agent.clone(), attempt.request);
-                let committed = self.ledger.get(attempt.request).is_some_and(|request| {
-                    matches!(
-                        request.phase,
-                        RequestPhase::Failed {
-                            message: Some(_),
-                            ..
-                        }
-                    )
-                });
-                if committed {
-                    self.responses.remove(&key);
-                } else {
-                    let response = self.responses.entry(key).or_default();
-                    if response.settlement().is_none() {
-                        response.settle(Settlement::Failed(failure.failure().into()));
-                    }
+                // arrive before or after this record.
+                let response = self.responses.entry((agent.clone(), attempt.request));
+                let response = response.or_default();
+                if response.settlement().is_none() {
+                    response.settle(Settlement::Failed(failure.failure().into()));
                 }
             }
             SessionEvent::MessageCommitted { .. } => {
                 self.responses.retain(|_, response| {
                     !matches!(
                         response.settlement(),
-                        Some(Settlement::Committed(message) | Settlement::Aborted(message))
+                        Some(Settlement::Committed(message))
                             if RecordSeq::from(*message) == record.sequence
                     )
                 });
@@ -285,7 +297,6 @@ impl Views<'_> {
 pub(crate) fn live(
     responses: &mut Responses,
     activities: Option<&mut HashMap<AgentId, ObservedActivity>>,
-    context: &mut HashMap<AgentId, ContextUsage>,
     committed: impl Fn(RecordSeq) -> bool,
     event: RuntimeEvent,
 ) {
@@ -314,9 +325,7 @@ pub(crate) fn live(
         } => {
             let key = (agent, request);
             match settlement {
-                Settlement::Committed(message) | Settlement::Aborted(message)
-                    if committed(message.into()) =>
-                {
+                Settlement::Committed(message) if committed(message.into()) => {
                     responses.remove(&key);
                 }
                 how => responses.entry(key).or_default().settle(how),
@@ -331,9 +340,6 @@ pub(crate) fn live(
                 }
             }
             activities.map(|activities| activities.insert(agent, activity));
-        }
-        RuntimeEvent::Context { agent, usage } => {
-            context.insert(agent, usage);
         }
     }
 }
@@ -401,12 +407,6 @@ mod tests {
         record(hub, agent, request, requested((request - 1).into()));
     }
 
-    /// Journals `request` and starts its first attempt just after it.
-    fn request_attempt(hub: &Hub, agent: &AgentId, request: u64) {
-        self::request(hub, agent, request, ModelPurpose::Agent);
-        record(hub, agent, request + 1, attempt(request.into(), 1));
-    }
-
     fn failed(request: u64, attempt: u64, error: &str) -> SessionEvent {
         SessionEvent::ModelFailed {
             attempt: AttemptRef {
@@ -459,6 +459,69 @@ mod tests {
                 event: ResponseEvent::Delta { block, kind, text },
             },
         )
+    }
+
+    /// The gauge shows the occupancy a committed response's own attempt reported, at
+    /// its model's capacity: never a failed attempt's, never output alone, and nothing
+    /// once a checkpoint replaces the history.
+    #[test]
+    fn the_gauge_reads_the_committed_attempts_reported_occupancy() {
+        use crate::provider::protocol::Usage;
+        use crate::session::{CompactionCheckpoint, CompactionTrigger, CompletedOutcome};
+        let hub = Hub::default();
+        let agent = AgentId::root(SessionId::from_bytes([7; 16]));
+        let gauge = |hub: &Hub| {
+            let snapshot = hub.borrow();
+            (snapshot.context.get(&agent)).map(|usage| (usage.tokens, usage.capacity))
+        };
+        let usage = |request: u64, usage| SessionEvent::Usage {
+            request: request.into(),
+            usage,
+        };
+        let done = |request: u64, attempt| AttemptRef {
+            request: request.into(),
+            attempt,
+        };
+        let completed = |attempt, message: u64| SessionEvent::ResponseCompleted {
+            attempt,
+            message: RecordSeq::from(message).message(),
+            outcome: CompletedOutcome::Answer,
+        };
+        request(&hub, &agent, 2, ModelPurpose::Agent);
+        record(&hub, &agent, 3, attempt(2.into(), 1));
+        record(&hub, &agent, 4, usage(2, tests::usage(2_000, 0, 20_000)));
+        record(&hub, &agent, 5, failed(2, 1, "connection lost"));
+        record(&hub, &agent, 6, attempt(2.into(), 2));
+        record(&hub, &agent, 7, committed());
+        record(&hub, &agent, 8, completed(done(2, 2), 7));
+        assert_eq!(gauge(&hub), None, "a retry that reported nothing");
+        request(&hub, &agent, 10, ModelPurpose::Agent);
+        record(&hub, &agent, 11, attempt(10.into(), 1));
+        let output = Usage {
+            output_tokens: Some(7),
+            ..Usage::default()
+        };
+        record(&hub, &agent, 12, usage(10, output));
+        record(&hub, &agent, 13, committed());
+        record(&hub, &agent, 14, completed(done(10, 1), 13));
+        assert_eq!(gauge(&hub), None, "output alone");
+        request(&hub, &agent, 16, ModelPurpose::Agent);
+        record(&hub, &agent, 17, attempt(16.into(), 1));
+        record(&hub, &agent, 18, usage(16, tests::usage(1_000, 0, 10)));
+        record(&hub, &agent, 19, committed());
+        record(&hub, &agent, 20, completed(done(16, 1), 19));
+        let capacity = tests::profile().profile.max_context.get();
+        assert_eq!(gauge(&hub), Some((1_010, capacity)));
+        let checkpoint = CompactionCheckpoint {
+            frontier: 20.into(),
+            message: Message::User(Vec::new()),
+            todos: Vec::new(),
+            retained: Vec::new(),
+            attempt: done(16, 1),
+            trigger: CompactionTrigger::Overflow,
+        };
+        record(&hub, &agent, 21, SessionEvent::Compaction { checkpoint });
+        assert_eq!(gauge(&hub), None, "after a checkpoint");
     }
 
     #[test]
@@ -545,12 +608,6 @@ mod tests {
             hub.borrow().clone().responses.get(&key).cloned()
         };
         let settlement = |request| response(request).and_then(|r| r.settlement().cloned());
-        // An abort commits its partial message and journals ModelFailed together.
-        delta(&hub, &agent, 7, "partial");
-        settle(7, Settlement::Aborted(3.into()));
-        record(&hub, &agent, 4, failed(7, 1, "provider aborted response"));
-        assert_eq!(settlement(7), Some(Settlement::Aborted(3.into())));
-        assert_eq!(response(7).unwrap().blocks()[0].text, "partial");
         // A record-driven failure yields to the runtime's later settlement.
         record(&hub, &agent, 5, failed(8, 1, "connection lost"));
         assert_eq!(settlement(8), Some(lost()));
@@ -570,47 +627,9 @@ mod tests {
         );
         let interrupted = Settlement::Failed(TurnFailure::Interrupted);
         assert_eq!(settlement(9), Some(interrupted));
-        assert_eq!(settlement(7), Some(Settlement::Aborted(3.into())));
         assert_eq!(settlement(8), Some(Settlement::Committed(6.into())));
-        // The commit the abort announced removes the response.
-        record(&hub, &agent, 3, committed());
-        assert!(response(7).is_none() && response(8).is_some());
-        // The journal commits the partial message before the failure record of
-        // the same transaction; the live settlement can land anywhere around
-        // them. Whatever the order, a response that committed is retired, never
-        // revived as a failure that committed nothing.
-        for (request, order) in [(20, "settle commit fail"), (30, "commit settle fail")]
-            .into_iter()
-            .chain([(40, "commit fail settle")])
-        {
-            request_attempt(&hub, &agent, request);
-            let message = request + 2;
-            for step in order.split(' ') {
-                match step {
-                    "settle" => settle(request, Settlement::Aborted(message.into())),
-                    "commit" => drop(record(&hub, &agent, message, committed())),
-                    "fail" => drop(record(
-                        &hub,
-                        &agent,
-                        request + 3,
-                        failed(request, 1, "aborted"),
-                    )),
-                    _ => unreachable!(),
-                }
-            }
-            assert!(response(request).is_none(), "{order}");
-        }
-        // A failure record for a request never observed live still registers,
-        // and a later attempt that committed nothing fails even though an
-        // earlier attempt of the same request committed its partial response.
+        // A failure record for a request never observed live still registers.
         record(&hub, &agent, 45, failed(46, 1, "connection lost"));
         assert!(settlement(46).is_some());
-        request_attempt(&hub, &agent, 50);
-        record(&hub, &agent, 52, committed());
-        record(&hub, &agent, 53, failed(50, 1, "aborted"));
-        assert!(response(50).is_none());
-        record(&hub, &agent, 54, attempt(50.into(), 2));
-        record(&hub, &agent, 55, failed(50, 2, "connection lost"));
-        assert_eq!(settlement(50), Some(lost()));
     }
 }

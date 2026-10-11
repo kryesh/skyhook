@@ -1,11 +1,11 @@
 //! api.openai.com: the `developer` role, `prompt_cache_key` on Chat as well,
 //! no reasoning replay on Chat, strict schemas, and organisation headers.
 
-use super::{Dialect, DialectConfig, DialectError, Profile, UnsupportedCodec};
+use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile, UnsupportedCodec};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheKey, Codec, CodecName, Identity, SchemaConstraint, ToolNames,
+        CacheKey, Codec, CodecName, Identity, SchemaConstraint, StateRole, ToolNames,
         chat_completions::{self, EmptyContent, ReasoningReplay, SystemRole},
         path,
         responses::{self, ReasoningSummary},
@@ -20,6 +20,7 @@ use crate::provider::{
 fn chat() -> chat_completions::Dialect {
     chat_completions::Dialect {
         system: SystemRole::Developer,
+        state_role: StateRole::System,
         reasoning_replay: ReasoningReplay::Unsupported,
         tool_names: ToolNames::OpenAi,
         schema: SchemaConstraint::OpenAiStrict,
@@ -36,6 +37,7 @@ fn chat() -> chat_completions::Dialect {
 pub(super) fn responses() -> responses::Dialect {
     responses::Dialect {
         tool_names: ToolNames::OpenAi,
+        state_role: StateRole::System,
         ..responses::Dialect::stateless()
     }
 }
@@ -86,6 +88,10 @@ pub enum Error {
 }
 
 impl DialectConfig for Config {
+    fn base_url() -> BaseUrl {
+        BaseUrl::Default("https://api.openai.com/v1")
+    }
+
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if !self.reasoning_summary.is_requested() && codec != CodecName::Responses {
             return Err(Error::SummaryNeedsResponses.into());
@@ -110,7 +116,7 @@ impl DialectConfig for Config {
         };
         let mut profile = Profile::new(codec, transport, Dialect::Openai);
         if self.organization.is_some() || self.project.is_some() {
-            profile.discriminate(&(&self.organization, &self.project));
+            profile.discriminate("account", &(&self.organization, &self.project));
         }
         // Identity headers tied to the key.
         for (header, value) in [

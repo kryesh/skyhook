@@ -2,12 +2,8 @@
 use chrono::Local;
 
 use crate::{
-    agent::TodoItem,
-    execution::ExecutionLocation,
-    identity::AgentId,
-    job::JobManager,
-    session::{RuntimeState, UserPart},
-    tool::policy::CapabilitySet,
+    agent::TodoItem, execution::ExecutionLocation, identity::AgentId, job::JobManager,
+    session::RuntimeState, tool::policy::CapabilitySet,
 };
 
 pub(super) fn runtime_state_content(
@@ -16,7 +12,7 @@ pub(super) fn runtime_state_content(
     agent: &AgentId,
     capabilities: &CapabilitySet,
     location: &ExecutionLocation,
-) -> UserPart {
+) -> RuntimeState {
     let items = store
         .inspect_todos(agent, None)
         .expect("own todo list is always readable");
@@ -30,15 +26,13 @@ pub(super) fn runtime_state_with_todos(
     capabilities: &CapabilitySet,
     todos: Vec<TodoItem>,
     location: &ExecutionLocation,
-) -> UserPart {
+) -> RuntimeState {
     let now = Local::now();
     let jobs = jobs.active_states(agent, capabilities, now.timestamp_millis());
-    UserPart::State {
-        state: RuntimeState {
-            date: now.format("%Y-%m-%d").to_string(),
-            jobs,
-            todos,
-            location: location.clone(),
-        },
+    RuntimeState {
+        date: now.format("%Y-%m-%d").to_string(),
+        jobs,
+        todos,
+        location: location.clone(),
     }
 }

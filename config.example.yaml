@@ -34,7 +34,8 @@ providers:
   openai:
     codec: "responses"
     dialect: "openai"
-    base_url: "https://api.openai.com/v1"
+    # base_url defaults to the dialect's own service; name it only for a proxy or mirror:
+    # base_url: "https://api.openai.com/v1"
     api_key:
       env: "OPENAI_API_KEY"
     # Reasoning summaries need a verified OpenAI organisation:
@@ -52,7 +53,7 @@ providers:
   anthropic:
     codec: "messages"
     dialect: "anthropic"
-    base_url: "https://api.anthropic.com/v1"
+    # base_url: "https://api.anthropic.com/v1"
     # Any value that may hold a secret (api_key or a header) takes one of
     # three forms: written literally, read from the environment when the provider is
     # built, or produced by a command run via /bin/sh -c on the first request (trimmed
@@ -67,9 +68,9 @@ providers:
     # Cache breakpoints default to five minutes; the hour costs more to write:
     # cache_ttl: "1h"
     models:
-      # https://platform.claude.com/docs/en/models/sonnet-4-6/overview
-      sonnet:
-        model: "claude-sonnet-4-6"
+      # https://platform.claude.com/docs/en/about-claude/models/overview
+      opus:
+        model: "claude-opus-5-5"
         reasoning: "high"
         max_context: 1000000
         max_output: 128000
@@ -100,7 +101,6 @@ providers:
   # openrouter:
   #   codec: "chat_completions"
   #   dialect: "openrouter"
-  #   base_url: "https://openrouter.ai/api/v1"
   #   api_key:
   #     env: "OPENROUTER_API_KEY"
   #   routing:

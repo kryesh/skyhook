@@ -35,12 +35,10 @@ pub enum RequestPhase {
         due: i64,
     },
     /// The last attempt failed, or none started before the request failed. A
-    /// provider abort commits its partial response as `message` before failing; a
     /// refusal is never retried automatically.
     Failed {
         attempt: Option<u64>,
         failure: RequestFailure,
-        message: Option<MessageSeq>,
         at: i64,
     },
     /// Cancelled, or left open when the session stopped. `attempt` is the last one
@@ -90,33 +88,10 @@ impl RequestPhase {
     }
 
     /// Whether its response stays at its journal position rather than in a status
-    /// card: it completed, was interrupted, or committed its partial reply.
+    /// card: it completed or was interrupted.
     #[must_use]
     pub fn settled_in_place(&self) -> bool {
-        matches!(
-            self,
-            Self::Completed { .. }
-                | Self::Interrupted { .. }
-                | Self::Failed {
-                    message: Some(_),
-                    ..
-                }
-        )
-    }
-
-    /// The attempt whose response the request committed to history: a completion,
-    /// or an abort's partial reply.
-    #[must_use]
-    pub fn committed_attempt(&self) -> Option<u64> {
-        match self {
-            Self::Completed { attempt, .. }
-            | Self::Failed {
-                attempt: Some(attempt),
-                message: Some(_),
-                ..
-            } => Some(*attempt),
-            _ => None,
-        }
+        matches!(self, Self::Completed { .. } | Self::Interrupted { .. })
     }
 
     fn last_attempt(&self) -> Option<u64> {
@@ -126,13 +101,6 @@ impl RequestPhase {
             | Self::Retrying { attempt, .. }
             | Self::Completed { attempt, .. } => Some(*attempt),
             Self::Failed { attempt, .. } | Self::Interrupted { attempt, .. } => *attempt,
-        }
-    }
-
-    fn committed(&self) -> Option<MessageSeq> {
-        match self {
-            Self::Open { message, .. } => *message,
-            _ => None,
         }
     }
 }
@@ -164,6 +132,37 @@ impl IntoIterator for RequestChanges {
     type IntoIter = std::iter::Flatten<std::array::IntoIter<Option<RequestSeq>, 2>>;
     fn into_iter(self) -> Self::IntoIter {
         [self.interrupted, self.named].into_iter().flatten()
+    }
+}
+
+/// Pairs each committed response with the usage its own attempt reported. Requests are
+/// serial per agent and an attempt journals its usage with its outcome, so a report
+/// belongs to the agent's latest started attempt; a new attempt discards an earlier
+/// one's, and a response whose attempt reported nothing has no usage.
+#[derive(Clone, Debug, Default)]
+pub struct CommittedUsage {
+    reported: HashMap<AgentId, (RequestSeq, Usage)>,
+}
+
+impl CommittedUsage {
+    /// Fold `record`: the request a committed response answered, with its attempt's
+    /// usage, when the record completes one that reported any.
+    pub fn fold(&mut self, record: &EventRecord) -> Option<(RequestSeq, Usage)> {
+        let agent = &record.agent;
+        match &record.event {
+            SessionEvent::ModelAttemptStarted(_) => {
+                self.reported.remove(agent);
+            }
+            SessionEvent::Usage { request, usage } => {
+                self.reported.insert(agent.clone(), (*request, *usage));
+            }
+            SessionEvent::ResponseCompleted { attempt, .. } => {
+                let reported = self.reported.remove(agent);
+                return reported.filter(|(request, _)| *request == attempt.request);
+            }
+            _ => {}
+        }
+        None
     }
 }
 
@@ -250,11 +249,10 @@ impl RequestLedger {
             }
             SessionEvent::ModelFailed { attempt, failure } => {
                 let (attempt, request) = (attempt.attempt, attempt.request);
-                changes.named = self.settle(request, |phase| match failure {
+                changes.named = self.settle(request, |_| match failure {
                     AttemptFailure::Final(failure) => RequestPhase::Failed {
                         attempt: Some(attempt),
                         failure: failure.clone().into(),
-                        message: phase.committed(),
                         at,
                     },
                     AttemptFailure::Retrying {
@@ -274,10 +272,8 @@ impl RequestLedger {
                     at,
                 });
             }
-            SessionEvent::ResponseCompleted {
-                attempt, message, ..
-            } => {
-                self.messages.insert(*message, attempt.request);
+            // The response's commit, in the same transaction, attributed its message.
+            SessionEvent::ResponseCompleted { attempt, .. } => {
                 changes.named = self.settle(attempt.request, |_| RequestPhase::Completed {
                     attempt: attempt.attempt,
                     at,
@@ -307,7 +303,6 @@ impl RequestLedger {
                     error => RequestPhase::Failed {
                         attempt,
                         failure: error.clone().into(),
-                        message: None,
                         at,
                     },
                 });
@@ -328,7 +323,7 @@ impl RequestLedger {
                 self.awaiting.insert(record.agent.clone());
             }
             SessionEvent::MessageCommitted {
-                message: Message::User(_),
+                message: Message::User(_) | Message::State(_),
             } => {
                 self.awaiting.insert(record.agent.clone());
             }
@@ -565,15 +560,6 @@ mod tests {
         AttemptRef { request, attempt }
     }
 
-    fn failed(attempt: Option<u64>, message: Option<MessageSeq>, at: i64) -> RequestPhase {
-        RequestPhase::Failed {
-            attempt,
-            failure: Failure::Other("boom".into()).into(),
-            message,
-            at,
-        }
-    }
-
     #[test]
     fn a_request_retries_through_its_journaled_failure_and_completes() {
         let mut journal = Journal::new();
@@ -618,25 +604,17 @@ mod tests {
     }
 
     #[test]
-    fn failures_settle_by_kind_and_keep_an_aborted_reply() {
+    fn failures_settle_by_kind() {
         let mut journal = Journal::new();
         let refused = journal.attempted(ModelPurpose::Agent);
         journal.failed(refused, 1, Failure::Refused);
         let declined = RequestPhase::Failed {
             attempt: Some(1),
             failure: Failure::Refused("boom".into()).into(),
-            message: None,
             at: journal.now(),
         };
         assert_eq!(journal.phase(refused), &declined);
 
-        // A provider abort commits its partial response before failing.
-        let aborted = journal.attempted(ModelPurpose::Agent);
-        let message = journal.reply();
-        let failure = journal.failed(aborted, 1, Failure::Other);
-        let partial = failed(Some(1), Some(message), at(failure));
-        assert_eq!(journal.phase(aborted), &partial);
-        assert_eq!(journal.request_of(message), Some(aborted));
         // A message outside an open attempt belongs to no request.
         let stray = journal.reply();
         assert_eq!(journal.request_of(stray), None);
@@ -650,7 +628,6 @@ mod tests {
         let failed = RequestPhase::Failed {
             attempt: None,
             failure: RequestFailure::Compaction(fault),
-            message: None,
             at: journal.now(),
         };
         assert_eq!(journal.phase(unattempted), &failed);
@@ -709,8 +686,7 @@ mod tests {
                 todos: Vec::new(),
                 retained: Vec::new(),
                 attempt: attempt_ref(checkpointed, 1),
-                before_tokens: 10,
-                after_tokens: 5,
+                trigger: crate::session::CompactionTrigger::Occupancy(100),
             },
         });
         let completed = RequestPhase::Completed {

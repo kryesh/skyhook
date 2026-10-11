@@ -327,13 +327,13 @@ mod tests {
         assert_eq!(images[0].format, crate::media::ImageFormat::Png);
         let blob = images[0].blob;
         let mut request = ModelRequest {
-            history: vec![Message::Tool(vec![ToolResult {
+            context: crate::provider::protocol::entries(vec![Message::Tool(vec![ToolResult {
                 call_id: "output".into(),
                 name: "jobs".into(),
                 result: serde_json::json!({}),
                 images,
                 is_error: false,
-            }])],
+            }])]),
             ..ModelRequest::test("image-test")
         };
         assert!(request.blobs.get(&blob).is_err());

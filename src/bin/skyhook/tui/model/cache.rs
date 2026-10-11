@@ -212,7 +212,7 @@ mod tests {
     use skyhook::job::JobTransition;
     use skyhook::provider::ProviderErrorKind;
     use skyhook::provider::protocol::{
-        AssistantItem, BlockId, BlockRef, Completion, CutReason, ItemId, ItemKind,
+        AssistantItem, BlockId, BlockRef, Completion, ItemId, ItemKind,
     };
     use skyhook::session::AttemptFailure;
     use skyhook::session::SessionEvent;
@@ -563,7 +563,7 @@ mod tests {
             }
             if attempt == 3 {
                 let answer = vec![AssistantItem::text("answer", 0, "final answer")];
-                turn.complete(Completion::cut(answer, CutReason::Aborted).unwrap());
+                turn.complete(Completion::answer(answer).unwrap());
                 break;
             }
             let error = ProviderErrorKind::Unavailable.error("HTTP 503 [code=overloaded]");
@@ -584,8 +584,8 @@ mod tests {
             }
             assert!(text.ends_with(&format!("partial {attempt} updated")));
         }
-        // An abort commits the visible text before its failure: the message stays
-        // intact beside the diagnostics, including on replay.
+        // The attempt that succeeds commits its answer, which replaces the retry card,
+        // including on replay.
         observe_record(&mut app, committed(assistant)).await;
         fold.refresh(&app.snapshot);
         let replies_now = replies(&fold.cache);
@@ -599,7 +599,7 @@ mod tests {
         );
         assert!(committed.footer.is_some());
         let _ = bounded(asked).await.unwrap();
-        observe_until(&mut app, |app| count(&app.snapshot, model_failed) == 3).await;
+        observe_until(&mut app, |app| count(&app.snapshot, model_failed) == 2).await;
         fold.refresh(&app.snapshot);
         // Only its footer changes, now that the request has settled.
         let intact =
@@ -611,11 +611,7 @@ mod tests {
             .filter(|card| card.key() == &EntryKey::Retry(request))
             .map(Entry::text)
             .collect();
-        assert_eq!(failures.len(), 1);
-        assert!(
-            failures[0].starts_with("Request failed · attempt 3\n"),
-            "{failures:?}"
-        );
+        assert!(failures.is_empty(), "{failures:?}");
         let mut replay = ObservationSnapshot::default();
         for event in app.snapshot.records.values() {
             update(&mut replay, RuntimeEvent::Record(Box::new(event.clone())));

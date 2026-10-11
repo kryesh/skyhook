@@ -27,8 +27,8 @@ pub enum UserContent {
     Attachment {
         attachment: AttachmentRef,
     },
-    /// Text the harness produced rather than the user: it joins the final turn
-    /// instead of posing as user input, and is never cached as history.
+    /// Text the harness delivered in the conversation rather than the user wrote, such
+    /// as job events.
     Runtime {
         text: String,
     },

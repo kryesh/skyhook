@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::Message;
+use super::{Entry, Message};
 use crate::{
     identity::AgentId,
     media::LoadedBlobs,
@@ -25,13 +25,12 @@ pub struct SystemSegment {
 pub struct ModelRequest {
     pub model: WireModel,
     pub system: Vec<SystemSegment>,
-    /// Committed conversation. Within one context it is an unchanged prefix of every
-    /// later request until compaction replaces it, so it is safe to cache.
-    pub history: Vec<Message>,
-    /// Content rebuilt for this request only (runtime state, instructions). Sent after
-    /// history and never cacheable.
-    pub tail: Vec<Message>,
-    /// Whether later requests in this context extend `history`.
+    /// The context window in send order. Everything before its first current state
+    /// is, within one provider context, a prefix later requests extend until compaction
+    /// replaces it, so it is safe to cache. Only a state whose request produced no
+    /// response drops out of it later, since nothing is bound to it.
+    pub context: Vec<Entry>,
+    /// Whether later requests in this context extend this one.
     #[serde(default)]
     pub history_lifetime: HistoryLifetime,
     pub tools: Vec<ToolDefinition>,
@@ -52,8 +51,7 @@ impl ModelRequest {
         Self {
             model: model.parse().unwrap(),
             system: Vec::new(),
-            history: Vec::new(),
-            tail: Vec::new(),
+            context: Vec::new(),
             history_lifetime: HistoryLifetime::default(),
             tools: Vec::new(),
             response_schema: None,
@@ -63,13 +61,25 @@ impl ModelRequest {
         }
     }
 
-    /// Every message in send order: history, then tail.
+    /// The context's messages in send order, without its states.
     pub fn messages(&self) -> impl DoubleEndedIterator<Item = &Message> + Clone {
-        self.history.iter().chain(&self.tail)
+        self.context.iter().filter_map(Entry::message)
     }
 
     pub fn messages_mut(&mut self) -> impl DoubleEndedIterator<Item = &mut Message> {
-        self.history.iter_mut().chain(&mut self.tail)
+        self.context.iter_mut().filter_map(|entry| match entry {
+            Entry::Message(message) => Some(message),
+            Entry::State(_) => None,
+        })
+    }
+
+    /// The states in send order.
+    #[cfg(test)]
+    pub(crate) fn states(&self) -> impl Iterator<Item = &super::State> {
+        self.context.iter().filter_map(|entry| match entry {
+            Entry::State(state) => Some(state),
+            Entry::Message(_) => None,
+        })
     }
 }
 

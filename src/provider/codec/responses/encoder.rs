@@ -3,13 +3,12 @@ use super::native::ItemType;
 use super::*;
 use crate::provider::ProviderErrorKind::InvalidRequest;
 use crate::provider::codec::{
-    CodecName,
-    common::{
-        attach_runtime_tail, check_tool, image_url, own_replay, system_text, tagged, tool_text,
-        user_parts,
-    },
+    CodecName, StateRole,
+    common::{check_tool, image_url, own_replay, system_text, tagged, tool_text, user_parts},
 };
-use crate::provider::protocol::{AssistantItem, Message, ModelRequest, Replay, ReplayFormat};
+use crate::provider::protocol::{
+    AssistantItem, Entry, Message, ModelRequest, Replay, ReplayFormat, State, sent,
+};
 use serde_json::Map;
 
 /// The body fields this codec writes.
@@ -29,18 +28,16 @@ pub(crate) fn encode(
     request: &ModelRequest,
     dialect: &Dialect,
 ) -> Result<Map<String, Value>, ProviderError> {
-    // History precedes the per-request tail so the tail never breaks a cached
-    // history prefix. Runtime state joins the final history turn, so only that
-    // turn is re-read.
     let mut input = Vec::new();
-    for (index, message) in request.messages().enumerate() {
-        if index >= request.history.len()
-            && attach_runtime_tail(&mut input, message, "input_text", |item| {
-                (item["type"] == "function_call_output").then(|| &mut item["output"])
-            })
-        {
-            continue;
-        }
+    let (prefix, rest) = sent(&request.context);
+    for entry in prefix.chain(rest) {
+        let message = match entry {
+            Entry::Message(message) => message,
+            Entry::State(state) => {
+                push_state(dialect.state_role, &mut input, state);
+                continue;
+            }
+        };
         match message {
             Message::User(parts) => {
                 let content = user_parts(request, parts, "input_text", |image| {
@@ -160,10 +157,35 @@ pub(crate) fn encode(
     Ok(settings)
 }
 
+/// A state the model reads, in the dialect's role: a developer message, or user content
+/// joining the user message before it. Responses cannot hide a superseded state, so it is
+/// omitted.
+fn push_state(role: StateRole, input: &mut Vec<Value>, state: &State) {
+    if !state.is_read() {
+        return;
+    }
+    let text = || json!({"type":"input_text", "text":state.text});
+    match role {
+        StateRole::System => {
+            input.push(json!({"type":"message", "role":"developer", "content":[text()]}));
+        }
+        StateRole::User => match input.last_mut() {
+            Some(previous) if previous["type"] == "message" && previous["role"] == "user" => {
+                previous["content"]
+                    .as_array_mut()
+                    .expect("constructed array")
+                    .push(text());
+            }
+            _ => input.push(json!({"type":"message", "role":"user", "content":[text()]})),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::tests::{assemble_with, call_item, completed, reasoning_item};
     use super::*;
+    use crate::provider::protocol::{Entry, entries};
 
     use crate::provider::codec::common::tests::{envelope, image, notes, request, scope};
     use crate::{
@@ -232,7 +254,7 @@ mod tests {
     #[test]
     fn empty_history_is_explicit_and_http_envelope_is_unchanged() {
         let mut req = request("gpt-5");
-        req.history.clear();
+        req.context.clear();
         req.max_output_tokens = None;
         let encoded = crate::provider::codec::Codec::Responses(Dialect::stateless())
             .encode(&req, &"session".parse().unwrap())
@@ -274,10 +296,10 @@ mod tests {
             attach(AttachmentRef::Image(image())),
             attach(AttachmentRef::Text(notes())),
         ]);
-        req.history = vec![
+        req.context = entries(vec![
             Message::User(content),
             tool_result(json!({"answer":42, "error":null}), vec![image()], true),
-        ];
+        ]);
         assert!(encode(&req, &Dialect::stateless()).is_err());
         // Load the fixture blobs as the session store would.
         req.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
@@ -317,7 +339,7 @@ mod tests {
             let mut req = request("gpt-5");
             let replay = envelope(format, model, reasoning_item(), Binding::Free);
             let reasoning = AssistantItem::reasoning("r", 0, "private", Some(replay));
-            req.history = vec![Message::Assistant(vec![reasoning])];
+            req.context = entries(vec![Message::Assistant(vec![reasoning])]);
             assert_eq!(
                 encode(&req, &Dialect::stateless()).unwrap()["input"],
                 json!([])
@@ -346,10 +368,10 @@ mod tests {
             items[0].reasoning_text().as_deref(),
             Some("native reasoning text")
         );
-        req.history = vec![
+        req.context = entries(vec![
             Message::Assistant(items),
             tool_result(json!({"found":true}), vec![], false),
-        ];
+        ]);
         let body = encode(&req, &Dialect::stateless()).unwrap();
         let input = &body["input"];
         assert_eq!(input[0], native);
@@ -374,11 +396,11 @@ mod tests {
             call_item(),
         ]);
         let mut req = request("gpt-5");
-        req.history = vec![
+        req.context = entries(vec![
             user("look it up"),
             Message::Assistant(items),
             tool_result(json!({"value":42}), vec![], false),
-        ];
+        ]);
         let encoded = encode(&req, &Dialect::stateless()).unwrap();
         let input = encoded["input"].as_array().unwrap();
         let reasoning = input.iter().filter(|item| item["type"] == "reasoning");
@@ -402,10 +424,11 @@ mod tests {
             (&json!("function_call_output"), &json!("call_1"))
         );
 
-        req.history.push(Message::Assistant(assemble(vec![text_item(
-            "answer", "42",
-        )])));
-        req.history.push(user("thanks"));
+        req.context
+            .push(Entry::from(Message::Assistant(assemble(vec![text_item(
+                "answer", "42",
+            )]))));
+        req.context.push(Entry::from(user("thanks")));
         let replayed = encode(&req, &Dialect::stateless()).unwrap();
         let replayed = replayed["input"].as_array().unwrap();
         assert_eq!(&replayed[..input.len()], input.as_slice());
@@ -413,23 +436,38 @@ mod tests {
         assert_eq!(replayed[6]["content"][0]["text"], "thanks");
     }
 
+    /// A state in the system role is a developer message; in the user role it joins a
+    /// user message before it, or is its own after a tool output. A superseded state is
+    /// omitted either way.
     #[test]
-    fn runtime_tail_joins_the_final_tool_output_or_user_turn() {
-        let text = "<skyhook_state>";
-        let state = Message::User(vec![UserContent::Runtime { text: text.into() }]);
+    fn states_take_the_dialects_role_and_never_join_tool_output() {
+        use crate::provider::protocol::{StateLifetime::*, state};
+        let text = |text: &str| json!({"type":"input_text","text":text});
         let mut req = request("gpt-5");
-        req.history = vec![tool_result(json!(1), vec![], false)];
-        let without_tail = encode(&req, &Dialect::stateless()).unwrap()["input"].take();
-        req.tail = vec![state.clone()];
-        let input = encode(&req, &Dialect::stateless()).unwrap()["input"].take();
-        assert_eq!(input.as_array().unwrap().len(), 1);
-        let output = without_tail[0]["output"].as_str().unwrap();
-        assert_eq!(input[0]["output"], format!("{output}\n\n{text}"));
-        req.history = vec![user("hi")];
-        let input = encode(&req, &Dialect::stateless()).unwrap()["input"].take();
+        req.context = vec![
+            state("earlier", Superseded),
+            tool_result(json!(1), vec![], false).into(),
+            state("now", Current),
+        ];
+        let as_user = Dialect::stateless();
+        let input = encode(&req, &as_user).unwrap()["input"].take();
+        assert_eq!(input.as_array().unwrap().len(), 2);
+        assert_eq!(input[0]["type"], "function_call_output");
+        assert_eq!(
+            input[1],
+            json!({"type":"message","role":"user","content":[text("now")]})
+        );
+        let system = Dialect {
+            state_role: StateRole::System,
+            ..Dialect::stateless()
+        };
+        let input = encode(&req, &system).unwrap()["input"].take();
+        assert_eq!(input[1]["role"], "developer");
+        req.context = vec![user("hi").into(), state("now", Current)];
+        let input = encode(&req, &as_user).unwrap()["input"].take();
         assert_eq!(
             input,
-            json!([{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"},{"type":"input_text","text":text}]}])
+            json!([{"type":"message","role":"user","content":[text("hi"), text("now")]}])
         );
     }
 }

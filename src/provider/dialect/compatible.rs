@@ -3,7 +3,7 @@
 
 use super::{Dialect, DialectConfig, DialectError, Profile, Scheme};
 use crate::provider::{
-    codec::{Codec, CodecName, chat_completions, messages, responses},
+    codec::{Codec, CodecName, StateRole, chat_completions, messages, responses},
     http::Transport,
 };
 
@@ -12,17 +12,23 @@ pub type Options = crate::provider::settings::Empty;
 
 crate::provider::settings::settings! {
     #[derive(Default)]
-    pub struct Config => Patch {}
+    pub struct Config => Patch {
+        /// The role runtime state takes: `user` (default) sends it as user content;
+        /// `system` needs a server that accepts system messages mid-conversation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state_role: Option<StateRole> => default,
+    }
 }
 
 impl DialectConfig for Config {
     /// A key travels as the codec's own.
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
-        let conventions = base(codec);
-        Ok(Profile {
+        let mut profile = Profile {
             key: Scheme::standard(codec),
-            ..Profile::new(conventions, Transport::plain(), Dialect::Compatible)
-        })
+            ..Profile::new(base(codec), Transport::plain(), Dialect::Compatible)
+        };
+        profile.state_role(self.state_role, StateRole::User);
+        Ok(profile)
     }
 }
 
@@ -33,7 +39,7 @@ pub(crate) fn base(codec: CodecName) -> Codec {
             Codec::ChatCompletions(chat_completions::Dialect::compatible())
         }
         CodecName::Responses => Codec::Responses(responses::Dialect::stateless()),
-        CodecName::Messages => Codec::Messages(messages::Dialect::anthropic()),
+        CodecName::Messages => Codec::Messages(messages::Dialect::standard()),
     }
 }
 

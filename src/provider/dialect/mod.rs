@@ -12,7 +12,7 @@ use crate::{
     named_enum::named_enum,
     provider::{
         ProviderError,
-        codec::{Codec, CodecName},
+        codec::{Codec, CodecName, StateRole},
         http::{Build, Headers, HttpProvider, Transport, headers::Value, transport::EVENT_STREAM},
     },
 };
@@ -107,17 +107,45 @@ impl Profile {
         }
     }
 
-    /// Partition private replay for nonsecret routing and tenant selectors.
-    pub(crate) fn discriminate(&mut self, identity: &impl Serialize) {
-        self.scope.push(':');
-        self.scope
-            .push_str(&serde_json::to_string(identity).expect("replay identity serializes"));
+    /// Send runtime state in the configured role, or the dialect's `default`. A role
+    /// other than the default joins the replay scope: replay produced while state took
+    /// another role followed a different conversation.
+    pub(crate) fn state_role(
+        &mut self,
+        configured: Option<StateRole>,
+        default: StateRole,
+    ) -> StateRole {
+        let role = configured.unwrap_or(default);
+        *self.codec.state_role_mut() = role;
+        if role != default {
+            self.discriminate("state_role", &role);
+        }
+        role
+    }
+
+    /// Partition private replay for nonsecret routing and tenant selectors. Each part
+    /// names its setting, so different settings with equal values never collide.
+    pub(crate) fn discriminate(&mut self, setting: &'static str, identity: &impl Serialize) {
+        let identity = serde_json::to_string(identity).expect("replay identity serializes");
+        self.scope.push_str(&format!(":{setting}={identity}"));
     }
 
     /// Send `value` as `name` on every request.
     pub(crate) fn fixed(&mut self, name: &'static str, value: HeaderValue) {
         let name = HeaderName::from_static(name);
         self.headers.insert(name, Value::Fixed(value));
+    }
+
+    /// Add `values` to the list header `name` on every request.
+    pub(crate) fn listed(
+        &mut self,
+        name: HeaderName,
+        values: impl IntoIterator<Item = &'static str>,
+    ) {
+        let values = values
+            .into_iter()
+            .map(|value| Value::Fixed(HeaderValue::from_static(value)));
+        self.headers.list(name, values);
     }
 }
 
@@ -152,6 +180,14 @@ pub enum BuildError {
 
 /// What every dialect's settings provide.
 pub(crate) trait DialectConfig {
+    /// The API root an entry without `base_url` uses.
+    fn base_url() -> BaseUrl
+    where
+        Self: Sized,
+    {
+        BaseUrl::Required
+    }
+
     /// Resolve wire conventions after inheritance. Connection and model-profile
     /// validation are shared, and no admission is repeated at build.
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError>;

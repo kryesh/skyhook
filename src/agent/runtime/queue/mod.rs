@@ -363,7 +363,7 @@ mod tests {
     /// Committed history as a provider would receive it.
     pub(super) fn committed(session: &SessionHandle) -> Vec<Sent> {
         let records = session.runtime.store.records();
-        events!(records, SessionEvent::MessageCommitted { message } => message.render())
+        events!(records, SessionEvent::MessageCommitted { message } => crate::agent::runtime::tests::sent(message))
     }
 
     pub(super) fn model_changes(session: &SessionHandle) -> Vec<String> {

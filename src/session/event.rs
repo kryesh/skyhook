@@ -45,8 +45,8 @@ named_enum! {
 }
 
 named_enum! {
-    /// Why a completed response ended early. Refusals and aborts fail the turn
-    /// instead, so they are never journaled as a completed response.
+    /// Why a completed response ended early. A refusal fails the turn instead, so it
+    /// is never journaled as a completed response.
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
     pub enum Truncation {
         MaxTokens = "max_tokens",
@@ -63,17 +63,20 @@ pub enum CompletedOutcome {
     Cut(Truncation),
 }
 
-/// A refusal or abort is the cut that fails the turn instead.
-impl TryFrom<Outcome> for CompletedOutcome {
-    type Error = CutReason;
+/// The model refused: the cut that fails the turn instead of completing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Refused;
 
-    fn try_from(outcome: Outcome) -> Result<Self, CutReason> {
+impl TryFrom<Outcome> for CompletedOutcome {
+    type Error = Refused;
+
+    fn try_from(outcome: Outcome) -> Result<Self, Refused> {
         Ok(match outcome {
             Outcome::Answer => Self::Answer,
             Outcome::ToolUse => Self::ToolUse,
             Outcome::Cut(CutReason::MaxTokens) => Self::Cut(Truncation::MaxTokens),
             Outcome::Cut(CutReason::Incomplete) => Self::Cut(Truncation::Incomplete),
-            Outcome::Cut(reason @ (CutReason::Refusal | CutReason::Aborted)) => return Err(reason),
+            Outcome::Cut(CutReason::Refusal) => return Err(Refused),
         })
     }
 }
@@ -274,8 +277,17 @@ pub struct CompactionCheckpoint {
     pub retained: Vec<MessageSeq>,
     /// The summary attempt that produced this checkpoint.
     pub attempt: AttemptRef,
-    pub before_tokens: u64,
-    pub after_tokens: u64,
+    pub trigger: CompactionTrigger,
+}
+
+/// What made an agent compact.
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionTrigger {
+    /// The completed response reported this occupancy, over the threshold.
+    Occupancy(u64),
+    /// A request overflowed the model's context window.
+    Overflow,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -316,8 +328,7 @@ impl ModelContext {
         ModelRequest {
             model: profile.model.clone(),
             system: self.system.clone(),
-            history: Vec::new(),
-            tail: Vec::new(),
+            context: Vec::new(),
             history_lifetime: HistoryLifetime::default(),
             tools: self.tools.clone(),
             response_schema: self.response_schema.clone(),
@@ -396,6 +407,9 @@ pub enum SessionEvent {
         /// History after the checkpoint is its retained messages, then the agent's
         /// later commits up to `through`.
         through: Option<MessageSeq>,
+        /// The first of those messages the request sent, when older ones were dropped for
+        /// it to fit; the checkpoint's own message is always sent.
+        from: Option<MessageSeq>,
         /// Request-specific messages sent after history.
         tail: Vec<Message>,
         history_lifetime: HistoryLifetime,
@@ -414,8 +428,8 @@ pub enum SessionEvent {
     },
     /// An attempt ended without an outcome: cancelled, or open when the session stopped.
     ModelAttemptInterrupted(AttemptRef),
-    /// Refusals and aborts fail the turn before this point and are recorded by
-    /// `ModelFailed` instead.
+    /// A refusal fails the turn before this point and is recorded by `ModelFailed`
+    /// instead.
     ResponseCompleted {
         attempt: AttemptRef,
         /// The committed assistant message this response produced.
@@ -532,6 +546,13 @@ impl EntryKind {
 }
 
 impl SessionEvent {
+    /// A usage report for `request`; none when the provider reported nothing, so a
+    /// missing report never reads as a measured zero.
+    #[must_use]
+    pub fn usage(request: RequestSeq, usage: Usage) -> Option<Self> {
+        (usage != Usage::default()).then_some(Self::Usage { request, usage })
+    }
+
     /// Whether this record is the session's activity, as the session list orders
     /// by. Closing a session is not: it interrupts its agents.
     #[must_use]

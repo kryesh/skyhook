@@ -7,7 +7,7 @@ use super::{
 use chrono::{DateTime, Utc};
 use skyhook::{
     identity::SessionId,
-    provider::protocol::Usage,
+    provider::protocol::UsageTotals,
     session::{
         SessionError, SessionStore,
         stats::{AgentStats, RequestStats, SessionStats, session_stats},
@@ -115,7 +115,7 @@ fn one_line(text: &str, limit: usize) -> String {
 }
 
 /// Input, cached, written and output token counts.
-fn usage_cells(usage: &Usage) -> [String; 4] {
+fn usage_cells(usage: &UsageTotals) -> [String; 4] {
     [
         usage.input_tokens,
         usage.cached_input_tokens,

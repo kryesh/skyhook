@@ -74,7 +74,6 @@ pub enum Outcome {
 pub enum CutReason {
     MaxTokens,
     Refusal,
-    Aborted,
     /// The provider ended without a normal finish it could name.
     Incomplete,
 }
@@ -211,16 +210,50 @@ impl Completion {
     }
 }
 
+/// A response's cumulative token counts as its provider reported them; a count the
+/// provider did not report is absent, not zero.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Usage {
-    /// Non-cached input tokens (including cache creation). Total prompt tokens
-    /// are `input_tokens + cached_input_tokens`, as used by the runtime meter.
-    pub input_tokens: u64,
+    /// Non-cached input tokens (including cache creation).
+    pub input_tokens: Option<u64>,
     /// Cache-read input tokens, excluded from `input_tokens`.
+    pub cached_input_tokens: Option<u64>,
+    /// The part of `input_tokens` written to the provider's cache.
+    pub cache_write_input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+}
+
+/// Token counts summed over usage reports, each missing count adding nothing.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct UsageTotals {
+    pub input_tokens: u64,
     pub cached_input_tokens: u64,
-    /// The part of `input_tokens` written to the provider's cache, when reported.
     pub cache_write_input_tokens: u64,
     pub output_tokens: u64,
+}
+
+impl UsageTotals {
+    pub fn add(&mut self, usage: Usage) {
+        let add = |total: &mut u64, count: Option<u64>| {
+            *total = total.saturating_add(count.unwrap_or_default());
+        };
+        add(&mut self.input_tokens, usage.input_tokens);
+        add(&mut self.cached_input_tokens, usage.cached_input_tokens);
+        add(
+            &mut self.cache_write_input_tokens,
+            usage.cache_write_input_tokens,
+        );
+        add(&mut self.output_tokens, usage.output_tokens);
+    }
+
+    pub fn merge(&mut self, totals: Self) {
+        self.input_tokens = self.input_tokens.saturating_add(totals.input_tokens);
+        self.cached_input_tokens =
+            (self.cached_input_tokens).saturating_add(totals.cached_input_tokens);
+        self.cache_write_input_tokens =
+            (self.cache_write_input_tokens).saturating_add(totals.cache_write_input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(totals.output_tokens);
+    }
 }
 
 /// A usage report claiming more cache writes than the input they are part of.
@@ -238,26 +271,59 @@ impl From<UsageError> for ProviderError {
 }
 
 impl Usage {
-    /// Cache writes are part of input, so a report claiming more is invalid.
-    pub fn check(self) -> Result<Self, UsageError> {
-        if self.cache_write_input_tokens > self.input_tokens {
-            return Err(UsageError {
-                cache_writes: self.cache_write_input_tokens,
-                input: self.input_tokens,
-            });
+    /// A report of every count.
+    #[must_use]
+    pub const fn prompted(input: u64, cached: u64, written: u64, output: u64) -> Self {
+        Self {
+            input_tokens: Some(input),
+            cached_input_tokens: Some(cached),
+            cache_write_input_tokens: Some(written),
+            output_tokens: Some(output),
         }
-        Ok(self)
     }
 
+    /// The whole prompt, cached or not. Unknown without the input count; missing cache
+    /// reads add nothing.
+    #[must_use]
+    pub fn prompt_tokens(self) -> Option<u64> {
+        let cached = self.cached_input_tokens.unwrap_or_default();
+        Some(self.input_tokens?.saturating_add(cached))
+    }
+
+    /// What the request and its response occupy of the context: the whole prompt and
+    /// the output, when the prompt is known.
+    #[must_use]
+    pub fn occupancy(self) -> Option<u64> {
+        let output = self.output_tokens.unwrap_or_default();
+        Some(self.prompt_tokens()?.saturating_add(output))
+    }
+
+    /// Cache writes are part of input, so a report claiming more is invalid.
+    pub fn check(self) -> Result<Self, UsageError> {
+        match (self.cache_write_input_tokens, self.input_tokens) {
+            (Some(cache_writes), Some(input)) if cache_writes > input => Err(UsageError {
+                cache_writes,
+                input,
+            }),
+            _ => Ok(self),
+        }
+    }
+
+    /// Add `usage`'s counts; a count only one side reported adds as it is.
     pub fn accumulate(&mut self, usage: Self) {
-        self.input_tokens = self.input_tokens.saturating_add(usage.input_tokens);
-        self.cached_input_tokens = self
-            .cached_input_tokens
-            .saturating_add(usage.cached_input_tokens);
-        self.cache_write_input_tokens = self
-            .cache_write_input_tokens
-            .saturating_add(usage.cache_write_input_tokens);
-        self.output_tokens = self.output_tokens.saturating_add(usage.output_tokens);
+        let add = |count: &mut Option<u64>, other: Option<u64>| {
+            *count = match (*count, other) {
+                (Some(count), Some(other)) => Some(count.saturating_add(other)),
+                (count, other) => count.or(other),
+            };
+        };
+        add(&mut self.input_tokens, usage.input_tokens);
+        add(&mut self.cached_input_tokens, usage.cached_input_tokens);
+        add(
+            &mut self.cache_write_input_tokens,
+            usage.cache_write_input_tokens,
+        );
+        add(&mut self.output_tokens, usage.output_tokens);
     }
 }
 
@@ -452,19 +518,12 @@ mod tests {
 
     #[test]
     fn cache_writes_may_equal_input_but_never_exceed_it() {
-        let valid = Usage {
-            input_tokens: 100,
-            cache_write_input_tokens: 100,
-            ..Usage::default()
-        };
+        let valid = Usage::prompted(100, 0, 100, 0);
         assert_eq!(
             ResponseEvent::Usage(valid).checked(),
             Ok(ResponseEvent::Usage(valid))
         );
-        let invalid = Usage {
-            cache_write_input_tokens: 101,
-            ..valid
-        };
+        let invalid = Usage::prompted(100, 0, 101, 0);
         let error = ResponseEvent::Usage(invalid).checked().unwrap_err();
         assert_eq!(
             ProviderError::from(error).kind(),
@@ -474,12 +533,7 @@ mod tests {
 
     #[test]
     fn live_view_keeps_arrival_order_tracks_the_current_block_and_replaces_usage() {
-        let usage = |input_tokens, cached_input_tokens, output_tokens| Usage {
-            input_tokens,
-            cached_input_tokens,
-            cache_write_input_tokens: 0,
-            output_tokens,
-        };
+        let usage = |input, cached, output| Usage::prompted(input, cached, 0, output);
         let live = LiveResponse::default();
         assert!(live.blocks().is_empty() && live.current().is_none());
         let Step::Open(live) = live.push(ResponseEvent::Usage(usage(100, 50, 3))) else {

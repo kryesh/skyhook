@@ -1,10 +1,7 @@
 //! One agent's context window and independently owned provider conversation.
 
-use std::collections::HashMap;
-
-use super::{HarnessError, compact::TokenMeter};
+use super::HarnessError;
 use crate::{
-    agent::{CompactionFault, ContextUsage},
     identity::AgentId,
     provider::{
         ProviderContext,
@@ -12,9 +9,9 @@ use crate::{
         protocol::{ModelRequest, Usage},
     },
     session::{
-        AttemptRef, EventRecord, Message, ModelPurpose, ModelRequestTemplate, ProfileSnapshot,
-        Projection, RecordSeq, RequestLedger, RequestSeq, SessionEvent, UserPart, project_history,
-        render_history,
+        CommittedUsage, CompactionTrigger, EventRecord, Message, ModelContext, ModelPurpose,
+        ModelRequestTemplate, ProfileSnapshot, Projected, Projection, RecordSeq, RuntimeState,
+        SessionEvent, UserPart, project_history,
     },
 };
 
@@ -22,10 +19,7 @@ pub(super) struct AgentContext {
     /// The profile this context was opened for; a different selection reopens it.
     pub profile: ProfileSnapshot,
     pub template: ModelRequestTemplate,
-    /// The estimate of what `template` adds to every request.
-    pub template_tokens: u64,
     pub projected: Projection,
-    pub meter: TokenMeter,
     pub provider: Box<dyn ProviderContext>,
     /// The last request's blobs, which the next request reuses.
     pub blobs: crate::media::LoadedBlobs,
@@ -33,6 +27,9 @@ pub(super) struct AgentContext {
     pub unavailable_tools: std::sync::Arc<std::collections::HashSet<String>>,
     /// What the journal leaves for the next request to compact for.
     reported: Reported,
+    /// The agent's latest request context and its record, while its mode is unchanged:
+    /// a mode pins its prompt and tools with a context of its own.
+    journaled: Option<(RecordSeq, ModelContext)>,
     /// The last journal sequence reflected in `projected`.
     through: RecordSeq,
     /// Checkpoint and retained messages, which precede later commits in `projected`.
@@ -42,28 +39,19 @@ pub(super) struct AgentContext {
 /// The occupancy the agent's last committed response reported, while no compaction
 /// has answered it and its model and mode are unchanged since: a fold of its journal,
 /// so a reopened context decides as the live one would.
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 struct Reported {
-    /// The latest usage record, which a committed response's outcome follows.
-    usage: Option<(RequestSeq, Usage)>,
+    committed: CommittedUsage,
     pending: Option<Usage>,
 }
 
 impl Reported {
-    fn fold(&mut self, event: &SessionEvent) {
-        match event {
-            SessionEvent::Usage { request, usage } => self.usage = Some((*request, *usage)),
-            SessionEvent::ResponseCompleted { attempt, .. } => {
-                if let Some((request, usage)) = self.usage
-                    && request == attempt.request
-                {
-                    self.pending = Some(usage);
-                }
-            }
-            // A round cut short, or whose summary a fresh one could replace, leaves
-            // the need; one that would fail again consumes it.
-            SessionEvent::CompactionFailed { error, .. }
-                if error.retryable() || *error == CompactionFault::Interrupted => {}
+    fn fold(&mut self, record: &EventRecord) {
+        if let Some((_, usage)) = self.committed.fold(record) {
+            self.pending = Some(usage);
+        }
+        match &record.event {
+            SessionEvent::CompactionFailed { error, .. } if error.keeps_need() => {}
             SessionEvent::Compaction { .. }
             | SessionEvent::CompactionFailed { .. }
             | SessionEvent::ModelChanged { .. }
@@ -83,20 +71,21 @@ impl AgentContext {
     ) -> Self {
         let projected = project_history(records, agent);
         let mut reported = Reported::default();
+        let mut journaled = None;
         for record in records.iter().filter(|record| &record.agent == agent) {
-            reported.fold(&record.event);
+            reported.fold(record);
+            fold_journaled(&mut journaled, record);
         }
         Self {
             profile,
-            template_tokens: super::compaction::estimate_request(&template.to_request()),
             template,
             prefix: history_prefix(&projected.messages, records, agent),
             projected,
-            meter: TokenMeter::default(),
             provider,
             blobs: Default::default(),
             unavailable_tools: Default::default(),
             reported,
+            journaled,
             through: records
                 .last()
                 .map_or(RecordSeq::default(), |record| record.sequence),
@@ -110,21 +99,19 @@ impl AgentContext {
         store: &crate::session::SessionStore,
         agent: &AgentId,
     ) -> Result<(), HarnessError> {
-        let (mut compacted, mut through, mut committed) = (false, self.through, Vec::new());
-        let mut reported = self.reported;
+        let (mut compacted, mut through) = (false, self.through);
+        let mut reported = std::mem::take(&mut self.reported);
         store.read(|state| {
-            let records = state.records_after(self.through);
-            for record in records.iter().filter(|record| &record.agent == agent) {
-                reported.fold(&record.event);
-                match &record.event {
-                    SessionEvent::Compaction { .. } => compacted = true,
-                    SessionEvent::MessageCommitted { message } => {
-                        committed.push((record.sequence, message.clone()));
-                    }
-                    _ => {}
-                }
+            let window = state.records_after(self.through);
+            for record in window.iter().filter(|record| &record.agent == agent) {
+                reported.fold(record);
+                fold_journaled(&mut self.journaled, record);
+                compacted |= matches!(record.event, SessionEvent::Compaction { .. });
             }
-            through = records.last().map_or(through, |record| record.sequence);
+            if !compacted {
+                (self.projected).extend(&state.ledger, &state.records, window, agent);
+            }
+            through = window.last().map_or(through, |record| record.sequence);
         });
         self.reported = reported;
         if compacted {
@@ -137,37 +124,64 @@ impl AgentContext {
             return Ok(());
         }
         self.through = through;
-        self.projected.messages.extend(committed);
         Ok(())
     }
 
     /// Build the runtime-state tail only when the profile sends it. A persisting
     /// profile commits it to history instead, before the request.
-    pub fn tail(&self, runtime: impl FnOnce() -> UserPart) -> Option<Message> {
+    pub fn tail(&self, runtime: impl FnOnce() -> RuntimeState) -> Option<Message> {
         match self.profile.profile.state_mode {
             StateMode::None => None,
-            StateMode::Dynamic | StateMode::Persist => Some(Message::User(vec![runtime()])),
+            StateMode::Dynamic | StateMode::Persist => Some(Message::State(runtime())),
         }
     }
 
-    /// The next request as the provider receives it: projected history, then the tail.
+    /// The next request as the provider receives it: the projected history, then the
+    /// tail as this request's own state.
     pub fn request(&self, tail: Option<&Message>) -> ModelRequest {
         ModelRequest {
-            history: render_history(self.projected.history()),
-            tail: tail.map(Message::render).into_iter().collect(),
+            context: self.projected.context(tail),
             ..self.template.to_request()
         }
     }
 
-    /// The reported occupancy the next request compacts for first, if over the threshold.
-    pub fn compaction_due(&self) -> Option<Usage> {
-        (self.reported.pending).filter(|usage| self.needs_compaction(*usage))
+    /// The record of the next request's context, journaled unless it is the agent's
+    /// latest: requests sharing a record keep their reported prompts comparable.
+    pub async fn context_record(
+        &mut self,
+        store: &crate::session::SessionStore,
+        agent: &AgentId,
+    ) -> Result<RecordSeq, crate::session::SessionError> {
+        let template = self.template.to_request();
+        let context = ModelContext {
+            purpose: ModelPurpose::Agent,
+            profile: self.profile.clone(),
+            system: template.system,
+            tools: template.tools,
+            response_schema: template.response_schema,
+        };
+        if let Some((sequence, journaled)) = &self.journaled
+            && *journaled == context
+        {
+            return Ok(*sequence);
+        }
+        let event = SessionEvent::ModelContext {
+            context: context.clone(),
+        };
+        let record = store.append(agent.clone(), event).await?;
+        self.journaled = Some((record.sequence, context));
+        Ok(record.sequence)
     }
 
-    fn needs_compaction(&self, usage: Usage) -> bool {
-        // Only the completed response's reported occupancy, including cached input
-        // and generated output; estimates never trigger it.
-        let tokens = occupancy(usage);
+    /// The reported occupancy the next request compacts for first, if over the threshold:
+    /// the completed response's, including cached input and generated output.
+    pub fn compaction_due(&self) -> Option<CompactionTrigger> {
+        let tokens = self.reported.pending?.occupancy()?;
+        self.needs_compaction(tokens)
+            .then_some(CompactionTrigger::Occupancy(tokens))
+    }
+
+    fn needs_compaction(&self, tokens: u64) -> bool {
         let (numerator, denominator) = COMPACTION_THRESHOLD;
         let profile = &self.profile.profile;
         let budget = profile.max_context.get() - profile.max_output.get();
@@ -176,22 +190,28 @@ impl AgentContext {
 
     /// A mode switch invalidates bound reasoning in the history before it.
     pub fn strip_bound_reasoning(&mut self) {
-        let later = self.projected.messages.split_off(self.prefix);
-        let kept = later
-            .into_iter()
-            .map(|(sequence, message)| (sequence, message.without_bound_reasoning()));
-        self.projected.messages.extend(kept);
+        self.projected.unbind(self.prefix);
     }
 
     pub fn contains_images(&self) -> bool {
         self.projected
             .messages
             .iter()
-            .any(|(_, message)| match message {
+            .any(|projected| match &projected.message {
                 Message::User(content) => content.iter().any(UserPart::is_image),
                 Message::Tool(results) => results.iter().any(|result| !result.images.is_empty()),
-                Message::Assistant(_) => false,
+                Message::Assistant(_) | Message::State(_) => false,
             })
+    }
+}
+
+fn fold_journaled(journaled: &mut Option<(RecordSeq, ModelContext)>, record: &EventRecord) {
+    match &record.event {
+        SessionEvent::ModelContext { context } if context.purpose == ModelPurpose::Agent => {
+            *journaled = Some((record.sequence, context.clone()));
+        }
+        SessionEvent::ModeChanged { .. } => *journaled = None,
+        _ => {}
     }
 }
 
@@ -199,17 +219,8 @@ impl AgentContext {
 /// fraction, whose reported use compacts it.
 const COMPACTION_THRESHOLD: (u128, u128) = (9, 10);
 
-pub(super) fn occupancy(usage: Usage) -> u64 {
-    let input = usage.input_tokens.saturating_add(usage.cached_input_tokens);
-    input.saturating_add(usage.output_tokens)
-}
-
 /// The projected checkpoint and the retained messages at or before its frontier.
-fn history_prefix(
-    projected: &[(RecordSeq, Message)],
-    records: &[EventRecord],
-    agent: &AgentId,
-) -> usize {
+fn history_prefix(projected: &[Projected], records: &[EventRecord], agent: &AgentId) -> usize {
     let frontier = records.iter().rev().find_map(|record| match &record.event {
         SessionEvent::Compaction { checkpoint } if &record.agent == agent => {
             Some(checkpoint.frontier)
@@ -220,72 +231,19 @@ fn history_prefix(
         1 + projected
             .iter()
             .skip(1)
-            .take_while(|(sequence, _)| *sequence <= frontier)
+            .take_while(|projected| projected.sequence <= frontier)
             .count()
     })
-}
-
-/// Context occupancy for historical agents without consulting current config: each
-/// agent's last occupancy reported by an attempt that committed its response, or a
-/// later checkpoint's estimate, at the capacity of its latest request. Output of an
-/// attempt that committed nothing never joined the context. A zero report is a
-/// backend reporting nothing, as the meter treats it too.
-pub(crate) fn recorded_context(
-    records: &[EventRecord],
-    ledger: &RequestLedger,
-) -> HashMap<AgentId, ContextUsage> {
-    let committed = |attempt: AttemptRef| {
-        ledger.get(attempt.request).is_some_and(|request| {
-            request.purpose == ModelPurpose::Agent
-                && request.phase.committed_attempt() == Some(attempt.attempt)
-        })
-    };
-    // Requests are sequential per agent, so a usage report belongs to the agent's
-    // latest started attempt.
-    let mut attempts = HashMap::new();
-    let mut tokens = HashMap::new();
-    for record in records {
-        let reported = match &record.event {
-            SessionEvent::ModelAttemptStarted(attempt) => {
-                attempts.insert(&record.agent, *attempt);
-                continue;
-            }
-            SessionEvent::Usage { request, usage }
-                if attempts
-                    .get(&record.agent)
-                    .is_some_and(|attempt| attempt.request == *request && committed(*attempt)) =>
-            {
-                match occupancy(*usage) {
-                    0 => continue,
-                    reported => reported,
-                }
-            }
-            SessionEvent::Compaction { checkpoint } => checkpoint.after_tokens,
-            _ => continue,
-        };
-        tokens.insert(&record.agent, reported);
-    }
-    let latest = |agent| ledger.get(ledger.latest(agent)?);
-    tokens
-        .into_iter()
-        .filter_map(|(agent, tokens)| {
-            let capacity = latest(agent)?.profile.profile.max_context.get();
-            Some((agent.clone(), ContextUsage { tokens, capacity }))
-        })
-        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::super::*;
     use crate::agent::runtime::tests::{
-        Requests, Script, Step, answer, child_launch, ephemeral_session, model_ref, recoverable,
-        scripted_session, send, shutdown_session, test_harness,
+        Requests, Script, Step, answer, child_launch, ephemeral_session, model_ref, send,
+        test_harness,
     };
-    use crate::provider::{
-        ProviderErrorKind,
-        protocol::{ContextId, ResponseEvent},
-    };
+    use crate::provider::{ProviderErrorKind, protocol::ContextId};
 
     fn test_context(capacity: u64, max_output: u64) -> super::AgentContext {
         let profile = ModelProfile {
@@ -304,43 +262,15 @@ mod tests {
                 name: model_ref("test"),
                 profile,
             },
-            template_tokens: crate::agent::runtime::compaction::estimate_request(&request),
             template: request.try_into().unwrap(),
             projected: crate::session::Projection::default(),
-            meter: super::TokenMeter::default(),
             provider,
             blobs: Default::default(),
             unavailable_tools: Default::default(),
             reported: Default::default(),
+            journaled: None,
             through: RecordSeq::default(),
             prefix: 0,
-        }
-    }
-
-    #[test]
-    fn meter_scales_later_estimates_by_the_reported_prompt_in_either_direction() {
-        let mut context = test_context(128_000, 1_000);
-        let request = |context: &super::AgentContext| {
-            let text = "x".repeat(40_000);
-            let tail = Message::User(vec![UserPart::Text { text }]);
-            context.request(Some(&tail))
-        };
-        let raw = context.meter.estimate(&request(&context));
-        for actual in [raw / 2, raw * 3] {
-            context.meter.observe(raw, tests::usage(actual, 0, 7));
-            assert_eq!(context.meter.estimate(&request(&context)), actual);
-            // A zero report keeps that baseline.
-            context.meter.observe(raw, Usage::default());
-            assert_eq!(context.meter.estimate(&request(&context)), actual);
-            // New history is scaled by the same ratio.
-            let text = "y".repeat(80_000);
-            context.projected.messages =
-                vec![(1.into(), Message::User(vec![UserPart::Text { text }]))];
-            let grown = super::super::compaction::estimate_request(&request(&context));
-            let expected = u128::from(grown) * u128::from(actual) / u128::from(raw);
-            let found = context.meter.estimate(&request(&context));
-            assert_eq!(u128::from(found), expected);
-            context.projected.messages.clear();
         }
     }
 
@@ -355,14 +285,12 @@ mod tests {
         ];
         for (capacity, max_output, threshold) in limits {
             let context = test_context(capacity, max_output);
-            let total = |tokens: u64| Usage {
-                input_tokens: tokens / 3,
-                cached_input_tokens: tokens / 3,
-                // Cache writes are already included in input and must not count twice.
-                cache_write_input_tokens: tokens / 3,
-                output_tokens: tokens - 2 * (tokens / 3),
+            // Cache writes are already included in input and must not count twice.
+            let total = |tokens: u64| {
+                let third = tokens / 3;
+                let usage = Usage::prompted(third, third, third, tokens - 2 * third);
+                usage.occupancy().unwrap()
             };
-            assert!(!context.needs_compaction(Usage::default()));
             for tokens in [threshold - 1, threshold, threshold + 1] {
                 assert_eq!(
                     context.needs_compaction(total(tokens)),
@@ -372,69 +300,55 @@ mod tests {
             }
             // Each partial sum overflows a u64; a wrapped total would be tiny.
             for overflow in [tests::usage(u64::MAX, 1, 0), tests::usage(u64::MAX, 0, 1)] {
-                assert!(context.needs_compaction(overflow));
+                assert!(context.needs_compaction(overflow.occupancy().unwrap()));
             }
         }
     }
 
-    /// A backend that reports no usage leaves resumed occupancy unknown, not zero.
-    #[tokio::test]
-    async fn resumed_context_skips_unreported_usage() {
-        let (_root, _, session) = scripted_session([answer("done")]).await;
-        session.prompt("work").await.unwrap();
-        let resumed =
-            (session.runtime.store).read(|state| recorded_context(&state.records, &state.ledger));
-        assert!(!resumed.contains_key(&session.root));
-        shutdown_session(session).await;
-    }
-
-    /// Only a committed response's report restores occupancy: output streamed by an
-    /// attempt that failed, was interrupted or was retried never joined the context.
-    #[tokio::test]
-    async fn resumed_context_counts_only_committed_attempts() {
-        let reported = |input, output| Ok(ResponseEvent::Usage(tests::usage(input, 0, output)));
-        let committed = |events: Vec<ResponseEvent>, input, output| {
-            let mut events: Vec<_> = events.into_iter().map(Ok).collect();
-            events.insert(events.len() - 1, reported(input, output));
-            Step::stream(events)
+    /// A committed response over the threshold leaves the need through failed summary
+    /// rounds a fresh summary could pass, but not through an overflowing one: that
+    /// round already shrank its summary, so the next request decides.
+    #[test]
+    fn only_a_summary_failure_a_retry_could_pass_keeps_the_need() {
+        use super::super::context::Reported;
+        use crate::session::{
+            AttemptRef, CompactionFailure, CompletedOutcome,
+            tests::{attempt, record},
         };
-        let failed = |error| Step::stream(vec![reported(2_000, 20_000), Err(error)]);
-        let steps = [
-            committed(answer("done"), 1_000, 10),
-            failed(ProviderErrorKind::Protocol.error("not retried")),
-            committed(answer("never released"), 3_000, 30_000).midstream(),
-            failed(recoverable()),
-            // The retry that commits reports nothing.
-            Step::new(answer("retried")),
+        use crate::{agent::CompactionFault, identity::SessionId};
+        let agent = AgentId::root(SessionId::from_bytes([3; 16]));
+        let request = 2.into();
+        let completed = [
+            attempt(request, 1),
+            SessionEvent::Usage {
+                request,
+                usage: tests::usage(1_000, 0, 10),
+            },
+            SessionEvent::ResponseCompleted {
+                attempt: AttemptRef {
+                    request,
+                    attempt: 1,
+                },
+                message: 3.into(),
+                outcome: CompletedOutcome::Answer,
+            },
         ];
-        let script = Script::new(steps, &Requests::default());
-        let root = tempfile::tempdir().unwrap();
-        let sessions = root.path().join("sessions");
-        let harness = test_harness(root.path(), &sessions, script.clone()).await;
-        let session = ephemeral_session(&harness).await;
-        let resumed = async || {
-            let store = &session.runtime.store;
-            store.read(|state| recorded_context(&state.records, &state.ledger))[&session.root]
-                .tokens
+        let failed = |error| SessionEvent::CompactionFailed {
+            failure: CompactionFailure::BeforeRequest,
+            error,
         };
-        session.prompt("committed").await.unwrap();
-        assert_eq!(resumed().await, 1_010);
-        session.prompt("failed").await.unwrap_err();
-        assert_eq!(resumed().await, 1_010);
-        let interrupted = session.prompt("interrupted");
-        let interrupt = async {
-            script.held(2).await;
-            session.interrupt().await;
-        };
-        let (result, ()) = tokio::join!(interrupted, interrupt);
-        result.unwrap_err();
-        assert_eq!(resumed().await, 1_010);
-        let retried = session.prompt("retried");
-        crate::agent::runtime::tests::retrying(&session, retried)
-            .await
-            .unwrap();
-        assert_eq!(resumed().await, 1_010);
-        shutdown_session(session).await;
+        let mut reported = Reported::default();
+        for (sequence, event) in (1..).zip(completed) {
+            reported.fold(&record(&agent, sequence, event));
+        }
+        for (error, keeps) in [
+            (CompactionFault::Interrupted, true),
+            (CompactionFault::Truncated, true),
+            (CompactionFault::Overflowed, false),
+        ] {
+            reported.fold(&record(&agent, 9, failed(error.clone())));
+            assert_eq!(reported.pending.is_some(), keeps, "{error:?}");
+        }
     }
 
     #[tokio::test]

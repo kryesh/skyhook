@@ -2,7 +2,7 @@
 
 use super::*;
 use crate::provider::{ProviderErrorKind, protocol::ResponseEvent};
-use crate::session::UserPart;
+use crate::session::RuntimeState;
 
 impl SessionRuntime {
     pub(super) async fn run_turn(
@@ -13,7 +13,6 @@ impl SessionRuntime {
     ) -> Result<String, HarnessError> {
         let (agent, owner_job) = (turn.agent, turn.owner_job);
         let (cancellation, location) = (turn.cancellation, turn.location);
-        let mut context_sequence = None;
         let mut final_text = String::new();
         let mut provider_attempt = 0u64;
         let mut context_failures = 0u8;
@@ -30,8 +29,6 @@ impl SessionRuntime {
                 .consume_queued_inputs(&mut turn, agent_context, settings)
                 .await
             {
-                // A mode or model change can replace both the template and its token meter.
-                context_sequence = None;
                 provider_attempt = 0;
                 context_failures = 0;
             }
@@ -45,33 +42,20 @@ impl SessionRuntime {
             if !profile.supports_images && agent_context.contains_images() {
                 return Err(HarnessError::ImagesUnsupported(profile.model.clone()));
             }
-            let template = agent_context.template.to_request();
-            let context = match context_sequence {
-                Some(sequence) => sequence,
-                None => {
-                    let context = crate::session::ModelContext {
-                        purpose: crate::session::ModelPurpose::Agent,
-                        profile: agent_context.profile.clone(),
-                        system: template.system.clone(),
-                        tools: template.tools.clone(),
-                        response_schema: template.response_schema.clone(),
-                    };
-                    let record = self
-                        .store
-                        .append(agent.clone(), SessionEvent::ModelContext { context })
-                        .await?;
-                    context_sequence = Some(record.sequence);
-                    record.sequence
-                }
-            };
+            let context = agent_context.context_record(&self.store, agent).await?;
             let tail = agent_context.tail(|| self.runtime_state(&turn));
-            let completed = agent_context.compaction_due();
-            if overflowed || completed.is_some() {
+            // An overflow is the latest word on the context's size.
+            let trigger = if overflowed {
+                Some(crate::session::CompactionTrigger::Overflow)
+            } else {
+                agent_context.compaction_due()
+            };
+            if let Some(trigger) = trigger {
                 overflowed = false;
                 let request = agent_context.request(tail.as_ref());
-                let (provider, meter) = (agent_context.provider.as_mut(), &mut agent_context.meter);
+                let provider = agent_context.provider.as_mut();
                 let snapshot = &agent_context.profile;
-                self.compact_history(&turn, provider, meter, snapshot, &request, completed)
+                self.compact_history(&turn, provider, snapshot, &request, trigger)
                     .await?;
                 // Consume input received during compaction before starting the
                 // normal request, rather than delaying it by another request.
@@ -95,16 +79,11 @@ impl SessionRuntime {
             self.store
                 .load_blobs(&mut request, &mut agent_context.blobs)
                 .await?;
-            let estimate = |message: &crate::provider::protocol::Message| {
-                compaction::estimate_message(message, request.model.as_str())
-            };
-            let messages = request.messages().map(estimate).sum::<u64>();
-            let input_estimate = agent_context.template_tokens + messages;
-            let context_tokens = agent_context.meter.scale(input_estimate);
             let requested = SessionEvent::ModelRequested {
                 context,
                 checkpoint: agent_context.projected.checkpoint,
                 through: agent_context.projected.through(),
+                from: None,
                 tail: tail.clone().into_iter().collect(),
                 history_lifetime: request.history_lifetime,
             };
@@ -114,13 +93,6 @@ impl SessionRuntime {
                 if cancellation.is_cancelled() {
                     return Err(HarnessError::Interrupted);
                 }
-                self.store.post(RuntimeEvent::Context {
-                    agent: agent.clone(),
-                    usage: ContextUsage {
-                        tokens: context_tokens,
-                        capacity: profile.max_context.get(),
-                    },
-                });
                 provider_attempt = provider_attempt.saturating_add(1);
                 let attempt = crate::session::AttemptRef {
                     request: requested.sequence.request(),
@@ -169,7 +141,6 @@ impl SessionRuntime {
             let (requested, attempt) = requested;
             let (completion, usage) = response;
             let outcome = completion.outcome();
-            let aborted = outcome == Outcome::Cut(CutReason::Aborted);
             let text = visible_text(completion.items());
             let calls: Vec<ToolCall> = completion.calls().cloned().collect();
             // Empty text is not history, even beside an action: a service may add an
@@ -184,59 +155,50 @@ impl SessionRuntime {
                     })
                     .collect(),
             );
-            let response_tokens = estimate(&assistant.render());
             // A refusal is never history and never retried here: it is deterministic
             // for a given request. A content-free message would make every later
             // request unencodable. Either fails the turn with nothing committed.
-            let unusable = if outcome == Outcome::Cut(CutReason::Refusal) {
-                Some(HarnessError::Refused(refusal_detail(&text)))
-            } else if !assistant.is_content_free() {
-                None
-            } else if aborted {
-                Some(HarnessError::ProviderAborted)
-            } else if outcome == Outcome::Cut(CutReason::MaxTokens) {
-                Some(HarnessError::OutputLimit)
-            } else {
-                Some(HarnessError::EmptyResponse)
+            let completed = match crate::session::CompletedOutcome::try_from(outcome) {
+                Err(crate::session::Refused) => Err(HarnessError::Refused(refusal_detail(&text))),
+                Ok(_) if assistant.is_content_free() => {
+                    Err(if outcome == Outcome::Cut(CutReason::MaxTokens) {
+                        HarnessError::OutputLimit
+                    } else {
+                        HarnessError::EmptyResponse
+                    })
+                }
+                Ok(completed) => Ok(completed),
             };
-            if let Some(error) = unusable {
-                let failure = Failure::from(&error);
-                let failed = crate::session::AttemptFailure::Final(failure.clone());
-                let failed = recovery::AttemptEnd::Failed(failed);
-                self.record_attempt(agent, attempt, usage, failed).await?;
-                self.store.post(RuntimeEvent::ResponseSettled {
-                    agent: agent.clone(),
-                    request: requested.sequence.request(),
-                    settlement: Settlement::Failed(failure.into()),
-                });
-                return Err(error);
-            }
+            let completed = match completed {
+                Ok(completed) => completed,
+                Err(error) => {
+                    let failure = Failure::from(&error);
+                    let failed = crate::session::AttemptFailure::Final(failure.clone());
+                    let failed = recovery::AttemptEnd::Failed(failed);
+                    self.record_attempt(agent, attempt, usage, failed).await?;
+                    self.store.post(RuntimeEvent::ResponseSettled {
+                        agent: agent.clone(),
+                        request: requested.sequence.request(),
+                        settlement: Settlement::Failed(failure.into()),
+                    });
+                    return Err(error);
+                }
+            };
             // The message, its usage and its outcome commit in one transaction, so a
             // crash never leaves a response without the attempt's outcome.
             let outcome = {
                 let (agent, request) = (agent.clone(), requested.sequence.request());
                 move |message: RecordSeq| {
                     let message = message.message();
-                    let mut events = Vec::new();
-                    if !aborted || usage != Usage::default() {
-                        events.push(SessionEvent::Usage { request, usage });
-                    }
-                    // A refusal returned above, so a cut that cannot complete is the abort.
-                    events.push(match crate::session::CompletedOutcome::try_from(outcome) {
-                        Ok(outcome) => SessionEvent::ResponseCompleted {
-                            attempt,
-                            message,
-                            outcome,
-                        },
-                        Err(_) => SessionEvent::ModelFailed {
-                            attempt,
-                            failure: crate::session::AttemptFailure::Final(Failure::Aborted),
-                        },
-                    });
-                    events
-                        .into_iter()
+                    let completed = SessionEvent::ResponseCompleted {
+                        attempt,
+                        message,
+                        outcome: completed,
+                    };
+                    (SessionEvent::usage(request, usage).into_iter())
+                        .chain([completed])
                         .map(|event| (agent.clone(), event))
-                        .collect()
+                        .collect::<Vec<_>>()
                 }
             };
             let ends = calls.is_empty();
@@ -276,16 +238,6 @@ impl SessionRuntime {
                 }
                 committed => committed?,
             };
-            if aborted {
-                // Preserve completed visible/replay content, but never turn a
-                // provider abort into a successful agent turn.
-                self.store.post(RuntimeEvent::ResponseSettled {
-                    agent: agent.clone(),
-                    request: requested.sequence.request(),
-                    settlement: Settlement::Aborted(origin),
-                });
-                return Err(HarnessError::ProviderAborted);
-            }
             // A child's earlier replies are published at commit; only the eventual
             // answer is its job's result.
             if owner_job.is_none() || calls.is_empty() {
@@ -296,41 +248,18 @@ impl SessionRuntime {
                 request: requested.sequence.request(),
                 settlement: Settlement::Committed(origin),
             });
-            agent_context.meter.observe(input_estimate, usage);
             let next_tail = agent_context.tail(|| self.runtime_state(&turn));
-            // The next request is this one with the response in its history and a new tail.
-            let tail_tokens = next_tail
-                .as_ref()
-                .map_or(0, |tail| estimate(&tail.render()));
-            let previous_tail = request.tail.iter().map(estimate).sum::<u64>();
-            let next = input_estimate + response_tokens + tail_tokens - previous_tail;
-            self.store.post(RuntimeEvent::Context {
-                agent: agent.clone(),
-                usage: ContextUsage {
-                    tokens: agent_context.meter.scale(next),
-                    capacity: profile.max_context.get(),
-                },
-            });
-            // Decided from the committed response's reported occupancy, never from an
-            // estimate that includes newly produced tool results or queued input. An
-            // answer ends the turn's model work: what it would compact waits for the
-            // next request boundary.
+            // Decided from the committed response's reported occupancy, which excludes
+            // newly produced tool results and queued input. An answer ends the turn's
+            // model work: what it would compact waits for the next request boundary.
             agent_context.refresh(&self.store, agent)?;
-            if !ends && let Some(completed) = agent_context.compaction_due() {
+            if !ends && let Some(trigger) = agent_context.compaction_due() {
                 let current = agent_context.request(next_tail.as_ref());
                 let compacted = async {
-                    let (provider, meter) =
-                        (agent_context.provider.as_mut(), &mut agent_context.meter);
+                    let provider = agent_context.provider.as_mut();
                     let snapshot = &agent_context.profile;
-                    self.compact_history(
-                        &turn,
-                        provider,
-                        meter,
-                        snapshot,
-                        &current,
-                        Some(completed),
-                    )
-                    .await?;
+                    self.compact_history(&turn, provider, snapshot, &current, trigger)
+                        .await?;
                     agent_context.refresh(&self.store, agent)?;
                     if cancellation.is_cancelled() {
                         return Err(HarnessError::Interrupted);
@@ -352,7 +281,6 @@ impl SessionRuntime {
                     self.commit(agent, Message::Tool(results)).await?;
                 }
                 compacted?;
-                context_sequence = None;
             }
             if !calls.is_empty() {
                 // Every call's job exists, in call order, before any runs: a `wait`
@@ -413,7 +341,6 @@ impl SessionRuntime {
                         .consume_queued_inputs(&mut turn, agent_context, settings)
                         .await
                 {
-                    context_sequence = None;
                     final_text.clear();
                     // The invocation continues, so the silent answer needs its wake now.
                     if let Some(job) = owner_job {
@@ -437,7 +364,7 @@ pub(super) type Streamed =
     Result<(crate::provider::protocol::Completion, Usage), (ProviderError, Usage)>;
 
 impl SessionRuntime {
-    fn runtime_state(&self, turn: &TurnContext<'_>) -> UserPart {
+    fn runtime_state(&self, turn: &TurnContext<'_>) -> RuntimeState {
         let (agent, capabilities) = (turn.agent, &turn.capabilities);
         state::runtime_state_content(&self.jobs, &self.store, agent, capabilities, turn.location)
     }
@@ -534,11 +461,6 @@ mod tests {
             (
                 cut(Vec::new(), CutReason::MaxTokens),
                 "output limit was reached",
-                false,
-            ),
-            (
-                cut(Vec::new(), CutReason::Aborted),
-                "provider aborted",
                 false,
             ),
             // A turn stands on nonblank text or a tool call: nothing, empty or
@@ -682,6 +604,21 @@ mod tests {
             Sent::Assistant(items) if *items == vec![call.clone()])));
     }
 
+    /// Turns under unchanged settings share one context record, which keeps their
+    /// reported prompts comparable for retention.
+    #[tokio::test]
+    async fn turns_with_unchanged_settings_share_a_context_record() {
+        let (_root, _requests, session) = scripted_session([answer("one"), answer("two")]).await;
+        session.prompt("first").await.unwrap();
+        session.prompt("second").await.unwrap();
+        let records = session.runtime.store.records();
+        let contexts = events!(&records, SessionEvent::ModelContext { .. } => ());
+        let requests = events!(&records, SessionEvent::ModelRequested { context, .. } => *context);
+        assert_eq!((contexts.len(), requests.len()), (1, 2));
+        assert_eq!(requests[0], requests[1]);
+        shutdown_session(session).await;
+    }
+
     #[tokio::test]
     async fn successful_responses_journal_their_outcome() {
         let (_root, _requests, session) = scripted_session([answer("done")]).await;
@@ -694,60 +631,7 @@ mod tests {
         assert_eq!(outcomes, vec![crate::session::CompletedOutcome::Answer]);
     }
 
-    #[tokio::test]
-    async fn aborted_response_preserves_visible_content_and_usage_but_fails() {
-        let payload = json!({"encrypted_content":"retained"});
-        let replay = envelope(ReplayFormat::Responses, "native", payload, Binding::Free);
-        let retained = vec![
-            AssistantItem::reasoning("reason", 0, "completed reasoning", Some(replay)),
-            AssistantItem::text("answer", 1, "partial visible answer"),
-        ];
-        let observed = usage(11, 7, 3);
-        let mut events = vec![ResponseEvent::Usage(observed)];
-        events.extend(cut(retained.clone(), CutReason::Aborted));
-        let (_root, requests, session) = scripted_session([events]).await;
-        let mut events = session.runtime.store.observe().updates;
-        let error = session.prompt("Abort this turn.").await.unwrap_err();
-        assert!(matches!(error, HarnessError::ProviderAborted));
-        assert_eq!(
-            session.runtime.store.observe().snapshot.activity[&session.root].state,
-            crate::agent::AgentActivity::Stopped(Failure::Aborted.into())
-        );
-        assert_eq!(requests.lock().unwrap().len(), 1);
-        assert_eq!(journaled_usage(&session).await, observed);
-        let records = session.runtime.store.records();
-        let assistants = events!(&records, SessionEvent::MessageCommitted { message: Message::Assistant(items) } => items.clone());
-        assert_eq!(assistants, vec![retained]);
-        assert_eq!(count!(&records, SessionEvent::Usage { .. }), 1);
-        assert_eq!(
-            count!(
-                &records,
-                SessionEvent::ModelFailed {
-                    failure: AttemptFailure::Final(Failure::Aborted),
-                    ..
-                }
-            ),
-            1
-        );
-        assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 0);
-        let mut settled = false;
-        while let Ok(event) = events.try_recv() {
-            match event.event {
-                RuntimeEvent::ResponseSettled { settlement, .. } => {
-                    assert!(matches!(settlement, Settlement::Aborted(_)));
-                    settled = true;
-                }
-                RuntimeEvent::TurnCompleted { .. } => {
-                    panic!("aborted turn cannot complete successfully")
-                }
-                _ => {}
-            }
-        }
-        assert!(settled);
-        session.shutdown().await.unwrap();
-    }
-
-    // End-to-end automatic compaction uses completed provider usage, not request estimates.
+    // End-to-end automatic compaction uses completed provider usage.
 
     use crate::session::ModelPurpose;
 
@@ -894,7 +778,7 @@ mod tests {
             assert_eq!(captured[2].max_output_tokens, captured[0].max_output_tokens);
             assert!(captured[2].response_schema.is_none());
             assert_eq!(captured[0].tools, captured[2].tools);
-            let sent_tool_message = tool_message.render();
+            let sent_tool_message = sent(tool_message);
             assert!(
                 !captured[1]
                     .messages()
@@ -907,7 +791,7 @@ mod tests {
                 .position(|message| message == &sent_tool_message)
                 .expect("the first post-compaction call receives the actual tool result");
             assert!(
-                matches!(&captured[2].history[index - 1], Sent::Assistant(items)
+                matches!(captured[2].messages().nth(index - 1), Some(Sent::Assistant(items))
                 if items.iter().filter_map(|item| item.call()).any(|call| call.id() == "append-once"))
             );
             // The persisted summary boundary and the post-compaction call both replay exactly.
@@ -1019,10 +903,12 @@ mod tests {
     async fn interruption_during_compaction_persistence_settles_unexecuted_calls() {
         let root = tempfile::tempdir().unwrap();
         let requests = Requests::default();
+        // The summary reports usage, which commits before its checkpoint.
+        let summary = with_usage(answer(summary_json().to_string()), &[usage(1_000, 0, 100)]);
         let script = Script::new(
             [
                 Step::new(with_usage(shell_response(), &[threshold_usage()])),
-                Step::new(answer(summary_json().to_string())).gated(),
+                Step::new(summary).gated(),
                 Step::new(answer("retry done")),
             ],
             &requests,
@@ -1163,7 +1049,7 @@ mod tests {
             matches!(results.as_slice(), [result] if result.is_error && result.call_id == "append-once")
         );
         assert_eq!(session.prompt("Continue.").await.unwrap(), "retry done");
-        let expected = Message::Tool(results.clone()).render();
+        let expected = sent(&Message::Tool(results.clone()));
         assert!(
             (requests.lock().unwrap().last().unwrap())
                 .messages()
@@ -1172,14 +1058,27 @@ mod tests {
         shutdown_session(session).await;
     }
 
+    /// Every mode leaves the next request extending the previous one unchanged: a
+    /// persisted state is committed, and a dynamic one is resent superseded before the
+    /// response it produced.
     #[tokio::test]
-    async fn state_mode_persists_or_omits_runtime_state() {
-        use crate::provider::profile::StateMode;
-        let state = |message: &&Sent| {
-            matches!(message, Sent::User(blocks) if blocks.iter().any(|block|
-            matches!(block, SentPart::Runtime { text } if text.starts_with("<skyhook_state>"))))
+    async fn state_mode_persists_supersedes_or_omits_runtime_state() {
+        use crate::provider::{
+            profile::StateMode,
+            protocol::{Entry, StateLifetime::*},
         };
-        for mode in [StateMode::None, StateMode::Persist] {
+        let lifetimes = |request: &ModelRequest| -> Vec<_> {
+            request.states().map(|state| state.lifetime).collect()
+        };
+        let modes = [
+            (StateMode::None, [&[][..], &[]]),
+            (
+                StateMode::Persist,
+                [&[Persisted][..], &[Persisted, Persisted]],
+            ),
+            (StateMode::Dynamic, [&[Current][..], &[Superseded, Current]]),
+        ];
+        for (mode, expected) in modes {
             let root = tempfile::tempdir().unwrap();
             let requests = Requests::default();
             let inspect = response(vec![tool_call(0, "first", "todo", json!({}))]);
@@ -1196,11 +1095,19 @@ mod tests {
             let [first, second] = captured.as_slice() else {
                 panic!("unexpected requests: {captured:?}")
             };
-            let persist = usize::from(mode == StateMode::Persist);
-            for (request, states) in [(first, persist), (second, 2 * persist)] {
-                assert!(request.tail.is_empty());
-                assert_eq!(request.history.iter().filter(state).count(), states);
+            assert_eq!(
+                [lifetimes(first), lifetimes(second)],
+                expected.map(<[_]>::to_vec)
+            );
+            let mut extended = first.context.clone();
+            for entry in &mut extended {
+                if let Entry::State(state) = entry
+                    && state.lifetime == Current
+                {
+                    state.lifetime = Superseded;
+                }
             }
+            assert!(second.context.starts_with(&extended), "{mode:?}");
             let inspected = second
                 .messages()
                 .flat_map(|message| match message {
@@ -1212,9 +1119,6 @@ mod tests {
             assert_eq!(inspected.name, "todo");
             assert!(!inspected.is_error, "todo failed: {inspected:?}");
             assert_eq!(inspected.result["result"], json!({"items": []}));
-            // Append-only: everything sent before is resent unchanged.
-            let sent: Vec<_> = first.messages().collect();
-            assert!(second.messages().take(sent.len()).eq(sent));
             shutdown_session(session).await;
         }
     }
@@ -1366,11 +1270,14 @@ mod tests {
             panic!("unexpected requests: {requests:?}")
         };
         assert_eq!((summary.0, summary.2), (ModelPurpose::Compaction, Detached));
-        assert_eq!(summary.1.last(), Some(&compaction::directive()));
+        // The directive precedes the summary's own state, which ends the request.
+        let [.., directive, Message::State(_)] = summary.1 else {
+            panic!("unexpected summary tail: {:?}", summary.1)
+        };
+        assert_eq!(directive, &compaction::directive());
         for (purpose, tail, lifetime) in [first, second, after] {
             assert_eq!((*purpose, *lifetime), (ModelPurpose::Agent, Extends));
-            assert!(matches!(tail, [Message::User(blocks)]
-            if matches!(blocks.as_slice(), [UserPart::State { .. }])));
+            assert!(matches!(tail, [Message::State(_)]));
         }
         shutdown_session(session).await;
     }
@@ -1432,7 +1339,9 @@ mod tests {
         ];
         assert_eq!(found, expected);
         let checkpoint = events!(&records, SessionEvent::Compaction { checkpoint } => checkpoint);
-        assert!(checkpoint[0].after_tokens < checkpoint[0].before_tokens);
+        let occupancy = threshold_usage().occupancy().unwrap();
+        let trigger = crate::session::CompactionTrigger::Occupancy(occupancy);
+        assert_eq!(checkpoint[0].trigger, trigger);
         {
             let captured = requests.lock().unwrap();
             assert!(captured[0].response_schema.is_none());
@@ -1447,7 +1356,7 @@ mod tests {
     async fn oversized_history_or_tool_result_with_low_completed_usage_does_not_compact() {
         for tool_result in [false, true] {
             let low = with_usage(answer("done"), &[usage(10, 5, 1)]);
-            let (_root, requests, session) = scripted_session([low]).await;
+            let (_root, _requests, session) = scripted_session([low]).await;
             if tool_result {
                 seed_history(&session, 6_000).await;
                 // An oversized historical tool result must not substitute for actual usage.
@@ -1474,8 +1383,6 @@ mod tests {
             let records = session.runtime.store.records();
             assert_eq!(purposes(&records), vec![ModelPurpose::Agent]);
             assert_eq!(count!(&records, SessionEvent::Compaction { .. }), 0);
-            let estimate = super::super::compaction::estimate_request(&requests.lock().unwrap()[0]);
-            assert!(estimate > 128_000);
             shutdown_session(session).await;
         }
     }
@@ -1483,14 +1390,8 @@ mod tests {
     #[tokio::test]
     async fn usage_with_cache_writes_above_input_fails_the_response_with_the_last_valid_usage() {
         // Cache writes may equal input, never exceed it.
-        let valid = Usage {
-            cache_write_input_tokens: 100,
-            ..usage(100, 0, 5)
-        };
-        let invalid = Usage {
-            cache_write_input_tokens: 101,
-            ..valid
-        };
+        let valid = Usage::prompted(100, 0, 100, 5);
+        let invalid = Usage::prompted(100, 0, 101, 5);
         let rejected = |events| with_usage(events, &[valid, invalid]);
         for compaction in [false, true] {
             let responses = if compaction {

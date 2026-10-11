@@ -368,11 +368,6 @@ mod tests {
                 Surface::Agent,
             ),
             (
-                Settlement::Aborted(MessageSeq::default()),
-                "Incomplete response",
-                Surface::Error,
-            ),
-            (
                 Settlement::Failed(disconnected),
                 "Incomplete response",
                 Surface::Error,

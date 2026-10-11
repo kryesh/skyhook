@@ -1,10 +1,10 @@
 //! What the core folds from the journal: the one in-memory copy of session state.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use super::{EventRecord, JournalFailure, SessionError, SessionEvent, SessionPhase};
 use crate::{
     agent::{
-        ContextUsage, ObservationSnapshot, ObservedEvent, RuntimeEvent,
+        ObservationSnapshot, ObservedEvent, RuntimeEvent,
         todo::{self, AgentTodos},
     },
     identity::{AgentId, JobId},
@@ -46,7 +46,7 @@ pub(crate) type Effect = Box<dyn FnOnce() + Send>;
 #[derive(Default)]
 pub(in crate::session) struct Observed {
     responses: crate::agent::Responses,
-    context: HashMap<AgentId, ContextUsage>,
+    context: crate::agent::ContextGauge,
     /// The newest record applied; journal sequences have no gaps.
     applied: RecordSeq,
     /// Counts publications, so an observer applies each one once.
@@ -63,7 +63,6 @@ impl CoreState {
             state.admit(std::slice::from_ref(record))?;
             state.apply(&mut observed, record);
         }
-        observed.context = crate::agent::recorded_context(records, &state.ledger);
         Ok((state, observed))
     }
 
@@ -92,6 +91,7 @@ impl CoreState {
         let views = crate::agent::Views {
             ledger: &mut self.ledger,
             responses: &mut observed.responses,
+            context: &mut observed.context,
         };
         views.record(record);
         observed.applied = record.sequence;
@@ -185,13 +185,7 @@ impl Observed {
     pub(in crate::session) fn post(&mut self, event: RuntimeEvent) {
         let applied = self.applied;
         let committed = |sequence| sequence <= applied;
-        crate::agent::live(
-            &mut self.responses,
-            None,
-            &mut self.context,
-            committed,
-            event,
-        );
+        crate::agent::live(&mut self.responses, None, committed, event);
     }
 
     /// The next publication.

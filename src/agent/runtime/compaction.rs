@@ -1,10 +1,10 @@
-//! Structured continuation guidance and provider-neutral context estimates.
+//! Structured continuation guidance for compaction summaries.
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
     agent::{CompactionError, todo::TodoItem},
-    provider::protocol::{AssistantItem, Message as ProviderMessage, ModelRequest},
+    provider::protocol::AssistantItem,
     session::{Message, UserPart},
 };
 
@@ -145,83 +145,6 @@ pub(crate) fn continuation(text: &str) -> Result<Continuation, CompactionError> 
         todos: summary.todos,
         jobs: summary.jobs,
     })
-}
-
-/// What an image is estimated to occupy, whatever its payload size.
-const IMAGE_TOKEN_ESTIMATE: u64 = 2_048;
-
-fn estimate_text(text: &str) -> u64 {
-    (text.len() as u64).div_ceil(4)
-}
-
-/// Provider-neutral estimate of what encoders send to `model`: image payload bytes
-/// are not text tokens, visible reasoning is display-only, and replay returns only
-/// to the model that produced it.
-pub(crate) fn estimate_message(message: &ProviderMessage, model: &str) -> u64 {
-    8 + match message {
-        ProviderMessage::User(blocks) => blocks
-            .iter()
-            .map(|block| match block.text() {
-                Ok(text) => 4 + estimate_text(&text),
-                Err(crate::media::AttachmentRef::Image(_)) => IMAGE_TOKEN_ESTIMATE,
-                Err(crate::media::AttachmentRef::Text(text)) => 4 + text.blob.bytes.div_ceil(4),
-            })
-            .sum::<u64>(),
-        ProviderMessage::Assistant(items) => items
-            .iter()
-            .map(|item| match item {
-                AssistantItem::Text { blocks, .. } => blocks
-                    .iter()
-                    .map(|block| 4 + estimate_text(&block.text))
-                    .sum::<u64>(),
-                // Visible reasoning is never sent; only replay for this model is.
-                AssistantItem::Reasoning { replay, .. } => replay
-                    .as_ref()
-                    .filter(|replay| replay.provenance.model == model)
-                    .map_or(0, |replay| estimate_text(&replay.payload.to_string())),
-                AssistantItem::ToolCall { call, .. } => {
-                    12 + estimate_text(call.id())
-                        + estimate_text(call.name())
-                        + estimate_text(
-                            &serde_json::Value::Object(call.arguments().clone()).to_string(),
-                        )
-                }
-            })
-            .sum::<u64>(),
-        ProviderMessage::Tool(results) => results
-            .iter()
-            .map(|result| {
-                12 + estimate_text(&result.call_id)
-                    + estimate_text(&result.name)
-                    + estimate_text(&result.result.to_string())
-                    + result.images.len() as u64 * IMAGE_TOKEN_ESTIMATE
-            })
-            .sum::<u64>(),
-    }
-}
-
-pub(crate) fn estimate_request(request: &ModelRequest) -> u64 {
-    16 + request
-        .system
-        .iter()
-        .map(|segment| 4 + estimate_text(&segment.text))
-        .sum::<u64>()
-        + request
-            .tools
-            .iter()
-            .map(|tool| {
-                12 + estimate_text(&tool.name)
-                    + estimate_text(&tool.description)
-                    + estimate_text(&tool.input_schema.to_string())
-            })
-            .sum::<u64>()
-        + request
-            .messages()
-            .map(|message| estimate_message(message, request.model.as_str()))
-            .sum::<u64>()
-        + request.response_schema.as_ref().map_or(0, |response| {
-            8 + estimate_text(&response.name) + estimate_text(&response.schema.to_string())
-        })
 }
 
 #[cfg(test)]
@@ -406,101 +329,5 @@ mod tests {
                 .todos
                 .is_empty()
         );
-    }
-
-    #[test]
-    fn estimate_counts_sent_blocks_and_replay_for_its_own_model_once_per_item() {
-        use crate::provider::codec::common::tests::envelope;
-        use crate::provider::protocol::{
-            AssistantItem, Binding, BlockId, ItemId, ReplayFormat, TextBlock, ToolCall,
-        };
-        let payload = json!({"encrypted_content": "opaque".repeat(100)});
-        // The final reasoning item has replay but no visible blocks.
-        let blocks = [3, 3, 2, 0];
-        let mut items: Vec<_> = (0..)
-            .zip(blocks)
-            .map(|(position, count): (u32, u32)| AssistantItem::Reasoning {
-                id: ItemId::try_from(format!("item-{position}")).unwrap(),
-                position: position.into(),
-                blocks: (0..count)
-                    .map(|part| TextBlock {
-                        id: BlockId::try_from(format!("block-{position}-{part}")).unwrap(),
-                        position: part.into(),
-                        text: "visible summary".into(),
-                    })
-                    .collect(),
-                replay: Some(envelope(
-                    ReplayFormat::Responses,
-                    "model",
-                    payload.clone(),
-                    Binding::Free,
-                )),
-            })
-            .collect();
-        // Visible reasoning is never sent; only the replay is.
-        let reasoning_cost = 4 * estimate_text(&payload.to_string());
-        let found = estimate_message(&ProviderMessage::Assistant(items.clone()), "model");
-        assert_eq!(found, 8 + reasoning_cost);
-        // Another model never receives this replay.
-        assert_eq!(
-            estimate_message(&ProviderMessage::Assistant(items.clone()), "other"),
-            8
-        );
-        items.push(AssistantItem::text("answer", 4, "visible answer"));
-        let call = ToolCall::new("call", "read", json!({"path":"file"})).unwrap();
-        let arguments = serde_json::Value::Object(call.arguments().clone()).to_string();
-        let call_cost =
-            12 + estimate_text(call.id()) + estimate_text(call.name()) + estimate_text(&arguments);
-        items.push(AssistantItem::tool_call("tool", 5, call));
-        assert_eq!(
-            estimate_message(&ProviderMessage::Assistant(items), "model"),
-            8 + reasoning_cost + 4 + estimate_text("visible answer") + call_cost
-        );
-    }
-
-    #[test]
-    fn request_estimate_accounts_for_the_response_schema() {
-        let mut request = ModelRequest::test("model");
-        let without_schema = estimate_request(&request);
-        request.response_schema = Some(crate::provider::protocol::ResponseSchema {
-            name: "compaction".into(),
-            schema: response_schema(),
-        });
-        assert!(estimate_request(&request) > without_schema + 1_000);
-    }
-
-    #[test]
-    fn attachment_estimates_fix_image_cost_and_scale_text_with_length() {
-        use crate::media::{AttachmentRef, BlobRef, ImageFormat, ImageRef, TextRef};
-        let estimate = |attachment| {
-            estimate_message(
-                &ProviderMessage::User(vec![crate::provider::protocol::UserContent::Attachment {
-                    attachment,
-                }]),
-                "model",
-            )
-        };
-        let blob = |bytes| BlobRef {
-            bytes,
-            ..BlobRef::of(b"")
-        };
-        let image = |bytes| {
-            let format = ImageFormat::Png;
-            estimate(AttachmentRef::Image(ImageRef {
-                file: None,
-                format,
-                blob: blob(bytes),
-            }))
-        };
-        let text = |bytes| {
-            estimate(AttachmentRef::Text(TextRef {
-                file: None,
-                blob: blob(bytes),
-            }))
-        };
-        assert_eq!(image(10), image(100_000));
-        assert!(image(10) > 1_000);
-        assert_eq!(text(4_000) - text(0), 1_000);
-        assert_eq!(text(4_001) - text(0), 1_001);
     }
 }

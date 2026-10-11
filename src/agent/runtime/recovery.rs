@@ -68,11 +68,9 @@ impl SessionRuntime {
         usage: Usage,
         end: AttemptEnd,
     ) -> Result<(), HarnessError> {
-        let mut events = Vec::new();
-        if usage != Usage::default() {
-            let request = attempt.request;
-            events.push((agent.clone(), SessionEvent::Usage { request, usage }));
-        }
+        let mut events: Vec<_> = (SessionEvent::usage(attempt.request, usage).into_iter())
+            .map(|event| (agent.clone(), event))
+            .collect();
         let outcome = match end {
             AttemptEnd::Interrupted => SessionEvent::ModelAttemptInterrupted(attempt),
             AttemptEnd::Failed(failure) => SessionEvent::ModelFailed { attempt, failure },
@@ -88,9 +86,9 @@ impl SessionRuntime {
         request: RequestSeq,
         usage: Usage,
     ) -> Result<(), HarnessError> {
-        self.store
-            .append(agent.clone(), SessionEvent::Usage { request, usage })
-            .await?;
+        if let Some(event) = SessionEvent::usage(request, usage) {
+            self.store.append(agent.clone(), event).await?;
+        }
         Ok(())
     }
 }
@@ -198,10 +196,11 @@ mod tests {
 
         /// Root history as JSON, plus its number of assistant messages.
         fn history(&self, records: &[EventRecord]) -> (String, usize) {
-            let history = project_history(records, &self.session.root).messages;
+            let projection = project_history(records, &self.session.root);
+            let history: Vec<_> = projection.history().map(|(message, _)| message).collect();
             let assistants = history
                 .iter()
-                .filter(|(_, message)| matches!(message, Message::Assistant(_)));
+                .filter(|message| matches!(message, Message::Assistant(_)));
             let assistants = assistants.count();
             (serde_json::to_string(&history).unwrap(), assistants)
         }
@@ -328,8 +327,8 @@ mod tests {
         let records = fixture.records();
         let failed_request = recoveries(&records)[0].0;
         let failed_usage = events!(&records, SessionEvent::Usage { request, usage } if *request == failed_request => *usage);
-        // failed usage and successful usage must each be recorded exactly once
-        assert_eq!(failed_usage, [observed_usage, Usage::default()]);
+        // The failed attempt's usage is recorded once; the retry reported none.
+        assert_eq!(failed_usage, [observed_usage]);
         assert_eq!(journaled_usage(&fixture.session).await, observed_usage);
         let jobs = count!(&records, SessionEvent::JobCreated { .. });
         assert_eq!(jobs, 1, "only the successful attempt may execute tools");
@@ -556,7 +555,7 @@ mod tests {
         let requests = fixture.requests();
         assert_eq!(requests.len(), 2);
         assert_eq!(requests[0], requests[1]);
-        assert_eq!(requests[0].context, ContextId::from(&child));
+        assert_eq!(requests[0].context_id, ContextId::from(&child));
         let records = fixture.records();
         assert_eq!(count!(&records, SessionEvent::JobCreated { .. }), 1);
         let child_records = records.iter().filter(|record| record.agent == child);

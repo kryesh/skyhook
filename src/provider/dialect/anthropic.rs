@@ -1,12 +1,12 @@
 //! api.anthropic.com: the Messages API with its version header, `x-api-key`,
 //! prefix-bound thinking, cache breakpoint lifetimes, and workspace-scoped keys.
 
-use super::{Dialect, DialectConfig, DialectError, Profile, Scheme, UnsupportedCodec};
+use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile, Scheme, UnsupportedCodec};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheTtl, Codec, CodecName,
-        messages::{self, ThinkingBinding},
+        CacheTtl, Codec, CodecName, StateRole,
+        messages::{self, SystemState, ThinkingBinding},
     },
     http::{
         Transport,
@@ -17,13 +17,21 @@ use crate::provider::{
 
 /// Signed thinking is bound to the exact conversation before it; letting the
 /// service drop a mismatched block keeps mode switches and compaction from
-/// failing, and the runtime still unbinds client-side.
+/// failing, and the runtime still unbinds client-side. System-role state is
+/// turn-scoped, which keeps that conversation fixed as the state changes.
 fn messages() -> messages::Dialect {
     messages::Dialect {
         thinking_binding: ThinkingBinding::DropOnMismatch,
-        ..messages::Dialect::anthropic()
+        system_state: SystemState::TurnScoped,
+        ..messages::Dialect::standard()
     }
 }
+
+/// The service's beta for `block_binding`.
+const BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// The service's beta for turn-scoped (`clear_at`) system messages.
+const CLEAR_AT_BETA: &str = "mid-conversation-system-clear-at-2026-08-21";
 
 /// A spend cap is reported as a rate limit without a retry hint.
 const ERRORS: ErrorSignals = ErrorSignals {
@@ -56,10 +64,18 @@ crate::provider::settings::settings! {
         pub workspace_id: Option<HeaderText> => default,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub cache_ttl: Option<CacheTtl> => default,
+        /// The role runtime state takes: `system` (default) needs a model that supports
+        /// mid-conversation system messages; `user` sends it as user content.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state_role: Option<StateRole> => default,
     }
 }
 
 impl DialectConfig for Config {
+    fn base_url() -> BaseUrl {
+        BaseUrl::Default("https://api.anthropic.com/v1")
+    }
+
     /// The key travels as the codec's own, `x-api-key`.
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         if codec != CodecName::Messages {
@@ -77,8 +93,14 @@ impl DialectConfig for Config {
             key: Scheme::XApiKey,
             ..Profile::new(codec, transport(), Dialect::Anthropic)
         };
+        let state_role = profile.state_role(self.state_role, StateRole::System);
+        let turn_scoped = (state_role == StateRole::System).then_some(CLEAR_AT_BETA);
+        profile.listed(
+            messages::BETA_HEADER,
+            [BINDING_BETA].into_iter().chain(turn_scoped),
+        );
         if let Some(workspace) = &self.workspace_id {
-            profile.discriminate(workspace);
+            profile.discriminate("workspace_id", workspace);
             profile.fixed("anthropic-workspace-id", workspace.value());
         }
         Ok(profile)
@@ -108,6 +130,11 @@ mod tests {
                 .scope
         };
         assert_eq!(scope("{}"), scope("cache_ttl: 1h"));
+        // State in another role than the default changes the conversation replay saw.
+        assert_eq!(scope("{}"), scope("state_role: system"));
+        assert_ne!(scope("{}"), scope("state_role: user"));
+        // Each part names its setting: equal values of different settings differ.
+        assert_ne!(scope("state_role: user"), scope("workspace_id: user"));
         assert_ne!(scope("{}"), scope("workspace_id: workspace_1"));
         assert_ne!(
             scope("workspace_id: workspace_1"),
@@ -125,11 +152,13 @@ mod tests {
         let configured = Config {
             workspace_id: Some("wrkspc_1".parse().unwrap()),
             cache_ttl: Some(CacheTtl::OneHour),
+            state_role: None,
         };
         assert_eq!(
             configured.admit(CodecName::Messages).unwrap().codec,
             Codec::Messages(messages::Dialect {
                 cache_ttl: Some(CacheTtl::OneHour),
+                state_role: StateRole::System,
                 ..messages()
             })
         );
@@ -150,7 +179,9 @@ mod tests {
         assert_eq!(header_values(&head, "anthropic-workspace-id"), ["wrkspc_1"]);
         assert_eq!(
             header_values(&head, "anthropic-beta"),
-            ["thinking-binding-controls-2026-08-01, context-1m-2025-08-07"]
+            [
+                "thinking-binding-controls-2026-08-01, mid-conversation-system-clear-at-2026-08-21, context-1m-2025-08-07"
+            ]
         );
     }
 

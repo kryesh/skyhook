@@ -83,8 +83,8 @@ U = input tokens + cached input tokens + output tokens
 U >= 0.9 × (max_context - max_output)
 ```
 
-This is the completed response's reported usage, not cumulative session usage or an estimate
-of the next request. Without reported usage, there is no estimate-based automatic trigger.
+This is the completed response's reported usage, not cumulative session usage. Skyhook does not
+estimate token counts, so without reported usage there is no automatic trigger.
 Compaction runs before executing tool calls from that response. The summarizer sees the entire
 latest response and its pending calls, explicitly marked as not yet executed. It reconciles the
 current todo list with the conversation and any pending todo changes; its reconciled list takes
@@ -104,8 +104,10 @@ compaction: from then on, the new model's reported usage decides.
 The provider still decides whether a request fits. A recognized context-overflow error can
 trigger compaction and retry, including for an oversized initial request or new tool output.
 Normal requests keep the configured `max_output`. Compaction requests can use a smaller output
-limit when less context space remains. The context meter in the terminal is an estimate
-for display, not the automatic compaction trigger. Configure
+limit when less context space remains, and a summary the provider rejects as too large is retried
+with half the output reserve, then with about the older half of the summarized history left out.
+After an overflow, compaction keeps only the latest exchange beside the summary. The context meter
+in the terminal shows the last reported occupancy. Configure
 [model limits](../configuration/providers-and-models.md) to match the endpoint you use.
 
 Compaction does not execute tools. It can retain selected job results as well as recent
@@ -117,10 +119,10 @@ summary can still be incomplete or inaccurate.
 Invalid, truncated, cancelled, or unsaved summaries leave the preceding context and todos
 active. Every valid, successfully persisted summary installs a checkpoint and its reconciled
 todos, even if the replacement context is not smaller. The terminal reports compaction start,
-estimated context size, and failures without printing the summary. Eligible compaction failures,
-such as a truncated or invalid summary, have a bounded retry policy, separate from transient
-model failures, which retry until success or cancellation. A refused or aborted summary is not
-retried. See
+the reported occupancy that triggered it, and failures without printing the summary. Eligible
+compaction failures, such as a truncated or invalid summary, have a bounded retry policy,
+separate from transient model failures, which retry until success or cancellation. A refused
+summary is not retried. See
 [model failure recovery](../configuration/providers-and-models.md#model-failure-recovery).
 
 For persistence and request reconstruction internals, see

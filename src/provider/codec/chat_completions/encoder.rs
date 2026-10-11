@@ -7,14 +7,15 @@ use crate::provider::{
     ProviderError,
     ProviderErrorKind::InvalidRequest,
     codec::{
-        CodecName, SchemaConstraint, ToolNames,
+        CodecName, SchemaConstraint, StateRole, ToolNames,
         common::{
-            attach_runtime_tail, check_tool, image_url, own_replay, signed_context, system_text,
-            tool_text, user_parts,
+            check_tool, image_url, own_replay, signed_context, system_text, tool_text, user_parts,
         },
         placement::breakpoint,
     },
-    protocol::{AssistantItem, Binding, HistoryLifetime, Message, ModelRequest, Replay},
+    protocol::{
+        AssistantItem, Binding, Entry, HistoryLifetime, Message, ModelRequest, Replay, State, sent,
+    },
 };
 use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_tool_name_char};
 use serde_json::{Map, Value, json};
@@ -39,17 +40,11 @@ pub(crate) fn encode(
     request: &ModelRequest,
     dialect: &Dialect,
 ) -> Result<Map<String, Value>, ProviderError> {
-    // History precedes the per-request tail so the tail never breaks a cached
-    // history prefix. Runtime state joins the final history turn, so only that
-    // turn is re-read.
     let mut messages = Vec::new();
     // One leading system message: many open-model chat templates reject
     // repeated or non-leading system turns.
     if let Some(text) = system_text(request) {
-        let role = match dialect.system {
-            SystemRole::System => "system",
-            SystemRole::Developer => "developer",
-        };
+        let role = system_role(dialect);
         let content = match dialect.cache {
             Cache::ContentPartBreakpoints { ttl }
                 if request.system.iter().any(|segment| segment.cache) =>
@@ -68,22 +63,25 @@ pub(crate) fn encode(
         messages.push(json!({"role": role, "content": content}));
     }
     let signed_only = signed_context(request, dialect.reasoning_replay.format().replay());
-    for message in &request.history {
-        push_message(request, dialect, signed_only, &mut messages, message)?;
+    let (prefix, rest) = sent(&request.context);
+    let send = |messages: &mut Vec<Value>, entry: &Entry| match entry {
+        Entry::Message(message) => push_message(request, dialect, signed_only, messages, message),
+        Entry::State(state) => {
+            push_state(dialect, messages, state);
+            Ok(())
+        }
+    };
+    for entry in prefix {
+        send(&mut messages, entry)?;
     }
-    // History is an unchanged prefix of later requests; detached history never is.
+    // The prefix is unchanged in later requests; a detached history never is.
     if let Cache::ContentPartBreakpoints { ttl } = dialect.cache
         && request.history_lifetime != HistoryLifetime::Detached
     {
         mark_last_cacheable(&mut messages, breakpoint(ttl));
     }
-    for message in &request.tail {
-        if attach_runtime_tail(&mut messages, message, "text", |item| {
-            (item["role"] == "tool").then(|| &mut item["content"])
-        }) {
-            continue;
-        }
-        push_message(request, dialect, signed_only, &mut messages, message)?;
+    for entry in rest {
+        send(&mut messages, entry)?;
     }
     flatten_text_content(&mut messages);
     let mut root = Map::new();
@@ -167,6 +165,35 @@ pub(crate) fn encode(
         }
     }
     Ok(root)
+}
+
+fn system_role(dialect: &Dialect) -> &'static str {
+    match dialect.system {
+        SystemRole::System => "system",
+        SystemRole::Developer => "developer",
+    }
+}
+
+/// A state the model reads, in the dialect's role: a message of the system prompt's role,
+/// or user content joining the user turn before it. Chat cannot hide a superseded state,
+/// so it is omitted.
+fn push_state(dialect: &Dialect, messages: &mut Vec<Value>, state: &State) {
+    if !state.is_read() {
+        return;
+    }
+    let text = || json!({"type": "text", "text": state.text});
+    match dialect.state_role {
+        StateRole::System => {
+            messages.push(json!({"role": system_role(dialect), "content": [text()]}));
+        }
+        StateRole::User => match messages.last_mut() {
+            Some(previous) if previous["role"] == "user" => previous["content"]
+                .as_array_mut()
+                .expect("constructed array")
+                .push(text()),
+            _ => messages.push(json!({"role": "user", "content": [text()]})),
+        },
+    }
 }
 
 fn push_message(
@@ -356,6 +383,7 @@ mod tests {
     };
     use super::*;
     use crate::provider::codec::common::tests::{envelope, image, notes, request};
+    use crate::provider::protocol::{entries, state};
     use crate::{
         media::AttachmentRef,
         provider::protocol::{
@@ -462,7 +490,7 @@ mod tests {
                 cache: false,
             },
         ];
-        request.history.extend([
+        request.context.extend(entries([
             Message::Assistant(vec![
                 AssistantItem::reasoning("r", 0, "summary", Some(signed)),
                 AssistantItem::reasoning(
@@ -484,10 +512,9 @@ mod tests {
                 is_error: false,
                 images: vec![],
             }]),
-        ]);
-        request.tail = vec![Message::User(vec![UserContent::Runtime {
-            text: "<state>".into(),
-        }])];
+        ]));
+        let current = crate::provider::protocol::StateLifetime::Current;
+        (request.context).push(state("<state>", current));
         let body = encode(&request, &claude).unwrap();
         let messages = body["messages"].as_array().unwrap();
         // Marked system segments keep their parts; the text-only replay is foreign here.
@@ -501,10 +528,10 @@ mod tests {
         assert_eq!(messages[1]["content"], "hello");
         assert_eq!(messages[2]["thinking_blocks"], json!([block]));
         assert!(messages[2].get("reasoning_content").is_none());
-        // The last history text (the tool result) takes the breakpoint, and the
-        // runtime tail joins it after the marked part.
+        // The tool result ends the prefix and takes the breakpoint; the request's own
+        // state follows as a user message, never inside the tool output.
         let parts = messages[3]["content"].as_array().unwrap();
-        assert_eq!(parts.len(), 2);
+        assert_eq!(parts.len(), 1);
         assert_eq!(parts[0]["cache_control"], json!({"type":"ephemeral"}));
         assert!(
             parts[0]["text"]
@@ -512,8 +539,8 @@ mod tests {
                 .unwrap()
                 .contains("\"result\":\"ok\"")
         );
-        assert_eq!(parts[1], json!({"type":"text","text":"<state>"}));
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[4], json!({"role":"user","content":"<state>"}));
+        assert_eq!(messages.len(), 5);
         request.history_lifetime = HistoryLifetime::Detached;
         let detached = encode(&request, &claude).unwrap();
         assert!(detached["messages"][3]["content"].is_string());
@@ -551,12 +578,12 @@ mod tests {
         let encode_turns = |dialect: &Dialect, turns: Vec<Message>| {
             let mut request = request("test-model");
             for turn in turns {
-                request.history.extend([
+                request.context.extend(entries([
                     turn,
                     Message::User(vec![UserContent::Text {
                         text: "next".into(),
                     }]),
-                ]);
+                ]));
             }
             let body = encode(&request, dialect).unwrap();
             let assistant: Vec<_> = body["messages"]
@@ -656,21 +683,23 @@ mod tests {
             text: "stable".into(),
             cache: true,
         }];
-        request.history.push(Message::Assistant(
-            details
-                .iter()
-                .enumerate()
-                .map(|(index, detail)| {
-                    let replay = envelope(
-                        ReplayFormat::ChatReasoningDetail,
-                        "test-model",
-                        detail.clone(),
-                        Binding::Conversation,
-                    );
-                    AssistantItem::reasoning(index.to_string(), index as u32, "", Some(replay))
-                })
-                .collect(),
-        ));
+        request
+            .context
+            .push(crate::provider::protocol::Entry::from(Message::Assistant(
+                details
+                    .iter()
+                    .enumerate()
+                    .map(|(index, detail)| {
+                        let replay = envelope(
+                            ReplayFormat::ChatReasoningDetail,
+                            "test-model",
+                            detail.clone(),
+                            Binding::Conversation,
+                        );
+                        AssistantItem::reasoning(index.to_string(), index as u32, "", Some(replay))
+                    })
+                    .collect(),
+            )));
         let body = encode(&request, &router).unwrap();
         assert_eq!(body["reasoning"], json!({"effort":"high"}));
         assert!(body.get("reasoning_effort").is_none());
@@ -703,7 +732,7 @@ mod tests {
 
     fn history(items: Vec<AssistantItem>) -> ModelRequest {
         ModelRequest {
-            history: vec![Message::Assistant(items)],
+            context: entries(vec![Message::Assistant(items)]),
             ..request("test-model")
         }
     }
@@ -728,7 +757,7 @@ mod tests {
             input_schema: schema.clone(),
         }];
         let attach = |attachment| UserContent::Attachment { attachment };
-        request.history = vec![
+        request.context = entries(vec![
             Message::User(vec![
                 UserContent::Text {
                     text: "look".into(),
@@ -747,7 +776,7 @@ mod tests {
                 is_error: true,
                 images: vec![image()],
             }]),
-        ];
+        ]);
         assert!(encode(&request, &unsupported()).is_err());
         // Load the fixture blobs as the session store would.
         request.blobs.insert(image().blob, b"\x01\x02\x03".to_vec());
@@ -880,7 +909,7 @@ mod tests {
         ];
         for mutation in mutations.map(Some).into_iter().chain([None]) {
             let mut request = original.clone();
-            let Message::Assistant(items) = &mut request.history[0] else {
+            let Some(Message::Assistant(items)) = request.messages_mut().next() else {
                 unreachable!()
             };
             let AssistantItem::Reasoning { replay, .. } = &mut items[0] else {
@@ -925,10 +954,12 @@ mod tests {
         assert!(!json!(body).to_string().contains("visible summary"));
     }
 
+    /// A state in the user role joins a user turn before it and is otherwise its own user
+    /// message, never part of a tool's output; in the system role it is a message of the
+    /// system prompt's role. A superseded state is omitted either way.
     #[test]
-    fn runtime_tail_joins_the_final_turn_instead_of_posing_as_the_user() {
-        let text = "<skyhook_state>";
-        let state = || Message::User(vec![UserContent::Runtime { text: text.into() }]);
+    fn states_take_the_dialects_role_and_never_join_tool_output() {
+        use crate::provider::protocol::{StateLifetime::*, state};
         let call = AssistantItem::tool_call("c", 0, inspect("call", json!({})));
         let result = Message::Tool(vec![ToolResult {
             call_id: "call".into(),
@@ -938,31 +969,30 @@ mod tests {
             is_error: false,
         }]);
         let mut req = history(vec![call]);
-        req.history.push(result);
-        let without_tail = encode(&req, &unsupported()).unwrap();
-        req.tail = vec![state()];
+        req.context.insert(0, state("earlier", Superseded));
+        req.context.extend([result.into(), state("now", Current)]);
         let body = encode(&req, &unsupported()).unwrap();
         let messages = body["messages"].as_array().unwrap();
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0], without_tail["messages"][0]);
-        let tool = without_tail["messages"][1]["content"].as_str().unwrap();
-        assert_eq!(messages[1]["content"], format!("{tool}\n\n{text}"));
-        // A user turn gains a part; an instruction or an assistant turn keeps its own message.
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], "tool");
+        assert!(!messages[1]["content"].as_str().unwrap().contains("now"));
+        assert_eq!(messages[2], json!({"role":"user","content":"now"}));
+        assert!(!json!(body).to_string().contains("earlier"));
+        let system = Dialect {
+            state_role: StateRole::System,
+            ..unsupported()
+        };
+        let body = encode(&req, &system).unwrap();
+        assert_eq!(
+            body["messages"][2],
+            json!({"role":"system","content":"now"})
+        );
         let mut req = request("test-model");
-        req.tail = vec![state()];
+        req.context.push(state("now", Current));
         let body = encode(&req, &unsupported()).unwrap();
         assert_eq!(
             body["messages"],
-            json!([{"role":"user","content":format!("hello\n\n{text}")}])
+            json!([{"role":"user","content":"hello\n\nnow"}])
         );
-        req.tail.push(Message::User(vec![UserContent::Text {
-            text: "compact".into(),
-        }]));
-        let body = encode(&req, &unsupported()).unwrap();
-        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
-        let mut req = history(vec![AssistantItem::text("t", 0, "done")]);
-        req.tail = vec![state()];
-        let body = encode(&req, &unsupported()).unwrap();
-        assert_eq!(body["messages"][1]["role"], "user");
     }
 }

@@ -850,7 +850,7 @@ mod tests {
             assert_eq!(started, depth as usize + 1, "every link launched once");
             let child = ContextId::from(&last.child(1));
             let first = (provider.requests.lock().unwrap()[served..].iter())
-                .find(|served| served.context == child)
+                .find(|served| served.context_id == child)
                 .map(|served| rendered(&served.request));
             assert!(first.unwrap().contains("last"));
             shutdown_session(resumed).await;

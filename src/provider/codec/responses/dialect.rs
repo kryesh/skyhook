@@ -1,6 +1,6 @@
 //! The conventions that vary between Responses servers.
 use crate::provider::codec::{
-    BodyPath, CacheKey, Effort, Identity, OPENAI_EFFORT, ToolNames, path,
+    BodyPath, CacheKey, Effort, Identity, OPENAI_EFFORT, StateRole, ToolNames, path,
 };
 
 /// Whether `instructions` is sent without system segments.
@@ -51,6 +51,7 @@ pub(crate) struct Dialect {
     /// events still fail.
     pub metadata_events: &'static [&'static str],
     pub tool_names: ToolNames,
+    pub state_role: StateRole,
 }
 
 impl Dialect {
@@ -72,6 +73,7 @@ impl Dialect {
             terminal_output: TerminalOutput::Restated,
             metadata_events: &[],
             tool_names: ToolNames::Any,
+            state_role: StateRole::User,
         }
     }
 }

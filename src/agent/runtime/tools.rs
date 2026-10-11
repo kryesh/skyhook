@@ -999,7 +999,7 @@ for line in sys.stdin:
             };
             assert_eq!((offers(0), offers(1)), (false, true));
             let Some(crate::provider::protocol::Message::Tool(results)) =
-                captured[2].history.last()
+                captured[2].messages().last()
             else {
                 panic!("expected the refused delegation");
             };

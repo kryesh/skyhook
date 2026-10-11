@@ -140,57 +140,6 @@ pub(crate) fn tool_text(tool: &ToolResult) -> String {
     json!({"result":tool.result,"is_error":tool.is_error}).to_string()
 }
 
-/// Attach a runtime-only tail message to the last encoded item when that item is a
-/// user turn or a tool output. Sent as its own user message, each request's state
-/// reads to the model as the user speaking again after every tool call. Returns false
-/// when the message must be encoded standalone.
-pub(crate) fn attach_runtime_tail(
-    items: &mut [Value],
-    message: &Message,
-    text_type: &str,
-    tool_output: fn(&mut Value) -> Option<&mut Value>,
-) -> bool {
-    let Message::User(parts) = message else {
-        return false;
-    };
-    let texts: Option<Vec<_>> = parts
-        .iter()
-        .map(|part| part.is_runtime().then(|| part.text().ok()).flatten())
-        .collect();
-    let (Some(texts), Some(last)) = (texts.filter(|texts| !texts.is_empty()), items.last_mut())
-    else {
-        return false;
-    };
-    if last["role"] == "user"
-        && let Some(content) = last["content"].as_array_mut()
-    {
-        content.extend(
-            texts
-                .into_iter()
-                .map(|text| json!({"type": text_type, "text": text})),
-        );
-        return true;
-    }
-    match tool_output(last) {
-        Some(Value::String(output)) => {
-            for text in texts {
-                output.push_str("\n\n");
-                output.push_str(&text);
-            }
-            true
-        }
-        Some(Value::Array(parts)) => {
-            parts.extend(
-                texts
-                    .into_iter()
-                    .map(|text| json!({"type": text_type, "text": text})),
-            );
-            true
-        }
-        _ => false,
-    }
-}
-
 pub(crate) fn position(index: usize) -> Result<Position, ProviderError> {
     Position::try_from(index).map_err(|error| ProviderErrorKind::Protocol.error(error.to_string()))
 }
@@ -272,7 +221,8 @@ impl Finish {
         match reason {
             Some(StopReason::Normal) => Self::Normal,
             Some(StopReason::MaxTokens) => Self::Cut(CutReason::MaxTokens),
-            Some(StopReason::Aborted) => Self::Cut(CutReason::Aborted),
+            // The service gave up on the response; retrying the request is standard.
+            Some(StopReason::Aborted) => Self::Error(ProviderErrorKind::Unavailable),
             Some(StopReason::Refusal) => Self::Cut(CutReason::Refusal),
             // An overflow fails the attempt: its output is discarded and the context compacted.
             Some(StopReason::ContextWindow) => {
@@ -553,9 +503,11 @@ pub(crate) mod tests {
     /// inputs relevant to the behavior under test.
     pub(crate) fn request(model: &str) -> ModelRequest {
         ModelRequest {
-            history: vec![Message::User(vec![UserContent::Text {
-                text: "hello".into(),
-            }])],
+            context: crate::provider::protocol::entries(vec![Message::User(vec![
+                UserContent::Text {
+                    text: "hello".into(),
+                },
+            ])]),
             max_output_tokens: std::num::NonZeroU64::new(8192),
             ..ModelRequest::test(model)
         }

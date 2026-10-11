@@ -1,6 +1,6 @@
 use crate::text::duration;
 use chrono::{DateTime, Datelike, NaiveDate, TimeDelta, TimeZone};
-use skyhook::provider::protocol::Usage;
+use skyhook::provider::protocol::UsageTotals;
 pub use skyhook::session::stats::agent_label;
 pub fn number(n: u64) -> String {
     if n >= 1_000_000 {
@@ -12,11 +12,11 @@ pub fn number(n: u64) -> String {
         n.to_string()
     }
 }
-pub fn footer(usage: Usage, context: Option<(u64, u64)>) -> String {
+pub fn footer(usage: UsageTotals, context: Option<(u64, u64)>) -> String {
     footer_stats(usage, context).join(" · ")
 }
 
-pub fn footer_stats(usage: Usage, context: Option<(u64, u64)>) -> [String; 3] {
+pub fn footer_stats(usage: UsageTotals, context: Option<(u64, u64)>) -> [String; 3] {
     let context =
         context
             .filter(|(_, capacity)| *capacity > 0)

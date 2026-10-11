@@ -1,10 +1,11 @@
-//! Reconstruct model-visible history and exact provider requests from durable events.
+//! Validate the journal's history rules and reconstruct exact provider requests from it.
 use crate::{
     identity::AgentId,
     provider::{profile::ModelRef, protocol::ModelRequest},
     session::Message,
 };
 
+use super::projection::{Projected, Projection, ledger, mode_boundary};
 use super::{EventRecord, ModelContext, ModelPurpose, SessionError, SessionEvent};
 use crate::session::{MessageSeq, RecordSeq, RequestSeq};
 
@@ -33,71 +34,6 @@ pub fn request_context<'a>(
     }
 }
 
-/// One agent's model-visible history: its latest checkpoint's sequence, if any, and
-/// the messages in order, the checkpoint's own message first.
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct Projection {
-    pub checkpoint: Option<RecordSeq>,
-    /// Each message with the record that carries it: a commit, or the checkpoint.
-    pub messages: Vec<(RecordSeq, Message)>,
-}
-
-impl Projection {
-    /// The last committed message after the checkpoint, which bounds a request's history.
-    #[must_use]
-    pub fn through(&self) -> Option<MessageSeq> {
-        let start = usize::from(self.checkpoint.is_some());
-        let (sequence, _) = self.messages[start..].last()?;
-        Some(sequence.message())
-    }
-
-    pub fn history(&self) -> impl Iterator<Item = &Message> {
-        self.messages.iter().map(|(_, message)| message)
-    }
-}
-
-/// Committed history as a provider receives it. Tool results are committed one
-/// message per call as each call finishes; providers receive one tool message per
-/// exchange, ordered like the calls that produced it.
-#[must_use]
-pub fn render_history<M: std::borrow::Borrow<Message>>(
-    messages: impl IntoIterator<Item = M>,
-) -> Vec<crate::provider::protocol::Message> {
-    use crate::provider::protocol::Message;
-    let mut merged: Vec<Message> = Vec::new();
-    let mut calls: Vec<String> = Vec::new();
-    for message in messages {
-        match message.borrow().render() {
-            Message::Tool(results) => {
-                if let Some(Message::Tool(previous)) = merged.last_mut() {
-                    previous.extend(results);
-                } else {
-                    merged.push(Message::Tool(results));
-                }
-                if let Some(Message::Tool(results)) = merged.last_mut() {
-                    results.sort_by_key(|result| {
-                        calls
-                            .iter()
-                            .position(|call| call == &result.call_id)
-                            .unwrap_or(usize::MAX)
-                    });
-                }
-            }
-            message => {
-                if let Message::Assistant(items) = &message {
-                    calls = items
-                        .iter()
-                        .filter_map(|item| item.call())
-                        .map(|call| call.id().to_owned())
-                        .collect();
-                }
-                merged.push(message);
-            }
-        }
-    }
-    merged
-}
-
 /// Validate a decoded journal's order-dependent rules, as append validates live
 /// records, so what a store hands out always projects.
 pub(super) fn admit_records(records: Vec<EventRecord>) -> Result<Vec<EventRecord>, SessionError> {
@@ -105,64 +41,6 @@ pub(super) fn admit_records(records: Vec<EventRecord>) -> Result<Vec<EventRecord
         validate(&records[..index], &[], record)?;
     }
     Ok(records)
-}
-
-/// Project the latest committed compaction and subsequent messages for one agent.
-/// Checkpoints were validated when appended or loaded, so a journal always projects.
-#[must_use]
-pub fn project_history(records: &[EventRecord], agent: &AgentId) -> Projection {
-    let checkpoint = records.iter().rposition(|record| {
-        &record.agent == agent && matches!(record.event, SessionEvent::Compaction { .. })
-    });
-    let mut result = Projection::default();
-    let frontier = if let Some(index) = checkpoint {
-        let record = &records[index];
-        let SessionEvent::Compaction { checkpoint } = &record.event else {
-            unreachable!()
-        };
-        result.checkpoint = Some(record.sequence);
-        result
-            .messages
-            .push((record.sequence, checkpoint.message.clone()));
-        for sequence in &checkpoint.retained {
-            let source = record_at(&records[..index], (*sequence).into())
-                .expect("retained sources were validated when the checkpoint was appended");
-            let SessionEvent::MessageCommitted { message } = &source.event else {
-                unreachable!()
-            };
-            let message = message.clone().without_bound_reasoning();
-            result.messages.push(((*sequence).into(), message));
-        }
-        checkpoint.frontier
-    } else {
-        RecordSeq::default()
-    };
-    let switched = mode_boundary(records, agent);
-    result.messages.extend(records.iter().filter_map(|record| {
-        if &record.agent == agent
-            && record.sequence > frontier
-            && let SessionEvent::MessageCommitted { message } = &record.event
-        {
-            let message = message.clone();
-            let message = if record.sequence < switched {
-                message.without_bound_reasoning()
-            } else {
-                message
-            };
-            return Some((record.sequence, message));
-        }
-        None
-    }));
-    result
-}
-
-/// A mode switch replaces the system prompt and tools, which invalidates bound
-/// reasoning before it exactly as compaction does.
-fn mode_boundary(records: &[EventRecord], agent: &AgentId) -> RecordSeq {
-    let switched = records.iter().rev().find(|record| {
-        &record.agent == agent && matches!(record.event, SessionEvent::ModeChanged { .. })
-    });
-    switched.map_or(RecordSeq::default(), |record| record.sequence)
 }
 
 crate::named_enum::named_enum! {
@@ -380,6 +258,10 @@ pub enum ReplayError {
     NotMessage,
     #[error("history must end at a message of the same agent's history under the checkpoint")]
     Through,
+    #[error(
+        "only a summary may drop older history, resuming after its opening exchange and never at tool results"
+    )]
+    From,
 }
 
 /// The history a `ModelRequested` record names: its context, then its checkpoint's
@@ -401,6 +283,7 @@ fn request_history<'a>(
         context,
         checkpoint,
         through,
+        from,
         ..
     } = &record.event
     else {
@@ -419,14 +302,22 @@ fn request_history<'a>(
         })) => (Some(checkpoint.frontier), &checkpoint.retained[..]),
         Some(_) => return Err(ReplayError::Checkpoint),
     };
+    // The history's end is a message it projects.
     if let Some(through) = *through {
         let projected = retained.contains(&through)
             || frontier.is_none_or(|frontier| RecordSeq::from(through) > frontier);
-        let message = own(through.into())
-            .is_some_and(|found| matches!(found.event, SessionEvent::MessageCommitted { .. }));
-        if !(projected && message) {
+        let committed = matches!(
+            own(through.into()).map(|found| &found.event),
+            Some(SessionEvent::MessageCommitted { .. })
+        );
+        if !(projected && committed) {
             return Err(ReplayError::Through);
         }
+    }
+    // Only a summary drops older history, which invalidates no reasoning it replays;
+    // reconstruction checks that it resumes at a cut `Projection::trim` could make.
+    if from.is_some() && context.purpose != ModelPurpose::Compaction {
+        return Err(ReplayError::From);
     }
     Ok(RequestHistory {
         context,
@@ -452,6 +343,7 @@ pub fn reconstruct_model_request(
     let SessionEvent::ModelRequested {
         checkpoint,
         through,
+        from,
         tail,
         history_lifetime,
         ..
@@ -476,7 +368,8 @@ pub fn reconstruct_model_request(
         .chain(later.map(|record| record.sequence.message()))
         .map(RecordSeq::from);
     let switched = mode_boundary(earlier, &call.agent);
-    let mut history = Vec::new();
+    let ledger = ledger(earlier);
+    let mut history = Projection::default();
     for source in checkpoint.iter().copied().chain(sources) {
         let record = lookup(source)
             .filter(|record| record.agent == call.agent)
@@ -486,20 +379,26 @@ pub fn reconstruct_model_request(
             SessionEvent::Compaction { checkpoint } => &checkpoint.message,
             _ => return Err(invalid(ReplayError::NotMessage)),
         };
-        // As in projection and summaries, bound reasoning never enters a changed conversation.
+        // As in projection, the checkpoint's message and bound reasoning before it never
+        // enter a changed conversation, and a summary drops tools, which changes the
+        // conversation for all of it.
         let changed = context.purpose == ModelPurpose::Compaction
+            || *checkpoint == Some(source)
             || source < switched
             || frontier.is_some_and(|last| source <= last);
-        let message = message.clone();
-        history.push(if changed {
-            message.without_bound_reasoning()
+        history.messages.push(if changed {
+            Projected::unbound(source, message.clone())
         } else {
-            message
+            Projected::bound(&ledger, earlier, source, message)
         });
     }
+    if let Some(from) = *from
+        && !history.trim_from(from)
+    {
+        return Err(invalid(ReplayError::From));
+    }
     let request = ModelRequest {
-        history: render_history(history),
-        tail: tail.iter().map(Message::render).collect(),
+        context: history.context(tail),
         history_lifetime: *history_lifetime,
         ..context.template()
     };
@@ -509,67 +408,22 @@ pub fn reconstruct_model_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider::protocol::StateLifetime;
+    use crate::session::CompactionTrigger;
+    use crate::session::{
+        project_history,
+        tests::{committed, context, requested_history, sequences, text_message},
+    };
     use crate::{
         agent::{TodoItem, TodoStatus},
         identity::AgentId,
         provider::codec::common::tests::envelope,
         provider::protocol::{
-            AssistantItem, Binding, HistoryLifetime, ReplayFormat, SystemSegment, ToolCall,
-            ToolDefinition, ToolResult,
+            AssistantItem, Binding, HistoryLifetime, ReplayFormat, ToolCall, ToolResult,
         },
         session::{AttemptRef, CompactionCheckpoint, SessionStore, UserPart, tests::MemorySession},
     };
     use serde_json::json;
-
-    fn text_message(text: &str) -> Message {
-        Message::User(vec![UserPart::Text { text: text.into() }])
-    }
-
-    fn committed(message: Message) -> SessionEvent {
-        SessionEvent::MessageCommitted { message }
-    }
-
-    fn requested(
-        context: RecordSeq,
-        checkpoint: Option<RecordSeq>,
-        history: &[RecordSeq],
-        tail: &str,
-        history_lifetime: HistoryLifetime,
-    ) -> SessionEvent {
-        SessionEvent::ModelRequested {
-            context,
-            checkpoint,
-            through: history.last().map(|source| source.message()),
-            tail: vec![text_message(tail)],
-            history_lifetime,
-        }
-    }
-
-    fn context(purpose: ModelPurpose, provider: &str, model: &str, system: &str) -> SessionEvent {
-        let mut profile = crate::session::tests::profile();
-        profile.name.provider = provider.parse().unwrap();
-        profile.profile.model = model.parse().unwrap();
-        profile.profile.reasoning = Some("high".into());
-        SessionEvent::ModelContext {
-            context: crate::session::ModelContext {
-                purpose,
-                profile,
-                system: vec![SystemSegment {
-                    text: system.into(),
-                    cache: true,
-                }],
-                tools: vec![ToolDefinition {
-                    name: "read".into(),
-                    description: "original description".into(),
-                    input_schema: json!({"type":"object"}),
-                }],
-                response_schema: Some(crate::provider::protocol::ResponseSchema {
-                    name: "answer".into(),
-                    schema: json!({"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}),
-                }),
-            },
-        }
-    }
 
     fn todo(text: &str) -> TodoItem {
         TodoItem {
@@ -647,7 +501,7 @@ mod tests {
         let child_context = append(&child, original).await;
         let child_message = append(&child, committed(text_message("child only"))).await;
         let history_lifetime = HistoryLifetime::Detached;
-        let request = requested(
+        let request = requested_history(
             context.sequence,
             None,
             &sources,
@@ -667,7 +521,7 @@ mod tests {
             ),
             (context.sequence, &[context.sequence], ReplayError::Through),
         ] {
-            let request = requested(context, None, history, "state", history_lifetime);
+            let request = requested_history(context, None, history, "state", history_lifetime);
             let rejected = refused(&store, &agent, request);
             assert!(
                 matches!(rejected, Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected),
@@ -681,14 +535,19 @@ mod tests {
             reconstruct_model_request(&records, call.sequence.request()).unwrap();
         assert_eq!(model.to_string(), "original-provider/test");
         let mut expected = template;
-        (expected.history, expected.history_lifetime) = (
-            vec![user.render(), assistant.render(), tool.render()],
-            history_lifetime,
-        );
-        expected.tail = vec![text_message("exact call-time state").render()];
+        let messages = [
+            &user,
+            &assistant,
+            &tool,
+            &text_message("exact call-time state"),
+        ];
+        expected.context = (messages.into_iter())
+            .map(|message| message.entry(StateLifetime::Persisted))
+            .collect();
+        expected.history_lifetime = history_lifetime;
         assert_eq!(restored, expected);
         // Value equality ignores key order and the sign of zero; the wire bytes must not.
-        let wire = |request: &ModelRequest| serde_json::to_string(&request.history[1]).unwrap();
+        let wire = |request: &ModelRequest| serde_json::to_string(&request.context[1]).unwrap();
         assert_eq!(wire(&restored), wire(&expected));
         let mut cache = crate::media::LoadedBlobs::default();
         store.load_blobs(&mut restored, &mut cache).await.unwrap();
@@ -732,135 +591,6 @@ mod tests {
         )
     }
 
-    fn projection_fixture() -> (AgentId, Vec<EventRecord>) {
-        let agent = AgentId::root(crate::identity::SessionId::generate().unwrap());
-        let checkpoint = CompactionCheckpoint {
-            todos: Vec::new(),
-            frontier: 2.into(),
-            message: text_message("first summary"),
-            retained: vec![1.into()],
-            attempt: AttemptRef {
-                request: 5.into(),
-                attempt: 1,
-            },
-            before_tokens: 100_000,
-            after_tokens: 10_000,
-        };
-        let summary = |checkpoint: Option<u64>, history: &[u64], tail| {
-            let history: Vec<RecordSeq> = history.iter().copied().map(Into::into).collect();
-            let checkpoint = checkpoint.map(Into::into);
-            requested(
-                4.into(),
-                checkpoint,
-                &history,
-                tail,
-                HistoryLifetime::Detached,
-            )
-        };
-        let events = vec![
-            committed(text_message("verbatim plan")),
-            committed(text_message("research")),
-            context(ModelPurpose::Agent, "provider", "model", "system"),
-            context(ModelPurpose::Compaction, "provider", "model", "system"),
-            summary(None, &[1, 2], "summarize"),
-            committed(text_message("concurrent steering")),
-            SessionEvent::Compaction {
-                checkpoint: checkpoint.clone(),
-            },
-            committed(text_message("continued work")),
-            summary(Some(7), &[1, 6, 8], "state at request time"),
-            SessionEvent::Compaction {
-                checkpoint: CompactionCheckpoint {
-                    frontier: 8.into(),
-                    message: text_message("second summary with inherited plan"),
-                    retained: vec![1.into(), 6.into()],
-                    attempt: AttemptRef {
-                        request: 9.into(),
-                        attempt: 1,
-                    },
-                    ..checkpoint
-                },
-            },
-        ];
-        let records = events
-            .into_iter()
-            .enumerate()
-            .map(|(index, event)| crate::session::tests::record(&agent, index as u64 + 1, event))
-            .collect();
-        (agent, records)
-    }
-
-    fn sequences(projection: &Projection) -> Vec<u64> {
-        projection
-            .messages
-            .iter()
-            .map(|(sequence, _)| sequence.get())
-            .collect()
-    }
-
-    #[test]
-    fn projection_preserves_concurrent_messages_and_repeated_compaction() {
-        let (agent, records) = projection_fixture();
-        let early = project_history(&records[..6], &agent);
-        assert_eq!((early.checkpoint, sequences(&early)), (None, vec![1, 2, 6]));
-        assert_eq!(early.through(), Some(RecordSeq::from(6).message()));
-        let first = project_history(&records[..8], &agent);
-        assert_eq!(
-            (first.checkpoint, sequences(&first)),
-            (Some(7.into()), vec![7, 1, 6, 8])
-        );
-        assert_eq!(first.through(), Some(RecordSeq::from(8).message()));
-        assert_eq!(
-            (&first.messages[1].1, &first.messages[2].1),
-            (
-                &text_message("verbatim plan"),
-                &text_message("concurrent steering")
-            )
-        );
-        let second = project_history(&records, &agent);
-        assert_eq!(
-            (second.checkpoint, sequences(&second)),
-            (Some(10.into()), vec![10, 1, 6])
-        );
-        assert_eq!(second.messages[1].1, text_message("verbatim plan"));
-        assert!(
-            project_history(&records, &agent.child(1))
-                .messages
-                .is_empty()
-        );
-        // Reconstruction resolves the same checkpoint and history bound, and rejects a
-        // checkpoint that is not the agent's, or a bound its history does not hold.
-        use ReplayError::{Checkpoint, Through};
-        for (checkpoint, through, expected) in [
-            (3u64, 8u64, Some(Checkpoint)),
-            (9, 8, Some(Checkpoint)),
-            (7, 1, None),
-            (7, 2, Some(Through)),
-            (7, 4, Some(Through)),
-            (7, 20, Some(Through)),
-        ] {
-            let mut invalid = records.clone();
-            let SessionEvent::ModelRequested {
-                checkpoint: named,
-                through: bound,
-                ..
-            } = &mut invalid[8].event
-            else {
-                unreachable!()
-            };
-            *named = Some(checkpoint.into());
-            *bound = Some(RecordSeq::from(through).message());
-            let replayed = reconstruct_model_request(&invalid, 9.into());
-            match expected {
-                None => assert!(replayed.is_ok()),
-                Some(expected) => assert!(matches!(
-                    replayed,
-                    Err(SessionError::ModelRequestReplay { reason, .. }) if reason == expected
-                )),
-            }
-        }
-    }
-
     /// Checkpoints are validated when appended, so a journal always projects.
     #[tokio::test]
     async fn invalid_compactions_are_refused() {
@@ -902,9 +632,15 @@ mod tests {
             .unwrap();
         let sources = [calls, first, second, research];
         let extends = HistoryLifetime::Extends;
-        let request = append(requested(agent_context, None, &sources, "state", extends))
-            .await
-            .unwrap();
+        let request = append(requested_history(
+            agent_context,
+            None,
+            &sources,
+            "state",
+            extends,
+        ))
+        .await
+        .unwrap();
         let attempt = |request: RecordSeq| {
             SessionEvent::ModelAttemptStarted(AttemptRef {
                 request: request.request(),
@@ -913,9 +649,15 @@ mod tests {
         };
         append(attempt(request)).await.unwrap();
         let detached = HistoryLifetime::Detached;
-        let summary = append(requested(summary_context, None, &sources, "sum", detached))
-            .await
-            .unwrap();
+        let summary = append(requested_history(
+            summary_context,
+            None,
+            &sources,
+            "sum",
+            detached,
+        ))
+        .await
+        .unwrap();
         append(attempt(summary)).await.unwrap();
         let checkpoint = |frontier: RecordSeq, retained: Vec<RecordSeq>, request: RecordSeq| {
             CompactionCheckpoint {
@@ -927,8 +669,7 @@ mod tests {
                     request: request.request(),
                     attempt: 1,
                 },
-                before_tokens: 100,
-                after_tokens: 10,
+                trigger: CompactionTrigger::Occupancy(100),
             }
         };
         let valid = checkpoint(todos, vec![calls, first, second], summary);
@@ -982,7 +723,7 @@ mod tests {
         ));
         // A checkpoint may name a summary request committed in its own batch.
         let owner = agent.clone();
-        let summary = requested(summary_context, None, &sources, "sum", detached);
+        let summary = requested_history(summary_context, None, &sources, "sum", detached);
         let batch = store.append_then(agent.clone(), summary, move |request| {
             let checkpoint = checkpoint(todos, vec![calls, first, second], request);
             let compaction = SessionEvent::Compaction { checkpoint };
@@ -1043,7 +784,7 @@ mod tests {
             let context_sequence = frontier.next();
             events.push(context(ModelPurpose::Compaction, "p", "m", "s"));
             let summary = context_sequence.next();
-            events.push(requested(
+            events.push(requested_history(
                 context_sequence,
                 None,
                 &[],
@@ -1060,8 +801,7 @@ mod tests {
                         request: summary.request(),
                         attempt: 1,
                     },
-                    before_tokens: 100,
-                    after_tokens: 10,
+                    trigger: CompactionTrigger::Occupancy(100),
                 },
             });
             let records = events
@@ -1081,79 +821,5 @@ mod tests {
                 "{results:?}, trailing={trailing}: {admitted:?}"
             );
         }
-    }
-
-    #[test]
-    fn bound_reasoning_does_not_survive_compaction() {
-        let (agent, mut records) = projection_fixture();
-        let replay = |binding| {
-            envelope(
-                ReplayFormat::Messages,
-                "model",
-                json!({"signature":"opaque"}),
-                binding,
-            )
-        };
-        let (portable, bound) = (replay(Binding::Free), replay(Binding::Conversation));
-        let message = |replay| {
-            Message::Assistant(vec![
-                AssistantItem::reasoning("bound", 0, "visible", replay),
-                AssistantItem::reasoning("portable", 1, "kept", Some(portable.clone())),
-                AssistantItem::text("said", 2, "answer"),
-            ])
-        };
-        let (signed, stripped) = (message(Some(bound)), message(None));
-        records[0].event = committed(signed.clone());
-        // Retained after each checkpoint, and sent without it by both summary requests.
-        assert_eq!(project_history(&records, &agent).messages[1].1, stripped);
-        for (request, index) in [(5, 0), (9, 1)] {
-            let (_, request) = reconstruct_model_request(&records, request.into()).unwrap();
-            assert_eq!(request.history[index], stripped.render());
-        }
-        // Bound reasoning after the latest checkpoint is kept; replay matches projection.
-        let append = |records: &mut Vec<EventRecord>, sequence: u64, event: SessionEvent| {
-            let mut record = records[8].clone();
-            (record.sequence, record.event) = (sequence.into(), event);
-            records.push(record);
-        };
-        append(&mut records, 11, committed(signed.clone()));
-        let lifetime = HistoryLifetime::Extends;
-        let state = |sources: &[u64]| {
-            let sources: Vec<RecordSeq> = sources.iter().copied().map(Into::into).collect();
-            requested(3.into(), Some(10.into()), &sources, "state", lifetime)
-        };
-        append(&mut records, 12, state(&[1, 6, 11]));
-        let projected = project_history(&records, &agent);
-        assert_eq!(projected.messages[3].1, signed);
-        let replays_projection = |records: &[EventRecord], request: u64, projected: &Projection| {
-            let (_, request) = reconstruct_model_request(records, request.into()).unwrap();
-            let rendered: Vec<_> = projected
-                .history()
-                .map(|message| message.render())
-                .collect();
-            assert_eq!(request.history, rendered);
-        };
-        replays_projection(&records, 12, &projected);
-        // A mode switch changes the conversation too: bound reasoning before it is
-        // dropped from later requests, while the earlier request replays as sent.
-        let mode = crate::session::ModeSelection {
-            name: "plan".parse().unwrap(),
-            definition: None,
-        };
-        let capabilities = Vec::new();
-        append(
-            &mut records,
-            13,
-            SessionEvent::ModeChanged { mode, capabilities },
-        );
-        append(&mut records, 14, committed(signed.clone()));
-        append(&mut records, 15, state(&[1, 6, 11, 14]));
-        let switched = project_history(&records, &agent);
-        assert_eq!(
-            (&switched.messages[3].1, &switched.messages[4].1),
-            (&stripped, &signed)
-        );
-        replays_projection(&records, 15, &switched);
-        replays_projection(&records, 12, &projected);
     }
 }

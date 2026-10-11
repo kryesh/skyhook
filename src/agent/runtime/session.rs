@@ -768,6 +768,47 @@ mod tests {
         shutdown_session(resumed).await;
     }
 
+    /// A mode pins its prompt and tools with a context of its own, even one equal to
+    /// the previous mode's: resume restores them from it.
+    #[tokio::test]
+    async fn a_mode_switch_journals_its_own_context_even_when_equal() {
+        use crate::tool::policy::{Capability, CapabilitySet, Mode};
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let requests = Requests::default();
+        let same = Mode {
+            capabilities: vec![Capability::Read],
+            instructions: None,
+            hint: None,
+        };
+        let modes: indexmap::IndexMap<_, _> =
+            [(mode_name("a"), same.clone()), (mode_name("b"), same)].into();
+        let provider = scripted_provider(&requests, [answer("first"), answer("second")]);
+        let session = test_builder(root.path(), &sessions, provider, false)
+            .capabilities(CapabilitySet::default())
+            .modes(modes)
+            .build()
+            .await
+            .unwrap()
+            .new_session()
+            .await
+            .unwrap();
+        session.prompt("first").await.unwrap();
+        let b = session.selection(None, Some(&mode_name("b"))).unwrap();
+        session.prompt_with_options("second", &[], b).await.unwrap();
+        let records = session.runtime.store.records();
+        let switched = records
+            .iter()
+            .position(|record| matches!(record.event, SessionEvent::ModeChanged { .. }))
+            .unwrap();
+        let repinned = records[switched..].iter().any(|record| {
+            matches!(&record.event, SessionEvent::ModelContext { context }
+                if context.purpose == crate::session::ModelPurpose::Agent)
+        });
+        assert!(repinned);
+        session.shutdown().await.unwrap();
+    }
+
     /// A mode consumed at a request boundary narrows the root's next tool call and its
     /// host scripts, while a child it already started keeps what it was given.
     #[tokio::test]
@@ -964,8 +1005,7 @@ mod tests {
         again.await.unwrap();
         assert!(
             requests.lock().unwrap()[1]
-                .history
-                .iter()
+                .messages()
                 .any(|message| matches!(message,
             Sent::User(parts) if parts.iter().any(SentPart::is_image)))
         );

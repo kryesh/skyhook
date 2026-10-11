@@ -350,9 +350,7 @@ mod tests {
         use crate::provider::protocol::{Message as Sent, UserContent};
         // Its history ends with the results; only the transient state follows them.
         let runtime = |message: &&Sent| match message {
-            Sent::User(parts) => parts
-                .iter()
-                .all(|part| matches!(part, UserContent::Runtime { .. })),
+            Sent::User(parts) => parts.iter().all(UserContent::is_runtime),
             _ => false,
         };
         let history = last.messages().rev().find(|message| !runtime(message));
@@ -874,7 +872,7 @@ mod tests {
         let captured = requests.lock().unwrap().clone();
         assert_eq!(captured[1].tools, original.tools);
         assert_eq!(captured[1].system, original.system);
-        let Some(Sent::Tool(results)) = captured[2].history.last() else {
+        let Some(Sent::Tool(results)) = captured[2].messages().last() else {
             panic!("expected the write result");
         };
         assert!(results[0].is_error);
@@ -1032,9 +1030,9 @@ mod tests {
         let child = captured
             .iter()
             .rev()
-            .find(|request| request.context != ContextId::from(&resumed.root))
+            .find(|request| request.context_id != ContextId::from(&resumed.root))
             .expect("the child made a request after the restart");
-        let history = serde_json::to_string(&child.history).unwrap();
+        let history = serde_json::to_string(&child.context).unwrap();
         assert!(history.contains("work") && history.contains("child done"));
         assert!(history.contains("Owner input"));
         shutdown_session(resumed).await;
@@ -1270,7 +1268,9 @@ mod tests {
             let captured = requests.lock().unwrap();
             assert_eq!(captured.len(), 4, "exactly one resumed provider invocation");
             let first = &captured[3];
-            assert_eq!(first.history.first(), Some(&checkpoint.message.render()));
+            let persisted = crate::provider::protocol::StateLifetime::Persisted;
+            let opening = checkpoint.message.entry(persisted);
+            assert_eq!(first.context.first(), Some(&opening));
             assert_eq!(first.system, prior_request.system);
             assert_eq!(first.tools, prior_request.tools);
             assert_eq!(first.model, prior_request.model);

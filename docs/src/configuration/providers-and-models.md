@@ -16,12 +16,12 @@ Different models on one provider may use different supported codecs:
 
 | Dialect | Codecs | Use for |
 | --- | --- | --- |
-| `compatible` | any | Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only `base_url`. A key is sent as each API specifies: a bearer token, or `x-api-key` on `messages`. |
-| `openai` | `chat_completions`, `responses` | `https://api.openai.com/v1`. Response schemas must fit OpenAI's strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: `reasoning_summary: unsupported` (default `requested`) for an unverified organisation (Responses only), `organization`, `project`. |
-| `anthropic` | `messages` | `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`. |
+| `compatible` | any | Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only `base_url`. A key is sent as each API specifies: a bearer token, or `x-api-key` on `messages`. Extra field: `state_role` (default `user`). |
+| `openai` | `chat_completions`, `responses` | `base_url` defaults to `https://api.openai.com/v1`. Response schemas must fit OpenAI's strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: `reasoning_summary: unsupported` (default `requested`) for an unverified organisation (Responses only), `organization`, `project`. |
+| `anthropic` | `messages` | `base_url` defaults to `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`, `state_role` (default `system`). |
 | `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login <provider>`. `base_url` defaults to the ChatGPT backend root `https://chatgpt.com/backend-api` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. |
-| `openrouter` | any | `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: `routing` (Chat only: `order`, `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, `fallback_models`) and `cache_ttl: "5m"` or `"1h"`. A response schema always sets `require_parameters`. |
-| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; `messages` behind an OpenAI upstream goes through the proxy's translation, which drops reasoning. Optional `tags` select LiteLLM's tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session. |
+| `openrouter` | any | `base_url` defaults to `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: `routing` (Chat only: `order`, `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, `fallback_models`), `cache_ttl: "5m"` or `"1h"`, and `state_role` (default `user`). A response schema always sets `require_parameters`. |
+| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; `messages` behind an OpenAI upstream goes through the proxy's translation, which drops reasoning. Optional `tags` select LiteLLM's tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session. Extra field: `state_role` (default `user`). |
 
 Every dialect but `codex` accepts `api_key` (see [authentication](authentication.md)); every
 dialect accepts fixed request `headers` for proxies or attribution, the
@@ -41,7 +41,7 @@ directly beside `model`. To migrate an older configuration, move each member of 
 | Where | Fields |
 | --- | --- |
 | Provider only | `dialect`, `base_url`, `api_key`, `headers`, `startup_timeout_secs`, `read_idle_timeout_secs`; Codex's `auth_url`. |
-| Provider defaults or direct model settings | `codec`; all placement selections listed below; the dialect's request fields: OpenAI's `reasoning_summary`, `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`; OpenRouter's `routing`, `cache_ttl`; LiteLLM's `upstream`, `tags`. |
+| Provider defaults or direct model settings | `codec`; all placement selections listed below; the dialect's request fields: OpenAI's `reasoning_summary`, `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`, `state_role`; OpenRouter's `routing`, `cache_ttl`, `state_role`; LiteLLM's `upstream`, `tags`, `state_role`; Compatible's `state_role`. |
 | Model only | `model`, `reasoning`, `max_context`, `max_output`, `supports_images`, `state_mode`, `hint`. |
 
 Missing model settings inherit from the provider. Explicit values win even when they are `false`,
@@ -150,20 +150,44 @@ instructions, tool definitions, conversation, and compaction all need room. This
 not an enforced minimum.
 
 `state_mode` controls how per-request runtime state (date, active jobs, and todos) reaches the model.
-`dynamic` (the default) sends a fresh snapshot after the history on each request without appending
-it to the conversation.
-`persist` keeps each snapshot in the conversation. Use it for models that bind signed reasoning
-to the exact earlier conversation (such as Claude Fable 5.1), at the cost of keeping every snapshot in context until
-compaction. `none` sends no runtime state, except to a compaction summary, which needs the
-current todo list to reconcile it. See [runtime state](../reference/runtime-state.md)
-for what the model receives.
+`dynamic` (the default) sends a fresh state with each request; the model sees only the current one.
+`persist` keeps each state in the conversation, at the cost of keeping every one in context until
+compaction. Use it for models that bind signed reasoning to the exact earlier conversation (such
+as Claude Fable 5.1) when the provider cannot hide earlier state, for example Claude reached
+through a Chat Completions or Responses proxy. `none` sends no runtime state, except to a
+compaction summary, which needs the current todo list to reconcile it. See
+[runtime state](../reference/runtime-state.md) for what the model receives.
+
+Runtime state is the harness speaking, so it never appears as tool output. A dialect's
+`state_role` selects how it is sent:
+
+- `system` uses the protocol's harness role: a system message on `messages`, a system or
+  developer message on `chat_completions`, and a developer message on `responses`. Through
+  `anthropic`, a `dynamic` state is a turn-scoped system message: the model reads it for one
+  request, and afterwards it costs no input tokens but stays in the conversation, so models that
+  bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku
+  5.5) keep it with `dynamic` state. It needs a model that supports mid-conversation system
+  messages (Claude Opus 4.8 and later, Fable, Sonnet 5.5, Haiku 5.5; not Sonnet 5). Other
+  dialects send plain system messages and drop superseded state, as `user` does. On `messages`, a
+  state with no valid place, such as right after an assistant turn, is not sent.
+- `user` sends state as user content, joining the user turn before it or as a turn of its own,
+  for servers without a harness role mid-conversation, such as many open-model chat templates.
+  Superseded state is then dropped, which changes the end of the conversation between requests.
+  During a tool loop each state is a new user turn, so a chat template that keeps reasoning
+  only for the latest user query drops the loop's earlier reasoning after it, whatever the
+  `state_mode`. For such models, enable the template's option to keep earlier reasoning
+  (Qwen's `preserve_thinking`, for example).
+
+`anthropic` defaults to `system`, `openai` and `codex` always use it, and `compatible`, `litellm`
+and `openrouter` default to `user`. Changing a provider's `state_role` changes the conversation
+earlier reasoning was produced in, so that reasoning is not replayed afterward.
 
 The [complete example](overview.md#complete-example) uses published hosted-model limits:
 
 | Model | Context | Output | Source |
 | --- | ---: | ---: | --- |
 | GPT-5.6 / GPT-5.6 Sol, OpenAI API | 1,050,000 | 128,000 | [Model documentation](https://developers.openai.com/api/docs/models/gpt-5.6-sol) |
-| Claude Sonnet 4.6 | 1,000,000 | 128,000 | [Model documentation](https://platform.claude.com/docs/en/models/sonnet-4-6/overview) |
+| Claude Opus 5.5 | 1,000,000 | 128,000 | [Model overview](https://platform.claude.com/docs/en/about-claude/models/overview) |
 | GPT-5.6 Sol, Codex subscription | 872,000 | 128,000 (not enforced) | [Codex model catalog](https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json) |
 
 The Codex catalog advertises a default context of 272,000 and a maximum configurable context

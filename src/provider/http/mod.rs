@@ -241,6 +241,7 @@ impl transport::Batches for codec::Decoder {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::provider::protocol::entries;
     use crate::provider::{
         codec::{
             chat_completions,
@@ -262,7 +263,7 @@ pub(crate) mod tests {
     /// A Chat-shaped request with one tool, for provider round trips.
     pub(crate) fn chat_request(model: &str, messages: Vec<Message>) -> ModelRequest {
         ModelRequest {
-            history: messages,
+            context: entries(messages),
             tools: vec![crate::provider::protocol::ToolDefinition {
                 name: "lookup".into(),
                 description: "Find a value".into(),
@@ -290,7 +291,7 @@ pub(crate) mod tests {
             replay: Some(replay),
         };
         ModelRequest {
-            history: vec![
+            context: entries(vec![
                 Message::Assistant(vec![
                     reasoning,
                     AssistantItem::tool_call(
@@ -306,7 +307,7 @@ pub(crate) mod tests {
                     images: vec![],
                     is_error: false,
                 }]),
-            ],
+            ]),
             max_output_tokens: std::num::NonZeroU64::new(100),
             ..request("gpt-5")
         }
@@ -350,7 +351,7 @@ pub(crate) mod tests {
         });
         let expected_text = item.reasoning_text();
         let request = ModelRequest {
-            history: vec![Message::Assistant(vec![item])],
+            context: entries(vec![Message::Assistant(vec![item])]),
             ..request("same-model")
         };
         let mut matching = request.clone();
@@ -358,7 +359,7 @@ pub(crate) mod tests {
         assert_eq!(matching, request);
         let mut foreign = request;
         filter_reasoning_scope(&mut foreign, &b);
-        let Message::Assistant(parts) = &foreign.history[0] else {
+        let Some(Message::Assistant(parts)) = foreign.messages().next() else {
             unreachable!()
         };
         assert!(parts[0].replay().is_none());
@@ -482,9 +483,9 @@ pub(crate) mod tests {
                 assert_eq!(reduced.completion.outcome(), Outcome::ToolUse);
                 let usage = reduced.usage;
                 let tokens = (
-                    usage.input_tokens,
-                    usage.cached_input_tokens,
-                    usage.output_tokens,
+                    usage.input_tokens.unwrap(),
+                    usage.cached_input_tokens.unwrap(),
+                    usage.output_tokens.unwrap(),
                 );
                 assert_eq!(tokens, (20, 80, 6));
                 let items = reduced.completion.items().to_vec();
@@ -691,7 +692,7 @@ pub(crate) mod tests {
         let provider = keyed_by_command(&server, session, command);
         let mut context = provider.open_context("c".parse().unwrap()).unwrap();
         let mut request = reasoning_tool_request(provider.scope());
-        let turn = request.history.clone();
+        let turn: Vec<_> = request.messages().cloned().collect();
         // Neither an unpolled nor an invalid invocation resolves the credential.
         drop(context.invoke(request.clone()));
         let mut unnamed = request.clone();
@@ -701,13 +702,13 @@ pub(crate) mod tests {
         });
         assert!(context.invoke(unnamed).next().await.unwrap().is_err());
         assert!(!count.exists());
-        request.history = vec![Message::User(vec![
+        request.context = entries(vec![Message::User(vec![
             crate::provider::protocol::UserContent::Text {
                 text: "start".into(),
             },
-        ])];
+        ])]);
         complete(&mut *context, request.clone()).await;
-        request.history.extend(turn);
+        request.context.extend(entries(turn));
         complete(&mut *context, request).await;
         let requests = server.finish().await;
         assert_eq!(requests.len(), 2);

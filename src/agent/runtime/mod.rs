@@ -35,7 +35,7 @@ use crate::{
 use super::TodoItem;
 pub use super::error::{Failure, HarnessError, TurnFailure};
 use super::interaction::{QuestionHandler, RuntimeEvent};
-use super::{ContextUsage, Observation, Settlement};
+use super::{Observation, Settlement};
 
 mod agents;
 #[cfg(test)]
@@ -46,7 +46,6 @@ mod compact;
 mod compaction;
 mod context;
 use context::AgentContext;
-pub(crate) use context::recorded_context;
 mod prompt;
 mod questions;
 mod queue;
@@ -402,6 +401,15 @@ impl SessionRuntime {
 mod tests {
     /// What a provider received, as distinct from what the session journals.
     pub(crate) use crate::provider::protocol::{Message as Sent, UserContent as SentPart};
+
+    /// A committed conversation message as the provider receives it.
+    pub(crate) fn sent(message: &Message) -> Sent {
+        use crate::provider::protocol::{Entry, StateLifetime};
+        let Entry::Message(sent) = message.entry(StateLifetime::Persisted) else {
+            panic!("a conversation message")
+        };
+        sent
+    }
     pub(super) use std::{
         sync::{
             Mutex as StdMutex,
@@ -428,7 +436,7 @@ mod tests {
     /// A request as the scripted context that received it saw it.
     #[derive(Debug, PartialEq)]
     pub(super) struct Served {
-        pub(super) context: ContextId,
+        pub(super) context_id: ContextId,
         pub(super) request: ModelRequest,
     }
 
@@ -662,7 +670,7 @@ mod tests {
                     .find(free)
                     .expect("scripted response");
                 script.requests.lock().unwrap().push(Arc::new(Served {
-                    context: self.1.clone(),
+                    context_id: self.1.clone(),
                     request: request.clone(),
                 }));
                 served[step] = Some(request);
@@ -785,7 +793,7 @@ mod tests {
 
     /// Every message of a request, as the JSON text assertions search.
     pub(super) fn rendered(request: &ModelRequest) -> String {
-        serde_json::to_string(&request.messages().collect::<Vec<_>>()).unwrap()
+        serde_json::to_string(&request.context).unwrap()
     }
 
     /// A leaf child of the root on the default test profile, in the session workspace.
@@ -890,14 +898,14 @@ mod tests {
 
     /// The rendered runtime state at the end of the request, without its tags.
     pub(super) fn request_runtime_state(request: &ModelRequest) -> String {
-        let [crate::provider::protocol::Message::User(content)] = request.tail.as_slice() else {
-            panic!("expected transient runtime state at the end of the request");
+        use crate::provider::protocol::{Entry, State, StateLifetime};
+        let Some(Entry::State(State {
+            text: state,
+            lifetime: StateLifetime::Current,
+        })) = request.context.last()
+        else {
+            panic!("expected the request's own state at its end");
         };
-        let state = content.iter().find_map(|content| match content {
-            crate::provider::protocol::UserContent::Runtime { text } => Some(text.clone()),
-            _ => None,
-        });
-        let state = state.expect("request has a runtime state block");
         let (prefix, suffix) = ("<skyhook_state>\n", "\n</skyhook_state>");
         state
             .strip_prefix(prefix)

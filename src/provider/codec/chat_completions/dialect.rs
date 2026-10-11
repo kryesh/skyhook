@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{
     codec::{
-        BodyPath, CacheTtl, Effort, Identity, OPENAI_EFFORT, SchemaConstraint, ToolNames, path,
+        BodyPath, CacheTtl, Effort, Identity, OPENAI_EFFORT, SchemaConstraint, StateRole,
+        ToolNames, path,
     },
     protocol::ReplayFormat,
 };
@@ -166,6 +167,7 @@ pub(crate) struct Dialect {
     pub cache: Cache,
     /// Routing preferences a router takes in the body.
     pub routing: Option<Routing>,
+    pub state_role: StateRole,
 }
 
 impl Dialect {
@@ -188,6 +190,7 @@ impl Dialect {
             identity: Identity::OMITTED,
             cache: Cache::Unsupported,
             routing: None,
+            state_role: StateRole::User,
         }
     }
 }

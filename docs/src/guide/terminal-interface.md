@@ -116,9 +116,11 @@ default · openai       8.4k · 200k(31.2k) · 42% (54k/128k)
 ```
 
 Values are session output tokens, session total input tokens (uncached input), and the selected
-agent's estimated current context occupancy (current tokens/model capacity). Session totals
-include children and compaction. Context includes instructions, tools, history, and runtime
-state; it is not cumulative usage. Missing context data appears as `—`.
+agent's context occupancy as the last response that reported its prompt counted it
+(tokens/model capacity). Session totals include children and compaction; a count a provider did
+not report adds nothing. Context includes instructions, tools, history, runtime state and that
+response; it is not cumulative usage. It appears as `—` until a response reports its prompt,
+including after compaction.
 
 ## Keyboard and mouse
 

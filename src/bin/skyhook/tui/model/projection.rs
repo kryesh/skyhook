@@ -7,7 +7,7 @@ use serde_json::Value;
 use skyhook::agent::{AgentActivity, ObservationSnapshot, StoppedReading, TodoItem, TurnFailure};
 use skyhook::identity::{AgentId, JobId};
 use skyhook::job::{JobEnvelope, JobRole, JobState, JobTransition};
-use skyhook::provider::protocol::Usage;
+use skyhook::provider::protocol::UsageTotals;
 use skyhook::session::{MessageSeq, RecordSeq, SessionEvent, Turns};
 use skyhook::target::TargetRef;
 use std::collections::{HashMap, HashSet};
@@ -132,8 +132,8 @@ impl AgentInfo {
 #[derive(Default)]
 pub struct Projection {
     pub agents: Vec<AgentInfo>,
-    pub usage: Usage,
-    pub agent_usage: HashMap<AgentId, Usage>,
+    pub usage: UsageTotals,
+    pub agent_usage: HashMap<AgentId, UsageTotals>,
     pub todos: HashMap<AgentId, Vec<TodoItem>>,
     pub(super) through: RecordSeq,
     pub(super) records_by_agent: HashMap<AgentId, Vec<RecordSeq>>,
@@ -311,11 +311,11 @@ impl Projection {
                     }
                 }
                 SessionEvent::Usage { usage, .. } => {
-                    self.usage.accumulate(*usage);
+                    self.usage.add(*usage);
                     self.agent_usage
                         .entry(record.agent.clone())
                         .or_default()
-                        .accumulate(*usage);
+                        .add(*usage);
                 }
                 SessionEvent::TodosReplaced { items } => {
                     self.todos.insert(record.agent.clone(), items.clone());

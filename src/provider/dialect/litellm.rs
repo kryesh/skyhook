@@ -16,7 +16,7 @@ use crate::{
     provider::{
         ProviderErrorKind,
         codec::{
-            Codec, CodecName, SchemaConstraint, ToolNames,
+            Codec, CodecName, SchemaConstraint, StateRole, ToolNames,
             chat_completions::{self, Cache, EmptyContent, ReasoningReplay},
             header, messages, path,
         },
@@ -115,6 +115,10 @@ crate::provider::settings::settings! {
         /// Sent as `x-litellm-tags`, for tag-based routing and spend logs.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         pub tags: Vec<Tag> => default,
+        /// The role runtime state takes: `user` (default) sends it as user content;
+        /// `system` needs a server that accepts system messages mid-conversation.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub state_role: Option<StateRole> => default,
     }
 }
 
@@ -128,15 +132,16 @@ impl DialectConfig for Config {
                 Codec::ChatCompletions(if claude { chat_claude() } else { chat_openai() })
             }
             CodecName::Responses => Codec::Responses(super::openai::responses()),
-            CodecName::Messages => Codec::Messages(messages::Dialect::anthropic()),
+            CodecName::Messages => Codec::Messages(messages::Dialect::standard()),
         };
         conventions.identity_mut().cache_key = header("x-litellm-session-id");
         let mut profile = Profile {
             scope: self.upstream.scope(),
             ..Profile::new(conventions, transport(), Dialect::Litellm)
         };
+        profile.state_role(self.state_role, StateRole::User);
         if !self.tags.is_empty() {
-            profile.discriminate(&self.tags);
+            profile.discriminate("tags", &self.tags);
             let tags: Vec<_> = self.tags.iter().map(Tag::as_str).collect();
             let value = HeaderValue::from_str(&tags.join(",")).expect("tags join into header text");
             profile.fixed("x-litellm-tags", value);
@@ -181,6 +186,7 @@ mod tests {
         let openai = Config {
             upstream: Upstream::Openai,
             tags: Vec::new(),
+            state_role: None,
         };
         let responses = head(&openai, CodecName::Responses, "k").await;
         assert_eq!(header_values(&responses, "x-litellm-session-id"), ["ctx"]);
@@ -199,6 +205,7 @@ mod tests {
         let config = Config {
             upstream: Upstream::Anthropic,
             tags: Vec::new(),
+            state_role: None,
         };
         for codec in [CodecName::ChatCompletions, CodecName::Messages] {
             let kind = |body| rejected(&config, codec, 400, body, None);

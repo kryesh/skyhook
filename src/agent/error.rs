@@ -62,8 +62,6 @@ pub enum HarnessError {
     /// optionally on another model.
     #[error("the model declined to respond: {0}")]
     Refused(String),
-    #[error("provider aborted response")]
-    ProviderAborted,
     #[error("agent turn was interrupted")]
     Interrupted,
     #[error("child-agent nesting limit reached")]
@@ -150,6 +148,9 @@ crate::named_enum::detailed_enum! {
         Checkpoint(crate::session::CheckpointError) = "checkpoint",
         #[error("compaction was interrupted")]
         Interrupted = "interrupted",
+        /// The summary request exceeded the model's context window; a smaller one may fit.
+        #[error("the summary exceeded the context window")]
+        Overflowed = "overflowed",
         #[error("summarization failed: {0}")]
         Summary(FailureKind) = "summary",
         /// A failure outside the summary's model attempts, such as journaling it.
@@ -168,9 +169,23 @@ impl CompactionFault {
             | Self::ToolCall
             | Self::Continuation(_)
             | Self::UnknownJob
-            | Self::HandoverOutput => true,
+            | Self::HandoverOutput
+            | Self::Overflowed => true,
             Self::Checkpoint(reason) => *reason == crate::session::CheckpointError::StaleTodos,
             Self::Interrupted | Self::Summary(_) | Self::Other(_) => false,
+        }
+    }
+
+    /// Whether a round that failed with this fault leaves the compaction need for the
+    /// next request: a round cut short, or one a fresh summary could pass. A summary that
+    /// overflowed already shrank within its round, so the next request decides instead:
+    /// it fits, or its own overflow compacts.
+    #[must_use]
+    pub fn keeps_need(&self) -> bool {
+        match self {
+            Self::Overflowed => false,
+            Self::Interrupted => true,
+            other => other.retryable(),
         }
     }
 }
@@ -179,6 +194,11 @@ impl From<&HarnessError> for CompactionFault {
     fn from(error: &HarnessError) -> Self {
         match error {
             HarnessError::Interrupted => Self::Interrupted,
+            HarnessError::Provider(error)
+                if error.kind() == crate::provider::ProviderErrorKind::ContextWindowExceeded =>
+            {
+                Self::Overflowed
+            }
             HarnessError::Compaction(compaction) => match compaction {
                 CompactionError::Truncated => Self::Truncated,
                 CompactionError::ToolCall => Self::ToolCall,
@@ -202,8 +222,6 @@ crate::named_enum::detailed_enum! {
     pub enum Failure / FailureKind {
         #[error("the model declined to respond: {0}")]
         Refused(String) = "refused",
-        #[error("provider aborted response")]
-        Aborted = "aborted",
         #[error("provider returned no assistant content")]
         Empty = "empty",
         #[error("the output limit was reached before any answer or tool call")]
@@ -247,7 +265,6 @@ impl From<&HarnessError> for Failure {
     fn from(error: &HarnessError) -> Self {
         match error {
             HarnessError::Refused(detail) => Self::Refused(detail.clone()),
-            HarnessError::ProviderAborted => Self::Aborted,
             HarnessError::EmptyResponse => Self::Empty,
             HarnessError::OutputLimit => Self::OutputLimit,
             HarnessError::Provider(error) => error.into(),

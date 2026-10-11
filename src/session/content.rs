@@ -1,5 +1,5 @@
 //! The durable conversation: what the session journals and projects. Providers
-//! see it rendered: runtime state and job events become text at that boundary,
+//! see it as context entries: runtime state as state, job events as runtime text,
 //! so the renderers here are part of the session format.
 
 use std::{fmt, path::PathBuf};
@@ -12,7 +12,7 @@ use crate::{
     identity::JobId,
     job::{AgentMessage, AgentProgress, JobState, JobView},
     media::AttachmentRef,
-    provider::protocol::{self, AssistantItem, ToolResult},
+    provider::protocol::{self, AssistantItem, Entry, StateLifetime, ToolResult},
     target::TargetRef,
     tool::registry::JobName,
 };
@@ -23,6 +23,8 @@ pub enum Message {
     User(Vec<UserPart>),
     Assistant(Vec<AssistantItem>),
     Tool(Vec<ToolResult>),
+    /// The agent's state at a request: the harness speaking, never conversation.
+    State(RuntimeState),
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
@@ -33,10 +35,6 @@ pub enum UserPart {
     },
     Attachment {
         attachment: AttachmentRef,
-    },
-    /// The agent's state at a request.
-    State {
-        state: RuntimeState,
     },
     /// Child replies and job views delivered since the last request.
     JobEvents {
@@ -58,7 +56,7 @@ impl Message {
     pub fn is_content_free(&self) -> bool {
         match self {
             Self::Assistant(items) => items.iter().all(AssistantItem::is_content_free),
-            Self::User(_) | Self::Tool(_) => false,
+            Self::User(_) | Self::Tool(_) | Self::State(_) => false,
         }
     }
 
@@ -67,23 +65,32 @@ impl Message {
     /// replay is kept.
     #[must_use]
     pub fn without_bound_reasoning(mut self) -> Self {
-        if let Self::Assistant(items) = &mut self {
-            items.iter_mut().for_each(AssistantItem::unbind);
-        }
+        self.unbind();
         self
     }
 
-    /// The message as a provider receives it: runtime state and job events as
-    /// runtime text, parent input and compaction summaries as user text.
+    pub fn unbind(&mut self) {
+        if let Self::Assistant(items) = self {
+            items.iter_mut().for_each(AssistantItem::unbind);
+        }
+    }
+
+    /// The context entry the message projects: its state with `lifetime`, or
+    /// conversation, job events as runtime text and parent input and compaction
+    /// summaries as user text.
     #[must_use]
-    pub fn render(&self) -> protocol::Message {
-        match self {
+    pub fn entry(&self, lifetime: StateLifetime) -> Entry {
+        Entry::Message(match self {
             Self::User(parts) => {
-                protocol::Message::User(parts.iter().map(UserPart::render).collect())
+                protocol::Message::User(parts.iter().map(UserPart::content).collect())
             }
             Self::Assistant(items) => protocol::Message::Assistant(items.clone()),
             Self::Tool(results) => protocol::Message::Tool(results.clone()),
-        }
+            Self::State(state) => {
+                let text = state.to_string();
+                return Entry::State(protocol::State { text, lifetime });
+            }
+        })
     }
 }
 
@@ -98,7 +105,7 @@ impl UserPart {
         )
     }
 
-    fn render(&self) -> protocol::UserContent {
+    fn content(&self) -> protocol::UserContent {
         match self {
             Self::Attachment { attachment } => protocol::UserContent::Attachment {
                 attachment: attachment.clone(),
@@ -106,9 +113,6 @@ impl UserPart {
             Self::Text { text } | Self::ParentInput { text } | Self::Compaction { text } => {
                 protocol::UserContent::Text { text: text.clone() }
             }
-            Self::State { state } => protocol::UserContent::Runtime {
-                text: state.to_string(),
-            },
             Self::JobEvents { events } => protocol::UserContent::Runtime {
                 text: job_events_text(events),
             },

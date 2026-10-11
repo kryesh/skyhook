@@ -257,7 +257,7 @@ CREATE TABLE message (
   UNIQUE (id, role)
 ) STRICT;
 
--- state and job_events parts hold their content in the user_part_* tables.
+-- job_events parts hold their content in user_part_job_event.
 CREATE TABLE user_part_kind (
   name TEXT PRIMARY KEY,
   text INTEGER NOT NULL CHECK (text IN (0,1)),
@@ -283,17 +283,19 @@ CREATE TABLE user_part (
 ) STRICT;
 
 -- The agent's state as a request sent it: its date and location, live jobs and todos.
-CREATE TABLE user_part_state (
-  part INTEGER PRIMARY KEY REFERENCES user_part(id),
+CREATE TABLE message_state (
+  message INTEGER PRIMARY KEY,
+  role TEXT GENERATED ALWAYS AS ('state') VIRTUAL,
   date TEXT NOT NULL,
   location_target INTEGER NOT NULL REFERENCES target(id),
-  location_workspace BLOB NOT NULL
+  location_workspace BLOB NOT NULL,
+  FOREIGN KEY (message, role) REFERENCES message(id, role)
 ) STRICT;
 
 -- Jobs in pre-order; parent_position nests an agent job's active children.
 -- An agent job has turns/tool_calls, its progress; any other job names its tool.
-CREATE TABLE user_part_state_job (
-  part INTEGER NOT NULL REFERENCES user_part_state(part),
+CREATE TABLE message_state_job (
+  message INTEGER NOT NULL REFERENCES message_state(message),
   position INTEGER NOT NULL CHECK (position >= 0),
   parent_position INTEGER,
   job INTEGER NOT NULL REFERENCES job(id),
@@ -305,18 +307,18 @@ CREATE TABLE user_part_state_job (
   age_seconds INTEGER NOT NULL CHECK (age_seconds >= 0),
   turns INTEGER CHECK (turns >= 0),
   tool_calls INTEGER CHECK (tool_calls >= 0),
-  PRIMARY KEY (part, position),
+  PRIMARY KEY (message, position),
   CHECK ((turns IS NULL) = (tool_calls IS NULL)),
   CHECK ((tool IS NULL) = (turns IS NOT NULL)),
-  FOREIGN KEY (part, parent_position) REFERENCES user_part_state_job(part, position)
+  FOREIGN KEY (message, parent_position) REFERENCES message_state_job(message, position)
 ) STRICT, WITHOUT ROWID;
 
-CREATE TABLE user_part_state_todo (
-  part INTEGER NOT NULL REFERENCES user_part_state(part),
+CREATE TABLE message_state_todo (
+  message INTEGER NOT NULL REFERENCES message_state(message),
   position INTEGER NOT NULL CHECK (position >= 0),
   text TEXT NOT NULL,
   status TEXT NOT NULL REFERENCES todo_status(name),
-  PRIMARY KEY (part, position)
+  PRIMARY KEY (message, position)
 ) STRICT, WITHOUT ROWID;
 
 CREATE TABLE job_event_kind (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
@@ -442,9 +444,10 @@ CREATE TABLE model_request (
   kind TEXT GENERATED ALWAYS AS ('model_requested') VIRTUAL,
   context INTEGER NOT NULL REFERENCES model_context(entry),
   -- History is the checkpoint, its retained sources, then the agent's commits after the
-  -- checkpoint's frontier up to history_through.
+  -- checkpoint's frontier up to history_through; history_from drops those before it.
   checkpoint INTEGER REFERENCES compaction(entry),
   history_through INTEGER REFERENCES message_commit(entry),
+  history_from INTEGER REFERENCES message_commit(entry),
   history_lifetime TEXT NOT NULL REFERENCES history_lifetime(name),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
@@ -503,7 +506,7 @@ CREATE TABLE failure (
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind)
 ) STRICT;
 
--- How a completed response ended; refusals and aborts are model failures instead.
+-- How a completed response ended; a refusal is a model failure instead.
 CREATE TABLE response_outcome (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 CREATE TABLE cut_reason (name TEXT PRIMARY KEY) STRICT, WITHOUT ROWID;
 
@@ -517,14 +520,15 @@ CREATE TABLE model_response (
   FOREIGN KEY (entry, kind) REFERENCES attempt_outcome(entry, kind)
 ) STRICT;
 
+-- A count is NULL when the provider did not report it.
 CREATE TABLE usage (
   entry INTEGER PRIMARY KEY,
   kind TEXT GENERATED ALWAYS AS ('usage') VIRTUAL,
   request INTEGER NOT NULL REFERENCES model_request(entry),
-  input_tokens INTEGER NOT NULL CHECK (input_tokens >= 0),
-  cached_input_tokens INTEGER NOT NULL CHECK (cached_input_tokens >= 0),
-  cache_write_input_tokens INTEGER NOT NULL CHECK (cache_write_input_tokens >= 0),
-  output_tokens INTEGER NOT NULL CHECK (output_tokens >= 0),
+  input_tokens INTEGER CHECK (input_tokens >= 0),
+  cached_input_tokens INTEGER CHECK (cached_input_tokens >= 0),
+  cache_write_input_tokens INTEGER CHECK (cache_write_input_tokens >= 0),
+  output_tokens INTEGER CHECK (output_tokens >= 0),
   FOREIGN KEY (entry, kind) REFERENCES entry(seq, kind),
   CHECK (cache_write_input_tokens <= input_tokens)
 ) STRICT;
@@ -535,8 +539,8 @@ CREATE TABLE compaction (
   kind TEXT GENERATED ALWAYS AS ('compaction') VIRTUAL,
   frontier INTEGER NOT NULL REFERENCES entry(seq),
   message INTEGER NOT NULL REFERENCES message(id),
-  before_tokens INTEGER NOT NULL CHECK (before_tokens >= 0),
-  after_tokens INTEGER NOT NULL CHECK (after_tokens >= 0),
+  -- The occupancy that triggered compaction; NULL when an overflow did.
+  reported_tokens INTEGER CHECK (reported_tokens >= 0),
   CHECK (frontier < entry),
   FOREIGN KEY (entry, kind) REFERENCES attempt_outcome(entry, kind)
 ) STRICT;

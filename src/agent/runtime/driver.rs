@@ -484,10 +484,9 @@ impl SessionRuntime {
                 }
                 // A provider/turn failure is terminal for this invocation, not for
                 // the retained child. Keep its loop, provider session, and projected
-                // history alive so the owning job can restart it. An aborted response
-                // commits its partial visible text before failing the turn; the
-                // failing job wakes the owner for it, and a parked child without a
-                // waiter needs the explicit wake.
+                // history alive so the owning job can restart it. The failing job
+                // wakes the owner for it, and a parked child without a waiter needs
+                // the explicit wake.
                 if !phase.fail(failure) {
                     self.wake_owner(owner_job).await;
                 }
@@ -572,7 +571,7 @@ mod tests {
         assert_eq!(&fields[6..], &["-", "-"]);
         assert!(lines.next().is_none(), "empty todos are omitted");
         let last = requests.last().unwrap();
-        let mut results = last.history.iter().flat_map(|message| match message {
+        let mut results = last.messages().flat_map(|message| match message {
             Sent::Tool(results) => results.as_slice(),
             _ => &[],
         });
@@ -701,10 +700,9 @@ mod tests {
             if content.iter().any(|part| matches!(part, SentPart::Text { text } if text.starts_with("Owner input:"))))
         };
         for request in &requests.lock().unwrap()[3..5] {
-            let history = &request.history;
-            let text = serde_json::to_string(history).unwrap();
+            let text = serde_json::to_string(&request.context).unwrap();
             assert_eq!(text.matches("child task").count(), 1);
-            assert!(!history.iter().any(parent_input));
+            assert!(!request.messages().any(parent_input));
         }
         provider.release(3);
         provider.release(4);
@@ -734,7 +732,7 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].state, JobState::Interrupted);
         // The redirected request carries the interrupted result and the prompt.
-        let history = serde_json::to_string(&requests.lock().unwrap()[2].history).unwrap();
+        let history = serde_json::to_string(&requests.lock().unwrap()[2].context).unwrap();
         assert!(
             history.contains("interrupted") && history.contains("new direction"),
             "{history}"
@@ -770,7 +768,7 @@ mod tests {
         let receipts = bounded(enqueue_prompts(&session, vec![prompt])).await;
         assert!(receipts[0].is_ok());
         assert_eq!(bounded(parent).await.unwrap().unwrap(), "redirected");
-        let history = serde_json::to_string(&requests.lock().unwrap()[2].history).unwrap();
+        let history = serde_json::to_string(&requests.lock().unwrap()[2].context).unwrap();
         assert!(
             history.contains("interrupted") && history.contains("use the right user"),
             "{history}"
@@ -784,94 +782,77 @@ mod tests {
 
     #[tokio::test]
     async fn failed_child_send_preserves_the_parents_pending_wait() {
-        for aborted in [false, true] {
-            let root = tempfile::tempdir().unwrap();
-            let requests = Requests::default();
-            let release = Arc::new(tokio::sync::Semaphore::new(0));
-            let gate = release.clone();
-            let wait_fixture = move |_, _| {
-                let gate = gate.clone();
-                async move {
-                    gate.acquire().await.unwrap().forget();
-                    Ok(ToolOutput::new(json!("released")))
-                }
-            };
-            let mut tools = ToolRegistryBuilder::default();
-            let (schema, options) = (json!({"type":"object"}), ToolOptions::default());
-            let description = "Wait for the test gate";
-            let registered =
-                tools.register_dynamic("wait_fixture", description, schema, options, wait_fixture);
-            registered.unwrap();
-            let wait = response(vec![tool_call(0, "wait", "wait_fixture", json!({}))]);
-            // The child's first invocation fails outright, or aborts after partial text.
-            let failed = if aborted {
-                let partial = AssistantItem::text("answer", 0, "partial child answer");
-                Step::new(cut(vec![partial], CutReason::Aborted))
-            } else {
-                let kind = crate::provider::ProviderErrorKind::Authentication;
-                Step::fail(kind.error("fixture permanent failure"))
-            };
-            let answers = ["child recovered", "parent done", "parent done"];
-            let answers = answers.map(|text| Step::new(answer(text)));
-            let steps = [Step::new(wait), failed].into_iter().chain(answers);
-            let provider = Script::new(steps, &requests);
-            let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
-                .tools(tools.build())
-                .build()
-                .await
-                .unwrap();
-            let session = harness.new_session().await.unwrap();
-            let jobs = &session.runtime.jobs;
-            let parent = spawn_prompt(&session, "wait for input");
-            let running = |job: &crate::job::JobEnvelope| {
-                job.tool == "wait_fixture" && job.state == JobState::Running
-            };
-            let wait_job = job_found(&session, &session.root, running).await;
-            let arguments = json!({"prompt":"retain my task", "bg":true});
-            let (executor, agent) = (&session.runtime.executor, session.root.clone());
-            let job = executor
-                .execute(agent, "agent", arguments, None)
-                .await
-                .unwrap()
-                .job;
-            let wait = async || bounded(jobs.wait(job, None, true)).await.unwrap();
-            let failed = wait().await;
-            assert_eq!(failed.state, JobState::Failed);
-            let child = session.root.child(1);
-            assert_eq!(requests.lock().unwrap().len(), 2, "no automatic replay");
-            if aborted {
-                assert!(matches!(&failed.diagnostic.as_ref().unwrap().cause,
-                    crate::tool::diagnostic::Cause::Message(message) if message == "provider aborted response"));
-                // A rejected selection neither replays nor unparks the child.
-                mailbox_barrier(&session, &child).await;
-                assert_eq!(requests.lock().unwrap().len(), 2);
+        let root = tempfile::tempdir().unwrap();
+        let requests = Requests::default();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let gate = release.clone();
+        let wait_fixture = move |_, _| {
+            let gate = gate.clone();
+            async move {
+                gate.acquire().await.unwrap().forget();
+                Ok(ToolOutput::new(json!("released")))
             }
-            let retry = format!("return tool.job({job}).send({{value:'try again'}});");
-            let resumed = session.run_script(retry).await.unwrap();
-            assert_eq!(resumed.value["value"], json!({}));
-            let recovered = wait().await;
-            assert_eq!(recovered.state, JobState::Completed);
-            assert_eq!(recovered.output, Some(json!("child recovered")));
-            // A child retry must not complete the parent's wait.
-            assert!(!parent.is_finished());
-            let state = jobs.snapshot(wait_job).unwrap().state;
-            assert_eq!(state, JobState::Running);
-            let records = session.runtime.store.records();
-            let root_records = records.iter().filter(|record| record.agent == session.root);
-            // No new parent request before its pending wait is released.
-            assert_eq!(count!(root_records, SessionEvent::ModelRequested { .. }), 1);
-            let child_records = records.iter().filter(|record| record.agent == child);
-            assert_eq!(count!(child_records, SessionEvent::AgentStarted { .. }), 1);
-            let history = requests.lock().unwrap()[2].history.clone();
-            let history = serde_json::to_string(&history).unwrap();
-            assert_eq!(history.matches("retain my task").count(), 1);
-            assert_eq!(history.matches("try again").count(), 1);
-            let partial = history.matches("partial child answer").count();
-            assert_eq!(partial, usize::from(aborted));
-            release.add_permits(1);
-            assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
-            session.shutdown().await.unwrap();
-        }
+        };
+        let mut tools = ToolRegistryBuilder::default();
+        let (schema, options) = (json!({"type":"object"}), ToolOptions::default());
+        let description = "Wait for the test gate";
+        let registered =
+            tools.register_dynamic("wait_fixture", description, schema, options, wait_fixture);
+        registered.unwrap();
+        let wait = response(vec![tool_call(0, "wait", "wait_fixture", json!({}))]);
+        // The child's first invocation fails outright.
+        let kind = crate::provider::ProviderErrorKind::Authentication;
+        let failed = Step::fail(kind.error("fixture permanent failure"));
+        let answers = ["child recovered", "parent done", "parent done"];
+        let answers = answers.map(|text| Step::new(answer(text)));
+        let steps = [Step::new(wait), failed].into_iter().chain(answers);
+        let provider = Script::new(steps, &requests);
+        let harness = test_builder(root.path(), &root.path().join("sessions"), provider, false)
+            .tools(tools.build())
+            .build()
+            .await
+            .unwrap();
+        let session = harness.new_session().await.unwrap();
+        let jobs = &session.runtime.jobs;
+        let parent = spawn_prompt(&session, "wait for input");
+        let running = |job: &crate::job::JobEnvelope| {
+            job.tool == "wait_fixture" && job.state == JobState::Running
+        };
+        let wait_job = job_found(&session, &session.root, running).await;
+        let arguments = json!({"prompt":"retain my task", "bg":true});
+        let (executor, agent) = (&session.runtime.executor, session.root.clone());
+        let job = executor
+            .execute(agent, "agent", arguments, None)
+            .await
+            .unwrap()
+            .job;
+        let wait = async || bounded(jobs.wait(job, None, true)).await.unwrap();
+        let failed = wait().await;
+        assert_eq!(failed.state, JobState::Failed);
+        let child = session.root.child(1);
+        assert_eq!(requests.lock().unwrap().len(), 2, "no automatic replay");
+        let retry = format!("return tool.job({job}).send({{value:'try again'}});");
+        let resumed = session.run_script(retry).await.unwrap();
+        assert_eq!(resumed.value["value"], json!({}));
+        let recovered = wait().await;
+        assert_eq!(recovered.state, JobState::Completed);
+        assert_eq!(recovered.output, Some(json!("child recovered")));
+        // A child retry must not complete the parent's wait.
+        assert!(!parent.is_finished());
+        let state = jobs.snapshot(wait_job).unwrap().state;
+        assert_eq!(state, JobState::Running);
+        let records = session.runtime.store.records();
+        let root_records = records.iter().filter(|record| record.agent == session.root);
+        // No new parent request before its pending wait is released.
+        assert_eq!(count!(root_records, SessionEvent::ModelRequested { .. }), 1);
+        let child_records = records.iter().filter(|record| record.agent == child);
+        assert_eq!(count!(child_records, SessionEvent::AgentStarted { .. }), 1);
+        let history = serde_json::to_string(&requests.lock().unwrap()[2].context).unwrap();
+        assert_eq!(history.matches("retain my task").count(), 1);
+        assert_eq!(history.matches("try again").count(), 1);
+        release.add_permits(1);
+        assert_eq!(bounded(parent).await.unwrap().unwrap(), "parent done");
+        session.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -909,9 +890,12 @@ mod tests {
             let requests = requests.lock().unwrap();
             assert_eq!(requests.len(), 3);
             let child_id = ContextId::from(&child);
-            assert!(requests.iter().all(|request| request.context == child_id));
-            let history = &requests[2].history;
-            let text = serde_json::to_string(history).unwrap();
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.context_id == child_id)
+            );
+            let text = serde_json::to_string(&requests[2].context).unwrap();
             let expected = ["remember the initial task", "first answer", "follow-up one"];
             for expected in expected
                 .into_iter()
@@ -920,7 +904,7 @@ mod tests {
                 assert!(text.contains(expected), "missing {expected}: {text}");
             }
             assert!(
-                matches!(history.last(), Some(Sent::User(content)) if matches!(&content[0], SentPart::Text {text} if text.contains("follow-up two")))
+                matches!(requests[2].messages().last(), Some(Sent::User(content)) if matches!(&content[0], SentPart::Text {text} if text.contains("follow-up two")))
             );
         }
         let records = session.runtime.store.records();
