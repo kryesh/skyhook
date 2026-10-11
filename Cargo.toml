@@ -80,7 +80,7 @@ hyper-util = { version = "0.1", default-features = false, features = [
 ] }
 ignore = "0.4.31"
 indexmap = { version = "2", features = ["serde"] }
-jsonschema = { version = "0.57", default-features = false }
+jsonschema = { version = "0.58", default-features = false }
 libsql = { version = "0.9.30", default-features = false, features = ["core"] }
 mimalloc = { version = "0.1", features = ["override"] }
 reqwest = { version = "0.13.4", default-features = false, features = [
@@ -110,8 +110,13 @@ rustls = { version = "0.23", default-features = false }
 schemars = { version = "1.2.2", features = ["preserve_order"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_bytes = "0.11.19"
-serde_with = { version = "3.21.0", default-features = false, features = ["macros"] }
-serde_json = { version = "1.0.151", features = ["float_roundtrip", "preserve_order"] }
+serde_with = { version = "3.21.0", default-features = false, features = [
+    "macros",
+] }
+serde_json = { version = "1.0.151", features = [
+    "float_roundtrip",
+    "preserve_order",
+] }
 serde-saphyr = "1.3"
 serde_json_path = "0.7.2"
 sha2 = "0.11"
