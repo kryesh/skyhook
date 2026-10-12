@@ -87,9 +87,9 @@ impl App {
         self.snapshot = *prepared.snapshot;
         self.selected = self.root_agent().clone();
         self.views.transfer(&draft, self.selected.clone());
-        for (agent, _) in &mut self.unsaved_status {
-            if *agent == draft {
-                *agent = self.selected.clone();
+        for status in &mut self.unsaved_status {
+            if status.agent == draft {
+                status.agent = self.selected.clone();
             }
         }
         self.content_cache = model::ContentCache::default();
@@ -126,7 +126,7 @@ impl App {
     /// A new action displaces a parked script only once it takes the start slot.
     fn replace_start(&mut self, start: StartState) {
         if let StartState::RetryScript(_) = std::mem::replace(&mut self.start, start) {
-            self.notice("Cancelled the pending script in favor of the new action");
+            self.toast("Cancelled the pending script in favor of the new action");
         }
     }
     pub(super) fn start_failed(&mut self, error: LaunchError) {
@@ -156,7 +156,7 @@ impl App {
     }
     pub fn start_script(&mut self, path: PathBuf) {
         if self.busy() {
-            self.notice("Wait for the current operation before starting a script");
+            self.toast("Wait for the current operation before starting a script");
             return;
         }
         let Some(session) = self.session().cloned() else {
@@ -311,8 +311,7 @@ mod tests {
             assert!(!snapshot.records.values().any(|record| matches!(
                 &record.event, SessionEvent::Status { message } if message == &status
             )));
-            let local = (session.root_agent().clone(), status);
-            assert!(app.unsaved_status.contains(&local));
+            assert!(unsaved(&app, session.root_agent()).contains(&status));
         }
         session.shutdown().await.unwrap();
     }

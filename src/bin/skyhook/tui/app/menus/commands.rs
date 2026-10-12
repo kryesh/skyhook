@@ -68,7 +68,7 @@ impl App {
                 {
                     self.start_script(path);
                 }
-                self.notice("Queued input resumed");
+                self.toast("Queued input resumed");
             }
             Command::Retry => self.retry(),
             Command::Queue => self.open(
@@ -115,11 +115,12 @@ impl App {
             Command::Files => self.open_files(None),
             Command::Sidebar => {
                 self.sidebar = !self.sidebar;
-                let (sidebar, notices) = (self.sidebar, self.root_notifier());
+                let (sidebar, tx) = (self.sidebar, self.tx.clone());
                 let workspace = self.launch.workspace.clone();
                 tokio::task::spawn_blocking(move || {
                     if let Err(error) = state::update(&workspace, |state| state.sidebar = sidebar) {
-                        notices.send(format!("Could not save sidebar setting: {error}"));
+                        let message = format!("Could not save sidebar setting: {error}");
+                        let _ = tx.send(Work::Toast(message));
                     }
                 });
             }
@@ -162,7 +163,7 @@ impl App {
         let mut activity = self.snapshot.activity.values();
         let retryable = viewed || activity.any(|activity| activity.state.is_retryable());
         if self.start.is_creating() || self.stopping || !retryable {
-            self.notice("No failed or interrupted turns to retry");
+            self.toast("No failed or interrupted turns to retry");
             return;
         }
         let Some(session) = self.session().cloned() else {
@@ -187,7 +188,7 @@ impl App {
         let mode = (mode != Some(&self.mode)).then(|| self.mode.clone());
         let tx = self.tx.clone();
         let notices = self.root_notifier();
-        notices.send("Continue requested");
+        self.toast("Continue requested");
         let requested = model.is_some() || mode.is_some();
         tokio::spawn(async move {
             let outcome = match session.selection(model.as_ref(), mode.as_ref()) {
@@ -227,22 +228,29 @@ impl App {
             all_details: true,
             today: self.clock.day(),
         };
-        let entries = model::entries(&self.snapshot, &self.projection, view, &self.outputs, true);
+        let entries = model::entries(
+            &self.snapshot,
+            &self.projection,
+            view,
+            &self.outputs,
+            &[],
+            true,
+        );
         let text = entries.iter().map(|entry| entry.text()).collect::<Vec<_>>();
         let text = text.join("\n\n");
         let Some(session) = self.session() else {
-            self.notice("No session to export yet");
+            self.toast("No session to export yet");
             return;
         };
         let label = crate::tui::format::agent_label(&self.selected).replace(':', "-");
         let path = session.directory().join(format!("conversation-{label}.md"));
-        let notices = self.notifier();
+        let tx = self.tx.clone();
         tokio::spawn(async move {
-            let notice = match tokio::fs::write(&path, text).await {
+            let message = match tokio::fs::write(&path, text).await {
                 Ok(_) => format!("Exported {}", path.display()),
                 Err(error) => error.to_string(),
             };
-            notices.send(notice);
+            let _ = tx.send(Work::Toast(message));
         });
     }
 }

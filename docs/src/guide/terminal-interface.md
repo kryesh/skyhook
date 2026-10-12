@@ -56,7 +56,9 @@ Full request bodies are available in the session log, not rendered in the UI. St
 such as interruptions and errors, appear in the conversation and are saved with the session, but
 are not sent to the model. Startup warnings (skills, configuration, connections and MCP servers)
 describe this installation rather than the session, so the terminal shows them but does not save
-them.
+them. Unsaved notices appear where they arrived in the conversation and scroll away as it grows.
+Feedback on an action, such as an attached file, a search without matches, an export, or a
+setting that could not be saved, shows briefly on the notice line instead.
 
 Job output is paged and searchable without acknowledging the agent's pending notifications.
 Select a job and press `o` for output fields, regex search, and the next page; `c` requests

@@ -11,7 +11,7 @@ mod retry;
 
 pub use super::format::{Clean, Clock, Timing, clean, footer, number, pretty, span};
 pub use cache::ContentCache;
-pub use entries::entries;
+pub use entries::{entries, status_entry};
 pub use jobs::{state_glyph, state_name, state_role, target_suffix};
 pub use projection::{AgentDisplayState, AgentInfo, Projection, WaitReason, open_jobs};
 pub use requests::{RequestRow, RequestStatus};
@@ -80,9 +80,19 @@ pub enum EntryKey {
     Retry(RequestSeq),
     Job(JobId),
     Working(AgentId),
+    /// The status at this index of the app's unsaved statuses.
     UnsavedStatus(usize),
     /// The failure that stopped the session.
     JournalFailed,
+}
+
+/// A status shown but never journaled. It follows the record that was newest
+/// when it arrived, so it scrolls away with the history around it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnsavedStatus {
+    pub agent: AgentId,
+    pub after: Option<RecordSeq>,
+    pub message: String,
 }
 
 #[derive(Default)]

@@ -47,6 +47,8 @@ pub enum Work {
     Started {
         result: Result<PreparedObservation, LaunchError>,
     },
+    /// Interface feedback from a task the app spawned.
+    Toast(String),
     /// A notice from before the session existed: shown, never journaled.
     LocalStatus {
         agent: AgentId,
@@ -170,13 +172,14 @@ impl App {
                             self.editor.delete(at - 1..at);
                         }
                         if let Some(file) = attachment.file() {
-                            self.notice(format!("Attached {}", file.display()));
+                            self.toast(format!("Attached {}", file.display()));
                         }
                         self.editor.attach(attachment);
                     }
-                    Err(error) => self.notice(error),
+                    Err(error) => self.toast(error),
                 }
             }
+            Work::Toast(message) => self.toast(message),
             Work::LocalStatus { agent, message } => {
                 // The draft's notices move to the session that grew out of it.
                 if agent != *self.root_agent() && self.attached_draft() != Some(&agent) {
@@ -554,20 +557,9 @@ mod tests {
         let (tx, mut work) = mpsc::unbounded_channel();
         app = app.sibling(Some(prepared), app.launch.clone(), tx);
         app.select(child.clone());
-        app.rebuild_content();
-        app.view().query = "text the saved child never saw".into();
-        app.find(false);
-        app.command(Command::Export);
-        let label = crate::tui::format::agent_label(&child).replace(':', "-");
-        let exported = viewed.directory().join(format!("conversation-{label}.md"));
-        let exported = format!("Exported {}", exported.display());
-        let notices = |app: &App| -> Vec<String> {
-            let notices = app.unsaved_status.iter();
-            let notices = notices.filter(|(agent, _)| agent == &child);
-            notices.map(|(_, message)| message.clone()).collect()
-        };
+        app.notice("about the child");
         bounded(async {
-            while notices(&app).len() < 2 {
+            while unsaved(&app, &child).is_empty() {
                 app.work(work.recv().await.expect("work channel is open"));
             }
         })
@@ -575,7 +567,7 @@ mod tests {
         let after = viewed.observe().snapshot.records;
         bounded(viewed.shutdown()).await.unwrap();
         viewed.close().await.unwrap();
-        assert_eq!(notices(&app), ["No matches".to_owned(), exported]);
+        assert_eq!(unsaved(&app, &child), ["about the child"]);
         assert_eq!(
             before, after,
             "a viewed session's notices are never journaled"

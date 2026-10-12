@@ -132,14 +132,15 @@ impl App {
             return;
         }
         (self.remembered_model, self.remembered_mode) = selection.clone();
-        let notices = self.root_notifier();
+        let tx = self.tx.clone();
         let workspace = self.launch.workspace.clone();
         tokio::task::spawn_blocking(move || {
             let saved = state::update(&workspace, |state| {
                 (state.model, state.mode) = selection;
             });
             if let Err(error) = saved {
-                notices.send(format!("Could not save model and mode selection: {error}"));
+                let message = format!("Could not save model and mode selection: {error}");
+                let _ = tx.send(Work::Toast(message));
             }
         });
     }
@@ -309,7 +310,7 @@ impl App {
     pub(super) fn remove_queued(&mut self, id: QueuedInputId) -> Option<QueuedInput> {
         let index = self.queue.iter().position(|queued| queued.id == id)?;
         if matches!(&self.queue[index].state, RowState::InFlight(row) if !row.cancel()) {
-            self.notice("This message is already being submitted");
+            self.toast("This message is already being submitted");
             return None;
         }
         let mut input = self.queue.remove(index).unwrap();
@@ -531,7 +532,6 @@ mod tests {
     #[tokio::test]
     async fn editing_a_dispatched_row_withdraws_it_unless_it_is_already_being_submitted() {
         let (_root, mut app, mut deliveries) = queue_fixture().await;
-        let mut rx = capture_work(&mut app);
         app.submit("editable".into());
         let editable = deliveries.try_recv().unwrap();
         app.command(Command::Queue);
@@ -554,11 +554,10 @@ mod tests {
         app.choose();
         assert_eq!(app.queue.len(), 1);
         assert_eq!(app.editor.text(), "draft");
-        let notices = notices(&app, &mut rx).await;
-        assert!(
-            notices
-                .iter()
-                .any(|notice| notice.contains("already being submitted"))
+        let toast = app.toast.take().map(|(toast, _)| toast);
+        assert_eq!(
+            toast.as_deref(),
+            Some("This message is already being submitted")
         );
         session.shutdown().await.unwrap();
     }

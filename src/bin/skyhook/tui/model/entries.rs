@@ -1,8 +1,9 @@
 //! Tab selection and ordered conversation projection, including call/result provenance.
 //!
-//! History is a fold over sources: journal records, or jobs on the Jobs tab. Each
-//! source owns a contiguous segment of entries, rebuilt only when something it was
-//! built from changes, so a new record costs its own entries, not the history's.
+//! History is a fold over sources: journal records and unsaved statuses, or jobs on
+//! the Jobs tab. Each source owns a contiguous segment of entries, rebuilt only when
+//! something it was built from changes, so a new record costs its own entries, not
+//! the history's.
 use crate::tui::app::OutputStore;
 
 use super::jobs::{call_entry, job_entry};
@@ -13,7 +14,7 @@ use super::notifications::job_event_entries;
 use super::requests::{request_entry, request_timing};
 use super::{
     Clean, Entry, EntryKey, EntryView, Projection, ResponseRef, Surface, Tab, Timing, Title,
-    number, pretty, span,
+    UnsavedStatus, number, pretty, span,
 };
 use skyhook::agent::ObservationSnapshot;
 use skyhook::identity::JobId;
@@ -48,8 +49,11 @@ pub enum Dep {
     Entry(EntryKey),
 }
 
+/// Declaration order is sort order: an unsaved status sorts before the records
+/// that follow its anchor, and one with no anchor before them all.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 enum Source {
+    Unsaved(usize),
     Record(RecordSeq),
     Job(JobId),
 }
@@ -112,6 +116,7 @@ pub struct Inputs<'a> {
     pub projection: &'a Projection,
     pub presentation: EntryView<'a>,
     pub outputs: &'a OutputStore,
+    pub unsaved: &'a [UnsavedStatus],
 }
 
 /// Tool results carry a call ID but no message sequence. Each pairs with a call of
@@ -224,6 +229,8 @@ impl Changed {
 pub struct History {
     /// How many of the agent's records have been folded.
     folded: usize,
+    /// How many unsaved statuses, of every agent, have been folded.
+    unsaved: usize,
     pairing: Pairing,
     turns: TurnStarts,
     segments: Vec<Segment>,
@@ -288,8 +295,8 @@ impl History {
         result
     }
 
-    /// Places of new sources in order: the agent's unfolded records, or its jobs
-    /// among `candidates` on the Jobs tab.
+    /// Places of new sources: the agent's unfolded records and unsaved statuses, or
+    /// its jobs among `candidates` on the Jobs tab.
     fn fold(
         &mut self,
         inputs: Inputs<'_>,
@@ -352,6 +359,17 @@ impl History {
                 }
                 None => Place::under(None, source),
             });
+        }
+        if presentation.tab == Tab::Conversation {
+            let new = inputs.unsaved.iter().enumerate().skip(self.unsaved);
+            let new = new.filter(|(_, status)| &status.agent == agent);
+            places.extend(new.map(|(index, status)| {
+                let anchor = status
+                    .after
+                    .map(|after| Place::under(None, Source::Record(after)));
+                Place::under(anchor.as_ref(), Source::Unsaved(index))
+            }));
+            self.unsaved = inputs.unsaved.len();
         }
         places
     }
@@ -509,6 +527,12 @@ impl History {
         } = inputs;
         let mut built = Built::default();
         match source {
+            Source::Unsaved(index) => {
+                if let Some(status) = inputs.unsaved.get(index) {
+                    let key = EntryKey::UnsavedStatus(index);
+                    built.push(status_entry(key, &status.message), None);
+                }
+            }
             Source::Job(job) => {
                 if let Some((mut entry, _)) = self.job_card(job, inputs, &mut built) {
                     // The Jobs tab is a dense list; conversation grouping owns its
@@ -665,10 +689,7 @@ impl History {
                 let title = Title::disclosed(title, open);
                 built.push(Entry::titled(key, title, body, Surface::Muted), None);
             }
-            SessionEvent::Status { message } => {
-                let entry = Entry::new(key, format!("Status · {message}"), Surface::Status);
-                built.push(entry, None);
-            }
+            SessionEvent::Status { message } => built.push(status_entry(key, message), None),
             SessionEvent::CompactionFailed { error, .. } => {
                 let text = format!("Compaction failed; previous context retained\n{error}");
                 built.push(Entry::new(key, text, Surface::Error), None);
@@ -785,12 +806,17 @@ impl History {
     }
 }
 
+pub fn status_entry(key: EntryKey, message: &dyn std::fmt::Display) -> Entry {
+    Entry::new(key, format!("Status · {message}"), Surface::Status)
+}
+
 /// Shared by retained UI content and fresh export construction.
 pub fn entries(
     snapshot: &ObservationSnapshot,
     projection: &Projection,
     presentation: EntryView<'_>,
     outputs: &OutputStore,
+    unsaved: &[UnsavedStatus],
     include_live: bool,
 ) -> Vec<Entry> {
     let inputs = Inputs {
@@ -798,6 +824,7 @@ pub fn entries(
         projection,
         presentation,
         outputs,
+        unsaved,
     };
     let (_, mut entries) = History::build(inputs);
     if include_live && presentation.tab == Tab::Conversation {
@@ -835,7 +862,7 @@ mod tests {
             all_details: details,
             today: Default::default(),
         };
-        entries(snapshot, &projection, view, &outputs, true)
+        entries(snapshot, &projection, view, &outputs, &[], true)
     }
 
     /// `snapshot` replayed with each record `sequence` seconds past the epoch.

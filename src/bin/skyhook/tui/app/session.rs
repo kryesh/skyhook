@@ -165,7 +165,16 @@ impl App {
         self.push_local(self.selected.clone(), message.into());
     }
     pub(super) fn push_local(&mut self, agent: AgentId, message: String) {
-        self.unsaved_status.push((agent, message));
+        let after = self
+            .snapshot
+            .records
+            .last_key_value()
+            .map(|(after, _)| *after);
+        (self.unsaved_status).push(model::UnsavedStatus {
+            agent,
+            after,
+            message,
+        });
         self.dirty = true;
         self.content_dirty = true;
     }

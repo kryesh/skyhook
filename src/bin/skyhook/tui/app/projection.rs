@@ -59,7 +59,7 @@ impl App {
     }
     pub(super) fn invalidate_content(&mut self) {
         self.content_dirty = true;
-        self.content_revision = self.content_revision.wrapping_add(1);
+        self.content_cache.invalidate();
     }
     /// Fold new journal records into the projection.
     pub fn rebuild_projection(&mut self) {
@@ -77,23 +77,15 @@ impl App {
     }
     pub fn rebuild_content(&mut self) {
         if self.content_dirty {
-            let status = |key, message: &dyn std::fmt::Display| {
-                Entry::new(key, format!("Status · {message}"), model::Surface::Status)
-            };
-            let unsaved = (self.unsaved_status.iter().enumerate())
-                .filter(|(_, (agent, _))| agent == &self.selected)
-                .map(|(index, (_, message))| {
-                    status(model::EntryKey::UnsavedStatus(index), message)
-                });
             // The session's conversation, and only it, shows what stopped it.
             let root = self.root_agent() == &self.selected;
             let failed = (self.snapshot.phase.failure())
                 .filter(|_| root)
                 .map(|failure| {
                     let failed = skyhook::session::SessionError::JournalFailed(failure.clone());
-                    status(model::EntryKey::JournalFailed, &failed)
+                    model::status_entry(model::EntryKey::JournalFailed, &failed)
                 });
-            let overlay = unsaved.chain(failed).collect();
+            let overlay = failed.into_iter().collect();
             let view = self.views.get_mut(&self.selected, self.tab);
             let changes = self.content_cache.update(
                 &self.snapshot,
@@ -106,7 +98,7 @@ impl App {
                     today: self.clock.day(),
                 },
                 &self.outputs,
-                self.content_revision,
+                &self.unsaved_status,
                 overlay,
             );
             self.render.dirty.extend(changes);

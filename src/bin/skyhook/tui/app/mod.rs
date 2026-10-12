@@ -183,7 +183,7 @@ pub struct App {
     draft_ticket: Token,
     pub status: super::status::StatusLog,
     // UI-only notices, including startup diagnostics and failed status writes.
-    unsaved_status: Vec<(AgentId, String)>,
+    unsaved_status: Vec<model::UnsavedStatus>,
     /// The session's title as the session list shows it.
     pub title: Option<SessionTitle>,
     title_ticket: Token,
@@ -201,7 +201,6 @@ pub struct App {
     /// The composer's first shown row while scrolled away from the cursor; none
     /// follows the cursor.
     pub composer_scroll: Option<usize>,
-    content_revision: u64,
     pub(super) content_cache: model::ContentCache,
     pub tick_count: usize,
     /// The wall time timings are shown at, advanced each tick.
@@ -312,7 +311,6 @@ impl App {
             dirty: true,
             content_dirty: true,
             composer_scroll: None,
-            content_revision: 0,
             content_cache: model::ContentCache::default(),
             tick_count: 0,
             clock: model::Clock::now(),
@@ -556,6 +554,12 @@ pub(super) mod tests {
         let row = app.entries().iter().position(|e| e.job_id() == Some(job));
         app.view().row = row.unwrap();
     }
+    /// The unsaved statuses shown in `agent`'s conversation.
+    pub(in crate::tui) fn unsaved(app: &App, agent: &AgentId) -> Vec<String> {
+        let statuses = app.unsaved_status.iter();
+        let statuses = statuses.filter(|status| &status.agent == agent);
+        statuses.map(|status| status.message.clone()).collect()
+    }
     /// Startup warnings are shown once, survive rebuilds and are never journaled.
     async fn assert_startup_warnings_ui_only(app: &mut App) {
         let session = app.session().unwrap().clone();
@@ -566,8 +570,8 @@ pub(super) mod tests {
         assert!(!warnings.is_empty());
         let root = session.root_agent().clone();
         for warning in &warnings {
-            let status = (root.clone(), format!("Startup warning: {warning}"));
-            assert!(app.unsaved_status.contains(&status));
+            let status = format!("Startup warning: {warning}");
+            assert!(unsaved(app, &root).contains(&status));
         }
         for _ in 0..2 {
             app.refresh();

@@ -296,7 +296,7 @@ impl App {
                             Ok(command) => self.command(command),
                             Err(_) if command.is_empty() => {}
                             Err(_) => {
-                                self.notice(format!("Unknown command: /{command}. Use /help."))
+                                self.toast(format!("Unknown command: /{command}. Use /help."))
                             }
                         }
                     } else {
@@ -459,7 +459,7 @@ impl App {
                 return;
             }
         }
-        self.notice("No matches");
+        self.toast("No matches");
     }
     /// Copy the composer's selection while it is focused, else the transcript's,
     /// else the selected or last agent message.

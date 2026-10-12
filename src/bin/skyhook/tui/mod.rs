@@ -107,10 +107,10 @@ pub async fn run(
     if let Some(mode) = explicit
         && !app.select_mode(&mode)
     {
-        app.notice(format!("Unknown mode: {mode}"));
+        app.local_notice(format!("Unknown mode: {mode}"));
     }
     if let Some(warning) = warning {
-        app.notice(warning);
+        app.local_notice(warning);
     }
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {

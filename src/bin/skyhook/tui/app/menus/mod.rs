@@ -1,5 +1,5 @@
 //! Palettes over the conversation, one module per kind that needs more than a row.
-use super::{App, HostRequest, QueuedInputId};
+use super::{App, HostRequest, QueuedInputId, Work};
 use crate::tui::editor::{Editor, TextField};
 use crate::tui::keys::Command;
 use crate::tui::model;
@@ -343,7 +343,7 @@ impl App {
         }
         match result {
             Ok(kind) => menu.kind = kind,
-            Err(error) => self.notice(error),
+            Err(error) => self.toast(error),
         }
         true
     }
@@ -436,12 +436,13 @@ impl App {
                     let Some(session) = self.session().cloned() else {
                         return;
                     };
-                    let notices = self.notifier();
+                    let tx = self.tx.clone();
                     tokio::spawn(async move {
-                        notices.send(match session.cancel_job(id).await {
+                        let message = match session.cancel_job(id).await {
                             Ok(job) => format!("Job {id}: {}", model::state_name(job.state)),
                             Err(e) => e.to_string(),
-                        });
+                        };
+                        let _ = tx.send(Work::Toast(message));
                     });
                 }
             },
@@ -460,7 +461,6 @@ mod tests {
     use crossterm::event::MouseEventKind;
     use ratatui::layout::Rect;
     use skyhook::provider::dialect::ProviderSettings;
-    use tokio::sync::mpsc;
 
     fn menu_completion(menu: &Menu, error: Option<&str>) -> Work {
         fn result<T>(value: T, error: Option<&str>) -> Result<Vec<Item<T>>, String> {
@@ -487,8 +487,6 @@ mod tests {
     #[tokio::test]
     async fn menu_loads_only_fill_the_originating_open_menu() {
         let (_root, mut app) = draft_fixture().await;
-        let (tx, mut rx) = mpsc::unbounded_channel();
-        app.status = crate::tui::status::StatusLog::new(tx);
         for (kind, fallible) in [
             (MenuKind::Sessions(vec![]), true),
             (MenuKind::Files(vec![], None), false),
@@ -510,16 +508,14 @@ mod tests {
             app.work(closed_failure);
             app.work(stale_success);
             assert!(app.menu().unwrap().kind.items().is_empty());
-            assert!(!app.dirty);
-            // A current failure keeps the menu and reports a notice.
+            assert!(!app.dirty && app.toast.is_none());
+            // A current failure keeps the menu and reports a toast.
             if fallible {
                 app.work(complete(&app, Some("current failure")));
                 assert_eq!(app.menu().unwrap().title, "Newer request");
                 assert!(app.menu().unwrap().kind.items().is_empty());
-                app.status.flush().await;
-                assert!(
-                    matches!(rx.try_recv().unwrap(), Work::LocalStatus { message, .. } if message == "current failure")
-                );
+                let toast = app.toast.take().map(|(toast, _)| toast);
+                assert_eq!(toast.as_deref(), Some("current failure"));
             }
             let (current, replaced) = (complete(&app, None), complete(&app, None));
             app.work(current);
@@ -531,11 +527,6 @@ mod tests {
             app.work(replaced);
             assert_eq!(app.menu().unwrap().title, "Replacement overlay");
         }
-        app.status.flush().await;
-        assert!(
-            rx.try_recv().is_err(),
-            "stale failures must not emit notices"
-        );
     }
 
     #[tokio::test]
