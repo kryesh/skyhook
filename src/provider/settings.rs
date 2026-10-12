@@ -1,5 +1,11 @@
 //! Typed partial settings. Omission inherits; a present value replaces an
 //! atomic field, including explicit defaults and null on nullable fields.
+//!
+//! Every setting but a list reads one way: left out, its default applies; an explicit
+//! null sends nothing; a value is used as given. A setting whose default is nothing is an
+//! `Option`; one whose default is something is [`Nullable`]; one that cannot be nothing
+//! is declared `optional`, which refuses null. A list refuses null: `[]` is its empty
+//! value.
 
 use std::fmt::Debug;
 
@@ -53,6 +59,13 @@ impl<T: Clone> Setting<T> {
         }
     }
 
+    pub fn optional(&self) -> Option<T> {
+        match self {
+            Self::Inherit => None,
+            Self::Set(value) => Some(value.clone()),
+        }
+    }
+
     pub fn or_default(&self) -> T
     where
         T: Default,
@@ -100,6 +113,51 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Setting<T> {
     }
 }
 
+/// A setting whose default is something that an explicit null withholds.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Nullable<T> {
+    #[default]
+    Default,
+    Null,
+    Value(T),
+}
+
+impl<T> Nullable<T> {
+    pub fn is_default(&self) -> bool {
+        matches!(self, Self::Default)
+    }
+
+    /// The value sent: `default` unless another value or nothing is chosen.
+    pub fn or(&self, default: T) -> Option<T>
+    where
+        T: Clone,
+    {
+        match self {
+            Self::Default => Some(default),
+            Self::Null => None,
+            Self::Value(value) => Some(value.clone()),
+        }
+    }
+}
+
+impl<T: Serialize> Serialize for Nullable<T> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Default => Err(serde::ser::Error::custom(
+                "default settings must be omitted",
+            )),
+            Self::Null => serializer.serialize_none(),
+            Self::Value(value) => value.serialize(serializer),
+        }
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for Nullable<T> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(Option::<T>::deserialize(deserializer)?.map_or(Self::Null, Self::Value))
+    }
+}
+
 /// Join the field names of flattened settings without maintaining another list.
 pub(crate) const fn fields<const N: usize>(groups: &[&[&'static str]]) -> [&'static str; N] {
     let mut fields = [""; N];
@@ -119,7 +177,8 @@ pub(crate) const fn fields<const N: usize>(groups: &[&[&'static str]]) -> [&'sta
 
 /// Declare resolved settings and their presence-preserving patch together.
 /// `required` has no default; `default` resolves only after overlaying layers.
-/// `object(T)` merges a nullable nested settings object field by field. A
+/// `optional(T)` resolves an `Option<T>` that is `None` only when left out: null is
+/// refused. `object(T)` merges a nullable nested settings object field by field. A
 /// `@flatten` group shares another settings declaration's fields.
 /// Field serde attributes describe the resolved form, never the patch.
 macro_rules! settings {
@@ -181,10 +240,12 @@ macro_rules! settings {
     (@type $ty:ty, object($inner:ty)) => {
         $crate::provider::settings::Setting<Option<<$inner as $crate::provider::settings::Settings>::Patch>>
     };
+    (@type $ty:ty, optional($inner:ty)) => { $crate::provider::settings::Setting<$inner> };
     (@type $ty:ty, $kind:ident) => { $crate::provider::settings::Setting<$ty> };
     (@overlay $lower:expr, $higher:expr, object($inner:ty)) => { $lower.overlay_object(&$higher) };
-    (@overlay $lower:expr, $higher:expr, $kind:ident) => { $lower.overlay(&$higher) };
+    (@overlay $lower:expr, $higher:expr, $kind:ident $(($inner:ty))?) => { $lower.overlay(&$higher) };
     (@resolve $value:expr, $field:ident, required) => { $value.required(stringify!($field))? };
+    (@resolve $value:expr, $field:ident, optional($inner:ty)) => { $value.optional() };
     (@resolve $value:expr, $field:ident, default) => { $value.or_default() };
     (@resolve $value:expr, $field:ident, object($inner:ty)) => { $value.resolve_object::<$inner>()? };
 }
@@ -211,6 +272,39 @@ mod tests {
             tags: Vec<String> => default,
             #[serde(default)]
             tenant: Option<String> => default,
+            #[serde(default, skip_serializing_if = "Nullable::is_default")]
+            level: Nullable<String> => default,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            role: Option<String> => optional(String),
+        }
+    }
+
+    /// Left out, a setting keeps its default; null sends nothing where nothing is a
+    /// choice and is refused where it is not; a value replaces the default.
+    #[test]
+    fn left_out_keeps_the_default_null_sends_nothing_and_values_replace_it() {
+        let read = |yaml: &str| Example::resolve(&crate::yaml::parse(yaml).unwrap()).unwrap();
+        let left_out = read("name: n");
+        assert_eq!(left_out.level.or("auto".into()), Some("auto".into()));
+        assert_eq!(left_out.role, None);
+        let chosen = read("name: n\nlevel: detailed\nrole: user");
+        assert_eq!(chosen.level.or("auto".into()), Some("detailed".into()));
+        assert_eq!(chosen.role.as_deref(), Some("user"));
+        let null = read("name: n\nlevel: null");
+        assert_eq!(null.level.or("auto".into()), None);
+        assert!(crate::yaml::parse::<ExamplePatch>("role: null").is_err());
+        let lower: ExamplePatch = crate::yaml::parse("level: null").unwrap();
+        let higher: ExamplePatch = crate::yaml::parse("level: concise").unwrap();
+        let merged = Example::resolve(
+            &lower
+                .overlay(&higher)
+                .overlay(&crate::yaml::parse("name: n").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(merged.level, Nullable::Value("concise".into()));
+        for yaml in ["level: null\n", "level: detailed\nrole: user\n"] {
+            let patch: ExamplePatch = crate::yaml::parse(yaml).unwrap();
+            assert_eq!(crate::yaml::to_string(&patch).unwrap(), yaml);
         }
     }
 

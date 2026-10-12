@@ -17,11 +17,11 @@ Different models on one provider may use different supported codecs:
 | Dialect | Codecs | Use for |
 | --- | --- | --- |
 | `compatible` | any | Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only `base_url`. A key is sent as each API specifies: a bearer token, or `x-api-key` on `messages`. Extra field: `state_role` (default `user`). |
-| `openai` | `chat_completions`, `responses` | `base_url` defaults to `https://api.openai.com/v1`. Response schemas must fit OpenAI's strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: `reasoning_summary: unsupported` (default `requested`) for an unverified organisation (Responses only), `organization`, `project`. |
+| `openai` | `chat_completions`, `responses` | `base_url` defaults to `https://api.openai.com/v1`. Response schemas must fit OpenAI's strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: `reasoning_summary` (Responses only): `"auto"` (default), `"concise"` or `"detailed"`, or `null` to request none for an unverified organisation; `organization`, `project`. |
 | `anthropic` | `messages` | `base_url` defaults to `https://api.anthropic.com/v1`. Extra fields: `workspace_id`, `cache_ttl: "5m"` or `"1h"`, `state_role` (default `system`). |
 | `codex` | `responses` | The ChatGPT subscription service; no `api_key`—run `skyhook auth login <provider>`. `base_url` defaults to the ChatGPT backend root `https://chatgpt.com/backend-api` and the extra field `auth_url` to `https://auth.openai.com`; set them only for a mirror. |
 | `openrouter` | any | `base_url` defaults to `https://openrouter.ai/api/v1`. Reasoning effort and returned reasoning follow OpenRouter's conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: `routing` (Chat only: `order`, `allow_fallbacks`, `require_parameters`, `data_collection: "allow"` or `"deny"`, `quantizations`, `zdr`, `fallback_models`), `cache_ttl: "5m"` or `"1h"`, and `state_role` (default `user`). A response schema always sets `require_parameters`. |
-| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Claude on Chat replays signed thinking and takes prompt caching, OpenAI on Chat has neither. `messages` behind an Anthropic upstream reaches the service as sent and gets the `anthropic` dialect's conventions: turn-scoped system state, signed thinking kept, and the betas both need, which the proxy forwards. Behind Bedrock it does not, since LiteLLM drops the turn-scoped beta on its Bedrock path; behind OpenAI it goes through the proxy's translation, which drops reasoning. Chat, and `messages` behind Bedrock, drop superseded state, which breaks models that bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): use `messages` behind Anthropic for them, or `state_mode: persist`. Optional `tags` select LiteLLM's tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session. Extra field: `state_role` (default `system` for `messages` behind Anthropic, `user` otherwise). |
+| `litellm` | any | A LiteLLM proxy; `api_key` is the virtual key, sent as a bearer token for every codec, including `messages`. Each model needs `upstream: "openai"`, `"anthropic"` or `"bedrock"` after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Behind `anthropic`, Chat replays signed thinking and takes prompt caching. Behind `openai`, Chat and Responses take OpenAI's conventions, with neither. Behind `bedrock`, which serves both families, they take OpenAI's conventions too, but Chat still replays the signed thinking the proxy returns. `messages` behind an Anthropic upstream reaches the service as sent and gets the `anthropic` dialect's conventions: turn-scoped system state, signed thinking kept, and the betas both need, which the proxy forwards. Behind Bedrock it does not, since LiteLLM drops the turn-scoped beta on its Bedrock path; behind OpenAI it goes through the proxy's translation, which drops reasoning. Chat, and `messages` behind Bedrock, drop superseded state, which breaks models that bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): use `messages` behind Anthropic for them, or `state_mode: persist`. Each conversation's identity rides `x-litellm-session-id`, which LiteLLM's session affinity and spend logs key on but which it forwards to no service; Chat and Responses behind `openai` or `bedrock` also send it as `prompt_cache_key`, which LiteLLM passes on for the service's own cache affinity. LiteLLM refuses `prompt_cache_key` for every model it serves through Bedrock's Converse API: Claude, Nova, Llama, Mistral, and OpenAI-family models such as GPT-OSS unless they are routed to Bedrock's OpenAI endpoint. Serve Claude through `messages`, whatever its upstream. For the others, send the identity in the header alone with `cache_key: {header: "x-litellm-session-id"}`. Optional `tags` select LiteLLM's tag-based routing and label its spend logs. Extra field: `state_role` (default `system` for `messages` behind Anthropic, `user` otherwise). |
 
 Every dialect but `codex` accepts `api_key` (see [authentication](authentication.md)); every
 dialect accepts fixed request `headers` for proxies or attribution, the
@@ -47,9 +47,16 @@ directly beside `model`. To migrate an older configuration, move each member of 
 Missing model settings inherit from the provider. Explicit values win even when they are `false`,
 `[]`, or a setting's usual default. Lists replace inherited lists rather than append. Under
 OpenRouter's `routing`, only declared members change: a model's `order` replaces the inherited
-order while an undeclared `allow_fallbacks` still inherits. For nullable settings, `null` clears
-an inherited value; for example, `organization: null` removes the organization header and
-`routing: null` removes routing preferences.
+order while an undeclared `allow_fallbacks` still inherits.
+
+Every request setting in the table above reads the same way, apart from lists. Left out, it
+inherits, and with nothing to inherit takes its default. An explicit `null` sends nothing: `organization: null` removes the
+organization header, `routing: null` removes routing preferences, `reasoning_summary: null`
+requests no summaries, and a placement selection of `null` places nothing. A setting that always
+sends something, such as `state_role` or `reasoning_effort`, refuses `null`; leave it out to take
+its default. Lists, such as LiteLLM's `tags`, refuse `null` too: `[]` is the empty list. A
+placement selection's list of locations is never empty; `null` is how it places nothing.
+Provider-only settings differ: `startup_timeout_secs: null`, for one, takes the default.
 
 Every model must have `codec`, and LiteLLM models must also have `upstream`, **after inheritance**.
 A provider may omit either if every model supplies it. Defaults and compatibility checks apply to
@@ -97,36 +104,38 @@ providers:
     codec: "chat_completions"
     dialect: "compatible"
     base_url: "http://127.0.0.1:8000/v1"
-    output_limit:                                # or: omitted
+    output_limit:                                # or null for none
       field: "max_tokens"
-    reasoning_replay:                            # the assistant-message key; or: omitted
+    reasoning_replay:                            # the assistant-message key; or null
       field: "reasoning"
-    cache_key:                                   # or `header: "x-session-id"`, or: omitted
-      body: "cache_salt"
+    cache_key:                                   # one location, a list of them, or null
+      - body: "cache_salt"
+      - header: "x-session-id"
     models:
       thinker:
         model: "served-name"
         max_context: 131072
         max_output: 32768
         reasoning_effort: "reasoning_effort"
-        output_limit: null                      # Restore the preset: max_completion_tokens.
+        output_limit: null                      # Send no output limit.
 ```
 
 The selectable dimensions are `output_limit`, `reasoning_effort` (a field path), `reasoning_replay`
-and `tool_stream` (Chat Completions only), `cache_key`, and `user_id`. An absent model selection
-inherits. A `null` selection clears the inherited explicit placement and restores the preset for
-the model's effective codec and dialect settings; it does not disable the convention. Use
-`omitted` to disable a placement that allows it. Changing `codec` does not discard inherited
-selections; clear or replace any that are not valid for the new codec.
+and `tool_stream` (Chat Completions only), `cache_key`, and `user_id`. Each selection names one
+location or a nonempty list of distinct locations, and the value is written at every one. A selection left
+out inherits, and with nothing to inherit keeps the preset for the model's effective codec and
+dialect settings; an explicit `null` places nothing. Changing `codec` does not discard inherited
+selections: set `null` for any the new codec has no place for, or replace them.
 
 A field path is dot-separated (`metadata.user_id`); `cache_key` and `user_id` carry the
 conversation identity.
 Paths must not name a field the codec writes itself (such as `model` or `messages`), and no two may
-overlap, including one inside another (`reasoning` and `reasoning.effort`). A `cache_key` header
+overlap, including one inside another (`reasoning` and `reasoning.effort`), within one selection or
+across two. A `cache_key` header
 must not be `accept`, `content-type`, or a header the codec sends itself (such as
 `anthropic-version` on `messages`). A `reasoning_replay`
-field moves the provider's replay to another key in the same form. Messages requires an output
-limit, so `output_limit: omitted` is refused there.
+field moves the provider's replay to other keys in the same form. Messages requires an output
+limit, so `output_limit: null` is refused there, as is `reasoning_effort: null` everywhere.
 
 ## Context and output budgets
 
@@ -312,9 +321,9 @@ Standard Chat Completions has no portable request-side reasoning field. Compatib
 replay their returned reasoning under **`reasoning_content` by default**. Ordinary Chat responses
 without reasoning do not acquire an invented reasoning field.
 A server that spells the key differently selects it with `reasoning_replay` set to
-`field: "reasoning"`; `reasoning_replay: omitted` keeps reasoning local. The `openai` dialect never
-replays on Chat, since the official API rejects unknown message keys; `litellm` with a Claude
-upstream replays the signed thinking blocks the proxy returns, and `openrouter` replays its
+`field: "reasoning"`; `reasoning_replay: null` keeps reasoning local. The `openai` dialect never
+replays on Chat, since the official API rejects unknown message keys; `litellm` behind an
+`anthropic` or `bedrock` upstream replays the signed thinking blocks the proxy returns, and `openrouter` replays its
 `reasoning_details`; both are bound to the exact conversation like Messages thinking. As on
 Messages, unsigned reasoning is replayed until signed reasoning appears in the context. From then
 on, only signed thinking blocks are sent, and a turn's `reasoning_details` are sent whole, in

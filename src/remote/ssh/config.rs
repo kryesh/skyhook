@@ -82,7 +82,7 @@ impl SshConfig {
 
         file.flush()?;
         let target = Some(route.destination.name.clone());
-        let askpass = super::askpass::AskpassServer::start(prompts, target)?;
+        let askpass = super::askpass::AskpassServer::start(prompts, target, None)?;
         Ok(Self {
             _directory: directory,
             path,

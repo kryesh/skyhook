@@ -1,10 +1,13 @@
-use std::{future::Future, pin::Pin};
+use std::{future::Future, path::PathBuf, pin::Pin};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
-use crate::target::{TargetName, TargetRef};
+use crate::{
+    identity::JobId,
+    target::{TargetName, TargetRef},
+};
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum SensitivePromptKind {
@@ -24,6 +27,32 @@ pub struct SensitivePrompt {
     pub target: Option<TargetName>,
     /// Where the prompting process runs.
     pub origin: TargetRef,
+    pub requester: Requester,
+}
+
+/// The process that ran the askpass helper, as far as the machine serving the
+/// prompt could tell. Best effort: any process running as the server's user can
+/// connect as the helper, and is then attributed to its own parent.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Requester {
+    pub executable: RequesterExecutable,
+    /// The running job whose process tree it belongs to.
+    pub job: Option<JobId>,
+}
+
+/// What the requesting program is. A process chooses its own name, arguments and
+/// environment, but not its executable or, without a set-user-ID program, its user.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum RequesterExecutable {
+    Path(PathBuf),
+    /// A program running as another user, such as set-user-ID `sudo`, whose
+    /// executable the serving user may not read; only its name and user are known.
+    Privileged {
+        name: String,
+        uid: u32,
+    },
+    #[default]
+    Unknown,
 }
 
 #[cfg(test)]
@@ -34,6 +63,7 @@ impl SensitivePrompt {
             message: "fixture".into(),
             target: None,
             origin: TargetRef::Root,
+            requester: Requester::default(),
         }
     }
 }

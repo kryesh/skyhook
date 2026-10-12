@@ -367,11 +367,18 @@ acknowledges as it reads. Replay recovers pending child messages from durable hi
 independently of output inspection. A child's text-only answer is held as its job's result;
 when its invocation goes on instead, the answer's release to the owner is journaled too.
 
-Process tools never connect stdin, and capture stdout/stderr. Without the `Interactive` capability,
-they also detach from the controlling terminal on Unix and replace inherited askpass settings with
-a rejecting helper. Redirecting stdio alone is insufficient: a program could still prompt through
-`/dev/tty`. The helper remains alive through process cleanup, independently of whether target
-management is enabled. OpenSSH runs a Skyhook binary as its askpass helper, so every binary calls
+Process tools never connect stdin, capture stdout/stderr, and detach from the controlling terminal
+on Unix. Redirecting stdio alone is insufficient: a program could still prompt through `/dev/tty`,
+and outside the terminal's foreground process group that stops it. Without a terminal, OpenSSH,
+sudo and Git prompt through the askpass helper (`SSH_ASKPASS`, `SUDO_ASKPASS`) instead. sudo also
+requires some `DISPLAY`, so a placeholder is set only when the process would have none. Root
+process tools always receive the session's askpass helper, backed by the host's sensitive prompt
+handler. Each prompt names its best-effort requester, and its job when the requesting process descends from
+the process a running job registered with the job manager. The session-managed SSH agent replaces
+`SSH_AUTH_SOCK` only with the `Targets` capability. Remote workers give their processes a helper that forwards prompts to the host.
+Without the `Interactive` capability, a call replaces these settings with a rejecting helper that
+remains alive through process cleanup, independently of whether target management is enabled.
+OpenSSH and sudo run a Skyhook binary as their askpass helper, so every binary calls
 `remote::askpass_main()` first: it answers the prompt and exits when started in that role and
 returns otherwise. SSH's host-mediated prompt channel is described under [authentication and prompt
 isolation](remote-transport-and-shims.md#authentication-and-prompt-isolation).
@@ -424,3 +431,31 @@ Source: [agent runtime](https://github.com/kryesh/skyhook/tree/main/src/agent/ru
 [providers](https://github.com/kryesh/skyhook/tree/main/src/provider),
 [tools](https://github.com/kryesh/skyhook/tree/main/src/tool), and
 [sessions](https://github.com/kryesh/skyhook/tree/main/src/session).
+
+## Terminal transcript selection
+
+The terminal lays out transcript entries into rows. Each row's layout separates what it paints
+as decoration (wrap continuations, code padding, disclosure glyphs, spinner gutters, diff markers,
+table borders and padding) from the source text it shows. A row's source is described by spans:
+which logical line they belong to, which bytes of that line's text, and which bytes of the row
+show them. A table cell is a logical line of its own, so the fragments of a wrapped cell share
+one line. Spans also keep the source that a row shows differently or not at all, such as a cell's
+trimmed separators, a replaced wide grapheme, or an empty cell.
+
+A selection is anchored to source, not to rows: each end is an entry key, a logical line identity
+within that entry, and a byte in that line's text. Line identities come from the source and do
+not depend on width, but they are identities only. A Markdown line is identified by its source
+position. A tool document or plain line after an entry's header is identified by all the text
+before it, so inserting a line gives every line below it a new identity; the header's own text
+is the entry's state, so it takes no part. Document order is the order in which the
+layout first shows each line, which reads a table's cells row by row even when their fragments
+interleave on screen. Endpoints, copying and highlighting all read the same spans. Copying joins
+each selected line's parts in that order, one line per table cell. Each layout of an entry orders
+its lines once, when a selection first needs them, so dragging across a long entry reads only
+the rows of the lines it selects.
+
+Whenever entries are laid out again (new text, a reply settling, a resize), the selection is
+re-resolved against the new rows. It survives only if its endpoints still exist and the text they
+select is unchanged; otherwise it is dropped rather than moved to other text.
+
+Source: [rendering](https://github.com/kryesh/skyhook/tree/main/src/bin/skyhook/tui/render).

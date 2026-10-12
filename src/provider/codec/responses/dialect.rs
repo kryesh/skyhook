@@ -1,6 +1,7 @@
 //! The conventions that vary between Responses servers.
 use crate::provider::codec::{
-    BodyPath, CacheKey, Effort, Identity, OPENAI_EFFORT, StateRole, ToolNames, path,
+    BodyPath, CacheKey, Effort, Identity, Locations, NonEmpty, OPENAI_EFFORT, StateRole, ToolNames,
+    path,
 };
 
 /// Whether `instructions` is sent without system segments.
@@ -12,41 +13,25 @@ pub(crate) enum Instructions {
 }
 
 crate::named_enum::named_enum! {
-    /// Whether reasoning summaries are requested.
+    /// The detail of the reasoning summaries requested, as `reasoning.summary` spells it.
     #[derive(Clone, Copy, Debug, Default, serde::Serialize, PartialEq, Eq)]
     pub enum ReasoningSummary {
         #[default]
-        Requested = "requested",
-        /// The service rejects `reasoning.summary`.
-        Unsupported = "unsupported",
+        Auto = "auto",
+        Concise = "concise",
+        Detailed = "detailed",
     }
-}
-
-impl ReasoningSummary {
-    pub(crate) fn is_requested(&self) -> bool {
-        *self == Self::Requested
-    }
-}
-
-/// What the terminal event says about streamed output items.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TerminalOutput {
-    /// Every streamed item is restated in the terminal `output`.
-    Restated,
-    /// The terminal `output` may be empty; streamed items are authoritative.
-    /// Premature EOF still fails.
-    StreamedOnly,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dialect {
     pub instructions: Instructions,
-    /// Where `max_output` goes; None when the endpoint manages the limit.
-    pub output_limit: Option<BodyPath>,
-    pub reasoning_summary: ReasoningSummary,
+    /// Where `max_output` goes; none when the endpoint manages the limit.
+    pub output_limit: Locations<BodyPath>,
+    /// None for a service that rejects `reasoning.summary`.
+    pub reasoning_summary: Option<ReasoningSummary>,
     pub effort: Effort,
     pub identity: Identity,
-    pub terminal_output: TerminalOutput,
     /// Event types that are transport metadata, not output. Unknown semantic
     /// events still fail.
     pub metadata_events: &'static [&'static str],
@@ -60,17 +45,16 @@ impl Dialect {
     pub(crate) fn stateless() -> Self {
         Self {
             instructions: Instructions::WhenPresent,
-            output_limit: Some(const { path("max_output_tokens") }),
-            reasoning_summary: ReasoningSummary::Requested,
+            output_limit: Locations::one(const { path("max_output_tokens") }),
+            reasoning_summary: Some(ReasoningSummary::Auto),
             effort: Effort {
-                path: const { path("reasoning.effort") },
+                path: NonEmpty::one(const { path("reasoning.effort") }),
                 levels: OPENAI_EFFORT,
             },
             identity: Identity {
-                cache_key: CacheKey::Body(const { path("prompt_cache_key") }),
-                user_id: None,
+                cache_key: Locations::one(CacheKey::Body(const { path("prompt_cache_key") })),
+                user_id: Locations::NONE,
             },
-            terminal_output: TerminalOutput::Restated,
             metadata_events: &[],
             tool_names: ToolNames::Any,
             state_role: StateRole::User,

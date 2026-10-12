@@ -5,25 +5,34 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     named_enum::named_enum,
-    provider::codec::{
-        BodyPath, CacheKey, Codec, CodecName, chat_completions, messages, overlaps, responses,
+    provider::{
+        codec::{
+            BodyPath, CacheKey, Codec, CodecName, Locations, NonEmpty, chat_completions, messages,
+            overlaps, responses,
+        },
+        settings::Nullable,
     },
 };
 
-/// A body placement as configuration spells it.
+/// A body location as configuration spells it: `{field: path}`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum Placement {
-    Omitted,
-    Field(BodyPath),
+#[serde(deny_unknown_fields)]
+pub struct BodyField {
+    pub field: BodyPath,
 }
 
-impl Placement {
-    fn path(&self) -> Option<BodyPath> {
-        match self {
-            Self::Omitted => None,
-            Self::Field(path) => Some(path.clone()),
-        }
+impl From<BodyField> for BodyPath {
+    fn from(field: BodyField) -> Self {
+        field.field
+    }
+}
+
+/// Locations chosen in place of the preset, if any were: none for null.
+fn chosen<T: Clone, U: From<T>>(selection: &Nullable<NonEmpty<T>>) -> Option<Locations<U>> {
+    match selection {
+        Nullable::Default => None,
+        Nullable::Null => Some(Locations::NONE),
+        Nullable::Value(locations) => Some(locations.clone().map(U::from).into()),
     }
 }
 
@@ -78,41 +87,39 @@ pub enum PlacementError {
 }
 
 crate::provider::settings::settings! {
-    /// Resolved placement selections. None keeps the dialect preset; a patch
-    /// can explicitly reset an inherited selection to None.
+    /// Resolved placement selections: left out, each keeps the dialect preset; null
+    /// places nothing; otherwise one location or a list of them.
     #[derive(Default)]
     pub struct Placements => PlacementsPatch {
+        #[serde(default, skip_serializing_if = "Nullable::is_default")]
+        pub output_limit: Nullable<NonEmpty<BodyField>> => default,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub output_limit: Option<Placement> => default,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub reasoning_effort: Option<BodyPath> => default,
+        pub reasoning_effort: Option<NonEmpty<BodyPath>> => optional(NonEmpty<BodyPath>),
         /// Chat Completions only. A field keeps the dialect's replay shape.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub reasoning_replay: Option<Placement> => default,
+        #[serde(default, skip_serializing_if = "Nullable::is_default")]
+        pub reasoning_replay: Nullable<NonEmpty<BodyField>> => default,
         /// Chat Completions only.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub tool_stream: Option<Placement> => default,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub cache_key: Option<CacheKey> => default,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub user_id: Option<Placement> => default,
+        #[serde(default, skip_serializing_if = "Nullable::is_default")]
+        pub tool_stream: Nullable<NonEmpty<BodyField>> => default,
+        #[serde(default, skip_serializing_if = "Nullable::is_default")]
+        pub cache_key: Nullable<NonEmpty<CacheKey>> => default,
+        #[serde(default, skip_serializing_if = "Nullable::is_default")]
+        pub user_id: Nullable<NonEmpty<BodyField>> => default,
     }
 }
 
 impl Placements {
     /// The codec with these selections applied, or the first selection the
-    /// codec has no dimension for.
+    /// codec has no dimension for or that withholds a value it needs.
     pub(crate) fn apply(&self, mut codec: Codec) -> Result<Codec, PlacementError> {
         let family = codec.name();
         if family != CodecName::ChatCompletions {
-            for (key, selected) in [
-                (
-                    PlacementKey::ReasoningReplay,
-                    self.reasoning_replay.is_some(),
-                ),
-                (PlacementKey::ToolStream, self.tool_stream.is_some()),
+            for (key, selection) in [
+                (PlacementKey::ReasoningReplay, &self.reasoning_replay),
+                (PlacementKey::ToolStream, &self.tool_stream),
             ] {
-                if selected {
+                // Placing nothing is a selection every family can honour.
+                if matches!(selection, Nullable::Value(_)) {
                     return Err(PlacementError::Foreign { key, family });
                 }
             }
@@ -122,39 +129,48 @@ impl Placements {
         }
         match &mut codec {
             Codec::ChatCompletions(dialect) => {
-                if let Some(limit) = &self.output_limit {
-                    dialect.output_limit = limit.path();
+                if let Some(limit) = chosen(&self.output_limit) {
+                    dialect.output_limit = limit;
                 }
-                if let Some(replay) = &self.reasoning_replay {
-                    dialect.reasoning_replay = match replay.path() {
-                        Some(path) => dialect.reasoning_replay.at(path),
-                        None => chat_completions::ReasoningReplay::Unsupported,
-                    };
+                match &self.reasoning_replay {
+                    Nullable::Default => {}
+                    Nullable::Null => {
+                        dialect.reasoning_replay = chat_completions::ReasoningReplay::Unsupported;
+                    }
+                    Nullable::Value(fields) => {
+                        dialect.reasoning_replay = dialect
+                            .reasoning_replay
+                            .at(fields.clone().map(BodyPath::from));
+                    }
                 }
-                if let Some(stream) = &self.tool_stream {
-                    dialect.tool_stream = stream.path();
+                if let Some(stream) = chosen(&self.tool_stream) {
+                    dialect.tool_stream = stream;
                 }
             }
             Codec::Responses(dialect) => {
-                if let Some(limit) = &self.output_limit {
-                    dialect.output_limit = limit.path();
+                if let Some(limit) = chosen(&self.output_limit) {
+                    dialect.output_limit = limit;
                 }
             }
-            Codec::Messages(dialect) => {
-                if let Some(limit) = &self.output_limit {
-                    dialect.output_limit = limit.path().ok_or(PlacementError::RequiresField {
+            Codec::Messages(dialect) => match &self.output_limit {
+                Nullable::Default => {}
+                Nullable::Null => {
+                    return Err(PlacementError::RequiresField {
                         key: PlacementKey::OutputLimit,
                         family,
-                    })?;
+                    });
                 }
-            }
+                Nullable::Value(fields) => {
+                    dialect.output_limit = fields.clone().map(BodyPath::from);
+                }
+            },
         }
         let identity = codec.identity_mut();
-        if let Some(key) = &self.cache_key {
-            identity.cache_key = key.clone();
+        if let Some(keys) = chosen(&self.cache_key) {
+            identity.cache_key = keys;
         }
-        if let Some(user) = &self.user_id {
-            identity.user_id = user.path();
+        if let Some(user) = chosen(&self.user_id) {
+            identity.user_id = user;
         }
         Ok(codec)
     }
@@ -167,26 +183,17 @@ pub(crate) fn check(codec: &Codec) -> Result<(), PlacementError> {
     let family = codec.name();
     let mut body: Vec<(Key, &BodyPath)> = Vec::new();
     let mut message: Vec<(Key, &BodyPath)> = Vec::new();
+    let at = |key: Key| move |path| (key, path);
     let (body_fields, message_fields) = match codec {
         Codec::ChatCompletions(dialect) => {
-            body.extend(
-                dialect
-                    .output_limit
-                    .iter()
-                    .map(|path| (Key::OutputLimit, path)),
-            );
-            body.push((Key::ReasoningEffort, &dialect.effort.path));
-            body.extend(
-                dialect
-                    .tool_stream
-                    .iter()
-                    .map(|path| (Key::ToolStream, path)),
-            );
+            body.extend(dialect.output_limit.iter().map(at(Key::OutputLimit)));
+            body.extend(dialect.effort.path.iter().map(at(Key::ReasoningEffort)));
+            body.extend(dialect.tool_stream.iter().map(at(Key::ToolStream)));
+            let replay = dialect.reasoning_replay.paths().into_iter();
             message.extend(
-                dialect
-                    .reasoning_replay
-                    .path()
-                    .map(|path| (Key::ReasoningReplay, path)),
+                replay
+                    .flat_map(NonEmpty::iter)
+                    .map(at(Key::ReasoningReplay)),
             );
             (
                 chat_completions::BODY_FIELDS,
@@ -194,38 +201,34 @@ pub(crate) fn check(codec: &Codec) -> Result<(), PlacementError> {
             )
         }
         Codec::Responses(dialect) => {
-            body.extend(
-                dialect
-                    .output_limit
-                    .iter()
-                    .map(|path| (Key::OutputLimit, path)),
-            );
-            body.push((Key::ReasoningEffort, &dialect.effort.path));
+            body.extend(dialect.output_limit.iter().map(at(Key::OutputLimit)));
+            body.extend(dialect.effort.path.iter().map(at(Key::ReasoningEffort)));
             (responses::BODY_FIELDS, &[][..])
         }
         Codec::Messages(dialect) => {
-            body.push((Key::OutputLimit, &dialect.output_limit));
-            body.push((Key::ReasoningEffort, &dialect.effort.path));
+            body.extend(dialect.output_limit.iter().map(at(Key::OutputLimit)));
+            body.extend(dialect.effort.path.iter().map(at(Key::ReasoningEffort)));
             (messages::BODY_FIELDS, &[][..])
         }
     };
     let identity = codec.identity();
-    match &identity.cache_key {
-        CacheKey::Body(path) => body.push((Key::CacheKey, path)),
-        CacheKey::Header(name) => {
-            use reqwest::header::{ACCEPT, CONTENT_TYPE};
-            if name == ACCEPT || name == CONTENT_TYPE || codec.headers().contains(name) {
-                let name = name.clone();
-                return Err(PlacementError::ReservedHeader {
-                    key: Key::CacheKey,
-                    name,
-                    family,
-                });
+    for key in identity.cache_key.iter() {
+        match key {
+            CacheKey::Body(path) => body.push((Key::CacheKey, path)),
+            CacheKey::Header(name) => {
+                use reqwest::header::{ACCEPT, CONTENT_TYPE};
+                if name == ACCEPT || name == CONTENT_TYPE || codec.headers().contains(name) {
+                    let name = name.clone();
+                    return Err(PlacementError::ReservedHeader {
+                        key: Key::CacheKey,
+                        name,
+                        family,
+                    });
+                }
             }
         }
-        CacheKey::Omitted => {}
     }
-    body.extend(identity.user_id.iter().map(|path| (Key::UserId, path)));
+    body.extend(identity.user_id.iter().map(at(Key::UserId)));
     for (fields, placements) in [(body_fields, body), (message_fields, message)] {
         for (index, &(key, path)) in placements.iter().enumerate() {
             if fields.iter().any(|field| overlaps(field, path.as_str())) {
@@ -257,37 +260,9 @@ mod tests {
     };
 
     #[test]
-    fn null_resets_an_inherited_selection_but_omitted_is_a_value() {
-        use crate::provider::settings::{Patch as _, Settings};
-
-        let lower: PlacementsPatch =
-            crate::yaml::parse("output_limit: {field: max_tokens}").unwrap();
-        let omitted: PlacementsPatch = crate::yaml::parse("output_limit: omitted").unwrap();
-        assert_eq!(
-            Placements::resolve(&lower.overlay(&omitted))
-                .unwrap()
-                .output_limit,
-            Some(Placement::Omitted)
-        );
-        let reset: PlacementsPatch = crate::yaml::parse("output_limit: null").unwrap();
-        assert_eq!(
-            crate::yaml::to_string(&reset).unwrap(),
-            "output_limit: null\n"
-        );
-        let resolved = Placements::resolve(&lower.overlay(&reset)).unwrap();
-        assert_eq!(resolved.output_limit, None);
-        assert_eq!(
-            Placements::resolve(&lower.overlay(&PlacementsPatch::default()))
-                .unwrap()
-                .output_limit,
-            Some(Placement::Field(path("max_tokens")))
-        );
-    }
-
-    #[test]
     fn selections_apply_per_family_and_reject_foreign_ones() {
         let placements: Placements = crate::yaml::parse(
-            "output_limit: {field: max_tokens}\nreasoning_replay: omitted\ncache_key: {header: x-session-id}\nuser_id: {field: metadata.user}\n",
+            "output_limit: {field: max_tokens}\nreasoning_replay: null\ncache_key: {header: x-session-id}\nuser_id: {field: metadata.user}\n",
         )
         .unwrap();
         let Codec::ChatCompletions(chat) =
@@ -295,23 +270,30 @@ mod tests {
         else {
             panic!()
         };
-        assert_eq!(chat.output_limit, Some(path("max_tokens")));
+        assert_eq!(chat.output_limit, Locations::one(path("max_tokens")));
         assert_eq!(
             chat.reasoning_replay,
             chat_completions::ReasoningReplay::Unsupported
         );
-        assert_eq!(chat.identity.cache_key, header("x-session-id"));
-        assert_eq!(chat.identity.user_id, Some(path("metadata.user")));
-        assert_eq!(chat.effort.path, path("reasoning_effort"));
         assert_eq!(
-            placements.apply(base(CodecName::Responses)).unwrap_err(),
+            chat.identity.cache_key,
+            Locations::one(header("x-session-id"))
+        );
+        assert_eq!(chat.identity.user_id, Locations::one(path("metadata.user")));
+        assert_eq!(chat.effort.path, NonEmpty::one(path("reasoning_effort")));
+        // Placing no replay suits every family; naming a field only Chat.
+        assert!(placements.apply(base(CodecName::Responses)).is_ok());
+        let replay: Placements =
+            crate::yaml::parse("reasoning_replay: {field: reasoning}").unwrap();
+        assert_eq!(
+            replay.apply(base(CodecName::Responses)).unwrap_err(),
             PlacementError::Foreign {
                 key: PlacementKey::ReasoningReplay,
                 family: CodecName::Responses
             }
         );
         let omitted = Placements {
-            output_limit: Some(Placement::Omitted),
+            output_limit: Nullable::Null,
             ..Default::default()
         };
         assert_eq!(
@@ -324,13 +306,73 @@ mod tests {
         let Codec::Responses(responses) = omitted.apply(base(CodecName::Responses)).unwrap() else {
             panic!()
         };
-        assert_eq!(responses.output_limit, None);
+        assert_eq!(responses.output_limit, Locations::NONE);
+        assert!(crate::yaml::parse::<PlacementsPatch>("reasoning_effort: null").is_err());
         assert!(crate::yaml::parse::<Placements>("cache_key: {header: 'bad header'}").is_err());
         assert!(crate::yaml::parse::<Placements>("unknown: 1").is_err());
         // `dump config` writes the tagged spelling back.
         assert_eq!(
             crate::yaml::to_string(&placements).unwrap().trim(),
-            "output_limit:\n  field: max_tokens\nreasoning_replay: omitted\ncache_key:\n  header: x-session-id\nuser_id:\n  field: metadata.user"
+            "output_limit:\n  field: max_tokens\nreasoning_replay: null\ncache_key:\n  header: x-session-id\nuser_id:\n  field: metadata.user"
+        );
+    }
+
+    /// A list selects every location it names; locations in one list stay clear of
+    /// one another, and a bad location is refused for its own reason.
+    #[test]
+    fn lists_place_one_value_at_several_locations() {
+        let text = "output_limit: [{field: max_tokens}, {field: max_completion_tokens}]\n\
+            reasoning_effort: [reasoning_effort, reasoning.effort]\n\
+            reasoning_replay: [{field: reasoning}, {field: reasoning_content}]\n\
+            cache_key: [{header: x-session-id}, {body: prompt_cache_key}]\n";
+        let placements: Placements = crate::yaml::parse(text).unwrap();
+        let written = crate::yaml::to_string(&placements).unwrap();
+        assert_eq!(
+            crate::yaml::parse::<Placements>(&written).unwrap(),
+            placements
+        );
+        let applied = placements.apply(base(CodecName::ChatCompletions)).unwrap();
+        assert_eq!(check(&applied), Ok(()));
+        let Codec::ChatCompletions(chat) = applied else {
+            panic!()
+        };
+        let both = |a, b| Locations::one(path(a)).with(path(b));
+        assert_eq!(
+            chat.output_limit,
+            both("max_tokens", "max_completion_tokens")
+        );
+        assert_eq!(
+            Locations::from(chat.effort.path),
+            both("reasoning_effort", "reasoning.effort")
+        );
+        let chat_completions::ReasoningReplay::Text(replay) = chat.reasoning_replay else {
+            panic!("{:?}", chat.reasoning_replay)
+        };
+        assert_eq!(
+            Locations::from(replay),
+            both("reasoning", "reasoning_content")
+        );
+        assert_eq!(
+            chat.identity.cache_key,
+            Locations::one(header("x-session-id")).with(CacheKey::Body(path("prompt_cache_key")))
+        );
+        let nested: Placements =
+            crate::yaml::parse("output_limit: [{field: limits}, {field: limits.output}]").unwrap();
+        assert_eq!(
+            check(&nested.apply(base(CodecName::Responses)).unwrap()),
+            Err(PlacementError::Overlap {
+                key: PlacementKey::OutputLimit,
+                path: path("limits"),
+                other: PlacementKey::OutputLimit,
+                other_path: path("limits.output"),
+            })
+        );
+        let refused = crate::yaml::parse::<Placements>("cache_key: [{header: 'bad header'}]");
+        assert!(
+            refused
+                .unwrap_err()
+                .to_string()
+                .contains("not a valid header name")
         );
     }
 
@@ -340,16 +382,16 @@ mod tests {
         let field: Placements = crate::yaml::parse("reasoning_replay: {field: kept}").unwrap();
         for (preset, expected) in [
             (
-                ReasoningReplay::ThinkingBlocks(path("thinking_blocks")),
-                ReasoningReplay::ThinkingBlocks(path("kept")),
+                ReasoningReplay::ThinkingBlocks(NonEmpty::one(path("thinking_blocks"))),
+                ReasoningReplay::ThinkingBlocks(NonEmpty::one(path("kept"))),
             ),
             (
-                ReasoningReplay::Details(path("reasoning_details")),
-                ReasoningReplay::Details(path("kept")),
+                ReasoningReplay::Details(NonEmpty::one(path("reasoning_details"))),
+                ReasoningReplay::Details(NonEmpty::one(path("kept"))),
             ),
             (
                 ReasoningReplay::Unsupported,
-                ReasoningReplay::Text(path("kept")),
+                ReasoningReplay::Text(NonEmpty::one(path("kept"))),
             ),
         ] {
             let codec = Codec::ChatCompletions(chat_completions::Dialect {
@@ -373,7 +415,7 @@ mod tests {
             tags: Vec::new(),
             state_role: None,
         };
-        let presets: [&dyn DialectConfig; 7] = [
+        let presets: [&dyn DialectConfig; 8] = [
             &compatible::Config::default(),
             &openai::Config::default(),
             &anthropic::Config::default(),
@@ -381,6 +423,7 @@ mod tests {
             &openrouter::Config::default(),
             &litellm(litellm::Upstream::Openai),
             &litellm(litellm::Upstream::Anthropic),
+            &litellm(litellm::Upstream::Bedrock),
         ];
         for (index, settings) in presets.into_iter().enumerate() {
             for family in [
@@ -408,10 +451,15 @@ mod tests {
             Err(header("accept", chat))
         );
         let messages = CodecName::Messages;
-        assert_eq!(
-            checked(messages, "cache_key: {header: anthropic-version}"),
-            Err(header("anthropic-version", messages))
-        );
+        for text in [
+            "cache_key: {header: anthropic-version}",
+            "cache_key: [{header: x-session}, {header: anthropic-version}]",
+        ] {
+            assert_eq!(
+                checked(messages, text),
+                Err(header("anthropic-version", messages))
+            );
+        }
         assert_eq!(checked(chat, "cache_key: {header: x-session}"), Ok(()));
         // Paths written apart, and a replay key named like a body field, pass.
         assert_eq!(

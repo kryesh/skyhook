@@ -44,7 +44,7 @@ pub use login::{
     AuthStatus, Login, LoginCommand, LoginError, LoginReason, LoginRequired, Usage, UsageWindow,
 };
 pub use models::{ModelSpec, Request, RequestPatch, RequestSettings};
-pub use placements::{Placement, PlacementError, PlacementKey, Placements, PlacementsPatch};
+pub use placements::{BodyField, PlacementError, PlacementKey, Placements, PlacementsPatch};
 
 named_enum! {
     /// The preset a provider entry names.
@@ -418,12 +418,14 @@ pub(crate) mod tests {
     /// environment value is never read.
     #[tokio::test]
     async fn placements_replace_credentials_which_replace_entry_headers() {
-        use crate::provider::codec::header;
+        use crate::provider::codec::{NonEmpty, header};
         let dir = tempfile::tempdir().unwrap();
         let count = dir.path().join("count");
         let command = format!("printf x >> '{}'; printf entry", count.to_str().unwrap());
         let selected = Placements {
-            cache_key: Some(header("x-api-key")),
+            cache_key: crate::provider::settings::Nullable::Value(NonEmpty::one(header(
+                "x-api-key",
+            ))),
             ..Placements::default()
         };
         let heads = heads(2, async |root| {

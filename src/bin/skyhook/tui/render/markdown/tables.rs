@@ -1,5 +1,6 @@
 //! Table sizing, cell wrapping, and bounded grid rendering.
 use super::super::{cells, cells_width, wrap_words};
+use super::{LineId, SourceSpan, text_len};
 use pulldown_cmark::Alignment;
 use ratatui::{
     style::Modifier,
@@ -12,11 +13,30 @@ struct Column {
     width: usize,
 }
 
+/// A cell's rendered text and the source position that identifies it.
+type Cell = (Line<'static>, usize);
+
 #[derive(Default)]
 pub(super) struct Table {
     columns: Vec<Column>,
-    rows: Vec<Vec<Line<'static>>>,
-    row: Vec<Line<'static>>,
+    rows: Vec<Vec<Cell>>,
+    row: Vec<Cell>,
+}
+
+/// A rendered table line and the cell fragments it shows. Each cell is
+/// identified by its source position until layout numbers its lines.
+pub(super) struct TableLine {
+    pub(super) line: Line<'static>,
+    pub(super) cells: Vec<SourceSpan>,
+}
+
+impl From<Line<'static>> for TableLine {
+    fn from(line: Line<'static>) -> Self {
+        Self {
+            line,
+            cells: Vec::new(),
+        }
+    }
 }
 
 impl Table {
@@ -34,8 +54,8 @@ impl Table {
         }
     }
 
-    pub(super) fn push_cell(&mut self, cell: Line<'static>) {
-        self.row.push(cell);
+    pub(super) fn push_cell(&mut self, cell: Line<'static>, origin: usize) {
+        self.row.push((cell, origin));
     }
 
     /// pulldown-cmark pads and truncates every GFM row to the header width.
@@ -43,7 +63,7 @@ impl Table {
         self.rows.push(std::mem::take(&mut self.row));
     }
 
-    pub(super) fn lines(mut self, width: usize) -> Vec<Line<'static>> {
+    pub(super) fn lines(mut self, width: usize) -> Vec<TableLine> {
         if !self.row.is_empty() {
             self.finish_row();
         }
@@ -52,7 +72,7 @@ impl Table {
             return Vec::new();
         }
         for row in &mut rows {
-            for (column, cell) in self.columns.iter_mut().zip(row) {
+            for (column, (cell, _)) in self.columns.iter_mut().zip(row) {
                 // The TUI paints one grapheme at a time. Some strings (e.g.
                 // Arabic lam-alef) measure narrower as a whole than the sum of
                 // their graphemes. Split only those spans so width measurement
@@ -139,62 +159,80 @@ impl Table {
                     .join(junction)
             ))
         };
-        let mut lines = vec![border('┌', "┬", '┐')];
+        let mut lines = vec![border('┌', "┬", '┐').into()];
         for (index, row) in rows.into_iter().enumerate() {
             if index > 0 {
-                lines.push(border('├', "┼", '┤'));
+                lines.push(border('├', "┼", '┤').into());
             }
             let mut cells: Vec<_> = row
                 .into_iter()
                 .zip(&self.columns)
-                .map(|(mut cell, column)| {
+                .enumerate()
+                .map(|(position, ((mut cell, origin), column))| {
                     if index == 0 {
                         bold(&mut cell);
                     }
-                    wrap_cell(cell, column.width).into_iter()
+                    wrap_cell(cell, LineId::cell(origin, position), column.width).into_iter()
                 })
                 .collect();
             let height = cells.iter().map(ExactSizeIterator::len).max().unwrap_or(1);
             for _ in 0..height {
-                let mut spans = vec![Span::raw("│")];
+                let mut line = TableLine::from(Line::from("│"));
                 for (index, column) in self.columns.iter().enumerate() {
                     let width = column.width;
-                    let cell = cells
-                        .get_mut(index)
-                        .and_then(Iterator::next)
-                        .unwrap_or_default();
-                    let padding = width.saturating_sub(cell.width());
+                    let fragment = cells.get_mut(index).and_then(Iterator::next);
+                    let cell_width = fragment.as_ref().map_or(0, |(cell, _)| cell.width());
+                    let padding = width.saturating_sub(cell_width);
                     let left = match column.alignment {
                         Alignment::Right => padding,
                         Alignment::Center => padding / 2,
                         _ => 0,
                     };
-                    spans.push(Span::raw(" ".repeat(left + 1)));
-                    spans.extend(cell.spans);
-                    spans.push(Span::raw(" ".repeat(padding - left + 1)));
-                    spans.push(Span::raw("│"));
+                    line.push(Span::raw(" ".repeat(left + 1)));
+                    if let Some((cell, span)) = fragment {
+                        line.push_cell(cell, span);
+                    }
+                    line.push(Span::raw(" ".repeat(padding - left + 1)));
+                    line.push(Span::raw("│"));
                 }
-                lines.push(Line::from(spans));
+                lines.push(line);
             }
         }
-        lines.push(border('└', "┴", '┘'));
+        lines.push(border('└', "┴", '┘').into());
         lines
+    }
+}
+
+impl TableLine {
+    fn push(&mut self, span: Span<'static>) {
+        self.line.spans.push(span);
+    }
+    /// Append a cell fragment, shown where it lands in this line.
+    fn push_cell(&mut self, cell: Line<'static>, span: SourceSpan) {
+        let at = text_len(&self.line);
+        self.line.spans.extend(cell.spans);
+        let shown = at..text_len(&self.line);
+        self.cells.push(SourceSpan { shown, ..span });
     }
 }
 
 /// If even the borders and one grapheme per column cannot fit, stack cells
 /// instead of emitting a broken grid or discarding their text.
-fn borderless(rows: Vec<Vec<Line<'static>>>, width: usize) -> Vec<Line<'static>> {
+fn borderless(rows: Vec<Vec<Cell>>, width: usize) -> Vec<TableLine> {
     let mut lines = Vec::new();
     for (index, row) in rows.into_iter().enumerate() {
         if index > 0 {
-            lines.push(Line::default());
+            lines.push(Line::default().into());
         }
-        for mut cell in row {
+        for (position, (mut cell, origin)) in row.into_iter().enumerate() {
             if index == 0 {
                 bold(&mut cell);
             }
-            lines.extend(wrap_cell(cell, width));
+            for (fragment, span) in wrap_cell(cell, LineId::cell(origin, position), width) {
+                let mut line = TableLine::from(Line::default());
+                line.push_cell(fragment, span);
+                lines.push(line);
+            }
         }
     }
     lines
@@ -206,22 +244,30 @@ fn bold(line: &mut Line<'_>) {
     }
 }
 
-fn wrap_cell(mut cell: Line<'static>, width: usize) -> Vec<Line<'static>> {
+/// A cell's rows as shown, each with the span of the cell's own text it
+/// stands for. Positions refer to that text, whatever the row shows for it.
+fn wrap_cell(cell: Line<'static>, id: LineId, width: usize) -> Vec<(Line<'static>, SourceSpan)> {
     let width = width.max(1);
-    // Only the borderless fallback can be narrower than a grapheme. Use a
-    // visible replacement there, rather than letting it overwrite the next cell.
-    for span in &mut cell.spans {
-        if cells(&span.content).any(|(_, _, w)| w > width) {
-            span.content = cells(&span.content)
-                .map(|(_, g, w)| if w > width { "�" } else { g })
-                .collect::<String>()
-                .into();
+    let text: String = cell.spans.iter().map(|span| &*span.content).collect();
+    let text = std::sync::Arc::<str>::from(text);
+    let mut start = 0;
+    let mut lines = Vec::new();
+    for mut line in wrap_words(cell, width) {
+        let source = start..start + text_len(&line);
+        start = source.end;
+        for span in &mut line.spans {
+            // Only the borderless fallback can be narrower than a grapheme.
+            // Show a replacement there, rather than overwriting the next cell.
+            if cells(&span.content).any(|(_, _, w)| w > width) {
+                span.content = cells(&span.content)
+                    .map(|(_, g, w)| if w > width { "�" } else { g })
+                    .collect::<String>()
+                    .into();
+            }
         }
-    }
-    let mut lines = wrap_words(cell, width);
-    for line in &mut lines {
         // Prose wrapping retains trailing separators beyond the viewport for
-        // selection. Inside a cell they must not push padding/borders outward.
+        // selection. Inside a cell they must not push padding/borders outward;
+        // the span still stands for them.
         while let Some(span) = line.spans.last_mut() {
             let trimmed = span.content.trim_end();
             if trimmed.is_empty() {
@@ -233,6 +279,14 @@ fn wrap_cell(mut cell: Line<'static>, width: usize) -> Vec<Line<'static>> {
                 break;
             }
         }
+        let shown: String = line.spans.iter().map(|span| &*span.content).collect();
+        let span = SourceSpan {
+            line: id,
+            text: (shown != text[source.clone()]).then(|| text.clone()),
+            source,
+            shown: 0..shown.len(),
+        };
+        lines.push((line, span));
     }
     lines
 }

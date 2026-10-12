@@ -36,11 +36,10 @@ ordinary automatically allowed operations still work. `--approve-all` (or config
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.
 
-`exec` never has stdin connected; without `interactive` it also has no
-controlling terminal, so
-ordinary `/dev/tty` prompts cannot stop the job waiting for terminal input. SSH authentication
-prompts are rejected even when inherited `SSH_ASKPASS` settings request another prompt helper
-or the `targets` capability is disabled. Existing `SSH_AUTH_SOCK` credentials are preserved unless
+`exec` never has stdin connected or a controlling terminal, so ordinary `/dev/tty` prompts cannot
+stop the job waiting for terminal input. SSH and `sudo` password prompts are rejected even when
+inherited `SSH_ASKPASS` or `SUDO_ASKPASS` settings request another prompt helper or the `targets`
+capability is disabled. Existing `SSH_AUTH_SOCK` credentials are preserved unless
 the configured target-authentication setup replaces them. Remote commands apply the same
 capability restrictions. This is still not an OS sandbox against deliberately programmed
 subprocesses that establish their own external interaction mechanisms.

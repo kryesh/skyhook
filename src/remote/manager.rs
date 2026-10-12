@@ -8,7 +8,7 @@ use futures_util::future::{BoxFuture, FutureExt as _, Shared};
 
 use super::{
     artifact::EmbeddedShimCatalog,
-    backend::{ConnectionFactory, ConnectionRequest, ProcessEnvironment},
+    backend::{ConnectionFactory, ConnectionRequest, ProcessAuthentication, ProcessEnvironment},
     client::{PooledConnection, Session},
     error::{ProtocolError, RemoteError},
     prompt::SensitivePromptHandler,
@@ -89,15 +89,17 @@ impl PreparedConnection {
 
 impl RemoteManager {
     /// A manager whose startups and connections stop once `shutdown` is cancelled,
-    /// as the session's own token is when its journal fails.
+    /// as the session's own token is when its journal fails. Local askpass prompts
+    /// name the running job of `jobs` they came from.
     pub(crate) fn new(
         catalog: EmbeddedShimCatalog,
         prompts: Arc<dyn SensitivePromptHandler>,
+        jobs: Option<crate::job::JobManager>,
         shutdown: CancellationToken,
     ) -> Self {
         Self {
             inner: Arc::new(RemoteInner {
-                factory: Arc::new(super::ssh::Backend::new(catalog, prompts.clone())),
+                factory: Arc::new(super::ssh::Backend::new(catalog, prompts.clone(), jobs)),
                 shutdown,
                 tasks: tokio_util::task::TaskTracker::new(),
                 pool: Mutex::new(HashMap::new()),
@@ -106,11 +108,14 @@ impl RemoteManager {
         }
     }
 
-    pub(crate) async fn environment(&self) -> Result<ProcessEnvironment, RemoteError> {
+    pub(crate) async fn environment(
+        &self,
+        authentication: ProcessAuthentication,
+    ) -> Result<ProcessEnvironment, RemoteError> {
         if self.inner.shutdown.is_cancelled() {
             return Err(RemoteError::Cancelled);
         }
-        self.inner.factory.environment().await
+        self.inner.factory.environment(authentication).await
     }
     fn pool(&self) -> std::sync::MutexGuard<'_, HashMap<ConnectionKey, Arc<PooledSlot>>> {
         self.inner
@@ -383,8 +388,13 @@ pub(crate) mod tests {
 
     fn manager(factory: Arc<dyn ConnectionFactory>) -> RemoteManager {
         let prompts = Arc::new(RejectSensitivePrompts);
-        RemoteManager::new(EmbeddedShimCatalog::default(), prompts, Default::default())
-            .with_connection_factory(factory)
+        RemoteManager::new(
+            EmbeddedShimCatalog::default(),
+            prompts,
+            None,
+            Default::default(),
+        )
+        .with_connection_factory(factory)
     }
 
     /// Counts transports it starts and holds each shim handshake until `ready` has a permit.

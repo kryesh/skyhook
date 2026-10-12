@@ -155,8 +155,9 @@ impl TargetRouter {
 
     pub(crate) async fn environment(
         &self,
+        authentication: crate::remote::backend::ProcessAuthentication,
     ) -> Result<crate::remote::backend::ProcessEnvironment, RemoteError> {
-        self.remote.environment().await
+        self.remote.environment(authentication).await
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -301,6 +302,7 @@ impl TargetRouter {
         let remote = RemoteManager::new(
             crate::remote::EmbeddedShimCatalog::default(),
             Arc::new(crate::remote::RejectSensitivePrompts),
+            None,
             Default::default(),
         );
         let targets = definitions.into_iter().collect();

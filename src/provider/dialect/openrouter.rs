@@ -11,7 +11,8 @@ use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile};
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheTtl, Codec, CodecName, Effort, OPENAI_EFFORT, SchemaConstraint, StateRole, ToolNames,
+        CacheTtl, Codec, CodecName, Effort, Locations, NonEmpty, OPENAI_EFFORT, SchemaConstraint,
+        StateRole, ToolNames,
         chat_completions::{self, Cache, EmptyContent, ReasoningReplay, Routing, UsageRequest},
         header, messages, path,
     },
@@ -24,10 +25,12 @@ use crate::provider::{
 fn chat(ttl: Option<CacheTtl>, routing: Option<Routing>) -> chat_completions::Dialect {
     chat_completions::Dialect {
         effort: Effort {
-            path: const { path("reasoning.effort") },
+            path: NonEmpty::one(const { path("reasoning.effort") }),
             levels: OPENAI_EFFORT,
         },
-        reasoning_replay: ReasoningReplay::Details(const { path("reasoning_details") }),
+        reasoning_replay: ReasoningReplay::Details(NonEmpty::one(
+            const { path("reasoning_details") },
+        )),
         empty_content: EmptyContent::Null,
         usage_request: UsageRequest::Implicit,
         tool_names: ToolNames::OpenAi,
@@ -178,7 +181,7 @@ crate::provider::settings::settings! {
         /// The role runtime state takes: `user` (default) sends it as user content;
         /// `system` needs a server that accepts system messages mid-conversation.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub state_role: Option<StateRole> => default,
+        pub state_role: Option<StateRole> => optional(StateRole),
     }
 }
 
@@ -208,7 +211,7 @@ impl DialectConfig for Config {
                 ..messages::Dialect::standard()
             }),
         };
-        codec.identity_mut().cache_key = header("x-session-id");
+        codec.identity_mut().cache_key = Locations::one(header("x-session-id"));
         let mut profile = Profile::new(codec, transport, Dialect::Openrouter);
         profile.state_role(self.state_role, StateRole::User);
         if let Some(routing) = &self.routing {

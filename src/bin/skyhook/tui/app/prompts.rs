@@ -1,7 +1,7 @@
 use super::*;
 use skyhook::{
     agent::{Question, QuestionAnswer},
-    remote::PromptAnswer,
+    remote::{PromptAnswer, Requester, RequesterExecutable},
 };
 use std::ops::Deref;
 
@@ -455,7 +455,11 @@ impl App {
                 let target = (prompt.target.as_ref())
                     .map_or_else(String::new, |target| format!(" · {target}"));
                 let origin = crate::tui::model::target_suffix(&prompt.origin);
-                format!("Authentication{target}{origin}\n{}", prompt.message)
+                let requester = requester_text(&prompt.requester);
+                format!(
+                    "Authentication{target}{origin}\n{requester}\n{}",
+                    prompt.message
+                )
             }
             PromptKind::Rename { .. } => {
                 "Rename session\nLeave empty to use the automatic title".into()
@@ -608,6 +612,19 @@ impl App {
     }
 }
 
+/// Who asked, so a prompt the agent's own command raised stands apart from one
+/// raised by the program it claims to be.
+fn requester_text(requester: &Requester) -> String {
+    let executable = match &requester.executable {
+        RequesterExecutable::Path(path) => path.display().to_string(),
+        RequesterExecutable::Privileged { name, uid } => format!("{name} (running as uid {uid})"),
+        RequesterExecutable::Unknown => "an unknown program".into(),
+    };
+    let job = requester
+        .job
+        .map_or_else(String::new, |job| format!(" in job {job}"));
+    format!("Requested by {executable}{job}")
+}
 #[cfg(test)]
 mod tests {
     use super::super::tests::*;
@@ -653,6 +670,7 @@ mod tests {
             message: format!("SSH prompt {id}"),
             target: None,
             origin: skyhook::target::TargetRef::Root,
+            requester: Requester::default(),
         };
         let kind = PromptKind::Authentication { prompt, reply };
         app.prompt(Prompt { id, kind });
@@ -913,10 +931,10 @@ mod tests {
         let expected = [
             "",
             "Authentication",
+            "Requested by an unknown program",
             "SSH prompt 100",
             "",
             masked.as_str(),
-            "",
         ];
         assert_eq!(askpass[..expected.len()], expected);
     }
@@ -1212,6 +1230,50 @@ mod tests {
                 ApprovalReply::Deny
             };
             assert_eq!(response.await.unwrap().unwrap(), expected);
+            assert!(app.prompts.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn authentication_names_its_requester_and_job() {
+        let (_root, mut app) = fixture().await;
+        let job = skyhook::identity::JobId::new(7).unwrap();
+        for (requester, expected) in [
+            (
+                Requester {
+                    executable: RequesterExecutable::Path("/usr/bin/ssh".into()),
+                    job: None,
+                },
+                "Requested by /usr/bin/ssh\n",
+            ),
+            (
+                Requester {
+                    executable: RequesterExecutable::Privileged {
+                        name: "sudo".into(),
+                        uid: 0,
+                    },
+                    job: Some(job),
+                },
+                "Requested by sudo (running as uid 0) in job 7\n",
+            ),
+            (Requester::default(), "Requested by an unknown program\n"),
+        ] {
+            let (reply, _response) = oneshot::channel();
+            let prompt = skyhook::remote::SensitivePrompt {
+                kind: SensitivePromptKind::Password,
+                message: "[sudo] password:".into(),
+                target: None,
+                origin: skyhook::target::TargetRef::Root,
+                requester,
+            };
+            let kind = PromptKind::Authentication { prompt, reply };
+            app.prompt(Prompt { id: 100, kind });
+            assert!(
+                app.prompt_text().contains(expected),
+                "{}",
+                app.prompt_text()
+            );
+            key(&mut app, Esc, M::NONE);
             assert!(app.prompts.is_empty());
         }
     }

@@ -83,9 +83,24 @@ listener is needed.
 SSH authentication prompts use `SensitivePromptHandler`, separate from model questions and tool
 output. Remote prompts and their typed answers (a secret, a confirmation or a rejection) travel as
 private control messages, not session events or saved results. OpenSSH is given an explicit askpass
-helper so the host can handle passwords, passphrases, and confirmations without exposing them to
-the agent transcript; the helper prints a secret, answers `yes` to a confirmed host key, and exits
-nonzero for a rejection.
+helper so the host can handle passwords, passphrases, and confirmations outside the agent
+transcript; the helper prints a secret to the program that ran it, answers `yes` to a confirmed
+host key, and exits nonzero for a rejection. The same helper is offered to sudo as `SUDO_ASKPASS`,
+which sudo uses whenever no terminal is available and some `DISPLAY` is set, so command password
+prompts reach the host the same way; a placeholder `DISPLAY` is set only when the process would
+have none. Since every interactive command receives the helper, a command the agent writes can run
+it and capture the answer, so each prompt carries its requester for the user to judge. The
+machine serving the prompt reads that requester from `/proc`, since its PIDs are meaningful only
+there. It reads the executable link of the parent of the socket peer, taking the peer to be the
+helper. A program running as another user, such as set-user-ID `sudo`, denies that read, so the
+prompt carries its name and effective UID instead. The attribution is best effort: any process
+running as the server's user can connect to the socket itself, so a command started by a genuine
+program (an SSH `ProxyCommand`, say) is reported as that program and receives the answer.
+Prompts on the host also carry the job: the ancestors of the helper are compared with
+the processes running exec jobs have registered with the job manager. A job that has ended no
+longer matches. Workers don't know host job IDs, so their prompts carry only the executable,
+and missing information leaves the requester unknown rather than failing the prompt. Once the
+session shuts down, its authentication refuses to start another askpass server.
 
 Each askpass server keeps its helper and socket in a private temporary directory and accepts
 only peers running as its own user. This prevents other local users from injecting

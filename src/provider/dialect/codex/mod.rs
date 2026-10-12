@@ -19,8 +19,8 @@ use super::{
 use crate::provider::{
     ProviderError,
     codec::{
-        Codec, CodecName, Identity, StateRole, header,
-        responses::{self, Instructions, TerminalOutput},
+        Codec, CodecName, Identity, Locations, StateRole, header,
+        responses::{self, Instructions},
     },
     http::{Headers, Session, Transport, auth::Authenticator, headers::Value},
     profile::ProviderName,
@@ -34,17 +34,16 @@ const SKYHOOK: HeaderValue = HeaderValue::from_static("skyhook");
 const MAX_BODY_BYTES: usize = 1024 * 1024;
 
 /// The subscription service's Responses conventions: `instructions` is required, no
-/// output limit is accepted, cache affinity travels as a header, completed items
-/// are not restated in the terminal event, and quota notices ride the stream.
+/// output limit is accepted, cache affinity travels as a header, and quota notices
+/// ride the stream.
 fn responses() -> responses::Dialect {
     responses::Dialect {
         instructions: Instructions::RequiredEvenWhenEmpty,
-        output_limit: None,
+        output_limit: Locations::NONE,
         identity: Identity {
-            cache_key: header("session-id"),
-            user_id: None,
+            cache_key: Locations::one(header("session-id")),
+            user_id: Locations::NONE,
         },
-        terminal_output: TerminalOutput::StreamedOnly,
         state_role: StateRole::System,
         metadata_events: &[
             "codex.rate_limits",

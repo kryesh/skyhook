@@ -2,7 +2,9 @@
 use super::super::super::tool_view;
 use super::super::{cells, cells_width, truncated, wrap_line, wrap_words};
 use super::parser::{LineInfo, parse};
-use super::{CodeGeometry, Layout, LayoutLine, RowLayout};
+use super::{
+    CodeGeometry, Layout, LayoutLine, LineIds, RowLayout, RowSource, SourceSpan, text_len,
+};
 use ratatui::text::{Line, Span};
 
 /// Wrap source inside its paragraph/container, then add geometry-only code
@@ -11,43 +13,49 @@ pub(in super::super) fn layout_highlighted(
     text: &str,
     placeholder: bool,
     width: usize,
-    markdown_width: usize,
-    prefix: &str,
     cache: Option<&tool_view::HighlightCache>,
 ) -> Layout {
     let width = width.max(1);
-    let mut parsed = parse(text, placeholder, markdown_width, cache);
-    if !prefix.is_empty() && !parsed.lines.is_empty() {
-        if parsed.table_first {
-            parsed.lines.insert(0, Line::from(prefix.to_owned()).into());
-        } else {
-            parsed.lines[0]
-                .line
-                .spans
-                .insert(0, Span::raw(prefix.to_owned()));
-            let info = &mut parsed.lines[0].info;
-            if info.prefix_spans > 0 || info.code.is_some() {
-                info.prefix_spans += 1;
-            }
-            // The reasoning spinner is only a first-row decoration, not a
-            // Markdown container to repeat on later visual rows.
-        }
-    }
+    let parsed = parse(text, placeholder, width, cache);
+    // Table lines vary in number with the width; their cells, which do not,
+    // identify their source, so only other lines take line identities.
+    let mut ids = LineIds::default();
+    let mut cell_ids = std::collections::HashMap::new();
     let mut input = parsed
         .lines
         .into_iter()
-        .map(|parsed| (parsed.line, parsed.info))
+        .map(|mut parsed| {
+            let source = match parsed.info.cells.take() {
+                None => RowSource::Line {
+                    line: ids.next(parsed.info.origin),
+                    start: 0,
+                },
+                Some(cells) => RowSource::Cells(
+                    (cells.into_iter())
+                        .map(|cell| SourceSpan {
+                            line: *(cell_ids.entry(cell.line))
+                                .or_insert_with(|| ids.next(cell.line.origin)),
+                            ..cell
+                        })
+                        .collect(),
+                ),
+            };
+            (parsed.line, source, parsed.info)
+        })
         .peekable();
     let mut output = Vec::new();
-    while let Some((line, info)) = input.next() {
-        if let Some(id) = info.code {
-            let mut block = vec![(line, info)];
-            while input.peek().is_some_and(|(_, info)| info.code == Some(id)) {
+    while let Some((line, id, info)) = input.next() {
+        if let Some(code) = info.code {
+            let mut block = vec![(line, id, info)];
+            while input
+                .peek()
+                .is_some_and(|(_, _, info)| info.code == Some(code))
+            {
                 block.push(input.next().unwrap());
             }
             let indent = block
                 .iter()
-                .map(|(line, info)| {
+                .map(|(line, _, info)| {
                     line.spans
                         .iter()
                         .take(info.prefix_spans)
@@ -60,7 +68,7 @@ pub(in super::super) fn layout_highlighted(
                 .min(width.saturating_sub(1));
             let longest = block
                 .iter()
-                .map(|(line, info)| {
+                .map(|(line, _, info)| {
                     line.spans
                         .iter()
                         .skip(info.prefix_spans)
@@ -72,7 +80,7 @@ pub(in super::super) fn layout_highlighted(
             // Very narrow containers prioritize a source grapheme over padding.
             let widest = block
                 .iter()
-                .flat_map(|(line, info)| line.spans.iter().skip(info.prefix_spans))
+                .flat_map(|(line, _, info)| line.spans.iter().skip(info.prefix_spans))
                 .flat_map(|span| cells(&span.content))
                 .map(|(_, _, width)| width)
                 .max()
@@ -80,18 +88,18 @@ pub(in super::super) fn layout_highlighted(
             let code = CodeGeometry::new(width, indent, longest, widest);
             let decoration = LayoutLine {
                 layout: RowLayout::decoration(
-                    truncated(block[0].1.continuation.clone(), indent),
+                    truncated(block[0].2.continuation.clone(), indent),
                     code,
                 ),
                 ..LayoutLine::default()
             };
             output.push(decoration.clone());
-            for (line, info) in block {
-                layout_source(line, info, width, Some(code), &mut output);
+            for (line, id, info) in block {
+                layout_source(line, id, info, width, Some(code), &mut output);
             }
             output.push(decoration);
         } else {
-            layout_source(line, info, width, None, &mut output);
+            layout_source(line, id, info, width, None, &mut output);
         }
     }
     Layout {
@@ -102,15 +110,17 @@ pub(in super::super) fn layout_highlighted(
 
 fn layout_source(
     mut line: Line<'static>,
+    source: RowSource,
     info: LineInfo,
     width: usize,
     code: Option<CodeGeometry>,
     output: &mut Vec<LayoutLine>,
 ) {
+    let text: String = line.spans.iter().map(|span| &*span.content).collect();
     let body = line
         .spans
         .split_off(info.prefix_spans.min(line.spans.len()));
-    let source_prefix = line.to_string().len();
+    let source_prefix = text_len(&line);
     let source_prefix_width = line
         .width()
         .max(info.continuation.width())
@@ -131,6 +141,7 @@ fn layout_source(
     } else {
         wrap_words(body, budget)
     };
+    let mut start = 0;
     for (index, mut body) in wrapped.into_iter().enumerate() {
         let first = index == 0;
         if first {
@@ -138,19 +149,21 @@ fn layout_source(
             spans.append(&mut body.spans);
             body.spans = spans;
         }
+        let layout = RowLayout::source(
+            if first {
+                Line::default()
+            } else {
+                continuation.clone()
+            },
+            if first { source_prefix } else { 0 },
+            if first { source_prefix_width } else { 0 },
+            code,
+        );
+        let row_start = start;
+        start += text_len(&body);
         output.push(LayoutLine {
+            layout: layout.with_source(source.slice(row_start..start, &text)),
             line: body,
-            layout: RowLayout::source(
-                if first {
-                    Line::default()
-                } else {
-                    continuation.clone()
-                },
-                if first { source_prefix } else { 0 },
-                if first { source_prefix_width } else { 0 },
-                code,
-            )
-            .with_flow(false, !first),
         });
     }
 }
@@ -165,11 +178,12 @@ mod tests {
     /// inserted by source_prefix_width or decorative continuation prefixes.
     fn painted_markdown(text: &str) -> Vec<String> {
         use super::super::super::{
-            Row, RowBlocks, TextPosition, render_row_line, selected_text, tests::fixture_row,
+            Row, RowBlocks, TextPosition, render_row_line,
+            tests::{fixture_row, selected_text},
         };
         use ratatui::{buffer::Buffer, layout::Rect};
         let width = 12;
-        let layout = layout_highlighted(text, false, width as usize, width as usize, "", None);
+        let layout = layout_highlighted(text, false, width as usize, None);
         let rows: Vec<Row> = layout
             .lines
             .into_iter()

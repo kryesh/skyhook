@@ -11,6 +11,15 @@ pub(crate) use super::transport::Transport;
 /// Authentication variables added to processes started on a credential origin.
 pub(crate) type ProcessEnvironment = BTreeMap<String, String>;
 
+/// The session-owned authentication a local process receives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProcessAuthentication {
+    /// The session's askpass helper; an inherited `SSH_AUTH_SOCK` is kept.
+    Prompts,
+    /// The askpass helper and the session-managed SSH agent.
+    PromptsAndAgent,
+}
+
 #[derive(Clone)]
 pub(crate) struct ConnectionRequest {
     /// Only the hops after `origin`; credentials belong to that origin, not `via`.
@@ -28,7 +37,10 @@ pub(crate) trait ConnectionFactory: Send + Sync {
     fn connect(&self, request: ConnectionRequest) -> BoxFuture<'_, Result<Transport, RemoteError>>;
 
     /// Obtain the session's process authentication environment, lazily if needed.
-    fn environment(&self) -> BoxFuture<'_, Result<ProcessEnvironment, RemoteError>> {
+    fn environment(
+        &self,
+        _authentication: ProcessAuthentication,
+    ) -> BoxFuture<'_, Result<ProcessEnvironment, RemoteError>> {
         Box::pin(async { Ok(ProcessEnvironment::new()) })
     }
 

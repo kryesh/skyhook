@@ -28,7 +28,7 @@ mod reasoning;
 mod terminal;
 
 pub use dialect::ReasoningSummary;
-pub(crate) use dialect::{Dialect, Instructions, TerminalOutput};
+pub(crate) use dialect::{Dialect, Instructions};
 
 pub(crate) use encoder::{BODY_FIELDS, encode};
 pub(crate) use errors::Code;
@@ -270,7 +270,6 @@ impl Item {
 }
 
 pub(crate) struct Decoder {
-    terminal_output: TerminalOutput,
     metadata_events: &'static [&'static str],
     errors: ErrorSignals,
     model: String,
@@ -279,6 +278,8 @@ pub(crate) struct Decoder {
     /// Every native ID and alias, and every bound wire index, to its item.
     ids: HashMap<String, usize>,
     wires: HashMap<usize, usize>,
+    /// Items whose final state said they stopped short.
+    unfinished: BTreeSet<usize>,
     completed: bool,
 }
 
@@ -324,15 +325,7 @@ pub(super) mod tests {
     }
 
     pub(super) fn decoder() -> Decoder {
-        decoder_for(TerminalOutput::Restated)
-    }
-
-    /// `StreamedOnly` is a service whose terminal event omits streamed items, like Codex.
-    pub(super) fn decoder_for(terminal_output: TerminalOutput) -> Decoder {
-        let dialect = Dialect {
-            terminal_output,
-            ..Dialect::stateless()
-        };
+        let dialect = Dialect::stateless();
         Decoder::new("test-model".into(), scope(), &dialect, ErrorSignals::NONE)
     }
 

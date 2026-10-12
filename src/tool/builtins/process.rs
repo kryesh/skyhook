@@ -38,7 +38,7 @@ pub(super) fn register<F: Future<Output = ()> + Send + 'static>(
         ToolOptions::new(vec![Capability::Exec])
             .result::<ProcessOutput>()
             .placement(crate::tool::ToolPlacement::TargetedWorkspace)
-            .target_authentication()
+            .process_authentication()
             .named()
             .background()
             .argument_paths(|exec: &mut Exec| {
@@ -121,6 +121,7 @@ async fn run_process(
             crate::remote::AskpassServer::start(
                 std::sync::Arc::new(crate::remote::RejectSensitivePrompts),
                 None,
+                None,
             )
             .map_err(|error| {
                 LocalError::io(error)
@@ -132,33 +133,30 @@ async fn run_process(
             })?,
         )
     };
-    command.envs(&context.process_environment);
+    crate::remote::apply_environment(command.as_std_mut(), &context.process_environment);
     if let Some(askpass) = &rejecting_askpass {
-        command.envs(askpass.environment());
+        crate::remote::apply_environment(command.as_std_mut(), &askpass.environment());
     }
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    // Redirected stdio still permits /dev/tty access, which stops a child outside
+    // the terminal's foreground group (SIGTTIN/SIGTTOU) even when interactive.
+    // Without a terminal, prompting programs such as sudo use the askpass helper.
+    // A new session detaches the controlling terminal and also makes the child
+    // its process-group leader, preserving group-wide cleanup below.
+    // SAFETY: setsid is async-signal-safe and the hook does not allocate or
+    // access shared state between fork and exec.
     #[cfg(unix)]
-    if context.capabilities().contains(Capability::Interactive) {
-        command.process_group(0);
-    } else {
-        // Redirected stdio still permits /dev/tty access (and SIGTTIN stops).
-        // A new session detaches the controlling terminal and also makes the
-        // child its process-group leader, preserving group-wide cleanup below.
-        // Do not combine this with process_group(0): a group leader cannot setsid.
-        // SAFETY: setsid is async-signal-safe and the hook does not allocate or
-        // access shared state between fork and exec.
-        unsafe {
-            command.pre_exec(|| {
-                if libc::setsid() == -1 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
     }
     if context.is_cancelled() {
         return Err(LocalError::cancelled()
@@ -172,6 +170,7 @@ async fn run_process(
             .operation(Operation::Spawn, Subject::Process)
             .effects(Effects::NotStarted)
     })?;
+    let attributed = child.id().and_then(|pid| context.attach_process(pid));
     #[cfg(unix)]
     let mut group = ProcessGroup::led_by(&child);
     let pipe_unavailable = |pipe: &str| {
@@ -194,7 +193,11 @@ async fn run_process(
         let execution = async {
             let (status, (), ()) = tokio::try_join!(
                 async {
-                    child.wait().await.map_err(LocalError::annotated(started(
+                    let status = child.wait().await;
+                    // A reaped PID can be reused while descendants keep the pipes
+                    // open; it must stop naming this job before then.
+                    drop(attributed);
+                    status.map_err(LocalError::annotated(started(
                         Operation::Wait,
                         Subject::Process,
                     )))
@@ -467,6 +470,41 @@ mod tests {
     + use<> {
         let deadline = deadline.clone();
         move |_| deadline.clone().cancelled_owned()
+    }
+
+    /// A reaped process's PID may be reused while a descendant keeps its output
+    /// open, so it stops naming the job before the call ends.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_reaped_process_stops_naming_its_job_while_output_stays_open() {
+        let runtime = TestRuntime::new().await;
+        let deadline = CancellationToken::new();
+        let executor = executor(&runtime, true, elapses(&deadline));
+        let dir = tempfile::tempdir().unwrap();
+        let release = dir.path().join("release");
+        let script = format!(
+            "echo $$; while [ ! -e '{}' ]; do sleep 0.01; done; sleep 3600 &",
+            release.display()
+        );
+        let command = json!({"command":script, "timeout":3600});
+        let run = executor.run_host(&runtime.agent, "exec", command);
+        let (result, ()) = tokio::join!(bounded(run), async {
+            let line = live_stdout(&runtime).await;
+            let pid: u32 = line.to_string().trim_matches('"').trim().parse().unwrap();
+            let job = runtime.jobs.list(&runtime.agent).last().unwrap().id;
+            assert_eq!(runtime.jobs.process_job(&[pid]), Some(job));
+            std::fs::write(&release, "").unwrap();
+            bounded(async {
+                while runtime.jobs.process_job(&[pid]).is_some() {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            })
+            .await;
+            let running = runtime.jobs.list(&runtime.agent);
+            assert_eq!(running.last().unwrap().state, JobState::Running);
+            deadline.cancel();
+        });
+        assert!(result.is_err());
     }
 
     #[cfg(unix)]
@@ -800,7 +838,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn capability_controls_terminal_access_under_a_pty() {
+    async fn process_tools_detach_from_the_terminal_under_a_pty() {
         let (mut master, mut slave) = (-1, -1);
         // SAFETY: openpty initializes the two descriptor slots; optional arguments
         // are null. OwnedFd below takes sole ownership on success.
@@ -881,7 +919,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    #[ignore = "invoked in a dedicated PTY/session by capability_controls_terminal_access_under_a_pty"]
+    #[ignore = "invoked in a dedicated PTY/session by process_tools_detach_from_the_terminal_under_a_pty"]
     fn pty_executor_helper() {
         if std::env::var_os(PTY_HELPER).is_none() {
             return;
@@ -895,24 +933,47 @@ mod tests {
         tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
             for interactive in [false, true] {
                 let runtime = TestRuntime::new().await;
-                // The fixture disables Targets: terminal gating must not depend on it.
+                // The fixture disables Targets: terminal isolation must not depend on it.
                 let executor = executor(&runtime, interactive, tokio::time::sleep);
-                let (command, expected) = if interactive {
-                    ("if (: <> /dev/tty) 2>/dev/null; then printf attached; else printf missing; fi", "attached")
-                } else {
-                    // With only setpgid and piped stdio this emits a terminal prompt
-                    // then stops on SIGTTIN. The tool timeout makes that regression
-                    // fail promptly instead of hanging the test suite.
-                    ("if (: <> /dev/tty) 2>/dev/null; then exec 3<> /dev/tty; printf 'Password: ' >&3; read answer <&3; else printf isolated; fi", "isolated")
-                };
+                // With only setpgid and piped stdio this emits a terminal prompt
+                // then stops on SIGTTIN. The tool timeout makes that regression
+                // fail promptly instead of hanging the test suite.
+                let command = "if (: <> /dev/tty) 2>/dev/null; then exec 3<> /dev/tty; printf 'Password: ' >&3; read answer <&3; else printf isolated; fi";
                 for argv in [false, true] {
                     let output = executor.run_host(&runtime.agent, "exec", sh_args(argv, command, Some(2))).await
                         .unwrap_or_else(|error| panic!("argv={argv} interactive={interactive}: {error}"));
                     assert_eq!(output.output.value["exit_code"], 0);
-                    assert_eq!(output.output.value["stdout"], expected);
+                    assert_eq!(output.output.value["stdout"], "isolated");
                 }
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn session_askpass_reaches_exec_without_targets_keeping_agent_and_display() {
+        let runtime = TestRuntime::new().await;
+        let policy = Arc::new(crate::tool::policy::AllowAll);
+        let router = crate::target::TargetRouter::test(&runtime.store, [], policy).await;
+        // The fixture disables Targets, so the managed agent must not start.
+        let executor =
+            executor(&runtime, true, tokio::time::sleep).with_target_router(router.clone());
+        let command = r#"printf '%s\n' "$SUDO_ASKPASS" "$SSH_AUTH_SOCK" "$DISPLAY"; test -x "$SUDO_ASKPASS" && printf live"#;
+        let output = executor
+            .run_host(&runtime.agent, "exec", sh_args(true, command, None))
+            .await
+            .unwrap();
+        let stdout = output.output.value["stdout"].as_str().unwrap().to_owned();
+        let lines: Vec<_> = stdout.lines().collect();
+        let inherited = |name| std::env::var(name).ok().filter(|value| !value.is_empty());
+        assert!(!lines[0].is_empty());
+        assert_eq!(lines[1], inherited("SSH_AUTH_SOCK").unwrap_or_default());
+        assert_eq!(
+            lines[2],
+            inherited("DISPLAY").as_deref().unwrap_or("skyhook")
+        );
+        assert_eq!(lines[3], "live");
+        router.shutdown().await;
     }
 
     #[cfg(unix)]
@@ -924,8 +985,9 @@ mod tests {
             ("DISPLAY", "inherited-display"),
             ("SKYHOOK_ASKPASS_SOCKET", "/inherited/prompt-socket"),
             ("SSH_AUTH_SOCK", "/inherited/agent-socket"),
+            ("SUDO_ASKPASS", "/inherited/sudo-helper"),
         ];
-        let command = r#"printf '%s\n' "$SSH_ASKPASS" "$SSH_ASKPASS_REQUIRE" "$DISPLAY" "$SKYHOOK_ASKPASS_SOCKET" "$SSH_AUTH_SOCK"; if test -x "$SSH_ASKPASS" && test -S "$SKYHOOK_ASKPASS_SOCKET"; then printf live; fi"#;
+        let command = r#"printf '%s\n' "$SSH_ASKPASS" "$SSH_ASKPASS_REQUIRE" "$DISPLAY" "$SKYHOOK_ASKPASS_SOCKET" "$SSH_AUTH_SOCK" "$SUDO_ASKPASS"; if test -x "$SSH_ASKPASS" && test -S "$SKYHOOK_ASKPASS_SOCKET"; then printf live; fi"#;
         for interactive in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let environment: crate::remote::backend::ProcessEnvironment = inherited
@@ -966,10 +1028,11 @@ mod tests {
                     assert_eq!(lines, inherited.map(|(_, value)| value));
                 } else {
                     assert_ne!(lines[0], "/inherited/prompt-helper");
-                    assert_eq!(lines[1..3], ["force", "skyhook"]);
+                    assert_eq!(lines[1..3], ["force", "inherited-display"]);
                     assert_ne!(lines[3], "/inherited/prompt-socket");
+                    assert_eq!(lines[5], lines[0], "sudo prompts use the same helper");
                     assert_eq!(
-                        lines[5], "live",
+                        lines[6], "live",
                         "rejecting broker must live throughout command"
                     );
                     assert!(

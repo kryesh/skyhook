@@ -185,9 +185,14 @@ Click agent and tool rows, scroll the relevant panel, or drag across text in use
 and tool output: releasing the mouse copies the selected characters, and `Ctrl+X Y` (or `y` while
 content is focused) copies them again. A plain click copies nothing. Selecting text never scrolls the
 conversation, and open palettes and text pages stay where they are under the pointer. Selection
-supports parts of a line and multiple lines; copying preserves Unicode and code indentation without
-adding newlines at visual wraps. Each copy reports how many characters it sent to the terminal; the
-terminal does not confirm that it accepted them.
+supports parts of a line and multiple lines. It stays in place while a reply streams and finishes,
+and when the terminal is resized, as long as the selected text is unchanged. Copying preserves
+Unicode and the source's own indentation without adding newlines at visual wraps. The indentation
+of tool output and arguments, the `+`/`−` markers of changes, and the expand/collapse glyphs and
+spinners of blocks and tool cards are not selected. In a table, selection follows the cells in
+reading order rather than the drawn grid: each table cell copies as one line, whole however it
+wraps, without borders or padding, and an empty cell copies as an empty line. Each copy reports
+how many characters it sent to the terminal; the terminal does not confirm that it accepted them.
 The workspace path is centered in the top bar. The bottom bar shows the model ID, session ID,
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
 (usually Shift-drag) and copy shortcut. Copy uses the terminal's OSC 52 clipboard support. `@` or `Ctrl+X F` attaches a workspace file
@@ -206,8 +211,19 @@ conversation; open menus and search keep input focus until closed. `Esc` dismiss
 questions and permissions without answering them; reopen pending requests with `Ctrl+X R`
 (or `/attention`, labelled **Reopen questions and permissions** in the palette).
 Submitting a new prompt rejects any pending question batches; those batches can no longer be reopened.
-For background questions and SSH authentication/askpass prompts, `Esc` cancels the request;
-cancelled requests cannot be reopened. SSH authentication prompts take priority over questions,
+Commands have no terminal, so password prompts from SSH and from `sudo` in commands (locally or
+on a target) appear as authentication prompts. The typed answer stays out of the conversation, but
+it goes to whichever process asked, and a command the agent runs can ask too and capture it.
+As a hint, each prompt names the program that appears to have asked and, when it runs under one,
+the job: for example `Requested by /usr/bin/ssh` or `Requested by sudo (running as uid 0) in job 12`.
+A program running as another user, such as `sudo`, shows only its name and user, since its
+executable cannot be read. This is best-effort attribution, not proof of who asked or where the
+answer goes: a command started by a genuine program, such as an SSH `ProxyCommand`, can ask in
+that program's name and receive the answer. Answer only prompts you expect from the work you
+asked for, and treat one that names a program you don't expect (a script, a shell, Skyhook
+itself) or an `unknown program` as raised by the agent's command.
+For background questions and authentication prompts, `Esc` cancels the request;
+cancelled requests cannot be reopened. Authentication prompts take priority over questions,
 permissions, menus, and search; interrupted question drafts resume afterward.
 
 Renaming opens a prompt of its own, ahead of pending questions and permissions, with the title you

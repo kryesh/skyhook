@@ -5,6 +5,7 @@ use crate::provider::ProviderErrorKind::InvalidRequest;
 use crate::provider::codec::{
     CodecName, StateRole,
     common::{check_tool, image_url, own_replay, system_text, tagged, tool_text, user_parts},
+    set_each,
 };
 use crate::provider::protocol::{
     AssistantItem, Entry, Message, ModelRequest, Replay, ReplayFormat, State, sent,
@@ -114,8 +115,8 @@ pub(crate) fn encode(
         ("store".into(), json!(false)),
         ("include".into(), json!(["reasoning.encrypted_content"])),
     ]);
-    if dialect.reasoning_summary.is_requested() {
-        settings.insert("reasoning".into(), json!({"summary":"auto"}));
+    if let Some(summary) = dialect.reasoning_summary {
+        settings.insert("reasoning".into(), json!({"summary": summary}));
     }
     match (system_text(request), dialect.instructions) {
         (Some(system), _) => {
@@ -149,8 +150,8 @@ pub(crate) fn encode(
     if let Some(reasoning) = &request.reasoning {
         dialect.effort.place(&mut settings, reasoning)?;
     }
-    if let (Some(max), Some(path)) = (request.max_output_tokens, &dialect.output_limit) {
-        path.set(&mut settings, json!(max))?;
+    if let Some(max) = request.max_output_tokens {
+        set_each(dialect.output_limit.iter(), &mut settings, json!(max))?;
     }
     // Input is always an explicit array, even for an empty conversation.
     settings.shift_insert(1, "input".into(), Value::Array(input));
@@ -242,7 +243,7 @@ mod tests {
         }
         req.reasoning = Some("low".into());
         let silent = Dialect {
-            reasoning_summary: ReasoningSummary::Unsupported,
+            reasoning_summary: None,
             ..Dialect::stateless()
         };
         let body = encode(&req, &silent).unwrap();

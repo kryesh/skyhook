@@ -218,13 +218,15 @@ impl Row {
 #[cfg(test)]
 mod tests {
     use super::super::super::tool_view::{Document, HighlightCache, Role, Section};
-    use super::super::tests::{expandable_entry, fixture_row, layout};
+    use super::super::tests::{
+        continued, expandable_entry, fixture_row, layout, selected_text, text_x,
+    };
     use super::*;
     use ratatui::widgets::{Paragraph, Widget};
 
     fn markdown_rows(input: &str, width: u16, cache: Option<&HighlightCache>) -> Vec<Row> {
         let columns = width as usize;
-        let layout = markdown::layout_highlighted(input, false, columns, columns, "", cache);
+        let layout = markdown::layout_highlighted(input, false, columns, cache);
         let rows = layout.lines.into_iter();
         rows.map(|line| fixture_row(line.line, line.layout, 1, width, 0))
             .collect()
@@ -266,11 +268,7 @@ mod tests {
             }
             if row.layout.decorative() {
                 assert!(row.text().is_empty());
-                let all = (
-                    TextPosition { row: 0, byte: 0 },
-                    TextPosition { row: 1, byte: 0 },
-                );
-                assert!(row.text_view().selection_range(0, Some(all)).is_none());
+                assert!(row.sources().next().is_none());
             }
         }
     }
@@ -303,8 +301,8 @@ mod tests {
                     assert!(row.line.style.bg.is_none());
                     if row.layout.source_prefix().0 == 0 && row.layout.prefix.width() == 0 {
                         let pad = row.layout.code().unwrap().padding();
-                        assert_eq!(row.text_x(), 1 + pad as u16);
-                        assert_eq!(row.byte_at_column(row.text_x()), 0);
+                        assert_eq!(text_x(row), 1 + pad as u16);
+                        assert_eq!(row.byte_at_column(text_x(row)), 0);
                     }
                 }
             }
@@ -379,13 +377,13 @@ mod tests {
             for width in [8, 16, 24] {
                 let rows = markdown_rows(input, width, None);
                 assert_eq!(copy_rows(&rows), original, "{input:?}, width {width}");
-                for row in rows.iter().filter(|row| row.layout.continued()) {
+                for row in rows.iter().filter(|row| continued(&row.layout)) {
                     assert!(
                         row.layout.prefix.width() >= 2,
                         "missing hanging prefix for {input:?}"
                     );
-                    assert_eq!(row.byte_at_column(row.text_x()), 0);
-                    assert!(row.text_x() >= row.x + 2);
+                    assert_eq!(row.byte_at_column(text_x(row)), 0);
+                    assert!(text_x(row) >= row.x + 2);
                 }
             }
         }

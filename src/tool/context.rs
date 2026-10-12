@@ -96,6 +96,11 @@ impl ToolContext {
     }
 
     #[must_use]
+    pub(crate) fn process_owner(&self) -> crate::job::ProcessOwner {
+        self.jobs.process_owner(self.job())
+    }
+
+    #[must_use]
     pub fn job(&self) -> JobId {
         self.subject.job
     }

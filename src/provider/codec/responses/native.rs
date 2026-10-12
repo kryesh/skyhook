@@ -1,7 +1,7 @@
 //! Native item shapes and field/argument validation.
 
 use super::*;
-use crate::named_enum::named_enum;
+use crate::named_enum::{NamedEnum, named_enum};
 use crate::provider::codec::common::{arguments_field, parse_tool_arguments, tagged};
 
 named_enum! {
@@ -11,6 +11,16 @@ named_enum! {
         Message = "message",
         Reasoning = "reasoning",
         FunctionCall = "function_call",
+    }
+}
+
+named_enum! {
+    /// An output item's own account of whether it finished.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(super) parsed enum ItemStatus {
+        Completed = "completed",
+        InProgress = "in_progress",
+        Incomplete = "incomplete",
     }
 }
 
@@ -53,6 +63,8 @@ pub(super) struct NativeItem<'a> {
     pub(super) raw: &'a Value,
     pub(super) id: &'a str,
     pub(super) kind: ItemKind,
+    /// The item says it stopped short. Leaving the status out claims nothing.
+    pub(super) unfinished: bool,
 }
 impl<'a> NativeItem<'a> {
     pub(super) fn parse(raw: &'a Value) -> Result<Self, ProviderError> {
@@ -60,10 +72,19 @@ impl<'a> NativeItem<'a> {
         if id.is_empty() {
             return Err(NATIVE.error("empty item ID"));
         }
+        let unfinished = match raw.get("status") {
+            None | Some(Value::Null) => false,
+            Some(status) => match status.as_str().and_then(ItemStatus::parse) {
+                Some(ItemStatus::Completed) => false,
+                Some(ItemStatus::InProgress | ItemStatus::Incomplete) => true,
+                None => return Err(NATIVE.error("unsupported output item status")),
+            },
+        };
         Ok(Self {
             raw,
             id,
             kind: kind(raw)?,
+            unfinished,
         })
     }
 }

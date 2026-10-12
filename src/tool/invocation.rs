@@ -296,6 +296,8 @@ pub(crate) struct LocalContext {
     output: OutputContext,
     authorizer: Arc<dyn LocalAuthorizer>,
     source: Option<crate::tool::source::Source>,
+    /// The host job running the call; a worker cannot name it.
+    process_owner: Option<crate::job::ProcessOwner>,
 }
 
 impl LocalContext {
@@ -315,7 +317,19 @@ impl LocalContext {
             output,
             authorizer,
             source: None,
+            process_owner: None,
         }
+    }
+
+    pub(crate) fn with_process_owner(mut self, owner: crate::job::ProcessOwner) -> Self {
+        self.process_owner = Some(owner);
+        self
+    }
+
+    /// Attribute process `pid` to the host job running the call, if any, until
+    /// the returned guard is dropped.
+    pub(crate) fn attach_process(&self, pid: u32) -> Option<crate::job::JobProcess> {
+        (self.process_owner.as_ref()).map(|owner| owner.attach(pid))
     }
 
     /// Attach the opened source argument.

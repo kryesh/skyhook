@@ -309,14 +309,12 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
     {
         let y = app.content_rect.y + offset as u16;
         let rect = r(row.x, y, row.width, 1);
-        // Only rows inside the selection's row span need their text.
-        let row_text = app
-            .selection
-            .filter(|(a, b)| (a.row.min(b.row)..=a.row.max(b.row)).contains(&(scroll + offset)))
-            .map(|_| row.text_view());
-        let selected = row_text
-            .as_ref()
-            .and_then(|view| view.selection_range(scroll + offset, app.selection));
+        let selection = app.selection.as_ref();
+        let selection = selection.filter(|selection| selection.covers(scroll + offset));
+        let view = selection.map(|_| row.text_view());
+        let selected = (selection.zip(view.as_ref()))
+            .map(|(selection, view)| selection.highlights(row, view.text()))
+            .unwrap_or_default();
         let entry = app.content_cache.entries().get(row.entry);
         let expandable = entry.is_some_and(model::Entry::expandable);
         let focused = navigation_active
@@ -328,7 +326,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
         let bg = row.background(
             entry.is_some_and(model::Entry::open),
             expandable && (focused || hovered),
-            selected.is_some(),
+            !selected.is_empty(),
         );
         fill(frame, rect, bg);
         let text_rect = r(row.paragraph_x(), y, row.text_width, 1);
@@ -338,8 +336,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
             frame.buffer_mut(),
             Style::default().fg(foreground(row.surface)).bg(bg),
         );
-        if let Some(range) = selected {
-            let view = row_text.as_ref().expect("selected range has row text");
+        if let Some(view) = view.filter(|_| !selected.is_empty()) {
             // Source-to-column geometry skips hanging prefixes and code padding.
             // A malformed layout yields no cells; never paint it elsewhere.
             let text_end = text_rect.right() as usize;
@@ -347,7 +344,7 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
                 (text_rect.x as usize + code.body_end()).min(text_end)
             });
             for (byte, column, width) in view.source_cells() {
-                if !range.contains(&byte) {
+                if !selected.iter().any(|bytes| bytes.contains(&byte)) {
                     continue;
                 }
                 let start = text_rect.x as usize + column;
@@ -372,8 +369,10 @@ fn draw_content(frame: &mut Frame, app: &mut App, navigation_active: bool) {
             && let Some(entry) = entry.filter(|entry| entry.timing.live())
         {
             app.animating = true;
-            if entry.job_id().is_none_or(running) {
-                let x = row.x + if expandable { 2 } else { 0 };
+            if entry.job_id().is_none_or(running)
+                && let Some(slot) = row.spinner
+            {
+                let x = row.x + slot;
                 // A card's spinner stands in for its state glyph, in the glyph's accent.
                 let color = if entry.header().is_some() {
                     THEME.primary
@@ -687,6 +686,38 @@ mod tests {
             observe_until(&mut app, |app| app.snapshot.jobs[&job].state.is_terminal()).await;
         }
         let _ = crate::tests::bounded(script).await.unwrap();
+    }
+
+    /// A live title's spinner takes only the gap its narrow row kept: when
+    /// the row keeps just the disclosure glyph, the title's text stays.
+    #[tokio::test]
+    async fn spinners_never_cover_narrow_titles() {
+        use skyhook::provider::protocol::ItemKind;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let asked = ask(app.session().unwrap(), "question");
+        let turn = model.turn().await;
+        let mut thought = String::new();
+        for (width, more, shown) in [
+            (22, "First\nSecond", "▾ R"),
+            (23, "\n\n**界 plan**\n\nThird\nFourth", "▾ 界"),
+        ] {
+            turn.delta("thinking", ItemKind::Reasoning, more);
+            thought.push_str(more);
+            observe_until(&mut app, |app| {
+                let mut responses = app.snapshot.responses.values();
+                responses.any(|response| response.blocks().iter().any(|b| b.text == thought))
+            })
+            .await;
+            let mut terminal = Terminal::new(TestBackend::new(width, 24)).unwrap();
+            terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let rows: Vec<String> = (0..24)
+                .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+                .collect();
+            assert!(rows.iter().any(|row| row.contains(shown)), "{rows:#?}");
+        }
+        turn.answer("done");
+        crate::tests::bounded(asked).await.unwrap().unwrap();
     }
 
     #[tokio::test]

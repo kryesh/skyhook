@@ -2,13 +2,13 @@
 
 ## Approval policy
 
-`--approve-all` or
-`approve_all: true` bypasses approval prompts. Subject to the granted capabilities, the default
-CLI auto-allows reads and agent operations, as well as writes inside the root workspace.
-Execution, HTTP requests, SSH access, target changes, and writes outside the root workspace
-require approval. When the `interactive` capability is granted, questions and SSH authentication
-appear in the interface. Otherwise operations needing human input fail
-immediately; `approve_all` bypasses tool approvals but never restores questions or authentication.
+`--approve-all` or `approve_all: true` bypasses approval prompts. Subject to the granted
+capabilities, the default CLI auto-allows reads and agent operations, as well as writes inside the
+root workspace. Execution, HTTP requests, SSH access, target changes, and writes outside the root
+workspace require approval. When the `interactive` capability is granted, questions and
+authentication prompts (SSH, and `sudo` in commands, locally or on targets) appear in the
+interface. Otherwise operations needing human input fail immediately; `approve_all` bypasses tool
+approvals but never restores questions or authentication.
 
 Filesystem tools and command `cwd` accept absolute paths or relative paths including `..`.
 The workspace is a base directory, not a security boundary. Filesystem path authorization and

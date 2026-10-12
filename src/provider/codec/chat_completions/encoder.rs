@@ -12,6 +12,7 @@ use crate::provider::{
             check_tool, image_url, own_replay, signed_context, system_text, tool_text, user_parts,
         },
         placement::breakpoint,
+        set_each,
     },
     protocol::{
         AssistantItem, Binding, Entry, HistoryLifetime, Message, ModelRequest, Replay, State, sent,
@@ -97,12 +98,10 @@ pub(crate) fn encode(
     if let Some(reasoning) = &request.reasoning {
         dialect.effort.place(&mut root, reasoning)?;
     }
-    if let (Some(limit), Some(path)) = (request.max_output_tokens, &dialect.output_limit) {
-        path.set(&mut root, json!(limit))?;
+    if let Some(limit) = request.max_output_tokens {
+        set_each(dialect.output_limit.iter(), &mut root, json!(limit))?;
     }
-    if let Some(path) = &dialect.tool_stream {
-        path.set(&mut root, json!(true))?;
-    }
+    set_each(dialect.tool_stream.iter(), &mut root, json!(true))?;
     if !request.tools.is_empty() {
         let mut names = BTreeSet::new();
         let mut tools = Vec::new();
@@ -273,7 +272,7 @@ fn push_message(
                 }
             };
             if let Some((field, reasoning)) = reasoning {
-                field.set(&mut message, reasoning)?;
+                set_each(field.iter(), &mut message, reasoning)?;
             }
             messages.push(Value::Object(message));
         }
@@ -373,7 +372,9 @@ mod tests {
     /// A server spelling the replay field `reasoning`.
     fn reasoning_field() -> Dialect {
         Dialect {
-            reasoning_replay: ReasoningReplay::Text(crate::provider::codec::path("reasoning")),
+            reasoning_replay: ReasoningReplay::Text(NonEmpty::one(crate::provider::codec::path(
+                "reasoning",
+            ))),
             ..Dialect::compatible()
         }
     }
@@ -383,6 +384,7 @@ mod tests {
     };
     use super::*;
     use crate::provider::codec::common::tests::{envelope, image, notes, request};
+    use crate::provider::codec::{Locations, NonEmpty};
     use crate::provider::protocol::{entries, state};
     use crate::{
         media::AttachmentRef,
@@ -407,11 +409,11 @@ mod tests {
         });
         let developer = Dialect {
             system: SystemRole::Developer,
-            output_limit: None,
-            tool_stream: Some(path("tool_stream")),
+            output_limit: Locations::NONE,
+            tool_stream: Locations::one(path("tool_stream")),
             identity: Identity {
-                cache_key: CacheKey::Body(path("prompt_cache_key")),
-                user_id: Some(path("metadata.user_id")),
+                cache_key: Locations::one(CacheKey::Body(path("prompt_cache_key"))),
+                user_id: Locations::one(path("metadata.user_id")),
             },
             ..Dialect::compatible()
         };
@@ -468,7 +470,9 @@ mod tests {
         use crate::provider::codec::path;
         use crate::provider::protocol::HistoryLifetime;
         let thinking_blocks = Dialect {
-            reasoning_replay: ReasoningReplay::ThinkingBlocks(path("thinking_blocks")),
+            reasoning_replay: ReasoningReplay::ThinkingBlocks(NonEmpty::one(path(
+                "thinking_blocks",
+            ))),
             cache: Cache::ContentPartBreakpoints { ttl: None },
             ..Dialect::compatible()
         };
@@ -603,7 +607,7 @@ mod tests {
         // signed, a turn with a signed detail replays its sequence whole and in
         // order, and a turn without one keeps only its text and calls.
         let router = Dialect {
-            reasoning_replay: ReasoningReplay::Details(path("reasoning_details")),
+            reasoning_replay: ReasoningReplay::Details(NonEmpty::one(path("reasoning_details"))),
             ..Dialect::compatible()
         };
         let summary = json!({"type":"reasoning.summary","summary":"Sum","index":0});
@@ -629,7 +633,9 @@ mod tests {
         assert_eq!(turns[1]["reasoning_details"], json!([summary, encrypted]));
         // Thinking blocks are filtered one by one.
         let thinking_blocks = Dialect {
-            reasoning_replay: ReasoningReplay::ThinkingBlocks(path("thinking_blocks")),
+            reasoning_replay: ReasoningReplay::ThinkingBlocks(NonEmpty::one(path(
+                "thinking_blocks",
+            ))),
             ..Dialect::compatible()
         };
         let open = json!({"type":"thinking","thinking":"open"});
@@ -665,10 +671,10 @@ mod tests {
         };
         let router = Dialect {
             effort: crate::provider::codec::Effort {
-                path: path("reasoning.effort"),
+                path: NonEmpty::one(path("reasoning.effort")),
                 levels: crate::provider::codec::OPENAI_EFFORT,
             },
-            reasoning_replay: ReasoningReplay::Details(path("reasoning_details")),
+            reasoning_replay: ReasoningReplay::Details(NonEmpty::one(path("reasoning_details"))),
             usage_request: UsageRequest::Implicit,
             cache: Cache::ContentPartBreakpoints {
                 ttl: Some(crate::provider::codec::CacheTtl::OneHour),

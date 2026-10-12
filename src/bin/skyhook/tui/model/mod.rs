@@ -16,7 +16,7 @@ pub use jobs::{state_glyph, state_name, state_role, target_suffix};
 pub use projection::{AgentDisplayState, AgentInfo, Projection, WaitReason, open_jobs};
 pub use requests::{RequestRow, RequestStatus};
 
-use super::tool_view::{Document, Role, Run};
+use super::tool_view::{Document, Run};
 use skyhook::identity::{AgentId, JobId};
 use skyhook::provider::protocol::BlockRef;
 use skyhook::session::{MessageSeq, RecordSeq, RequestSeq};
@@ -151,7 +151,7 @@ impl Disclosure {
         if open { Self::Open } else { Self::Closed }
     }
 
-    fn glyph(self) -> &'static str {
+    pub fn glyph(self) -> &'static str {
         match self {
             Self::Open => "▾ ",
             Self::Closed => "▸ ",
@@ -212,11 +212,15 @@ impl Title {
         format!("{glyph}{gutter}")
     }
 
-    /// The heading as plain text, its label as source.
-    pub fn line(&self, gutter: bool) -> String {
+    /// The label as source, and its suffix: the heading after its prefix.
+    pub fn heading(&self) -> String {
         let (Label::Plain(label) | Label::Markdown { source: label, .. }) = &self.label;
-        let suffix = self.suffix.unwrap_or_default();
-        format!("{}{}{suffix}", self.prefix(gutter), &**label)
+        format!("{}{}", &**label, self.suffix.unwrap_or_default())
+    }
+
+    /// The heading as plain text, its label as source.
+    pub fn line(&self) -> String {
+        format!("{}{}", self.prefix(false), self.heading())
     }
 }
 
@@ -245,11 +249,10 @@ struct Card {
     plain: String,
 }
 impl Card {
-    /// The header leads with the disclosure glyph of whether a body exists.
-    fn new(mut header: Vec<Run>, body: Option<Document>) -> Self {
-        let glyph = Disclosure::new(body.is_some()).glyph();
-        header.insert(0, Run::new(glyph, Role::Indicator));
-        let mut plain = String::new();
+    /// The plain text leads with the disclosure glyph of whether a body
+    /// exists; the header runs do not, as rendering draws it as decoration.
+    fn new(header: Vec<Run>, body: Option<Document>) -> Self {
+        let mut plain = Disclosure::new(body.is_some()).glyph().to_owned();
         for run in &header {
             plain.push_str(run.text());
         }
@@ -339,7 +342,7 @@ impl Entry {
 
     /// Expansion as projection built it: a title's disclosure, or whether a
     /// card carries its body.
-    fn disclosure(&self) -> Option<Disclosure> {
+    pub fn disclosure(&self) -> Option<Disclosure> {
         match &self.body {
             EntryBody::Text { title, .. } => title.as_ref()?.disclosure,
             EntryBody::Request { .. } => None,
@@ -382,7 +385,7 @@ impl Entry {
 
     pub(crate) fn titled(key: EntryKey, title: Title, body: String, surface: Surface) -> Self {
         let body = Clean::from(body);
-        let mut plain = title.line(false);
+        let mut plain = title.line();
         if !body.is_empty() {
             plain.push('\n');
             plain.push_str(&body);

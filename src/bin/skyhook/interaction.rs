@@ -336,6 +336,7 @@ pub(crate) mod tests {
             message: "password".into(),
             target: None,
             origin: TargetRef::Root,
+            requester: Default::default(),
         }
     }
 

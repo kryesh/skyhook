@@ -411,7 +411,8 @@ impl AdmittedInput<ToolContext, ToolOutput> for HostedInput {
                     output.context(),
                     Arc::new(HostAuthorizer(context.clone())),
                 )
-                .with_source(context.source().cloned());
+                .with_source(context.source().cloned())
+                .with_process_owner(context.process_owner());
                 let result = admitted.call(local).await;
                 output.context().settle().await?;
                 match result {

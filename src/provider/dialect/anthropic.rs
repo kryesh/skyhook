@@ -80,7 +80,7 @@ crate::provider::settings::settings! {
         /// The role runtime state takes: `system` (default) needs a model that supports
         /// mid-conversation system messages; `user` sends it as user content.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub state_role: Option<StateRole> => default,
+        pub state_role: Option<StateRole> => optional(StateRole),
     }
 }
 

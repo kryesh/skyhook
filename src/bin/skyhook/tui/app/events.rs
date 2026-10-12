@@ -68,6 +68,20 @@ pub enum Work {
     Stopped,
     HighlightsReady,
 }
+/// What the held left button is doing in the transcript.
+#[derive(Default)]
+pub(super) enum Gesture {
+    #[default]
+    Released,
+    /// Held without moving. Releasing toggles `toggle`'s entry when pressed
+    /// on its toggle, and never moves or copies the selection, whose text
+    /// may have reflowed under the pointer.
+    Pressed { toggle: Option<model::EntryKey> },
+    /// Moved while held: the selection follows each motion of the pointer,
+    /// and is copied when released.
+    Dragging,
+}
+
 #[derive(Clone)]
 pub enum Hit {
     Agent(AgentId),
@@ -380,7 +394,7 @@ impl App {
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) => {
-                        self.pressed_entry = None;
+                        self.gesture = Gesture::Pressed { toggle: None };
                         self.selection = None;
                         // An open palette owns the pointer, as it owns hover: the
                         // transcript beneath it is not selectable.
@@ -398,10 +412,9 @@ impl App {
                                     self.focus = Focus::Content;
                                     self.view().row = index;
                                     if toggle {
-                                        self.pressed_entry = self
-                                            .entries()
-                                            .get(index)
-                                            .map(|entry| entry.key().clone());
+                                        let key = self.entries().get(index);
+                                        let toggle = key.map(|entry| entry.key().clone());
+                                        self.gesture = Gesture::Pressed { toggle };
                                     }
                                 }
                                 Hit::Menu(index) => {
@@ -448,51 +461,52 @@ impl App {
                             // Hold the viewport still while selecting a streaming reply.
                             self.view().scroll = Some(self.scroll_offset());
                             self.focus = Focus::Content;
-                            self.selection = Some((position, position));
+                            self.selection =
+                                crate::tui::render::Selection::new(&self.render.rows, position);
                         }
                     }
                     MouseEventKind::Up(MouseButton::Left) => {
-                        if self.pressed_entry.is_none() {
-                            if let Some((anchor, _)) = self.selection
-                                && let Some(head) = self.text_position(point)
-                            {
-                                self.selection = Some((anchor, head));
+                        match std::mem::take(&mut self.gesture) {
+                            // The last drag motion placed the head: the text under the
+                            // pointer may have reflowed since. Copied once, on release.
+                            Gesture::Dragging => {
+                                if let Some(text) = self.selected_text() {
+                                    self.copy_text(text);
+                                }
                             }
-                            // Copied once, on release, rather than on every drag motion.
-                            if let Some(text) = self.selected_text() {
-                                self.copy_text(text);
+                            Gesture::Pressed { toggle: Some(key) } => {
+                                if let Some((_, Hit::Entry(index, true))) = self
+                                    .hits
+                                    .iter()
+                                    .rev()
+                                    .find(|(rect, _)| rect.contains(point.into()))
+                                    && self
+                                        .entries()
+                                        .get(*index)
+                                        .is_some_and(|entry| entry.key() == &key)
+                                {
+                                    self.view().row = *index;
+                                    self.toggle();
+                                }
                             }
-                        }
-                        if let Some(key) = self.pressed_entry.take()
-                            && let Some((_, Hit::Entry(index, true))) = self
-                                .hits
-                                .iter()
-                                .rev()
-                                .find(|(rect, _)| rect.contains(point.into()))
-                            && self
-                                .entries()
-                                .get(*index)
-                                .is_some_and(|entry| entry.key() == &key)
-                        {
-                            self.view().row = *index;
-                            self.toggle();
+                            Gesture::Pressed { toggle: None } | Gesture::Released => {}
                         }
                     }
                     MouseEventKind::Drag(MouseButton::Left)
-                        if self.content_rect.contains(point.into()) =>
+                        if self.content_rect.contains(point.into())
+                            && !matches!(self.gesture, Gesture::Released) =>
                     {
-                        self.pressed_entry = None;
-                        if let Some((anchor, _)) = self.selection
-                            && let Some(head) = self.text_position(point)
+                        self.gesture = Gesture::Dragging;
+                        if let Some(head) = self.text_position(point)
+                            && let Some(selection) = &mut self.selection
                         {
-                            self.selection = Some((anchor, head));
+                            selection.extend(&self.render.rows, head);
                         }
                     }
                     _ => {}
                 }
             }
             Event::Resize(..) => {
-                self.selection = None;
                 self.reveal_prompt();
             }
             _ => {}
@@ -724,6 +738,160 @@ mod tests {
         assert!(app.prompts.is_empty());
     }
 
+    /// A press and release without movement copies nothing, even when the
+    /// streaming reply rewraps under the pointer between them.
+    #[tokio::test]
+    async fn a_stationary_click_copies_nothing_while_its_text_rewraps() {
+        use skyhook::provider::protocol::ItemKind;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let text = format!("{} beta", "a".repeat(46));
+        let asked = ask(app.session().unwrap(), "question");
+        let turn = model.turn().await;
+        turn.delta("text", ItemKind::Text, &text);
+        observe_until(&mut app, |app| streamed(&app.snapshot, &text)).await;
+        let screen = draw(&mut app);
+        let (x, y) = (screen.lines().enumerate())
+            .find_map(|(y, line)| Some((line.find(" beta")? + 3, y)))
+            .unwrap();
+        let cell = Rect::new(x as u16, y as u16, 1, 1);
+        app.clipboard = Some("earlier".into());
+        mouse(&mut app, cell, MouseEventKind::Down(MouseButton::Left));
+        turn.delta("text", ItemKind::Text, "gamma");
+        let grown = format!("{text}gamma");
+        observe_until(&mut app, |app| streamed(&app.snapshot, &grown)).await;
+        let after = draw(&mut app);
+        assert!(!after.contains("a beta"), "the word wraps:\n{after}");
+        mouse(&mut app, cell, MouseEventKind::Up(MouseButton::Left));
+        assert_eq!(app.clipboard.as_deref(), Some("earlier"));
+        assert!(app.toast.is_none());
+        assert!(
+            app.selection
+                .as_ref()
+                .is_some_and(|selection| selection.text().is_empty())
+        );
+        turn.answer(&grown);
+        bounded(asked).await.unwrap().unwrap();
+    }
+
+    /// Releasing a drag where it last moved keeps the selection the drag
+    /// made, even when the text has rewrapped under the pointer since.
+    #[tokio::test]
+    async fn releasing_a_drag_after_its_text_rewraps_keeps_the_selection() {
+        use skyhook::provider::protocol::ItemKind;
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let text = format!("{} beta", "a".repeat(46));
+        let asked = ask(app.session().unwrap(), "question");
+        let turn = model.turn().await;
+        turn.delta("text", ItemKind::Text, &text);
+        observe_until(&mut app, |app| streamed(&app.snapshot, &text)).await;
+        let screen = draw(&mut app);
+        let (x, y) = (screen.lines().enumerate())
+            .find_map(|(y, line)| Some((line.find(" beta")? + 1, y)))
+            .unwrap();
+        let (start, end) = (
+            Rect::new(x as u16, y as u16, 1, 1),
+            Rect::new(x as u16 + 2, y as u16, 1, 1),
+        );
+        let left = MouseButton::Left;
+        mouse(&mut app, start, MouseEventKind::Down(left));
+        mouse(&mut app, end, MouseEventKind::Drag(left));
+        turn.delta("text", ItemKind::Text, "gamma");
+        let grown = format!("{text}gamma");
+        observe_until(&mut app, |app| streamed(&app.snapshot, &grown)).await;
+        let after = draw(&mut app);
+        assert!(!after.contains("a beta"), "the word wraps:\n{after}");
+        let selected = |app: &App| app.selection.as_ref().map(|s| s.text().to_owned());
+        assert_eq!(selected(&app).as_deref(), Some("be"));
+        mouse(&mut app, end, MouseEventKind::Up(left));
+        assert_eq!(selected(&app).as_deref(), Some("be"));
+        assert_eq!(app.clipboard.as_deref(), Some("be"));
+        turn.answer(&grown);
+        bounded(asked).await.unwrap().unwrap();
+    }
+
+    /// Text selected while a reply streams stays selected as its reasoning
+    /// collapses, as more text arrives, as the reply settles, and through a
+    /// resize: the selection follows its text, not its rows.
+    #[tokio::test]
+    async fn streamed_selection_survives_settling_and_resize() {
+        use skyhook::provider::protocol::{AssistantItem, ItemKind};
+        let (_root, mut app, mut model, _session) = played_fixture().await;
+        let (thought, text) = (
+            "First thought\nSecond thought",
+            "Alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo lima",
+        );
+        let full = format!("{text} mike");
+        let asked = ask(app.session().unwrap(), "question");
+        let turn = model.turn().await;
+        let left = MouseButton::Left;
+        let selection = |app: &App| app.selection.as_ref().map(|s| s.text().to_owned());
+        // Press on the first cell of `from`, drag `past` cells beyond `to`'s
+        // first, and release.
+        let drag = |app: &mut App, from: &str, to: &str, past: u16| {
+            let screen = draw(app);
+            let cell = |word: &str| {
+                (screen.lines().enumerate()).find_map(|(y, line)| {
+                    let x = line[..line.find(word)?].chars().count();
+                    Some(Rect::new(x as u16, y as u16, 1, 1))
+                })
+            };
+            let (start, mut end) = (cell(from).unwrap(), cell(to).unwrap());
+            end.x += past;
+            mouse(app, start, MouseEventKind::Down(left));
+            mouse(app, end, MouseEventKind::Drag(left));
+            mouse(app, end, MouseEventKind::Up(left));
+        };
+        // A title selected while its reasoning streams, spinner and all.
+        turn.delta("thinking", ItemKind::Reasoning, thought);
+        observe_until(&mut app, |app| streamed(&app.snapshot, thought)).await;
+        assert!(
+            draw(&mut app).contains("Second thought"),
+            "reasoning streams open"
+        );
+        drag(&mut app, "Reasoning", "Reasoning", 9);
+        assert_eq!(app.clipboard.take().as_deref(), Some("Reasoning"));
+        turn.delta("text", ItemKind::Text, text);
+        observe_until(&mut app, |app| streamed(&app.snapshot, text)).await;
+        assert!(
+            !draw(&mut app).contains("Second thought"),
+            "reasoning collapses"
+        );
+        assert_eq!(selection(&app).as_deref(), Some("Reasoning"));
+        // Then text in the reply, with more streaming after it.
+        drag(&mut app, "bravo", "kilo", 0);
+        let selected = "bravo charlie delta echo foxtrot golf hotel india juliet ";
+        assert_eq!(app.clipboard.take().as_deref(), Some(selected));
+        let streaming = app.selection.as_ref().unwrap().rows();
+        turn.delta("text", ItemKind::Text, " mike");
+        observe_until(&mut app, |app| streamed(&app.snapshot, &full)).await;
+        draw(&mut app);
+        assert_eq!(selection(&app).as_deref(), Some(selected));
+        turn.end(vec![
+            AssistantItem::reasoning("thinking", 0, thought, None),
+            AssistantItem::text("text", 1, &full),
+        ]);
+        bounded(asked).await.unwrap().unwrap();
+        observe_until(&mut app, |app| count(&app.snapshot, answered) > 0).await;
+        let settled = draw_buffer(&mut app);
+        assert_eq!(selection(&app).as_deref(), Some(selected));
+        let color = crate::tui::theme::THEME.selected;
+        // The selected cells of the transcript, in reading order.
+        let highlighted = |app: &App, buffer: &ratatui::buffer::Buffer| {
+            let area = app.content_rect;
+            let cells = area.rows().flat_map(|row| row.columns());
+            let cells = cells.map(|position| &buffer[position]);
+            let selected = cells.filter(|cell| cell.bg == color);
+            selected.map(|cell| cell.symbol()).collect::<String>()
+        };
+        assert_eq!(highlighted(&app, &settled), selected);
+        app.event(Event::Resize(40, 24));
+        let resized = draw_sized_buffer(&mut app, 40, 24);
+        assert_eq!(selection(&app).as_deref(), Some(selected));
+        assert_ne!(app.selection.as_ref().unwrap().rows(), streaming);
+        assert_eq!(highlighted(&app, &resized), selected);
+        assert!(app.clipboard.is_none() && app.toast.is_some());
+    }
+
     /// Releasing a drag copies just the selected text and reports how many
     /// characters were sent; a plain click copies nothing.
     #[tokio::test]
@@ -787,7 +955,10 @@ mod tests {
         app.clipboard = Some("earlier".into());
         let (x, y) = rows.last().copied().unwrap();
         click(&mut app, Rect::new(x, y, 1, 1));
-        assert!(app.selection.is_some_and(|(anchor, head)| anchor == head));
+        assert!(app.selection.as_ref().is_some_and(|selection| {
+            let (anchor, head) = selection.rows();
+            anchor == head
+        }));
         assert_eq!(app.clipboard.as_deref(), Some("earlier"));
         assert!(app.toast.is_none());
     }
@@ -943,10 +1114,10 @@ mod tests {
         mouse(&mut app, end, MouseEventKind::Down(left));
         mouse(&mut app, start, MouseEventKind::Drag(left));
         mouse(&mut app, start, MouseEventKind::Up(left));
-        assert!(
-            app.selection
-                .is_some_and(|(anchor, head)| anchor.row != head.row)
-        );
+        assert!(app.selection.as_ref().is_some_and(|selection| {
+            let (anchor, head) = selection.rows();
+            anchor == head && selection.text().is_empty()
+        }));
         assert_eq!(app.clipboard.as_deref(), Some("earlier"));
         assert!(app.toast.is_none());
     }

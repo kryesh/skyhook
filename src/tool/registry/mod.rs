@@ -281,7 +281,7 @@ struct ToolExecution {
     placement: ToolPlacement,
     permission_resource: Option<ResourceId>,
     read_error_output: Option<fn(&super::diagnostic::Diagnostic) -> Option<Value>>,
-    target_authentication: bool,
+    process_authentication: bool,
     reads_source: bool,
 }
 
@@ -361,8 +361,8 @@ impl<C: Send + 'static, O: OutputValue> CatalogEntry<C, O> {
         self.execution.permission_resource.as_ref()
     }
 
-    pub(crate) const fn target_authentication(&self) -> bool {
-        self.execution.target_authentication
+    pub(crate) const fn process_authentication(&self) -> bool {
+        self.execution.process_authentication
     }
 
     pub(crate) const fn reads_source(&self) -> bool {

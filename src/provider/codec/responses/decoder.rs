@@ -10,7 +10,6 @@ impl Decoder {
         errors: ErrorSignals,
     ) -> Self {
         Self {
-            terminal_output: dialect.terminal_output,
             metadata_events: dialect.metadata_events,
             errors,
             model,
@@ -18,6 +17,7 @@ impl Decoder {
             items: BTreeMap::new(),
             ids: HashMap::new(),
             wires: HashMap::new(),
+            unfinished: BTreeSet::new(),
             completed: false,
         }
     }
@@ -177,6 +177,9 @@ impl Decoder {
             .ok_or_else(|| NATIVE.error("end of unstarted output item"))?;
         if self.item_by_id(header.id) != Some(id) || header.kind != item.kind() {
             return Err(NATIVE.error("final output item identity changed"));
+        }
+        if header.unfinished {
+            self.unfinished.insert(id);
         }
         match &item.body {
             ItemBody::Reasoning(_) => return self.end_reasoning(id, native),
@@ -428,7 +431,7 @@ mod tests {
             ("max_output_tokens", CutReason::MaxTokens),
             ("content_filter", CutReason::Refusal),
         ] {
-            let mut decoder = decoder_for(TerminalOutput::StreamedOnly);
+            let mut decoder = decoder();
             let mut events = Vec::new();
             feed_into(
                 &mut decoder,

@@ -42,7 +42,7 @@ impl RenderState {
     }
 }
 
-/// Reflow dirty entries, preserve scroll anchors, and validate active selections.
+/// Reflow dirty entries, preserve scroll anchors, and reflow the text selection.
 pub(super) fn prepare_rows(app: &mut App, width: u16) {
     let tab = app.tab;
     let content_changed = app.content_dirty;
@@ -85,8 +85,8 @@ pub(super) fn prepare_rows(app: &mut App, width: u16) {
     dirty.dedup();
     let truncated = app.render.rows.entry_count() > app.content_cache.entries().len();
     let changed = reset || !dirty.is_empty() || truncated;
-    // Selection validation visits just the selected rows that can change:
-    // those from the first dirty or removed entry onward.
+    // Rows before the first dirty or removed entry keep their indices and
+    // text, so a selection ending before it needs no reflow.
     let rows = &app.render.rows;
     let first_changed = if reset {
         Some(0)
@@ -95,17 +95,14 @@ pub(super) fn prepare_rows(app: &mut App, width: u16) {
         let removed = rows.entry_start(app.content_cache.entries().len());
         dirty.into_iter().chain(removed).min()
     };
-    let selection_before = app
-        .selection
-        .zip(first_changed)
-        .and_then(|((a, b), first)| {
-            let first = first.max(a.row.min(b.row));
-            let end = a.row.max(b.row);
-            (first <= end).then(|| {
-                let before = rows.iter_from(first).take(end - first + 1).cloned();
-                (first, before.collect::<Vec<_>>())
-            })
-        });
+    let reflow_selection =
+        app.selection
+            .as_ref()
+            .zip(first_changed)
+            .is_some_and(|(selection, first)| {
+                let (anchor, head) = selection.rows();
+                first <= anchor.row.max(head.row)
+            });
     if reset {
         app.render.rows.clear();
     }
@@ -126,12 +123,9 @@ pub(super) fn prepare_rows(app: &mut App, width: u16) {
     app.render
         .rows
         .truncate_entries(app.content_cache.entries().len());
-    if let (Some(selection), Some((first, before))) = (app.selection, selection_before) {
-        let unchanged =
-            selection_unchanged(first, &before, app.render.rows.iter_from(first), selection);
-        if !unchanged {
-            app.selection = None;
-        }
+    if reflow_selection {
+        app.selection =
+            (app.selection.take()).and_then(|selection| selection.reflow(&app.render.rows));
     }
     app.render.reset = false;
     if changed {

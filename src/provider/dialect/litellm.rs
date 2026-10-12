@@ -1,11 +1,17 @@
 //! A LiteLLM proxy. The model alias hides which family serves it, and the proxy
-//! translates each codec to that family, so the entry names the upstream: Anthropic
-//! behind Chat replays signed `thinking_blocks` and takes `cache_control` on
-//! content parts, while OpenAI behind Chat rejects both. Anthropic behind Messages
-//! receives the request as sent, so it takes Anthropic's own Messages conventions;
-//! any other upstream goes through the proxy's translation. Every codec takes the
-//! proxy's virtual key as a bearer token; session affinity and spend logs key on
-//! `x-litellm-session-id`; deployment tags ride `x-litellm-tags`.
+//! translates each codec to that family, so the entry names the upstream. Anthropic
+//! takes Anthropic's conventions on every codec: signed `thinking_blocks` and
+//! `cache_control` on Chat, and its own Messages conventions, since the proxy forwards
+//! Messages as sent. OpenAI takes OpenAI's. Bedrock serves both families, so its codec
+//! decides: OpenAI's conventions on Chat and Responses, with Chat replaying the signed
+//! `thinking_blocks` its Bedrock path returns, and standard Messages on Messages.
+//! Every codec takes the proxy's virtual key as a bearer token; deployment tags ride
+//! `x-litellm-tags`.
+//!
+//! The context identity rides `x-litellm-session-id`, which the proxy's session
+//! affinity and spend logs key on but forwards to no upstream. Chat and Responses
+//! under OpenAI's conventions also carry `prompt_cache_key`, which the proxy passes
+//! to the service for its own cache affinity.
 
 use reqwest::header::HeaderValue;
 use serde::Serialize;
@@ -17,7 +23,8 @@ use crate::{
     provider::{
         ProviderErrorKind,
         codec::{
-            Codec, CodecName, SchemaConstraint, StateRole, ToolNames,
+            CacheKey, Codec, CodecName, Locations, NonEmpty, SchemaConstraint, StateRole,
+            ToolNames,
             chat_completions::{self, Cache, EmptyContent, ReasoningReplay},
             header, messages, path,
         },
@@ -39,15 +46,10 @@ named_enum! {
 }
 
 impl Upstream {
-    /// On Chat, Bedrock serves Anthropic's models with the same conventions as Anthropic.
+    /// Whether the upstream takes Anthropic's conventions whatever the codec. Bedrock's
+    /// codec decides instead, and the proxy's Bedrock path drops the turn-scoped beta
+    /// Anthropic's Messages conventions need.
     const fn is_anthropic(self) -> bool {
-        matches!(self, Self::Anthropic | Self::Bedrock)
-    }
-
-    /// Whether Anthropic's own Messages conventions reach the service intact. The proxy
-    /// forwards Anthropic's request as sent, but its Bedrock path drops the
-    /// turn-scoped beta those conventions need.
-    const fn takes_anthropic_messages(self) -> bool {
         matches!(self, Self::Anthropic)
     }
 
@@ -67,16 +69,29 @@ fn chat_openai() -> chat_completions::Dialect {
     }
 }
 
+/// OpenAI's conventions, replaying the signed `thinking_blocks` the proxy returns, from
+/// which its Bedrock path rebuilds the model's reasoning.
+fn chat_bedrock() -> chat_completions::Dialect {
+    chat_completions::Dialect {
+        reasoning_replay: thinking_blocks(),
+        ..chat_openai()
+    }
+}
+
 /// Anthropic's tool-name alphabet is OpenAI's; `strict` is not honoured, so the
 /// schema goes as written.
 fn chat_anthropic() -> chat_completions::Dialect {
     chat_completions::Dialect {
-        reasoning_replay: ReasoningReplay::ThinkingBlocks(const { path("thinking_blocks") }),
+        reasoning_replay: thinking_blocks(),
         empty_content: EmptyContent::Null,
         tool_names: ToolNames::OpenAi,
         cache: Cache::ContentPartBreakpoints { ttl: None },
         ..chat_completions::Dialect::compatible()
     }
+}
+
+fn thinking_blocks() -> ReasoningReplay {
+    ReasoningReplay::ThinkingBlocks(NonEmpty::one(const { path("thinking_blocks") }))
 }
 
 /// Proxy errors name an overflow only in the message, and an exhausted
@@ -128,22 +143,19 @@ crate::provider::settings::settings! {
         /// behind Messages defaults to `system`, turn-scoped; every other upstream
         /// and codec to `user`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        pub state_role: Option<StateRole> => default,
+        pub state_role: Option<StateRole> => optional(StateRole),
     }
 }
 
 impl DialectConfig for Config {
-    /// The bridge to Anthropic may drop `prompt_cache_key`, so affinity travels as
-    /// a header whatever the upstream and codec.
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
         let anthropic = self.upstream.is_anthropic();
-        let anthropic_messages =
-            codec == CodecName::Messages && self.upstream.takes_anthropic_messages();
+        let anthropic_messages = codec == CodecName::Messages && anthropic;
         let mut conventions = match codec {
-            CodecName::ChatCompletions => Codec::ChatCompletions(if anthropic {
-                chat_anthropic()
-            } else {
-                chat_openai()
+            CodecName::ChatCompletions => Codec::ChatCompletions(match self.upstream {
+                Upstream::Anthropic => chat_anthropic(),
+                Upstream::Openai => chat_openai(),
+                Upstream::Bedrock => chat_bedrock(),
             }),
             CodecName::Responses => Codec::Responses(super::openai::responses()),
             CodecName::Messages if anthropic_messages => {
@@ -151,7 +163,12 @@ impl DialectConfig for Config {
             }
             CodecName::Messages => Codec::Messages(messages::Dialect::standard()),
         };
-        conventions.identity_mut().cache_key = header("x-litellm-session-id");
+        let session = Locations::one(header("x-litellm-session-id"));
+        conventions.identity_mut().cache_key = if codec != CodecName::Messages && !anthropic {
+            session.with(CacheKey::Body(const { path("prompt_cache_key") }))
+        } else {
+            session
+        };
         let mut profile = Profile {
             scope: self.upstream.scope(),
             ..Profile::new(conventions, transport(), Dialect::Litellm)
@@ -219,6 +236,75 @@ mod tests {
         assert!(crate::yaml::parse::<Config>("{upstream: openai, tags: ['a,b']}").is_err());
     }
 
+    /// Bedrock serves both families, so its codec decides: OpenAI's conventions on Chat and
+    /// Responses, where Anthropic keeps its own, with Chat still replaying signed thinking.
+    #[test]
+    fn bedrock_takes_openai_conventions_and_replays_thinking_on_chat() {
+        let codec = |upstream, codec| {
+            let config = Config {
+                upstream,
+                tags: Vec::new(),
+                state_role: None,
+            };
+            config.admit(codec).unwrap().codec
+        };
+        assert_eq!(
+            codec(Upstream::Bedrock, CodecName::Responses),
+            codec(Upstream::Openai, CodecName::Responses)
+        );
+        let chat = |upstream| match codec(upstream, CodecName::ChatCompletions) {
+            Codec::ChatCompletions(dialect) => dialect,
+            other => panic!("Chat conventions: {other:?}"),
+        };
+        let (bedrock, openai) = (chat(Upstream::Bedrock), chat(Upstream::Openai));
+        assert_eq!(
+            bedrock.reasoning_replay,
+            chat(Upstream::Anthropic).reasoning_replay
+        );
+        assert_eq!(
+            chat_completions::Dialect {
+                reasoning_replay: openai.reasoning_replay.clone(),
+                ..bedrock
+            },
+            openai
+        );
+    }
+
+    /// Chat and Responses behind OpenAI or Bedrock carry the identity in the body for the
+    /// service as well as in the session header for the proxy; Messages and Anthropic
+    /// carry the header alone.
+    #[test]
+    fn the_service_gets_the_identity_behind_openai_and_bedrock() {
+        let session = Locations::one(header("x-litellm-session-id"));
+        let both = session
+            .clone()
+            .with(CacheKey::Body(path("prompt_cache_key")));
+        use CodecName::{ChatCompletions, Messages, Responses};
+        for (upstream, codec, expected) in [
+            (Upstream::Openai, ChatCompletions, &both),
+            (Upstream::Openai, Responses, &both),
+            (Upstream::Openai, Messages, &session),
+            (Upstream::Bedrock, ChatCompletions, &both),
+            (Upstream::Bedrock, Responses, &both),
+            (Upstream::Bedrock, Messages, &session),
+            (Upstream::Anthropic, ChatCompletions, &session),
+            (Upstream::Anthropic, Responses, &session),
+            (Upstream::Anthropic, Messages, &session),
+        ] {
+            let config = Config {
+                upstream,
+                tags: Vec::new(),
+                state_role: None,
+            };
+            let admitted = config.admit(codec).unwrap().codec;
+            assert_eq!(
+                &admitted.identity().cache_key,
+                expected,
+                "{upstream} {codec}"
+            );
+        }
+    }
+
     /// Anthropic behind Messages takes the anthropic dialect's conventions: turn-scoped system
     /// state, thinking dropped on a binding mismatch, and the betas both need. Every
     /// other upstream and codec keeps user-role state and announces no beta.
@@ -233,7 +319,7 @@ mod tests {
             state_role: StateRole::System,
             ..super::super::anthropic::messages()
         });
-        expected.identity_mut().cache_key = header("x-litellm-session-id");
+        expected.identity_mut().cache_key = Locations::one(header("x-litellm-session-id"));
         assert_eq!(
             anthropic.admit(CodecName::Messages).unwrap().codec,
             expected

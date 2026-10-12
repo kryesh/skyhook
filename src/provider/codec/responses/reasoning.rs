@@ -485,7 +485,7 @@ mod tests {
             (Some("different"), "native", false),
             (None, "changed", true),
         ] {
-            let mut decoder = super::super::tests::decoder_for(TerminalOutput::StreamedOnly);
+            let mut decoder = super::super::tests::decoder();
             let result = feed(
                 &mut decoder,
                 vec![

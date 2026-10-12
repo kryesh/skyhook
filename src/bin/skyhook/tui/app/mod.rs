@@ -1,3 +1,4 @@
+use events::Gesture;
 pub use events::{Hit, Operation, Work};
 pub use input::InputTarget;
 use lifecycle::{PendingStart, StartState};
@@ -211,8 +212,8 @@ pub struct App {
     pub content_rect: Rect,
     pub tree_rect: Rect,
     pub composer_rect: Rect,
-    pub selection: Option<(super::render::TextPosition, super::render::TextPosition)>,
-    pressed_entry: Option<model::EntryKey>,
+    pub selection: Option<super::render::Selection>,
+    gesture: Gesture,
     pub hover: Option<(u16, u16)>,
     pub render: super::render::RenderState,
 }
@@ -322,7 +323,7 @@ impl App {
             tree_rect: Rect::default(),
             composer_rect: Rect::default(),
             selection: None,
-            pressed_entry: None,
+            gesture: Gesture::Released,
             hover: None,
             render: super::render::RenderState::new(selected, tx),
         };

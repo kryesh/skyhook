@@ -3,7 +3,10 @@
 use futures_util::future::BoxFuture;
 
 use super::*;
-use crate::{remote::PreparedConnection, tool::source::Source};
+use crate::{
+    remote::{PreparedConnection, backend::ProcessAuthentication},
+    tool::source::Source,
+};
 
 impl ToolExecutor {
     pub(super) fn job_spec(&self, plan: &InvocationPlan) -> JobSpec {
@@ -143,13 +146,19 @@ impl ToolExecutor {
             tool.name().to_owned(),
             plan.authorization_arguments,
         );
-        let authentication = if context.capabilities().contains(Capability::Targets)
-            && context.execution_location().is_root()
-            && tool.target_authentication()
-        {
-            self.shared.router.clone()
-        } else {
-            None
+        // The managed agent replaces an inherited SSH_AUTH_SOCK only for target management.
+        let authentication = match &self.shared.router {
+            Some(router)
+                if context.execution_location().is_root() && tool.process_authentication() =>
+            {
+                let authentication = if context.capabilities().contains(Capability::Targets) {
+                    ProcessAuthentication::PromptsAndAgent
+                } else {
+                    ProcessAuthentication::Prompts
+                };
+                Some((router.clone(), authentication))
+            }
+            _ => None,
         };
         let job = context.job();
         // The handle shows the job as launched, before its worker can finish it.
@@ -170,10 +179,10 @@ impl ToolExecutor {
                         ))
                         .paths(plan.path_facts);
                 let result = async {
-                    if let Some(router) = authentication {
+                    if let Some((router, authentication)) = authentication {
                         context.process_environment.extend(
                             router
-                                .environment()
+                                .environment(authentication)
                                 .await
                                 .map_err(|e| e.into_tool_error())?,
                         );

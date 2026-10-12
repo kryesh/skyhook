@@ -949,7 +949,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_enforces_exact_capabilities_and_noninteractive_exec_sessions() {
+    async fn worker_enforces_exact_capabilities_and_detached_exec_sessions() {
         let worker = Harness::start(
             std::fs::canonicalize(".").unwrap(),
             RecordingPolicy::allowing(),
@@ -996,7 +996,7 @@ mod tests {
                 .split_whitespace()
                 .collect();
             assert_eq!(ids.len(), 2);
-            assert_eq!(ids[0] == ids[1], !interactive);
+            assert_eq!(ids[0], ids[1], "every process leads its own session");
         }
         worker.finish().await;
     }

@@ -24,8 +24,9 @@ pub(crate) use error::RemoteError;
 pub(crate) use manager::tests::PendingHandshakeFactory;
 pub(crate) use manager::{PreparedConnection, RemoteManager};
 pub use prompt::{
-    PromptAnswer, RejectSensitivePrompts, SecretValue, SensitivePrompt, SensitivePromptError,
-    SensitivePromptFuture, SensitivePromptHandler, SensitivePromptKind,
+    PromptAnswer, RejectSensitivePrompts, Requester, RequesterExecutable, SecretValue,
+    SensitivePrompt, SensitivePromptError, SensitivePromptFuture, SensitivePromptHandler,
+    SensitivePromptKind,
 };
 pub use ssh::askpass_main;
-pub(crate) use ssh::{AskpassServer, SshOption};
+pub(crate) use ssh::{AskpassServer, SshOption, apply_environment};

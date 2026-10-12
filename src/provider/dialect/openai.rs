@@ -5,7 +5,7 @@ use super::{BaseUrl, Dialect, DialectConfig, DialectError, Profile, UnsupportedC
 use crate::provider::{
     ProviderErrorKind,
     codec::{
-        CacheKey, Codec, CodecName, Identity, SchemaConstraint, StateRole, ToolNames,
+        CacheKey, Codec, CodecName, Identity, Locations, SchemaConstraint, StateRole, ToolNames,
         chat_completions::{self, EmptyContent, ReasoningReplay, SystemRole},
         path,
         responses::{self, ReasoningSummary},
@@ -15,6 +15,7 @@ use crate::provider::{
         errors::{ErrorRule, ErrorSignals, Field},
         headers::HeaderText,
     },
+    settings::Nullable,
 };
 
 fn chat() -> chat_completions::Dialect {
@@ -26,8 +27,8 @@ fn chat() -> chat_completions::Dialect {
         schema: SchemaConstraint::OpenAiStrict,
         empty_content: EmptyContent::Null,
         identity: Identity {
-            cache_key: CacheKey::Body(const { path("prompt_cache_key") }),
-            user_id: None,
+            cache_key: Locations::one(CacheKey::Body(const { path("prompt_cache_key") })),
+            user_id: Locations::NONE,
         },
         ..chat_completions::Dialect::compatible()
     }
@@ -68,10 +69,11 @@ pub type Options = crate::provider::settings::Empty;
 crate::provider::settings::settings! {
     #[derive(Default)]
     pub struct Config => Patch {
-        /// Responses only. Reasoning summaries need a verified organisation; an
-        /// unverified one is refused with HTTP 400, so it opts out here.
-        #[serde(default, skip_serializing_if = "ReasoningSummary::is_requested")]
-        pub reasoning_summary: ReasoningSummary => default,
+        /// Responses only: the summary detail requested, `auto` by default. Summaries
+        /// need a verified organisation; an unverified one is refused with HTTP 400, so
+        /// null requests none.
+        #[serde(default, skip_serializing_if = "Nullable::is_default")]
+        pub reasoning_summary: Nullable<ReasoningSummary> => default,
         /// Sent as `OpenAI-Organization`.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pub organization: Option<HeaderText> => default,
@@ -93,13 +95,13 @@ impl DialectConfig for Config {
     }
 
     fn admit(&self, codec: CodecName) -> Result<Profile, DialectError> {
-        if !self.reasoning_summary.is_requested() && codec != CodecName::Responses {
+        if matches!(self.reasoning_summary, Nullable::Value(_)) && codec != CodecName::Responses {
             return Err(Error::SummaryNeedsResponses.into());
         }
         let codec = match codec {
             CodecName::ChatCompletions => Codec::ChatCompletions(chat()),
             CodecName::Responses => Codec::Responses(responses::Dialect {
-                reasoning_summary: self.reasoning_summary,
+                reasoning_summary: self.reasoning_summary.or(ReasoningSummary::default()),
                 ..responses()
             }),
             CodecName::Messages => {
@@ -138,10 +140,9 @@ mod tests {
 
     #[tokio::test]
     async fn key_and_identity_headers_ride_every_request() {
-        let config: Config = crate::yaml::parse(
-            "{reasoning_summary: unsupported, organization: org_1, project: proj_1}",
-        )
-        .unwrap();
+        let config: Config =
+            crate::yaml::parse("{reasoning_summary: null, organization: org_1, project: proj_1}")
+                .unwrap();
         let head = head(&config, CodecName::Responses, "k").await;
         assert_eq!(header_values(&head, "authorization"), ["Bearer k"]);
         assert_eq!(header_values(&head, "openai-organization"), ["org_1"]);
@@ -158,7 +159,7 @@ mod tests {
                 .unwrap()
                 .scope
         };
-        assert_eq!(scope("{}"), scope("reasoning_summary: unsupported"));
+        assert_eq!(scope("{}"), scope("reasoning_summary: null"));
         let tenant = scope("organization: org_1\nproject: project_1");
         for other in [
             "{}",
@@ -170,28 +171,43 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_preset_default_overrides_an_inherited_opt_out() {
-        use crate::provider::settings::{Patch as _, Settings};
-
-        let lower: Patch = crate::yaml::parse("reasoning_summary: unsupported").unwrap();
-        let higher: Patch = crate::yaml::parse("reasoning_summary: requested").unwrap();
-        assert_eq!(
-            crate::yaml::to_string(&higher).unwrap(),
-            "reasoning_summary: requested\n"
-        );
-        let config = Config::resolve(&lower.overlay(&higher)).unwrap();
-        assert_eq!(config.reasoning_summary, ReasoningSummary::Requested);
-        assert!(config.admit(CodecName::ChatCompletions).is_ok());
+    fn the_summary_requested_is_auto_unless_another_or_none_is_chosen() {
+        for (reasoning_summary, requested) in [
+            (Nullable::Default, Some(ReasoningSummary::Auto)),
+            (Nullable::Null, None),
+            (
+                Nullable::Value(ReasoningSummary::Detailed),
+                Some(ReasoningSummary::Detailed),
+            ),
+        ] {
+            let config = Config {
+                reasoning_summary,
+                ..Config::default()
+            };
+            let Codec::Responses(dialect) = config.admit(CodecName::Responses).unwrap().codec
+            else {
+                panic!("Responses conventions");
+            };
+            assert_eq!(dialect.reasoning_summary, requested);
+        }
     }
 
+    /// Only a chosen detail needs Responses: an inherited null requests nothing anywhere.
     #[test]
-    fn summaries_opt_out_on_responses_only() {
-        let quiet = Config {
-            reasoning_summary: ReasoningSummary::Unsupported,
+    fn summaries_are_chosen_on_responses_only() {
+        let summary = |reasoning_summary| Config {
+            reasoning_summary,
             ..Config::default()
         };
+        assert!(
+            summary(Nullable::Null)
+                .admit(CodecName::ChatCompletions)
+                .is_ok()
+        );
         assert_eq!(
-            quiet.admit(CodecName::ChatCompletions).err(),
+            summary(Nullable::Value(ReasoningSummary::Concise))
+                .admit(CodecName::ChatCompletions)
+                .err(),
             Some(Error::SummaryNeedsResponses.into())
         );
     }

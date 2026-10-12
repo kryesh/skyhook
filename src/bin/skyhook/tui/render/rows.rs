@@ -1,10 +1,11 @@
 //! Entry-local rows addressed through cumulative entry heights. Updates cost
 //! the number of later entries; streaming and resets only touch the tail.
 use super::super::tool_view::Document;
-use super::Row;
+use super::{Row, selection::LineOrder};
 use std::{
     collections::{HashMap, HashSet},
     ops::Index,
+    sync::OnceLock,
 };
 
 /// One entry's rows and the highlight sources they show.
@@ -14,6 +15,8 @@ struct Block {
     sources: Vec<u64>,
     /// Fenced code found while laying out Markdown, for highlight scheduling.
     fences: Document,
+    /// The order of the rows' logical lines, once a selection needs it.
+    order: OnceLock<LineOrder>,
 }
 
 #[derive(Default)]
@@ -59,8 +62,17 @@ impl RowBlocks {
             .iter()
             .chain(rest.iter().flat_map(|block| &block.rows))
     }
+    /// An entry's rows; none past the last entry.
+    pub(super) fn entry_rows(&self, entry: usize) -> &[Row] {
+        self.blocks.get(entry).map_or(&[], |block| &block.rows)
+    }
     pub(super) fn fences(&self, entry: usize) -> Option<&Document> {
         self.blocks.get(entry).map(|block| &block.fences)
+    }
+    /// The order of an entry's logical lines in its current layout.
+    pub(super) fn line_order(&self, entry: usize) -> Option<&LineOrder> {
+        let block = self.blocks.get(entry)?;
+        Some(block.order.get_or_init(|| LineOrder::of(&block.rows)))
     }
     pub fn clear(&mut self) {
         self.blocks.clear();
@@ -86,6 +98,7 @@ impl RowBlocks {
     ) {
         self.ensure_entry(index);
         let block = &mut self.blocks[index];
+        block.order.take();
         block.fences = update(&mut block.rows);
         sources.extend(block.fences.highlight_sources());
         sources.sort_unstable();

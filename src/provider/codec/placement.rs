@@ -1,5 +1,5 @@
-//! Where a dialect places a value: dot paths into the body, the one header
-//! placement (cache affinity), and the values placed there.
+//! Where a dialect places a value: dot paths into the body, the one dimension that
+//! may also be a header (cache affinity), and the values placed there.
 
 use std::{borrow::Cow, fmt};
 
@@ -7,6 +7,7 @@ use reqwest::header::HeaderName;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
+use super::Locations;
 use crate::provider::{ProviderError, ProviderErrorKind::InvalidRequest};
 
 /// A dot path into a request object, naming where a dialect places a value.
@@ -111,13 +112,12 @@ impl BodyPath {
     }
 }
 
-/// Where the stable context identity travels: the one dimension that may be a
+/// A place the stable context identity travels: the one dimension that may be a
 /// header, since some services derive cache affinity from one. Configuration
-/// spells it `omitted`, `{header: name}` or `{body: path}`.
+/// spells it `{header: name}` or `{body: path}`.
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CacheKey {
-    Omitted,
     Header(#[serde(with = "header_name")] HeaderName),
     Body(BodyPath),
 }
@@ -126,14 +126,14 @@ pub enum CacheKey {
 /// services that key caches per user.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Identity {
-    pub cache_key: CacheKey,
-    pub user_id: Option<BodyPath>,
+    pub cache_key: Locations<CacheKey>,
+    pub user_id: Locations<BodyPath>,
 }
 
 impl Identity {
-    pub(crate) const OMITTED: Self = Self {
-        cache_key: CacheKey::Omitted,
-        user_id: None,
+    pub(crate) const NONE: Self = Self {
+        cache_key: Locations::NONE,
+        user_id: Locations::NONE,
     };
 }
 

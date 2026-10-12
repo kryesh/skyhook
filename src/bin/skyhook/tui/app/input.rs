@@ -484,9 +484,8 @@ impl App {
     /// The transcript text the pointer selected, unless it holds none. Distinct
     /// endpoints are not enough: a span across a soft wrap has no source text.
     pub(super) fn selected_text(&self) -> Option<String> {
-        let selection = self.selection?;
-        let text = crate::tui::render::selected_text(&self.render.rows, selection);
-        (!text.is_empty()).then_some(text)
+        let text = self.selection.as_ref()?.text();
+        (!text.is_empty()).then(|| text.to_owned())
     }
     /// Send `text` to the terminal clipboard and say how much was sent. OSC 52
     /// reports nothing back, so that is all the message can claim.

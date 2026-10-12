@@ -44,6 +44,7 @@ mod error;
 mod input;
 mod lifecycle;
 mod messages;
+mod process;
 pub(super) mod views;
 
 pub(crate) use delivery::{Delivery, Notification};
@@ -57,6 +58,7 @@ pub use entry::{Invocation, RunTiming};
 pub use error::{InputUnavailableReason, JobError};
 pub(crate) use input::Concluding;
 pub(crate) use lifecycle::woken;
+pub(crate) use process::{JobProcess, ProcessOwner};
 pub(crate) use progress::AgentProgress;
 pub(crate) use views::{JOB_VIEW_SCHEMAS, Waiting, release_records};
 pub use views::{JobEnvelope, JobView, Notice, Presentation};

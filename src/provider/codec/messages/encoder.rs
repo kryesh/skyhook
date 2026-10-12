@@ -11,6 +11,7 @@ use crate::{
                 blob_error, check_tool, own_replay, signed_context, tagged, tool_text, user_parts,
             },
             placement::{breakpoint, path},
+            set_each,
         },
         protocol::{
             AssistantItem, Binding, Entry, HistoryLifetime, Message, ModelRequest, ReplayFormat,
@@ -44,7 +45,7 @@ pub(crate) fn encode(
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
     body.insert("stream".into(), json!(true));
-    dialect.output_limit.set(&mut body, json!(max_tokens))?;
+    set_each(dialect.output_limit.iter(), &mut body, json!(max_tokens))?;
     let mut system = Vec::new();
     let mut cache_breakpoints = 0;
     let breakpoint = || breakpoint(dialect.cache_ttl);
@@ -300,8 +301,8 @@ fn mark_last_cacheable(messages: &mut [Value], breakpoint: Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::provider::codec::StateRole;
     use crate::provider::codec::common::tests::{envelope, image, notes};
+    use crate::provider::codec::{NonEmpty, StateRole};
     use crate::provider::protocol::{Entry, StateLifetime, entries, state};
     use crate::{
         media::AttachmentRef,
@@ -433,7 +434,7 @@ mod tests {
         );
         // A limit placed inside output_config sits beside the format and effort.
         let nested = Dialect {
-            output_limit: const { path("output_config.max_tokens") },
+            output_limit: NonEmpty::one(const { path("output_config.max_tokens") }),
             ..Dialect::standard()
         };
         let body = encode(&request, &nested).unwrap();

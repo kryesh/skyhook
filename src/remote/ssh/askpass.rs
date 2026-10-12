@@ -1,6 +1,11 @@
 use crate::{
-    remote::prompt::{
-        PromptAnswer, SecretValue, SensitivePrompt, SensitivePromptHandler, SensitivePromptKind,
+    job::JobManager,
+    remote::{
+        backend::ProcessEnvironment,
+        prompt::{
+            PromptAnswer, Requester, SecretValue, SensitivePrompt, SensitivePromptHandler,
+            SensitivePromptKind,
+        },
     },
     target::{TargetName, TargetRef},
 };
@@ -18,7 +23,7 @@ use tokio::{
 };
 use zeroize::Zeroizing;
 
-/// The argument that makes a Skyhook binary run as OpenSSH's askpass helper.
+/// The argument that makes a Skyhook binary run as the askpass helper.
 const FLAG: &str = "--askpass";
 /// Names the helper's server socket.
 const SOCKET: &str = "SKYHOOK_ASKPASS_SOCKET";
@@ -27,7 +32,7 @@ const ASKPASS_MAX_BYTES: u64 = 64 * 1024;
 /// How often a pending prompt checks that the helper asking it still exists.
 const PEER_POLL: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// Answer OpenSSH's prompt and exit, when OpenSSH started this process as its
+/// Answer an askpass prompt (from OpenSSH or sudo) and exit, when started as the
 /// askpass helper; otherwise return. Every Skyhook binary calls this first.
 pub fn askpass_main() {
     let mut arguments = std::env::args_os().skip(1);
@@ -63,10 +68,12 @@ struct AskpassRequest {
 }
 
 impl AskpassServer {
-    /// Serve prompts for SSH connecting to `target`, or for an agent's own prompts.
+    /// Serve prompts for SSH connecting to `target`, or for an agent's own prompts,
+    /// attributing each to the running job of `jobs` it came from.
     pub fn start(
         handler: Arc<dyn SensitivePromptHandler>,
         target: Option<TargetName>,
+        jobs: Option<JobManager>,
     ) -> Result<Self, std::io::Error> {
         use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
         // Randomness isolates servers even within one process; the PID is only descriptive.
@@ -79,14 +86,14 @@ impl AskpassServer {
         std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
         let socket = directory.path().join("askpass.sock");
         let executable = directory.path().join("askpass");
+        let helper_path = super::config::wire_path(&executable)?;
+        // sudo uses SUDO_ASKPASS whenever no terminal is available, which is always
+        // the case for process tools, and a display is set; see `apply_environment`.
         let environment = std::collections::BTreeMap::from([
-            (
-                "SSH_ASKPASS".into(),
-                super::config::wire_path(&executable)?.to_owned(),
-            ),
+            ("SSH_ASKPASS".into(), helper_path.to_owned()),
+            ("SUDO_ASKPASS".into(), helper_path.to_owned()),
             ("SSH_ASKPASS_REQUIRE".into(), "force".into()),
             (SOCKET.into(), super::config::wire_path(&socket)?.to_owned()),
-            ("DISPLAY".into(), "skyhook".into()),
         ]);
         // Name this process's image rather than its file: a rebuild or upgrade that
         // replaces the binary mid-run would otherwise leave OpenSSH a missing helper.
@@ -116,8 +123,8 @@ impl AskpassServer {
                 tokio::select! {
                     accepted = listener.accept() => {
                         let Ok((stream, _)) = accepted else { break };
-                        let (handler, target) = (handler.clone(), target.clone());
-                        tasks.spawn(async move { let _ = serve_one(stream, handler, target).await; });
+                        let (handler, target, jobs) = (handler.clone(), target.clone(), jobs.clone());
+                        tasks.spawn(async move { let _ = serve_one(stream, handler, target, jobs).await; });
                     }
                     _ = tasks.join_next(), if !tasks.is_empty() => {}
                 }
@@ -139,6 +146,29 @@ impl AskpassServer {
     }
 }
 
+/// Give `command` `environment`. When that brings an askpass helper, also name a
+/// placeholder display unless `command` would run with one: askpass fallbacks (sudo's,
+/// and OpenSSH's before `SSH_ASKPASS_REQUIRE`) need some `DISPLAY`, but replacing a
+/// real one would break graphical programs.
+pub(crate) fn apply_environment(
+    command: &mut std::process::Command,
+    environment: &ProcessEnvironment,
+) {
+    command.envs(environment);
+    if !environment.contains_key("SSH_ASKPASS") {
+        return;
+    }
+    let has_display =
+        |value: Option<&std::ffi::OsStr>| value.is_some_and(|value| !value.is_empty());
+    let display = match command.get_envs().find(|(key, _)| *key == "DISPLAY") {
+        Some((_, value)) => has_display(value),
+        None => has_display(std::env::var_os("DISPLAY").as_deref()),
+    };
+    if !display {
+        command.env("DISPLAY", "skyhook");
+    }
+}
+
 impl Drop for AskpassServer {
     fn drop(&mut self) {
         self.task.abort();
@@ -149,6 +179,7 @@ async fn serve_one(
     mut stream: UnixStream,
     handler: Arc<dyn SensitivePromptHandler>,
     target: Option<TargetName>,
+    jobs: Option<JobManager>,
 ) -> Result<(), std::io::Error> {
     // Authenticate before reading/parsing untrusted input or invoking the handler.
     let peer = stream.peer_cred()?;
@@ -177,11 +208,17 @@ async fn serve_one(
             tokio::time::sleep(PEER_POLL).await;
         }
     };
+    let requester = peer_pid
+        .and_then(|pid| u32::try_from(pid).ok())
+        .map_or_else(Requester::default, |pid| {
+            super::requester::requester(pid, jobs.as_ref())
+        });
     let prompt = SensitivePrompt {
         kind,
         message: request.prompt,
         target,
         origin: TargetRef::Root,
+        requester,
     };
     let answer = tokio::select! {
         result = handler.prompt(prompt) => match result {
@@ -272,7 +309,7 @@ mod tests {
     }
 
     fn start(handler: Arc<FixedAnswer>) -> AskpassServer {
-        AskpassServer::start(handler, Some("build".parse().unwrap())).unwrap()
+        AskpassServer::start(handler, Some("build".parse().unwrap()), None).unwrap()
     }
 
     fn fixed(value: &'static str) -> Arc<FixedAnswer> {
@@ -304,6 +341,33 @@ mod tests {
         match crate::tests::bounded(request).await {
             PromptAnswer::Secret(value) => value,
             answer => panic!("password request unexpectedly answered {answer:?}"),
+        }
+    }
+
+    /// Only an askpass helper brings a display, and only in place of a missing one.
+    #[test]
+    fn a_placeholder_display_only_replaces_a_missing_one_beside_askpass() {
+        let display = |command: &std::process::Command| {
+            (command.get_envs().find(|(key, _)| *key == "DISPLAY"))
+                .and_then(|(_, value)| value.map(|value| value.to_owned()))
+        };
+        let askpass = ProcessEnvironment::from([("SSH_ASKPASS".into(), "helper".into())]);
+        for (set, environment, expected) in [
+            (Some(":99"), &askpass, Some(":99")),
+            (Some(""), &askpass, Some("skyhook")),
+            (None, &askpass, Some("skyhook")),
+            (None, &ProcessEnvironment::new(), None),
+        ] {
+            let mut command = std::process::Command::new("true");
+            match set {
+                Some(value) => command.env("DISPLAY", value),
+                None => command.env_remove("DISPLAY"),
+            };
+            apply_environment(&mut command, environment);
+            assert_eq!(
+                display(&command).as_deref(),
+                expected.map(std::ffi::OsStr::new)
+            );
         }
     }
 
@@ -445,7 +509,7 @@ mod tests {
         }
         for prompt in ["Are you sure (yes/no)?", "Password:"] {
             let (client, server) = UnixStream::pair().unwrap();
-            let task = tokio::spawn(serve_one(server, Arc::new(Mismatched), None));
+            let task = tokio::spawn(serve_one(server, Arc::new(Mismatched), None, None));
             assert!(matches!(
                 ask_for(client, prompt).await,
                 PromptAnswer::Rejected
@@ -454,11 +518,40 @@ mod tests {
         }
     }
 
+    /// The helper's process names the job it runs under, however it was started.
+    #[tokio::test]
+    async fn prompts_name_the_job_whose_process_asked() {
+        struct Recording(std::sync::Mutex<Vec<Requester>>);
+        impl SensitivePromptHandler for Recording {
+            fn prompt(&self, prompt: SensitivePrompt) -> crate::remote::SensitivePromptFuture {
+                self.0.lock().unwrap().push(prompt.requester);
+                Box::pin(async { Ok(PromptAnswer::Rejected) })
+            }
+        }
+        let runtime = crate::tests::TestRuntime::new().await;
+        let lease = (runtime.jobs)
+            .test_running(crate::job::JobSpec::test(runtime.agent.clone(), "exec"))
+            .await;
+        let job = lease.into_test_id();
+        let _attached = runtime.jobs.process_owner(job).attach(std::process::id());
+        let recording = Arc::new(Recording(std::sync::Mutex::new(Vec::new())));
+        let (client, server) = UnixStream::pair().unwrap();
+        let jobs = Some(runtime.jobs.clone());
+        let task = tokio::spawn(serve_one(server, recording.clone(), None, jobs));
+        assert!(matches!(ask(client).await, PromptAnswer::Rejected));
+        task.await.unwrap().unwrap();
+        let requesters = recording.0.lock().unwrap();
+        assert_eq!(
+            requesters.iter().map(|r| r.job).collect::<Vec<_>>(),
+            [Some(job)]
+        );
+    }
+
     #[tokio::test]
     async fn rejected_prompts_are_distinct_from_empty_secrets() {
         let (client, server) = UnixStream::pair().unwrap();
         let rejecting = Arc::new(crate::remote::RejectSensitivePrompts);
-        let task = tokio::spawn(serve_one(server, rejecting, None));
+        let task = tokio::spawn(serve_one(server, rejecting, None, None));
         assert!(matches!(ask(client).await, PromptAnswer::Rejected));
         task.await.unwrap().unwrap();
         let empty = serde_json::from_str::<PromptAnswer>(r#"{"Secret":""}"#).unwrap();

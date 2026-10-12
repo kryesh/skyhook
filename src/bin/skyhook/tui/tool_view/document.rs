@@ -13,9 +13,13 @@ use unicode_width::UnicodeWidthStr;
 
 impl Document {
     pub fn line(&mut self, text: impl Into<String>, role: Role) {
+        self.indented(0, text, role);
+    }
+    /// Lines of `text`, each `indent` cells in.
+    fn indented(&mut self, indent: usize, text: impl Into<String>, role: Role) {
         for line in text.into().split('\n') {
-            self.sections
-                .push(Section::Line(vec![Run::new(line, role)]));
+            let runs = vec![Run::new(line, role)];
+            self.sections.push(Section::Line { indent, runs });
         }
     }
     pub(super) fn code(
@@ -37,7 +41,7 @@ impl Document {
     pub fn arguments(&mut self, hints: Hints<'_>) {
         self.line("Arguments", Role::Heading);
         if hints.args.as_object().is_some_and(|v| v.is_empty()) {
-            self.line("  No arguments", Role::Muted);
+            self.indented(2, "No arguments", Role::Muted);
         } else {
             self.fields(hints.args, 2, hints, false);
         }
@@ -68,7 +72,6 @@ impl Document {
             .unwrap_or(0)
             .min(24);
         for (name, value) in entries {
-            let prefix = " ".repeat(indent);
             let source = hints.source(&name);
             let literal = literal || source.is_some();
             if let Some((language, role)) = source
@@ -79,15 +82,15 @@ impl Document {
                     Role::Added => (format!("{name} (added)"), Some("+ ")),
                     _ => (name, None),
                 };
-                self.line(format!("{prefix}{label}"), Role::Label);
+                self.indented(indent, label, Role::Label);
                 self.code(text, &language, indent + 2, gutter.map(Clean::from), role);
             } else if let Some((text, role)) = scalar(value) {
                 if text.contains('\n') {
-                    self.line(format!("{prefix}{name}"), Role::Label);
+                    self.indented(indent, name, Role::Label);
                     self.argument_block(value, indent + 2, literal);
                 } else {
                     let runs = vec![
-                        Run::new(format!("{prefix}{name}"), Role::Label),
+                        Run::new(name.clone(), Role::Label),
                         Run::new(
                             " ".repeat(width.saturating_sub(name.width()) + 2),
                             Role::Plain,
@@ -95,13 +98,13 @@ impl Document {
                         Run::new(text, role),
                     ];
                     self.sections.push(if value.is_string() && !literal {
-                        Section::Prose(runs)
+                        Section::Prose { indent, runs }
                     } else {
-                        Section::Line(runs)
+                        Section::Line { indent, runs }
                     });
                 }
             } else {
-                self.line(format!("{prefix}{name}"), Role::Label);
+                self.indented(indent, name, Role::Label);
                 self.fields(value, indent + 2, hints, literal);
             }
         }
@@ -109,10 +112,8 @@ impl Document {
     /// Prose wraps at words, one logical line per source line.
     fn prose(&mut self, text: &str, indent: usize, role: Role) {
         for line in text.split('\n') {
-            self.sections.push(Section::Prose(vec![
-                Run::new(" ".repeat(indent), Role::Plain),
-                Run::new(line, role),
-            ]));
+            let runs = vec![Run::new(line, role)];
+            self.sections.push(Section::Prose { indent, runs });
         }
     }
     fn argument_block(&mut self, value: &Value, indent: usize, literal: bool) {
@@ -507,8 +508,8 @@ mod tests {
             let lines = document.layout_lines(None);
             let found = lines
                 .iter()
-                .find(|(line, _)| line.to_string().contains(needle));
-            found.unwrap().1
+                .find(|line| line.text.to_string().contains(needle));
+            found.unwrap().wrap
         };
         let document = arguments(
             "exec",
@@ -836,7 +837,7 @@ mod tests {
             }
             assert!(text.contains("More saved output available"));
             assert!(document.sections.iter().any(|section| {
-                matches!(section, Section::Line(runs) if runs.len() == 1
+                matches!(section, Section::Line { runs, .. } if runs.len() == 1
                     && &*runs[0].text == "/result/missing" && runs[0].role == Role::Label)
             }));
             assert!(has_source(&document, "  live payload\t"));

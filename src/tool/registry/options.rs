@@ -99,10 +99,11 @@ impl<A> ToolOptions<A> {
         )
     }
 
-    /// The handler spawns processes that may authenticate to configured targets.
+    /// The handler spawns processes that receive the session's askpass helper, and its
+    /// managed SSH agent with the `Targets` capability.
     #[must_use]
-    pub(crate) const fn target_authentication(mut self) -> Self {
-        self.execution.target_authentication = true;
+    pub(crate) const fn process_authentication(mut self) -> Self {
+        self.execution.process_authentication = true;
         self
     }
 

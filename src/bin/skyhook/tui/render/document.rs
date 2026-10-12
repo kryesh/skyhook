@@ -1,6 +1,8 @@
 //! Entry geometry and layout.
 
-use super::super::tool_view::{Document, HighlightCache, Wrap, header_line};
+use super::super::tool_view::{
+    Document, DocumentLine, HighlightCache, Role, Run, Wrap, header_line,
+};
 use super::*;
 
 /// How an entry's text sits inside its rows.
@@ -16,6 +18,8 @@ enum Framing {
 /// Cells reserved for the counter painted at the right edge of a live entry's
 /// header row, as wide as "in 9h 59m 59s".
 pub(super) const COUNTER_WIDTH: u16 = 13;
+/// Cells a spinner and its gap take before untitled live text.
+const SPINNER_GUTTER: u16 = 2;
 
 /// Geometry and framing shared by every entry layout.
 pub(super) struct EntryGeometry {
@@ -30,6 +34,8 @@ pub(super) struct EntryGeometry {
     entry: usize,
     entry_key: std::sync::Arc<model::EntryKey>,
     selectable: bool,
+    /// Cells before the text of every row, left to a spinner.
+    gutter: u16,
 }
 impl EntryGeometry {
     pub(super) fn new(entry: &model::Entry, width: u16, index: usize) -> Self {
@@ -69,14 +75,28 @@ impl EntryGeometry {
             entry: index,
             entry_key: std::sync::Arc::new(entry.key().clone()),
             selectable: entry.selectable(),
+            gutter: 0,
         }
     }
-    pub(super) fn row(&self, line: Line<'static>, header: bool, continued: bool) -> Row {
+    /// Inset the text past a spinner painted at the start of each row: the
+    /// gutter is geometry, never part of the text.
+    fn reserve_spinner(&mut self) {
+        self.gutter = SPINNER_GUTTER;
+        self.body_width = self.body_width.saturating_sub(SPINNER_GUTTER).max(1);
+        self.header_width = self.header_width.saturating_sub(SPINNER_GUTTER).max(1);
+    }
+    pub(super) fn row(
+        &self,
+        line: Line<'static>,
+        header: bool,
+        layout: markdown::RowLayout,
+    ) -> Row {
         let (inset, padding) = match self.framing {
             Framing::Boxed => (2, 2),
             Framing::Hanging => (u16::from(!header), 0),
             Framing::Flush => (0, 0),
         };
+        let inset = inset + self.gutter;
         Row {
             line: std::sync::Arc::new(line),
             x: self.x,
@@ -87,7 +107,8 @@ impl EntryGeometry {
             entry: self.entry,
             entry_key: self.entry_key.clone(),
             selectable: self.selectable,
-            layout: markdown::RowLayout::default().with_flow(header, continued),
+            layout: layout.with_header(header),
+            spinner: None,
         }
     }
     /// A message box's top or bottom edge.
@@ -95,8 +116,7 @@ impl EntryGeometry {
         Row {
             inset: 0,
             text_width: self.row_width,
-            layout: markdown::RowLayout::spacer(),
-            ..self.row(Line::default(), false, false)
+            ..self.row(Line::default(), false, markdown::RowLayout::spacer())
         }
     }
     /// The separator after an entry.
@@ -110,24 +130,56 @@ impl EntryGeometry {
         }
     }
     /// Wrap logical lines, the first as the header row; later lines and
-    /// continuations share the hanging indent.
-    fn push_wrapped(&self, rows: &mut Vec<Row>, lines: Vec<(Line<'static>, Wrap)>) {
+    /// continuations share the hanging indent. A line's lead is decoration
+    /// before its first row, and its continuations align under its text.
+    /// Returns how much of the header's lead was kept.
+    fn push_wrapped(&self, rows: &mut Vec<Row>, lines: Vec<DocumentLine>) -> usize {
+        let mut kept = 0;
         let indent = usize::from(self.framing == Framing::Hanging);
         let hanging = (self.body_width as usize).saturating_sub(indent).max(1);
-        for (index, (line, wrap)) in lines.into_iter().enumerate() {
-            let first = if index == 0 {
+        let mut ids = markdown::TextIds::default();
+        for (index, DocumentLine { lead, text, wrap }) in lines.into_iter().enumerate() {
+            let id = match index {
+                0 => markdown::LineId::default(),
+                _ => ids.next(&text),
+            };
+            let width = if index == 0 {
                 self.header_width as usize
             } else {
                 hanging
             };
+            // As with code padding, source wins over decoration: the lead,
+            // blank on continuations, leaves room for the widest grapheme on
+            // every row of the line, including the narrower hanging rows.
+            let widest = (text.spans.iter())
+                .flat_map(|span| cells(&span.content))
+                .map(|(_, _, width)| width)
+                .max()
+                .unwrap_or(0);
+            let room = width.min(hanging).saturating_sub(widest.max(1));
+            let mut lead = truncated(lead, room);
+            lead.spans.retain(|span| !span.content.is_empty());
+            let lead_width = lead.width();
+            if index == 0 {
+                kept = lead_width;
+            }
+            let first = width - lead_width;
+            let rest = hanging.saturating_sub(lead_width).max(1);
             let wrapped = match wrap {
-                Wrap::Hard => wrap_line(line, first, hanging),
-                Wrap::Words => wrap_words(line, first),
+                Wrap::Hard => wrap_line(text, first, rest),
+                Wrap::Words => wrap_words(text, first),
             };
-            for (part, line) in wrapped.into_iter().enumerate() {
-                rows.push(self.row(line, index == 0 && part == 0, part > 0));
+            for (part, line) in markdown::LayoutLine::wrapped(wrapped, id).enumerate() {
+                let mut row = self.row(line.line, index == 0 && part == 0, line.layout);
+                row.layout.prefix = match part {
+                    0 => lead.clone(),
+                    _ if lead_width == 0 => Line::default(),
+                    _ => Line::from(" ".repeat(lead_width)),
+                };
+                rows.push(row);
             }
         }
+        kept
     }
 }
 
@@ -141,35 +193,51 @@ pub(super) fn update_entry_rows(
     highlights: &HighlightCache,
     request_columns: RequestColumns,
 ) -> Document {
-    let geometry = EntryGeometry::new(entry, width, index);
+    let mut geometry = EntryGeometry::new(entry, width, index);
     let boxed = geometry.framing == Framing::Boxed;
     rows.clear();
     if let Some(request) = entry.request() {
         let line = request_columns.line(request, geometry.body_width, geometry.header_width);
-        rows.push(geometry.row(line, true, false));
+        let mut row = geometry.row(line, true, markdown::RowLayout::default());
+        // Request columns leave their first cells to the spinner.
+        row.spinner = Some(row.inset);
+        rows.push(row);
         return Document::default();
     }
     if boxed {
         rows.push(geometry.edge());
     }
-    // A live entry leaves its first cells to the spinner: after the
-    // disclosure glyph of a title, or before an untitled body.
+    // A live entry leaves its first cells to the spinner: after a title's
+    // disclosure glyph, both decoration in the title's lead, or before an
+    // untitled body, which is inset past them. Neither is selected.
     let live = entry.timing.live();
     let title = entry.title();
-    let gutter = if title.is_none() && live { "  " } else { "" };
+    let title_lead = |title: &model::Title| Line::from(title.prefix(live));
+    // A spinner paints over the header row, which a message box's edge
+    // precedes: only an unboxed untitled body gives it the gutter.
+    if title.is_none() && live && entry.header().is_none() && !boxed {
+        geometry.reserve_spinner();
+    }
     let mut fences = Document::default();
+    let mut kept = 0;
     if let Some(header) = entry.header() {
-        let mut lines = vec![(header_line(header), Wrap::Hard)];
+        let glyph = entry.disclosure().map(model::Disclosure::glyph);
+        let glyph = glyph.map(|glyph| Run::new(glyph, Role::Indicator));
+        let mut lines = vec![DocumentLine {
+            lead: header_line(&Vec::from_iter(glyph)),
+            text: header_line(header),
+            wrap: Wrap::Hard,
+        }];
         if let Some(body) = entry.document() {
             lines.extend(body.layout_lines(Some(highlights)));
         }
-        geometry.push_wrapped(rows, lines);
+        kept = geometry.push_wrapped(rows, lines);
     } else if matches!(
         entry.surface,
         Surface::User | Surface::Agent | Surface::Reasoning
     ) {
         if let Some(title) = title {
-            let mut line = match &title.label {
+            let mut text = match &title.label {
                 model::Label::Plain(label) => Line::from(label.to_string()),
                 model::Label::Markdown {
                     source,
@@ -178,12 +246,17 @@ pub(super) fn update_entry_rows(
                     markdown::title(&format!("{}{}", &**definitions, &**source)).unwrap_or_default()
                 }
             };
-            line.spans.insert(0, Span::raw(title.prefix(live)));
-            line.spans.extend(title.suffix.map(Span::raw));
+            text.spans.extend(title.suffix.map(Span::raw));
             if boxed {
-                line = line.style(Style::default().add_modifier(Modifier::BOLD));
+                text = text.style(Style::default().add_modifier(Modifier::BOLD));
             }
-            geometry.push_wrapped(rows, vec![(line, Wrap::Words)]);
+            let lead = title_lead(title);
+            let line = DocumentLine {
+                lead,
+                text,
+                wrap: Wrap::Words,
+            };
+            kept = geometry.push_wrapped(rows, vec![line]);
         }
         let body = entry.body();
         // Expanded reasoning omits the empty body; message boxes retain it.
@@ -194,38 +267,54 @@ pub(super) fn update_entry_rows(
             } else {
                 geometry.body_width
             };
-            let layout = stream::layout_highlighted(body, width.into(), gutter, Some(highlights));
+            let layout = stream::layout_highlighted(body, width.into(), Some(highlights));
             fences = layout.fences;
             for line in layout.lines {
-                let header = rows.is_empty();
-                let continued = line.layout.continued();
-                let mut row = geometry.row(line.line, header, continued);
-                row.layout = line.layout.with_flow(header, continued);
-                rows.push(row);
+                let layout = line.layout.in_segment(markdown::Segment::Markdown);
+                rows.push(geometry.row(line.line, rows.is_empty(), layout));
             }
         }
     } else {
         let body = entry.body();
         let body = (title.is_none() || !body.is_empty()).then_some(body);
-        let body = body.iter().flat_map(|body| body.split('\n')).enumerate();
+        let body = body.iter().flat_map(|body| body.split('\n'));
         let lines = title
-            .map(|title| title.line(live))
+            .map(|title| DocumentLine {
+                lead: title_lead(title),
+                text: Line::from(title.heading()),
+                wrap: Wrap::Hard,
+            })
             .into_iter()
-            .chain(body.map(|(index, line)| {
-                let gutter = if index == 0 { gutter } else { "" };
-                format!("{gutter}{line}")
-            }))
-            .map(|line| (Line::from(line), Wrap::Hard))
+            .chain(body.map(|line| DocumentLine::new(Line::from(line.to_owned()), Wrap::Hard)))
             .collect();
-        geometry.push_wrapped(rows, lines);
+        kept = geometry.push_wrapped(rows, lines);
+    }
+    // The spinner paints only where layout kept room: over a card's state
+    // glyph after its kept disclosure glyph, in the gap of a title's lead
+    // when the lead kept it, or in an untitled body's gutter.
+    if let Some(row) = rows.iter_mut().find(|row| row.layout.header()) {
+        let kept = kept as u16;
+        row.spinner = match (entry.header(), title) {
+            (Some(_), _) => Some(row.inset + kept),
+            (None, Some(title)) => {
+                let glyph = title.prefix(false).width() as u16;
+                (kept > glyph).then_some(row.inset + glyph)
+            }
+            (None, None) => Some(row.inset.saturating_sub(geometry.gutter)),
+        };
     }
     if boxed {
         if let Some(footer) = &entry.footer {
             let footer = Span::styled(footer.to_string(), Style::default().fg(THEME.muted));
-            for line in [Line::default(), Line::from(footer)] {
+            for (index, line) in [Line::default(), Line::from(footer)]
+                .into_iter()
+                .enumerate()
+            {
                 let wrapped = wrap_words(line, geometry.body_width as usize);
-                for (part, line) in wrapped.into_iter().enumerate() {
-                    rows.push(geometry.row(line, false, part > 0));
+                let id = markdown::LineId::at(index);
+                for line in markdown::LayoutLine::wrapped(wrapped, id) {
+                    let layout = line.layout.in_segment(markdown::Segment::Footer);
+                    rows.push(geometry.row(line.line, false, layout));
                 }
             }
         }
@@ -240,7 +329,7 @@ pub(super) fn update_entry_rows(
 #[cfg(test)]
 mod tests {
     use super::super::super::tool_view::{Hints, Role, Run, Section};
-    use super::super::tests::layout;
+    use super::super::tests::{layout, selected_text, text_x};
     use super::*;
 
     fn arguments(tool: &str, args: &serde_json::Value) -> Document {
@@ -250,39 +339,20 @@ mod tests {
         document
     }
 
-    fn assert_argument_reflow(document: &Document) {
+    /// `document` as an expanded card copies `expected` at every width.
+    fn assert_argument_reflow(document: &Document, expected: &str) {
         let mut body = document.clone();
-        let Section::Line(header) = body.sections.remove(0) else {
+        let Section::Line { runs: header, .. } = body.sections.remove(0) else {
             panic!("argument fixture starts with its tool header");
         };
         let mut entry = model::Entry::card(model::EntryKey::UnsavedStatus(1), header, Some(body));
         entry.compact_after = true;
-        let mut document = document.clone();
-        document.sections[0] = Section::Line(entry.header().unwrap().to_vec());
         for width in [0, 1, 2, 8, 12, 40, 120, 24] {
-            let geometry = EntryGeometry::new(&entry, width, 0);
             let rows = layout(&entry, width);
-            let body = geometry.body_width.saturating_sub(1).max(1) as usize;
-            let lines = document.layout_lines(None).into_iter().enumerate();
-            let expected: Vec<_> = lines
-                .flat_map(|(index, (line, wrap))| {
-                    let first = if index == 0 {
-                        geometry.body_width as usize
-                    } else {
-                        body
-                    };
-                    match wrap {
-                        Wrap::Hard => wrap_line(line, first, body),
-                        Wrap::Words => wrap_words(line, first),
-                    }
-                })
-                .map(|line| line.to_string())
-                .collect();
-            assert_eq!(
-                rows.iter().map(Row::text).collect::<Vec<_>>(),
-                expected,
-                "width {width}"
-            );
+            for row in &rows {
+                let lead = row.layout.prefix.width() as u16;
+                assert!(lead < row.text_width.max(1), "width {width}");
+            }
             let start = TextPosition { row: 0, byte: 0 };
             let end = TextPosition {
                 row: rows.len() - 1,
@@ -292,10 +362,118 @@ mod tests {
             blocks.replace_entry(0, rows, Vec::new());
             assert_eq!(
                 selected_text(&blocks, (start, end)),
-                entry.text(),
+                expected,
                 "width {width}"
             );
-            assert_eq!(selected_text(&blocks, (end, start)), entry.text());
+            assert_eq!(selected_text(&blocks, (end, start)), expected);
+        }
+    }
+
+    /// A diff's indent and change markers are painted beside its lines, but
+    /// selection, copying and the selection highlight cover only the source.
+    #[test]
+    fn diff_markers_and_indents_are_painted_but_not_selected() {
+        let (old, new) = ("let a = 1;\nlet b = 2;", "let a = 3;");
+        let args = serde_json::json!({"path": "file.rs", "old": old, "new": new});
+        for width in [40, 20] {
+            let rows = argument_card("replace", &args, width);
+            let marked: Vec<_> = rows
+                .iter()
+                .filter(|row| {
+                    let lead = row.layout.prefix.to_string();
+                    ["− ", "+ "].iter().any(|marker| lead.ends_with(marker))
+                })
+                .collect();
+            assert!(marked.len() >= 3, "width {width}");
+            for row in &rows {
+                let text = row.text();
+                assert!(!text.contains("− ") && !text.contains("+ "), "{text:?}");
+            }
+            for row in marked {
+                // A press on the marker starts at the source; the highlight
+                // starts where the source does.
+                let lead = row.layout.prefix.width() as u16;
+                assert_eq!(row.byte_at_column(row.paragraph_x()), 0);
+                assert_eq!(text_x(row), row.paragraph_x() + lead);
+            }
+            let copied = copy_from(rows, "let a = 1;");
+            assert_eq!(
+                copied,
+                format!("{old}\nnew (added)\n{new}"),
+                "width {width}"
+            );
+        }
+    }
+
+    /// The expanded card of `tool` with `args`, and its rows at `width`.
+    fn argument_card(tool: &str, args: &serde_json::Value, width: u16) -> Vec<Row> {
+        let mut document = arguments(tool, args);
+        let Section::Line { runs: header, .. } = document.sections.remove(0) else {
+            panic!("argument fixture starts with its tool header");
+        };
+        let key = model::EntryKey::UnsavedStatus(1);
+        layout(&model::Entry::card(key, header, Some(document)), width)
+    }
+
+    /// Copy from the first row that starts `from` to the end of the card.
+    fn copy_from(rows: Vec<Row>, from: &str) -> String {
+        let texts: Vec<_> = rows.iter().map(Row::text).collect();
+        let first =
+            (texts.iter()).position(|text| !text.is_empty() && from.starts_with(text.as_str()));
+        let first = first.unwrap_or_else(|| panic!("{from:?} in {texts:?}"));
+        let last = rows.len() - 1;
+        let mut blocks = RowBlocks::default();
+        blocks.replace_entry(0, rows, Vec::new());
+        let start = TextPosition {
+            row: first,
+            byte: 0,
+        };
+        let end = TextPosition {
+            row: last,
+            byte: usize::MAX,
+        };
+        selected_text(&blocks, (start, end))
+    }
+
+    /// Prose arguments copy as written: the argument's own whitespace stays,
+    /// the card's indentation does not.
+    #[test]
+    fn prose_arguments_copy_without_presentation_indent() {
+        let args = serde_json::json!({"prompt": "alpha\n  beta"});
+        for width in [60, 12] {
+            let copied = copy_from(argument_card("agent", &args, width), "alpha");
+            assert_eq!(copied, "alpha\n  beta", "width {width}");
+        }
+    }
+
+    /// A card's disclosure glyph is painted before its header, not selected.
+    #[test]
+    fn card_disclosure_glyphs_are_decoration() {
+        let args = serde_json::json!({"path": "f"});
+        let rows = argument_card("read", &args, 40);
+        assert_eq!(rows[0].layout.prefix.to_string(), "▾ ");
+        assert_eq!(copy_from(rows, "read"), "read\nArguments\npath  f");
+    }
+
+    /// A diff line paints its marker before its source; however narrow, the
+    /// marker gives way so the widest source grapheme still fits.
+    #[test]
+    fn narrow_diffs_paint_wide_source_graphemes() {
+        let args = serde_json::json!({"path": "f", "old": "界x", "new": "y"});
+        for (width, painted_source) in [(40, "− 界"), (12, "界")] {
+            let rows = argument_card("replace", &args, width);
+            let painted: Vec<String> = rows
+                .iter()
+                .map(|row| {
+                    let area = Rect::new(0, 0, width, 1);
+                    let mut buffer = Buffer::empty(area);
+                    let text = Rect::new(row.paragraph_x(), 0, row.text_width, 1);
+                    render_row_line(row, text, &mut buffer, Style::default());
+                    (0..width).map(|x| buffer[(x, 0)].symbol()).collect()
+                })
+                .collect();
+            let shown = |text: &str| painted.iter().any(|row| row.contains(text));
+            assert!(shown(painted_source) && shown("x"), "{painted:#?}");
         }
     }
 
@@ -312,10 +490,23 @@ mod tests {
         });
         let original = args.clone();
         let document = arguments("agent", &args);
-        assert_argument_reflow(&document);
+        let expected = format!(
+            "agent\nArguments\nprompt\n{}\n\n  Keep **literal** text, café e\u{301}lan 世界 👩‍💻 together.  \n\n\
+             description  short inline prose\nnested\nitems\n1.  nested array prose\n2.\n\
+             first paragraph\n  second paragraph  \n\
+             token        extraordinarilylongunbrokentoken世界👩‍💻e\u{301}",
+            "Please inspect the current implementation and explain every relevant change. "
+                .repeat(5)
+        );
+        assert_argument_reflow(&document, &expected);
         // A long prompt's short words must never be split, even though its
         // paragraphs are longer than the viewport and include indentation.
-        for (line, wrapping) in document.layout_lines(None) {
+        for DocumentLine {
+            text: line,
+            wrap: wrapping,
+            ..
+        } in document.layout_lines(None)
+        {
             let text = line.to_string();
             if wrapping != Wrap::Words || text.contains("extraordinarily") {
                 continue;
@@ -336,31 +527,42 @@ mod tests {
     #[test]
     fn tool_argument_code_keeps_hard_wrap_and_copy_after_resize() {
         let source = "  const message = 'long words stay hard wrapped';\t// café 👩‍💻\n\n    console.log(message);  \n";
-        for (tool, args) in [
+        // Sources are shown with tabs expanded; indentation inside them is theirs.
+        let shown = "  const message = 'long words stay hard wrapped';    // café 👩‍💻\n\n    console.log(message);  \n";
+        for (tool, args, expected) in [
             (
                 "script",
                 serde_json::json!({"source": source, "description": "prose next to source"}),
+                format!("script\nArguments\nsource\n{shown}\ndescription  prose next to source"),
             ),
             (
                 "exec",
                 serde_json::json!({"command": "  printf '%s  %s'  first second\t\n\n"}),
+                "exec\nArguments\ncommand\n  printf '%s  %s'  first second    \n\n".to_owned(),
             ),
             (
                 "exec",
                 serde_json::json!({"command": ["sh", "-c", "  echo long shell words  \n"], "nested": {"source": source}}),
+                format!(
+                    "exec\nArguments\ncommand\n1.  sh\n2.  -c\n3.\n  echo long shell words  \n\nnested\nsource\n{shown}"
+                ),
             ),
             (
                 "write",
                 serde_json::json!({"path": "file.js", "content": source}),
+                format!("write\nArguments\npath     file.js\ncontent\n{shown}"),
             ),
             (
                 "replace",
                 serde_json::json!({"path": "file.js", "old": source, "new": "  replacement text  \n"}),
+                format!(
+                    "replace\nArguments\npath  file.js\nold (removed)\n{shown}\nnew (added)\n  replacement text  \n"
+                ),
             ),
         ] {
             let document = arguments(tool, &args);
             let original = document.clone();
-            assert_argument_reflow(&document);
+            assert_argument_reflow(&document, &expected);
             assert_eq!(document, original);
         }
     }
@@ -377,10 +579,9 @@ mod tests {
         ];
         let key = model::EntryKey::UnsavedStatus(1);
         let entry = model::Entry::card(key.clone(), header.clone(), None);
-        assert_eq!(
-            entry.text(),
-            header_line(entry.header().unwrap()).to_string()
-        );
+        // The glyph leads the entry's text, but is drawn as decoration.
+        let header_text = header_line(entry.header().unwrap()).to_string();
+        assert_eq!(entry.text(), format!("▸ {header_text}"));
         let expanded = model::Entry::card(key, header, Some(Document::default()));
         // An expanded body only changes where the header wraps, not its styles.
         let styled = |rows: Vec<Row>| {
@@ -406,13 +607,12 @@ mod tests {
                 .map(|span| span.content.as_ref())
                 .collect();
             assert!(name.contains("read"));
-            assert!(
-                spans
-                    .iter()
-                    .any(|span| span.content.contains("▸") && span.style.fg == Some(THEME.primary))
+            let glyph = &rows[0].layout.prefix.spans[0];
+            assert_eq!(
+                (&*glyph.content, glyph.style.fg),
+                ("▸ ", Some(THEME.primary))
             );
-            // Past the disclosure glyph.
-            assert_eq!(styled(rows)[1..], styled(layout(&expanded, width))[1..]);
+            assert_eq!(styled(rows), styled(layout(&expanded, width)));
         }
     }
 
@@ -443,10 +643,9 @@ mod tests {
         let key = model::EntryKey::UnsavedStatus(1);
         let entry = model::Entry::titled(key, title, String::new(), Surface::Reasoning);
         let rows = layout(&entry, 60);
-        assert_eq!(
-            rows[0].text().trim_end(),
-            "▸ Inspecting scripts · incomplete"
-        );
+        // The disclosure glyph is painted before the title, not selected with it.
+        assert_eq!(rows[0].layout.prefix.to_string(), "▸ ");
+        assert_eq!(rows[0].text().trim_end(), "Inspecting scripts · incomplete");
         let spans = &rows[0].line.spans;
         let fg = |text: &str| {
             spans

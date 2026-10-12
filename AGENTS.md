@@ -23,6 +23,7 @@ Architecture: `docs/src/development/architecture.md`.
   in an algorithm or logic.
 - Avoid adding special cases, if there is a better structural solution prefer to use that instead.
 - Avoid single huge files, if a file is getting big consider if it should be split up into multiple modules.
+- The best patches remove more code than they add.
 
 ## Types
 

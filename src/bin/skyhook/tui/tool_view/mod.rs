@@ -91,9 +91,10 @@ pub fn header_line(runs: &[Run]) -> Line<'static> {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Section {
-    Line(Vec<Run>),
+    /// Hard-wrapped runs. `indent` is presentation, never part of the text.
+    Line { indent: usize, runs: Vec<Run> },
     /// Prose arguments retain their literal text, but wrap at word boundaries.
-    Prose(Vec<Run>),
+    Prose { indent: usize, runs: Vec<Run> },
     Code {
         source: CodeSource,
         language: String,
@@ -110,97 +111,178 @@ pub enum Wrap {
     Words,
 }
 
+/// A styled logical line and its presentation-only layout.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DocumentLine {
+    /// Decoration painted before the text, such as a code block's indent and
+    /// change marker: shown, but never selected or copied with the text.
+    pub lead: Line<'static>,
+    pub text: Line<'static>,
+    pub wrap: Wrap,
+}
+impl DocumentLine {
+    pub fn new(text: Line<'static>, wrap: Wrap) -> Self {
+        Self {
+            lead: Line::default(),
+            text,
+            wrap,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Document {
     pub sections: Vec<Section>,
 }
+/// The text of a logical line, before styling.
+enum Piece<'a> {
+    Runs {
+        runs: &'a [Run],
+        wrap: Wrap,
+    },
+    /// Line `index` of a code section's `source`.
+    Code {
+        text: &'a str,
+        index: usize,
+        source: &'a CodeSource,
+        language: &'a str,
+        role: Role,
+    },
+}
+
+/// A logical line: its lead, as `indent` cells and any marker, then its text.
+/// Display styles these and plain text reads them as they are, so the two
+/// always show the same lines with the same leads.
+struct Logical<'a> {
+    indent: usize,
+    marker: Option<&'a str>,
+    piece: Piece<'a>,
+}
+
 impl Document {
+    /// Every logical line, in order.
+    fn logical_lines(&self) -> impl Iterator<Item = Logical<'_>> {
+        self.sections
+            .iter()
+            .flat_map(|section| -> Box<dyn Iterator<Item = Logical<'_>> + '_> {
+                let line = |indent: &usize, runs, wrap| {
+                    Box::new(std::iter::once(Logical {
+                        indent: *indent,
+                        marker: None,
+                        piece: Piece::Runs { runs, wrap },
+                    }))
+                };
+                match section {
+                    Section::Line { indent, runs } => line(indent, runs, Wrap::Hard),
+                    Section::Prose { indent, runs } => line(indent, runs, Wrap::Words),
+                    Section::Code {
+                        source,
+                        language,
+                        indent,
+                        gutters,
+                        role,
+                    } => {
+                        // Split without trimming: empty lines and trailing whitespace are
+                        // significant.
+                        Box::new(
+                            source
+                                .split('\n')
+                                .enumerate()
+                                .map(move |(index, text)| Logical {
+                                    indent: *indent,
+                                    marker: gutters.as_deref(),
+                                    piece: Piece::Code {
+                                        text,
+                                        index,
+                                        source,
+                                        language,
+                                        role: *role,
+                                    },
+                                }),
+                        )
+                    }
+                }
+            })
+    }
+
+    /// The document as displayed, leads included: a whole entry's plain text.
+    /// Selection copies the same lines without their leads.
     pub fn plain_text(&self) -> String {
         let mut text = String::new();
-        let mut first = true;
-        for section in &self.sections {
-            match section {
-                Section::Line(runs) | Section::Prose(runs) => {
-                    if !first {
-                        text.push('\n');
-                    }
-                    first = false;
-                    for run in runs {
-                        text.push_str(&run.text);
-                    }
-                }
-                Section::Code {
-                    source,
-                    indent,
-                    gutters,
-                    ..
-                } => {
-                    for line in source.split('\n') {
-                        if !first {
-                            text.push('\n');
-                        }
-                        first = false;
-                        text.extend(std::iter::repeat_n(' ', *indent));
-                        if let Some(gutter) = gutters.as_deref() {
-                            text.push_str(gutter);
-                        }
-                        text.push_str(line);
-                    }
-                }
+        for (index, line) in self.logical_lines().enumerate() {
+            if index > 0 {
+                text.push('\n');
+            }
+            text.extend(std::iter::repeat_n(' ', line.indent));
+            text.push_str(line.marker.unwrap_or_default());
+            match line.piece {
+                Piece::Runs { runs, .. } => text.extend(runs.iter().map(Run::text)),
+                Piece::Code { text: code, .. } => text.push_str(code),
             }
         }
         text
     }
+    /// Each logical line as painted, its lead included.
     pub fn lines(&self, cache: Option<&HighlightCache>) -> Vec<Line<'static>> {
         self.layout_lines(cache)
             .into_iter()
-            .map(|(line, _)| line)
+            .map(|DocumentLine { mut lead, text, .. }| {
+                lead.spans.extend(text.spans);
+                lead
+            })
             .collect()
     }
-    /// Styled logical lines and their presentation-only reflow policy.
-    pub fn layout_lines(&self, cache: Option<&HighlightCache>) -> Vec<(Line<'static>, Wrap)> {
-        let mut lines = Vec::new();
-        for section in &self.sections {
-            match section {
-                Section::Line(runs) => lines.push((header_line(runs), Wrap::Hard)),
-                Section::Prose(runs) => lines.push((header_line(runs), Wrap::Words)),
-                Section::Code {
-                    source,
-                    language,
-                    indent,
-                    gutters,
-                    role,
-                } => {
-                    let key = CodeKey::admit(source, language);
-                    let highlighted = key
-                        .as_ref()
-                        .and_then(|key| cache.and_then(|cache| cache.ready(key)))
+    pub fn layout_lines(&self, cache: Option<&HighlightCache>) -> Vec<DocumentLine> {
+        // A code section's highlighting, looked up once for all its lines.
+        let mut highlighted: Option<(&CodeSource, Option<&[Line<'static>]>)> = None;
+        let lines = self.logical_lines().map(|line| match line.piece {
+            Piece::Runs { runs, wrap } => DocumentLine {
+                lead: lead(line.indent, None),
+                text: header_line(runs),
+                wrap,
+            },
+            Piece::Code {
+                text,
+                index,
+                source,
+                language,
+                role,
+            } => {
+                if !highlighted.is_some_and(|(section, _)| std::ptr::eq(section, source)) {
+                    let lines = cache
+                        .zip(CodeKey::admit(source, language))
+                        .and_then(|(cache, key)| cache.ready(&key))
                         .and_then(Option::as_deref);
-                    // Split without trimming: empty lines and trailing whitespace are significant.
-                    for (index, text) in source.split('\n').enumerate() {
-                        let mut spans = vec![Span::raw(" ".repeat(*indent))];
-                        if let Some(gutter) = gutters.as_deref() {
-                            spans.push(Span::styled(
-                                gutter.to_owned(),
-                                if matches!(role, Role::Added | Role::Removed) {
-                                    role.style()
-                                } else {
-                                    Role::Muted.style()
-                                },
-                            ));
-                        }
-                        if let Some(line) = highlighted.and_then(|lines| lines.get(index)) {
-                            spans.extend(line.spans.iter().cloned());
-                        } else {
-                            spans.push(Span::styled(text.to_owned(), role.style()));
-                        }
-                        lines.push((Line::from(spans), Wrap::Hard));
-                    }
+                    highlighted = Some((source, lines));
+                }
+                let gutter_style = if matches!(role, Role::Added | Role::Removed) {
+                    role.style()
+                } else {
+                    Role::Muted.style()
+                };
+                let marker = line
+                    .marker
+                    .map(|marker| Span::styled(marker.to_owned(), gutter_style));
+                let styled = highlighted.and_then(|(_, lines)| lines?.get(index));
+                let text = match styled {
+                    Some(styled) => Line::from(styled.spans.clone()),
+                    None => Line::from(Span::styled(text.to_owned(), role.style())),
+                };
+                DocumentLine {
+                    lead: lead(line.indent, marker),
+                    text,
+                    wrap: Wrap::Hard,
                 }
             }
-        }
-        lines
+        });
+        lines.collect()
     }
+}
+
+/// A section's presentation before its text: `indent` cells, then any marker.
+fn lead(indent: usize, marker: Option<Span<'static>>) -> Line<'static> {
+    let indent = (indent > 0).then(|| Span::raw(" ".repeat(indent)));
+    Line::from(indent.into_iter().chain(marker).collect::<Vec<_>>())
 }
 
 #[cfg(test)]
@@ -226,11 +308,17 @@ pub(crate) mod tests {
         let mut document = Document::default();
         assert_eq!(document.plain_text(), "");
         document.line("\nheading\t\u{1b}\r", Role::Heading);
-        document.sections.push(Section::Line(vec![]));
-        document.sections.push(Section::Line(vec![
-            Run::new("a\tb", Role::String),
-            Run::new("\u{7}界", Role::Number),
-        ]));
+        document.sections.push(Section::Line {
+            indent: 0,
+            runs: vec![],
+        });
+        document.sections.push(Section::Line {
+            indent: 2,
+            runs: vec![
+                Run::new("a\tb", Role::String),
+                Run::new("\u{7}界", Role::Number),
+            ],
+        });
         document.code(
             "a  \n\t界\r\n",
             "js",

@@ -368,7 +368,12 @@ mod tests {
             );
             let header = entry.header().unwrap();
             let arrow = if open { "▾" } else { "▸" };
-            assert_eq!(header_text(header), format!("{arrow} agent @{target}"));
+            assert_eq!(header_text(header), format!("agent @{target}"));
+            assert!(
+                entry
+                    .text()
+                    .starts_with(&format!("{arrow} agent @{target}"))
+            );
             let suffix = Run::new(format!(" @{target}"), Role::Target);
             assert_eq!(header.last(), Some(&suffix));
             assert_eq!(entry.document().is_some(), open);

@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::provider::{
     codec::{
-        BodyPath, CacheTtl, Effort, Identity, OPENAI_EFFORT, SchemaConstraint, StateRole,
-        ToolNames, path,
+        BodyPath, CacheTtl, Effort, Identity, Locations, NonEmpty, OPENAI_EFFORT, SchemaConstraint,
+        StateRole, ToolNames, path,
     },
     protocol::ReplayFormat,
 };
@@ -21,31 +21,31 @@ pub(crate) enum SystemRole {
 /// portable field, so the spelling is the server's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ReasoningReplay {
-    /// Reasoning stays local; the server rejects unknown message keys.
+    /// Reasoning stays local.
     Unsupported,
     /// The reasoning text under this key of the assistant message.
-    Text(BodyPath),
+    Text(NonEmpty<BodyPath>),
     /// The service's signed thinking blocks, kept whole and replayed under this
     /// key of the assistant message. Like Messages thinking, they are bound to
     /// the exact conversation before them.
-    ThinkingBlocks(BodyPath),
+    ThinkingBlocks(NonEmpty<BodyPath>),
     /// A router's `reasoning_details` objects (text, encrypted, or summary),
     /// kept whole and replayed verbatim in order under this key of the
     /// assistant message; bound to the conversation.
-    Details(BodyPath),
+    Details(NonEmpty<BodyPath>),
 }
 
 impl ReasoningReplay {
     /// Where the assistant message carries the replay.
-    pub(crate) fn path(&self) -> Option<&BodyPath> {
+    pub(crate) fn paths(&self) -> Option<&NonEmpty<BodyPath>> {
         match self {
             Self::Unsupported => None,
             Self::Text(path) | Self::ThinkingBlocks(path) | Self::Details(path) => Some(path),
         }
     }
 
-    /// The same shape under another key; text where nothing was replayed.
-    pub(crate) fn at(&self, path: BodyPath) -> Self {
+    /// The same shape under other keys; text where nothing was replayed.
+    pub(crate) fn at(&self, path: NonEmpty<BodyPath>) -> Self {
         match self {
             Self::Unsupported | Self::Text(_) => Self::Text(path),
             Self::ThinkingBlocks(_) => Self::ThinkingBlocks(path),
@@ -153,15 +153,15 @@ pub enum DataCollection {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dialect {
     pub system: SystemRole,
-    /// Where `max_output` goes; None when the endpoint manages the limit.
-    pub output_limit: Option<BodyPath>,
+    /// Where `max_output` goes; none when the endpoint manages the limit.
+    pub output_limit: Locations<BodyPath>,
     pub effort: Effort,
     pub reasoning_replay: ReasoningReplay,
     pub empty_content: EmptyContent,
     pub usage_request: UsageRequest,
     pub tool_names: ToolNames,
     /// A flag some servers need before streaming tool arguments.
-    pub tool_stream: Option<BodyPath>,
+    pub tool_stream: Locations<BodyPath>,
     pub schema: SchemaConstraint,
     pub identity: Identity,
     pub cache: Cache,
@@ -176,18 +176,20 @@ impl Dialect {
     pub(crate) fn compatible() -> Self {
         Self {
             system: SystemRole::System,
-            output_limit: Some(const { path("max_completion_tokens") }),
+            output_limit: Locations::one(const { path("max_completion_tokens") }),
             effort: Effort {
-                path: const { path("reasoning_effort") },
+                path: NonEmpty::one(const { path("reasoning_effort") }),
                 levels: OPENAI_EFFORT,
             },
-            reasoning_replay: ReasoningReplay::Text(const { path("reasoning_content") }),
+            reasoning_replay: ReasoningReplay::Text(NonEmpty::one(
+                const { path("reasoning_content") },
+            )),
             empty_content: EmptyContent::EmptyString,
             usage_request: UsageRequest::StreamOptions,
             tool_names: ToolNames::Any,
-            tool_stream: None,
+            tool_stream: Locations::NONE,
             schema: SchemaConstraint::Grammar,
-            identity: Identity::OMITTED,
+            identity: Identity::NONE,
             cache: Cache::Unsupported,
             routing: None,
             state_role: StateRole::User,

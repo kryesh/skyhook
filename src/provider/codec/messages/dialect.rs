@@ -2,7 +2,9 @@
 use reqwest::header::{HeaderName, HeaderValue};
 
 use crate::provider::{
-    codec::{BodyPath, CacheTtl, Effort, EffortLevels, Identity, StateRole, ToolNames, path},
+    codec::{
+        BodyPath, CacheTtl, Effort, EffortLevels, Identity, NonEmpty, StateRole, ToolNames, path,
+    },
     http::{Headers, headers::Value},
 };
 
@@ -40,7 +42,7 @@ pub(crate) const BETA_HEADER: HeaderName = HeaderName::from_static("anthropic-be
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dialect {
     /// Where `max_output` goes; the API requires it.
-    pub output_limit: BodyPath,
+    pub output_limit: NonEmpty<BodyPath>,
     pub effort: Effort,
     pub tool_names: ToolNames,
     pub identity: Identity,
@@ -54,13 +56,13 @@ pub(crate) struct Dialect {
 impl Dialect {
     pub(crate) fn standard() -> Self {
         Self {
-            output_limit: const { path("max_tokens") },
+            output_limit: NonEmpty::one(const { path("max_tokens") }),
             effort: Effort {
-                path: const { path("output_config.effort") },
+                path: NonEmpty::one(const { path("output_config.effort") }),
                 levels: MESSAGES_EFFORT,
             },
             tool_names: ToolNames::Anthropic,
-            identity: Identity::OMITTED,
+            identity: Identity::NONE,
             cache_ttl: None,
             thinking_binding: ThinkingBinding::Unenforced,
             state_role: StateRole::User,

@@ -600,6 +600,8 @@ pub(super) struct JobHandles {
     pub(super) task_abort: Option<(Invocation, AbortHandle)>,
     /// What restarts it once it ends, while the core records that it can.
     pub(super) resume: Option<Resume>,
+    /// The process it runs, while that process runs.
+    pub(super) process: Option<u32>,
 }
 
 impl JobHandles {
@@ -610,6 +612,7 @@ impl JobHandles {
             cancellation,
             task_abort: None,
             resume: None,
+            process: None,
         };
         (handles, receiver)
     }

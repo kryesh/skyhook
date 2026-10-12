@@ -2,43 +2,36 @@
 //! authoritative replacements: every update renders its complete source, with a
 //! stateless plain-prose fast path and a conservative Markdown fallback.
 
-use super::markdown::{self, Layout, LayoutLine};
+use super::markdown::{self, Layout, LayoutLine, LineIds};
 use super::wrap_words;
-use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthStr;
+use ratatui::text::Line;
 
 pub(super) fn layout_highlighted(
     text: &str,
     width: usize,
-    prefix: &str,
     highlights: Option<&super::super::tool_view::HighlightCache>,
 ) -> Layout {
     let width = width.max(1);
-    if let Some(lines) = plain_layout(text, width, prefix) {
+    if let Some(lines) = plain_layout(text, width) {
         return Layout {
             lines,
             ..Layout::default()
         };
     }
-    markdown::layout_highlighted(
-        text,
-        true,
-        width,
-        width.saturating_sub(prefix.width()),
-        prefix,
-        highlights,
-    )
+    markdown::layout_highlighted(text, true, width, highlights)
 }
 
 /// Render a complete plain source once, or decline so Markdown handles it.
-fn plain_layout(text: &str, width: usize, prefix: &str) -> Option<Vec<LayoutLine>> {
-    // Conservative narrow-prefix admission, including multibyte prefixes.
-    if !prefix.is_empty() && width < prefix.len() {
-        return None;
-    }
+fn plain_layout(text: &str, width: usize) -> Option<Vec<LayoutLine>> {
+    // Lines are identified by their source offsets, as Markdown identifies
+    // them, so a stream switching layouts keeps its selection.
+    let mut ids = LineIds::default();
     let mut output = Vec::new();
     let mut pending_blank = false;
+    let mut origin = 0;
     for body in text.split('\n') {
+        let line_origin = origin;
+        origin += body.len() + 1;
         if body
             .char_indices()
             .any(|(offset, ch)| !safe_char(ch, offset == 0))
@@ -51,23 +44,15 @@ fn plain_layout(text: &str, width: usize, prefix: &str) -> Option<Vec<LayoutLine
             continue;
         }
         if pending_blank {
-            output.push((Line::default(), false).into());
+            let blank = vec![Line::default()];
+            output.extend(LayoutLine::wrapped(blank, ids.next(line_origin)));
             pending_blank = false;
         }
-        let mut spans = Vec::new();
-        if output.is_empty() && !prefix.is_empty() {
-            spans.push(Span::raw(prefix.to_owned()));
-        }
-        spans.push(Span::raw(visible.to_owned()));
-        output.extend(
-            wrap_words(Line::from(spans), width)
-                .into_iter()
-                .enumerate()
-                .map(|(part, line)| (line, part > 0).into()),
-        );
+        let rows = wrap_words(Line::from(visible.to_owned()), width);
+        output.extend(LayoutLine::wrapped(rows, ids.next(line_origin)));
     }
     if output.is_empty() {
-        output.push((Line::from(prefix.to_owned()), false).into());
+        output.extend(LayoutLine::wrapped(vec![Line::default()], ids.next(0)));
     }
     Some(output)
 }
@@ -94,11 +79,13 @@ fn safe_char(ch: char, line_start: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use super::super::tests::continued;
     use super::*;
     use ratatui::style::Style;
+    use unicode_width::UnicodeWidthStr;
 
-    fn render(text: &str, width: usize, prefix: &str) -> Vec<LayoutLine> {
-        layout_highlighted(text, width, prefix, None).lines
+    fn render(text: &str, width: usize) -> Vec<LayoutLine> {
+        layout_highlighted(text, width, None).lines
     }
 
     #[test]
@@ -110,13 +97,13 @@ mod tests {
             let mut rows = Vec::new();
             for ch in input.chars() {
                 text.push(ch);
-                rows = render(&text, width, "");
+                rows = render(&text, width);
             }
             assert_eq!(rows.iter().filter(|row| row.layout.decorative()).count(), 2);
             let mut copied = String::new();
             let mut first = true;
             for row in rows.iter().filter(|row| !row.layout.decorative()) {
-                if !first && !row.layout.continued() {
+                if !first && !continued(&row.layout) {
                     copied.push('\n');
                 }
                 copied.push_str(&row.line.to_string());
@@ -151,55 +138,50 @@ mod tests {
             format!("```\n```\n\n{NARROW_TABLE}"),
         ];
         for source in sources {
-            for prefix in ["", "  ", "↳ ", "界 "] {
-                for width in [18, 23, 28] {
-                    let rows = render(&source, width, prefix);
-                    assert!(rows.len() > 4, "cells should wrap inside the table");
-                    let start = rows
-                        .iter()
-                        .position(|row| row.line.to_string().contains('┌'));
-                    let table_rows = &rows[start.unwrap()..];
-                    let separator = table_rows
-                        .iter()
-                        .find(|row| row.line.to_string().contains('├'));
-                    // Measure actual screen columns, including quote containers;
-                    // stripping the spinner would hide first-row misalignment.
-                    let columns = border_columns(&separator.unwrap().line.to_string());
-                    let mut separators = 0;
-                    for row in table_rows {
-                        let text = row.line.to_string();
-                        assert!(row.line.width() <= width, "{text:?}, width {width}");
-                        let continued = row.layout.continued();
-                        assert!(!continued, "downstream wrapper split a table row: {text:?}");
-                        let actual = border_columns(&text);
-                        assert_eq!(actual, columns, "misaligned physical borders: {text:?}");
-                        let (end, joint) = if text.contains('├') {
-                            separators += 1;
-                            ('┤', Some('┼'))
-                        } else if text.contains('┌') {
-                            ('┐', Some('┬'))
-                        } else if text.contains('└') {
-                            ('┘', Some('┴'))
-                        } else {
-                            assert!(text.starts_with('│'), "{text:?}");
-                            ('│', None)
-                        };
-                        assert!(text.ends_with(end), "{text:?}");
-                        assert!(joint.is_none_or(|joint| text.matches(joint).count() == 1));
-                    }
-                    assert_eq!(separators, 2);
+            for width in [18, 23, 28] {
+                let rows = render(&source, width);
+                assert!(rows.len() > 4, "cells should wrap inside the table");
+                let start = rows
+                    .iter()
+                    .position(|row| row.line.to_string().contains('┌'));
+                let table_rows = &rows[start.unwrap()..];
+                let separator = table_rows
+                    .iter()
+                    .find(|row| row.line.to_string().contains('├'));
+                // Measure actual screen columns, including quote containers.
+                let columns = border_columns(&separator.unwrap().line.to_string());
+                let mut separators = 0;
+                for row in table_rows {
+                    let text = row.line.to_string();
+                    assert!(row.line.width() <= width, "{text:?}, width {width}");
+                    let continued = continued(&row.layout);
+                    assert!(!continued, "downstream wrapper split a table row: {text:?}");
+                    let actual = border_columns(&text);
+                    assert_eq!(actual, columns, "misaligned physical borders: {text:?}");
+                    let (end, joint) = if text.contains('├') {
+                        separators += 1;
+                        ('┤', Some('┼'))
+                    } else if text.contains('┌') {
+                        ('┐', Some('┬'))
+                    } else if text.contains('└') {
+                        ('┘', Some('┴'))
+                    } else {
+                        assert!(text.starts_with('│'), "{text:?}");
+                        ('│', None)
+                    };
+                    assert!(text.ends_with(end), "{text:?}");
+                    assert!(joint.is_none_or(|joint| text.matches(joint).count() == 1));
                 }
+                assert_eq!(separators, 2);
             }
         }
         // Replacement rendering follows resizes of a growing table.
-        for prefix in ["", "  ", "界 "] {
-            let mut source = format!("{NARROW_TABLE}\n\nplain tail");
-            let wide_rows = render(&source, 60, prefix).len();
-            for width in [17, 8, 3, 35, 60] {
-                let rows = render(&source, width, prefix);
-                assert!(width != 17 || rows.len() > wide_rows);
-                source.push_str(" more");
-            }
+        let mut source = format!("{NARROW_TABLE}\n\nplain tail");
+        let wide_rows = render(&source, 60).len();
+        for width in [17, 8, 3, 35, 60] {
+            let rows = render(&source, width);
+            assert!(width != 17 || rows.len() > wide_rows);
+            source.push_str(" more");
         }
     }
 
@@ -254,10 +236,9 @@ mod tests {
             for end in ends.chain([source.len()]) {
                 let text = &source[..end];
                 for width in [1, 3, 13, 80] {
-                    let reference =
-                        markdown::layout_highlighted(text, true, width, width, "", None).lines;
+                    let reference = markdown::layout_highlighted(text, true, width, None).lines;
                     assert_eq!(
-                        canonical(render(text, width, "")),
+                        canonical(render(text, width)),
                         canonical(reference),
                         "{text:?} at width {width}"
                     );

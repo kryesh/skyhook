@@ -18,6 +18,7 @@ impl SessionRuntime {
         let remote = RemoteManager::new(
             harness.shim_catalog.clone(),
             harness.sensitive_prompts.clone(),
+            Some(jobs.clone()),
             store.root().child_token(),
         );
         let router = crate::target::TargetRouter::new(store.clone(), remote, authorization.clone());
@@ -463,7 +464,9 @@ mod tests {
         assert_eq!(viewed.activity[&session.root].state, interrupted);
         assert_eq!(viewed.jobs[&exec].state, JobState::Interrupted);
         // Remote startups stop with the rest of the session's work.
-        let remote = session.runtime.router.environment().await;
+        let remote = (session.runtime.router)
+            .environment(crate::remote::backend::ProcessAuthentication::PromptsAndAgent)
+            .await;
         assert!(matches!(remote, Err(crate::remote::RemoteError::Cancelled)));
         assert!(failed(
             bounded(session.shutdown()).await.map(|()| String::new())

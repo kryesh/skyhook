@@ -24,24 +24,29 @@ impl Decoder {
         let response = event
             .get("response")
             .ok_or_else(|| NATIVE.error("missing final response"))?;
-        let finish = match NATIVE.string(response, "status")? {
-            // An incomplete response names why, and never a normal finish.
-            "incomplete" => Finish::of(
-                response
-                    .pointer("/incomplete_details/reason")
+        let reason = response
+            .pointer("/incomplete_details/reason")
+            .filter(|reason| !reason.is_null());
+        // An incomplete response names why, and never a normal finish.
+        let cut = || {
+            Finish::of(
+                reason
                     .and_then(Value::as_str)
                     .and_then(StopReason::read)
                     .filter(|reason| *reason != StopReason::Normal),
-            ),
-            "completed" if kind == Event::Completed => Finish::Normal,
+            )
+        };
+        let finish = match NATIVE.string(response, "status")? {
+            "incomplete" => cut(),
+            "completed" if kind == Event::Completed && reason.is_none() => Finish::Normal,
+            // A completed response that still says why it stopped short was cut.
+            "completed" if kind == Event::Completed => cut(),
             _ => return Err(NATIVE.error("terminal response status disagrees with event")),
         };
-        let output = if self.terminal_output == TerminalOutput::StreamedOnly
-            && response.get("output").is_none()
-        {
-            &[][..]
-        } else {
-            array(response, "output")?.as_slice()
+        // Some services leave out the items they streamed; those stand on their own.
+        let output = match response.get("output") {
+            None => &[][..],
+            Some(_) => array(response, "output")?.as_slice(),
         };
         // The one report is final; the prompt total includes its cached part.
         let usage = response
@@ -67,8 +72,7 @@ impl Decoder {
             return finish.complete(Vec::new()).map(drop);
         }
         let truncated = finish != Finish::Normal;
-        let omitted = self.terminal_output == TerminalOutput::StreamedOnly
-            && output.is_empty()
+        let omitted = output.is_empty()
             && self.items.values().all(|item| {
                 item.snapshot().is_some() || (truncated && item.kind() == ItemKind::ToolCall)
             });
@@ -105,6 +109,10 @@ impl Decoder {
             }
             self.end(id, native, true)?;
         }
+        // Tolerating omitted fields never overrides an item's own word that it stopped short.
+        if !truncated && !self.unfinished.is_empty() {
+            return Err(NATIVE.error("normal response holds an unfinished output item"));
+        }
         if !omitted
             && self.items.iter().any(|(id, item)| {
                 !seen.contains(id) && !(truncated && item.kind() == ItemKind::ToolCall)
@@ -135,19 +143,17 @@ mod tests {
     use super::super::tests::*;
     use super::*;
 
-    const TERMINALS: [TerminalOutput; 2] = [TerminalOutput::Restated, TerminalOutput::StreamedOnly];
-
     #[test]
     fn abnormal_terminal_discards_tools_but_preserves_reasoning_and_usage() {
         for tag in ["response.incomplete", "response.completed"] {
-            for terminal in TERMINALS {
+            for restated in [true, false] {
                 for output_done in [false, true] {
                     for (detail, reason) in [
                         ("max_output_tokens", CutReason::MaxTokens),
                         ("content_filter", CutReason::Refusal),
                     ] {
                         for args in ["{\"query\":", "{\"query\":\"rust\"}"] {
-                            let decoder = decoder_for(terminal);
+                            let decoder = decoder();
                             let native = reasoning_item();
                             let text = message("text", "partial answer");
                             let mut call = call_item();
@@ -179,10 +185,7 @@ mod tests {
                                 "input_tokens_details":{"cached_tokens":reported}});
                             frames.push(json!({"type":tag, "response":{
                             "status":"incomplete", "incomplete_details":{"reason":detail},
-                            "output":match terminal {
-                                TerminalOutput::Restated => vec![native.clone(), call, text],
-                                TerminalOutput::StreamedOnly => vec![],
-                            },
+                            "output":if restated { vec![native.clone(), call, text] } else { vec![] },
                             "usage":usage}}));
                             let reduced = assemble_with(decoder, frames).unwrap();
                             assert_eq!(reduced.completion.outcome(), Outcome::Cut(reason));
@@ -205,38 +208,116 @@ mod tests {
         }
     }
 
+    /// A terminal output may leave out streamed items only once every one has finished.
     #[test]
-    fn context_overflow_wins_over_open_items() {
-        for terminal in TERMINALS {
-            let text = json!({"type":"message", "id":"msg", "role":"assistant", "content":[]});
+    fn an_empty_terminal_output_needs_every_streamed_item_finished() {
+        let text = message("msg", "hello");
+        let finished = vec![added(0, text.clone()), done(0, text), completed(vec![])];
+        assert!(assemble_with(decoder(), finished).is_ok());
+        let open = json!({"type":"message", "id":"msg", "role":"assistant", "content":[]});
+        let frames = vec![added(0, open), delta("msg", "hel"), completed(vec![])];
+        let error = assemble_with(decoder(), frames).err().unwrap();
+        assert!(error.message.contains("omitted a streamed output item"));
+    }
+
+    /// An item's own word that it stopped short contradicts a normal finish, so it
+    /// never runs; a cut keeps such text and drops such a call, as for any cut.
+    #[test]
+    fn an_unfinished_item_fails_a_normal_finish_and_survives_a_cut() {
+        for status in ["incomplete", "in_progress"] {
+            for item in [call_item(), message("msg", "partial")] {
+                let text = item["type"] == "message";
+                let mut unfinished = item.clone();
+                unfinished["status"] = json!(status);
+                for restated in [true, false] {
+                    let output = if restated {
+                        vec![unfinished.clone()]
+                    } else {
+                        vec![]
+                    };
+                    let frames = |terminal| {
+                        vec![
+                            added(0, item.clone()),
+                            done(0, unfinished.clone()),
+                            terminal,
+                        ]
+                    };
+                    let error = assemble(frames(completed(output.clone()))).err().unwrap();
+                    assert!(error.message.contains("unfinished output item"), "{status}");
+                    let cut = json!({"type":"response.incomplete", "response":{"status":"incomplete",
+                        "incomplete_details":{"reason":"max_output_tokens"}, "output":output}});
+                    let reduced = assemble(frames(cut)).unwrap();
+                    assert_eq!(
+                        reduced.completion.outcome(),
+                        Outcome::Cut(CutReason::MaxTokens)
+                    );
+                    let items = reduced.items();
+                    assert!(items.iter().all(|item| item.call().is_none()));
+                    assert_eq!(items.len(), usize::from(text), "{status}");
+                }
+            }
+        }
+        let mut unknown = call_item();
+        unknown["status"] = json!("paused");
+        assert!(assemble(vec![added(0, unknown)]).is_err());
+    }
+
+    /// A completed status that still says why the response stopped is a cut; a null
+    /// reason says nothing.
+    #[test]
+    fn a_completed_status_with_a_reason_to_stop_is_a_cut() {
+        for (details, outcome, calls) in [
+            (
+                json!({"reason":"max_output_tokens"}),
+                Outcome::Cut(CutReason::MaxTokens),
+                0,
+            ),
+            (json!({"reason":null}), Outcome::ToolUse, 1),
+            (Value::Null, Outcome::ToolUse, 1),
+        ] {
             let frames = vec![
-                added(0, text),
-                delta("msg", "partial"),
-                json!({"type":"response.incomplete", "response":{"status":"incomplete",
-                "incomplete_details":{"reason":"model_context_window_exceeded"}, "output":[]}}),
+                added(0, call_item()),
+                done(0, call_item()),
+                json!({"type":"response.completed", "response":{"status":"completed",
+                "incomplete_details":details, "output":[call_item()]}}),
             ];
-            let error = assemble_with(decoder_for(terminal), frames).err().unwrap();
+            let reduced = assemble(frames).unwrap();
+            assert_eq!(reduced.completion.outcome(), outcome);
+            let items = reduced.items();
             assert_eq!(
-                error.kind(),
-                crate::provider::ProviderErrorKind::ContextWindowExceeded
+                items.iter().filter(|item| item.call().is_some()).count(),
+                calls
             );
         }
     }
 
     #[test]
+    fn context_overflow_wins_over_open_items() {
+        let text = json!({"type":"message", "id":"msg", "role":"assistant", "content":[]});
+        let frames = vec![
+            added(0, text),
+            delta("msg", "partial"),
+            json!({"type":"response.incomplete", "response":{"status":"incomplete",
+            "incomplete_details":{"reason":"model_context_window_exceeded"}, "output":[]}}),
+        ];
+        let error = assemble_with(decoder(), frames).err().unwrap();
+        assert_eq!(
+            error.kind(),
+            crate::provider::ProviderErrorKind::ContextWindowExceeded
+        );
+    }
+
+    #[test]
     fn deferred_malformed_tools_still_fail_on_normal_terminal() {
-        for terminal in TERMINALS {
-            let mut decoder = decoder_for(terminal);
+        for restated in [true, false] {
+            let mut decoder = decoder();
             let mut call = call_item();
             call["arguments"] = json!("{\"query\":");
             decoder.feed(added(0, call.clone())).unwrap();
             assert!(decoder.feed(done(0, call.clone())).unwrap().is_empty());
             assert!(
                 decoder
-                    .feed(completed(match terminal {
-                        TerminalOutput::Restated => vec![call],
-                        TerminalOutput::StreamedOnly => vec![],
-                    }))
+                    .feed(completed(if restated { vec![call] } else { vec![] }))
                     .is_err()
             );
         }

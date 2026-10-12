@@ -7,6 +7,7 @@ mod markdown;
 mod menu;
 mod painting;
 mod panels;
+mod row;
 mod rows;
 mod selection;
 mod sidebar;
@@ -17,8 +18,9 @@ pub use cache::RenderState;
 pub use frame::draw;
 pub(super) use markdown::{Section, sections};
 pub(super) use panels::scroll_to;
+pub use row::Row;
 pub use rows::RowBlocks;
-pub use selection::{Row, TextPosition, selected_text};
+pub use selection::{Selection, TextPosition};
 
 use cache::*;
 use columns::*;
@@ -26,7 +28,6 @@ use document::*;
 use menu::*;
 use painting::*;
 use panels::*;
-use selection::*;
 use sidebar::*;
 use wrapping::*;
 
@@ -71,7 +72,34 @@ mod tests {
             entry_key: std::sync::Arc::new(model::EntryKey::UnsavedStatus(entry)),
             selectable: true,
             layout,
+            spinner: None,
         }
+    }
+
+    /// The text a selection from `a` to `b` copies.
+    pub(super) fn selected_text(rows: &RowBlocks, (a, b): (TextPosition, TextPosition)) -> String {
+        let selection = Selection::new(rows, a).map(|mut selection| {
+            selection.extend(rows, b);
+            selection
+        });
+        selection.map_or_else(String::new, |selection| selection.text().to_owned())
+    }
+
+    /// Where a row's text starts: the column of its first source cell.
+    pub(super) fn text_x(row: &Row) -> u16 {
+        let (_, prefix_width) = row.layout.source_prefix();
+        let body = row.layout.prefix.width() + prefix_width;
+        let body = row.layout.code().map_or(body, |code| code.body_start());
+        let first = row.text_view().source_cells().next();
+        row.paragraph_x() + first.map_or(body, |(_, column, _)| column) as u16
+    }
+
+    /// Whether a row continues a wrapped logical line.
+    pub(super) fn continued(layout: &markdown::RowLayout) -> bool {
+        matches!(
+            layout.row_source(),
+            Some(markdown::RowSource::Line { start, .. }) if *start > 0
+        )
     }
 
     /// An entry's rows at `width`, as the transcript lays them out.

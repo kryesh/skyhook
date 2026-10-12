@@ -551,6 +551,7 @@ mod tests {
                         message: "SSH authentication".into(),
                         target: None,
                         origin: skyhook::target::TargetRef::Root,
+                        requester: Default::default(),
                     },
                     reply,
                 },

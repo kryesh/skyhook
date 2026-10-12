@@ -1,7 +1,8 @@
 //! Markdown event interpretation, styles, and source container metadata.
 use super::super::super::tool_view::{self, Document, Section};
 use super::super::THEME;
-use super::tables::Table;
+use super::SourceSpan;
+use super::tables::{Table, TableLine};
 use pulldown_cmark::{CodeBlockKind, Event, OffsetIter, Options, Parser, Tag, TagEnd};
 use ratatui::{
     style::{Modifier, Style},
@@ -9,15 +10,20 @@ use ratatui::{
 };
 use std::ops::Range;
 
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub(super) struct LineInfo {
     pub(super) prefix_spans: usize,
     pub(super) continuation: Line<'static>,
     pub(super) code: Option<usize>,
+    /// The source position of the first event since the previous line, or
+    /// that line's own origin: independent of width, unlike line counts.
+    pub(super) origin: usize,
+    /// A table line's cell fragments, which identify its source instead.
+    pub(super) cells: Option<Vec<SourceSpan>>,
 }
 
 /// A rendered logical line travels with the metadata that describes it.
-#[derive(Debug, Default, PartialEq, Eq)]
+#[derive(Default)]
 pub(super) struct ParsedLine {
     pub(super) line: Line<'static>,
     pub(super) info: LineInfo,
@@ -36,8 +42,6 @@ pub(super) struct Parsed {
     pub(super) lines: Vec<ParsedLine>,
     /// Closed, named fences: the sources the highlight cache may color.
     pub(super) fences: Document,
-    /// A table is the first block, possibly inside containers.
-    pub(super) table_first: bool,
 }
 
 /// Every Markdown consumer reads source with the same parser configuration.
@@ -123,10 +127,19 @@ struct Renderer<'a> {
     links: Vec<String>,
     table: Option<Table>,
     fences: Document,
-    table_first: bool,
+    /// The cell fragments of the table line being flushed.
+    cells: Option<Vec<SourceSpan>>,
+    /// The origin of the next line, once an event has arrived for it.
+    origin: Option<usize>,
+    last_origin: usize,
 }
 
 impl Renderer<'_> {
+    fn origin(&mut self) -> usize {
+        self.last_origin = self.origin.take().unwrap_or(self.last_origin);
+        self.last_origin
+    }
+
     fn list(&self) -> Option<&List> {
         self.containers
             .iter()
@@ -190,41 +203,20 @@ impl Renderer<'_> {
 
     fn begin(&mut self) {
         if self.gap && !self.lines.is_empty() {
-            self.lines.push(ParsedLine::default());
+            let origin = self.origin();
+            self.lines.push(ParsedLine {
+                info: LineInfo {
+                    origin,
+                    ..LineInfo::default()
+                },
+                ..ParsedLine::default()
+            });
         }
         self.gap = false;
     }
 
-    fn flush(&mut self, force: bool) {
-        if !force && self.spans.is_empty() {
-            return;
-        }
-        self.begin();
-        let mut spans = Vec::new();
-        for container in &self.containers {
-            match container {
-                Container::Quote => {
-                    spans.push(Span::styled("│ ", Style::default().fg(THEME.muted)))
-                }
-                Container::List(list) => {
-                    let indent = list.indent;
-                    if indent > 0 {
-                        spans.push(Span::raw(" ".repeat(indent)));
-                    }
-                }
-            }
-        }
-        let prefix_spans = spans.len() + self.marker_spans;
-        spans.append(&mut self.spans);
-        self.marker_spans = 0;
-        self.marker_only = false;
-        if let Some(list) = self.list_mut()
-            && list.indent == 0
-        {
-            list.indent = list
-                .next
-                .map_or(2, |next| format!("{}. ", next.saturating_sub(1)).len());
-        }
+    /// The hanging prefix of a line's continuation rows inside the containers.
+    fn continuation(&self) -> Line<'static> {
         let mut continuation = Vec::new();
         for (depth, container) in self.containers.iter().enumerate() {
             match container {
@@ -244,12 +236,60 @@ impl Renderer<'_> {
                 }
             }
         }
+        Line::from(continuation)
+    }
+
+    /// Push the pending spans as a line. `force` pushes one with none: a line
+    /// whose source shows nothing, unlike a blank separator, keeps its row.
+    fn flush(&mut self, force: bool) {
+        let cells = self.cells.take();
+        if !force && self.spans.is_empty() {
+            return;
+        }
+        self.begin();
+        let mut spans = Vec::new();
+        for container in &self.containers {
+            match container {
+                Container::Quote => {
+                    spans.push(Span::styled("│ ", Style::default().fg(THEME.muted)))
+                }
+                Container::List(list) => {
+                    let indent = list.indent;
+                    if indent > 0 {
+                        spans.push(Span::raw(" ".repeat(indent)));
+                    }
+                }
+            }
+        }
+        let prefix_spans = spans.len() + self.marker_spans;
+        let shift: usize = spans.iter().map(|span| span.content.len()).sum();
+        let cells = cells.map(|cells| {
+            let shifted = cells.into_iter().map(|cell| SourceSpan {
+                shown: cell.shown.start + shift..cell.shown.end + shift,
+                ..cell
+            });
+            shifted.collect()
+        });
+        spans.append(&mut self.spans);
+        self.marker_spans = 0;
+        self.marker_only = false;
+        if let Some(list) = self.list_mut()
+            && list.indent == 0
+        {
+            list.indent = list
+                .next
+                .map_or(2, |next| format!("{}. ", next.saturating_sub(1)).len());
+        }
+        let continuation = self.continuation();
+        let origin = self.origin();
         self.lines.push(ParsedLine {
             line: Line::from(spans),
             info: LineInfo {
                 prefix_spans,
-                continuation: Line::from(continuation),
+                continuation,
                 code: self.code.as_ref().map(|code| code.id),
+                origin,
+                cells,
             },
         });
         if let Some(code) = &mut self.code {
@@ -277,6 +317,7 @@ impl Renderer<'_> {
     }
 
     fn event(&mut self, event: Event<'_>, range: Range<usize>) {
+        self.origin.get_or_insert(range.start);
         match event {
             Event::Start(Tag::Strong) => self.bold += 1,
             Event::Start(Tag::Heading { .. }) => {
@@ -481,15 +522,12 @@ impl Renderer<'_> {
                 }
             }
             Event::Start(Tag::Table(alignments)) => {
-                self.table_first |= self.lines.is_empty() && self.spans.is_empty();
                 self.flush(false);
                 self.table = Some(Table::new(alignments));
             }
             Event::End(TagEnd::TableCell) => {
-                self.table
-                    .as_mut()
-                    .unwrap()
-                    .push_cell(Line::from(std::mem::take(&mut self.spans)));
+                let cell = Line::from(std::mem::take(&mut self.spans));
+                self.table.as_mut().unwrap().push_cell(cell, range.start);
             }
             Event::Start(Tag::TableHead) => self.heading += 1,
             Event::End(TagEnd::TableHead) => {
@@ -498,18 +536,19 @@ impl Renderer<'_> {
             }
             Event::End(TagEnd::TableRow) => self.table.as_mut().unwrap().finish_row(),
             Event::End(TagEnd::Table) => {
-                let indent: usize = self
-                    .containers
-                    .iter()
-                    .map(|container| match container {
-                        Container::Quote => 2,
-                        Container::List(list) => list.indent,
-                    })
-                    .sum();
-                let width = self.width.saturating_sub(indent).max(1);
-                for line in self.table.take().unwrap().lines(width) {
+                // The rows hang inside the containers as continuations do,
+                // so layout never wraps them again.
+                let width = self
+                    .width
+                    .saturating_sub(self.continuation().width())
+                    .max(1);
+                for TableLine { line, cells } in self.table.take().unwrap().lines(width) {
+                    // A cell fragment shows source even with no visible text;
+                    // a blank borderless separator shows none.
+                    let source = !cells.is_empty();
                     self.spans = line.spans;
-                    self.flush(false);
+                    self.cells = Some(cells);
+                    self.flush(source);
                 }
                 self.gap = true;
             }
@@ -543,7 +582,9 @@ pub(super) fn parse(
         links: Vec::new(),
         table: None,
         fences: Document::default(),
-        table_first: false,
+        cells: None,
+        origin: None,
+        last_origin: 0,
     };
     for (event, range) in events(text) {
         renderer.event(event, range);
@@ -555,7 +596,6 @@ pub(super) fn parse(
     Parsed {
         lines: renderer.lines,
         fences: renderer.fences,
-        table_first: renderer.table_first,
     }
 }
 

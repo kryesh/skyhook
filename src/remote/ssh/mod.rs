@@ -3,16 +3,19 @@ mod askpass;
 mod authentication;
 mod config;
 mod process;
+mod requester;
 
-pub(crate) use askpass::AskpassServer;
 pub use askpass::askpass_main;
+pub(crate) use askpass::{AskpassServer, apply_environment};
 pub(crate) use authentication::WorkerAuthentication;
 pub(crate) use config::SshOption;
 pub(crate) use process::open;
 
 use crate::remote::{
     artifact::EmbeddedShimCatalog,
-    backend::{ConnectionFactory, ConnectionRequest, ProcessEnvironment, Transport},
+    backend::{
+        ConnectionFactory, ConnectionRequest, ProcessAuthentication, ProcessEnvironment, Transport,
+    },
     error::RemoteError,
     prompt::SensitivePromptHandler,
 };
@@ -30,10 +33,14 @@ pub(crate) struct Backend {
 }
 
 impl Backend {
-    pub fn new(catalog: EmbeddedShimCatalog, prompts: Arc<dyn SensitivePromptHandler>) -> Self {
+    pub fn new(
+        catalog: EmbeddedShimCatalog,
+        prompts: Arc<dyn SensitivePromptHandler>,
+        jobs: Option<crate::job::JobManager>,
+    ) -> Self {
         Self {
             catalog,
-            authentication: authentication::Authentication::new(prompts.clone()),
+            authentication: authentication::Authentication::new(prompts.clone(), jobs),
             prompts,
         }
     }
@@ -61,8 +68,11 @@ impl ConnectionFactory for Backend {
         })
     }
 
-    fn environment(&self) -> BoxFuture<'_, Result<ProcessEnvironment, RemoteError>> {
-        Box::pin(self.authentication.environment())
+    fn environment(
+        &self,
+        authentication: ProcessAuthentication,
+    ) -> BoxFuture<'_, Result<ProcessEnvironment, RemoteError>> {
+        Box::pin(self.authentication.process_environment(authentication))
     }
 
     fn shutdown(&self) -> BoxFuture<'_, ()> {

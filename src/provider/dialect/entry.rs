@@ -606,7 +606,7 @@ providers:
             .replace("http://127.0.0.1:11434/v1", &root)
             .replace(
                 "        max_output: 512\n",
-                "        max_output: 512\n      strict:\n        model: strict-model\n        max_context: 4096\n        max_output: 512\n        reasoning_replay: omitted\n        output_limit: {field: max_tokens}\n",
+                "        max_output: 512\n      strict:\n        model: strict-model\n        max_context: 4096\n        max_output: 512\n        reasoning_replay: null\n        output_limit: {field: max_tokens}\n",
             );
         for entry in &build(&text) {
             let mut context = entry.provider.open_context("c".parse().unwrap()).unwrap();
@@ -647,14 +647,6 @@ providers:
         assert!(sent(local, "max_completion_tokens") && !sent(local, "max_tokens"));
         assert!(sent(strict, "max_tokens") && !sent(strict, "max_completion_tokens"));
         assert!(replayed(local_replay) && !replayed(strict_replay));
-        let foreign = text
-            .replace("codec: chat_completions", "codec: responses")
-            .replace("        output_limit: {field: max_tokens}\n", "");
-        let refused = error(&foreign);
-        assert!(
-            refused.contains("reasoning_replay is not a responses setting"),
-            "{refused}"
-        );
     }
 
     const PROXY: &str = r#"
@@ -725,19 +717,17 @@ providers:
 
     #[test]
     fn request_roundtrip_preserves_explicit_defaults_and_nullable_fields() {
-        use crate::provider::codec::{Codec, responses::ReasoningSummary};
         let openai = with(
-            &LOCAL.replace("dialect: compatible", "dialect: openai")
+            &LOCAL
+                .replace("dialect: compatible", "dialect: openai")
                 .replace("codec: chat_completions", "codec: responses")
-                .replace("max_output: 512", "max_output: 512\n        reasoning_summary: requested\n        organization: null"),
-            "    reasoning_summary: unsupported\n    organization: inherited",
+                .replace(
+                    "max_output: 512",
+                    "max_output: 512\n        reasoning_summary: auto\n        organization: null",
+                ),
+            "    reasoning_summary: null\n    organization: inherited",
         );
         let config = roundtrip(&openai);
-        let admitted = config.providers["local"].admit().unwrap();
-        let Codec::Responses(profile) = &admitted.models()["local"].wire.codec else {
-            panic!("Responses fixture");
-        };
-        assert_eq!(profile.reasoning_summary, ReasoningSummary::Requested);
         let ProviderSettings::Openai(models) = &config.providers["local"].settings else {
             panic!("OpenAI fixture");
         };
@@ -794,7 +784,7 @@ providers:
             "auth_url: https://auth.example.com",
             "upstream: openai",
             "unknown_setting: true",
-            "overrides: {output_limit: omitted}",
+            "overrides: {output_limit: null}",
         ] {
             let refused = error(&LOCAL.replace(
                 "max_output: 512",
@@ -810,20 +800,21 @@ providers:
     }
 
     #[test]
-    fn placement_null_restores_the_effective_codec_preset_while_omitted_disables() {
-        use crate::provider::codec::{Codec, path};
+    fn placement_null_places_nothing_and_clears_a_foreign_inherited_selection() {
+        use crate::provider::codec::{Codec, Locations, path};
         let provider = with(
             LOCAL,
-            "    output_limit: {field: max_tokens}\n    reasoning_replay: omitted",
+            "    output_limit: {field: max_tokens}\n    reasoning_replay: {field: reasoning}",
         );
         for (selection, expected) in [
-            ("null", Some(path("max_completion_tokens"))),
-            ("omitted", None),
+            ("", Locations::one(path("max_tokens"))),
+            ("\n        output_limit: null", Locations::NONE),
+            (
+                "\n        output_limit: [{field: max_tokens}, {field: limit}]",
+                Locations::one(path("max_tokens")).with(path("limit")),
+            ),
         ] {
-            let text = provider.replace(
-                "max_output: 512",
-                &format!("max_output: 512\n        output_limit: {selection}"),
-            );
+            let text = provider.replace("max_output: 512", &format!("max_output: 512{selection}"));
             let config = roundtrip(&text);
             let admitted = config.providers["local"].admit().unwrap();
             let Codec::ChatCompletions(profile) = &admitted.models()["local"].wire.codec else {
@@ -831,13 +822,16 @@ providers:
             };
             assert_eq!(profile.output_limit, expected);
         }
-        let switched = provider.replace("max_output: 512", "max_output: 512\n        codec: responses\n        output_limit: null\n        reasoning_replay: null");
+        let switched = provider.replace(
+            "max_output: 512",
+            "max_output: 512\n        codec: responses\n        reasoning_replay: null",
+        );
         let config = roundtrip(&switched);
         let admitted = config.providers["local"].admit().unwrap();
         let Codec::Responses(profile) = &admitted.models()["local"].wire.codec else {
             panic!("Responses fixture");
         };
-        assert_eq!(profile.output_limit, Some(path("max_output_tokens")));
+        assert_eq!(profile.output_limit, Locations::one(path("max_tokens")));
         let inherited = switched.replace("        reasoning_replay: null\n", "");
         assert!(error(&inherited).contains("reasoning_replay is not a responses setting"));
     }
@@ -1026,8 +1020,9 @@ providers:
                     .flatten()
                     .any(|part| part.get("cache_control").is_some())
             };
-            assert!(cached(&bodies[1]) && cached(&bodies[2]) && cached(&bodies[3]));
-            assert!(!cached(&bodies[4]));
+            // Bedrock's Chat takes OpenAI's conventions, as the OpenAI upstream does.
+            assert!(cached(&bodies[1]) && cached(&bodies[2]));
+            assert!(!cached(&bodies[3]) && !cached(&bodies[4]));
         })
         .await;
     }

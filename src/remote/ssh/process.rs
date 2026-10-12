@@ -39,11 +39,11 @@ pub(crate) async fn open(
     command
         .arg(remote_command)
         .envs(environment)
-        .envs(config.askpass.environment())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    super::apply_environment(command.as_std_mut(), &config.askpass.environment());
     command.process_group(0);
     let mut child = command.spawn().map_err(RemoteError::start)?;
     let mut group = crate::process_group::ProcessGroup::led_by(&child);

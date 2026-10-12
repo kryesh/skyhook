@@ -21,12 +21,16 @@ use crate::tool::registry::{MAX_TOOL_NAME_BYTES, is_valid_tool_name};
 
 pub mod chat_completions;
 pub(crate) mod common;
+mod locations;
 pub(crate) mod messages;
 mod openai;
 mod placement;
 pub(crate) mod responses;
 pub(crate) mod usage;
 
+pub(crate) use locations::Locations;
+pub(crate) use locations::set_each;
+pub use locations::{LocationsError, NonEmpty};
 pub use placement::{BodyPath, CacheKey, CacheTtl};
 pub(crate) use placement::{Identity, header, overlaps, path};
 pub use responses::ReasoningSummary;
@@ -87,18 +91,18 @@ impl Encoded {
         identity: &Identity,
         context: &ContextId,
     ) -> Result<(), ProviderError> {
-        match &identity.cache_key {
-            CacheKey::Omitted => {}
-            CacheKey::Body(path) => path.set(root, Value::String(context.as_str().to_owned()))?,
-            CacheKey::Header(name) => {
-                let value = HeaderValue::from_str(context.as_str())
-                    .map_err(|_| InvalidRequest.error("invalid context identity header"))?;
-                headers.insert(name.clone(), value);
+        let identity_value = || Value::String(context.as_str().to_owned());
+        for key in identity.cache_key.iter() {
+            match key {
+                CacheKey::Body(path) => path.set(root, identity_value())?,
+                CacheKey::Header(name) => {
+                    let value = HeaderValue::from_str(context.as_str())
+                        .map_err(|_| InvalidRequest.error("invalid context identity header"))?;
+                    headers.insert(name.clone(), value);
+                }
             }
         }
-        if let Some(path) = &identity.user_id {
-            path.set(root, Value::String(context.as_str().to_owned()))?;
-        }
+        set_each(identity.user_id.iter(), root, identity_value())?;
         Ok(())
     }
 }
@@ -258,7 +262,7 @@ impl EffortLevels {
 /// Where the profile's `reasoning` goes, and the values accepted there.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Effort {
-    pub path: BodyPath,
+    pub path: NonEmpty<BodyPath>,
     pub levels: EffortLevels,
 }
 
@@ -274,7 +278,7 @@ impl Effort {
         if !self.levels.accepts(effort) {
             return Err(InvalidRequest.error(format!("Unsupported reasoning effort: {effort}")));
         }
-        self.path.set(root, Value::from(effort))
+        set_each(self.path.iter(), root, Value::from(effort))
     }
 }
 
@@ -327,19 +331,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn a_header_identity_is_placed_on_the_request() {
+    fn the_identity_is_placed_at_every_selected_header_and_field() {
         let request = common::tests::request("m");
         let context = "session".parse().unwrap();
         let keyed = Codec::Messages(messages::Dialect {
             identity: Identity {
-                cache_key: header("x-session-id"),
-                user_id: None,
+                cache_key: Locations::one(header("x-session-id"))
+                    .with(CacheKey::Body(path("metadata.session"))),
+                user_id: Locations::one(path("metadata.user")),
             },
             ..messages::Dialect::standard()
         });
         let encoded = keyed.encode(&request, &context).unwrap();
         assert_eq!(encoded.headers.len(), 1);
         assert_eq!(encoded.headers["x-session-id"], "session");
+        assert_eq!(
+            encoded.body["metadata"],
+            serde_json::json!({"session": "session", "user": "session"})
+        );
         let plain = Codec::Messages(messages::Dialect::standard());
         assert!(plain.encode(&request, &context).unwrap().headers.is_empty());
     }
@@ -396,7 +405,7 @@ mod tests {
             ..chat_completions::Dialect::compatible()
         };
         let nested = messages::Dialect {
-            output_limit: path("output_config.max_tokens"),
+            output_limit: NonEmpty::one(path("output_config.max_tokens")),
             ..messages::Dialect::standard()
         };
         for (codec, fields, placed) in [

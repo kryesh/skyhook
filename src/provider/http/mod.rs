@@ -439,14 +439,21 @@ pub(crate) mod tests {
     async fn chat_round_trip_persists_history_and_scopes_replay_by_provider_name() {
         use crate::provider::{
             Provider,
-            dialect::{self, Placement, Placements, Sourced, compatible},
+            codec::NonEmpty,
+            dialect::{self, BodyField, Placements, Sourced, compatible},
             protocol::{Message, Outcome, ToolResult, UserContent},
+            settings::Nullable,
         };
         crate::tests::bounded(async {
             for (replay, field) in [
-                (None, Some("reasoning_content")),
-                (Some(Placement::Field(codec::path("reasoning"))), Some("reasoning")),
-                (Some(Placement::Omitted), None),
+                (Nullable::Default, Some("reasoning_content")),
+                (
+                    Nullable::Value(NonEmpty::one(BodyField {
+                        field: codec::path("reasoning"),
+                    })),
+                    Some("reasoning"),
+                ),
+                (Nullable::Null, None),
             ] {
                 let model = "served-model";
                 let first = vec![
