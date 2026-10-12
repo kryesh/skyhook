@@ -294,7 +294,7 @@ fn request_history<'a>(
     else {
         return Err(ReplayError::Context);
     };
-    let (frontier, retained) = match checkpoint.map(&own) {
+    let (frontier, retained) = match checkpoint.map(own) {
         None => (None, &[][..]),
         Some(Some(EventRecord {
             event: SessionEvent::Compaction { checkpoint },

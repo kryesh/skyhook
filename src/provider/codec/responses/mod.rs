@@ -22,13 +22,14 @@ mod encoder;
 mod errors;
 mod events;
 mod identity;
+mod input;
 mod native;
 mod normalization;
 mod reasoning;
 mod terminal;
 
-pub use dialect::ReasoningSummary;
-pub(crate) use dialect::{Dialect, Instructions};
+pub(crate) use dialect::{Cache, Dialect, Instructions};
+pub use dialect::{CyberAccessProgram, ReasoningSummary, ServiceTier};
 
 pub(crate) use encoder::{BODY_FIELDS, encode};
 pub(crate) use errors::Code;

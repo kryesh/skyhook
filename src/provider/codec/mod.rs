@@ -33,7 +33,7 @@ pub(crate) use locations::set_each;
 pub use locations::{LocationsError, NonEmpty};
 pub use placement::{BodyPath, CacheKey, CacheTtl};
 pub(crate) use placement::{Identity, header, overlaps, path};
-pub use responses::ReasoningSummary;
+pub use responses::{CyberAccessProgram, ReasoningSummary, ServiceTier};
 
 crate::named_enum::named_enum! {
     #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -415,7 +415,12 @@ mod tests {
                 &["max_completion_tokens", "reasoning_effort"][..],
             ),
             (
-                Codec::Responses(responses::Dialect::stateless()),
+                Codec::Responses(responses::Dialect {
+                    service_tier: Some("priority".parse().unwrap()),
+                    cyber_access_program: Some(responses::CyberAccessProgram::DaybreakBlue),
+                    cache: responses::Cache::Explicit,
+                    ..responses::Dialect::stateless()
+                }),
                 responses::BODY_FIELDS,
                 &["max_output_tokens", "reasoning.effort", "prompt_cache_key"],
             ),

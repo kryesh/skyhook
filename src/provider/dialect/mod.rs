@@ -43,7 +43,10 @@ pub use entry::{ConfigHome, ProviderModels, ProviderSettings, RawProviderConfig}
 pub use login::{
     AuthStatus, Login, LoginCommand, LoginError, LoginReason, LoginRequired, Usage, UsageWindow,
 };
-pub use models::{ModelSpec, Request, RequestPatch, RequestSettings};
+pub use models::{
+    AccessPrograms, AccessProgramsPatch, ModelSpec, Request, RequestPatch, RequestSettings,
+    ResponseSetting,
+};
 pub use placements::{BodyField, PlacementError, PlacementKey, Placements, PlacementsPatch};
 
 named_enum! {

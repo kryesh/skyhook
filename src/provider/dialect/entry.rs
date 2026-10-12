@@ -107,7 +107,7 @@ impl<P: Patch, O> ProviderModels<P, O> {
                     let settings = self.defaults.overlay(&model.settings);
                     let request = Request::resolve(&settings.request)?;
                     let mut wire = C::resolve(&settings.dialect)?.admit(request.codec)?;
-                    wire.codec = request.placements.apply(wire.codec)?;
+                    wire.codec = request.apply(wire.codec)?;
                     model.validate(&wire.codec)?;
                     Ok(AdmittedModel {
                         profile: model.profile.clone(),
@@ -738,6 +738,77 @@ providers:
                 .organization
                 .is_none()
         );
+    }
+
+    #[test]
+    fn responses_selections_inherit_per_leaf_and_null_clears_them() {
+        use crate::provider::codec::{Codec, CyberAccessProgram::*, responses::Cache};
+        let provider = with(
+            &LOCAL.replace("codec: chat_completions", "codec: responses"),
+            "    service_tier: priority\n    access_programs: {cyber: daybreak_blue}\n    explicit_caching: true",
+        );
+        let models = [
+            ("empty", "access_programs: {}"),
+            (
+                "override",
+                "service_tier: flex\n        access_programs: {cyber: standard}\n        explicit_caching: false",
+            ),
+            ("leaf_null", "access_programs: {cyber: null}"),
+            (
+                "cleared",
+                "service_tier: null\n        access_programs: null\n        explicit_caching: null",
+            ),
+            (
+                "switched",
+                "codec: messages\n        service_tier: null\n        access_programs: null\n        explicit_caching: false",
+            ),
+        ]
+        .map(|(name, selection)| {
+            format!("      {name}:\n        model: local-model\n        max_context: 4096\n        max_output: 512\n        {selection}\n")
+        })
+        .concat();
+        let config = roundtrip(&format!("{provider}{models}"));
+        let admitted = config.providers["local"].admit().unwrap();
+        for (name, tier, cyber, cache) in [
+            (
+                "local",
+                Some("priority"),
+                Some(DaybreakBlue),
+                Cache::Explicit,
+            ),
+            (
+                "empty",
+                Some("priority"),
+                Some(DaybreakBlue),
+                Cache::Explicit,
+            ),
+            ("override", Some("flex"), Some(Standard), Cache::Automatic),
+            ("leaf_null", Some("priority"), None, Cache::Explicit),
+            ("cleared", None, None, Cache::Automatic),
+        ] {
+            let Codec::Responses(profile) = &admitted.models()[name].wire.codec else {
+                panic!("Responses fixture");
+            };
+            assert_eq!(
+                (
+                    profile.service_tier.as_ref().map(|tier| tier.as_str()),
+                    profile.cyber_access_program,
+                    profile.cache,
+                ),
+                (tier, cyber, cache),
+                "{name}"
+            );
+        }
+        assert!(matches!(
+            admitted.models()["switched"].wire.codec,
+            Codec::Messages(_)
+        ));
+        // An empty object inherits the provider's leaves, so it does not clear them.
+        let inherited = provider.replace(
+            "max_output: 512",
+            "max_output: 512\n        codec: messages\n        service_tier: null\n        access_programs: {}\n        explicit_caching: false",
+        );
+        assert!(error(&inherited).contains("access_programs applies only to the responses codec"));
     }
 
     #[test]

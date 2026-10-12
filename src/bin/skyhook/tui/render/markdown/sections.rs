@@ -78,7 +78,7 @@ pub(in crate::tui) fn sections(text: &str) -> Vec<Section<'_>> {
                     .filter(|range| title(&text[range.clone()]).is_some())
                 {
                     Some(range) => {
-                        let title = opened.replace(range.clone()).map(&source);
+                        let title = opened.replace(range.clone()).map(source);
                         sections.push(Section {
                             title,
                             body: source(start..end),
@@ -94,7 +94,7 @@ pub(in crate::tui) fn sections(text: &str) -> Vec<Section<'_>> {
         }
     }
     sections.push(Section {
-        title: opened.map(&source),
+        title: opened.map(source),
         body: source(start..end),
     });
     sections.retain(|section| section.title.is_some() || !section.body.text.is_empty());

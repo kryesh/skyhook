@@ -41,13 +41,14 @@ directly beside `model`. To migrate an older configuration, move each member of 
 | Where | Fields |
 | --- | --- |
 | Provider only | `dialect`, `base_url`, `api_key`, `headers`, `startup_timeout_secs`, `read_idle_timeout_secs`; Codex's `auth_url`. |
-| Provider defaults or direct model settings | `codec`; all placement selections listed below; the dialect's request fields: OpenAI's `reasoning_summary`, `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`, `state_role`; OpenRouter's `routing`, `cache_ttl`, `state_role`; LiteLLM's `upstream`, `tags`, `state_role`; Compatible's `state_role`. |
+| Provider defaults or direct model settings | `codec`; all placement selections listed below; the Responses settings `service_tier`, `access_programs`, `explicit_caching`; the dialect's request fields: OpenAI's `reasoning_summary`, `organization`, `project`; Anthropic's `workspace_id`, `cache_ttl`, `state_role`; OpenRouter's `routing`, `cache_ttl`, `state_role`; LiteLLM's `upstream`, `tags`, `state_role`; Compatible's `state_role`. |
 | Model only | `model`, `reasoning`, `max_context`, `max_output`, `supports_images`, `state_mode`, `hint`. |
 
 Missing model settings inherit from the provider. Explicit values win even when they are `false`,
 `[]`, or a setting's usual default. Lists replace inherited lists rather than append. Under
 OpenRouter's `routing`, only declared members change: a model's `order` replaces the inherited
-order while an undeclared `allow_fallbacks` still inherits.
+order while an undeclared `allow_fallbacks` still inherits. The same leaf-by-leaf inheritance
+applies to `access_programs`: `{}` inherits its leaves, rather than clearing the object.
 
 Every request setting in the table above reads the same way, apart from lists. Left out, it
 inherits, and with nothing to inherit takes its default. An explicit `null` sends nothing: `organization: null` removes the
@@ -93,6 +94,41 @@ providers:
 
 Configure the aliases and routing in LiteLLM itself; `upstream` tells Skyhook which request and
 reasoning conventions to use for each alias.
+
+### Responses settings
+
+Any dialect serving `codec: "responses"` accepts three optional settings, as provider defaults
+or beside `model`. All are unset by default, and each is sent only when selected. A backend
+serving Responses need not accept them; check that the endpoint, model, and account support a
+setting before selecting it. Other codecs refuse a selection, so a model that switches away from
+Responses must clear inherited ones with `null`.
+
+- `service_tier` is the backend's tier ID, such as `priority`, `flex`, or `ultrafast`. It is
+  sent exactly as written: Skyhook does not translate client aliases such as `fast`. Faster
+  tiers can cost more or use more of a subscription; see
+  [ChatGPT speed](https://learn.chatgpt.com/docs/agent-configuration/speed).
+- `access_programs.cyber` requests a cybersecurity access program: `standard`, `daybreak_blue`,
+  or `daybreak_red`. The model and account must be eligible for the program; it does not grant
+  entitlement, and other safeguards still apply. Some models take a different wire value from
+  the approval it needs: `gpt-6-astra` and `gpt-6.1-sol` take `daybreak_blue` but require Daybreak
+  Red entitlement. See the [Daybreak guide](https://developers.openai.com/api/docs/guides/daybreak).
+- `explicit_caching: true` switches the request to explicit prompt caching. Skyhook marks
+  checkpoints at the end of the stable history and at earlier turns, never on the changing
+  runtime state, so later requests can reuse the prefix. Requests with no stable history, such
+  as compaction, are not cached. Left unset, the backend's automatic caching is unchanged. See
+  the [prompt-caching guide](https://developers.openai.com/api/docs/guides/prompt-caching) for
+  supported models and pricing.
+
+```yaml
+astra:
+  model: "gpt-6-astra"
+  max_context: 1050000
+  max_output: 128000
+  service_tier: "priority"
+  access_programs:
+    cyber: "daybreak_blue"
+  explicit_caching: true
+```
 
 ### Placement selections
 

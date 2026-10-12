@@ -40,11 +40,21 @@ providers:
       env: "OPENAI_API_KEY"
     # Reasoning summaries need a verified OpenAI organisation:
     # reasoning_summary: null
+    # Responses-only selections, sent only when set. Availability depends on the
+    # endpoint, model, and account; faster tiers can cost more.
+    # service_tier: "priority"         # wire tier ID, sent as written
+    # Cybersecurity access program (standard, daybreak_blue, or daybreak_red); the
+    # model and account must be eligible: https://developers.openai.com/api/docs/guides/daybreak
+    # access_programs:
+    #   cyber: "daybreak_blue"
     # Published model limits; smaller budgets can be chosen for cost/latency.
     models:
       # https://developers.openai.com/api/docs/models/gpt-5.6-sol
       openai:
         model: "gpt-5.6-sol"
+        # Explicit prompt-cache checkpoints, for endpoints and models that support them:
+        # https://developers.openai.com/api/docs/guides/prompt-caching
+        # explicit_caching: true
         reasoning: "high"
         max_context: 1050000
         max_output: 128000
@@ -85,6 +95,7 @@ providers:
     # base_url: "https://chatgpt.com/backend-api"
     # auth_url: "https://auth.openai.com"
     # Stored credentials are bound to the auth_url; changing it requires a new login.
+    # service_tier and access_programs work here too, as for openai above.
     models:
       # Codex's catalog advertises a maximum context of 872000 (default: 272000).
       # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json

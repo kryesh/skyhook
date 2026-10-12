@@ -496,6 +496,33 @@ mod tests {
                 responses
             ))
         );
+        for path in [
+            "service_tier",
+            "service_tier.custom",
+            "access_programs",
+            "access_programs.cyber",
+            "access_programs.cyber.custom",
+            "access_programs.other",
+            "prompt_cache_options",
+            "prompt_cache_options.mode",
+            "prompt_cache_options.other.nested",
+        ] {
+            for (key, selection) in [
+                (
+                    PlacementKey::ReasoningEffort,
+                    format!("reasoning_effort: {path}"),
+                ),
+                (
+                    PlacementKey::CacheKey,
+                    format!("cache_key: {{body: {path}}}"),
+                ),
+            ] {
+                assert_eq!(
+                    checked(responses, &selection),
+                    Err(reserved(key, path, responses))
+                );
+            }
+        }
         let overlap = |key, path: &str, other, other_path: &str| PlacementError::Overlap {
             key,
             path: BodyPath::new(path).unwrap(),

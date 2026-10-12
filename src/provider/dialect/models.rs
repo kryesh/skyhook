@@ -5,7 +5,7 @@ use serde_json::{Map, Value};
 
 use super::{ModelError, Placements};
 use crate::provider::{
-    codec::{Codec, CodecName},
+    codec::{Codec, CodecName, CyberAccessProgram, ServiceTier, responses::Cache},
     profile::ModelProfile,
     settings::Patch,
 };
@@ -15,6 +15,64 @@ crate::provider::settings::settings! {
     pub struct Request => RequestPatch {
         @flatten { pub placements: Placements }
         pub codec: CodecName => required,
+        /// Responses only. The wire tier ID, sent without client aliases.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub service_tier: Option<ServiceTier> => default,
+        /// Responses only.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub access_programs: Option<AccessPrograms> => object(AccessPrograms),
+        /// Responses only. Mark stable-prefix checkpoints instead of leaving caching to
+        /// the backend.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub explicit_caching: Option<bool> => default,
+    }
+}
+
+crate::provider::settings::settings! {
+    #[derive(Default)]
+    pub struct AccessPrograms => AccessProgramsPatch {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub cyber: Option<CyberAccessProgram> => default,
+    }
+}
+
+crate::named_enum::named_enum! {
+    /// A setting only the Responses codec can send.
+    #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+    pub enum ResponseSetting {
+        ServiceTier = "service_tier",
+        AccessPrograms = "access_programs",
+        ExplicitCaching = "explicit_caching",
+    }
+}
+
+impl Request {
+    /// The codec with the shared selections applied, or the first one it cannot send.
+    pub(crate) fn apply(&self, codec: Codec) -> Result<Codec, ModelError> {
+        let mut codec = self.placements.apply(codec)?;
+        let cyber = self
+            .access_programs
+            .as_ref()
+            .and_then(|programs| programs.cyber);
+        let cache = match self.explicit_caching {
+            Some(true) => Cache::Explicit,
+            Some(false) | None => Cache::Automatic,
+        };
+        if let Codec::Responses(dialect) = &mut codec {
+            dialect.service_tier = self.service_tier.clone();
+            dialect.cyber_access_program = cyber;
+            dialect.cache = cache;
+        } else if let Some(setting) = [
+            (ResponseSetting::ServiceTier, self.service_tier.is_some()),
+            (ResponseSetting::AccessPrograms, cyber.is_some()),
+            (ResponseSetting::ExplicitCaching, cache == Cache::Explicit),
+        ]
+        .into_iter()
+        .find_map(|(setting, selected)| selected.then_some(setting))
+        {
+            return Err(ModelError::ResponsesOnly(setting));
+        }
+        Ok(codec)
     }
 }
 
@@ -123,5 +181,80 @@ impl<P> ModelSpec<P> {
             });
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::provider::dialect::compatible::base;
+
+    fn apply(text: &str) -> Result<Codec, ModelError> {
+        let request: Request = crate::yaml::parse(text).unwrap();
+        request.apply(base(request.codec))
+    }
+
+    #[test]
+    fn responses_selections_default_to_unset_and_reach_the_codec() {
+        let Codec::Responses(unset) = apply("codec: responses").unwrap() else {
+            panic!("Responses fixture");
+        };
+        assert_eq!(
+            (unset.service_tier, unset.cyber_access_program, unset.cache),
+            (None, None, Cache::Automatic)
+        );
+        let Codec::Responses(selected) = apply(
+            "codec: responses\nservice_tier: priority\naccess_programs: {cyber: daybreak_blue}\nexplicit_caching: true",
+        )
+        .unwrap() else {
+            panic!("Responses fixture");
+        };
+        assert_eq!(selected.service_tier, Some("priority".parse().unwrap()));
+        assert_eq!(
+            selected.cyber_access_program,
+            Some(CyberAccessProgram::DaybreakBlue)
+        );
+        assert_eq!(selected.cache, Cache::Explicit);
+    }
+
+    #[test]
+    fn other_codecs_refuse_effective_responses_selections_but_accept_empty_ones() {
+        for codec in ["chat_completions", "messages"] {
+            for (selection, setting) in [
+                ("service_tier: fast", ResponseSetting::ServiceTier),
+                (
+                    "access_programs: {cyber: standard}",
+                    ResponseSetting::AccessPrograms,
+                ),
+                ("explicit_caching: true", ResponseSetting::ExplicitCaching),
+            ] {
+                assert_eq!(
+                    apply(&format!("codec: {codec}\n{selection}")).unwrap_err(),
+                    ModelError::ResponsesOnly(setting)
+                );
+            }
+            assert!(
+                apply(&format!(
+                    "codec: {codec}\naccess_programs: {{}}\nexplicit_caching: false"
+                ))
+                .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn responses_selections_are_parsed_at_the_boundary() {
+        for refused in [
+            "service_tier: '  '",
+            "service_tier: true",
+            "explicit_caching: 'true'",
+            "access_programs: {cyber: daybreak-blue}",
+            "access_programs: {unknown: standard}",
+        ] {
+            assert!(
+                crate::yaml::parse::<Request>(&format!("codec: responses\n{refused}")).is_err(),
+                "{refused}"
+            );
+        }
     }
 }

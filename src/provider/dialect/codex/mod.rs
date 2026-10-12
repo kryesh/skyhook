@@ -218,12 +218,14 @@ mod tests {
         name: &str,
         server: &Server,
         directory: std::path::PathBuf,
+        request: &super::super::Request,
     ) -> crate::provider::http::HttpProvider {
         let common = Common {
             base_url: Some(server.url.trim_end_matches("/responses").to_owned()),
             ..Common::default()
         };
-        let profile = Config::default().admit(CodecName::Responses).unwrap();
+        let mut profile = Config::default().admit(request.codec).unwrap();
+        profile.codec = request.apply(profile.codec).unwrap();
         let connection = common.admit(BaseUrl::Required).unwrap();
         let credentials = subscription(auth::test_manager(directory));
         super::super::build(
@@ -255,7 +257,11 @@ mod tests {
         let sse = reply("200 OK", "Content-Type: text/event-stream\r\n", &body);
         let server = Server::start(vec![Plan::reply(sse)]).await;
         let directory = tempfile::tempdir().unwrap();
-        let provider = provider("codex", &server, directory.path().to_owned());
+        let settings = crate::yaml::parse(
+            "codec: responses\nservice_tier: priority\naccess_programs: {cyber: daybreak_blue}\nexplicit_caching: true",
+        )
+        .unwrap();
+        let provider = provider("codex", &server, directory.path().to_owned(), &settings);
         let mut context = provider.open_context("context".parse().unwrap()).unwrap();
         let request = reasoning_tool_request(provider.scope());
         let events: Vec<_> = context.invoke(request).collect().await;
@@ -279,6 +285,15 @@ mod tests {
         let body: Value = serde_json::from_str(body).unwrap();
         assert!(body.get("max_output_tokens").is_none());
         assert_eq!(body["instructions"], "");
+        assert_eq!(body["service_tier"], "priority");
+        assert_eq!(body["access_programs"], json!({"cyber": "daybreak_blue"}));
+        assert_eq!(body["prompt_cache_options"], json!({"mode": "explicit"}));
+        assert_eq!(
+            body["input"][2]["output"],
+            json!([{"type": "input_text",
+                "text": json!({"result": {"ok": true}, "is_error": false}).to_string(),
+                "prompt_cache_breakpoint": {"mode": "explicit"}}])
+        );
     }
 
     #[test]

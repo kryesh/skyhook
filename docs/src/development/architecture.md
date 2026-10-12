@@ -33,7 +33,9 @@ credentials live. `provider::dialect` owns the entries
 provider-only `Options` (connection rules and any Skyhook-managed `Login`) and its
 inheritable request settings. Request defaults and model settings are typed partial declarations
 (`provider::settings`) that keep inheritance intent until admission resolves each model into a
-complete, independently validated codec and transport profile.
+complete, independently validated codec and transport profile. The shared `Request` also carries
+the Responses-only selections (`service_tier`, `access_programs`, `explicit_caching`); admission
+refuses an effective one on any other codec.
 
 ## Provider boundary and lifetime
 
@@ -105,7 +107,13 @@ the end of the context is omitted everywhere: its request produced nothing bound
   history prefix under those settings.
 
 Messages, and Chat dialects that select content-part breakpoints, mark the end of the prefix as a
-cache breakpoint except for detached requests. OpenAI protocols use automatic prefix caching.
+cache breakpoint except for detached requests. Responses uses automatic prefix caching unless
+`explicit_caching` is selected. Then the encoder sends `prompt_cache_options: {mode: "explicit"}`
+and marks an `input_text` block at the end of the history prefix and before each earlier
+assistant response in it, so each prior request's prefix stays reusable; the current state and
+the rest of the request carry no marker, and detached requests carry none. Tool outputs become
+text-block arrays in that mode so they can carry a marker. Other OpenAI protocols use automatic
+prefix caching.
 
 ## Request, response, and recovery lifecycle
 

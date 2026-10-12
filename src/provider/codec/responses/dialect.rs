@@ -1,7 +1,10 @@
 //! The conventions that vary between Responses servers.
-use crate::provider::codec::{
-    BodyPath, CacheKey, Effort, Identity, Locations, NonEmpty, OPENAI_EFFORT, StateRole, ToolNames,
-    path,
+use crate::{
+    newtype::{Blank, nonblank, string_newtype},
+    provider::codec::{
+        BodyPath, CacheKey, Effort, Identity, Locations, NonEmpty, OPENAI_EFFORT, StateRole,
+        ToolNames, path,
+    },
 };
 
 /// Whether `instructions` is sent without system segments.
@@ -10,6 +13,14 @@ pub(crate) enum Instructions {
     WhenPresent,
     /// The service rejects requests without the field.
     RequiredEvenWhenEmpty,
+}
+
+/// Explicit-only caching is opt-in; otherwise the backend keeps its defaults.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Cache {
+    #[default]
+    Automatic,
+    Explicit,
 }
 
 crate::named_enum::named_enum! {
@@ -23,6 +34,21 @@ crate::named_enum::named_enum! {
     }
 }
 
+string_newtype! {
+    /// A service tier's wire ID. Catalogs may advertise tiers unknown to this client.
+    pub struct ServiceTier(Blank) = |value| nonblank("service_tier", value);
+}
+
+crate::named_enum::named_enum! {
+    /// The cybersecurity access program requested, not the account's approval level.
+    #[derive(Clone, Copy, Debug, serde::Serialize, PartialEq, Eq)]
+    pub enum CyberAccessProgram {
+        Standard = "standard",
+        DaybreakBlue = "daybreak_blue",
+        DaybreakRed = "daybreak_red",
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Dialect {
     pub instructions: Instructions,
@@ -30,6 +56,9 @@ pub(crate) struct Dialect {
     pub output_limit: Locations<BodyPath>,
     /// None for a service that rejects `reasoning.summary`.
     pub reasoning_summary: Option<ReasoningSummary>,
+    pub service_tier: Option<ServiceTier>,
+    pub cyber_access_program: Option<CyberAccessProgram>,
+    pub cache: Cache,
     pub effort: Effort,
     pub identity: Identity,
     /// Event types that are transport metadata, not output. Unknown semantic
@@ -47,6 +76,9 @@ impl Dialect {
             instructions: Instructions::WhenPresent,
             output_limit: Locations::one(const { path("max_output_tokens") }),
             reasoning_summary: Some(ReasoningSummary::Auto),
+            service_tier: None,
+            cyber_access_program: None,
+            cache: Cache::Automatic,
             effort: Effort {
                 path: NonEmpty::one(const { path("reasoning.effort") }),
                 levels: OPENAI_EFFORT,

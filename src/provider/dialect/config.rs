@@ -6,7 +6,7 @@ use std::{env, fmt, time::Duration};
 use reqwest::header::{HeaderName, HeaderValue};
 use serde::{Deserialize, Serialize};
 
-use super::{DialectError, PlacementError};
+use super::{DialectError, PlacementError, ResponseSetting};
 use crate::provider::{
     codec::EffortLevels,
     http::{
@@ -203,6 +203,8 @@ pub enum ModelError {
     Limits(#[from] LimitsError),
     #[error(transparent)]
     Placement(#[from] PlacementError),
+    #[error("{0} applies only to the responses codec")]
+    ResponsesOnly(ResponseSetting),
     #[error("reasoning `{effort}` is not one of: {}", .levels.0.join(", "))]
     Reasoning {
         effort: String,
