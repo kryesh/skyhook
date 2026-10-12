@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -183,7 +183,7 @@
                         <h1 id="command-line-reference"><a class="header" href="#command-line-reference">Command-line reference</a></h1>
 <pre><code class="language-text">skyhook [OPTIONS]
 skyhook batch [OPTIONS] &lt;--prompt TEXT|--script PATH&gt;
-skyhook auth &lt;login|status|logout&gt; [codex]
+skyhook auth &lt;login|status&gt; &lt;PROVIDER&gt; [OPTIONS]
 skyhook dump [config|skills] [OPTIONS]
 skyhook stats &lt;SESSION_ID|--list&gt; [OPTIONS]
 </code></pre>
@@ -328,17 +328,19 @@ Names come from the job that spawned the agent. Model call counts
 cover agent turns only, while token figures include compaction requests. Sessions written by an
 earlier session format are refused with a nonzero exit.</p>
 <h2 id="authentication-commands"><a class="header" href="#authentication-commands">Authentication commands</a></h2>
-<pre><code class="language-sh">skyhook auth login
-skyhook auth login --headless
-skyhook auth status
-skyhook auth logout
+<pre><code class="language-sh">skyhook auth login codex
+skyhook auth login codex --headless
+skyhook auth status codex
+skyhook auth status codex --check
 </code></pre>
-<p>The optional provider argument currently accepts only <code>codex</code>, which is the default.
-<code>auth login --headless</code> selects device authorization rather than a browser; it is separate
-from <code>skyhook batch</code>. Login needs no configuration file; when one exists it must load, and login
-signs in to the <code>auth_url</code> its <code>codex</code> providers share (entries naming different ones are refused),
-or OpenAI’s issuer when none names one. <code>auth status</code> checks the stored credentials against that
-issuer; <code>auth logout</code> reads no configuration.
+<p>The argument names a configured provider whose dialect Skyhook signs in to; currently that is any
+<code>codex</code> provider. The configuration is found as for a session: <code>--workspace PATH</code> selects the
+workspace whose <code>.skyhook/config.yaml</code> overlays the user file, and <code>--config path.yaml</code> loads only
+that file. It must load and define the provider. <code>auth login --headless</code> selects device
+authorization rather than a browser; it is separate from <code>skyhook batch</code>. Login signs in to the
+provider’s <code>auth_url</code>. <code>auth status</code> checks that provider’s stored credentials against it without
+contacting the service; <code>--check</code> also presents them to the service in a request that spends no
+quota, and fails unless the provider is logged in and the service accepts them. To sign out, delete the provider’s credentials file.
 See <a href="../configuration/authentication.html">authentication</a> for credential ownership and storage.</p>
 <h2 id="related-settings"><a class="header" href="#related-settings">Related settings</a></h2>
 <p>The <a href="../configuration/overview.html">configuration overview</a> describes configuration paths

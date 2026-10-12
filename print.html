@@ -36,7 +36,7 @@
             const path_to_root = "";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="toc-8b14bb79.js"></script>
@@ -264,7 +264,7 @@ interactive terminal. Use <code>skyhook batch</code> with <code>-p/--prompt</cod
 with redirected input/output support and automatic exit; see <a href="#headless-execution">Headless execution</a>.</p>
 <p>An unused startup draft creates no saved session. The first sent message or explicitly run
 script creates the session. Use <code>--workspace PATH</code> to select another workspace. Normally,
-<code>&lt;workspace&gt;/.skyhook/config.yaml</code> overlays the selected user configuration. Use
+<code>&lt;workspace&gt;/.skyhook/config.yaml</code> overlays the selected user configuration, entry by entry. Use
 <code>--config path.yaml</code> to load <strong>only</strong> that file instead, with no user/workspace config merging.
 See <a href="#file-selection-and-layering">configuration layering</a>, including
 its workspace trust boundary.</p>
@@ -296,12 +296,15 @@ syntax highlighting once their closing fence arrives; open blocks keep a consist
 code style while streaming.</p>
 <p>The agent tree appears above the composer while children are active or a child agent is being
 viewed. Click an agent to inspect its conversation without mixing its output with other agents.
-Each agent retains its reading position and expanded rows. Agents using the <code>wait</code> tool show
-<strong>Waiting</strong> rather than <strong>Running tools</strong>. Tree rows show <code>@target</code> for remote agents and their
-own token totals and context usage: output · input (uncached) · context.
+Each agent and tab retains its reading position and expanded rows. Agents using the <code>wait</code> tool
+show <strong>Waiting</strong> rather than <strong>Running tools</strong>. Tree rows show <code>@target</code> for remote agents and their
+own token totals, context usage and time: output · input (uncached) · context · time. The time is
+how long a busy agent’s current turn has run; once it isn’t busy, how long a child ran its job, or
+how long the root agent’s last turn took.
 Agent call previews show the child’s target even while queued or running; an omitted target
 inherits the caller’s target. Completed final replies identify the model that answered in a
-footer below the reply.</p>
+footer below the reply, with how long that response took and, when tool rounds came first, how
+long the whole turn took.</p>
 <p>The composer always sends to the root agent. While root is busy, Enter queues a follow-up
 for its next model request, without interrupting the current request or tools. It does not wait
 for the entire turn to finish. <code>/queue</code> edits/removes input that has not yet been consumed.
@@ -310,24 +313,32 @@ composer; merely opening the queue or deleting an item does not pause it. Interr
 submission or delivery errors, and session-start failures also pause queue delivery. <code>/resume</code>
 clears that pause, as does normal composer Enter (even with an empty draft); slash commands
 do not automatically resume the queue.
+If Skyhook cannot write a session’s journal, that session stops as if the process had crashed:
+its queued input is dropped and its conversation shows why. It stays open to read until you close
+it, and reopening it continues from what was saved.
 Queued input lives only in the running interface: it is not saved with the session. Each open
 session keeps its own queue, which keeps delivering while you look at another session and is
 discarded when its session is closed.</p>
 <p><code>/retry</code> continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
-which agent is selected. Parents with pending waits stay in those waits.
-Automatic model retries display the attempt number, next delay, and latest diagnostic in one
-error block. Partial output from the failed attempt clears when the next attempt starts;
-successful replies have no retry labels. Retries continue until success or cancellation for
-<a href="#model-failure-recovery">transient model failures</a>.</p>
+which agent is selected. Parents with pending waits stay in those waits. On a reopened session
+that has not run anything yet, <code>/retry</code> always starts it and continues whatever it left
+unfinished, or reports that there was nothing.
+Automatic model retries display the attempt number, a countdown to the next attempt, and the
+latest diagnostic in one error block. Partial output from the failed attempt clears when the next
+attempt starts; successful replies have no retry labels. Retries continue until success or
+cancellation for <a href="#model-failure-recovery">transient model failures</a>.</p>
 <p>The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
-tab, while reading positions and expanded rows remain separate for each agent. Requests include
-compaction requests and token summaries; transient retries appear under the same request, which
-reads <strong>Retrying</strong> while the next attempt is pending. Full request bodies are available in the
-session log, not rendered in the UI. Status messages, including
-skill warnings, interruptions, and errors, appear in the conversation and are saved with the
-session, but are not sent to the model. Connection and MCP startup warnings describe this
-installation rather than the session, so they are shown but not saved.</p>
+tab, while reading positions and expanded rows remain separate for each agent and tab. Requests
+include compaction requests, when each was sent, token summaries, and how long each took; transient
+retries appear under the same request, which reads <strong>Retrying</strong> while the next attempt is pending.
+Full request bodies are available in the session log, not rendered in the UI. Status messages,
+such as interruptions and errors, appear in the conversation and are saved with the session, but
+are not sent to the model. Startup warnings (skills, configuration, connections and MCP servers)
+describe this installation rather than the session, so the terminal shows them but does not save
+them. Unsaved notices appear where they arrived in the conversation and scroll away as it grows.
+Feedback on an action, such as an attached file, a search without matches, an export, or a
+setting that could not be saved, shows briefly on the notice line instead.</p>
 <p>Job output is paged and searchable without acknowledging the agent’s pending notifications.
 Select a job and press <code>o</code> for output fields, regex search, and the next page; <code>c</code> requests
 cancellation (useful for background jobs, since interrupting already cancels the foreground tool).
@@ -337,8 +348,16 @@ output becomes available as it is transferred to the host.</p>
 <p>Provider-supplied reasoning streams in a separate expanded block and collapses when answer text
 starts or the response finishes. Click a multi-line block or press Enter when selected to reopen
 it, including after resuming a session. Single-line reasoning stays inline without an
-expand/collapse control and is not selectable, even when it wraps in a narrow terminal.
-Spinners indicate that a request is still active.</p>
+expand/collapse control and is not selectable, even when it wraps in a narrow terminal. A
+heading or wholly bold or italic line followed by a blank line starts a new reasoning section,
+titled by that line and collapsible like any multi-line block; only the section still streaming
+stays expanded. A title with nothing under it stays inline.
+Spinners indicate that work is still active, and a counter at the end of the row shows for how
+long. The working indicator counts the whole turn, across model requests and tool rounds;
+streaming reasoning counts from its request. Running tool calls count up and keep their duration
+once finished; expanding one shows when it started. A running tool waiting for input keeps its
+status symbol while its counter runs, and a retry counts down to its next attempt. Copied and
+exported text includes finished durations but not running counters.</p>
 <h2 id="model-selection-and-ui-state"><a class="header" href="#model-selection-and-ui-state">Model selection and UI state</a></h2>
 <p>Models are named <code>provider/model</code> and listed in configuration declaration order. For a new
 session, selection uses <code>--model</code>, then the most recently submitted configured model, then
@@ -359,18 +378,25 @@ Restore a missing recorded model before resuming rather than substituting anothe
 <p>The interface stores the last submitted model and mode and the sidebar setting in the workspace’s
 <code>.skyhook/state.json</code>, beside its sessions, without changing the model configuration.
 Session titles are saved with their history.</p>
-<p>A sidebar beside the conversation lists each configured MCP server with its startup status and the
-viewed agent’s todos, with the viewed agent’s capabilities pinned to its bottom. For the root agent
-these are what the mode of the next message grants. A section with nothing to list
-is left out, title included. The sidebar is shown by default; <code>Ctrl+X B</code> or <code>/sidebar</code> toggles it.
+<p>A sidebar beside the conversation shows the session’s title on its first line; click it to rename
+the session. Below, it lists the MCP servers the viewed agent can use, with their startup status,
+and the viewed agent’s todos, with the viewed agent’s capabilities pinned to its bottom. For the
+root agent of a new session these are what the mode of the next message grants, so cycling modes
+changes them. Once the root agent runs, choosing a mode for the next message that changes what it
+runs, including its own mode after the configuration redefined it, previews the change: a green
+<code>+</code> marks a server that mode would add, and a server it would remove is greyed out. A section with
+nothing to list is left out, title included. The sidebar is shown by default; <code>Ctrl+X B</code> or
+<code>/sidebar</code> toggles it.
 Terminals narrower than 100 columns hide it without changing the saved setting.</p>
 <p>The bottom bar uses this format:</p>
 <pre><code class="language-text">default · openai       8.4k · 200k(31.2k) · 42% (54k/128k)
 </code></pre>
 <p>Values are session output tokens, session total input tokens (uncached input), and the selected
-agent’s estimated current context occupancy (current tokens/model capacity). Session totals
-include children and compaction. Context includes instructions, tools, history, and runtime
-state; it is not cumulative usage. Missing context data appears as <code>—</code>.</p>
+agent’s context occupancy as the last response that reported its prompt counted it
+(tokens/model capacity). Session totals include children and compaction; a count a provider did
+not report adds nothing. Context includes instructions, tools, history, runtime state and that
+response; it is not cumulative usage. It appears as <code>—</code> until a response reports its prompt,
+including after compaction.</p>
 <h2 id="keyboard-and-mouse"><a class="header" href="#keyboard-and-mouse">Keyboard and mouse</a></h2>
 <p>The command palette and <code>/help</code> also list these shortcuts. <code>Ctrl+X</code> is a leader: release it, then press the next key when ready, or <code>Esc</code> to cancel.</p>
 <div class="table-wrapper">
@@ -381,6 +407,7 @@ state; it is not cumulative usage. Missing context data appears as <code>—</co
 <tbody>
 <tr><td><code>Ctrl+P</code>, <code>/</code></td><td>Commands</td></tr>
 <tr><td><code>Ctrl+X N</code>, <code>Ctrl+X S</code>, <code>Ctrl+X W</code></td><td>New session, switch session, close session</td></tr>
+<tr><td><code>Ctrl+X L</code>, <code>/rename</code></td><td>Rename the session</td></tr>
 <tr><td><code>Ctrl+X M</code>, <code>/model</code></td><td>Model for subsequent user messages</td></tr>
 <tr><td><code>Ctrl+X A</code></td><td>Agent picker</td></tr>
 <tr><td><code>Ctrl+X I</code>, <code>/queue</code></td><td>Edit queued follow-ups</td></tr>
@@ -398,13 +425,13 @@ state; it is not cumulative usage. Missing context data appears as <code>—</co
 <tr><td>Click a pane</td><td>Focus composer, tree, or conversation</td></tr>
 <tr><td><code>Enter</code></td><td>Send/queue, select, expand</td></tr>
 <tr><td><code>Alt+Enter</code>, <code>Ctrl+J</code>, supported <code>Shift+Enter</code></td><td>Newline</td></tr>
-<tr><td><code>PageUp</code>, <code>PageDown</code></td><td>Scroll history</td></tr>
+<tr><td><code>PageUp</code>, <code>PageDown</code></td><td>Scroll history; page through a draft taller than its box</td></tr>
 <tr><td><code>Ctrl+Alt+U</code>, <code>Ctrl+Alt+D</code></td><td>Half-page scrolling</td></tr>
 <tr><td><code>Home</code>, <code>End</code> in content</td><td>Beginning, latest</td></tr>
 <tr><td><code>/</code>, <code>n</code>, <code>N</code> in content</td><td>Search, next/previous match</td></tr>
 <tr><td><code>[</code>, <code>]</code> in content</td><td>Previous/next inspector tab</td></tr>
 <tr><td><code>Esc</code></td><td>Close local UI, dismiss/cancel prompts, otherwise interrupt work, cancelling the running foreground tool</td></tr>
-<tr><td><code>Ctrl+C</code></td><td>Clear draft, otherwise interrupt (as <code>Esc</code>)/quit</td></tr>
+<tr><td><code>Ctrl+C</code></td><td>Clear draft, otherwise interrupt (as <code>Esc</code>)/quit; in a prompt, clear its text, otherwise as <code>Esc</code></td></tr>
 <tr><td><code>Ctrl+X H</code>, <code>/help</code></td><td>Help and shortcuts</td></tr>
 <tr><td><code>Ctrl+X Q</code></td><td>Quit</td></tr>
 </tbody>
@@ -419,18 +446,27 @@ from the preview.</p>
 The command palette omits navigation-only actions; the <code>Ctrl+X</code> arrows step through
 agents and inspector tabs. Click the conversation, or pick an agent with <code>Ctrl+X A</code>, to focus it.
 Menus use arrows, mouse hover, the mouse wheel, or <code>Ctrl+P/N</code>; Enter or Tab activates
-the selected item. The Agents
-palette labels its Output, Input (uncached), and Context statistics. The composer
+the selected item. The Agents palette labels its Status column and its Output, Input (uncached),
+Context, and Time statistics. The composer
 wraps at word boundaries and grows with its draft up to half the space between the top and
-bottom bars, then scrolls to follow the cursor. It supports word movement, selection, <code>Ctrl+A/E</code>,
+bottom bars, then scrolls to follow the cursor; the mouse wheel over a taller draft scrolls it
+without moving the cursor. It supports word movement, selection, <code>Ctrl+A/E</code>,
 <code>Ctrl+W</code>, <code>Ctrl+U/K</code>, undo with <code>Ctrl+Z</code> or <code>Ctrl+-</code>, and redo with <code>Ctrl+Y</code>, <code>Ctrl+Shift+Z</code> or
 <code>Ctrl+.</code>. <code>Home</code>/<code>End</code> move to the start/end of the line, and <code>Ctrl+Home</code>/<code>Ctrl+End</code> to the
 start/end of the draft. Up/Down move through displayed input rows; in an empty composer they
 recall earlier prompts, and keep stepping through them until the recalled prompt is edited.
 Click agent and tool rows, scroll the relevant panel, or drag across text in user/agent messages
-and tool output, then copy the selected characters with <code>Ctrl+X Y</code> (or <code>y</code> while content is focused).
-Selection supports parts of a line and multiple lines; copying preserves Unicode and code indentation
-without adding newlines at visual wraps.
+and tool output: releasing the mouse copies the selected characters, and <code>Ctrl+X Y</code> (or <code>y</code> while
+content is focused) copies them again. A plain click copies nothing. Selecting text never scrolls the
+conversation, and open palettes and text pages stay where they are under the pointer. Selection
+supports parts of a line and multiple lines. It stays in place while a reply streams and finishes,
+and when the terminal is resized, as long as the selected text is unchanged. Copying preserves
+Unicode and the source’s own indentation without adding newlines at visual wraps. The indentation
+of tool output and arguments, the <code>+</code>/<code>−</code> markers of changes, and the expand/collapse glyphs and
+spinners of blocks and tool cards are not selected. In a table, selection follows the cells in
+reading order rather than the drawn grid: each table cell copies as one line, whole however it
+wraps, without borders or padding, and an empty cell copies as an empty line. Each copy reports
+how many characters it sent to the terminal; the terminal does not confirm that it accepted them.
 The workspace path is centered in the top bar. The bottom bar shows the model ID, session ID,
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
 (usually Shift-drag) and copy shortcut. Copy uses the terminal’s OSC 52 clipboard support. <code>@</code> or <code>Ctrl+X F</code> attaches a workspace file
@@ -449,9 +485,24 @@ conversation; open menus and search keep input focus until closed. <code>Esc</co
 questions and permissions without answering them; reopen pending requests with <code>Ctrl+X R</code>
 (or <code>/attention</code>, labelled <strong>Reopen questions and permissions</strong> in the palette).
 Submitting a new prompt rejects any pending question batches; those batches can no longer be reopened.
-For background questions and SSH authentication/askpass prompts, <code>Esc</code> cancels the request;
-cancelled requests cannot be reopened. SSH authentication prompts take priority over questions,
+Commands have no terminal, so password prompts from SSH and from <code>sudo</code> in commands (locally or
+on a target) appear as authentication prompts. The typed answer stays out of the conversation, but
+it goes to whichever process asked, and a command the agent runs can ask too and capture it.
+As a hint, each prompt names the program that appears to have asked and, when it runs under one,
+the job: for example <code>Requested by /usr/bin/ssh</code> or <code>Requested by sudo (running as uid 0) in job 12</code>.
+A program running as another user, such as <code>sudo</code>, shows only its name and user, since its
+executable cannot be read. This is best-effort attribution, not proof of who asked or where the
+answer goes: a command started by a genuine program, such as an SSH <code>ProxyCommand</code>, can ask in
+that program’s name and receive the answer. Answer only prompts you expect from the work you
+asked for, and treat one that names a program you don’t expect (a script, a shell, Skyhook
+itself) or an <code>unknown program</code> as raised by the agent’s command.
+For background questions and authentication prompts, <code>Esc</code> cancels the request;
+cancelled requests cannot be reopened. Authentication prompts take priority over questions,
 permissions, menus, and search; interrupted question drafts resume afterward.</p>
+<p>Renaming opens a prompt of its own, ahead of pending questions and permissions, with the title you
+set ready to edit, or empty while the title is automatic; the composer and its draft are left
+alone. <code>Enter</code> saves the title, and saving it empty returns the session to its automatic title.
+<code>Esc</code> cancels the rename. A draft has nothing to rename until its first message is sent.</p>
 <p>Within questions and permissions, <code>↑</code>/<code>↓</code> selects an answer, <code>PageUp</code>/<code>PageDown</code> scrolls
 the prompt text, and <code>Ctrl+PageUp</code>/<code>Ctrl+PageDown</code> scrolls long answer descriptions.
 In multi-question prompts, <code>←</code>/<code>→</code> switches questions while navigating choices, preserving
@@ -484,21 +535,22 @@ Resumed runs print the existing session ID.</p>
 in the session logs; they are not printed to stdout or stderr. The process exits successfully when
 the submitted operation and shutdown succeed. On failure or interruption it exits nonzero and
 prints the error to stderr; stdout still carries only the session ID. A failure before a session
-can be opened produces no session-ID line. Explicit <code>--help</code> and <code>--version</code>
+can be opened produces no session-ID line. If Skyhook cannot write the session journal, the session
+stops as if the process had crashed: the error says so, and no final status is recorded. Explicit <code>--help</code> and <code>--version</code>
 retain their normal output. Headless mode is not a line-oriented conversation over stdin.</p>
 <p>The submitted root turn or workflow defines completion. A workflow must explicitly await background
-work it needs completed; outstanding jobs are cancelled and drained during shutdown. Interrupt and
-termination signals also trigger cleanup and journaled status rather than a terminal prompt.</p>
+work it needs completed; outstanding jobs are cancelled, and child agents interrupted, during
+shutdown. Interrupt and termination signals also trigger cleanup and journaled status rather than
+a terminal prompt.</p>
 <p>A batch job never has human interaction. Root <code>ask</code> is unavailable (also inside scripts and with <code>bg:true</code>). Child agents
 can still ask their owning parent agent. Operations requiring human approval fail immediately;
 ordinary automatically allowed operations still work. <code>--approve-all</code> (or config <code>approve_all: true</code>)
 bypasses tool approvals but does not enable questions, SSH passwords/passphrases, or host/agent
 confirmation prompts. SSH credentials that work without a prompt can still authenticate.</p>
-<p><code>exec</code> never has stdin connected; without <code>interactive</code> it also has no
-controlling terminal, so
-ordinary <code>/dev/tty</code> prompts cannot stop the job waiting for terminal input. SSH authentication
-prompts are rejected even when inherited <code>SSH_ASKPASS</code> settings request another prompt helper
-or the <code>targets</code> capability is disabled. Existing <code>SSH_AUTH_SOCK</code> credentials are preserved unless
+<p><code>exec</code> never has stdin connected or a controlling terminal, so ordinary <code>/dev/tty</code> prompts cannot
+stop the job waiting for terminal input. SSH and <code>sudo</code> password prompts are rejected even when
+inherited <code>SSH_ASKPASS</code> or <code>SUDO_ASKPASS</code> settings request another prompt helper or the <code>targets</code>
+capability is disabled. Existing <code>SSH_AUTH_SOCK</code> credentials are preserved unless
 the configured target-authentication setup replaces them. Remote commands apply the same
 capability restrictions. This is still not an OS sandbox against deliberately programmed
 subprocesses that establish their own external interaction mechanisms.</p>
@@ -514,37 +566,73 @@ behind does not create an empty saved session. Resuming an existing session stil
 saved sessions only in <code>&lt;workspace&gt;/.skyhook/sessions</code>, where <code>--workspace</code> selects the workspace
 (default: the current directory). It does not search parent or sibling workspaces. Sessions
 written by an incompatible earlier session format cannot be reopened.</p>
-<p>The terminal keeps several sessions open at once. <code>/new</code> opens a draft beside the current
-session, and <code>/sessions</code> lists open sessions, marked with their live status, above the
-workspace’s saved ones: choosing an open session switches to it, choosing a saved one opens it
-alongside. Sessions you switch away from keep working, and the notice line reports when one of
-them has a pending question or permission request or has failed. <code>/close</code> shuts down the
-current session only; quitting shuts down all of them. Model selection
-and UI state are described in the <a href="#model-selection-and-ui-state">terminal guide</a>.</p>
+<p>The terminal keeps several sessions open at once. <code>/new</code> opens a draft beside the current session,
+and <code>/sessions</code> lists the open and saved sessions: the current session first, then the other
+activated sessions, those still working first, then every other session by most recent activity.
+An open session is activated once it has run here: a new session from its first message, a reopened
+one from the first action that changes it. Activated sessions are shown in bold. Opening a session
+and closing it again with nothing running does not count as activity. The current session is marked <code>&gt;</code>. Open sessions show their live status,
+and saved ones how they would resume: idle, interrupted, or failed. Opening a saved session changes
+nothing in it until you act on it, by sending a message, continuing it, or anything else that is
+saved with it; notices about it meanwhile are shown, not saved. A session closed idle with results
+still waiting for its main agent is listed and opens as idle, as described below. A lock marks a session
+that was held open when the list was shown, by another Skyhook instance or because it was still
+closing here. Choosing one that was closing here opens it once it has closed; one another instance
+holds cannot be opened until that instance closes it, and choosing it says so. A saved session whose
+status cannot be read shows no status symbol. Each row’s id, event count, mode, and last activity
+time sit at the right. When a row is too narrow, they give way from the left, id first, then event
+count, mode, and time, so titles keep at least 30 columns; longer titles are cut short with <code>…</code>.
+Choosing an open session switches to it, choosing a saved one opens it alongside. Sessions you
+switch away from keep working, and the notice line reports when one of them has a pending question
+or permission request or has failed. A session you switch away from with nothing running, nothing
+waiting on you, and nothing typed or queued is closed, so other Skyhook instances can open it; it
+stays in the list as a saved session. <code>/close</code> shuts down the current session only; quitting shuts
+down all of them.</p>
+<p>A session is named after the first message you send it. Rename it with <code>/rename</code> (<code>Ctrl+X L</code>) or
+by clicking its title in the sidebar. A title you set stays until you change it, whatever the
+session does later, and renaming starts from it; renaming a session with an automatic title starts
+empty, and saving an empty title returns the session to its automatic title. A session
+without a title is listed by its first message. Model selection and
+UI state are described in the <a href="#model-selection-and-ui-state">terminal guide</a>.</p>
 <p>Interrupting a session stops active model requests and cancels foreground tools, scripts, and
-questions. Delegated child agents retain their conversations and can continue with <code>/retry</code>;
-parents waiting on their work keep those waits. Sending new input lets a parent proceed while
-its retained child remains available in the background. Background jobs otherwise keep running,
-except those owned by a cancelled script. Explicit job cancellation and session shutdown stop
-work rather than leaving it running for later recovery.</p>
+questions. Nothing asks a model again until you continue with <code>/retry</code> or send new input: results
+that arrive meanwhile wait, and reach their agent with its next request. A response already
+recorded when the interrupt lands stands. Delegated child agents, including ones that had yet to
+start, retain their conversations and continue with <code>/retry</code>; parents waiting on their work keep
+those waits. Sending new input breaks those waits at every depth: the session proceeds, and each
+retained child remains interrupted in the background, where <code>/retry</code> can still continue it.
+Cancelling a job an interrupted agent is waiting on lets that agent go on with the result.
+Background jobs otherwise keep running, except those owned by a cancelled script. Explicit job
+cancellation stops work for good. Closing a session interrupts it the same way and cancels its
+other running jobs: child agents that were running, or already interrupted, can still be continued
+after it reopens, as can a delegation it stopped before the child started, which asks for
+approval again. Closing a session does not change its last activity time: as after a crash, work
+that closing cuts short ends when the session last did something. A session whose journal Skyhook
+cannot write stops the same way, as if its process had crashed, and reopens as one would.</p>
 <p>Child agents must finish or cancel their owned work before completing. The root agent may leave
 background services running while the session remains open, but they do not survive shutdown
 or a process restart. On resume, unfinished jobs are marked interrupted and job IDs are not
-reused. Retained child agents can be resumed; ordinary process and tool jobs cannot. Pending
-child replies remain available after resume. See <a href="#jobs-and-agents">jobs and agents</a>
-for delegation, notifications, and cancellation from scripts.</p>
+reused. Requests, jobs, and tool calls the previous process left running are recorded as ending
+when it last did something, so their durations stop there and reopening a session does not change
+its last activity time. Retained child agents can be resumed; ordinary process and tool jobs
+cannot. Pending child replies and job notifications remain available after resume and reach their
+agent with its next request: reopening a session does not start one. A session reopened with any
+waiting for its main agent resumes interrupted once it runs, so <code>/retry</code> delivers them as a new
+message would. See
+<a href="#jobs-and-agents">jobs and agents</a> for delegation, notifications, and cancellation
+from scripts.</p>
 <h2 id="conversation-compaction"><a class="header" href="#conversation-compaction">Conversation compaction</a></h2>
 <p>Skyhook uses the current model to summarize older conversation when context grows large. The
 continuation is intended to preserve the task, instructions, plans, findings, unfinished work,
 and where to resume. Recent conversation and the original calls for active work remain in
 context; historical tool calls are not executed again. Compaction also reconciles the agent’s
 todo list against the conversation without changing child-agent lists.</p>
-<p>Automatic compaction runs directly after a successful model response when:</p>
+<p>A successful model response triggers automatic compaction when:</p>
 <pre><code class="language-text">U = input tokens + cached input tokens + output tokens
 U &gt;= 0.9 × (max_context - max_output)
 </code></pre>
-<p>This is the completed response’s reported usage, not cumulative session usage or an estimate
-of the next request. Without reported usage, there is no estimate-based automatic trigger.
+<p>This is the completed response’s reported usage, not cumulative session usage. Skyhook does not
+estimate token counts, so without reported usage there is no automatic trigger.
 Compaction runs before executing tool calls from that response. The summarizer sees the entire
 latest response and its pending calls, explicitly marked as not yet executed. It reconciles the
 current todo list with the conversation and any pending todo changes; its reconciled list takes
@@ -554,12 +642,19 @@ normally; a scripted replacement can update the reconciled list. The original ca
 results are included in the first normal post-compaction request; the summary does not consume
 those future results. If compaction fails, the turn ends and those calls are recorded as not
 executed.
-Text-only responses can also trigger compaction before the turn returns.</p>
+A text-only response returns at once; the compaction it triggers runs before the agent’s next
+model request, also after the session is closed and reopened. A compaction that is interrupted,
+or whose summaries could not be used, stays due and runs again before the agent’s next request,
+for example when you continue. One that fails for another reason, such as a provider error, is
+not tried again, and the next request is sent without it. Switching model or mode clears a due
+compaction: from then on, the new model’s reported usage decides.</p>
 <p>The provider still decides whether a request fits. A recognized context-overflow error can
 trigger compaction and retry, including for an oversized initial request or new tool output.
 Normal requests keep the configured <code>max_output</code>. Compaction requests can use a smaller output
-limit when less context space remains. The context meter in the terminal is an estimate
-for display, not the automatic compaction trigger. Configure
+limit when less context space remains, and a summary the provider rejects as too large is retried
+with half the output reserve, then with about the older half of the summarized history left out.
+After an overflow, compaction keeps only the latest exchange beside the summary. The context meter
+in the terminal shows the last reported occupancy. Configure
 <a href="#providers-and-models">model limits</a> to match the endpoint you use.</p>
 <p>Compaction does not execute tools. It can retain selected job results as well as recent
 conversation; full saved results remain accessible through
@@ -569,10 +664,10 @@ summary can still be incomplete or inaccurate.</p>
 <p>Invalid, truncated, cancelled, or unsaved summaries leave the preceding context and todos
 active. Every valid, successfully persisted summary installs a checkpoint and its reconciled
 todos, even if the replacement context is not smaller. The terminal reports compaction start,
-estimated context size, and failures without printing the summary. Eligible compaction failures,
-such as a truncated or invalid summary, have a bounded retry policy, separate from transient
-model failures, which retry until success or cancellation. A refused or aborted summary is not
-retried. See
+the reported occupancy that triggered it, and failures without printing the summary. Eligible
+compaction failures, such as a truncated or invalid summary, have a bounded retry policy,
+separate from transient model failures, which retry until success or cancellation. A refused
+summary is not retried. See
 <a href="#model-failure-recovery">model failure recovery</a>.</p>
 <p>For persistence and request reconstruction internals, see
 <a href="#library-architecture">library architecture</a> and
@@ -580,13 +675,13 @@ retried. See
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="permissions-and-capabilities"><a class="header" href="#permissions-and-capabilities">Permissions and capabilities</a></h1>
 <h2 id="approval-policy"><a class="header" href="#approval-policy">Approval policy</a></h2>
-<p><code>--approve-all</code> or
-<code>approve_all: true</code> bypasses approval prompts. Subject to the granted capabilities, the default
-CLI auto-allows reads and agent operations, as well as writes inside the root workspace.
-Execution, HTTP requests, SSH access, target changes, and writes outside the root workspace
-require approval. When the <code>interactive</code> capability is granted, questions and SSH authentication
-appear in the interface. Otherwise operations needing human input fail
-immediately; <code>approve_all</code> bypasses tool approvals but never restores questions or authentication.</p>
+<p><code>--approve-all</code> or <code>approve_all: true</code> bypasses approval prompts. Subject to the granted
+capabilities, the default CLI auto-allows reads and agent operations, as well as writes inside the
+root workspace. Execution, HTTP requests, SSH access, target changes, and writes outside the root
+workspace require approval. When the <code>interactive</code> capability is granted, questions and
+authentication prompts (SSH, and <code>sudo</code> in commands, locally or on targets) appear in the
+interface. Otherwise operations needing human input fail immediately; <code>approve_all</code> bypasses tool
+approvals but never restores questions or authentication.</p>
 <p>Filesystem tools and command <code>cwd</code> accept absolute paths or relative paths including <code>..</code>.
 The workspace is a base directory, not a security boundary. Filesystem path authorization and
 human approval are distinct: the default CLI read policy auto-allows reads even when their
@@ -596,13 +691,15 @@ its own approval requirements. Permissions name paths as text, so an operation w
 names a path or workspace that is not valid Unicode is refused rather than approved under an
 approximate name.</p>
 <p>Choose <strong>Allow once</strong> to approve only the current operation. When offered, <strong>Allow proposed
-scope</strong> saves the displayed grant for later operations in the same session, including after
-resume; inspect <strong>Details</strong> before granting it. Path grants apply only to the approved target
-and access mode. Directory grants cover descendants; read and write grants remain separate.
+scope</strong> saves the displayed grant for later operations while the session stays open; reopening
+the session asks again. Inspect <strong>Details</strong> before granting it. Path grants apply only to the
+approved target and access mode. Directory grants cover descendants; read and write grants remain
+separate.
 Process execution remains subject to confirmation on each invocation. These defaults apply to
 the CLI; <a href="#embedding">library hosts</a> can supply a different approval policy.</p>
 <p>Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
-queued job while authorization is pending. A denial preserves its reason and marks the rejected
+queued job while authorization is pending. A prompt is withdrawn once nothing waits for it, as
+when its operation is cancelled or its session stops. A denial preserves its reason and marks the rejected
 operation with <code>code: "permission_denied"</code>; it does not undo work that a
 containing script already performed.
 Agents must not circumvent a denial through another tool or route. For programmatic failure
@@ -656,20 +753,27 @@ cannot be given to a child. A workspace
 config that declares a mode replaces the whole definition of a user-config mode with that name;
 modes it does not name are kept, in declaration order.</p>
 <p><code>--mode NAME</code> selects the starting mode; without it the terminal starts in the mode last used in
-that workspace, and a batch job in <code>default_mode</code>. In the terminal, <code>Tab</code>/<code>Shift+Tab</code> in the composer (or
-<code>/mode</code>) choose the mode the next message is sent in; the footer shows it. A change takes effect
-with that message and forfeits the provider’s prompt cache for the next request. Child agents keep what they start with: the capabilities and instructions of the mode their
-parent chose for them, or otherwise the capabilities their parent holds and no mode instructions.
-Background jobs and scripts already running keep their capabilities too. A session can only hold capabilities
-that some configured mode grants, and MCP servers start under that union, so switching modes
-never starts or stops a server. Approvals granted earlier stay recorded but cannot be used while
-the mode lacks their capability. A resumed session continues in the mode it was last in. A
-session records each mode’s definition the first time it is used and keeps it: editing or
-removing that mode in the configuration does not change the session, while modes added later
-can still be selected. A resumed session is also never granted more than it started with, so a
-batch session reopened in the terminal stays without <code>interactive</code>. Because <code>general</code> is always
-present, redeclare it with a narrower list if the terminal should never be able to switch to its
-default capabilities.
+that workspace, and a batch job in <code>default_mode</code>. In the terminal, <code>Tab</code>/<code>Shift+Tab</code> in the
+composer (or <code>/mode</code>) choose the mode the next message is sent in; the footer shows it. Cycling
+modes only makes that choice: it never changes the session. A change takes effect with that message
+and forfeits the provider’s prompt cache for the next request. Child agents keep what they start
+with: the capabilities and instructions of the mode their parent chose for them, or otherwise the
+capabilities their parent holds and no mode instructions. Background jobs and scripts already
+running keep their capabilities too. A session can only hold capabilities that some configured mode
+grants, and MCP servers start under that union, so switching modes never starts or stops a server.
+Approvals granted earlier stay granted but cannot be used while the mode lacks their capability.</p>
+<p>A resumed session continues in the mode it was last in, as the current configuration defines it:
+the configuration decides what a reopened session’s modes grant, more or less than before, and a
+batch session reopened in the terminal gains <code>interactive</code>. Opening a session whose modes the
+configuration has since changed or removed shows a warning and changes nothing, and neither do
+renaming it or cancelling a job. The change applies with the next work that runs the root agent: a
+prompt, retry, continue, script or job delivery. It is recorded together with the message that
+work commits, or just before a script starts. A root agent whose mode was removed moves to the
+default mode. Child agents it already started keep what they started with, within what the
+configuration still allows. The session’s history keeps every
+definition of a mode it used, so earlier entries still show what they ran under. Because <code>general</code>
+is always present, redeclare it with a narrower list if the terminal should never be able to switch
+to its default capabilities.
 Continuing a failed or interrupted root turn also applies a newly chosen mode.</p>
 <p>Capabilities gate both tool discovery and invocation, including JavaScript. Approval policies and
 cached grants cannot restore a missing capability. Ungated orchestration tools remain available even
@@ -803,10 +907,13 @@ A working-directory override is separate from the target’s configured workspac
 or saved-output inspection failure is not necessarily a failure of the command on the remote
 machine.</p>
 <p>Prefer these named targets to manually running <code>ssh</code>. A tool that needs an SSH route requests
-approval before any probe, authentication, or shim deployment. A saved
+approval before any probe, authentication, or shim deployment. A
 <a href="#approval-policy">route grant</a> applies across tools and workspaces, so
 reconnecting an unchanged route needs no new approval. Changing a target or any hop in its route
-invalidates the affected grant.</p>
+invalidates every grant naming it, whatever the resource, and stops connections still starting
+over the old route; an operation waiting for approval or a connection is planned again and asks
+about the new definition. An operation already running over the old route finishes there, but any
+further approval it asks for is refused.</p>
 <p>JavaScript orchestration and the session log stay on the host; nested tool calls use the
 selected target and workspace. For remote execution internals and shim builds, see
 <a href="#remote-transport-and-shims">remote transport and shims</a>.</p>
@@ -919,24 +1026,15 @@ fallback.</p>
 <p>Missing optional user files are fine: a complete workspace-only configuration can be used.
 A broken user file is not silently treated as missing if no fallback succeeds. The effective
 configuration must be valid; defaults are applied <strong>after merging</strong>.</p>
-<p>Mappings merge recursively; sequences and scalar values replace the earlier value. The exception is
-<strong>named entries under <code>targets</code> and <code>modes</code></strong>: a workspace entry replaces the <em>whole</em> user
-entry of the same name, without inheriting omitted fields. For example, <code>targets.build</code>
-replaces that target’s SSH, authentication, workspace, and routing settings; <code>modes.general</code>
-replaces that mode’s capabilities, instructions, and hint. Other named entries remain available.
-A provider entry that changes <code>dialect</code> likewise replaces the earlier provider’s settings, which
-belong to the other dialect, while the models declared under it still merge by name, keeping their
-profile, <code>codec</code>, and placements but not the earlier dialect’s fields. Within a
-provider, a later layer replaces <code>api_key</code> and each <code>headers</code> value whole, and likewise each
-convention choice (<code>cache_key</code>, <code>output_limit</code>, <code>reasoning_effort</code>, <code>reasoning_replay</code>,
-<code>tool_stream</code>, <code>user_id</code>) directly on the provider or model: a workspace
-<code>api_key: {command: ...}</code> or <code>cache_key: {body: ...}</code> takes the place of a user <code>{env: ...}</code> or
-<code>{header: ...}</code> rather than combining with it. An explicit <code>null</code> replaces the earlier value: it
-clears a nullable field, but is not a deletion operator for map entries. Required fields and named
-entries must still have valid values.</p>
-<p>Layers merge first; only then does each model inherit the request settings it omits from its
-provider (see <a href="#provider-defaults-and-model-settings">provider defaults and model settings</a>).
-An explicit <code>null</code>, <code>false</code>, or <code>[]</code> stays explicit through layering.</p>
+<p>The workspace file overlays the user file key by key, and each key’s value is replaced whole. The
+exception is the named maps <code>providers</code>, <code>modes</code>, <code>targets</code>, and <code>mcp</code>. These merge by name, and each
+entry comes whole from the last file that defines it. A workspace entry replaces the user entry of
+the same name without inheriting its omitted fields, and entries with other names stay available.
+For example, a workspace <code>providers.openai</code> must repeat the dialect, endpoint, credentials, and
+every model it keeps. A replaced entry keeps its position in the user file’s order. Entries only
+the workspace defines come after the user’s.</p>
+<p>An explicit <code>null</code> is a value, not a deletion: <code>providers: null</code> or <code>providers.openai: null</code> makes
+the configuration invalid rather than removing entries.</p>
 <h3 id="example-user-models-workspace-targets"><a class="header" href="#example-user-models-workspace-targets">Example: user models, workspace targets</a></h3>
 <p>Keep providers, with their models, in the selected user <code>config.yaml</code>:</p>
 <pre><code class="language-yaml">providers:
@@ -977,7 +1075,7 @@ targets:
     host: "new-build.example.com"
     workspace: "/srv/project"
 </code></pre>
-<p>The effective configuration retains <code>providers.openai</code>, <code>models.default</code>, and <code>targets.bastion</code>.
+<p>The effective configuration retains <code>providers.openai</code>, with its <code>default</code> model, and <code>targets.bastion</code>.
 A named mode or target is replaced whole, not merged: <code>modes.general</code> grants exactly the listed
 capabilities, and <code>targets.build</code> uses the new host and workspace,
 with default authentication/routing behavior: neither the old key nor <code>via: "bastion"</code> survives.
@@ -1018,7 +1116,8 @@ to the old format. Use <code>skyhook dump config</code> to validate and inspect 
 <p>Relative MCP <code>cwd</code> values resolve against the directory of the <strong>source file defining that
 value</strong>. A user-defined <code>cwd</code> keeps its user-file base when other MCP fields are overlaid;
 a workspace-defined <code>cwd</code> uses the workspace config’s directory (<code>&lt;workspace&gt;/.skyhook</code>),
-not the workspace root.</p>
+not the workspace root. An MCP server without <code>cwd</code>, from either file, starts in the session
+workspace rather than the directory <code>skyhook</code> was launched from.</p>
 <p>The CLI always stores and discovers sessions in <code>&lt;workspace&gt;/.skyhook/sessions</code>, including
 headless execution and resume. It does not search other workspaces or honor <code>session_root</code> overrides.
 Remote paths resolve on the selected <a href="#execution-targets">execution target</a>.
@@ -1090,16 +1189,27 @@ providers:
   openai:
     codec: "responses"
     dialect: "openai"
-    base_url: "https://api.openai.com/v1"
+    # base_url defaults to the dialect's own service; name it only for a proxy or mirror:
+    # base_url: "https://api.openai.com/v1"
     api_key:
       env: "OPENAI_API_KEY"
     # Reasoning summaries need a verified OpenAI organisation:
-    # reasoning_summary: unsupported
+    # reasoning_summary: null
+    # Responses-only selections, sent only when set. Availability depends on the
+    # endpoint, model, and account; faster tiers can cost more.
+    # service_tier: "priority"         # wire tier ID, sent as written
+    # Cybersecurity access program (standard, daybreak_blue, or daybreak_red); the
+    # model and account must be eligible: https://developers.openai.com/api/docs/guides/daybreak
+    # access_programs:
+    #   cyber: "daybreak_blue"
     # Published model limits; smaller budgets can be chosen for cost/latency.
     models:
       # https://developers.openai.com/api/docs/models/gpt-5.6-sol
       openai:
         model: "gpt-5.6-sol"
+        # Explicit prompt-cache checkpoints, for endpoints and models that support them:
+        # https://developers.openai.com/api/docs/guides/prompt-caching
+        # explicit_caching: true
         reasoning: "high"
         max_context: 1050000
         max_output: 128000
@@ -1108,7 +1218,7 @@ providers:
   anthropic:
     codec: "messages"
     dialect: "anthropic"
-    base_url: "https://api.anthropic.com/v1"
+    # base_url: "https://api.anthropic.com/v1"
     # Any value that may hold a secret (api_key or a header) takes one of
     # three forms: written literally, read from the environment when the provider is
     # built, or produced by a command run via /bin/sh -c on the first request (trimmed
@@ -1123,23 +1233,24 @@ providers:
     # Cache breakpoints default to five minutes; the hour costs more to write:
     # cache_ttl: "1h"
     models:
-      # https://platform.claude.com/docs/en/models/sonnet-4-6/overview
-      sonnet:
-        model: "claude-sonnet-4-6"
+      # https://platform.claude.com/docs/en/about-claude/models/overview
+      opus:
+        model: "claude-opus-5-5"
         reasoning: "high"
         max_context: 1000000
         max_output: 128000
         supports_images: true
 
-  # Run `skyhook auth login` (or `skyhook auth login --headless`) first.
+  # Run `skyhook auth login codex` (or `skyhook auth login codex --headless`) first.
   # Credentials belong to Skyhook; official Codex client credentials are never accessed.
   codex:
     codec: "responses"
     dialect: "codex"
     # The service and its OAuth issuer default to OpenAI's; name them only for a mirror:
-    # base_url: "https://chatgpt.com/backend-api/codex"
+    # base_url: "https://chatgpt.com/backend-api"
     # auth_url: "https://auth.openai.com"
     # Stored credentials are bound to the auth_url; changing it requires a new login.
+    # service_tier and access_programs work here too, as for openai above.
     models:
       # Codex's catalog advertises a maximum context of 872000 (default: 272000).
       # https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json
@@ -1156,7 +1267,6 @@ providers:
   # openrouter:
   #   codec: "chat_completions"
   #   dialect: "openrouter"
-  #   base_url: "https://openrouter.ai/api/v1"
   #   api_key:
   #     env: "OPENROUTER_API_KEY"
   #   routing:
@@ -1173,8 +1283,9 @@ providers:
 
   # A LiteLLM virtual key is a bearer token for every codec, including messages.
   # upstream asserts the family behind an alias; configure actual routing in LiteLLM.
+  # Claude behind messages keeps its signed thinking across requests.
   # proxy:
-  #   codec: "chat_completions"
+  #   codec: "messages"
   #   dialect: "litellm"
   #   base_url: "https://litellm.example.com/v1"
   #   api_key:
@@ -1321,12 +1432,12 @@ Different models on one provider may use different supported codecs:</p>
 <tr><th>Dialect</th><th>Codecs</th><th>Use for</th></tr>
 </thead>
 <tbody>
-<tr><td><code>compatible</code></td><td>any</td><td>Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only <code>base_url</code>. A key is sent as each API specifies: a bearer token, or <code>x-api-key</code> on <code>messages</code>.</td></tr>
-<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary: unsupported</code> (default <code>requested</code>) for an unverified organisation (Responses only), <code>organization</code>, <code>project</code>.</td></tr>
-<tr><td><code>anthropic</code></td><td><code>messages</code></td><td><code>https://api.anthropic.com/v1</code>. Extra fields: <code>workspace_id</code>, <code>cache_ttl: "5m"</code> or <code>"1h"</code>.</td></tr>
-<tr><td><code>codex</code></td><td><code>responses</code></td><td>The ChatGPT subscription service; no <code>api_key</code>—run <code>skyhook auth login</code>. <code>base_url</code> defaults to <code>https://chatgpt.com/backend-api/codex</code> and the extra field <code>auth_url</code> to <code>https://auth.openai.com</code>; set them only for a mirror.</td></tr>
-<tr><td><code>openrouter</code></td><td>any</td><td><code>https://openrouter.ai/api/v1</code>. Reasoning effort and returned reasoning follow OpenRouter’s conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: <code>routing</code> (Chat only: <code>order</code>, <code>allow_fallbacks</code>, <code>require_parameters</code>, <code>data_collection: "allow"</code> or <code>"deny"</code>, <code>quantizations</code>, <code>zdr</code>, <code>fallback_models</code>) and <code>cache_ttl: "5m"</code> or <code>"1h"</code>. A response schema always sets <code>require_parameters</code>.</td></tr>
-<tr><td><code>litellm</code></td><td>any</td><td>A LiteLLM proxy; <code>api_key</code> is the virtual key, sent as a bearer token for every codec, including <code>messages</code>. Each model needs <code>upstream: "openai"</code>, <code>"anthropic"</code> or <code>"bedrock"</code> after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; <code>messages</code> behind an OpenAI upstream goes through the proxy’s translation, which drops reasoning. Optional <code>tags</code> select LiteLLM’s tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session.</td></tr>
+<tr><td><code>compatible</code></td><td>any</td><td>Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only <code>base_url</code>. A key is sent as each API specifies: a bearer token, or <code>x-api-key</code> on <code>messages</code>. Extra field: <code>state_role</code> (default <code>user</code>).</td></tr>
+<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>base_url</code> defaults to <code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary</code> (Responses only): <code>"auto"</code> (default), <code>"concise"</code> or <code>"detailed"</code>, or <code>null</code> to request none for an unverified organisation; <code>organization</code>, <code>project</code>.</td></tr>
+<tr><td><code>anthropic</code></td><td><code>messages</code></td><td><code>base_url</code> defaults to <code>https://api.anthropic.com/v1</code>. Extra fields: <code>workspace_id</code>, <code>cache_ttl: "5m"</code> or <code>"1h"</code>, <code>state_role</code> (default <code>system</code>).</td></tr>
+<tr><td><code>codex</code></td><td><code>responses</code></td><td>The ChatGPT subscription service; no <code>api_key</code>—run <code>skyhook auth login &lt;provider&gt;</code>. <code>base_url</code> defaults to the ChatGPT backend root <code>https://chatgpt.com/backend-api</code> and the extra field <code>auth_url</code> to <code>https://auth.openai.com</code>; set them only for a mirror.</td></tr>
+<tr><td><code>openrouter</code></td><td>any</td><td><code>base_url</code> defaults to <code>https://openrouter.ai/api/v1</code>. Reasoning effort and returned reasoning follow OpenRouter’s conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: <code>routing</code> (Chat only: <code>order</code>, <code>allow_fallbacks</code>, <code>require_parameters</code>, <code>data_collection: "allow"</code> or <code>"deny"</code>, <code>quantizations</code>, <code>zdr</code>, <code>fallback_models</code>), <code>cache_ttl: "5m"</code> or <code>"1h"</code>, and <code>state_role</code> (default <code>user</code>). A response schema always sets <code>require_parameters</code>.</td></tr>
+<tr><td><code>litellm</code></td><td>any</td><td>A LiteLLM proxy; <code>api_key</code> is the virtual key, sent as a bearer token for every codec, including <code>messages</code>. Each model needs <code>upstream: "openai"</code>, <code>"anthropic"</code> or <code>"bedrock"</code> after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Behind <code>anthropic</code>, Chat replays signed thinking and takes prompt caching. Behind <code>openai</code>, Chat and Responses take OpenAI’s conventions, with neither. Behind <code>bedrock</code>, which serves both families, they take OpenAI’s conventions too, but Chat still replays the signed thinking the proxy returns. <code>messages</code> behind an Anthropic upstream reaches the service as sent and gets the <code>anthropic</code> dialect’s conventions: turn-scoped system state, signed thinking kept, and the betas both need, which the proxy forwards. Behind Bedrock it does not, since LiteLLM drops the turn-scoped beta on its Bedrock path; behind OpenAI it goes through the proxy’s translation, which drops reasoning. Chat, and <code>messages</code> behind Bedrock, drop superseded state, which breaks models that bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): use <code>messages</code> behind Anthropic for them, or <code>state_mode: persist</code>. Each conversation’s identity rides <code>x-litellm-session-id</code>, which LiteLLM’s session affinity and spend logs key on but which it forwards to no service; Chat and Responses behind <code>openai</code> or <code>bedrock</code> also send it as <code>prompt_cache_key</code>, which LiteLLM passes on for the service’s own cache affinity. LiteLLM refuses <code>prompt_cache_key</code> for every model it serves through Bedrock’s Converse API: Claude, Nova, Llama, Mistral, and OpenAI-family models such as GPT-OSS unless they are routed to Bedrock’s OpenAI endpoint. Serve Claude through <code>messages</code>, whatever its upstream. For the others, send the identity in the header alone with <code>cache_key: {header: "x-litellm-session-id"}</code>. Optional <code>tags</code> select LiteLLM’s tag-based routing and label its spend logs. Extra field: <code>state_role</code> (default <code>system</code> for <code>messages</code> behind Anthropic, <code>user</code> otherwise).</td></tr>
 </tbody>
 </table>
 </div>
@@ -1349,7 +1460,7 @@ directly beside <code>model</code>. To migrate an older configuration, move each
 </thead>
 <tbody>
 <tr><td>Provider only</td><td><code>dialect</code>, <code>base_url</code>, <code>api_key</code>, <code>headers</code>, <code>startup_timeout_secs</code>, <code>read_idle_timeout_secs</code>; Codex’s <code>auth_url</code>.</td></tr>
-<tr><td>Provider defaults or direct model settings</td><td><code>codec</code>; all placement selections listed below; the dialect’s request fields: OpenAI’s <code>reasoning_summary</code>, <code>organization</code>, <code>project</code>; Anthropic’s <code>workspace_id</code>, <code>cache_ttl</code>; OpenRouter’s <code>routing</code>, <code>cache_ttl</code>; LiteLLM’s <code>upstream</code>, <code>tags</code>.</td></tr>
+<tr><td>Provider defaults or direct model settings</td><td><code>codec</code>; all placement selections listed below; the Responses settings <code>service_tier</code>, <code>access_programs</code>, <code>explicit_caching</code>; the dialect’s request fields: OpenAI’s <code>reasoning_summary</code>, <code>organization</code>, <code>project</code>; Anthropic’s <code>workspace_id</code>, <code>cache_ttl</code>, <code>state_role</code>; OpenRouter’s <code>routing</code>, <code>cache_ttl</code>, <code>state_role</code>; LiteLLM’s <code>upstream</code>, <code>tags</code>, <code>state_role</code>; Compatible’s <code>state_role</code>.</td></tr>
 <tr><td>Model only</td><td><code>model</code>, <code>reasoning</code>, <code>max_context</code>, <code>max_output</code>, <code>supports_images</code>, <code>state_mode</code>, <code>hint</code>.</td></tr>
 </tbody>
 </table>
@@ -1357,9 +1468,16 @@ directly beside <code>model</code>. To migrate an older configuration, move each
 <p>Missing model settings inherit from the provider. Explicit values win even when they are <code>false</code>,
 <code>[]</code>, or a setting’s usual default. Lists replace inherited lists rather than append. Under
 OpenRouter’s <code>routing</code>, only declared members change: a model’s <code>order</code> replaces the inherited
-order while an undeclared <code>allow_fallbacks</code> still inherits. For nullable settings, <code>null</code> clears
-an inherited value; for example, <code>organization: null</code> removes the organization header and
-<code>routing: null</code> removes routing preferences.</p>
+order while an undeclared <code>allow_fallbacks</code> still inherits. The same leaf-by-leaf inheritance
+applies to <code>access_programs</code>: <code>{}</code> inherits its leaves, rather than clearing the object.</p>
+<p>Every request setting in the table above reads the same way, apart from lists. Left out, it
+inherits, and with nothing to inherit takes its default. An explicit <code>null</code> sends nothing: <code>organization: null</code> removes the
+organization header, <code>routing: null</code> removes routing preferences, <code>reasoning_summary: null</code>
+requests no summaries, and a placement selection of <code>null</code> places nothing. A setting that always
+sends something, such as <code>state_role</code> or <code>reasoning_effort</code>, refuses <code>null</code>; leave it out to take
+its default. Lists, such as LiteLLM’s <code>tags</code>, refuse <code>null</code> too: <code>[]</code> is the empty list. A
+placement selection’s list of locations is never empty; <code>null</code> is how it places nothing.
+Provider-only settings differ: <code>startup_timeout_secs: null</code>, for one, takes the default.</p>
 <p>Every model must have <code>codec</code>, and LiteLLM models must also have <code>upstream</code>, <strong>after inheritance</strong>.
 A provider may omit either if every model supplies it. Defaults and compatibility checks apply to
 each effective model, not to the provider defaults in isolation. Unknown fields, provider-only
@@ -1391,6 +1509,38 @@ models in one provider instance, regardless of their request settings.</p>
 </code></pre>
 <p>Configure the aliases and routing in LiteLLM itself; <code>upstream</code> tells Skyhook which request and
 reasoning conventions to use for each alias.</p>
+<h3 id="responses-settings"><a class="header" href="#responses-settings">Responses settings</a></h3>
+<p>Any dialect serving <code>codec: "responses"</code> accepts three optional settings, as provider defaults
+or beside <code>model</code>. All are unset by default, and each is sent only when selected. A backend
+serving Responses need not accept them; check that the endpoint, model, and account support a
+setting before selecting it. Other codecs refuse a selection, so a model that switches away from
+Responses must clear inherited ones with <code>null</code>.</p>
+<ul>
+<li><code>service_tier</code> is the backend’s tier ID, such as <code>priority</code>, <code>flex</code>, or <code>ultrafast</code>. It is
+sent exactly as written: Skyhook does not translate client aliases such as <code>fast</code>. Faster
+tiers can cost more or use more of a subscription; see
+<a href="https://learn.chatgpt.com/docs/agent-configuration/speed">ChatGPT speed</a>.</li>
+<li><code>access_programs.cyber</code> requests a cybersecurity access program: <code>standard</code>, <code>daybreak_blue</code>,
+or <code>daybreak_red</code>. The model and account must be eligible for the program; it does not grant
+entitlement, and other safeguards still apply. Some models take a different wire value from
+the approval it needs: <code>gpt-6-astra</code> and <code>gpt-6.1-sol</code> take <code>daybreak_blue</code> but require Daybreak
+Red entitlement. See the <a href="https://developers.openai.com/api/docs/guides/daybreak">Daybreak guide</a>.</li>
+<li><code>explicit_caching: true</code> switches the request to explicit prompt caching. Skyhook marks
+checkpoints at the end of the stable history and at earlier turns, never on the changing
+runtime state, so later requests can reuse the prefix. Requests with no stable history, such
+as compaction, are not cached. Left unset, the backend’s automatic caching is unchanged. See
+the <a href="https://developers.openai.com/api/docs/guides/prompt-caching">prompt-caching guide</a> for
+supported models and pricing.</li>
+</ul>
+<pre><code class="language-yaml">astra:
+  model: "gpt-6-astra"
+  max_context: 1050000
+  max_output: 128000
+  service_tier: "priority"
+  access_programs:
+    cyber: "daybreak_blue"
+  explicit_caching: true
+</code></pre>
 <h3 id="placement-selections"><a class="header" href="#placement-selections">Placement selections</a></h3>
 <p>A server that deviates from its dialect’s presets can select placements at either level:</p>
 <pre><code class="language-yaml">providers:
@@ -1398,42 +1548,45 @@ reasoning conventions to use for each alias.</p>
     codec: "chat_completions"
     dialect: "compatible"
     base_url: "http://127.0.0.1:8000/v1"
-    output_limit:                                # or: omitted
+    output_limit:                                # or null for none
       field: "max_tokens"
-    reasoning_replay:                            # the assistant-message key; or: omitted
+    reasoning_replay:                            # the assistant-message key; or null
       field: "reasoning"
-    cache_key:                                   # or `header: "x-session-id"`, or: omitted
-      body: "cache_salt"
+    cache_key:                                   # one location, a list of them, or null
+      - body: "cache_salt"
+      - header: "x-session-id"
     models:
       thinker:
         model: "served-name"
         max_context: 131072
         max_output: 32768
         reasoning_effort: "reasoning_effort"
-        output_limit: null                      # Restore the preset: max_completion_tokens.
+        output_limit: null                      # Send no output limit.
 </code></pre>
 <p>The selectable dimensions are <code>output_limit</code>, <code>reasoning_effort</code> (a field path), <code>reasoning_replay</code>
-and <code>tool_stream</code> (Chat Completions only), <code>cache_key</code>, and <code>user_id</code>. An absent model selection
-inherits. A <code>null</code> selection clears the inherited explicit placement and restores the preset for
-the model’s effective codec and dialect settings; it does not disable the convention. Use
-<code>omitted</code> to disable a placement that allows it. Changing <code>codec</code> does not discard inherited
-selections; clear or replace any that are not valid for the new codec.</p>
+and <code>tool_stream</code> (Chat Completions only), <code>cache_key</code>, and <code>user_id</code>. Each selection names one
+location or a nonempty list of distinct locations, and the value is written at every one. A selection left
+out inherits, and with nothing to inherit keeps the preset for the model’s effective codec and
+dialect settings; an explicit <code>null</code> places nothing. Changing <code>codec</code> does not discard inherited
+selections: set <code>null</code> for any the new codec has no place for, or replace them.</p>
 <p>A field path is dot-separated (<code>metadata.user_id</code>); <code>cache_key</code> and <code>user_id</code> carry the
 conversation identity.
 Paths must not name a field the codec writes itself (such as <code>model</code> or <code>messages</code>), and no two may
-overlap, including one inside another (<code>reasoning</code> and <code>reasoning.effort</code>). A <code>cache_key</code> header
+overlap, including one inside another (<code>reasoning</code> and <code>reasoning.effort</code>), within one selection or
+across two. A <code>cache_key</code> header
 must not be <code>accept</code>, <code>content-type</code>, or a header the codec sends itself (such as
 <code>anthropic-version</code> on <code>messages</code>). A <code>reasoning_replay</code>
-field moves the provider’s replay to another key in the same form. Messages requires an output
-limit, so <code>output_limit: omitted</code> is refused there.</p>
+field moves the provider’s replay to other keys in the same form. Messages requires an output
+limit, so <code>output_limit: null</code> is refused there, as is <code>reasoning_effort: null</code> everywhere.</p>
 <h2 id="context-and-output-budgets"><a class="header" href="#context-and-output-budgets">Context and output budgets</a></h2>
 <p>Every model profile requires <code>max_context</code> and <code>max_output</code>. Both must be positive, and
 <code>max_output</code> must be smaller than <code>max_context</code>. Prompt/history, reasoning, and generated
 text share the context window. Automatic <a href="#conversation-compaction">compaction</a>
-runs directly after a response when its reported input, cached input, and output tokens reach
+is triggered by a response whose reported input, cached input, and output tokens reach
 90% of <code>max_context - max_output</code>; it does not estimate the next request. Compaction precedes
-tool execution. The summarizer sees the pending calls, and their results reach the first
-post-compaction request intact; a pending <code>todo</code> replacement is superseded by its reconciled list.
+tool execution, or, after a final answer, the agent’s next request. The summarizer sees the
+pending calls, and their results reach the first post-compaction request intact; a pending <code>todo</code>
+replacement is superseded by its reconciled list.
 A <code>max_output</code> of at least 50% of <code>max_context</code> produces a startup warning for that model, whether
 or not it is selected: reserving that much output space leaves most of the window unused for
 input. The configuration remains valid.
@@ -1445,13 +1598,41 @@ using Skyhook with less than approximately <strong>128k tokens of <code>max_cont
 instructions, tool definitions, conversation, and compaction all need room. This is guidance,
 not an enforced minimum.</p>
 <p><code>state_mode</code> controls how per-request runtime state (date, active jobs, and todos) reaches the model.
-<code>dynamic</code> (the default) sends a fresh snapshot after the history on each request without appending
-it to the conversation.
-<code>persist</code> keeps each snapshot in the conversation. Use it for models that bind signed reasoning
-to the exact earlier conversation (such as Claude Fable 5.1), at the cost of keeping every snapshot in context until
-compaction. <code>none</code> sends no runtime state, except to a compaction summary, which needs the
-current todo list to reconcile it. See <a href="#todos-and-runtime-state">runtime state</a>
-for what the model receives.</p>
+<code>dynamic</code> (the default) sends a fresh state with each request; the model sees only the current one.
+<code>persist</code> keeps each state in the conversation, at the cost of keeping every one in context until
+compaction. Use it for models that bind signed reasoning to the exact earlier conversation (such
+as Claude Fable 5.1) when the provider cannot hide earlier state, for example Claude reached
+through a Chat Completions or Responses proxy. <code>none</code> sends no runtime state, except to a
+compaction summary, which needs the current todo list to reconcile it. See
+<a href="#todos-and-runtime-state">runtime state</a> for what the model receives.</p>
+<p>Runtime state is the harness speaking, so it never appears as tool output. A dialect’s
+<code>state_role</code> selects how it is sent:</p>
+<ul>
+<li><code>system</code> uses the protocol’s harness role: a system message on <code>messages</code>, a system or
+developer message on <code>chat_completions</code>, and a developer message on <code>responses</code>. Through
+<code>anthropic</code>, or <code>litellm</code> with an Anthropic upstream on <code>messages</code>, a <code>dynamic</code> state is a
+turn-scoped system message: the model reads it for one request, and afterwards it costs no input
+tokens but stays in the conversation, so models that bind thinking to the exact earlier
+conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) keep it with <code>dynamic</code> state.
+It needs a model that supports mid-conversation system messages (Claude Opus 4.8 and later,
+Fable, Sonnet 5.5, Haiku 5.5; not Sonnet 5). Other dialects send plain system messages and drop
+superseded state, as <code>user</code> does. On <code>messages</code>, a state with no valid place, such as right
+after an assistant turn, is not sent.</li>
+<li><code>user</code> sends state as user content, joining the user turn before it or as a turn of its own,
+for servers without a harness role mid-conversation, such as many open-model chat templates.
+Superseded state is then dropped, which changes the end of the conversation between requests.
+During a tool loop each state is a new user turn, so a chat template that keeps reasoning
+only for the latest user query drops the loop’s earlier reasoning after it, whatever the
+<code>state_mode</code>. For such models, enable the template’s option to keep earlier reasoning
+(Qwen’s <code>preserve_thinking</code>, for example).</li>
+</ul>
+<p><code>anthropic</code> defaults to <code>system</code>, as does <code>litellm</code> for <code>messages</code> behind an Anthropic upstream;
+<code>openai</code> and <code>codex</code> always use it, and <code>compatible</code>, <code>openrouter</code> and every other <code>litellm</code>
+combination default to <code>user</code>. Changing a provider’s <code>state_role</code> changes the conversation
+earlier reasoning was produced in, so that reasoning is not replayed afterward. Through
+<code>anthropic</code>, or <code>litellm</code> with an Anthropic upstream on <code>messages</code>, set <code>reasoning</code> to a level
+other than <code>off</code> on models that bind thinking: only then does Skyhook ask the service to drop a
+thinking block whose earlier conversation changed, rather than reject the request.</p>
 <p>The <a href="#complete-example">complete example</a> uses published hosted-model limits:</p>
 <div class="table-wrapper">
 <table>
@@ -1460,7 +1641,7 @@ for what the model receives.</p>
 </thead>
 <tbody>
 <tr><td>GPT-5.6 / GPT-5.6 Sol, OpenAI API</td><td style="text-align: right">1,050,000</td><td style="text-align: right">128,000</td><td><a href="https://developers.openai.com/api/docs/models/gpt-5.6-sol">Model documentation</a></td></tr>
-<tr><td>Claude Sonnet 4.6</td><td style="text-align: right">1,000,000</td><td style="text-align: right">128,000</td><td><a href="https://platform.claude.com/docs/en/models/sonnet-4-6/overview">Model documentation</a></td></tr>
+<tr><td>Claude Opus 5.5</td><td style="text-align: right">1,000,000</td><td style="text-align: right">128,000</td><td><a href="https://platform.claude.com/docs/en/about-claude/models/overview">Model overview</a></td></tr>
 <tr><td>GPT-5.6 Sol, Codex subscription</td><td style="text-align: right">872,000</td><td style="text-align: right">128,000 (not enforced)</td><td><a href="https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json">Codex model catalog</a></td></tr>
 </tbody>
 </table>
@@ -1560,9 +1741,9 @@ the context; from then on only signed blocks are sent.</p>
 replay their returned reasoning under <strong><code>reasoning_content</code> by default</strong>. Ordinary Chat responses
 without reasoning do not acquire an invented reasoning field.
 A server that spells the key differently selects it with <code>reasoning_replay</code> set to
-<code>field: "reasoning"</code>; <code>reasoning_replay: omitted</code> keeps reasoning local. The <code>openai</code> dialect never
-replays on Chat, since the official API rejects unknown message keys; <code>litellm</code> with a Claude
-upstream replays the signed thinking blocks the proxy returns, and <code>openrouter</code> replays its
+<code>field: "reasoning"</code>; <code>reasoning_replay: null</code> keeps reasoning local. The <code>openai</code> dialect never
+replays on Chat, since the official API rejects unknown message keys; <code>litellm</code> behind an
+<code>anthropic</code> or <code>bedrock</code> upstream replays the signed thinking blocks the proxy returns, and <code>openrouter</code> replays its
 <code>reasoning_details</code>; both are bound to the exact conversation like Messages thinking. As on
 Messages, unsigned reasoning is replayed until signed reasoning appears in the context. From then
 on, only signed thinking blocks are sent, and a turn’s <code>reasoning_details</code> are sent whole, in
@@ -1656,20 +1837,42 @@ configured separately.</p>
 quoting, comments, <code>export</code> declarations, and variable interpolation. A malformed or unreadable file
 fails startup without printing its contents.</p>
 <h2 id="codex-subscription-login"><a class="header" href="#codex-subscription-login">Codex subscription login</a></h2>
-<p>The <code>codex</code> provider uses <strong>Skyhook-owned</strong> OAuth credentials. Run <code>skyhook auth login</code> for browser
-authorization or <code>skyhook auth login --headless</code> for device authorization. <code>skyhook auth status</code>
-reports local login status for the configured issuer and <code>skyhook auth logout</code> removes Skyhook’s
-credentials. Login does not require a model configuration; when the discovered config has a
-<code>codex</code> provider with <code>auth_url</code>, login and token refresh use that issuer instead of
-<code>https://auth.openai.com</code>, and <code>base_url</code> likewise replaces <code>https://chatgpt.com/backend-api/codex</code>
-for requests. <code>auth_url</code> must use HTTPS (HTTP only on a loopback host) and carry no credentials,
-query, or fragment; a path prefix is kept. A configuration whose <code>codex</code> providers name different
-issuers is refused: one login serves one issuer. Skyhook never imports, reads, or modifies the
-official Codex client’s credential files. Secure Codex credential storage currently requires Unix;
-other platforms fail explicitly rather than writing tokens without private file permissions.</p>
-<p>Stored credentials are bound to the issuer that granted them. When a provider’s issuer differs, or
-the credentials were saved by an older Skyhook, requests fail without sending them and ask you to
-run <code>skyhook auth login codex</code> again.</p>
+<p>A <code>codex</code> provider uses <strong>Skyhook-owned</strong> OAuth credentials, one login per provider. Name the
+provider as it is configured: for a provider named <code>codex</code>, run <code>skyhook auth login codex</code> for browser
+authorization or <code>skyhook auth login codex --headless</code> for device authorization.
+<code>skyhook auth status codex</code> reports that provider’s local login status without contacting the
+service, so it cannot tell whether the service still accepts the login. <code>skyhook auth status codex --check</code> also presents the credentials to the service with the provider’s <code>headers</code>, refreshing
+them first if a request would, and reports the plan and rate-limit use it returns. It fails when
+the provider is not logged in or the service rejects the credentials. The check reads the account’s
+usage, which runs no model and spends no quota; that endpoint is not publicly documented by OpenAI, so what it
+reports may change. Several <code>codex</code> providers can sign in to different accounts or issuers
+independently. Login does not require the provider to have models.</p>
+<p>When the provider sets <code>auth_url</code>, login and token refresh use that issuer instead of
+<code>https://auth.openai.com</code>. <code>base_url</code> likewise replaces the ChatGPT backend root,
+<code>https://chatgpt.com/backend-api</code>. Requests go to <code>codex/responses</code> beneath it, and <code>--check</code> to
+<code>wham/usage</code>, so a mirror serves both beneath one root. <code>auth_url</code> must
+use HTTPS (HTTP only on a loopback host) and carry no credentials, query, or fragment; a path prefix
+is kept. Skyhook never imports, reads, or modifies the official Codex client’s credential files.
+Secure Codex credential storage currently requires Unix; other platforms fail explicitly rather than
+writing tokens without private file permissions.</p>
+<p>Credentials are kept in a <code>credentials/</code> directory next to the configuration file that defines the
+provider, as <code>&lt;provider&gt;.json</code>. For a provider in the user configuration that is
+<code>~/.config/skyhook/credentials/</code> (or under <code>$XDG_CONFIG_HOME/skyhook</code>). For a provider the workspace
+configuration defines, it is <code>&lt;workspace&gt;/.skyhook/credentials/</code>; keep that directory out of version
+control. For <code>--config path.yaml</code>, it is beside that file. Skyhook creates the directory when you
+first log in, readable only by you, and refuses to use one that grants any access to other users.
+Checking status or starting a session creates nothing there, except a missing lock file beside saved
+credentials.</p>
+<p>To sign a provider out, delete its <code>credentials/&lt;provider&gt;.json</code> while no session is using it.
+Nothing is revoked on the server, so this is also how to clear credentials for a provider you have
+removed from your configuration.</p>
+<p>A provider name becomes a file name, so it must contain no NUL character and be at most 250 bytes.
+On a case-insensitive file system, such as macOS by default, names that differ only in case (<code>Work</code>
+and <code>work</code>) share one credentials file; give such providers distinct names.</p>
+<p>Stored credentials are bound to the issuer that granted them. When a provider’s issuer differs,
+requests fail without sending them and name the command that signs it in again. That command
+selects the provider’s configuration file with <code>-c</code>, so it signs in the same entry the session used
+wherever you run it.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="mcp-servers"><a class="header" href="#mcp-servers">MCP servers</a></h1>
 <p>Configure Model Context Protocol servers in the top-level <strong><code>mcp</code></strong> mapping, with one named
@@ -1681,7 +1884,7 @@ legacy HTTP+SSE transport is not supported.</p>
     transport: "stdio"
     start_command: ["my-mcp-server", "--root", "/srv/project"]
     capabilities: ["read"]
-    cwd: "mcp-work"                  # Relative to the source config file's directory.
+    cwd: "mcp-work"                  # Relative to its config file's directory; default: workspace.
     env: { LOG_LEVEL: "warn" }        # Environment overrides for the launched process.
     startup_timeout_secs: 30         # Default; must be a positive integer.
     call_timeout_secs: 120           # Default; must be a positive integer.
@@ -1701,8 +1904,10 @@ absolute HTTP(S) <code>url</code>. It connects first, and only starts the option
 unreachable—not on authentication, protocol, or other server errors. <code>cwd</code> and <code>env</code> apply only to
 <code>start_command</code>; HTTP connections without a startup command must omit them. Relative <code>cwd</code> is
 resolved against the directory of the source configuration file that defines the value, not the
-agent workspace. When user and workspace config are layered, an inherited user <code>cwd</code> retains its
-user-file base; an overlaid workspace <code>cwd</code> uses <code>&lt;workspace&gt;/.skyhook</code>. Timeouts must be positive
+agent workspace. Each server entry comes whole from one file, so a user server’s <code>cwd</code> is relative to
+the user file’s directory and a workspace server’s to <code>&lt;workspace&gt;/.skyhook</code>. Without <code>cwd</code>, the
+command runs in the session workspace, whichever file defines the server; MCP commands always run on
+the session host, never on a remote target. Timeouts must be positive
 whole seconds. Unknown settings and invalid transport combinations are rejected. Environment
 values must be strings; quote numeric-looking values such as <code>WORKERS: "4"</code>.</p>
 <p>HTTP <code>headers_env</code> maps header names to environment-variable names. The variable’s complete value
@@ -1806,8 +2011,9 @@ final reply in the call’s <code>.result</code>, with no progress or later mess
 make another model request until its foreground calls return.</p>
 <p>Child names are scoped to their caller: <code>A</code> and <code>B</code> may each create a child named <code>worker</code>, but
 all scripts owned by <code>A</code> share <code>A</code>’s child-name scope. A child retains its name even after
-termination; send follow-ups to its existing job instead of launching a duplicate. A failed
-launch that never created a child does not permanently reserve the name.</p>
+termination; send follow-ups to its existing job instead of launching a duplicate. A launch
+that created no child holds no name: of two launches taking one name at once, the first to start
+its child keeps it.</p>
 <p>Each model-facing <code>ask</code> contains one <code>{id, prompt, options?}</code> question; independent concurrent calls are merged by the runtime. A child
 question batch changes its stable agent job to <code>waiting_input</code>; answer that job with
 <code>tool.job(id).send({value: answer})</code> in a script. For a merged batch, use
@@ -1849,8 +2055,9 @@ question has <code>state: "waiting_input"</code>; <code>jobs({job})</code> retur
 <code>presentation.question</code>, regardless of its size.</p>
 <p>Jobs normally follow <code>queued → running → completed</code>, optionally cycling through
 <code>waiting_input → running</code>; <code>failed</code>, <code>cancelled</code>, and <code>interrupted</code> are terminal alternatives.
-A <code>jobs({job})</code> read acknowledges a pending question or terminal result and suppresses duplicate
-automatic notification. Explicit reads remain repeatable, and <code>jobs</code> itself never waits; see
+A <code>jobs({job})</code> read acknowledges the question or result it returned, suppressing duplicate
+automatic notification; an outcome that arrives after the read is still notified. Explicit reads
+remain repeatable, and <code>jobs</code> itself never waits; see
 <a href="#waiting-for-background-work">waiting for background work</a>.
 Unanswered questions do not expire. Send answers to the stable child-agent job ID.</p>
 <p>Cancellation cascades through descendant jobs and agents and terminates managed command process
@@ -1895,7 +2102,7 @@ See <a href="#saved-job-output">saved job output</a> for inspection and paginati
 <h1 id="command-line-reference"><a class="header" href="#command-line-reference">Command-line reference</a></h1>
 <pre><code class="language-text">skyhook [OPTIONS]
 skyhook batch [OPTIONS] &lt;--prompt TEXT|--script PATH&gt;
-skyhook auth &lt;login|status|logout&gt; [codex]
+skyhook auth &lt;login|status&gt; &lt;PROVIDER&gt; [OPTIONS]
 skyhook dump [config|skills] [OPTIONS]
 skyhook stats &lt;SESSION_ID|--list&gt; [OPTIONS]
 </code></pre>
@@ -2040,17 +2247,19 @@ Names come from the job that spawned the agent. Model call counts
 cover agent turns only, while token figures include compaction requests. Sessions written by an
 earlier session format are refused with a nonzero exit.</p>
 <h2 id="authentication-commands"><a class="header" href="#authentication-commands">Authentication commands</a></h2>
-<pre><code class="language-sh">skyhook auth login
-skyhook auth login --headless
-skyhook auth status
-skyhook auth logout
+<pre><code class="language-sh">skyhook auth login codex
+skyhook auth login codex --headless
+skyhook auth status codex
+skyhook auth status codex --check
 </code></pre>
-<p>The optional provider argument currently accepts only <code>codex</code>, which is the default.
-<code>auth login --headless</code> selects device authorization rather than a browser; it is separate
-from <code>skyhook batch</code>. Login needs no configuration file; when one exists it must load, and login
-signs in to the <code>auth_url</code> its <code>codex</code> providers share (entries naming different ones are refused),
-or OpenAI’s issuer when none names one. <code>auth status</code> checks the stored credentials against that
-issuer; <code>auth logout</code> reads no configuration.
+<p>The argument names a configured provider whose dialect Skyhook signs in to; currently that is any
+<code>codex</code> provider. The configuration is found as for a session: <code>--workspace PATH</code> selects the
+workspace whose <code>.skyhook/config.yaml</code> overlays the user file, and <code>--config path.yaml</code> loads only
+that file. It must load and define the provider. <code>auth login --headless</code> selects device
+authorization rather than a browser; it is separate from <code>skyhook batch</code>. Login signs in to the
+provider’s <code>auth_url</code>. <code>auth status</code> checks that provider’s stored credentials against it without
+contacting the service; <code>--check</code> also presents them to the service in a request that spends no
+quota, and fails unless the provider is logged in and the service accepts them. To sign out, delete the provider’s credentials file.
 See <a href="#authentication">authentication</a> for credential ownership and storage.</p>
 <h2 id="related-settings"><a class="header" href="#related-settings">Related settings</a></h2>
 <p>The <a href="#configuration-overview">configuration overview</a> describes configuration paths
@@ -2470,9 +2679,15 @@ over-precise decimals, and out-of-range numbers such as <code>1e400</code> do no
 preview:</p>
 <ul>
 <li><strong>Text fields</strong>, strings reached only through objects of at most 100 members, such as <code>stdout</code>,
-file <code>content</code>, or <code>body.text</code>, each keep at most 100 lines or 8 KiB (8192 bytes), whichever
+file <code>content</code>, or <code>body.text</code>, each keep at most 200 lines or 16 KiB (16384 bytes), whichever
 comes first, counting UTF-8 content bytes before JSON escaping. Together they keep at most
-32 KiB; later strings are shortened like everything else.</li>
+64 KiB; later strings are shortened like everything else.</li>
+<li><strong>Command streams</strong>, the <code>stdout</code> and <code>stderr</code> text fields of <code>exec</code>, keep both ends within
+those limits: their first whole lines, up to 60 lines and 30% of the bytes, then a marker line
+such as <code>… lines 61–4860 omitted …</code>, then their last whole lines, up to 140 and the bytes the
+first lines left. The marker line is not part of the output and is not counted. A stream whose
+last line alone is over those bytes keeps only its start, like other text fields. An <code>exec</code>
+response a script returns keeps both ends of its streams in the script’s result too.</li>
 <li><strong>Everything else</strong> shares one 8 KiB preview budget, which also counts the shape and truncation
 records below. When it is exceeded, strings keep their first 256 bytes; if every element then
 fits, all are kept. Otherwise arrays keep their first elements, with one count shared by every
@@ -2495,6 +2710,8 @@ its deepest levels to <code>"{…}"</code> and <code>[count, "…"]</code>.</p>
 <ul>
 <li><code>{field, total_lines, next_start, next_offset?}</code> for a string, with the exact position to
 continue from; <code>next_offset</code> is present only when that position is inside a line.</li>
+<li><code>{field, total_lines, next_start, tail_start}</code> for a command stream shown around a marker line:
+lines <code>next_start</code> up to, but not including, <code>tail_start</code> were left out.</li>
 <li><code>{field, shown, total_elements, kept?}</code> for an array.</li>
 <li><code>{field, shown, total_members, kept?}</code> for an object.</li>
 <li><code>{field, cuts}</code> for further cuts within <code>field</code>, beyond the first 32 listed.</li>
@@ -2601,11 +2818,12 @@ become available as they are transferred; inspecting already-transferred output 
 reconnecting to the remote machine.</p>
 <p>The TUI’s automatic output view shows the structured result and previews any available captures
 not represented there. This exposes both process streams while live and preserves stderr and exit
-status on completion. Explicit field, page, and search selections remain selected; choose
-<strong>automatic output</strong> in the Saved output menu to return to automatic viewing. The menu lists up to
-100 fields one level below the one shown, from the page of it shown, starting with the result’s
-fields and captures, and the field above it; <strong>more fields</strong> shows the field from where the
-list stops, so the menu lists the rest.</p>
+status on completion. While a job runs, each capture shows its latest lines, up to 20 within a
+page’s bytes, and follows them as output arrives. Explicit field, page, and search selections
+remain selected; choose <strong>automatic output</strong> in the Saved output menu to return to automatic
+viewing. The menu lists up to 100 fields one level below the one shown, from the page of it shown,
+starting with the result’s fields and captures, and the field above it; <strong>more fields</strong> shows the
+field from where the list stops, so the menu lists the rest.</p>
 <p>Recorded model requests keep the previews, pages, and notifications the model actually saw;
 they are not regenerated from saved output.</p>
 <div style="break-before: page; page-break-before: always;"></div>
@@ -2810,9 +3028,9 @@ local or remote execution meet at shared runtime boundaries.</p>
 </thead>
 <tbody>
 <tr><td><code>config::RuntimeConfig</code></td><td>An admitted, immutable configuration generation. A selected model retains the configuration that admitted it.</td></tr>
-<tr><td><code>agent::Harness</code></td><td>Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions.</td></tr>
+<tr><td><code>agent::Harness</code></td><td>Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, modes, and the capability ceiling every session it opens runs under.</td></tr>
 <tr><td><code>agent::SessionHandle</code> / session runtime</td><td>One agent tree, its registry and jobs, target routing, MCP connections, observation stream, and session store.</td></tr>
-<tr><td><code>AgentContext</code></td><td>One agent loop’s projected history, request template, model profile, token calibration, and owned provider context.</td></tr>
+<tr><td><code>AgentContext</code></td><td>One agent loop’s projected history, request template, model profile, and owned provider context.</td></tr>
 <tr><td><code>provider::ProviderContext</code></td><td>Conversation-scoped provider resources and one-attempt model invocations, not authoritative conversation history or retry policy.</td></tr>
 <tr><td><code>tool::executor::ToolExecutor</code></td><td>Shared admission, routing, authorization, and supervised execution for model and script tool calls.</td></tr>
 <tr><td><code>session::SessionStore</code></td><td>Durable events, content-addressed blobs, and saved job outputs and captures.</td></tr>
@@ -2823,12 +3041,16 @@ local or remote execution meet at shared runtime boundaries.</p>
 select machines and workspaces; tools still operate on those machines’ files.</p>
 <h2 id="configuration-and-provider-entries"><a class="header" href="#configuration-and-provider-entries">Configuration and provider entries</a></h2>
 <p><code>config</code> loads and layers configuration, admits it, resolves model selections, and builds the
-model catalog; it does not interpret provider entries. <code>provider::dialect</code> owns them
+model catalog; it does not interpret provider entries. Layering takes each named entry whole from one
+file and stamps every provider with that file (<code>ConfigHome</code>), beside which its Skyhook-managed
+credentials live. <code>provider::dialect</code> owns the entries
 (<code>RawProviderConfig</code>, <code>ProviderSettings</code>, <code>ProviderModels</code>): each dialect module declares its
-provider-only <code>Options</code> (connection rules, authentication, cross-entry constraints) and its
+provider-only <code>Options</code> (connection rules and any Skyhook-managed <code>Login</code>) and its
 inheritable request settings. Request defaults and model settings are typed partial declarations
 (<code>provider::settings</code>) that keep inheritance intent until admission resolves each model into a
-complete, independently validated codec and transport profile.</p>
+complete, independently validated codec and transport profile. The shared <code>Request</code> also carries
+the Responses-only selections (<code>service_tier</code>, <code>access_programs</code>, <code>explicit_caching</code>); admission
+refuses an effective one on any other codec.</p>
 <h2 id="provider-boundary-and-lifetime"><a class="header" href="#provider-boundary-and-lifetime">Provider boundary and lifetime</a></h2>
 <p><code>provider::Provider</code> is a shared factory. <code>open_context(id)</code> creates an independently owned
 <code>ProviderContext</code> for one conversation without making a model request; <code>invoke(&amp;mut self, request)</code> returns an owned asynchronous response stream that does not borrow the context. A
@@ -2848,16 +3070,16 @@ models of one provider build share its HTTP client, credential sources, command 
 OAuth state.</p>
 <p>The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context
-for later input; resources are released when that loop exits. A model change prepares
-its replacement before committing the selection, preserves journal history, and resets token
-calibration. Reselecting the current model keeps the current context. A mode change also replaces
-the prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
-context under the same context identity.</p>
-<p>The session owns the durable conversation (<code>session::Message</code>): user text and attachments, the
-agent’s state (date, live jobs, todos), job events (child replies and presented job views),
-parent input and compaction summaries. Providers receive it rendered: state and job events
-become runtime text that joins the final turn, so the provider layer knows nothing about jobs
-or todos, and those renderers are part of the session format.</p>
+for later input; resources are released when that loop exits. A model change prepares its
+replacement before committing the selection and preserves journal history. Reselecting the
+current model keeps the current context. A mode change also replaces the prompt and tool surface
+and invalidates earlier bound reasoning. Resume opens a fresh provider context under the same
+context identity.</p>
+<p>The session owns the durable conversation (<code>session::Message</code>): user text and attachments, job
+events (child replies and presented job views), parent input and compaction summaries, and the
+agent’s state (date, live jobs, todos) as a message of its own. Providers receive it rendered:
+state becomes a context state entry and job events runtime text, so the provider layer knows
+nothing about jobs or todos, and those renderers are part of the session format.</p>
 <p>Providers receive complete provider-neutral requests; they do not privately replay failed
 submissions. A <code>response_schema</code> must be transmitted as a structured-output constraint or
 rejected with <code>InvalidRequest</code>, not silently ignored or replaced with prompting. Input images
@@ -2865,23 +3087,37 @@ must be encoded or rejected explicitly; generated image outputs are not supporte
 replay carries provider/model provenance, so incompatible private payloads are omitted from
 encoding without deleting the durable transcript.</p>
 <h3 id="history-transient-state-and-caching"><a class="header" href="#history-transient-state-and-caching">History, transient state, and caching</a></h3>
-<p>A <code>ModelRequest</code> separates committed <code>history</code> from request-specific <code>tail</code> content.
-<code>messages()</code> iterates history followed by tail. History is an unchanged prefix of later requests
-under the same context settings until compaction replaces it; the tail is rebuilt and never
-cacheable. A profile’s <code>state_mode</code> puts runtime state in the tail (<code>dynamic</code>), commits it to
-history (<code>persist</code>), or omits it (<code>none</code>). Persisted state lets later requests extend an unchanged
-conversation, which matters for reasoning bound to that conversation.</p>
+<p>A <code>ModelRequest</code> carries its context as one ordered list of typed entries: messages, and runtime
+state the harness wrote, with how long the state stays in the model’s view (<code>StateLifetime</code>). A
+profile’s <code>state_mode</code> sends each request’s own state (<code>current</code>, <code>dynamic</code>), commits it to the
+conversation (<code>persisted</code>, <code>persist</code>), or omits it (<code>none</code>). Everything before the first current
+state is a prefix later requests extend under the same context settings until compaction replaces
+it. Only a state whose request produced no response later drops out of it, since nothing is bound
+to it.</p>
+<p>The journal records each request’s tail. The projection gives each committed response the state
+its request sent, attributed as the request ledger attributes responses, and later requests send
+it again before that response as <code>superseded</code> state, back to the latest checkpoint or mode switch
+(where bound reasoning ends). A superseded state never reaches the model, so the model always
+reads only the latest dynamic state. Each codec places state in its dialect’s <code>StateRole</code>: the
+protocol’s harness role, or user content where a server has none mid-conversation; never inside
+tool output. A Messages dialect may make system-role state turn-scoped, which lets that codec
+resend superseded state hidden from the model and keep the conversation unchanged for reasoning
+bound to it; every other placement omits superseded state. A state not followed by a response or
+the end of the context is omitted everywhere: its request produced nothing bound to it.</p>
 <p><code>history_lifetime</code> communicates cache reuse without prescribing a provider implementation:</p>
 <ul>
 <li><code>extends</code> is the default: later requests extend this history.</li>
 <li><code>detached</code> marks one-off settings, such as a compaction summary request, with no reusable
 history prefix under those settings.</li>
 </ul>
-<p>Messages, and Chat dialects that select content-part breakpoints, mark the last history block as a
-cache breakpoint except for detached requests.
-OpenAI protocols use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
-to the final tool output or user message instead of introducing a separate user turn, which
-would look like the user speaking again after every tool call.</p>
+<p>Messages, and Chat dialects that select content-part breakpoints, mark the end of the prefix as a
+cache breakpoint except for detached requests. Responses uses automatic prefix caching unless
+<code>explicit_caching</code> is selected. Then the encoder sends <code>prompt_cache_options: {mode: "explicit"}</code>
+and marks an <code>input_text</code> block at the end of the history prefix and before each earlier
+assistant response in it, so each prior request’s prefix stays reusable; the current state and
+the rest of the request carry no marker, and detached requests carry none. Tool outputs become
+text-block arrays in that mode so they can carry a marker. Other OpenAI protocols use automatic
+prefix caching.</p>
 <h2 id="request-response-and-recovery-lifecycle"><a class="header" href="#request-response-and-recovery-lifecycle">Request, response, and recovery lifecycle</a></h2>
 <ol>
 <li>At a request boundary, the runtime applies accepted input and model/mode selections, refreshes
@@ -2893,8 +3129,7 @@ terminal <code>End</code> holding the <code>Completion</code>: the complete item
 response ended (an answer, tool use, or a cut). Only a completion built for tool use carries
 tool calls, so nothing else can authorize execution. <code>LiveResponse</code> gives the runtime and
 observers the same provisional view of the deltas until the end arrives. Observers then see
-each response settle as committed, committed-but-aborted, or failed, keyed by the journal
-sequence it produced.</li>
+each response settle as committed or failed, keyed by the journal sequence it produced.</li>
 <li>Only an accepted response becomes model-visible history. Its message, usage, and outcome
 commit together before tool dispatch. Each tool result commits as its call finishes; request
 projection merges results back into the original call order. This preserves completed work
@@ -2907,17 +3142,77 @@ the request lifecycle. Observation snapshots embed it, and session statistics, r
 (open attempts to interrupt) and the terminal interface read request outcomes, retry state, usage
 and message attribution from it. Folding a record reports the requests it changed, and the ledger
 lists the requests changed after a given record, so a host folding records incrementally refreshes
-just those. Interrupt and continue read each agent loop’s own turn state instead: idle,
-busy, parked after a failed or interrupted turn, when only new input resumes it and job
-notifications wait for that input’s request, or held: interrupted while waiting on retained
-children, which <code>continue</code> restarts together with it. The host’s observation is a display, never an
-input to that decision.</p>
+just those. <code>session::Turns</code> is likewise the one journal fold of turns, shared by statistics and the
+terminal’s reply footers: a turn runs from an agent’s first agent-purpose (non-compaction) model
+request after the last one ended until a response ends it without calling tools or the agent stops.
+Whether resuming continues a stopped turn is read from where the journal leaves each agent’s last
+turn: the core keeps it with each agent’s contract, and resume and every agent’s observed activity
+read it; the session summary the terminal’s session list reads applies the same rule to the
+database without decoding the session. Resume also parks an idle root interrupted when it has deliveries pending. Whether it has
+depends on live-only facts such as resume handlers, so the summary, which reads only the journal,
+does not show it, nor does a reopened session until it runs. The summary also holds the one rule choosing a session’s title from its title
+records, reported with the winning title’s source, which the terminal reads rather than folding
+them. Its last activity skips entry kinds that <code>EntryKind::is_activity</code> excludes, through a flag the
+<code>entry_kind</code> dictionary is seeded with, so the SQL and a host’s live fold of
+<code>SessionEvent::is_activity</code> share one definition. A reopened session is only viewed: it journals
+nothing and runs no agent until the first call that changes it activates it. That call starts the
+activation, which runs on even if the call gives up, and a call while it runs joins it. Activation
+first prepares the root, so a root that cannot run leaves the session viewed with nothing journaled,
+for the next call to try again; then
+one commit, which runs to the end once queued, starts the root and settles leftover work: jobs still running as interrupted, open requests, unanswered calls, every turn the
+journal leaves open (a request without an outcome, a call without a result, or input not yet
+answered), and the releases of the foreground jobs nothing holds across a
+restart (retained children, and every outcome nobody read, whoever called the job; a model call cut
+short is read by the interrupted answer reopening gives it). Until then a viewed session
+reads as that settlement would leave it: stopped at its last activity, its root as it would resume.
+The core admits every command by the session’s <code>SessionPhase</code> (viewing, running, shutting down,
+failed, closed), in one match on phase and command that also gives the phase the command moves to;
+only a running session that goes on running dates its records now, so what activation settles and
+what a closing session journals take its last activity’s time: every fold ends that work there,
+opening or closing changes no session’s last activity, and entry times need not increase with
+sequence. Shutdown first moves
+the session to shutting down: from then on no agent launches, takes input, begins a turn or requests
+a model, and no
+<code>continue</code> or <code>send</code> restarts a job, while work already running may still record how it ends. A
+restart committed before that is running work. The same commit stops the session as a crash would:
+it interrupts every turn, ends every child invocation still running interrupted, releases the waits
+held on them, and cancels only the other running jobs. Closing neither ends an interruption’s
+resumability nor journals activity for it; explicit cancellation (<code>CancelScope::Outcome</code>) does both.
+Shutting down a viewed session closes it instead: it never ran, so it stops nothing, journals
+nothing, is released for another open, and reads as it did while viewed. A closed session admits
+only shutting down and closing, which do nothing.</p>
+<p>Interrupt, continue and new input read three facts the core keeps, and nothing else. The session’s
+flow is open or paused: an interrupt that stops anything pauses it, as does a resume, and until
+<code>continue</code> or new input opens it no agent takes deliveries, which stay pending for the next request.
+Each agent’s turn is idle, busy, held, or parked after a failed or interrupted turn, when only input
+or <code>continue</code> resumes it and job notifications wait for that request. Only a busy turn requests,
+commits a response or makes calls. A response without calls leaves busy in its own commit, so an
+interrupt either stops a turn or finds it between turns; the turn goes on, busy again, only for
+input queued for it or for deliveries while the flow is open, as an agent between turns takes them.
+Each child invocation is unbegun until its child takes the input that begins it. An interrupt
+decides each agent from its own turn and jobs: a busy turn with a live foreground child invocation
+is held on it, any other busy turn is stopped, a stopped turn and an agent between turns give up
+input they had yet to take, and an invocation yet to begin is preempted: the input that begins it
+runs as an interrupted turn, unless <code>continue</code> comes first. A held turn keeps waiting: <code>continue</code>,
+or cancelling a job it holds, makes it busy again, and a wait that ends otherwise parks it
+interrupted. An agent call is accepted by the commit that installs its child, once the call still
+runs and its name is free among its owner’s installed children. A call without that start record was
+never accepted: one a stopped process or new input left interrupted is stopped as a crash stops
+it, and is planned and asked for again when the session continues. Only a requested cancellation ends an interruption, and no startup step
+restarts a job finished underneath it. New input breaks every held link in one commit: it releases
+each held turn’s live foreground child invocations, ends the held descendants’ turns interrupted,
+ends each released invocation the interrupt stopped, held or yet to begin, interrupted, so its call
+reads so, opens the flow and queues the input. The host’s observation is a display, never an input to that
+decision. A release is journaled; from it on, the released job reports to its owner through
+delivery, live and after reopening.</p>
 <p>Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized <code>ProviderErrorKind</code> values rather than error-message text: rate limits, timeouts,
 transport failures, and unavailable servers repeat the frozen logical request. Input
 and selection changes wait for the next request boundary. The failed stream is dropped before
 backoff; server retry hints take precedence over capped exponential delays. Recovery remains
-cancellable and continues until success or interruption.</p>
+cancellable and continues until success or interruption. A failure is journaled with its retry
+and backoff, so a request never reads failed while it retries, and one a crash leaves retrying
+reopens interrupted.</p>
 <p>A retry starts a fresh live response while retaining the attempt audit records and any reported
 usage. A stream that fails or closes before its end never authorizes tool execution, and
 transient recovery does not rerun completed tools. An expired command-sourced credential is
@@ -2925,16 +3220,26 @@ transient: the provider discards it on a 401 and the retry fetches a fresh one. 
 authentication failures, invalid requests, and protocol errors do not enter this retry loop.
 Context-window recovery and unusable compaction summaries have their own bounded recovery path;
 a checkpoint that breaks a journal invariant is not retried.</p>
-<p>A refusal cut fails without committing the refused message; an abort cut can retain completed
-safe content but still fails the turn. Any other response with neither nonblank text nor a tool
-call fails with nothing committed: <code>OutputLimit</code> when cut at the output limit, <code>Empty</code> otherwise.
-A truncated or incomplete cut with content commits it as a completed response with that outcome.
+<p>A refusal cut fails without committing the refused message. A response the service aborts is a
+failed attempt like a server error, retried with nothing committed. Any other response with
+neither nonblank text nor a tool call fails with nothing committed: <code>OutputLimit</code> when cut at the
+output limit, <code>Empty</code> otherwise. A truncated or incomplete cut with content commits it as a
+completed response with that outcome.
 Empty text is never committed, even beside a tool call.</p>
 <h2 id="compaction-and-context-accounting"><a class="header" href="#compaction-and-context-accounting">Compaction and context accounting</a></h2>
 <p>The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a successful response’s reported occupancy (uncached input,
-cached input, and output), at 90% of <code>max_context - max_output</code>, not from a display estimate.
-It runs after committing that response and before creating or executing its tool calls.</p>
+cached input, and output), at 90% of <code>max_context - max_output</code>. Skyhook estimates no token
+counts: every size it uses is one a provider reported.
+It runs after committing a response with tool calls, before creating or executing them. A final
+answer leaves busy in its own commit, so the compaction it triggers runs at the next request
+boundary, before the agent’s next turn sends its first request. The need is folded from the
+agent’s journal whenever its context opens or refreshes: the last committed response’s occupancy,
+until a checkpoint installs, a round fails with a fault a fresh summary could not fix, or the
+agent’s model or mode changes. An interrupted round and unusable summaries leave it, so a reopened
+or continued agent compacts first, as the live one would have. A summary that overflowed already
+shrank within its round, so it consumes the need, even if the round is then interrupted: the next
+request fits, or its own overflow compacts. A context-window overflow compacts and retries within its turn only.</p>
 <p>Summarization is a separate recorded request with a structured response schema and no callable
 tools. Native history ends before any trailing unanswered tool-call message, keeping the summary
 request valid for providers that require paired calls and results. The latest response is instead
@@ -2947,16 +3252,24 @@ Replacements made by that response’s scripts run normally.
 All results join the retained calls in the first normal post-compaction request. Completed
 exchanges cannot be partially retained. The retained projection removes reasoning bound to the
 replaced context.
-Compaction reserves the greater of reported occupancy and calibrated summary-input size,
-including the temporary response block, directive, and schema. Its output limit is the smaller
-of the configured limit and the remaining context space; no available output space fails before
-invoking the provider. Normal request settings are unchanged, and the summary’s effective limit
-is journaled for exact reconstruction.</p>
+The summary’s output limit is the smaller of the configured limit and the space the completed
+response’s reported occupancy leaves; no space left fails before invoking the provider. A summary
+the provider rejects as too large is retried within the attempt limit, smaller at each step: with
+half the output reserve, then also without about half of the history after its opening exchange,
+cut at the user or assistant message nearest the middle, which the summary request journals as
+its history’s first message; no stage raises the output limit an earlier one sent. The retained
+tail’s sizes are inferred from reports: messages after the agent’s last reported request stay
+whole, and earlier exchanges join them while the growth between the prompts of the requests
+around them fits the retention budget. Only consecutive requests under the same model context
+are compared, and growth that is zero or negative sizes nothing, which stops the walk. A
+checkpoint for an overflow retains only the last exchange: the messages the overflowing request
+added are unsized and may be what overflowed. Retention keeps conversation only; a committed
+state is stale once the next request sends its own. Normal request settings are unchanged, and
+the summary’s effective limit is journaled for exact reconstruction.</p>
 <p>History replacement and todo reconciliation become active only after checkpoint persistence.
 Validation prevents a stale summary from overwriting newer todo state. Every valid, successfully
-persisted continuation replaces the context and reconciles todos, regardless of estimated size
-reduction. Replay uses the stored continuation rather than rerunning the summary or today’s
-renderer. See <a href="#reconstructing-model-calls">model-call reconstruction</a> for the
+persisted continuation replaces the context and reconciles todos. Replay uses the stored
+continuation rather than rerunning the summary or today’s renderer. See <a href="#reconstructing-model-calls">model-call reconstruction</a> for the
 durable reference contract.</p>
 <h2 id="tools-jobs-and-execution"><a class="header" href="#tools-jobs-and-execution">Tools, jobs, and execution</a></h2>
 <p><code>ToolRegistryBuilder</code> supports typed and JSON-based registrations. Typed registrations generate
@@ -2977,7 +3290,12 @@ rather than denied.</p>
 <p>The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
 (queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
 are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
-its startup stage carries a job from creation to its running worker. A tool may declare a source argument, a
+its startup stage carries a job from creation to its running worker. A finish claims the job before
+it prepares any output, so of competing outcomes (completion, cancellation, interruption) only the one
+that publishes saves output, once, in the transaction that journals it; the others wait for it, then
+apply only where its outcome admits them,
+as a cancellation ends an interruption. Each finish is bound to the invocation it was issued for,
+so one from before a restart never ends the invocation the restart began. A tool may declare a source argument, a
 <code>TargetPath</code> on any target: the executor selects its location like a tool target, authorizes the
 read with the call, and opens it for the call’s context. A host tool whose input places its job
 elsewhere, such as a child agent’s target and workspace, has that location selected before the job
@@ -3003,7 +3321,7 @@ diagnostics and result slots registered by their producer, such as an expected <
 rendered only when the viewer’s capabilities permit exposing them. Host-site wording is relative
 to the viewer’s target: “on session host” is omitted for host-local viewers and retained for remote
 viewers. Pages of a value enclosing a diagnostic slot stream from the viewer’s own rendering of
-the saved document; nothing capability-sensitive is cached.</p>
+the saved document.</p>
 <p>This rendering boundary does not guarantee that target aliases never appear in a restricted view.
 A privileged <code>jobs</code> output read saves its rendered view as an ordinary JSON snapshot. Later
 restricted views of that saved result, or script results that copy it, retain the earlier rendered
@@ -3015,29 +3333,44 @@ outermost larger containers, unless they enclose a capture, JSON-declared text, 
 a long string reached through object members alone, or the diagnostic slot. Text a schema
 declares as <code>contentMediaType: application/json</code> is classified once at finalization, unless its
 output was cut off, and when it is JSON is read as that value from its original bytes.
-Finalization also records the fields presentation never shortens, those marked
-<code>x-skyhook-complete</code> in the output schema joining those a script’s returned tool results carry,
-and then the size of the result’s automatic presentation, which notification batching budgets
-without previewing it again. Jobs persist their output schemas so resumed and remote results use
-the same rules.</p>
+Finalization also records the fields whose presentation the output schema declares with
+<code>x-skyhook-preview</code>, joining those a script’s returned tool results carry: <code>complete</code> fields are
+never shortened, and <code>ends</code> text keeps its first and last lines; a field declared both ways is
+complete. Jobs persist their output schemas so resumed and remote results use the same rules.</p>
 <p>All saved JSON is read through streaming readers built in <code>job::output::json</code>. Previews, pages,
 and navigation into stored containers hold a bounded pool of what they may show rather than the
-value, and sampled readings take stored text only up to its prefix, with its extent from storage.
+value, and sampled readings take stored text only up to its prefix, with its extent from storage,
+and the last bytes of text declared to keep both ends.
 Memory still grows with the largest single key or number, which the reader buffers whole; with the
 keys of each open object while detection tracks duplicates by hash; with fields marked complete,
 which are read whole; and with a JSONPath query’s selected field, which is loaded within a cap
 metered on the bytes it reads. JavaScript receives complete results, while the journal retains the
 exact previews delivered to the model. See <a href="#saved-job-output">saved job output</a> for the
 user-facing limits.</p>
-<p>Child messages and job notifications use a prepared delivery receipt: snapshot pending events,
-then commit them to the parent’s history together with their acknowledgment. Abandoned preparation leaves the
-events pending; cancellation cannot split an accepted commit from its acknowledgment. Replay
-recovers pending child messages from durable history, independently of output inspection.</p>
-<p>Process tools never connect stdin, and capture stdout/stderr. Without the <code>Interactive</code> capability,
-they also detach from the controlling terminal on Unix and replace inherited askpass settings with
-a rejecting helper. Redirecting stdio alone is insufficient: a program could still prompt through
-<code>/dev/tty</code>. The helper remains alive through process cleanup, independently of whether target
-management is enabled. OpenSSH runs a Skyhook binary as its askpass helper, so every binary calls
+<p>Child messages and job notifications are read, presented, then committed to the parent’s history
+together with their acknowledgment. The commit is refused when anything it presents is no longer
+pending as it was read, as when a claim acknowledged it meanwhile, and the parent presents what is
+pending now instead. Abandoned presentation leaves the events pending; cancellation cannot split
+an accepted commit from its acknowledgment. A model call’s result likewise commits with the
+acknowledgment of the outcome it reports, so a result that never commits, as when the process
+dies first, leaves that outcome pending for delivery. A job’s own reads, such as a <code>jobs</code> read or
+the calls a script collects, are acknowledged by its finish in the same way, however it ends:
+failed or cancelled, with or without output. The host journals no result, so its collection
+acknowledges as it reads. Replay recovers pending child messages from durable history,
+independently of output inspection. A child’s text-only answer is held as its job’s result;
+when its invocation goes on instead, the answer’s release to the owner is journaled too.</p>
+<p>Process tools never connect stdin, capture stdout/stderr, and detach from the controlling terminal
+on Unix. Redirecting stdio alone is insufficient: a program could still prompt through <code>/dev/tty</code>,
+and outside the terminal’s foreground process group that stops it. Without a terminal, OpenSSH,
+sudo and Git prompt through the askpass helper (<code>SSH_ASKPASS</code>, <code>SUDO_ASKPASS</code>) instead. sudo also
+requires some <code>DISPLAY</code>, so a placeholder is set only when the process would have none. Root
+process tools always receive the session’s askpass helper, backed by the host’s sensitive prompt
+handler. Each prompt names its best-effort requester, and its job when the requesting process descends from
+the process a running job registered with the job manager. The session-managed SSH agent replaces
+<code>SSH_AUTH_SOCK</code> only with the <code>Targets</code> capability. Remote workers give their processes a helper that forwards prompts to the host.
+Without the <code>Interactive</code> capability, a call replaces these settings with a rejecting helper that
+remains alive through process cleanup, independently of whether target management is enabled.
+OpenSSH and sudo run a Skyhook binary as their askpass helper, so every binary calls
 <code>remote::askpass_main()</code> first: it answers the prompt and exits when started in that role and
 returns otherwise. SSH’s host-mediated prompt channel is described under <a href="#authentication-and-prompt-isolation">authentication and prompt
 isolation</a>.</p>
@@ -3047,20 +3380,67 @@ normalized; blobs, job results, and line-addressable captures share the database
 separate transcript or output files. Only shapes that a model, a tool’s own schema or a provider
 defines are stored as JSON text: tool-call arguments and results, job arguments and output
 schemas, tool and response schemas, reasoning replay payloads, saved job results and the
-results and pages a job event presented. Related state transitions are appended transactionally
-before their in-memory projections are published. Accepted writer work is owned independently
-of the caller, so dropping an await does not cancel a commit already in progress.</p>
-<p>A writer lock excludes competing session owners, not read-only snapshot inspection. If a write’s
-outcome becomes uncertain, the writer requires recovery instead of allowing later appends to
-pretend the commit failed. On resume, the runtime reconciles unfinished model attempts and
+results and pages a job event presented. Each open session has one core thread that owns the
+writer and the one in-memory fold of the journal: its records, request ledger, jobs, todos and
+targets, and beside them, never journaled, each running agent’s turn and inbox and every
+registered wait. A wait, such as an agent’s <code>wait</code>, a caller awaiting its foreground job, or an
+idle agent awaiting work, is a predicate the core decides when it is registered and after every
+change. Senders to an agent never wait: its inbox accumulates in order.
+Observation views the runtime updates without journaling, such as streaming deltas, sit beside
+that fold. A command plans against
+that state on the core thread, commits its entries in one transaction, and applies and publishes
+them before the next command runs, so no reader sees a record the state does not reflect.
+Reopening folds the journal with the same apply, refusing a job transition the job’s phase does
+not admit. Dropping an await, or its runtime, does not cancel a command already queued.</p>
+<p>A write the journal cannot take stops the session as a crash does: a refused or failed
+transaction, a commit whose outcome is unknown, a failed blob insert, a finished job’s output
+that cannot be prepared for its finish, or a panic on the core thread. In the same critical section the session moves to failed, its connection takes no more
+writes, everything it runs is cancelled, no agent runs, and every wait and reply resolves with the
+failure, which every later write reports too. Observers see the phase change, and read every
+turn, request, response and job the session left going as interrupted at its last activity, as
+reopening settles them. Rules a concurrent change can break, such as the stale-todos check on a compaction
+checkpoint, are decided by their command’s plan against the state it commits to, so a refusal
+there is not a failure.</p>
+<p>A writer lock excludes competing session owners, not read-only snapshot inspection. Closing the
+store rolls back any abandoned transaction and makes its shared SQLite connection read-only before
+releasing that lock, so retained output handles cannot write into a reopened session. Saved output
+can still be read. Dropping the store’s last handle closes it the same way, and so does dropping a
+session’s last handle, which also stops its agent loops, job work, and the approval and question
+prompts they asked, where they stand: a session left that way reopens as a crash would leave it. A
+session closed with nothing journaled is removed, so a caller that gives up creating one leaves
+nothing behind. Closing a failed session releases it too, and reports the failure; reopening
+resolves what committed. Activating a reopened session reconciles unfinished model attempts and
 committed tool calls lacking results before any agent runs. Agents retain their journaled prompt,
-tools, and capability contract; current configuration can narrow that contract, not silently
-expand it. Observation is a host projection of durable records plus live state, not a second
-source of conversation history.</p>
+tools, and capability contract; current configuration can narrow that contract, not silently expand
+it. Observation is a host view of durable records, the jobs the session state folds from them, and
+live state; it is not a second source of conversation history or job state.</p>
 <p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/agent/runtime">agent runtime</a>,
 <a href="https://github.com/kryesh/skyhook/tree/main/src/provider">providers</a>,
 <a href="https://github.com/kryesh/skyhook/tree/main/src/tool">tools</a>, and
 <a href="https://github.com/kryesh/skyhook/tree/main/src/session">sessions</a>.</p>
+<h2 id="terminal-transcript-selection"><a class="header" href="#terminal-transcript-selection">Terminal transcript selection</a></h2>
+<p>The terminal lays out transcript entries into rows. Each row’s layout separates what it paints
+as decoration (wrap continuations, code padding, disclosure glyphs, spinner gutters, diff markers,
+table borders and padding) from the source text it shows. A row’s source is described by spans:
+which logical line they belong to, which bytes of that line’s text, and which bytes of the row
+show them. A table cell is a logical line of its own, so the fragments of a wrapped cell share
+one line. Spans also keep the source that a row shows differently or not at all, such as a cell’s
+trimmed separators, a replaced wide grapheme, or an empty cell.</p>
+<p>A selection is anchored to source, not to rows: each end is an entry key, a logical line identity
+within that entry, and a byte in that line’s text. Line identities come from the source and do
+not depend on width, but they are identities only. A Markdown line is identified by its source
+position. A tool document or plain line after an entry’s header is identified by all the text
+before it, so inserting a line gives every line below it a new identity; the header’s own text
+is the entry’s state, so it takes no part. Document order is the order in which the
+layout first shows each line, which reads a table’s cells row by row even when their fragments
+interleave on screen. Endpoints, copying and highlighting all read the same spans. Copying joins
+each selected line’s parts in that order, one line per table cell. Each layout of an entry orders
+its lines once, when a selection first needs them, so dragging across a long entry reads only
+the rows of the lines it selects.</p>
+<p>Whenever entries are laid out again (new text, a reply settling, a resize), the selection is
+re-resolved against the new rows. It survives only if its endpoints still exist and the text they
+select is unchanged; otherwise it is dropped rather than moved to other text.</p>
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/bin/skyhook/tui/render">rendering</a>.</p>
 <div style="break-before: page; page-break-before: always;"></div>
 <h1 id="embedding"><a class="header" href="#embedding">Embedding</a></h1>
 <p>The <code>skyhook-agent</code> package exposes the <code>skyhook</code> Rust library crate. Hosts supply configuration,
@@ -3089,8 +3469,25 @@ root agent that capability set directly, and no mode applies.
 <code>SessionHandle::selection(model, mode)</code> issues the <code>Selection</code> a submitted message or a continued
 turn carries, rejecting a <code>provider/model</code> or mode the session does not have; omitted selections
 retain the active model and mode. A mode change applies to the root agent from the boundary that
-consumes it, not retroactively to children it already started. A session pins each mode’s
-definition on first use and cannot outgrow its original capability ceiling.</p>
+consumes it, not retroactively to children it already started. A session runs the harness’s modes
+and capability ceiling, whatever it ran under before. A reopened session reports modes the
+configuration redefined or removed in <code>startup_warnings()</code> and changes nothing while viewed, nor
+when calls such as <code>rename</code>, <code>record_status</code> or <code>cancel_job</code> activate it. The next work that runs
+the root (a prompt, continue, job delivery or <code>run_script</code>) decides its mode once: the selected
+one, else its own as configured now, or the default mode once its own is gone (without a default
+mode, it keeps running its own edition). A message’s
+<code>ModelChanged</code> and <code>ModeChanged</code> are journaled in one transaction with its <code>MessageCommitted</code>; a
+script’s precede the script. Each <code>ModeChanged</code> or <code>AgentStarted</code> whose definition
+differs from that mode’s latest journaled one records a new edition, which the journal keeps for
+auditing. <code>SessionHandle::changes_mode(mode)</code> reports whether the root’s next message in <code>mode</code>
+would change what it runs.</p>
+<p>Each <code>SessionEvent::TitleSet</code> records its <code>TitleSource</code>: <code>Prompt</code>, <code>User</code> or <code>Generated</code>.
+<code>SessionHandle::set_title(title)</code> gives a session an automatic title from its first input (a prompt
+or a script) and leaves a titled session alone; <code>rename(Some(title))</code> sets the user’s title, and
+<code>rename(None)</code> journals a <code>TitleCleared</code> that returns the session to its automatic title.
+<code>title().await</code> reads the title the session list shows, as a <code>SessionTitle</code> with its text and
+<code>TitleSource</code>: the user’s newest title unless cleared since, otherwise the newest <code>Prompt</code> or
+<code>Generated</code> title, otherwise the first text the user sent the root agent, as a <code>Prompt</code> title.</p>
 <p>Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
 and an embedded shim catalog. A <code>SensitivePromptHandler</code> answers each <code>SensitivePrompt</code> with a
 <code>PromptAnswer</code>: <code>Secret</code> for passwords, passphrases and keyboard-interactive prompts, and
@@ -3103,51 +3500,91 @@ an override supplied by <code>Config::session_root</code>, is passed through unc
 relative to the process working directory, not the workspace or configuration file. The CLI selects
 its own workspace-local session root.</p>
 <h2 id="host-observation-api"><a class="header" href="#host-observation-api">Host observation API</a></h2>
-<p><code>SessionHandle::observe().await</code> returns a snapshot and receiver sharing an atomic revision
+<p><code>SessionHandle::observe()</code> returns a snapshot and receiver sharing an atomic revision
 boundary. Apply updates to the snapshot in revision order with <code>ObservationSnapshot::apply</code>.
+Once the session no longer runs (viewed, failed or closed), the snapshot reads every request,
+response, job and turn it left going as interrupted at its last activity; <code>apply</code> returns the jobs
+and requests an update read that way, which no update of their own reports.
 It contains:</p>
 <ul>
 <li>Durable records keyed by their original journal sequence.</li>
 <li>The request ledger: each logical request’s lifecycle phase, outcome, and usage, folded from
 those records. Host statistics and displays read request state from it.</li>
+<li>Every job as the session state holds it: its owner, call arguments, state, failure, current
+invocation, and when that invocation ran. A job’s update arrives just before the record that
+moved it.</li>
 <li>Request-scoped live responses keyed by agent and logical request: their streamed blocks in
 arrival order, then the authoritative blocks once the response has ended.</li>
-<li>Current agent activity and context-usage estimates.</li>
+<li>Current agent activity, with when its turn began (or, once it is no longer busy, when that
+turn ended), and the context gauge: each agent’s occupancy as its last committed response
+reported it, folded from the journal and cleared by a checkpoint.</li>
 </ul>
 <p>Live response deltas are provisional, not additional committed messages. A new attempt of the
 same logical request resets its live response without removing durable attempt records. On
 receiver lag, obtain a fresh observation and replace <strong>both</strong> the snapshot and receiver; continuing
 with only one can leave a gap or apply stale live state.</p>
-<p><code>inspect_jobs</code>, <code>inspect_output</code>, <code>inspect_output_with_captures</code>, and <code>inspect_output_fields</code> are
-host inspection APIs. They do not claim jobs or consume agent notifications. <code>cancel_job</code> is the
-separate operation that requests cancellation. <code>startup_warnings</code>, <code>warnings</code>, and <code>mcp_servers</code>
-expose startup diagnostics and MCP discovery outcomes without inserting diagnostics into model
-context or writing directly to a terminal. <code>record_status</code> likewise records host-facing status,
-not a user message.</p>
+<p><code>inspect_jobs</code> (a synchronous read of an agent’s jobs), <code>inspect_output</code>,
+<code>inspect_output_with_captures</code>, and <code>inspect_output_fields</code> are host inspection APIs. They do not
+claim jobs or consume agent notifications. <code>cancel_job</code> is the separate operation that requests
+cancellation. <code>startup_warnings</code>, <code>warnings</code>, and <code>mcp_servers</code> expose startup diagnostics and MCP
+discovery outcomes without inserting diagnostics into model context or writing directly to a
+terminal. <code>record_status</code> likewise records host-facing status, not a user message.</p>
 <p><code>TodoItem</code> and <code>TodoStatus</code> are exported by <code>skyhook::agent</code>. Hosts projecting
 checklists from observed records apply <code>SessionEvent::TodosReplaced</code> and the reconciled todos in
 <code>SessionEvent::Compaction</code> checkpoints in sequence. Both replace the owning agent’s entire list;
 child-agent lists remain independent.</p>
 <h2 id="interruption-continuation-and-shutdown"><a class="header" href="#interruption-continuation-and-shutdown">Interruption, continuation, and shutdown</a></h2>
 <p><code>prompt</code> and <code>prompt_with_options</code> submit input and wait for its turn. <code>interrupt</code> stops active
-turns while retaining child jobs for continuation; explicit job cancellation is non-resumable.
+turns while retaining child jobs for continuation, and returns how many turns and unstarted child
+agents it stopped. If that is more than none, job deliveries start no turn until
+<code>continue_turn_with</code> or new input: they stay pending for that request. An interrupt also hands
+back input no agent has taken yet: a pending <code>prompt</code> returns <code>Interrupted</code>, and each
+<code>QueuedPromptReceipt</code> from <code>enqueue_prompts</code> resolves <code>Interrupted</code>. Explicit job cancellation is
+non-resumable.
 <code>continue_turn_with</code> continues failed or interrupted work without duplicating its input and can
 select a model or mode for the continued root turn. Its <code>ContinueOutcome</code> distinguishes a root
 answer from resumed children and reports whether the selection applied: restarting children does
 not imply that a waiting or live root also ran. <code>continue_turn</code> uses default options and returns
 the root answer, or an empty string when there is none.</p>
-<p>Use <code>Harness::resume_session</code> to reopen durable state. The runtime reconciles interrupted work
-before starting agents and opens fresh provider contexts; it does not reuse old network resources.
-A root turn that failed or was interrupted before the session closed can still be continued.
+<p>Use <code>Harness::resume_session</code> to reopen durable state. The session opens to view: it journals
+nothing, and its observation reads it stopped at its last activity, until the first call that
+changes it, such as a prompt, <code>continue_turn_with</code>, a script, a status, a title or a job
+cancellation. That call first prepares the root agent; if the root cannot run, for example because
+its model is no longer configured, the call fails and the session stays viewed. Otherwise the
+runtime reconciles interrupted work in one transaction before starting agents. Shutting down a
+viewed session stops nothing and journals nothing: it closes the session, releasing it for another
+open, and later calls that would change it are refused. Work the previous process left open is
+recorded as ending when that process last did something, so reopening a session is not activity;
+record times therefore need not increase with sequence. It opens fresh provider contexts and does
+not reuse old network resources.
+A root turn that failed or was interrupted before the session closed can still be continued. A root
+that closed idle with job deliveries pending resumes interrupted too, so <code>continue_turn_with</code> or new
+input delivers them.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.</p>
-<p>Session databases use format 15. Earlier formats are not migrated and cannot be resumed with
+<p>Session databases use format 22. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
-producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
-remains available so the host can append a final status after observing shutdown errors; await
-that append before dropping the session/store owner.</p>
+producers, drains accepted job and journal work, and closes MCP and remote resources. It interrupts
+the session as a crash would: child agents still running end interrupted and can be continued once
+the session is resumed, and other running jobs are cancelled. Once it has
+begun, new prompts, <code>continue</code>, host scripts, new jobs, and input that would restart a finished
+job are refused with <code>SessionError::Refused</code>; input to a running job and answers to its questions
+are still accepted. The
+journal remains available so the host can append a final status after observing shutdown errors;
+await that append, then <code>SessionHandle::close()</code>, which releases the session so it can be opened
+again at once rather than once every handle has dropped; closing a closed session does nothing. Closing also prevents retained output
+handles from writing to the session; already saved output remains readable. Dropping the last
+<code>SessionHandle</code> without shutting down closes the session as a crash would leave it and stops its
+agents and jobs; resuming it settles what was running. A session closed with nothing journaled, such as one
+whose <code>new_session</code> caller gave up, is removed.
+A write the session journal cannot take stops the session as a crash would: the call that met it,
+calls it cut short and every later call return <code>SessionError::JournalFailed</code> with the first
+cause; <code>shutdown</code> and <code>close</code> report it too and still release the session. Its observation reads
+the phase as failed. <code>SessionHandle::phase</code> tells whether the session still runs and journals.
+A session belongs to the Tokio runtime that created or resumed it: use it only from that runtime,
+and keep the runtime running until the session is closed.</p>
 <h2 id="embedded-shim-catalog"><a class="header" href="#embedded-shim-catalog">Embedded shim catalog</a></h2>
 <p>The library’s shim catalog is empty by default. Supply <code>remote::EmbeddedShimCatalog</code> through
 <code>HarnessBuilder::shim_catalog</code> to enable remote execution. The CLI supplies its own catalog, but
@@ -3161,7 +3598,14 @@ behavior.</p>
 <h2 id="reading-a-session-archive"><a class="header" href="#reading-a-session-archive">Reading a session archive</a></h2>
 <p><code>SessionStore::read_records(root, id).await</code> returns sequence-ordered records from a read-only
 database snapshot without acquiring the session’s writer lock. A live owner may continue writing;
-archive inspection neither takes ownership nor resumes unfinished work.</p>
+archive inspection neither takes ownership nor resumes unfinished work.
+<code>SessionStore::is_open(root, id).await</code> reports whether a store in any process holds the session.
+It takes the session lock shared for an instant; an open racing it retries once before failing
+with <code>AlreadyOpen</code>. <code>SessionStore::summary(root, id).await</code> reads a session list row without
+decoding the session, including its title as <code>SessionHandle::title</code> reads it, in <code>last_millis</code> the
+time of its newest record that <code>SessionEvent::is_activity</code> (closing a session is not), and, in
+<code>stopped</code>, the failed or interrupted turn that resuming the root agent would continue, if any. <code>stopped</code> reads only the root’s journaled turns, so a session that closed idle with job
+deliveries pending has none, yet resumes interrupted.</p>
 <p>The SQLite layout is versioned by <code>session::SESSION_FORMAT_VERSION</code>. Opening a database validates
 its identity and version; there is no migration or compatibility layer for earlier layouts.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
@@ -3175,16 +3619,19 @@ including the model ID, reasoning setting, and output limit. Context records des
 settings, not the lifetime of a <code>ProviderContext</code> resource.</li>
 <li><code>model_requested</code> identifies one frozen logical request before its first invocation. It references
 the context record and stores the checkpoint it opens with, its history as the agent’s commits
-through a message sequence, <code>tail</code> as exact inline messages, and
-<code>history_lifetime</code>. Retries refer back to this
+through a message sequence (a summary that overflowed resumes <code>from</code> a later one), <code>tail</code> as
+exact inline messages, and <code>history_lifetime</code>. Retries refer back to this
 request using <code>model_attempt_started</code>, with separate failure/interruption or completion outcomes.
 Ordinary requests reuse a context record while their settings remain applicable; summarization
 has a separate context with its structured response schema.</li>
 <li><code>compaction</code> stores the exact replacement message, retained original message references, covered
-frontier, the summary attempt that produced it, token estimates, and reconciled owner todos.
+frontier, the summary attempt that produced it, the reported occupancy that triggered it (none
+after an overflow), and reconciled owner todos.
 History and todos become active together after persistence.</li>
 <li>Runtime state and job-event content are stored structurally and rendered for the model on
-reconstruction, so a request replays the text the model was sent.</li>
+reconstruction, so a request replays the text the model was sent. A reconstructed context
+carries, before each response since its checkpoint or the agent’s latest mode switch, the state
+the request that produced it sent; codecs decide whether to send it.</li>
 <li>Reconstruction resolves those references and inline values. It does not consult current
 configuration, live jobs, or the current compaction renderer. Runtime state and job events are
 rendered by the current state renderer and job-view serialization, which are therefore part of
@@ -3201,7 +3648,7 @@ on an owning <code>SessionStore</code> loads their contents for provider encodin
 exactly this request’s blobs in <code>cache</code>; unlike <code>read_records</code>, opening a store acquires the
 session’s writer lock. Reconstruction reproduces Skyhook’s provider-neutral input, not an
 API-specific wire encoding or a replay of the external call.</p>
-<p>The <code>ModelRequest</code> contract preserves the history/tail split and <code>history_lifetime</code> cache hints.
+<p>The <code>ModelRequest</code> contract preserves the typed context entries and <code>history_lifetime</code> cache hints.
 See <a href="#history-transient-state-and-caching">history, transient state, and caching</a>
 for their semantics and provider rationale.</p>
 <p>Source: <a href="https://github.com/kryesh/skyhook/blob/main/src/config/runtime.rs">configuration admission</a>,
@@ -3235,7 +3682,8 @@ support relayed SSH streams and sensitive prompts without turning them into tool
 operations share validation and execution behavior.</p>
 <h2 id="connection-and-request-lifecycle"><a class="header" href="#connection-and-request-lifecycle">Connection and request lifecycle</a></h2>
 <p>Connection startup is shared by callers using the same pool key. Cancelling one waiter stops its
-wait, not the shared startup. Startup failure removes the failed slot; transport I/O or protocol failure
+wait, not the shared startup; redefining a target on its route stops the startup, and its callers
+plan again. Startup failure removes the failed slot; transport I/O or protocol failure
 during execution discards the affected pooled connection so later work can establish a new one.
 It does not transparently replay the failed tool operation.</p>
 <p>Once connected, request IDs associate output and cancellation with individual operations.
@@ -3279,9 +3727,24 @@ listener is needed.</p>
 <p>SSH authentication prompts use <code>SensitivePromptHandler</code>, separate from model questions and tool
 output. Remote prompts and their typed answers (a secret, a confirmation or a rejection) travel as
 private control messages, not session events or saved results. OpenSSH is given an explicit askpass
-helper so the host can handle passwords, passphrases, and confirmations without exposing them to
-the agent transcript; the helper prints a secret, answers <code>yes</code> to a confirmed host key, and exits
-nonzero for a rejection.</p>
+helper so the host can handle passwords, passphrases, and confirmations outside the agent
+transcript; the helper prints a secret to the program that ran it, answers <code>yes</code> to a confirmed
+host key, and exits nonzero for a rejection. The same helper is offered to sudo as <code>SUDO_ASKPASS</code>,
+which sudo uses whenever no terminal is available and some <code>DISPLAY</code> is set, so command password
+prompts reach the host the same way; a placeholder <code>DISPLAY</code> is set only when the process would
+have none. Since every interactive command receives the helper, a command the agent writes can run
+it and capture the answer, so each prompt carries its requester for the user to judge. The
+machine serving the prompt reads that requester from <code>/proc</code>, since its PIDs are meaningful only
+there. It reads the executable link of the parent of the socket peer, taking the peer to be the
+helper. A program running as another user, such as set-user-ID <code>sudo</code>, denies that read, so the
+prompt carries its name and effective UID instead. The attribution is best effort: any process
+running as the server’s user can connect to the socket itself, so a command started by a genuine
+program (an SSH <code>ProxyCommand</code>, say) is reported as that program and receives the answer.
+Prompts on the host also carry the job: the ancestors of the helper are compared with
+the processes running exec jobs have registered with the job manager. A job that has ended no
+longer matches. Workers don’t know host job IDs, so their prompts carry only the executable,
+and missing information leaves the requester unknown rather than failing the prompt. Once the
+session shuts down, its authentication refuses to start another askpass server.</p>
 <p>Each askpass server keeps its helper and socket in a private temporary directory and accepts
 only peers running as its own user. This prevents other local users from injecting
 prompts or obtaining answers through the socket; it is not an isolation boundary against other

@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -190,7 +190,7 @@ legacy HTTP+SSE transport is not supported.</p>
     transport: "stdio"
     start_command: ["my-mcp-server", "--root", "/srv/project"]
     capabilities: ["read"]
-    cwd: "mcp-work"                  # Relative to the source config file's directory.
+    cwd: "mcp-work"                  # Relative to its config file's directory; default: workspace.
     env: { LOG_LEVEL: "warn" }        # Environment overrides for the launched process.
     startup_timeout_secs: 30         # Default; must be a positive integer.
     call_timeout_secs: 120           # Default; must be a positive integer.
@@ -210,8 +210,10 @@ absolute HTTP(S) <code>url</code>. It connects first, and only starts the option
 unreachable—not on authentication, protocol, or other server errors. <code>cwd</code> and <code>env</code> apply only to
 <code>start_command</code>; HTTP connections without a startup command must omit them. Relative <code>cwd</code> is
 resolved against the directory of the source configuration file that defines the value, not the
-agent workspace. When user and workspace config are layered, an inherited user <code>cwd</code> retains its
-user-file base; an overlaid workspace <code>cwd</code> uses <code>&lt;workspace&gt;/.skyhook</code>. Timeouts must be positive
+agent workspace. Each server entry comes whole from one file, so a user server’s <code>cwd</code> is relative to
+the user file’s directory and a workspace server’s to <code>&lt;workspace&gt;/.skyhook</code>. Without <code>cwd</code>, the
+command runs in the session workspace, whichever file defines the server; MCP commands always run on
+the session host, never on a remote target. Timeouts must be positive
 whole seconds. Unknown settings and invalid transport combinations are rejected. Environment
 values must be strings; quote numeric-looking values such as <code>WORKERS: "4"</code>.</p>
 <p>HTTP <code>headers_env</code> maps header names to environment-variable names. The variable’s complete value

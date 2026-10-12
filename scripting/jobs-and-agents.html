@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -209,8 +209,9 @@ final reply in the call’s <code>.result</code>, with no progress or later mess
 make another model request until its foreground calls return.</p>
 <p>Child names are scoped to their caller: <code>A</code> and <code>B</code> may each create a child named <code>worker</code>, but
 all scripts owned by <code>A</code> share <code>A</code>’s child-name scope. A child retains its name even after
-termination; send follow-ups to its existing job instead of launching a duplicate. A failed
-launch that never created a child does not permanently reserve the name.</p>
+termination; send follow-ups to its existing job instead of launching a duplicate. A launch
+that created no child holds no name: of two launches taking one name at once, the first to start
+its child keeps it.</p>
 <p>Each model-facing <code>ask</code> contains one <code>{id, prompt, options?}</code> question; independent concurrent calls are merged by the runtime. A child
 question batch changes its stable agent job to <code>waiting_input</code>; answer that job with
 <code>tool.job(id).send({value: answer})</code> in a script. For a merged batch, use
@@ -252,8 +253,9 @@ question has <code>state: "waiting_input"</code>; <code>jobs({job})</code> retur
 <code>presentation.question</code>, regardless of its size.</p>
 <p>Jobs normally follow <code>queued → running → completed</code>, optionally cycling through
 <code>waiting_input → running</code>; <code>failed</code>, <code>cancelled</code>, and <code>interrupted</code> are terminal alternatives.
-A <code>jobs({job})</code> read acknowledges a pending question or terminal result and suppresses duplicate
-automatic notification. Explicit reads remain repeatable, and <code>jobs</code> itself never waits; see
+A <code>jobs({job})</code> read acknowledges the question or result it returned, suppressing duplicate
+automatic notification; an outcome that arrives after the read is still notified. Explicit reads
+remain repeatable, and <code>jobs</code> itself never waits; see
 <a href="#waiting-for-background-work">waiting for background work</a>.
 Unanswered questions do not expire. Send answers to the stable child-agent job ID.</p>
 <p>Cancellation cascades through descendant jobs and agents and terminates managed command process

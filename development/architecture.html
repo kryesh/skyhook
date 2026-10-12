@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -195,9 +195,9 @@ local or remote execution meet at shared runtime boundaries.</p>
 </thead>
 <tbody>
 <tr><td><code>config::RuntimeConfig</code></td><td>An admitted, immutable configuration generation. A selected model retains the configuration that admitted it.</td></tr>
-<tr><td><code>agent::Harness</code></td><td>Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, and the capability ceiling for new sessions.</td></tr>
+<tr><td><code>agent::Harness</code></td><td>Configured models with their provider factories; policy and interaction handlers, configured tools, instructions, modes, and the capability ceiling every session it opens runs under.</td></tr>
 <tr><td><code>agent::SessionHandle</code> / session runtime</td><td>One agent tree, its registry and jobs, target routing, MCP connections, observation stream, and session store.</td></tr>
-<tr><td><code>AgentContext</code></td><td>One agent loop’s projected history, request template, model profile, token calibration, and owned provider context.</td></tr>
+<tr><td><code>AgentContext</code></td><td>One agent loop’s projected history, request template, model profile, and owned provider context.</td></tr>
 <tr><td><code>provider::ProviderContext</code></td><td>Conversation-scoped provider resources and one-attempt model invocations, not authoritative conversation history or retry policy.</td></tr>
 <tr><td><code>tool::executor::ToolExecutor</code></td><td>Shared admission, routing, authorization, and supervised execution for model and script tool calls.</td></tr>
 <tr><td><code>session::SessionStore</code></td><td>Durable events, content-addressed blobs, and saved job outputs and captures.</td></tr>
@@ -208,12 +208,16 @@ local or remote execution meet at shared runtime boundaries.</p>
 select machines and workspaces; tools still operate on those machines’ files.</p>
 <h2 id="configuration-and-provider-entries"><a class="header" href="#configuration-and-provider-entries">Configuration and provider entries</a></h2>
 <p><code>config</code> loads and layers configuration, admits it, resolves model selections, and builds the
-model catalog; it does not interpret provider entries. <code>provider::dialect</code> owns them
+model catalog; it does not interpret provider entries. Layering takes each named entry whole from one
+file and stamps every provider with that file (<code>ConfigHome</code>), beside which its Skyhook-managed
+credentials live. <code>provider::dialect</code> owns the entries
 (<code>RawProviderConfig</code>, <code>ProviderSettings</code>, <code>ProviderModels</code>): each dialect module declares its
-provider-only <code>Options</code> (connection rules, authentication, cross-entry constraints) and its
+provider-only <code>Options</code> (connection rules and any Skyhook-managed <code>Login</code>) and its
 inheritable request settings. Request defaults and model settings are typed partial declarations
 (<code>provider::settings</code>) that keep inheritance intent until admission resolves each model into a
-complete, independently validated codec and transport profile.</p>
+complete, independently validated codec and transport profile. The shared <code>Request</code> also carries
+the Responses-only selections (<code>service_tier</code>, <code>access_programs</code>, <code>explicit_caching</code>); admission
+refuses an effective one on any other codec.</p>
 <h2 id="provider-boundary-and-lifetime"><a class="header" href="#provider-boundary-and-lifetime">Provider boundary and lifetime</a></h2>
 <p><code>provider::Provider</code> is a shared factory. <code>open_context(id)</code> creates an independently owned
 <code>ProviderContext</code> for one conversation without making a model request; <code>invoke(&amp;mut self, request)</code> returns an owned asynchronous response stream that does not borrow the context. A
@@ -233,16 +237,16 @@ models of one provider build share its HTTP client, credential sources, command 
 OAuth state.</p>
 <p>The runtime retains the provider context across turns, tool work, questions, retries, and
 compaction. A completed or failed child invocation can retain its idle agent loop and context
-for later input; resources are released when that loop exits. A model change prepares
-its replacement before committing the selection, preserves journal history, and resets token
-calibration. Reselecting the current model keeps the current context. A mode change also replaces
-the prompt and tool surface and invalidates earlier bound reasoning. Resume opens a fresh provider
-context under the same context identity.</p>
-<p>The session owns the durable conversation (<code>session::Message</code>): user text and attachments, the
-agent’s state (date, live jobs, todos), job events (child replies and presented job views),
-parent input and compaction summaries. Providers receive it rendered: state and job events
-become runtime text that joins the final turn, so the provider layer knows nothing about jobs
-or todos, and those renderers are part of the session format.</p>
+for later input; resources are released when that loop exits. A model change prepares its
+replacement before committing the selection and preserves journal history. Reselecting the
+current model keeps the current context. A mode change also replaces the prompt and tool surface
+and invalidates earlier bound reasoning. Resume opens a fresh provider context under the same
+context identity.</p>
+<p>The session owns the durable conversation (<code>session::Message</code>): user text and attachments, job
+events (child replies and presented job views), parent input and compaction summaries, and the
+agent’s state (date, live jobs, todos) as a message of its own. Providers receive it rendered:
+state becomes a context state entry and job events runtime text, so the provider layer knows
+nothing about jobs or todos, and those renderers are part of the session format.</p>
 <p>Providers receive complete provider-neutral requests; they do not privately replay failed
 submissions. A <code>response_schema</code> must be transmitted as a structured-output constraint or
 rejected with <code>InvalidRequest</code>, not silently ignored or replaced with prompting. Input images
@@ -250,23 +254,37 @@ must be encoded or rejected explicitly; generated image outputs are not supporte
 replay carries provider/model provenance, so incompatible private payloads are omitted from
 encoding without deleting the durable transcript.</p>
 <h3 id="history-transient-state-and-caching"><a class="header" href="#history-transient-state-and-caching">History, transient state, and caching</a></h3>
-<p>A <code>ModelRequest</code> separates committed <code>history</code> from request-specific <code>tail</code> content.
-<code>messages()</code> iterates history followed by tail. History is an unchanged prefix of later requests
-under the same context settings until compaction replaces it; the tail is rebuilt and never
-cacheable. A profile’s <code>state_mode</code> puts runtime state in the tail (<code>dynamic</code>), commits it to
-history (<code>persist</code>), or omits it (<code>none</code>). Persisted state lets later requests extend an unchanged
-conversation, which matters for reasoning bound to that conversation.</p>
+<p>A <code>ModelRequest</code> carries its context as one ordered list of typed entries: messages, and runtime
+state the harness wrote, with how long the state stays in the model’s view (<code>StateLifetime</code>). A
+profile’s <code>state_mode</code> sends each request’s own state (<code>current</code>, <code>dynamic</code>), commits it to the
+conversation (<code>persisted</code>, <code>persist</code>), or omits it (<code>none</code>). Everything before the first current
+state is a prefix later requests extend under the same context settings until compaction replaces
+it. Only a state whose request produced no response later drops out of it, since nothing is bound
+to it.</p>
+<p>The journal records each request’s tail. The projection gives each committed response the state
+its request sent, attributed as the request ledger attributes responses, and later requests send
+it again before that response as <code>superseded</code> state, back to the latest checkpoint or mode switch
+(where bound reasoning ends). A superseded state never reaches the model, so the model always
+reads only the latest dynamic state. Each codec places state in its dialect’s <code>StateRole</code>: the
+protocol’s harness role, or user content where a server has none mid-conversation; never inside
+tool output. A Messages dialect may make system-role state turn-scoped, which lets that codec
+resend superseded state hidden from the model and keep the conversation unchanged for reasoning
+bound to it; every other placement omits superseded state. A state not followed by a response or
+the end of the context is omitted everywhere: its request produced nothing bound to it.</p>
 <p><code>history_lifetime</code> communicates cache reuse without prescribing a provider implementation:</p>
 <ul>
 <li><code>extends</code> is the default: later requests extend this history.</li>
 <li><code>detached</code> marks one-off settings, such as a compaction summary request, with no reusable
 history prefix under those settings.</li>
 </ul>
-<p>Messages, and Chat dialects that select content-part breakpoints, mark the last history block as a
-cache breakpoint except for detached requests.
-OpenAI protocols use automatic prefix caching and send the tail last. Their codecs attach a runtime-only tail
-to the final tool output or user message instead of introducing a separate user turn, which
-would look like the user speaking again after every tool call.</p>
+<p>Messages, and Chat dialects that select content-part breakpoints, mark the end of the prefix as a
+cache breakpoint except for detached requests. Responses uses automatic prefix caching unless
+<code>explicit_caching</code> is selected. Then the encoder sends <code>prompt_cache_options: {mode: "explicit"}</code>
+and marks an <code>input_text</code> block at the end of the history prefix and before each earlier
+assistant response in it, so each prior request’s prefix stays reusable; the current state and
+the rest of the request carry no marker, and detached requests carry none. Tool outputs become
+text-block arrays in that mode so they can carry a marker. Other OpenAI protocols use automatic
+prefix caching.</p>
 <h2 id="request-response-and-recovery-lifecycle"><a class="header" href="#request-response-and-recovery-lifecycle">Request, response, and recovery lifecycle</a></h2>
 <ol>
 <li>At a request boundary, the runtime applies accepted input and model/mode selections, refreshes
@@ -278,8 +296,7 @@ terminal <code>End</code> holding the <code>Completion</code>: the complete item
 response ended (an answer, tool use, or a cut). Only a completion built for tool use carries
 tool calls, so nothing else can authorize execution. <code>LiveResponse</code> gives the runtime and
 observers the same provisional view of the deltas until the end arrives. Observers then see
-each response settle as committed, committed-but-aborted, or failed, keyed by the journal
-sequence it produced.</li>
+each response settle as committed or failed, keyed by the journal sequence it produced.</li>
 <li>Only an accepted response becomes model-visible history. Its message, usage, and outcome
 commit together before tool dispatch. Each tool result commits as its call finishes; request
 projection merges results back into the original call order. This preserves completed work
@@ -292,17 +309,77 @@ the request lifecycle. Observation snapshots embed it, and session statistics, r
 (open attempts to interrupt) and the terminal interface read request outcomes, retry state, usage
 and message attribution from it. Folding a record reports the requests it changed, and the ledger
 lists the requests changed after a given record, so a host folding records incrementally refreshes
-just those. Interrupt and continue read each agent loop’s own turn state instead: idle,
-busy, parked after a failed or interrupted turn, when only new input resumes it and job
-notifications wait for that input’s request, or held: interrupted while waiting on retained
-children, which <code>continue</code> restarts together with it. The host’s observation is a display, never an
-input to that decision.</p>
+just those. <code>session::Turns</code> is likewise the one journal fold of turns, shared by statistics and the
+terminal’s reply footers: a turn runs from an agent’s first agent-purpose (non-compaction) model
+request after the last one ended until a response ends it without calling tools or the agent stops.
+Whether resuming continues a stopped turn is read from where the journal leaves each agent’s last
+turn: the core keeps it with each agent’s contract, and resume and every agent’s observed activity
+read it; the session summary the terminal’s session list reads applies the same rule to the
+database without decoding the session. Resume also parks an idle root interrupted when it has deliveries pending. Whether it has
+depends on live-only facts such as resume handlers, so the summary, which reads only the journal,
+does not show it, nor does a reopened session until it runs. The summary also holds the one rule choosing a session’s title from its title
+records, reported with the winning title’s source, which the terminal reads rather than folding
+them. Its last activity skips entry kinds that <code>EntryKind::is_activity</code> excludes, through a flag the
+<code>entry_kind</code> dictionary is seeded with, so the SQL and a host’s live fold of
+<code>SessionEvent::is_activity</code> share one definition. A reopened session is only viewed: it journals
+nothing and runs no agent until the first call that changes it activates it. That call starts the
+activation, which runs on even if the call gives up, and a call while it runs joins it. Activation
+first prepares the root, so a root that cannot run leaves the session viewed with nothing journaled,
+for the next call to try again; then
+one commit, which runs to the end once queued, starts the root and settles leftover work: jobs still running as interrupted, open requests, unanswered calls, every turn the
+journal leaves open (a request without an outcome, a call without a result, or input not yet
+answered), and the releases of the foreground jobs nothing holds across a
+restart (retained children, and every outcome nobody read, whoever called the job; a model call cut
+short is read by the interrupted answer reopening gives it). Until then a viewed session
+reads as that settlement would leave it: stopped at its last activity, its root as it would resume.
+The core admits every command by the session’s <code>SessionPhase</code> (viewing, running, shutting down,
+failed, closed), in one match on phase and command that also gives the phase the command moves to;
+only a running session that goes on running dates its records now, so what activation settles and
+what a closing session journals take its last activity’s time: every fold ends that work there,
+opening or closing changes no session’s last activity, and entry times need not increase with
+sequence. Shutdown first moves
+the session to shutting down: from then on no agent launches, takes input, begins a turn or requests
+a model, and no
+<code>continue</code> or <code>send</code> restarts a job, while work already running may still record how it ends. A
+restart committed before that is running work. The same commit stops the session as a crash would:
+it interrupts every turn, ends every child invocation still running interrupted, releases the waits
+held on them, and cancels only the other running jobs. Closing neither ends an interruption’s
+resumability nor journals activity for it; explicit cancellation (<code>CancelScope::Outcome</code>) does both.
+Shutting down a viewed session closes it instead: it never ran, so it stops nothing, journals
+nothing, is released for another open, and reads as it did while viewed. A closed session admits
+only shutting down and closing, which do nothing.</p>
+<p>Interrupt, continue and new input read three facts the core keeps, and nothing else. The session’s
+flow is open or paused: an interrupt that stops anything pauses it, as does a resume, and until
+<code>continue</code> or new input opens it no agent takes deliveries, which stay pending for the next request.
+Each agent’s turn is idle, busy, held, or parked after a failed or interrupted turn, when only input
+or <code>continue</code> resumes it and job notifications wait for that request. Only a busy turn requests,
+commits a response or makes calls. A response without calls leaves busy in its own commit, so an
+interrupt either stops a turn or finds it between turns; the turn goes on, busy again, only for
+input queued for it or for deliveries while the flow is open, as an agent between turns takes them.
+Each child invocation is unbegun until its child takes the input that begins it. An interrupt
+decides each agent from its own turn and jobs: a busy turn with a live foreground child invocation
+is held on it, any other busy turn is stopped, a stopped turn and an agent between turns give up
+input they had yet to take, and an invocation yet to begin is preempted: the input that begins it
+runs as an interrupted turn, unless <code>continue</code> comes first. A held turn keeps waiting: <code>continue</code>,
+or cancelling a job it holds, makes it busy again, and a wait that ends otherwise parks it
+interrupted. An agent call is accepted by the commit that installs its child, once the call still
+runs and its name is free among its owner’s installed children. A call without that start record was
+never accepted: one a stopped process or new input left interrupted is stopped as a crash stops
+it, and is planned and asked for again when the session continues. Only a requested cancellation ends an interruption, and no startup step
+restarts a job finished underneath it. New input breaks every held link in one commit: it releases
+each held turn’s live foreground child invocations, ends the held descendants’ turns interrupted,
+ends each released invocation the interrupt stopped, held or yet to begin, interrupted, so its call
+reads so, opens the flow and queues the input. The host’s observation is a display, never an input to that
+decision. A release is journaled; from it on, the released job reports to its owner through
+delivery, live and after reopening.</p>
 <p>Transient recovery belongs to the runtime, not the provider or transport. It classifies
 normalized <code>ProviderErrorKind</code> values rather than error-message text: rate limits, timeouts,
 transport failures, and unavailable servers repeat the frozen logical request. Input
 and selection changes wait for the next request boundary. The failed stream is dropped before
 backoff; server retry hints take precedence over capped exponential delays. Recovery remains
-cancellable and continues until success or interruption.</p>
+cancellable and continues until success or interruption. A failure is journaled with its retry
+and backoff, so a request never reads failed while it retries, and one a crash leaves retrying
+reopens interrupted.</p>
 <p>A retry starts a fresh live response while retaining the attempt audit records and any reported
 usage. A stream that fails or closes before its end never authorizes tool execution, and
 transient recovery does not rerun completed tools. An expired command-sourced credential is
@@ -310,16 +387,26 @@ transient: the provider discards it on a 401 and the retry fetches a fresh one. 
 authentication failures, invalid requests, and protocol errors do not enter this retry loop.
 Context-window recovery and unusable compaction summaries have their own bounded recovery path;
 a checkpoint that breaks a journal invariant is not retried.</p>
-<p>A refusal cut fails without committing the refused message; an abort cut can retain completed
-safe content but still fails the turn. Any other response with neither nonblank text nor a tool
-call fails with nothing committed: <code>OutputLimit</code> when cut at the output limit, <code>Empty</code> otherwise.
-A truncated or incomplete cut with content commits it as a completed response with that outcome.
+<p>A refusal cut fails without committing the refused message. A response the service aborts is a
+failed attempt like a server error, retried with nothing committed. Any other response with
+neither nonblank text nor a tool call fails with nothing committed: <code>OutputLimit</code> when cut at the
+output limit, <code>Empty</code> otherwise. A truncated or incomplete cut with content commits it as a
+completed response with that outcome.
 Empty text is never committed, even beside a tool call.</p>
 <h2 id="compaction-and-context-accounting"><a class="header" href="#compaction-and-context-accounting">Compaction and context accounting</a></h2>
 <p>The journal is authoritative; compaction replaces the model-visible projection, not old records.
 Automatic compaction is decided from a successful response’s reported occupancy (uncached input,
-cached input, and output), at 90% of <code>max_context - max_output</code>, not from a display estimate.
-It runs after committing that response and before creating or executing its tool calls.</p>
+cached input, and output), at 90% of <code>max_context - max_output</code>. Skyhook estimates no token
+counts: every size it uses is one a provider reported.
+It runs after committing a response with tool calls, before creating or executing them. A final
+answer leaves busy in its own commit, so the compaction it triggers runs at the next request
+boundary, before the agent’s next turn sends its first request. The need is folded from the
+agent’s journal whenever its context opens or refreshes: the last committed response’s occupancy,
+until a checkpoint installs, a round fails with a fault a fresh summary could not fix, or the
+agent’s model or mode changes. An interrupted round and unusable summaries leave it, so a reopened
+or continued agent compacts first, as the live one would have. A summary that overflowed already
+shrank within its round, so it consumes the need, even if the round is then interrupted: the next
+request fits, or its own overflow compacts. A context-window overflow compacts and retries within its turn only.</p>
 <p>Summarization is a separate recorded request with a structured response schema and no callable
 tools. Native history ends before any trailing unanswered tool-call message, keeping the summary
 request valid for providers that require paired calls and results. The latest response is instead
@@ -332,16 +419,24 @@ Replacements made by that response’s scripts run normally.
 All results join the retained calls in the first normal post-compaction request. Completed
 exchanges cannot be partially retained. The retained projection removes reasoning bound to the
 replaced context.
-Compaction reserves the greater of reported occupancy and calibrated summary-input size,
-including the temporary response block, directive, and schema. Its output limit is the smaller
-of the configured limit and the remaining context space; no available output space fails before
-invoking the provider. Normal request settings are unchanged, and the summary’s effective limit
-is journaled for exact reconstruction.</p>
+The summary’s output limit is the smaller of the configured limit and the space the completed
+response’s reported occupancy leaves; no space left fails before invoking the provider. A summary
+the provider rejects as too large is retried within the attempt limit, smaller at each step: with
+half the output reserve, then also without about half of the history after its opening exchange,
+cut at the user or assistant message nearest the middle, which the summary request journals as
+its history’s first message; no stage raises the output limit an earlier one sent. The retained
+tail’s sizes are inferred from reports: messages after the agent’s last reported request stay
+whole, and earlier exchanges join them while the growth between the prompts of the requests
+around them fits the retention budget. Only consecutive requests under the same model context
+are compared, and growth that is zero or negative sizes nothing, which stops the walk. A
+checkpoint for an overflow retains only the last exchange: the messages the overflowing request
+added are unsized and may be what overflowed. Retention keeps conversation only; a committed
+state is stale once the next request sends its own. Normal request settings are unchanged, and
+the summary’s effective limit is journaled for exact reconstruction.</p>
 <p>History replacement and todo reconciliation become active only after checkpoint persistence.
 Validation prevents a stale summary from overwriting newer todo state. Every valid, successfully
-persisted continuation replaces the context and reconciles todos, regardless of estimated size
-reduction. Replay uses the stored continuation rather than rerunning the summary or today’s
-renderer. See <a href="embedding.html#reconstructing-model-calls">model-call reconstruction</a> for the
+persisted continuation replaces the context and reconciles todos. Replay uses the stored
+continuation rather than rerunning the summary or today’s renderer. See <a href="embedding.html#reconstructing-model-calls">model-call reconstruction</a> for the
 durable reference contract.</p>
 <h2 id="tools-jobs-and-execution"><a class="header" href="#tools-jobs-and-execution">Tools, jobs, and execution</a></h2>
 <p><code>ToolRegistryBuilder</code> supports typed and JSON-based registrations. Typed registrations generate
@@ -362,7 +457,12 @@ rather than denied.</p>
 <p>The executor coordinates host-owned jobs and persistence. A job moves through one lifecycle
 (queued, awaiting approval, running, waiting for input, finished) whose transitions and outcomes
 are journaled; the job state a caller sees is a projection of that lifecycle, and a lease typed by
-its startup stage carries a job from creation to its running worker. A tool may declare a source argument, a
+its startup stage carries a job from creation to its running worker. A finish claims the job before
+it prepares any output, so of competing outcomes (completion, cancellation, interruption) only the one
+that publishes saves output, once, in the transaction that journals it; the others wait for it, then
+apply only where its outcome admits them,
+as a cancellation ends an interruption. Each finish is bound to the invocation it was issued for,
+so one from before a restart never ends the invocation the restart began. A tool may declare a source argument, a
 <code>TargetPath</code> on any target: the executor selects its location like a tool target, authorizes the
 read with the call, and opens it for the call’s context. A host tool whose input places its job
 elsewhere, such as a child agent’s target and workspace, has that location selected before the job
@@ -388,7 +488,7 @@ diagnostics and result slots registered by their producer, such as an expected <
 rendered only when the viewer’s capabilities permit exposing them. Host-site wording is relative
 to the viewer’s target: “on session host” is omitted for host-local viewers and retained for remote
 viewers. Pages of a value enclosing a diagnostic slot stream from the viewer’s own rendering of
-the saved document; nothing capability-sensitive is cached.</p>
+the saved document.</p>
 <p>This rendering boundary does not guarantee that target aliases never appear in a restricted view.
 A privileged <code>jobs</code> output read saves its rendered view as an ordinary JSON snapshot. Later
 restricted views of that saved result, or script results that copy it, retain the earlier rendered
@@ -400,29 +500,44 @@ outermost larger containers, unless they enclose a capture, JSON-declared text, 
 a long string reached through object members alone, or the diagnostic slot. Text a schema
 declares as <code>contentMediaType: application/json</code> is classified once at finalization, unless its
 output was cut off, and when it is JSON is read as that value from its original bytes.
-Finalization also records the fields presentation never shortens, those marked
-<code>x-skyhook-complete</code> in the output schema joining those a script’s returned tool results carry,
-and then the size of the result’s automatic presentation, which notification batching budgets
-without previewing it again. Jobs persist their output schemas so resumed and remote results use
-the same rules.</p>
+Finalization also records the fields whose presentation the output schema declares with
+<code>x-skyhook-preview</code>, joining those a script’s returned tool results carry: <code>complete</code> fields are
+never shortened, and <code>ends</code> text keeps its first and last lines; a field declared both ways is
+complete. Jobs persist their output schemas so resumed and remote results use the same rules.</p>
 <p>All saved JSON is read through streaming readers built in <code>job::output::json</code>. Previews, pages,
 and navigation into stored containers hold a bounded pool of what they may show rather than the
-value, and sampled readings take stored text only up to its prefix, with its extent from storage.
+value, and sampled readings take stored text only up to its prefix, with its extent from storage,
+and the last bytes of text declared to keep both ends.
 Memory still grows with the largest single key or number, which the reader buffers whole; with the
 keys of each open object while detection tracks duplicates by hash; with fields marked complete,
 which are read whole; and with a JSONPath query’s selected field, which is loaded within a cap
 metered on the bytes it reads. JavaScript receives complete results, while the journal retains the
 exact previews delivered to the model. See <a href="../reference/job-output.html">saved job output</a> for the
 user-facing limits.</p>
-<p>Child messages and job notifications use a prepared delivery receipt: snapshot pending events,
-then commit them to the parent’s history together with their acknowledgment. Abandoned preparation leaves the
-events pending; cancellation cannot split an accepted commit from its acknowledgment. Replay
-recovers pending child messages from durable history, independently of output inspection.</p>
-<p>Process tools never connect stdin, and capture stdout/stderr. Without the <code>Interactive</code> capability,
-they also detach from the controlling terminal on Unix and replace inherited askpass settings with
-a rejecting helper. Redirecting stdio alone is insufficient: a program could still prompt through
-<code>/dev/tty</code>. The helper remains alive through process cleanup, independently of whether target
-management is enabled. OpenSSH runs a Skyhook binary as its askpass helper, so every binary calls
+<p>Child messages and job notifications are read, presented, then committed to the parent’s history
+together with their acknowledgment. The commit is refused when anything it presents is no longer
+pending as it was read, as when a claim acknowledged it meanwhile, and the parent presents what is
+pending now instead. Abandoned presentation leaves the events pending; cancellation cannot split
+an accepted commit from its acknowledgment. A model call’s result likewise commits with the
+acknowledgment of the outcome it reports, so a result that never commits, as when the process
+dies first, leaves that outcome pending for delivery. A job’s own reads, such as a <code>jobs</code> read or
+the calls a script collects, are acknowledged by its finish in the same way, however it ends:
+failed or cancelled, with or without output. The host journals no result, so its collection
+acknowledges as it reads. Replay recovers pending child messages from durable history,
+independently of output inspection. A child’s text-only answer is held as its job’s result;
+when its invocation goes on instead, the answer’s release to the owner is journaled too.</p>
+<p>Process tools never connect stdin, capture stdout/stderr, and detach from the controlling terminal
+on Unix. Redirecting stdio alone is insufficient: a program could still prompt through <code>/dev/tty</code>,
+and outside the terminal’s foreground process group that stops it. Without a terminal, OpenSSH,
+sudo and Git prompt through the askpass helper (<code>SSH_ASKPASS</code>, <code>SUDO_ASKPASS</code>) instead. sudo also
+requires some <code>DISPLAY</code>, so a placeholder is set only when the process would have none. Root
+process tools always receive the session’s askpass helper, backed by the host’s sensitive prompt
+handler. Each prompt names its best-effort requester, and its job when the requesting process descends from
+the process a running job registered with the job manager. The session-managed SSH agent replaces
+<code>SSH_AUTH_SOCK</code> only with the <code>Targets</code> capability. Remote workers give their processes a helper that forwards prompts to the host.
+Without the <code>Interactive</code> capability, a call replaces these settings with a rejecting helper that
+remains alive through process cleanup, independently of whether target management is enabled.
+OpenSSH and sudo run a Skyhook binary as their askpass helper, so every binary calls
 <code>remote::askpass_main()</code> first: it answers the prompt and exits when started in that role and
 returns otherwise. SSH’s host-mediated prompt channel is described under <a href="remote-transport-and-shims.html#authentication-and-prompt-isolation">authentication and prompt
 isolation</a>.</p>
@@ -432,20 +547,67 @@ normalized; blobs, job results, and line-addressable captures share the database
 separate transcript or output files. Only shapes that a model, a tool’s own schema or a provider
 defines are stored as JSON text: tool-call arguments and results, job arguments and output
 schemas, tool and response schemas, reasoning replay payloads, saved job results and the
-results and pages a job event presented. Related state transitions are appended transactionally
-before their in-memory projections are published. Accepted writer work is owned independently
-of the caller, so dropping an await does not cancel a commit already in progress.</p>
-<p>A writer lock excludes competing session owners, not read-only snapshot inspection. If a write’s
-outcome becomes uncertain, the writer requires recovery instead of allowing later appends to
-pretend the commit failed. On resume, the runtime reconciles unfinished model attempts and
+results and pages a job event presented. Each open session has one core thread that owns the
+writer and the one in-memory fold of the journal: its records, request ledger, jobs, todos and
+targets, and beside them, never journaled, each running agent’s turn and inbox and every
+registered wait. A wait, such as an agent’s <code>wait</code>, a caller awaiting its foreground job, or an
+idle agent awaiting work, is a predicate the core decides when it is registered and after every
+change. Senders to an agent never wait: its inbox accumulates in order.
+Observation views the runtime updates without journaling, such as streaming deltas, sit beside
+that fold. A command plans against
+that state on the core thread, commits its entries in one transaction, and applies and publishes
+them before the next command runs, so no reader sees a record the state does not reflect.
+Reopening folds the journal with the same apply, refusing a job transition the job’s phase does
+not admit. Dropping an await, or its runtime, does not cancel a command already queued.</p>
+<p>A write the journal cannot take stops the session as a crash does: a refused or failed
+transaction, a commit whose outcome is unknown, a failed blob insert, a finished job’s output
+that cannot be prepared for its finish, or a panic on the core thread. In the same critical section the session moves to failed, its connection takes no more
+writes, everything it runs is cancelled, no agent runs, and every wait and reply resolves with the
+failure, which every later write reports too. Observers see the phase change, and read every
+turn, request, response and job the session left going as interrupted at its last activity, as
+reopening settles them. Rules a concurrent change can break, such as the stale-todos check on a compaction
+checkpoint, are decided by their command’s plan against the state it commits to, so a refusal
+there is not a failure.</p>
+<p>A writer lock excludes competing session owners, not read-only snapshot inspection. Closing the
+store rolls back any abandoned transaction and makes its shared SQLite connection read-only before
+releasing that lock, so retained output handles cannot write into a reopened session. Saved output
+can still be read. Dropping the store’s last handle closes it the same way, and so does dropping a
+session’s last handle, which also stops its agent loops, job work, and the approval and question
+prompts they asked, where they stand: a session left that way reopens as a crash would leave it. A
+session closed with nothing journaled is removed, so a caller that gives up creating one leaves
+nothing behind. Closing a failed session releases it too, and reports the failure; reopening
+resolves what committed. Activating a reopened session reconciles unfinished model attempts and
 committed tool calls lacking results before any agent runs. Agents retain their journaled prompt,
-tools, and capability contract; current configuration can narrow that contract, not silently
-expand it. Observation is a host projection of durable records plus live state, not a second
-source of conversation history.</p>
+tools, and capability contract; current configuration can narrow that contract, not silently expand
+it. Observation is a host view of durable records, the jobs the session state folds from them, and
+live state; it is not a second source of conversation history or job state.</p>
 <p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/agent/runtime">agent runtime</a>,
 <a href="https://github.com/kryesh/skyhook/tree/main/src/provider">providers</a>,
 <a href="https://github.com/kryesh/skyhook/tree/main/src/tool">tools</a>, and
 <a href="https://github.com/kryesh/skyhook/tree/main/src/session">sessions</a>.</p>
+<h2 id="terminal-transcript-selection"><a class="header" href="#terminal-transcript-selection">Terminal transcript selection</a></h2>
+<p>The terminal lays out transcript entries into rows. Each row’s layout separates what it paints
+as decoration (wrap continuations, code padding, disclosure glyphs, spinner gutters, diff markers,
+table borders and padding) from the source text it shows. A row’s source is described by spans:
+which logical line they belong to, which bytes of that line’s text, and which bytes of the row
+show them. A table cell is a logical line of its own, so the fragments of a wrapped cell share
+one line. Spans also keep the source that a row shows differently or not at all, such as a cell’s
+trimmed separators, a replaced wide grapheme, or an empty cell.</p>
+<p>A selection is anchored to source, not to rows: each end is an entry key, a logical line identity
+within that entry, and a byte in that line’s text. Line identities come from the source and do
+not depend on width, but they are identities only. A Markdown line is identified by its source
+position. A tool document or plain line after an entry’s header is identified by all the text
+before it, so inserting a line gives every line below it a new identity; the header’s own text
+is the entry’s state, so it takes no part. Document order is the order in which the
+layout first shows each line, which reads a table’s cells row by row even when their fragments
+interleave on screen. Endpoints, copying and highlighting all read the same spans. Copying joins
+each selected line’s parts in that order, one line per table cell. Each layout of an entry orders
+its lines once, when a selection first needs them, so dragging across a long entry reads only
+the rows of the lines it selects.</p>
+<p>Whenever entries are laid out again (new text, a reply settling, a resize), the selection is
+re-resolved against the new rows. It survives only if its endpoints still exist and the text they
+select is unchanged; otherwise it is dropped rather than moved to other text.</p>
+<p>Source: <a href="https://github.com/kryesh/skyhook/tree/main/src/bin/skyhook/tui/render">rendering</a>.</p>
 
                     </main>
 

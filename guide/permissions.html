@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -182,13 +182,13 @@
                     <main>
                         <h1 id="permissions-and-capabilities"><a class="header" href="#permissions-and-capabilities">Permissions and capabilities</a></h1>
 <h2 id="approval-policy"><a class="header" href="#approval-policy">Approval policy</a></h2>
-<p><code>--approve-all</code> or
-<code>approve_all: true</code> bypasses approval prompts. Subject to the granted capabilities, the default
-CLI auto-allows reads and agent operations, as well as writes inside the root workspace.
-Execution, HTTP requests, SSH access, target changes, and writes outside the root workspace
-require approval. When the <code>interactive</code> capability is granted, questions and SSH authentication
-appear in the interface. Otherwise operations needing human input fail
-immediately; <code>approve_all</code> bypasses tool approvals but never restores questions or authentication.</p>
+<p><code>--approve-all</code> or <code>approve_all: true</code> bypasses approval prompts. Subject to the granted
+capabilities, the default CLI auto-allows reads and agent operations, as well as writes inside the
+root workspace. Execution, HTTP requests, SSH access, target changes, and writes outside the root
+workspace require approval. When the <code>interactive</code> capability is granted, questions and
+authentication prompts (SSH, and <code>sudo</code> in commands, locally or on targets) appear in the
+interface. Otherwise operations needing human input fail immediately; <code>approve_all</code> bypasses tool
+approvals but never restores questions or authentication.</p>
 <p>Filesystem tools and command <code>cwd</code> accept absolute paths or relative paths including <code>..</code>.
 The workspace is a base directory, not a security boundary. Filesystem path authorization and
 human approval are distinct: the default CLI read policy auto-allows reads even when their
@@ -198,13 +198,15 @@ its own approval requirements. Permissions name paths as text, so an operation w
 names a path or workspace that is not valid Unicode is refused rather than approved under an
 approximate name.</p>
 <p>Choose <strong>Allow once</strong> to approve only the current operation. When offered, <strong>Allow proposed
-scope</strong> saves the displayed grant for later operations in the same session, including after
-resume; inspect <strong>Details</strong> before granting it. Path grants apply only to the approved target
-and access mode. Directory grants cover descendants; read and write grants remain separate.
+scope</strong> saves the displayed grant for later operations while the session stays open; reopening
+the session asks again. Inspect <strong>Details</strong> before granting it. Path grants apply only to the
+approved target and access mode. Directory grants cover descendants; read and write grants remain
+separate.
 Process execution remains subject to confirmation on each invocation. These defaults apply to
 the CLI; <a href="../development/embedding.html">library hosts</a> can supply a different approval policy.</p>
 <p>Approval controls and pending/granted approval details remain user-facing. Agents see an ordinary
-queued job while authorization is pending. A denial preserves its reason and marks the rejected
+queued job while authorization is pending. A prompt is withdrawn once nothing waits for it, as
+when its operation is cancelled or its session stops. A denial preserves its reason and marks the rejected
 operation with <code>code: "permission_denied"</code>; it does not undo work that a
 containing script already performed.
 Agents must not circumvent a denial through another tool or route. For programmatic failure
@@ -258,20 +260,27 @@ cannot be given to a child. A workspace
 config that declares a mode replaces the whole definition of a user-config mode with that name;
 modes it does not name are kept, in declaration order.</p>
 <p><code>--mode NAME</code> selects the starting mode; without it the terminal starts in the mode last used in
-that workspace, and a batch job in <code>default_mode</code>. In the terminal, <code>Tab</code>/<code>Shift+Tab</code> in the composer (or
-<code>/mode</code>) choose the mode the next message is sent in; the footer shows it. A change takes effect
-with that message and forfeits the provider’s prompt cache for the next request. Child agents keep what they start with: the capabilities and instructions of the mode their
-parent chose for them, or otherwise the capabilities their parent holds and no mode instructions.
-Background jobs and scripts already running keep their capabilities too. A session can only hold capabilities
-that some configured mode grants, and MCP servers start under that union, so switching modes
-never starts or stops a server. Approvals granted earlier stay recorded but cannot be used while
-the mode lacks their capability. A resumed session continues in the mode it was last in. A
-session records each mode’s definition the first time it is used and keeps it: editing or
-removing that mode in the configuration does not change the session, while modes added later
-can still be selected. A resumed session is also never granted more than it started with, so a
-batch session reopened in the terminal stays without <code>interactive</code>. Because <code>general</code> is always
-present, redeclare it with a narrower list if the terminal should never be able to switch to its
-default capabilities.
+that workspace, and a batch job in <code>default_mode</code>. In the terminal, <code>Tab</code>/<code>Shift+Tab</code> in the
+composer (or <code>/mode</code>) choose the mode the next message is sent in; the footer shows it. Cycling
+modes only makes that choice: it never changes the session. A change takes effect with that message
+and forfeits the provider’s prompt cache for the next request. Child agents keep what they start
+with: the capabilities and instructions of the mode their parent chose for them, or otherwise the
+capabilities their parent holds and no mode instructions. Background jobs and scripts already
+running keep their capabilities too. A session can only hold capabilities that some configured mode
+grants, and MCP servers start under that union, so switching modes never starts or stops a server.
+Approvals granted earlier stay granted but cannot be used while the mode lacks their capability.</p>
+<p>A resumed session continues in the mode it was last in, as the current configuration defines it:
+the configuration decides what a reopened session’s modes grant, more or less than before, and a
+batch session reopened in the terminal gains <code>interactive</code>. Opening a session whose modes the
+configuration has since changed or removed shows a warning and changes nothing, and neither do
+renaming it or cancelling a job. The change applies with the next work that runs the root agent: a
+prompt, retry, continue, script or job delivery. It is recorded together with the message that
+work commits, or just before a script starts. A root agent whose mode was removed moves to the
+default mode. Child agents it already started keep what they started with, within what the
+configuration still allows. The session’s history keeps every
+definition of a mode it used, so earlier entries still show what they ran under. Because <code>general</code>
+is always present, redeclare it with a narrower list if the terminal should never be able to switch
+to its default capabilities.
 Continuing a failed or interrupted root turn also applies a newly chosen mode.</p>
 <p>Capabilities gate both tool discovery and invocation, including JavaScript. Approval policies and
 cached grants cannot restore a missing capability. Ungated orchestration tools remain available even

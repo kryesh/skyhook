@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -302,10 +302,13 @@ A working-directory override is separate from the target’s configured workspac
 or saved-output inspection failure is not necessarily a failure of the command on the remote
 machine.</p>
 <p>Prefer these named targets to manually running <code>ssh</code>. A tool that needs an SSH route requests
-approval before any probe, authentication, or shim deployment. A saved
+approval before any probe, authentication, or shim deployment. A
 <a href="permissions.html#approval-policy">route grant</a> applies across tools and workspaces, so
 reconnecting an unchanged route needs no new approval. Changing a target or any hop in its route
-invalidates the affected grant.</p>
+invalidates every grant naming it, whatever the resource, and stops connections still starting
+over the old route; an operation waiting for approval or a connection is planned again and asks
+about the new definition. An operation already running over the old route finishes there, but any
+further approval it asks for is refused.</p>
 <p>JavaScript orchestration and the session log stay on the host; nested tool calls use the
 selected target and workspace. For remote execution internals and shim builds, see
 <a href="../development/remote-transport-and-shims.html">remote transport and shims</a>.</p>

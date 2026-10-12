@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -207,8 +207,25 @@ root agent that capability set directly, and no mode applies.
 <code>SessionHandle::selection(model, mode)</code> issues the <code>Selection</code> a submitted message or a continued
 turn carries, rejecting a <code>provider/model</code> or mode the session does not have; omitted selections
 retain the active model and mode. A mode change applies to the root agent from the boundary that
-consumes it, not retroactively to children it already started. A session pins each mode’s
-definition on first use and cannot outgrow its original capability ceiling.</p>
+consumes it, not retroactively to children it already started. A session runs the harness’s modes
+and capability ceiling, whatever it ran under before. A reopened session reports modes the
+configuration redefined or removed in <code>startup_warnings()</code> and changes nothing while viewed, nor
+when calls such as <code>rename</code>, <code>record_status</code> or <code>cancel_job</code> activate it. The next work that runs
+the root (a prompt, continue, job delivery or <code>run_script</code>) decides its mode once: the selected
+one, else its own as configured now, or the default mode once its own is gone (without a default
+mode, it keeps running its own edition). A message’s
+<code>ModelChanged</code> and <code>ModeChanged</code> are journaled in one transaction with its <code>MessageCommitted</code>; a
+script’s precede the script. Each <code>ModeChanged</code> or <code>AgentStarted</code> whose definition
+differs from that mode’s latest journaled one records a new edition, which the journal keeps for
+auditing. <code>SessionHandle::changes_mode(mode)</code> reports whether the root’s next message in <code>mode</code>
+would change what it runs.</p>
+<p>Each <code>SessionEvent::TitleSet</code> records its <code>TitleSource</code>: <code>Prompt</code>, <code>User</code> or <code>Generated</code>.
+<code>SessionHandle::set_title(title)</code> gives a session an automatic title from its first input (a prompt
+or a script) and leaves a titled session alone; <code>rename(Some(title))</code> sets the user’s title, and
+<code>rename(None)</code> journals a <code>TitleCleared</code> that returns the session to its automatic title.
+<code>title().await</code> reads the title the session list shows, as a <code>SessionTitle</code> with its text and
+<code>TitleSource</code>: the user’s newest title unless cleared since, otherwise the newest <code>Prompt</code> or
+<code>Generated</code> title, otherwise the first text the user sent the root agent, as a <code>Prompt</code> title.</p>
 <p>Before building, hosts can supply policy, question and sensitive-prompt handlers, additional tools,
 and an embedded shim catalog. A <code>SensitivePromptHandler</code> answers each <code>SensitivePrompt</code> with a
 <code>PromptAnswer</code>: <code>Secret</code> for passwords, passphrases and keyboard-interactive prompts, and
@@ -221,51 +238,91 @@ an override supplied by <code>Config::session_root</code>, is passed through unc
 relative to the process working directory, not the workspace or configuration file. The CLI selects
 its own workspace-local session root.</p>
 <h2 id="host-observation-api"><a class="header" href="#host-observation-api">Host observation API</a></h2>
-<p><code>SessionHandle::observe().await</code> returns a snapshot and receiver sharing an atomic revision
+<p><code>SessionHandle::observe()</code> returns a snapshot and receiver sharing an atomic revision
 boundary. Apply updates to the snapshot in revision order with <code>ObservationSnapshot::apply</code>.
+Once the session no longer runs (viewed, failed or closed), the snapshot reads every request,
+response, job and turn it left going as interrupted at its last activity; <code>apply</code> returns the jobs
+and requests an update read that way, which no update of their own reports.
 It contains:</p>
 <ul>
 <li>Durable records keyed by their original journal sequence.</li>
 <li>The request ledger: each logical request’s lifecycle phase, outcome, and usage, folded from
 those records. Host statistics and displays read request state from it.</li>
+<li>Every job as the session state holds it: its owner, call arguments, state, failure, current
+invocation, and when that invocation ran. A job’s update arrives just before the record that
+moved it.</li>
 <li>Request-scoped live responses keyed by agent and logical request: their streamed blocks in
 arrival order, then the authoritative blocks once the response has ended.</li>
-<li>Current agent activity and context-usage estimates.</li>
+<li>Current agent activity, with when its turn began (or, once it is no longer busy, when that
+turn ended), and the context gauge: each agent’s occupancy as its last committed response
+reported it, folded from the journal and cleared by a checkpoint.</li>
 </ul>
 <p>Live response deltas are provisional, not additional committed messages. A new attempt of the
 same logical request resets its live response without removing durable attempt records. On
 receiver lag, obtain a fresh observation and replace <strong>both</strong> the snapshot and receiver; continuing
 with only one can leave a gap or apply stale live state.</p>
-<p><code>inspect_jobs</code>, <code>inspect_output</code>, <code>inspect_output_with_captures</code>, and <code>inspect_output_fields</code> are
-host inspection APIs. They do not claim jobs or consume agent notifications. <code>cancel_job</code> is the
-separate operation that requests cancellation. <code>startup_warnings</code>, <code>warnings</code>, and <code>mcp_servers</code>
-expose startup diagnostics and MCP discovery outcomes without inserting diagnostics into model
-context or writing directly to a terminal. <code>record_status</code> likewise records host-facing status,
-not a user message.</p>
+<p><code>inspect_jobs</code> (a synchronous read of an agent’s jobs), <code>inspect_output</code>,
+<code>inspect_output_with_captures</code>, and <code>inspect_output_fields</code> are host inspection APIs. They do not
+claim jobs or consume agent notifications. <code>cancel_job</code> is the separate operation that requests
+cancellation. <code>startup_warnings</code>, <code>warnings</code>, and <code>mcp_servers</code> expose startup diagnostics and MCP
+discovery outcomes without inserting diagnostics into model context or writing directly to a
+terminal. <code>record_status</code> likewise records host-facing status, not a user message.</p>
 <p><code>TodoItem</code> and <code>TodoStatus</code> are exported by <code>skyhook::agent</code>. Hosts projecting
 checklists from observed records apply <code>SessionEvent::TodosReplaced</code> and the reconciled todos in
 <code>SessionEvent::Compaction</code> checkpoints in sequence. Both replace the owning agent’s entire list;
 child-agent lists remain independent.</p>
 <h2 id="interruption-continuation-and-shutdown"><a class="header" href="#interruption-continuation-and-shutdown">Interruption, continuation, and shutdown</a></h2>
 <p><code>prompt</code> and <code>prompt_with_options</code> submit input and wait for its turn. <code>interrupt</code> stops active
-turns while retaining child jobs for continuation; explicit job cancellation is non-resumable.
+turns while retaining child jobs for continuation, and returns how many turns and unstarted child
+agents it stopped. If that is more than none, job deliveries start no turn until
+<code>continue_turn_with</code> or new input: they stay pending for that request. An interrupt also hands
+back input no agent has taken yet: a pending <code>prompt</code> returns <code>Interrupted</code>, and each
+<code>QueuedPromptReceipt</code> from <code>enqueue_prompts</code> resolves <code>Interrupted</code>. Explicit job cancellation is
+non-resumable.
 <code>continue_turn_with</code> continues failed or interrupted work without duplicating its input and can
 select a model or mode for the continued root turn. Its <code>ContinueOutcome</code> distinguishes a root
 answer from resumed children and reports whether the selection applied: restarting children does
 not imply that a waiting or live root also ran. <code>continue_turn</code> uses default options and returns
 the root answer, or an empty string when there is none.</p>
-<p>Use <code>Harness::resume_session</code> to reopen durable state. The runtime reconciles interrupted work
-before starting agents and opens fresh provider contexts; it does not reuse old network resources.
-A root turn that failed or was interrupted before the session closed can still be continued.
+<p>Use <code>Harness::resume_session</code> to reopen durable state. The session opens to view: it journals
+nothing, and its observation reads it stopped at its last activity, until the first call that
+changes it, such as a prompt, <code>continue_turn_with</code>, a script, a status, a title or a job
+cancellation. That call first prepares the root agent; if the root cannot run, for example because
+its model is no longer configured, the call fails and the session stays viewed. Otherwise the
+runtime reconciles interrupted work in one transaction before starting agents. Shutting down a
+viewed session stops nothing and journals nothing: it closes the session, releasing it for another
+open, and later calls that would change it are refused. Work the previous process left open is
+recorded as ending when that process last did something, so reopening a session is not activity;
+record times therefore need not increase with sequence. It opens fresh provider contexts and does
+not reuse old network resources.
+A root turn that failed or was interrupted before the session closed can still be continued. A root
+that closed idle with job deliveries pending resumes interrupted too, so <code>continue_turn_with</code> or new
+input delivers them.
 Journaled agent settings remain the baseline, subject to restrictions imposed by current host
 configuration.</p>
-<p>Session databases use format 15. Earlier formats are not migrated and cannot be resumed with
+<p>Session databases use format 22. Earlier formats are not migrated and cannot be resumed with
 this version; retain a compatible Skyhook version to inspect or resume those sessions, or start a
 new session.</p>
 <p>Await <code>SessionHandle::shutdown()</code> before releasing the host’s session owner. Shutdown stops runtime
-producers, drains accepted job and journal work, and closes MCP and remote resources. The journal
-remains available so the host can append a final status after observing shutdown errors; await
-that append before dropping the session/store owner.</p>
+producers, drains accepted job and journal work, and closes MCP and remote resources. It interrupts
+the session as a crash would: child agents still running end interrupted and can be continued once
+the session is resumed, and other running jobs are cancelled. Once it has
+begun, new prompts, <code>continue</code>, host scripts, new jobs, and input that would restart a finished
+job are refused with <code>SessionError::Refused</code>; input to a running job and answers to its questions
+are still accepted. The
+journal remains available so the host can append a final status after observing shutdown errors;
+await that append, then <code>SessionHandle::close()</code>, which releases the session so it can be opened
+again at once rather than once every handle has dropped; closing a closed session does nothing. Closing also prevents retained output
+handles from writing to the session; already saved output remains readable. Dropping the last
+<code>SessionHandle</code> without shutting down closes the session as a crash would leave it and stops its
+agents and jobs; resuming it settles what was running. A session closed with nothing journaled, such as one
+whose <code>new_session</code> caller gave up, is removed.
+A write the session journal cannot take stops the session as a crash would: the call that met it,
+calls it cut short and every later call return <code>SessionError::JournalFailed</code> with the first
+cause; <code>shutdown</code> and <code>close</code> report it too and still release the session. Its observation reads
+the phase as failed. <code>SessionHandle::phase</code> tells whether the session still runs and journals.
+A session belongs to the Tokio runtime that created or resumed it: use it only from that runtime,
+and keep the runtime running until the session is closed.</p>
 <h2 id="embedded-shim-catalog"><a class="header" href="#embedded-shim-catalog">Embedded shim catalog</a></h2>
 <p>The library’s shim catalog is empty by default. Supply <code>remote::EmbeddedShimCatalog</code> through
 <code>HarnessBuilder::shim_catalog</code> to enable remote execution. The CLI supplies its own catalog, but
@@ -279,7 +336,14 @@ behavior.</p>
 <h2 id="reading-a-session-archive"><a class="header" href="#reading-a-session-archive">Reading a session archive</a></h2>
 <p><code>SessionStore::read_records(root, id).await</code> returns sequence-ordered records from a read-only
 database snapshot without acquiring the session’s writer lock. A live owner may continue writing;
-archive inspection neither takes ownership nor resumes unfinished work.</p>
+archive inspection neither takes ownership nor resumes unfinished work.
+<code>SessionStore::is_open(root, id).await</code> reports whether a store in any process holds the session.
+It takes the session lock shared for an instant; an open racing it retries once before failing
+with <code>AlreadyOpen</code>. <code>SessionStore::summary(root, id).await</code> reads a session list row without
+decoding the session, including its title as <code>SessionHandle::title</code> reads it, in <code>last_millis</code> the
+time of its newest record that <code>SessionEvent::is_activity</code> (closing a session is not), and, in
+<code>stopped</code>, the failed or interrupted turn that resuming the root agent would continue, if any. <code>stopped</code> reads only the root’s journaled turns, so a session that closed idle with job
+deliveries pending has none, yet resumes interrupted.</p>
 <p>The SQLite layout is versioned by <code>session::SESSION_FORMAT_VERSION</code>. Opening a database validates
 its identity and version; there is no migration or compatibility layer for earlier layouts.</p>
 <h2 id="reconstructing-model-calls"><a class="header" href="#reconstructing-model-calls">Reconstructing model calls</a></h2>
@@ -293,16 +357,19 @@ including the model ID, reasoning setting, and output limit. Context records des
 settings, not the lifetime of a <code>ProviderContext</code> resource.</li>
 <li><code>model_requested</code> identifies one frozen logical request before its first invocation. It references
 the context record and stores the checkpoint it opens with, its history as the agent’s commits
-through a message sequence, <code>tail</code> as exact inline messages, and
-<code>history_lifetime</code>. Retries refer back to this
+through a message sequence (a summary that overflowed resumes <code>from</code> a later one), <code>tail</code> as
+exact inline messages, and <code>history_lifetime</code>. Retries refer back to this
 request using <code>model_attempt_started</code>, with separate failure/interruption or completion outcomes.
 Ordinary requests reuse a context record while their settings remain applicable; summarization
 has a separate context with its structured response schema.</li>
 <li><code>compaction</code> stores the exact replacement message, retained original message references, covered
-frontier, the summary attempt that produced it, token estimates, and reconciled owner todos.
+frontier, the summary attempt that produced it, the reported occupancy that triggered it (none
+after an overflow), and reconciled owner todos.
 History and todos become active together after persistence.</li>
 <li>Runtime state and job-event content are stored structurally and rendered for the model on
-reconstruction, so a request replays the text the model was sent.</li>
+reconstruction, so a request replays the text the model was sent. A reconstructed context
+carries, before each response since its checkpoint or the agent’s latest mode switch, the state
+the request that produced it sent; codecs decide whether to send it.</li>
 <li>Reconstruction resolves those references and inline values. It does not consult current
 configuration, live jobs, or the current compaction renderer. Runtime state and job events are
 rendered by the current state renderer and job-view serialization, which are therefore part of
@@ -319,7 +386,7 @@ on an owning <code>SessionStore</code> loads their contents for provider encodin
 exactly this request’s blobs in <code>cache</code>; unlike <code>read_records</code>, opening a store acquires the
 session’s writer lock. Reconstruction reproduces Skyhook’s provider-neutral input, not an
 API-specific wire encoding or a replay of the external call.</p>
-<p>The <code>ModelRequest</code> contract preserves the history/tail split and <code>history_lifetime</code> cache hints.
+<p>The <code>ModelRequest</code> contract preserves the typed context entries and <code>history_lifetime</code> cache hints.
 See <a href="architecture.html#history-transient-state-and-caching">history, transient state, and caching</a>
 for their semantics and provider rationale.</p>
 <p>Source: <a href="https://github.com/kryesh/skyhook/blob/main/src/config/runtime.rs">configuration admission</a>,

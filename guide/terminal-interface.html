@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -192,12 +192,15 @@ syntax highlighting once their closing fence arrives; open blocks keep a consist
 code style while streaming.</p>
 <p>The agent tree appears above the composer while children are active or a child agent is being
 viewed. Click an agent to inspect its conversation without mixing its output with other agents.
-Each agent retains its reading position and expanded rows. Agents using the <code>wait</code> tool show
-<strong>Waiting</strong> rather than <strong>Running tools</strong>. Tree rows show <code>@target</code> for remote agents and their
-own token totals and context usage: output · input (uncached) · context.
+Each agent and tab retains its reading position and expanded rows. Agents using the <code>wait</code> tool
+show <strong>Waiting</strong> rather than <strong>Running tools</strong>. Tree rows show <code>@target</code> for remote agents and their
+own token totals, context usage and time: output · input (uncached) · context · time. The time is
+how long a busy agent’s current turn has run; once it isn’t busy, how long a child ran its job, or
+how long the root agent’s last turn took.
 Agent call previews show the child’s target even while queued or running; an omitted target
 inherits the caller’s target. Completed final replies identify the model that answered in a
-footer below the reply.</p>
+footer below the reply, with how long that response took and, when tool rounds came first, how
+long the whole turn took.</p>
 <p>The composer always sends to the root agent. While root is busy, Enter queues a follow-up
 for its next model request, without interrupting the current request or tools. It does not wait
 for the entire turn to finish. <code>/queue</code> edits/removes input that has not yet been consumed.
@@ -206,24 +209,32 @@ composer; merely opening the queue or deleting an item does not pause it. Interr
 submission or delivery errors, and session-start failures also pause queue delivery. <code>/resume</code>
 clears that pause, as does normal composer Enter (even with an empty draft); slash commands
 do not automatically resume the queue.
+If Skyhook cannot write a session’s journal, that session stops as if the process had crashed:
+its queued input is dropped and its conversation shows why. It stays open to read until you close
+it, and reopening it continues from what was saved.
 Queued input lives only in the running interface: it is not saved with the session. Each open
 session keeps its own queue, which keeps delivering while you look at another session and is
 discarded when its session is closed.</p>
 <p><code>/retry</code> continues failed or interrupted turns without duplicating their original prompts.
 After a session interruption it resumes all interrupted children automatically, regardless of
-which agent is selected. Parents with pending waits stay in those waits.
-Automatic model retries display the attempt number, next delay, and latest diagnostic in one
-error block. Partial output from the failed attempt clears when the next attempt starts;
-successful replies have no retry labels. Retries continue until success or cancellation for
-<a href="../configuration/providers-and-models.html#model-failure-recovery">transient model failures</a>.</p>
+which agent is selected. Parents with pending waits stay in those waits. On a reopened session
+that has not run anything yet, <code>/retry</code> always starts it and continues whatever it left
+unfinished, or reports that there was nothing.
+Automatic model retries display the attempt number, a countdown to the next attempt, and the
+latest diagnostic in one error block. Partial output from the failed attempt clears when the next
+attempt starts; successful replies have no retry labels. Retries continue until success or
+cancellation for <a href="../configuration/providers-and-models.html#model-failure-recovery">transient model failures</a>.</p>
 <p>The inspector provides Conversation, Requests, and Jobs tabs. Switching agents keeps the selected
-tab, while reading positions and expanded rows remain separate for each agent. Requests include
-compaction requests and token summaries; transient retries appear under the same request, which
-reads <strong>Retrying</strong> while the next attempt is pending. Full request bodies are available in the
-session log, not rendered in the UI. Status messages, including
-skill warnings, interruptions, and errors, appear in the conversation and are saved with the
-session, but are not sent to the model. Connection and MCP startup warnings describe this
-installation rather than the session, so they are shown but not saved.</p>
+tab, while reading positions and expanded rows remain separate for each agent and tab. Requests
+include compaction requests, when each was sent, token summaries, and how long each took; transient
+retries appear under the same request, which reads <strong>Retrying</strong> while the next attempt is pending.
+Full request bodies are available in the session log, not rendered in the UI. Status messages,
+such as interruptions and errors, appear in the conversation and are saved with the session, but
+are not sent to the model. Startup warnings (skills, configuration, connections and MCP servers)
+describe this installation rather than the session, so the terminal shows them but does not save
+them. Unsaved notices appear where they arrived in the conversation and scroll away as it grows.
+Feedback on an action, such as an attached file, a search without matches, an export, or a
+setting that could not be saved, shows briefly on the notice line instead.</p>
 <p>Job output is paged and searchable without acknowledging the agent’s pending notifications.
 Select a job and press <code>o</code> for output fields, regex search, and the next page; <code>c</code> requests
 cancellation (useful for background jobs, since interrupting already cancels the foreground tool).
@@ -233,8 +244,16 @@ output becomes available as it is transferred to the host.</p>
 <p>Provider-supplied reasoning streams in a separate expanded block and collapses when answer text
 starts or the response finishes. Click a multi-line block or press Enter when selected to reopen
 it, including after resuming a session. Single-line reasoning stays inline without an
-expand/collapse control and is not selectable, even when it wraps in a narrow terminal.
-Spinners indicate that a request is still active.</p>
+expand/collapse control and is not selectable, even when it wraps in a narrow terminal. A
+heading or wholly bold or italic line followed by a blank line starts a new reasoning section,
+titled by that line and collapsible like any multi-line block; only the section still streaming
+stays expanded. A title with nothing under it stays inline.
+Spinners indicate that work is still active, and a counter at the end of the row shows for how
+long. The working indicator counts the whole turn, across model requests and tool rounds;
+streaming reasoning counts from its request. Running tool calls count up and keep their duration
+once finished; expanding one shows when it started. A running tool waiting for input keeps its
+status symbol while its counter runs, and a retry counts down to its next attempt. Copied and
+exported text includes finished durations but not running counters.</p>
 <h2 id="model-selection-and-ui-state"><a class="header" href="#model-selection-and-ui-state">Model selection and UI state</a></h2>
 <p>Models are named <code>provider/model</code> and listed in configuration declaration order. For a new
 session, selection uses <code>--model</code>, then the most recently submitted configured model, then
@@ -255,18 +274,25 @@ Restore a missing recorded model before resuming rather than substituting anothe
 <p>The interface stores the last submitted model and mode and the sidebar setting in the workspace’s
 <code>.skyhook/state.json</code>, beside its sessions, without changing the model configuration.
 Session titles are saved with their history.</p>
-<p>A sidebar beside the conversation lists each configured MCP server with its startup status and the
-viewed agent’s todos, with the viewed agent’s capabilities pinned to its bottom. For the root agent
-these are what the mode of the next message grants. A section with nothing to list
-is left out, title included. The sidebar is shown by default; <code>Ctrl+X B</code> or <code>/sidebar</code> toggles it.
+<p>A sidebar beside the conversation shows the session’s title on its first line; click it to rename
+the session. Below, it lists the MCP servers the viewed agent can use, with their startup status,
+and the viewed agent’s todos, with the viewed agent’s capabilities pinned to its bottom. For the
+root agent of a new session these are what the mode of the next message grants, so cycling modes
+changes them. Once the root agent runs, choosing a mode for the next message that changes what it
+runs, including its own mode after the configuration redefined it, previews the change: a green
+<code>+</code> marks a server that mode would add, and a server it would remove is greyed out. A section with
+nothing to list is left out, title included. The sidebar is shown by default; <code>Ctrl+X B</code> or
+<code>/sidebar</code> toggles it.
 Terminals narrower than 100 columns hide it without changing the saved setting.</p>
 <p>The bottom bar uses this format:</p>
 <pre><code class="language-text">default · openai       8.4k · 200k(31.2k) · 42% (54k/128k)
 </code></pre>
 <p>Values are session output tokens, session total input tokens (uncached input), and the selected
-agent’s estimated current context occupancy (current tokens/model capacity). Session totals
-include children and compaction. Context includes instructions, tools, history, and runtime
-state; it is not cumulative usage. Missing context data appears as <code>—</code>.</p>
+agent’s context occupancy as the last response that reported its prompt counted it
+(tokens/model capacity). Session totals include children and compaction; a count a provider did
+not report adds nothing. Context includes instructions, tools, history, runtime state and that
+response; it is not cumulative usage. It appears as <code>—</code> until a response reports its prompt,
+including after compaction.</p>
 <h2 id="keyboard-and-mouse"><a class="header" href="#keyboard-and-mouse">Keyboard and mouse</a></h2>
 <p>The command palette and <code>/help</code> also list these shortcuts. <code>Ctrl+X</code> is a leader: release it, then press the next key when ready, or <code>Esc</code> to cancel.</p>
 <div class="table-wrapper">
@@ -277,6 +303,7 @@ state; it is not cumulative usage. Missing context data appears as <code>—</co
 <tbody>
 <tr><td><code>Ctrl+P</code>, <code>/</code></td><td>Commands</td></tr>
 <tr><td><code>Ctrl+X N</code>, <code>Ctrl+X S</code>, <code>Ctrl+X W</code></td><td>New session, switch session, close session</td></tr>
+<tr><td><code>Ctrl+X L</code>, <code>/rename</code></td><td>Rename the session</td></tr>
 <tr><td><code>Ctrl+X M</code>, <code>/model</code></td><td>Model for subsequent user messages</td></tr>
 <tr><td><code>Ctrl+X A</code></td><td>Agent picker</td></tr>
 <tr><td><code>Ctrl+X I</code>, <code>/queue</code></td><td>Edit queued follow-ups</td></tr>
@@ -294,13 +321,13 @@ state; it is not cumulative usage. Missing context data appears as <code>—</co
 <tr><td>Click a pane</td><td>Focus composer, tree, or conversation</td></tr>
 <tr><td><code>Enter</code></td><td>Send/queue, select, expand</td></tr>
 <tr><td><code>Alt+Enter</code>, <code>Ctrl+J</code>, supported <code>Shift+Enter</code></td><td>Newline</td></tr>
-<tr><td><code>PageUp</code>, <code>PageDown</code></td><td>Scroll history</td></tr>
+<tr><td><code>PageUp</code>, <code>PageDown</code></td><td>Scroll history; page through a draft taller than its box</td></tr>
 <tr><td><code>Ctrl+Alt+U</code>, <code>Ctrl+Alt+D</code></td><td>Half-page scrolling</td></tr>
 <tr><td><code>Home</code>, <code>End</code> in content</td><td>Beginning, latest</td></tr>
 <tr><td><code>/</code>, <code>n</code>, <code>N</code> in content</td><td>Search, next/previous match</td></tr>
 <tr><td><code>[</code>, <code>]</code> in content</td><td>Previous/next inspector tab</td></tr>
 <tr><td><code>Esc</code></td><td>Close local UI, dismiss/cancel prompts, otherwise interrupt work, cancelling the running foreground tool</td></tr>
-<tr><td><code>Ctrl+C</code></td><td>Clear draft, otherwise interrupt (as <code>Esc</code>)/quit</td></tr>
+<tr><td><code>Ctrl+C</code></td><td>Clear draft, otherwise interrupt (as <code>Esc</code>)/quit; in a prompt, clear its text, otherwise as <code>Esc</code></td></tr>
 <tr><td><code>Ctrl+X H</code>, <code>/help</code></td><td>Help and shortcuts</td></tr>
 <tr><td><code>Ctrl+X Q</code></td><td>Quit</td></tr>
 </tbody>
@@ -315,18 +342,27 @@ from the preview.</p>
 The command palette omits navigation-only actions; the <code>Ctrl+X</code> arrows step through
 agents and inspector tabs. Click the conversation, or pick an agent with <code>Ctrl+X A</code>, to focus it.
 Menus use arrows, mouse hover, the mouse wheel, or <code>Ctrl+P/N</code>; Enter or Tab activates
-the selected item. The Agents
-palette labels its Output, Input (uncached), and Context statistics. The composer
+the selected item. The Agents palette labels its Status column and its Output, Input (uncached),
+Context, and Time statistics. The composer
 wraps at word boundaries and grows with its draft up to half the space between the top and
-bottom bars, then scrolls to follow the cursor. It supports word movement, selection, <code>Ctrl+A/E</code>,
+bottom bars, then scrolls to follow the cursor; the mouse wheel over a taller draft scrolls it
+without moving the cursor. It supports word movement, selection, <code>Ctrl+A/E</code>,
 <code>Ctrl+W</code>, <code>Ctrl+U/K</code>, undo with <code>Ctrl+Z</code> or <code>Ctrl+-</code>, and redo with <code>Ctrl+Y</code>, <code>Ctrl+Shift+Z</code> or
 <code>Ctrl+.</code>. <code>Home</code>/<code>End</code> move to the start/end of the line, and <code>Ctrl+Home</code>/<code>Ctrl+End</code> to the
 start/end of the draft. Up/Down move through displayed input rows; in an empty composer they
 recall earlier prompts, and keep stepping through them until the recalled prompt is edited.
 Click agent and tool rows, scroll the relevant panel, or drag across text in user/agent messages
-and tool output, then copy the selected characters with <code>Ctrl+X Y</code> (or <code>y</code> while content is focused).
-Selection supports parts of a line and multiple lines; copying preserves Unicode and code indentation
-without adding newlines at visual wraps.
+and tool output: releasing the mouse copies the selected characters, and <code>Ctrl+X Y</code> (or <code>y</code> while
+content is focused) copies them again. A plain click copies nothing. Selecting text never scrolls the
+conversation, and open palettes and text pages stay where they are under the pointer. Selection
+supports parts of a line and multiple lines. It stays in place while a reply streams and finishes,
+and when the terminal is resized, as long as the selected text is unchanged. Copying preserves
+Unicode and the source’s own indentation without adding newlines at visual wraps. The indentation
+of tool output and arguments, the <code>+</code>/<code>−</code> markers of changes, and the expand/collapse glyphs and
+spinners of blocks and tool cards are not selected. In a table, selection follows the cells in
+reading order rather than the drawn grid: each table cell copies as one line, whole however it
+wraps, without borders or padding, and an empty cell copies as an empty line. Each copy reports
+how many characters it sent to the terminal; the terminal does not confirm that it accepted them.
 The workspace path is centered in the top bar. The bottom bar shows the model ID, session ID,
 and token statistics. These are plain text; use the terminal emulator’s selection gesture
 (usually Shift-drag) and copy shortcut. Copy uses the terminal’s OSC 52 clipboard support. <code>@</code> or <code>Ctrl+X F</code> attaches a workspace file
@@ -345,9 +381,24 @@ conversation; open menus and search keep input focus until closed. <code>Esc</co
 questions and permissions without answering them; reopen pending requests with <code>Ctrl+X R</code>
 (or <code>/attention</code>, labelled <strong>Reopen questions and permissions</strong> in the palette).
 Submitting a new prompt rejects any pending question batches; those batches can no longer be reopened.
-For background questions and SSH authentication/askpass prompts, <code>Esc</code> cancels the request;
-cancelled requests cannot be reopened. SSH authentication prompts take priority over questions,
+Commands have no terminal, so password prompts from SSH and from <code>sudo</code> in commands (locally or
+on a target) appear as authentication prompts. The typed answer stays out of the conversation, but
+it goes to whichever process asked, and a command the agent runs can ask too and capture it.
+As a hint, each prompt names the program that appears to have asked and, when it runs under one,
+the job: for example <code>Requested by /usr/bin/ssh</code> or <code>Requested by sudo (running as uid 0) in job 12</code>.
+A program running as another user, such as <code>sudo</code>, shows only its name and user, since its
+executable cannot be read. This is best-effort attribution, not proof of who asked or where the
+answer goes: a command started by a genuine program, such as an SSH <code>ProxyCommand</code>, can ask in
+that program’s name and receive the answer. Answer only prompts you expect from the work you
+asked for, and treat one that names a program you don’t expect (a script, a shell, Skyhook
+itself) or an <code>unknown program</code> as raised by the agent’s command.
+For background questions and authentication prompts, <code>Esc</code> cancels the request;
+cancelled requests cannot be reopened. Authentication prompts take priority over questions,
 permissions, menus, and search; interrupted question drafts resume afterward.</p>
+<p>Renaming opens a prompt of its own, ahead of pending questions and permissions, with the title you
+set ready to edit, or empty while the title is automatic; the composer and its draft are left
+alone. <code>Enter</code> saves the title, and saving it empty returns the session to its automatic title.
+<code>Esc</code> cancels the rename. A draft has nothing to rename until its first message is sent.</p>
 <p>Within questions and permissions, <code>↑</code>/<code>↓</code> selects an answer, <code>PageUp</code>/<code>PageDown</code> scrolls
 the prompt text, and <code>Ctrl+PageUp</code>/<code>Ctrl+PageDown</code> scrolls long answer descriptions.
 In multi-question prompts, <code>←</code>/<code>→</code> switches questions while navigating choices, preserving

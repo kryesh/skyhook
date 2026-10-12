@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -199,12 +199,12 @@ Different models on one provider may use different supported codecs:</p>
 <tr><th>Dialect</th><th>Codecs</th><th>Use for</th></tr>
 </thead>
 <tbody>
-<tr><td><code>compatible</code></td><td>any</td><td>Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only <code>base_url</code>. A key is sent as each API specifies: a bearer token, or <code>x-api-key</code> on <code>messages</code>.</td></tr>
-<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary: unsupported</code> (default <code>requested</code>) for an unverified organisation (Responses only), <code>organization</code>, <code>project</code>.</td></tr>
-<tr><td><code>anthropic</code></td><td><code>messages</code></td><td><code>https://api.anthropic.com/v1</code>. Extra fields: <code>workspace_id</code>, <code>cache_ttl: "5m"</code> or <code>"1h"</code>.</td></tr>
-<tr><td><code>codex</code></td><td><code>responses</code></td><td>The ChatGPT subscription service; no <code>api_key</code>—run <code>skyhook auth login</code>. <code>base_url</code> defaults to <code>https://chatgpt.com/backend-api/codex</code> and the extra field <code>auth_url</code> to <code>https://auth.openai.com</code>; set them only for a mirror.</td></tr>
-<tr><td><code>openrouter</code></td><td>any</td><td><code>https://openrouter.ai/api/v1</code>. Reasoning effort and returned reasoning follow OpenRouter’s conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: <code>routing</code> (Chat only: <code>order</code>, <code>allow_fallbacks</code>, <code>require_parameters</code>, <code>data_collection: "allow"</code> or <code>"deny"</code>, <code>quantizations</code>, <code>zdr</code>, <code>fallback_models</code>) and <code>cache_ttl: "5m"</code> or <code>"1h"</code>. A response schema always sets <code>require_parameters</code>.</td></tr>
-<tr><td><code>litellm</code></td><td>any</td><td>A LiteLLM proxy; <code>api_key</code> is the virtual key, sent as a bearer token for every codec, including <code>messages</code>. Each model needs <code>upstream: "openai"</code>, <code>"anthropic"</code> or <code>"bedrock"</code> after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Claude on Chat keeps its signed thinking and prompt caching, OpenAI on Chat has neither; <code>messages</code> behind an OpenAI upstream goes through the proxy’s translation, which drops reasoning. Optional <code>tags</code> select LiteLLM’s tag-based routing and label its spend logs; each conversation is reported as one LiteLLM session.</td></tr>
+<tr><td><code>compatible</code></td><td>any</td><td>Standards-following servers: OpenAI- or Anthropic-compatible endpoints need only <code>base_url</code>. A key is sent as each API specifies: a bearer token, or <code>x-api-key</code> on <code>messages</code>. Extra field: <code>state_role</code> (default <code>user</code>).</td></tr>
+<tr><td><code>openai</code></td><td><code>chat_completions</code>, <code>responses</code></td><td><code>base_url</code> defaults to <code>https://api.openai.com/v1</code>. Response schemas must fit OpenAI’s strict subset, prompt caching is keyed per conversation, and Chat keeps reasoning local because the API accepts none back. Extra fields: <code>reasoning_summary</code> (Responses only): <code>"auto"</code> (default), <code>"concise"</code> or <code>"detailed"</code>, or <code>null</code> to request none for an unverified organisation; <code>organization</code>, <code>project</code>.</td></tr>
+<tr><td><code>anthropic</code></td><td><code>messages</code></td><td><code>base_url</code> defaults to <code>https://api.anthropic.com/v1</code>. Extra fields: <code>workspace_id</code>, <code>cache_ttl: "5m"</code> or <code>"1h"</code>, <code>state_role</code> (default <code>system</code>).</td></tr>
+<tr><td><code>codex</code></td><td><code>responses</code></td><td>The ChatGPT subscription service; no <code>api_key</code>—run <code>skyhook auth login &lt;provider&gt;</code>. <code>base_url</code> defaults to the ChatGPT backend root <code>https://chatgpt.com/backend-api</code> and the extra field <code>auth_url</code> to <code>https://auth.openai.com</code>; set them only for a mirror.</td></tr>
+<tr><td><code>openrouter</code></td><td>any</td><td><code>base_url</code> defaults to <code>https://openrouter.ai/api/v1</code>. Reasoning effort and returned reasoning follow OpenRouter’s conventions, history is marked for prompt caching, and each conversation keeps its routing affinity. Extra fields: <code>routing</code> (Chat only: <code>order</code>, <code>allow_fallbacks</code>, <code>require_parameters</code>, <code>data_collection: "allow"</code> or <code>"deny"</code>, <code>quantizations</code>, <code>zdr</code>, <code>fallback_models</code>), <code>cache_ttl: "5m"</code> or <code>"1h"</code>, and <code>state_role</code> (default <code>user</code>). A response schema always sets <code>require_parameters</code>.</td></tr>
+<tr><td><code>litellm</code></td><td>any</td><td>A LiteLLM proxy; <code>api_key</code> is the virtual key, sent as a bearer token for every codec, including <code>messages</code>. Each model needs <code>upstream: "openai"</code>, <code>"anthropic"</code> or <code>"bedrock"</code> after inheritance. This asserts the family behind the alias; it does not configure proxy routing. Behind <code>anthropic</code>, Chat replays signed thinking and takes prompt caching. Behind <code>openai</code>, Chat and Responses take OpenAI’s conventions, with neither. Behind <code>bedrock</code>, which serves both families, they take OpenAI’s conventions too, but Chat still replays the signed thinking the proxy returns. <code>messages</code> behind an Anthropic upstream reaches the service as sent and gets the <code>anthropic</code> dialect’s conventions: turn-scoped system state, signed thinking kept, and the betas both need, which the proxy forwards. Behind Bedrock it does not, since LiteLLM drops the turn-scoped beta on its Bedrock path; behind OpenAI it goes through the proxy’s translation, which drops reasoning. Chat, and <code>messages</code> behind Bedrock, drop superseded state, which breaks models that bind thinking to the exact earlier conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5): use <code>messages</code> behind Anthropic for them, or <code>state_mode: persist</code>. Each conversation’s identity rides <code>x-litellm-session-id</code>, which LiteLLM’s session affinity and spend logs key on but which it forwards to no service; Chat and Responses behind <code>openai</code> or <code>bedrock</code> also send it as <code>prompt_cache_key</code>, which LiteLLM passes on for the service’s own cache affinity. LiteLLM refuses <code>prompt_cache_key</code> for every model it serves through Bedrock’s Converse API: Claude, Nova, Llama, Mistral, and OpenAI-family models such as GPT-OSS unless they are routed to Bedrock’s OpenAI endpoint. Serve Claude through <code>messages</code>, whatever its upstream. For the others, send the identity in the header alone with <code>cache_key: {header: "x-litellm-session-id"}</code>. Optional <code>tags</code> select LiteLLM’s tag-based routing and label its spend logs. Extra field: <code>state_role</code> (default <code>system</code> for <code>messages</code> behind Anthropic, <code>user</code> otherwise).</td></tr>
 </tbody>
 </table>
 </div>
@@ -227,7 +227,7 @@ directly beside <code>model</code>. To migrate an older configuration, move each
 </thead>
 <tbody>
 <tr><td>Provider only</td><td><code>dialect</code>, <code>base_url</code>, <code>api_key</code>, <code>headers</code>, <code>startup_timeout_secs</code>, <code>read_idle_timeout_secs</code>; Codex’s <code>auth_url</code>.</td></tr>
-<tr><td>Provider defaults or direct model settings</td><td><code>codec</code>; all placement selections listed below; the dialect’s request fields: OpenAI’s <code>reasoning_summary</code>, <code>organization</code>, <code>project</code>; Anthropic’s <code>workspace_id</code>, <code>cache_ttl</code>; OpenRouter’s <code>routing</code>, <code>cache_ttl</code>; LiteLLM’s <code>upstream</code>, <code>tags</code>.</td></tr>
+<tr><td>Provider defaults or direct model settings</td><td><code>codec</code>; all placement selections listed below; the Responses settings <code>service_tier</code>, <code>access_programs</code>, <code>explicit_caching</code>; the dialect’s request fields: OpenAI’s <code>reasoning_summary</code>, <code>organization</code>, <code>project</code>; Anthropic’s <code>workspace_id</code>, <code>cache_ttl</code>, <code>state_role</code>; OpenRouter’s <code>routing</code>, <code>cache_ttl</code>, <code>state_role</code>; LiteLLM’s <code>upstream</code>, <code>tags</code>, <code>state_role</code>; Compatible’s <code>state_role</code>.</td></tr>
 <tr><td>Model only</td><td><code>model</code>, <code>reasoning</code>, <code>max_context</code>, <code>max_output</code>, <code>supports_images</code>, <code>state_mode</code>, <code>hint</code>.</td></tr>
 </tbody>
 </table>
@@ -235,9 +235,16 @@ directly beside <code>model</code>. To migrate an older configuration, move each
 <p>Missing model settings inherit from the provider. Explicit values win even when they are <code>false</code>,
 <code>[]</code>, or a setting’s usual default. Lists replace inherited lists rather than append. Under
 OpenRouter’s <code>routing</code>, only declared members change: a model’s <code>order</code> replaces the inherited
-order while an undeclared <code>allow_fallbacks</code> still inherits. For nullable settings, <code>null</code> clears
-an inherited value; for example, <code>organization: null</code> removes the organization header and
-<code>routing: null</code> removes routing preferences.</p>
+order while an undeclared <code>allow_fallbacks</code> still inherits. The same leaf-by-leaf inheritance
+applies to <code>access_programs</code>: <code>{}</code> inherits its leaves, rather than clearing the object.</p>
+<p>Every request setting in the table above reads the same way, apart from lists. Left out, it
+inherits, and with nothing to inherit takes its default. An explicit <code>null</code> sends nothing: <code>organization: null</code> removes the
+organization header, <code>routing: null</code> removes routing preferences, <code>reasoning_summary: null</code>
+requests no summaries, and a placement selection of <code>null</code> places nothing. A setting that always
+sends something, such as <code>state_role</code> or <code>reasoning_effort</code>, refuses <code>null</code>; leave it out to take
+its default. Lists, such as LiteLLM’s <code>tags</code>, refuse <code>null</code> too: <code>[]</code> is the empty list. A
+placement selection’s list of locations is never empty; <code>null</code> is how it places nothing.
+Provider-only settings differ: <code>startup_timeout_secs: null</code>, for one, takes the default.</p>
 <p>Every model must have <code>codec</code>, and LiteLLM models must also have <code>upstream</code>, <strong>after inheritance</strong>.
 A provider may omit either if every model supplies it. Defaults and compatibility checks apply to
 each effective model, not to the provider defaults in isolation. Unknown fields, provider-only
@@ -269,6 +276,38 @@ models in one provider instance, regardless of their request settings.</p>
 </code></pre>
 <p>Configure the aliases and routing in LiteLLM itself; <code>upstream</code> tells Skyhook which request and
 reasoning conventions to use for each alias.</p>
+<h3 id="responses-settings"><a class="header" href="#responses-settings">Responses settings</a></h3>
+<p>Any dialect serving <code>codec: "responses"</code> accepts three optional settings, as provider defaults
+or beside <code>model</code>. All are unset by default, and each is sent only when selected. A backend
+serving Responses need not accept them; check that the endpoint, model, and account support a
+setting before selecting it. Other codecs refuse a selection, so a model that switches away from
+Responses must clear inherited ones with <code>null</code>.</p>
+<ul>
+<li><code>service_tier</code> is the backend’s tier ID, such as <code>priority</code>, <code>flex</code>, or <code>ultrafast</code>. It is
+sent exactly as written: Skyhook does not translate client aliases such as <code>fast</code>. Faster
+tiers can cost more or use more of a subscription; see
+<a href="https://learn.chatgpt.com/docs/agent-configuration/speed">ChatGPT speed</a>.</li>
+<li><code>access_programs.cyber</code> requests a cybersecurity access program: <code>standard</code>, <code>daybreak_blue</code>,
+or <code>daybreak_red</code>. The model and account must be eligible for the program; it does not grant
+entitlement, and other safeguards still apply. Some models take a different wire value from
+the approval it needs: <code>gpt-6-astra</code> and <code>gpt-6.1-sol</code> take <code>daybreak_blue</code> but require Daybreak
+Red entitlement. See the <a href="https://developers.openai.com/api/docs/guides/daybreak">Daybreak guide</a>.</li>
+<li><code>explicit_caching: true</code> switches the request to explicit prompt caching. Skyhook marks
+checkpoints at the end of the stable history and at earlier turns, never on the changing
+runtime state, so later requests can reuse the prefix. Requests with no stable history, such
+as compaction, are not cached. Left unset, the backend’s automatic caching is unchanged. See
+the <a href="https://developers.openai.com/api/docs/guides/prompt-caching">prompt-caching guide</a> for
+supported models and pricing.</li>
+</ul>
+<pre><code class="language-yaml">astra:
+  model: "gpt-6-astra"
+  max_context: 1050000
+  max_output: 128000
+  service_tier: "priority"
+  access_programs:
+    cyber: "daybreak_blue"
+  explicit_caching: true
+</code></pre>
 <h3 id="placement-selections"><a class="header" href="#placement-selections">Placement selections</a></h3>
 <p>A server that deviates from its dialect’s presets can select placements at either level:</p>
 <pre><code class="language-yaml">providers:
@@ -276,42 +315,45 @@ reasoning conventions to use for each alias.</p>
     codec: "chat_completions"
     dialect: "compatible"
     base_url: "http://127.0.0.1:8000/v1"
-    output_limit:                                # or: omitted
+    output_limit:                                # or null for none
       field: "max_tokens"
-    reasoning_replay:                            # the assistant-message key; or: omitted
+    reasoning_replay:                            # the assistant-message key; or null
       field: "reasoning"
-    cache_key:                                   # or `header: "x-session-id"`, or: omitted
-      body: "cache_salt"
+    cache_key:                                   # one location, a list of them, or null
+      - body: "cache_salt"
+      - header: "x-session-id"
     models:
       thinker:
         model: "served-name"
         max_context: 131072
         max_output: 32768
         reasoning_effort: "reasoning_effort"
-        output_limit: null                      # Restore the preset: max_completion_tokens.
+        output_limit: null                      # Send no output limit.
 </code></pre>
 <p>The selectable dimensions are <code>output_limit</code>, <code>reasoning_effort</code> (a field path), <code>reasoning_replay</code>
-and <code>tool_stream</code> (Chat Completions only), <code>cache_key</code>, and <code>user_id</code>. An absent model selection
-inherits. A <code>null</code> selection clears the inherited explicit placement and restores the preset for
-the model’s effective codec and dialect settings; it does not disable the convention. Use
-<code>omitted</code> to disable a placement that allows it. Changing <code>codec</code> does not discard inherited
-selections; clear or replace any that are not valid for the new codec.</p>
+and <code>tool_stream</code> (Chat Completions only), <code>cache_key</code>, and <code>user_id</code>. Each selection names one
+location or a nonempty list of distinct locations, and the value is written at every one. A selection left
+out inherits, and with nothing to inherit keeps the preset for the model’s effective codec and
+dialect settings; an explicit <code>null</code> places nothing. Changing <code>codec</code> does not discard inherited
+selections: set <code>null</code> for any the new codec has no place for, or replace them.</p>
 <p>A field path is dot-separated (<code>metadata.user_id</code>); <code>cache_key</code> and <code>user_id</code> carry the
 conversation identity.
 Paths must not name a field the codec writes itself (such as <code>model</code> or <code>messages</code>), and no two may
-overlap, including one inside another (<code>reasoning</code> and <code>reasoning.effort</code>). A <code>cache_key</code> header
+overlap, including one inside another (<code>reasoning</code> and <code>reasoning.effort</code>), within one selection or
+across two. A <code>cache_key</code> header
 must not be <code>accept</code>, <code>content-type</code>, or a header the codec sends itself (such as
 <code>anthropic-version</code> on <code>messages</code>). A <code>reasoning_replay</code>
-field moves the provider’s replay to another key in the same form. Messages requires an output
-limit, so <code>output_limit: omitted</code> is refused there.</p>
+field moves the provider’s replay to other keys in the same form. Messages requires an output
+limit, so <code>output_limit: null</code> is refused there, as is <code>reasoning_effort: null</code> everywhere.</p>
 <h2 id="context-and-output-budgets"><a class="header" href="#context-and-output-budgets">Context and output budgets</a></h2>
 <p>Every model profile requires <code>max_context</code> and <code>max_output</code>. Both must be positive, and
 <code>max_output</code> must be smaller than <code>max_context</code>. Prompt/history, reasoning, and generated
 text share the context window. Automatic <a href="../guide/sessions-and-context.html#conversation-compaction">compaction</a>
-runs directly after a response when its reported input, cached input, and output tokens reach
+is triggered by a response whose reported input, cached input, and output tokens reach
 90% of <code>max_context - max_output</code>; it does not estimate the next request. Compaction precedes
-tool execution. The summarizer sees the pending calls, and their results reach the first
-post-compaction request intact; a pending <code>todo</code> replacement is superseded by its reconciled list.
+tool execution, or, after a final answer, the agent’s next request. The summarizer sees the
+pending calls, and their results reach the first post-compaction request intact; a pending <code>todo</code>
+replacement is superseded by its reconciled list.
 A <code>max_output</code> of at least 50% of <code>max_context</code> produces a startup warning for that model, whether
 or not it is selected: reserving that much output space leaves most of the window unused for
 input. The configuration remains valid.
@@ -323,13 +365,41 @@ using Skyhook with less than approximately <strong>128k tokens of <code>max_cont
 instructions, tool definitions, conversation, and compaction all need room. This is guidance,
 not an enforced minimum.</p>
 <p><code>state_mode</code> controls how per-request runtime state (date, active jobs, and todos) reaches the model.
-<code>dynamic</code> (the default) sends a fresh snapshot after the history on each request without appending
-it to the conversation.
-<code>persist</code> keeps each snapshot in the conversation. Use it for models that bind signed reasoning
-to the exact earlier conversation (such as Claude Fable 5.1), at the cost of keeping every snapshot in context until
-compaction. <code>none</code> sends no runtime state, except to a compaction summary, which needs the
-current todo list to reconcile it. See <a href="../reference/runtime-state.html">runtime state</a>
-for what the model receives.</p>
+<code>dynamic</code> (the default) sends a fresh state with each request; the model sees only the current one.
+<code>persist</code> keeps each state in the conversation, at the cost of keeping every one in context until
+compaction. Use it for models that bind signed reasoning to the exact earlier conversation (such
+as Claude Fable 5.1) when the provider cannot hide earlier state, for example Claude reached
+through a Chat Completions or Responses proxy. <code>none</code> sends no runtime state, except to a
+compaction summary, which needs the current todo list to reconcile it. See
+<a href="../reference/runtime-state.html">runtime state</a> for what the model receives.</p>
+<p>Runtime state is the harness speaking, so it never appears as tool output. A dialect’s
+<code>state_role</code> selects how it is sent:</p>
+<ul>
+<li><code>system</code> uses the protocol’s harness role: a system message on <code>messages</code>, a system or
+developer message on <code>chat_completions</code>, and a developer message on <code>responses</code>. Through
+<code>anthropic</code>, or <code>litellm</code> with an Anthropic upstream on <code>messages</code>, a <code>dynamic</code> state is a
+turn-scoped system message: the model reads it for one request, and afterwards it costs no input
+tokens but stays in the conversation, so models that bind thinking to the exact earlier
+conversation (Claude Fable 5.1, Opus 5.5, Sonnet 5.5, Haiku 5.5) keep it with <code>dynamic</code> state.
+It needs a model that supports mid-conversation system messages (Claude Opus 4.8 and later,
+Fable, Sonnet 5.5, Haiku 5.5; not Sonnet 5). Other dialects send plain system messages and drop
+superseded state, as <code>user</code> does. On <code>messages</code>, a state with no valid place, such as right
+after an assistant turn, is not sent.</li>
+<li><code>user</code> sends state as user content, joining the user turn before it or as a turn of its own,
+for servers without a harness role mid-conversation, such as many open-model chat templates.
+Superseded state is then dropped, which changes the end of the conversation between requests.
+During a tool loop each state is a new user turn, so a chat template that keeps reasoning
+only for the latest user query drops the loop’s earlier reasoning after it, whatever the
+<code>state_mode</code>. For such models, enable the template’s option to keep earlier reasoning
+(Qwen’s <code>preserve_thinking</code>, for example).</li>
+</ul>
+<p><code>anthropic</code> defaults to <code>system</code>, as does <code>litellm</code> for <code>messages</code> behind an Anthropic upstream;
+<code>openai</code> and <code>codex</code> always use it, and <code>compatible</code>, <code>openrouter</code> and every other <code>litellm</code>
+combination default to <code>user</code>. Changing a provider’s <code>state_role</code> changes the conversation
+earlier reasoning was produced in, so that reasoning is not replayed afterward. Through
+<code>anthropic</code>, or <code>litellm</code> with an Anthropic upstream on <code>messages</code>, set <code>reasoning</code> to a level
+other than <code>off</code> on models that bind thinking: only then does Skyhook ask the service to drop a
+thinking block whose earlier conversation changed, rather than reject the request.</p>
 <p>The <a href="overview.html#complete-example">complete example</a> uses published hosted-model limits:</p>
 <div class="table-wrapper">
 <table>
@@ -338,7 +408,7 @@ for what the model receives.</p>
 </thead>
 <tbody>
 <tr><td>GPT-5.6 / GPT-5.6 Sol, OpenAI API</td><td style="text-align: right">1,050,000</td><td style="text-align: right">128,000</td><td><a href="https://developers.openai.com/api/docs/models/gpt-5.6-sol">Model documentation</a></td></tr>
-<tr><td>Claude Sonnet 4.6</td><td style="text-align: right">1,000,000</td><td style="text-align: right">128,000</td><td><a href="https://platform.claude.com/docs/en/models/sonnet-4-6/overview">Model documentation</a></td></tr>
+<tr><td>Claude Opus 5.5</td><td style="text-align: right">1,000,000</td><td style="text-align: right">128,000</td><td><a href="https://platform.claude.com/docs/en/about-claude/models/overview">Model overview</a></td></tr>
 <tr><td>GPT-5.6 Sol, Codex subscription</td><td style="text-align: right">872,000</td><td style="text-align: right">128,000 (not enforced)</td><td><a href="https://github.com/openai/codex/blob/main/codex-rs/models-manager/models.json">Codex model catalog</a></td></tr>
 </tbody>
 </table>
@@ -438,9 +508,9 @@ the context; from then on only signed blocks are sent.</p>
 replay their returned reasoning under <strong><code>reasoning_content</code> by default</strong>. Ordinary Chat responses
 without reasoning do not acquire an invented reasoning field.
 A server that spells the key differently selects it with <code>reasoning_replay</code> set to
-<code>field: "reasoning"</code>; <code>reasoning_replay: omitted</code> keeps reasoning local. The <code>openai</code> dialect never
-replays on Chat, since the official API rejects unknown message keys; <code>litellm</code> with a Claude
-upstream replays the signed thinking blocks the proxy returns, and <code>openrouter</code> replays its
+<code>field: "reasoning"</code>; <code>reasoning_replay: null</code> keeps reasoning local. The <code>openai</code> dialect never
+replays on Chat, since the official API rejects unknown message keys; <code>litellm</code> behind an
+<code>anthropic</code> or <code>bedrock</code> upstream replays the signed thinking blocks the proxy returns, and <code>openrouter</code> replays its
 <code>reasoning_details</code>; both are bound to the exact conversation like Messages thinking. As on
 Messages, unsigned reasoning is replayed until signed reasoning appears in the context. From then
 on, only signed thinking blocks are sent, and a turn’s <code>reasoning_details</code> are sent whole, in

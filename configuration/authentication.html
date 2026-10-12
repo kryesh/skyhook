@@ -35,7 +35,7 @@
             const path_to_root = "../";
             const default_light_theme = "light";
             const default_dark_theme = "navy";
-            window.path_to_searchindex_js = "../searchindex-82915d7a.js";
+            window.path_to_searchindex_js = "../searchindex-389413f3.js";
         </script>
         <!-- Start loading toc.js asap -->
         <script src="../toc-8b14bb79.js"></script>
@@ -243,20 +243,42 @@ configured separately.</p>
 quoting, comments, <code>export</code> declarations, and variable interpolation. A malformed or unreadable file
 fails startup without printing its contents.</p>
 <h2 id="codex-subscription-login"><a class="header" href="#codex-subscription-login">Codex subscription login</a></h2>
-<p>The <code>codex</code> provider uses <strong>Skyhook-owned</strong> OAuth credentials. Run <code>skyhook auth login</code> for browser
-authorization or <code>skyhook auth login --headless</code> for device authorization. <code>skyhook auth status</code>
-reports local login status for the configured issuer and <code>skyhook auth logout</code> removes Skyhook’s
-credentials. Login does not require a model configuration; when the discovered config has a
-<code>codex</code> provider with <code>auth_url</code>, login and token refresh use that issuer instead of
-<code>https://auth.openai.com</code>, and <code>base_url</code> likewise replaces <code>https://chatgpt.com/backend-api/codex</code>
-for requests. <code>auth_url</code> must use HTTPS (HTTP only on a loopback host) and carry no credentials,
-query, or fragment; a path prefix is kept. A configuration whose <code>codex</code> providers name different
-issuers is refused: one login serves one issuer. Skyhook never imports, reads, or modifies the
-official Codex client’s credential files. Secure Codex credential storage currently requires Unix;
-other platforms fail explicitly rather than writing tokens without private file permissions.</p>
-<p>Stored credentials are bound to the issuer that granted them. When a provider’s issuer differs, or
-the credentials were saved by an older Skyhook, requests fail without sending them and ask you to
-run <code>skyhook auth login codex</code> again.</p>
+<p>A <code>codex</code> provider uses <strong>Skyhook-owned</strong> OAuth credentials, one login per provider. Name the
+provider as it is configured: for a provider named <code>codex</code>, run <code>skyhook auth login codex</code> for browser
+authorization or <code>skyhook auth login codex --headless</code> for device authorization.
+<code>skyhook auth status codex</code> reports that provider’s local login status without contacting the
+service, so it cannot tell whether the service still accepts the login. <code>skyhook auth status codex --check</code> also presents the credentials to the service with the provider’s <code>headers</code>, refreshing
+them first if a request would, and reports the plan and rate-limit use it returns. It fails when
+the provider is not logged in or the service rejects the credentials. The check reads the account’s
+usage, which runs no model and spends no quota; that endpoint is not publicly documented by OpenAI, so what it
+reports may change. Several <code>codex</code> providers can sign in to different accounts or issuers
+independently. Login does not require the provider to have models.</p>
+<p>When the provider sets <code>auth_url</code>, login and token refresh use that issuer instead of
+<code>https://auth.openai.com</code>. <code>base_url</code> likewise replaces the ChatGPT backend root,
+<code>https://chatgpt.com/backend-api</code>. Requests go to <code>codex/responses</code> beneath it, and <code>--check</code> to
+<code>wham/usage</code>, so a mirror serves both beneath one root. <code>auth_url</code> must
+use HTTPS (HTTP only on a loopback host) and carry no credentials, query, or fragment; a path prefix
+is kept. Skyhook never imports, reads, or modifies the official Codex client’s credential files.
+Secure Codex credential storage currently requires Unix; other platforms fail explicitly rather than
+writing tokens without private file permissions.</p>
+<p>Credentials are kept in a <code>credentials/</code> directory next to the configuration file that defines the
+provider, as <code>&lt;provider&gt;.json</code>. For a provider in the user configuration that is
+<code>~/.config/skyhook/credentials/</code> (or under <code>$XDG_CONFIG_HOME/skyhook</code>). For a provider the workspace
+configuration defines, it is <code>&lt;workspace&gt;/.skyhook/credentials/</code>; keep that directory out of version
+control. For <code>--config path.yaml</code>, it is beside that file. Skyhook creates the directory when you
+first log in, readable only by you, and refuses to use one that grants any access to other users.
+Checking status or starting a session creates nothing there, except a missing lock file beside saved
+credentials.</p>
+<p>To sign a provider out, delete its <code>credentials/&lt;provider&gt;.json</code> while no session is using it.
+Nothing is revoked on the server, so this is also how to clear credentials for a provider you have
+removed from your configuration.</p>
+<p>A provider name becomes a file name, so it must contain no NUL character and be at most 250 bytes.
+On a case-insensitive file system, such as macOS by default, names that differ only in case (<code>Work</code>
+and <code>work</code>) share one credentials file; give such providers distinct names.</p>
+<p>Stored credentials are bound to the issuer that granted them. When a provider’s issuer differs,
+requests fail without sending them and name the command that signs it in again. That command
+selects the provider’s configuration file with <code>-c</code>, so it signs in the same entry the session used
+wherever you run it.</p>
 
                     </main>
 
